@@ -783,6 +783,9 @@ function environmentAssignmentValueLimit(key: string): number {
     || upper === "LCM_SUPERVISOR_CWD"
     || upper === "LCM_SUPERVISOR_ENTRYPOINT"
     || upper === "LCM_POSTGRES_CA_FILE"
+    || upper === "TMPDIR"
+    || upper === "TMP"
+    || upper === "TEMP"
     || upper === "LCM_CREDENTIAL_DIRECTORY"
     || /^LCM_CREDENTIAL_[A-Z0-9_]+_FILE$/u.test(upper)
   ) return MAX_PATH_METADATA_BYTES;
@@ -3212,7 +3215,7 @@ function metadataEnvironmentArgs(
   uid: number,
   environment: Readonly<Record<string, string>>,
 ): string[] {
-  const values = new Map<string, string>(Object.entries(normalizedManagedLaunchEnvironment(spec, environment)));
+  const values = new Map<string, string>();
   values.set("LCM_SUPERVISOR_MARKER", spec.marker);
   values.set("LCM_SUPERVISOR_SCOPE", spec.scopeDigest);
   values.set("LCM_SUPERVISOR_STATE_ROOT", spec.stateRoot);
@@ -3226,6 +3229,8 @@ function metadataEnvironmentArgs(
   if (spec.storageBackend !== undefined) values.set("LCM_SUPERVISOR_STORAGE_BACKEND", spec.storageBackend);
   if (spec.postgresCaFile !== undefined) values.set("LCM_POSTGRES_CA_FILE", spec.postgresCaFile);
   values.set("LCM_SUPERVISOR_ENV_DIGEST", managedLaunchEnvironmentDigest(spec, "systemd-user", uid, environment));
+  const normalizedEnvironment = normalizedManagedLaunchEnvironment(spec, environment);
+  for (const name of MANAGED_DAEMON_TEMP_NAMES) values.set(name, normalizedEnvironment[name]!);
   if (spec.credentialDirectory !== undefined) values.set("LCM_CREDENTIAL_DIRECTORY", spec.credentialDirectory);
   if (spec.credentialFiles !== undefined && spec.credentialFiles.length > 0) {
     values.set("LCM_SYSTEMD_CRED_IDS", spec.credentialFiles.map(({ name }) => name).join(","));

@@ -632,6 +632,46 @@ describe("managed one-launch credentials", () => {
 });
 
 describe("systemd-user supervisor", () => {
+  it("keeps long launch values out of systemd metadata while preserving normalized temp assignments", async () => {
+    const base = makeRoot();
+    const nested = join(base, ...Array.from({ length: 12 }, (_, index) => `state-root-${index}-${"x".repeat(36)}`));
+    mkdirSync(nested, { recursive: true, mode: 0o700 });
+    const daemonTemp = join(nested, "daemon-tmp");
+    const longPath = `/opt/${"path-segment-".repeat(60)}`;
+    const environment = {
+      HOME: "/home/test",
+      PATH: longPath,
+      LCM_SUMMARY_PROVIDER: "openai",
+      TMPDIR: "/ambient",
+      TMP: "/ambient",
+      TEMP: "/ambient",
+    };
+    const spec = makeSpec("systemd-user", nested, { launchEnvironment: environment });
+    const observed = managerText(spec, "active", 601, "running", environment)
+      .replace("Environment=", `Environment=PATH=${longPath} TMPDIR=${daemonTemp} TMP=${daemonTemp} TEMP=${daemonTemp} `);
+    const runner = fakeRunner([
+      { code: 1, stderr: "Unit is not-found" },
+      { code: 0, stdout: "started" },
+      { code: 0, stdout: observed },
+    ]);
+    await expect(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+      uid: 501,
+      environment,
+    }).start(spec)).rejects.toThrow("manager command");
+    const args = runner.calls[1]!.args;
+    expect(args.some((value) => value.startsWith("--setenv=PATH="))).toBe(false);
+    expect(args.some((value) => value.startsWith("--setenv=HOME="))).toBe(false);
+    expect(args.some((value) => value.startsWith("--setenv=LCM_SUMMARY_PROVIDER="))).toBe(false);
+    expect(args).toContain(`--setenv=TMPDIR=${daemonTemp}`);
+    expect(args).toContain(`--setenv=TMP=${daemonTemp}`);
+    expect(args).toContain(`--setenv=TEMP=${daemonTemp}`);
+    expect(args).toContain(`TMPDIR=${daemonTemp}`);
+    expect(args).toContain(`TMP=${daemonTemp}`);
+    expect(args).toContain(`TEMP=${daemonTemp}`);
+  });
+
   it("rejects a state-root parent redirect before systemd-run", async () => {
     const root = makeRoot();
     const outside = makeRoot();
