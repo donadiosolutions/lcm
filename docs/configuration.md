@@ -1010,9 +1010,11 @@ version or HTTP transport EOF. LCM accepts only a complete, well-formed
 `response.completed` event whose response status is `completed`, then closes the
 one-use upstream stream itself. A client may close after consuming that terminal
 event without turning a successful compaction into a failure. EOF before a
-terminal event, malformed or mismatched SSE event data, post-terminal bytes,
-and `response.failed` or `response.incomplete` events fail closed. This
-behavior has no configuration option.
+terminal event, malformed or mismatched SSE event data, bytes decoded after the
+terminal frame in the same upstream chunk, and `response.failed` or
+`response.incomplete` events fail closed. Once a valid terminal frame is
+accepted, unread queued or future upstream bytes are canceled and never relayed.
+This behavior has no configuration option.
 
 ```json
 {

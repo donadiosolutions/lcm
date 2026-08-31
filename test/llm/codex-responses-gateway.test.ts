@@ -538,6 +538,25 @@ describe("Codex Responses zero-tools gateway", () => {
       signal,
     )).resolves.toBeUndefined();
     await new Promise<void>((resolve) => setImmediate(resolve));
+
+    let queuedSuffixCancelled = false;
+    const queuedSuffix = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(COMPLETED_SSE));
+        controller.enqueue(new Uint8Array([0xc3]));
+      },
+      cancel() {
+        queuedSuffixCancelled = true;
+      },
+    });
+    const terminalOnlyResponse = makeFakeResponse(true);
+    await expect(utils.relaySse(
+      queuedSuffix,
+      terminalOnlyResponse as unknown as ServerResponse,
+      signal,
+    )).resolves.toBeUndefined();
+    expect(terminalOnlyResponse.end).toHaveBeenCalledWith(encoder.encode(COMPLETED_SSE));
+    expect(queuedSuffixCancelled).toBe(true);
   });
 
   it("keeps semantic completion when downstream close fires synchronously during terminal end", async () => {
