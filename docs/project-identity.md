@@ -188,6 +188,23 @@ accepted only when it identifies one locally verified project; same-remote
 clones are ambiguous and skipped. This repository metadata is historical
 evidence only and never becomes a PostgreSQL binding.
 
+A real Codex import reconciles the requested/current project's verified legacy
+linked-worktree identity before taking the map snapshot used to classify
+sessions. This remains current-project scoped even with `--all`; identities for
+foreign projects discovered in the catalogue are not reconciled implicitly.
+Remote passive-event operator commands perform the same reconciliation before
+checking the current project's PostgreSQL binding. A compatible legacy binding
+therefore carries to the primary checkout before either path uses it, while a
+conflict fails before daemon or PostgreSQL access. Separate clones with the same
+remote URL remain distinct.
+
+An empty Codex catalogue and every Codex `--dry-run` remain read-only. A dry run
+previews the unreconciled map snapshot, so during a legacy split it can report a
+current-project session as ambiguous even though a subsequent real import
+safely reconciles and imports it. The import result's `reconciled` count still
+describes session resolution through thread-owner or worktree-tombstone
+evidence; it does not count project-map reconciliation.
+
 ## Configure PostgreSQL
 
 Machine registration and remote project operations require the PostgreSQL

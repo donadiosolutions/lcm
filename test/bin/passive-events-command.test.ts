@@ -10,10 +10,16 @@ const state = vi.hoisted(() => ({
   remoteProjectId: "0195d250-0000-7000-8000-000000000001" as string | undefined,
   machineId: "0195d250-0000-7000-8000-000000000002",
   health: { status: "healthy" } as { status: string; error?: Error },
+  loadConfig: vi.fn(),
+  reconcileWorktree: vi.fn(),
+  resolveProject: vi.fn(),
+  requireMachine: vi.fn(),
+  runtimeConstructor: vi.fn(),
   runtimeHealth: vi.fn(),
   runtimeClose: vi.fn(),
   outboxOpen: vi.fn(),
   outboxClose: vi.fn(),
+  repositoryConstructor: vi.fn(),
   printHelp: vi.fn(),
   getDeliveryDiagnostics: vi.fn(),
   listAwaitingRemote: vi.fn(),
@@ -33,19 +39,7 @@ vi.mock("node:process", async (importOriginal) => ({
 
 vi.mock("../../src/daemon/config.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../src/daemon/config.js")>()),
-  loadDaemonConfig: vi.fn(() => ({
-    storage: {
-      backend: state.backend,
-      postgresql: {
-        url: "postgresql://runtime@db/lcm",
-        caFile: "/ca.pem",
-        poolMax: 2,
-        connectionTimeoutMs: 1_000,
-        idleTimeoutMs: 1_000,
-        statementTimeoutMs: 1_000,
-      },
-    },
-  })),
+  loadDaemonConfig: state.loadConfig,
 }));
 
 vi.mock("../../src/runtime-paths.js", async (importOriginal) => ({
@@ -56,20 +50,23 @@ vi.mock("../../src/runtime-paths.js", async (importOriginal) => ({
 
 vi.mock("../../src/project-map.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../src/project-map.js")>()),
-  resolveProjectIdentity: vi.fn(() => ({
-    projectId: "local-project",
-    remoteProjectId: state.remoteProjectId,
-  })),
+  resolveProjectIdentity: state.resolveProject,
+}));
+
+vi.mock("../../src/worktree-reconciliation.js", () => ({
+  ensureWorktreeProjectReconciled: state.reconcileWorktree,
 }));
 
 vi.mock("../../src/machine-identity.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../src/machine-identity.js")>()),
-  requireMachineIdentity: vi.fn(() => ({ machineId: state.machineId })),
+  requireMachineIdentity: state.requireMachine,
 }));
 
 vi.mock("../../src/storage/postgresql/runtime.js", () => ({
   PostgreSqlRuntime: class {
-    constructor(_settings: unknown) {}
+    constructor(settings: unknown) {
+      state.runtimeConstructor(settings);
+    }
     health = state.runtimeHealth;
     close = state.runtimeClose;
   },
@@ -90,7 +87,9 @@ vi.mock("../../src/storage/postgresql/passive-event-repository.js", () => ({
     readEvents = state.readEvents;
     listQuarantined = state.listQuarantined;
     replayQuarantined = state.replayRemote;
-    constructor(_runtime: unknown, _projectId: string, _machineId: string) {}
+    constructor(runtime: unknown, projectId: string, machineId: string) {
+      state.repositoryConstructor(runtime, projectId, machineId);
+    }
   },
 }));
 
@@ -189,6 +188,25 @@ describe("lcm events staged PostgreSQL operator commands", () => {
     state.backend = "postgresql";
     state.remoteProjectId = "0195d250-0000-7000-8000-000000000001";
     state.health = { status: "healthy" };
+    state.loadConfig.mockImplementation(() => ({
+      storage: {
+        backend: state.backend,
+        postgresql: {
+          url: "postgresql://runtime@db/lcm",
+          caFile: "/ca.pem",
+          poolMax: 2,
+          connectionTimeoutMs: 1_000,
+          idleTimeoutMs: 1_000,
+          statementTimeoutMs: 1_000,
+        },
+      },
+    }));
+    state.reconcileWorktree.mockReturnValue(undefined);
+    state.resolveProject.mockImplementation(() => ({
+      projectId: "local-project",
+      remoteProjectId: state.remoteProjectId,
+    }));
+    state.requireMachine.mockImplementation(() => ({ machineId: state.machineId }));
     state.runtimeHealth.mockImplementation(async () => state.health);
     state.runtimeClose.mockResolvedValue(undefined);
     state.outboxClose.mockResolvedValue(undefined);
@@ -260,6 +278,38 @@ describe("lcm events staged PostgreSQL operator commands", () => {
     expect(state.runtimeClose).toHaveBeenCalledOnce();
   });
 
+  it("carries a reconciled worktree binding through ordered operator admission", async () => {
+    const remoteProjectId = "0195d250-0000-7000-8000-000000000001";
+    state.remoteProjectId = undefined;
+    state.reconcileWorktree.mockImplementation(() => {
+      state.remoteProjectId = remoteProjectId;
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await invoke("events", "status", "--json");
+
+    const orderedSpies = [
+      state.loadConfig,
+      state.reconcileWorktree,
+      state.resolveProject,
+      state.requireMachine,
+      state.runtimeConstructor,
+      state.runtimeHealth,
+      state.outboxOpen,
+      state.repositoryConstructor,
+    ];
+    for (const spy of orderedSpies) expect(spy).toHaveBeenCalledOnce();
+    const invocationOrder = orderedSpies.map((spy) => spy.mock.invocationCallOrder[0]);
+    expect(invocationOrder).toEqual([...invocationOrder].sort((left, right) => left - right));
+    expect(new Set(invocationOrder).size).toBe(invocationOrder.length);
+    expect(state.repositoryConstructor).toHaveBeenCalledWith(
+      expect.anything(),
+      remoteProjectId,
+      state.machineId,
+    );
+    expect(error).not.toHaveBeenCalledWith(expect.stringContaining("project link"));
+  });
+
   it("prints compact human status", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     await invoke("events", "status");
@@ -278,19 +328,60 @@ describe("lcm events staged PostgreSQL operator commands", () => {
     expect(JSON.parse(stdoutText(stdout))).toEqual({
       error: "remote passive-event commands require storage.backend \"postgresql\"",
     });
+    expect(state.reconcileWorktree).not.toHaveBeenCalled();
+    expect(state.resolveProject).not.toHaveBeenCalled();
+    expect(state.requireMachine).not.toHaveBeenCalled();
+    expect(state.runtimeConstructor).not.toHaveBeenCalled();
     expect(state.runtimeHealth).not.toHaveBeenCalled();
+    expect(state.outboxOpen).not.toHaveBeenCalled();
+    expect(state.repositoryConstructor).not.toHaveBeenCalled();
   });
 
-  it("requires a remote project binding and closes an unhealthy runtime", async () => {
+  it("surfaces reconciliation conflicts before any downstream admission", async () => {
+    state.reconcileWorktree.mockImplementation(() => {
+      throw new Error("conflicting PostgreSQL project bindings");
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await expect(invoke("events", "status")).rejects.toThrow("exit:1");
+
+    expect(error).toHaveBeenCalledWith("Error: conflicting PostgreSQL project bindings");
+    expect(state.reconcileWorktree).toHaveBeenCalledOnce();
+    expect(state.resolveProject).not.toHaveBeenCalled();
+    expect(state.requireMachine).not.toHaveBeenCalled();
+    expect(state.runtimeConstructor).not.toHaveBeenCalled();
+    expect(state.runtimeHealth).not.toHaveBeenCalled();
+    expect(state.outboxOpen).not.toHaveBeenCalled();
+    expect(state.repositoryConstructor).not.toHaveBeenCalled();
+  });
+
+  it("reports the exact genuinely-unbound diagnostic before opening resources", async () => {
     state.remoteProjectId = undefined;
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    await expect(invoke("events", "status")).rejects.toThrow("exit:1");
-    expect(error).toHaveBeenCalledWith(expect.stringContaining("project link"));
-    expect(state.runtimeClose).not.toHaveBeenCalled();
 
-    state.remoteProjectId = "0195d250-0000-7000-8000-000000000001";
-    state.health = { status: "unhealthy", error: new Error("database unavailable") };
     await expect(invoke("events", "status")).rejects.toThrow("exit:1");
+
+    expect(error).toHaveBeenCalledWith(
+      "Error: local project has no PostgreSQL binding; run `lcm project create` or `lcm project link <project-id>`",
+    );
+    expect(state.reconcileWorktree).toHaveBeenCalledOnce();
+    expect(state.resolveProject).toHaveBeenCalledOnce();
+    expect(state.reconcileWorktree.mock.invocationCallOrder[0])
+      .toBeLessThan(state.resolveProject.mock.invocationCallOrder[0]);
+    expect(state.requireMachine).not.toHaveBeenCalled();
+    expect(state.runtimeConstructor).not.toHaveBeenCalled();
+    expect(state.runtimeHealth).not.toHaveBeenCalled();
+    expect(state.outboxOpen).not.toHaveBeenCalled();
+    expect(state.repositoryConstructor).not.toHaveBeenCalled();
+  });
+
+  it("closes an unhealthy runtime", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    state.health = { status: "unhealthy", error: new Error("database unavailable") };
+
+    await expect(invoke("events", "status")).rejects.toThrow("exit:1");
+
+    expect(error).toHaveBeenCalledWith("Error: database unavailable");
     expect(state.outboxClose).toHaveBeenCalledOnce();
     expect(state.runtimeClose).toHaveBeenCalledOnce();
   });

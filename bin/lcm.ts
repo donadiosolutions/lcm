@@ -1332,15 +1332,17 @@ async function openPassiveEventOperatorSession(): Promise<PassiveEventOperatorSe
       "remote passive-event commands require storage.backend \"postgresql\"",
     );
   }
-  const [{ resolveProjectIdentity }, { requireMachineIdentity }, runtimeModule, repositoryModule, outboxModule, pathModule] =
+  const [{ resolveProjectIdentity }, { ensureWorktreeProjectReconciled }, { requireMachineIdentity }, runtimeModule, repositoryModule, outboxModule, pathModule] =
     await Promise.all([
       import("../src/project-map.js"),
+      import("../src/worktree-reconciliation.js"),
       import("../src/machine-identity.js"),
       import("../src/storage/postgresql/runtime.js"),
       import("../src/storage/postgresql/passive-event-repository.js"),
       import("../src/storage/local-hook-outbox.js"),
       import("../src/db/events-path.js"),
     ]);
+  ensureWorktreeProjectReconciled(process.cwd());
   const project = resolveProjectIdentity(process.cwd());
   if (!project.remoteProjectId) {
     throw new Error(
