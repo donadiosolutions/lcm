@@ -14,6 +14,7 @@ const MAX_HEADER_VALUE_BYTES = 16 * 1024;
 const MAX_MODEL_BYTES = 256;
 const MAX_AUTH_BYTES = 16 * 1024;
 const MAX_ACCOUNT_BYTES = 256;
+const MAX_SSE_LINE_CHARS = 1024 * 1024;
 const GENERIC_ERROR = "codex responses gateway request failed\n";
 const OUTCOME_ERROR = "codex responses gateway did not complete";
 const CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
@@ -31,10 +32,16 @@ const REASONING_EFFORTS = new Set([
 const REASONING_SUMMARIES = new Set(["none", "auto", "concise", "detailed"]);
 const REASONING_CONTEXTS = new Set(["current_turn", "all_turns"]);
 const SERVICE_TIERS = new Set(["default", "fast", "priority", "flex"]);
+const RESPONSES_TERMINAL_EVENT_TYPES = new Set([
+  "response.completed",
+  "response.failed",
+  "response.incomplete",
+]);
 
 /**
- * Headers Codex 0.149.1 attaches to Responses requests.  This list is
- * intentionally explicit: arbitrary caller headers never cross the gateway.
+ * Responses transport metadata that Codex may attach. This semantic allowlist
+ * is intentionally version-independent: arbitrary caller headers never cross
+ * the gateway.
  */
 const CODEX_METADATA_HEADERS = [
   "x-openai-fedramp",
@@ -404,17 +411,136 @@ async function writeChunk(
   });
 }
 
+type ResponsesTerminalState = "pending" | "completed" | "failed";
+
+type ResponsesSseObserver = {
+  readonly terminalState: ResponsesTerminalState;
+  observe(chunk: Uint8Array): void;
+  finish(): ResponsesTerminalState;
+};
+
+function classifyResponsesSseEvent(eventType: string, data: string): ResponsesTerminalState {
+  if (eventType.length === 0 && data.length === 0) return "pending";
+  let payload: PlainRecord;
+  try {
+    const parsed = JSON.parse(data) as unknown;
+    if (!isPlainObject(parsed)) return "failed";
+    payload = parsed;
+  } catch {
+    return "failed";
+  }
+  const payloadType = typeof payload.type === "string" ? payload.type : "";
+  if (payloadType.length === 0 || (eventType.length > 0 && eventType !== payloadType)) return "failed";
+  const declaredTerminal = RESPONSES_TERMINAL_EVENT_TYPES.has(eventType);
+  const payloadTerminal = RESPONSES_TERMINAL_EVENT_TYPES.has(payloadType);
+  if (!declaredTerminal && !payloadTerminal) return "pending";
+  if (payloadType !== "response.completed") return "failed";
+  const response = isPlainObject(payload.response) ? payload.response : undefined;
+  return response?.status === "completed" && (response.error === undefined || response.error === null)
+    ? "completed"
+    : "failed";
+}
+
+function createResponsesSseObserver(): ResponsesSseObserver {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let pendingLine = "";
+  let eventType = "";
+  let eventData = "";
+  let terminalState: ResponsesTerminalState = "pending";
+  let skipLeadingLineFeed = false;
+
+  const acceptLinePart = (part: string): void => {
+    if (pendingLine.length + part.length > MAX_SSE_LINE_CHARS) throw genericError();
+    pendingLine += part;
+  };
+
+  const dispatchLine = (): void => {
+    const line = pendingLine;
+    pendingLine = "";
+    if (line.length === 0) {
+      terminalState = classifyResponsesSseEvent(eventType, eventData);
+      eventType = "";
+      eventData = "";
+      return;
+    }
+    if (line.startsWith("event:")) {
+      const value = line.slice("event:".length);
+      eventType = value.startsWith(" ") ? value.slice(1) : value;
+      return;
+    }
+    if (line.startsWith("data:")) {
+      const value = line.slice("data:".length);
+      const dataPart = value.startsWith(" ") ? value.slice(1) : value;
+      if (eventData.length + dataPart.length + 1 > MAX_SSE_LINE_CHARS) throw genericError();
+      eventData += `${eventData.length === 0 ? "" : "\n"}${dataPart}`;
+    }
+  };
+
+  const observeText = (rawText: string): void => {
+    let text = rawText;
+    if (skipLeadingLineFeed) {
+      if (text.startsWith("\n")) text = text.slice(1);
+      skipLeadingLineFeed = false;
+    }
+    if (text.length === 0) return;
+    skipLeadingLineFeed = text.endsWith("\r");
+    text = text.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+    let offset = 0;
+    while (offset < text.length) {
+      const newline = text.indexOf("\n", offset);
+      if (newline === -1) {
+        acceptLinePart(text.slice(offset));
+        return;
+      }
+      acceptLinePart(text.slice(offset, newline));
+      dispatchLine();
+      const nextOffset = newline + 1;
+      if (terminalState !== "pending") {
+        if (nextOffset < text.length) terminalState = "failed";
+        return;
+      }
+      offset = nextOffset;
+    }
+  };
+
+  return {
+    get terminalState() {
+      return terminalState;
+    },
+    observe(chunk) {
+      if (chunk.byteLength > MAX_SSE_LINE_CHARS || terminalState !== "pending") throw genericError();
+      observeText(decoder.decode(chunk, { stream: true }));
+    },
+    finish() {
+      observeText(decoder.decode());
+      return terminalState;
+    },
+  };
+}
+
 async function relaySse(
   upstreamBody: ReadableStream<Uint8Array>,
   downstream: ServerResponse,
   signal: AbortSignal,
+  observer: ResponsesSseObserver = createResponsesSseObserver(),
+  abortUpstream?: () => void,
 ): Promise<void> {
   const reader = upstreamBody.getReader();
   try {
     while (true) {
       if (signal.aborted) throw genericError();
       const result = await reader.read();
-      if (result.done) return;
+      if (result.done) {
+        observer.finish();
+        throw genericError();
+      }
+      observer.observe(result.value);
+      if (observer.terminalState === "failed") throw genericError();
+      if (observer.terminalState === "completed") {
+        downstream.end(result.value);
+        abortUpstream?.();
+        return;
+      }
       await writeChunk(downstream, result.value, signal);
     }
   } catch {
@@ -544,9 +670,10 @@ export async function createCodexResponsesGateway(
     requestSeen = true;
 
     const controller = new AbortController();
+    const sseObserver = createResponsesSseObserver();
     activeControllers.add(controller);
     const onResponseClose = (): void => {
-      if (!response.writableEnded) controller.abort();
+      if (!response.writableEnded && sseObserver.terminalState !== "completed") controller.abort();
     };
     const onRequestClose = (): void => {
       if (!request.complete) controller.abort();
@@ -599,9 +726,8 @@ export async function createCodexResponsesGateway(
       response.setHeader("Content-Type", contentType ?? "text/event-stream");
       const cacheControl = safeResponseHeader(upstream.headers.get("cache-control"));
       if (cacheControl !== undefined) response.setHeader("Cache-Control", cacheControl);
-      await relaySse(upstream.body, response, controller.signal);
+      await relaySse(upstream.body, response, controller.signal, sseObserver, () => controller.abort());
       upstreamBody = null;
-      if (!response.writableEnded) response.end();
       requestCompleted = true;
       finishCompletion();
     } catch (error) {
@@ -722,6 +848,8 @@ export const __codexResponsesGatewayTestUtils = {
   isSseContentType,
   writeChunk,
   relaySse,
+  createResponsesSseObserver,
+  classifyResponsesSseEvent,
   listen,
   closeServer,
 };
