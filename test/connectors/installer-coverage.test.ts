@@ -79,6 +79,106 @@ afterEach(() => {
 });
 
 describe("installer defensive branches", () => {
+  it("sanitizes descriptor open failures at the public removal boundary", async () => {
+    const root = join(directory, "remove-display-sanitization");
+    const configPath = join(root, "config.json");
+    const initial = installConnector("cursor", "mcp", root, { configPath, persistTransport: false });
+    const mcpPath = initial.paths!.find((path) => path.endsWith("mcp.json"))!;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const operationPath = String(path);
+          const isMcpLeaf = operationPath.startsWith("/proc/self/fd/")
+            && operationPath.endsWith("/mcp.json")
+            && (Number(flags) & actual.constants.O_RDWR) !== 0;
+          if (isMcpLeaf) {
+            throw Object.assign(new Error(`injected low-level open failure at ${operationPath}`), { code: "EIO" });
+          }
+          return mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+        }) as typeof actual.openSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      const result = module.removeConnector("cursor", { cwd: root, configPath });
+      expect(result).toEqual(expect.objectContaining({ success: false }));
+      if (typeof result === "boolean") throw new Error("expected a transport removal result");
+      expect(result.failures.join("; ")).toContain(mcpPath);
+      expect(result.failures.join("; ")).not.toContain("/proc/self/fd/");
+      expect(result.failures.join("; ")).not.toContain("injected low-level open failure at /proc");
+
+      let caught: unknown;
+      try {
+        module.removeConnector("cursor", "mcp", root);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
+      expect((caught as Error & { cause?: unknown }).cause).toBeUndefined();
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("sanitizes receipt errors before rollback diagnostics", async () => {
+    const root = join(directory, "receipt-display-sanitization");
+    const configPath = join(root, "config.json");
+    const skillPath = join(root, ".cursor", "skills", "lcm-memory", "SKILL.md");
+    let receiptFailureArmed = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          if (!receiptFailureArmed && isSkill(descriptor)) {
+            receiptFailureArmed = true;
+            throw Object.assign(new Error("injected truncate failure"), { code: "EIO" });
+          }
+          return actual.ftruncateSync(descriptor, length);
+        }) as typeof actual.ftruncateSync,
+        fstatSync: ((descriptor: number) => {
+          if (receiptFailureArmed && isSkill(descriptor)) {
+            receiptFailureArmed = false;
+            throw Object.assign(new Error(`receipt denied at /proc/self/fd/${descriptor}`), { code: "EIO" });
+          }
+          return actual.fstatSync(descriptor);
+        }) as typeof actual.fstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      let caught: unknown;
+      try {
+        module.installConnector("cursor", "cli", root, {
+          configPath,
+          persistTransport: false,
+          failAt: "complete",
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toContain("expected-after receipt unavailable");
+      expect((caught as Error).message).toContain(skillPath);
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
+      expect((caught as Error & { cause?: unknown }).cause).toBeUndefined();
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
   it("uses an injected native restore seam during MCP compensation", () => {
     withTempHome((cwd) => {
       let entries: readonly Record<string, unknown>[] = [];

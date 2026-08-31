@@ -561,7 +561,7 @@ class ConnectorMutationAuthority {
   private withDisplay(error: unknown, displayPath: string): Error {
     const sanitized = this.displayError(error).message;
     const message = sanitized.includes(displayPath) ? sanitized : `${sanitized} at ${displayPath}`;
-    const wrapped = new Error(message, { cause: error });
+    const wrapped = new Error(message);
     const code = (error as NodeJS.ErrnoException)?.code;
     if (typeof code === "string") Object.assign(wrapped, { code });
     return wrapped;
@@ -782,6 +782,7 @@ class ConnectorMutationAuthority {
       }
       const lease = { path: displayPath, descriptor, initial: registered, created };
       this.leases.set(displayPath, lease);
+      this.recordProcDisplay(`/proc/self/fd/${descriptor}`, displayPath);
       this.descriptors.push(descriptor);
       return lease;
     } catch (error) {
@@ -805,7 +806,7 @@ class ConnectorMutationAuthority {
       return content;
     } catch (error) {
       lease.receipt = undefined;
-      lease.receiptError = error instanceof Error ? error.message : String(error);
+      lease.receiptError = this.displayError(error).message;
       throw error;
     }
   }
@@ -862,7 +863,7 @@ class ConnectorMutationAuthority {
           failures.push(`${lease.path}: physical absence cannot be safely restored; created inode was neutralized`);
         }
       } catch (error) {
-        failures.push(`${lease.path}: ${error instanceof Error ? error.message : String(error)}`);
+        failures.push(`${lease.path}: ${this.displayError(error).message}`);
       }
     }
     return failures;
@@ -877,7 +878,7 @@ class ConnectorMutationAuthority {
       sanitized = sanitized.replaceAll(operationPath, displayPath);
     }
     if (!(error instanceof Error)) return new Error(sanitized);
-    const wrapped = new Error(sanitized, { cause: error });
+    const wrapped = new Error(sanitized);
     const code = (error as NodeJS.ErrnoException).code;
     if (typeof code === "string") Object.assign(wrapped, { code });
     return wrapped;
@@ -2114,7 +2115,7 @@ function installTransportBundle(
         codexMcpMutated ||= !codexMcpEntriesEqual(runner.get(), priorCodexMcp);
       } catch (readbackError) {
         codexMcpMutated = true;
-        failures.push(`Codex MCP state readback: ${String(readbackError)}`);
+        failures.push(`Codex MCP state readback: ${activeMutationAuthority!.displayError(readbackError).message}`);
       }
     }
     if (filesMutated) {
@@ -2122,16 +2123,20 @@ function installTransportBundle(
       failures.push(...ownedFailures.map((failure) => `owned state: ${failure}`));
     }
     if (runner && priorCodexMcp && codexMcpMutated) {
-      try { compensateCodexMcp(runner, priorCodexMcp); } catch (restoreError) { failures.push(`Codex MCP state: ${String(restoreError)}`); }
+      try { compensateCodexMcp(runner, priorCodexMcp); } catch (restoreError) {
+        failures.push(`Codex MCP state: ${activeMutationAuthority!.displayError(restoreError).message}`);
+      }
     }
     if (configMutated) {
       try {
         restoreTransportChoice(configFile, agent.id, priorTransport);
         if (readConnectorTransport(configFile, agent.id) !== priorTransport) throw new Error("transport config compensation readback mismatch");
-      } catch (restoreError) { failures.push(`transport config: ${String(restoreError)}`); }
+      } catch (restoreError) {
+        failures.push(`transport config: ${activeMutationAuthority!.displayError(restoreError).message}`);
+      }
     }
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(failures.length > 0 ? `${detail}; rollback incomplete (${failures.join("; ")})` : detail, { cause: error });
+    const detail = activeMutationAuthority!.displayError(error).message;
+    throw new Error(failures.length > 0 ? `${detail}; rollback incomplete (${failures.join("; ")})` : detail);
   }
 }
 
@@ -2200,6 +2205,7 @@ export function installConnector(
 function removeTransportBundle(agent: Agent, cwd: string, options: ConnectorInstallerOptions): RemoveResult {
   const configFile = options.configPath ?? defaultConfigPath();
   const failures: string[] = [];
+  const failureMessage = (error: unknown): string => activeMutationAuthority!.displayError(error).message;
   const paths: string[] = allOwnedPaths(agent, cwd);
   const hadAnchoredTarget = paths.some((path) => activeMutationAuthority!.hasTarget(path));
   let removed = false;
@@ -2210,7 +2216,7 @@ function removeTransportBundle(agent: Agent, cwd: string, options: ConnectorInst
     : undefined;
   if (codexMcp) {
     try { preflightCodexMcpRemove(codexMcp); } catch (error) {
-      failures.push(`mcp: ${error instanceof Error ? error.message : String(error)}`);
+      failures.push(`mcp: ${failureMessage(error)}`);
       return { success: false, removed: false, paths, failures };
     }
   }
@@ -2218,7 +2224,7 @@ function removeTransportBundle(agent: Agent, cwd: string, options: ConnectorInst
     const settingsPath = surfacePath(agent, "hook", cwd);
     if (settingsPath) {
       try { removed = removeClaudeNativeMcp(settingsPath) || removed; } catch (error) {
-        failures.push(`native-mcp: ${error instanceof Error ? error.message : String(error)}`);
+        failures.push(`native-mcp: ${failureMessage(error)}`);
       }
     }
   }
@@ -2226,12 +2232,12 @@ function removeTransportBundle(agent: Agent, cwd: string, options: ConnectorInst
     try {
       removed = removeSurface(agent, surface, cwd, codexMcp, true) || removed;
     } catch (error) {
-      failures.push(`${surface}: ${error instanceof Error ? error.message : String(error)}`);
+      failures.push(`${surface}: ${failureMessage(error)}`);
     }
   }
   if (failures.length === 0 && (removed || hadAnchoredTarget)) {
     try { clearConnectorTransport(configFile, agent.id); } catch (error) {
-      failures.push(`transport config: ${error instanceof Error ? error.message : String(error)}`);
+      failures.push(`transport config: ${failureMessage(error)}`);
     }
   }
   return { success: failures.length === 0, removed, paths, failures };

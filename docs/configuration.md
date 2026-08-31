@@ -181,7 +181,9 @@ parents are then created one component at a time. The selected project root or
 captured home root may itself be a symlink, but a redirected descendant parent
 (including an in-root alias) is refused before connector files, native MCP
 state, or the stored transport choice are mutated. Public results and errors
-continue to use ordinary display paths.
+continue to use ordinary display paths. Removal failure lists and rollback
+diagnostics apply the same redaction and do not expose retained
+`/proc/self/fd` operation paths or an unsanitized nested error cause.
 
 This guarantee is intentionally Linux-specific. Filesystem-backed connector
 install/remove refuse on macOS, other non-Linux platforms, or when strict
