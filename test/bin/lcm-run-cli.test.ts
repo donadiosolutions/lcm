@@ -729,7 +729,7 @@ describe("runCli daemon-backed and utility actions", () => {
     }
   });
 
-  it("routes store through an authenticated healthy daemon without migration", async () => {
+  it("runs legacy migration before routing store through an authenticated healthy daemon", async () => {
     state.health.mockResolvedValue({
       status: "healthy",
       version: "1.4.2",
@@ -756,9 +756,11 @@ describe("runCli daemon-backed and utility actions", () => {
         sleep,
       })).toBeUndefined();
 
-      expect(migrate).not.toHaveBeenCalled();
+      expect(migrate).toHaveBeenCalledOnce();
       expect(state.ensureDaemon).not.toHaveBeenCalled();
       expect(state.health).toHaveBeenCalledOnce();
+      expect(migrate.mock.invocationCallOrder[0])
+        .toBeLessThan(state.health.mock.invocationCallOrder[0]!);
       expect(state.post).toHaveBeenCalledWith("/store", {
         cwd: process.cwd(),
         text: "memory",
@@ -791,12 +793,12 @@ describe("runCli daemon-backed and utility actions", () => {
 
     expect(await invoke(["store", "memory"], { migrate, sleep })).toBeUndefined();
 
-    expect(state.health).toHaveBeenCalledOnce();
     expect(migrate).toHaveBeenCalledOnce();
+    expect(state.health).toHaveBeenCalledOnce();
     expect(state.ensureDaemon).toHaveBeenCalledOnce();
-    expect(state.health.mock.invocationCallOrder[0])
-      .toBeLessThan(migrate.mock.invocationCallOrder[0]!);
     expect(migrate.mock.invocationCallOrder[0])
+      .toBeLessThan(state.health.mock.invocationCallOrder[0]!);
+    expect(state.health.mock.invocationCallOrder[0])
       .toBeLessThan(state.ensureDaemon.mock.invocationCallOrder[0]!);
     expect(state.post).toHaveBeenCalledWith("/store", expect.objectContaining({
       text: "memory",
@@ -924,11 +926,40 @@ describe("runCli daemon-backed and utility actions", () => {
       sleep: async (_delayMs: number) => undefined,
     })).rejects.toBe(contention);
 
-    expect(state.health).toHaveBeenCalledOnce();
     expect(migrate).toHaveBeenCalledOnce();
-    expect(state.health.mock.invocationCallOrder[0])
-      .toBeLessThan(migrate.mock.invocationCallOrder[0]!);
+    expect(state.health).not.toHaveBeenCalled();
     expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+  });
+
+  it("rejects unauthenticated legacy coexistence before healthy store admission", async () => {
+    state.health.mockResolvedValue({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
+    const rejection = new Error("legacy and active LCM homes coexist without authenticated migration evidence");
+    const migrate = vi.fn(() => { throw rejection; });
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+
+    let observed: unknown;
+    try {
+      await runCli(["node", "lcm", "store", "text"], { migrate, sleep });
+    } catch (error) {
+      observed = error;
+    }
+
+    expect(observed).toBe(rejection);
+    expect(observed).toMatchObject({
+      message: "legacy and active LCM homes coexist without authenticated migration evidence",
+    });
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.health).not.toHaveBeenCalled();
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
   });
 
   it("defers verified PostgreSQL store mutation admission to the daemon", async () => {
@@ -970,11 +1001,13 @@ describe("runCli daemon-backed and utility actions", () => {
     try {
       expect(await invoke(["store", "memory"], { migrate, sleep })).toBeUndefined();
       expect(state.health).toHaveBeenCalledOnce();
-      expect(migrate).not.toHaveBeenCalled();
+      expect(migrate).toHaveBeenCalledOnce();
       expect(state.ensureDaemon).not.toHaveBeenCalled();
       expect(state.post).toHaveBeenCalledWith("/store", expect.objectContaining({
         text: "memory",
       }));
+      expect(migrate.mock.invocationCallOrder[0])
+        .toBeLessThan(state.health.mock.invocationCallOrder[0]!);
     } finally {
       state.runtimeHome = previousRuntime.home;
       state.runtimePidPath = previousRuntime.pid;

@@ -55,11 +55,11 @@ terminal, completes both outputs, and then exits with status 1.
 
 ## Healthy-daemon routing
 
-The following daemon-backed commands use a migration-free preflight when the
+The following six read commands use a migration-free preflight when the
 managed daemon is healthy. The shared preflight acquires an authenticated
-daemon client for six reads and for `lcm store`:
+daemon client for each read:
 
-| Command | Read performed by the daemon |
+| Command | Operation performed by the daemon |
 |---|---|
 | `lcm search <query>` | Search episodic and promoted memory |
 | `lcm grep <query>` | Search messages and summaries by exact text or regular expression |
@@ -67,7 +67,6 @@ daemon client for six reads and for `lcm store`:
 | `lcm expand <nodeId>` | Expand a summary into source detail |
 | `lcm status` | Read daemon and project status |
 | `lcm stats --pool` | Read daemon connection-pool statistics |
-| `lcm store <text>` | Store a durable memory entry |
 
 Before using this route, LCM reads a bounded, no-follow configuration snapshot
 without taking the private mutation/publication lock. If `config.json` is
@@ -95,12 +94,13 @@ An existing publication directory without a journal is incomplete evidence,
 not the legacy SQLite no-evidence case. This response buffering applies to
 read routes; `lcm store` remains a mutation.
 
-For a proven `lcm store` client, the CLI skips redundant root bootstrap and
-defers storage selection to the authenticated daemon's request-time admission.
-The daemon still revalidates backend, configuration, and publication state and
-performs the write through operation-scoped publication admission. If the
-client preflight cannot prove identity, health, or a stable configuration,
-`lcm store` returns to the existing locked migration and daemon-lifecycle path.
+`lcm store <text>` first completes legacy-home bootstrap admission through the
+same locked migration gate, then reuses the authenticated healthy daemon client
+without redundant lifecycle discovery. The daemon still revalidates backend,
+configuration, and publication state and performs the write through
+operation-scoped publication admission. If the client preflight cannot prove
+identity, health, or a stable configuration, `lcm store` returns to the
+existing daemon-lifecycle path without rerunning the completed legacy gate.
 
 The route is fail closed. An unreadable, malformed, oversized, symlinked, or
 otherwise invalid configuration, missing token, failed or ambiguous health

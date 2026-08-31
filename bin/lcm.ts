@@ -1191,7 +1191,6 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
     || action === "grep"
     || action === "describe"
     || action === "expand"
-    || action === "store"
   )) return false;
   if (topLevel && action === "post-tool") return false;
   if (topLevel && action === "status") return false;
@@ -1202,7 +1201,12 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   return true;
 }
 
-type DaemonClientProvider = (options?: { readonly preflightStorage?: boolean }) => Promise<DaemonClient>;
+type DaemonClientOptions = {
+  readonly preflightStorage?: boolean;
+  readonly rootBootstrapComplete?: boolean;
+};
+
+type DaemonClientProvider = (options?: DaemonClientOptions) => Promise<DaemonClient>;
 
 export function registerMemoryCommands(
   program: Command,
@@ -1309,7 +1313,7 @@ export function registerMemoryCommands(
         printHelp("store"); exit(0);
       }
 
-      const client = await daemonClient();
+      const client = await daemonClient({ rootBootstrapComplete: true });
       const result = await client.post("/store", {
         cwd: process.cwd(),
         text,
@@ -1968,7 +1972,7 @@ type DaemonClientWithConfig = Readonly<{
 }>;
 
 async function createDaemonClientOrExitWithConfig(
-  options: { readonly preflightStorage?: boolean } = {},
+  options: DaemonClientOptions = {},
 ): Promise<DaemonClientWithConfig> {
   const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
   const { loadDaemonConfig } = await import("../src/daemon/config.js");
@@ -2007,14 +2011,14 @@ async function createDaemonClientOrExitWithConfig(
 }
 
 async function createDaemonClientOrExit(
-  options: { readonly preflightStorage?: boolean } = {},
+  options: DaemonClientOptions = {},
 ): Promise<DaemonClient> {
   return (await createDaemonClientOrExitWithConfig(options)).client;
 }
 
 async function createDaemonReadClientOrExit(
   preflightSeams?: RootBootstrapRetrySeams,
-  options: { readonly preflightStorage?: boolean } = {},
+  options: DaemonClientOptions = {},
 ): Promise<DaemonClientWithConfig> {
   const configPath = defaultConfigPath();
   try {
@@ -2058,11 +2062,13 @@ async function createDaemonReadClientOrExit(
     // existing authenticated migration and lifecycle path below.
   }
 
-  await migrateLegacyHomeWithRetry({
-    migrate: preflightSeams?.migrate ?? migrateLegacyHomeIfNeeded,
-    sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
-    attempt: preflightSeams?.attempt,
-  });
+  if (options.rootBootstrapComplete !== true) {
+    await migrateLegacyHomeWithRetry({
+      migrate: preflightSeams?.migrate ?? migrateLegacyHomeIfNeeded,
+      sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
+      attempt: preflightSeams?.attempt,
+    });
+  }
   return createDaemonClientOrExitWithConfig(options);
 }
 
