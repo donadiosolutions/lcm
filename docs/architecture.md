@@ -283,9 +283,12 @@ adapter and logs' existing safety boundaries.
 Once factory shutdown begins, an in-flight factory health probe reports the
 closed state and exposes no runtime detail, even if the underlying probe later
 settles with a healthy, unavailable, or failed result.
-For PostgreSQL, once project shutdown begins, project health reports the
-closed state with the project identity and exposes no query detail, even if its
-probe settles later.
+For PostgreSQL and SQLite, once project shutdown begins, project health reports
+the closed state with the project identity and exposes no query detail, even if
+its probe settles later. A failed SQLite project close clears the in-progress
+close attempt and reopens the lifecycle latch for a later retry, even though
+the pooled handle was already released; health may therefore be unavailable
+between attempts.
 
 ### Transactions
 
