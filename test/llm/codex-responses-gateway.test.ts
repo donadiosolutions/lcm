@@ -491,28 +491,50 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(backpressured.write).not.toHaveBeenCalled();
     expect(backpressured.end).toHaveBeenCalledWith(encoder.encode(COMPLETED_SSE));
 
+    let cancelCalled = false;
     let releaseCancel: (() => void) | undefined;
     const untrustedCancel = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(encoder.encode(COMPLETED_SSE));
       },
       cancel() {
+        cancelCalled = true;
         return new Promise<void>((resolve) => { releaseCancel = resolve; });
       },
     });
     let settled = false;
+    const abortUpstream = vi.fn();
     const cancellationRelay = utils.relaySse(
       untrustedCancel,
       makeFakeResponse(true) as unknown as ServerResponse,
       signal,
+      undefined,
+      abortUpstream,
     ).then(() => { settled = true; });
     await new Promise<void>((resolve) => setImmediate(resolve));
     try {
       expect(settled).toBe(true);
+      expect(cancelCalled).toBe(true);
+      expect(abortUpstream).toHaveBeenCalledOnce();
     } finally {
       releaseCancel?.();
     }
     await cancellationRelay;
+
+    const rejectingCancel = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(COMPLETED_SSE));
+      },
+      cancel() {
+        return Promise.reject(new Error("cancel rejected"));
+      },
+    });
+    await expect(utils.relaySse(
+      rejectingCancel,
+      makeFakeResponse(true) as unknown as ServerResponse,
+      signal,
+    )).resolves.toBeUndefined();
+    await new Promise<void>((resolve) => setImmediate(resolve));
   });
 
   it("keeps semantic completion when downstream close fires synchronously during terminal end", async () => {
@@ -1263,7 +1285,7 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(gateway.requestAccepted).toBe(true);
     expect(gateway.requestCompleted).toBe(true);
     expect(upstreamSignal?.aborted).toBe(true);
-    expect(upstreamCancelled).toBe(false);
+    expect(upstreamCancelled).toBe(true);
   });
 
   it("fails completion when the upstream stream is aborted or the gateway closes", async () => {

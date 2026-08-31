@@ -14,7 +14,9 @@ const MAX_HEADER_VALUE_BYTES = 16 * 1024;
 const MAX_MODEL_BYTES = 256;
 const MAX_AUTH_BYTES = 16 * 1024;
 const MAX_ACCOUNT_BYTES = 256;
+const MAX_SSE_CHUNK_BYTES = 1024 * 1024;
 const MAX_SSE_LINE_CHARS = 1024 * 1024;
+const MAX_SSE_EVENT_DATA_CHARS = 1024 * 1024;
 const GENERIC_ERROR = "codex responses gateway request failed\n";
 const OUTCOME_ERROR = "codex responses gateway did not complete";
 const CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
@@ -471,8 +473,9 @@ function createResponsesSseObserver(): ResponsesSseObserver {
     if (line.startsWith("data:")) {
       const value = line.slice("data:".length);
       const dataPart = value.startsWith(" ") ? value.slice(1) : value;
-      if (eventData.length + dataPart.length + 1 > MAX_SSE_LINE_CHARS) throw genericError();
-      eventData += `${eventData.length === 0 ? "" : "\n"}${dataPart}`;
+      const separator = eventData.length === 0 ? "" : "\n";
+      if (eventData.length + separator.length + dataPart.length > MAX_SSE_EVENT_DATA_CHARS) throw genericError();
+      eventData += `${separator}${dataPart}`;
     }
   };
 
@@ -508,7 +511,7 @@ function createResponsesSseObserver(): ResponsesSseObserver {
       return terminalState;
     },
     observe(chunk) {
-      if (chunk.byteLength > MAX_SSE_LINE_CHARS || terminalState !== "pending") throw genericError();
+      if (chunk.byteLength > MAX_SSE_CHUNK_BYTES || terminalState !== "pending") throw genericError();
       observeText(decoder.decode(chunk, { stream: true }));
     },
     finish() {
@@ -538,6 +541,7 @@ async function relaySse(
       if (observer.terminalState === "failed") throw genericError();
       if (observer.terminalState === "completed") {
         downstream.end(result.value);
+        void reader.cancel().catch(() => undefined);
         abortUpstream?.();
         return;
       }
