@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { ConfigValidationError } from "../../src/daemon/config.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
@@ -728,6 +729,52 @@ describe("runCli daemon-backed and utility actions", () => {
     }
   });
 
+  it("runs legacy migration before routing store through an authenticated healthy daemon", async () => {
+    state.health.mockResolvedValue({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+    const root = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-store-"));
+    actualFs.mkdirSync(join(root, ".lcm"), { recursive: true });
+    const previousRuntime = {
+      home: state.runtimeHome,
+      pid: state.runtimePidPath,
+      token: state.runtimeTokenPath,
+    };
+    state.runtimeHome = root;
+    state.runtimePidPath = join(root, ".lcm", "daemon.pid");
+    state.runtimeTokenPath = join(root, ".lcm", "daemon.token");
+
+    try {
+      expect(await invoke(["store", "memory", "--tag", "project:lcm"], {
+        migrate,
+        sleep,
+      })).toBeUndefined();
+
+      expect(migrate).toHaveBeenCalledOnce();
+      expect(state.ensureDaemon).not.toHaveBeenCalled();
+      expect(state.health).toHaveBeenCalledOnce();
+      expect(migrate.mock.invocationCallOrder[0])
+        .toBeLessThan(state.health.mock.invocationCallOrder[0]!);
+      expect(state.post).toHaveBeenCalledWith("/store", {
+        cwd: process.cwd(),
+        text: "memory",
+        tags: ["project:lcm"],
+        metadata: {},
+      });
+    } finally {
+      state.runtimeHome = previousRuntime.home;
+      state.runtimePidPath = previousRuntime.pid;
+      state.runtimeTokenPath = previousRuntime.token;
+      actualFs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("falls back to one authenticated migration when the read fast path cannot authorize", async () => {
     state.health.mockResolvedValue({ status: "ok", storageBackend: "postgresql" });
     const migrate = vi.fn();
@@ -737,6 +784,25 @@ describe("runCli daemon-backed and utility actions", () => {
 
     expect(migrate).toHaveBeenCalledOnce();
     expect(state.ensureDaemon).toHaveBeenCalledOnce();
+  });
+
+  it("falls back to authenticated migration when store preflight cannot authorize", async () => {
+    state.health.mockResolvedValue({ status: "ok", storageBackend: "postgresql" });
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+
+    expect(await invoke(["store", "memory"], { migrate, sleep })).toBeUndefined();
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.health).toHaveBeenCalledOnce();
+    expect(state.ensureDaemon).toHaveBeenCalledOnce();
+    expect(migrate.mock.invocationCallOrder[0])
+      .toBeLessThan(state.health.mock.invocationCallOrder[0]!);
+    expect(state.health.mock.invocationCallOrder[0])
+      .toBeLessThan(state.ensureDaemon.mock.invocationCallOrder[0]!);
+    expect(state.post).toHaveBeenCalledWith("/store", expect.objectContaining({
+      text: "memory",
+    }));
   });
 
   it("never authorizes the read fast path from public health without a token", async () => {
@@ -831,7 +897,6 @@ describe("runCli daemon-backed and utility actions", () => {
     const migrate = vi.fn();
     const sleep = vi.fn(async (_delayMs: number) => undefined);
     const mutationCases = [
-      ["store", "text"],
       ["daemon", "start"],
       ["daemon", "restart"],
       ["stats"],
@@ -852,6 +917,7 @@ describe("runCli daemon-backed and utility actions", () => {
   });
 
   it("propagates private mutation-lock contention from the routed migration", async () => {
+    state.health.mockResolvedValue({ status: "ok", storageBackend: "postgresql" });
     const contention = new PrivateMutationLockContentionError("publication lock is busy");
     const migrate = vi.fn(() => { throw contention; });
 
@@ -859,6 +925,101 @@ describe("runCli daemon-backed and utility actions", () => {
       migrate,
       sleep: async (_delayMs: number) => undefined,
     })).rejects.toBe(contention);
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.health).not.toHaveBeenCalled();
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+  });
+
+  it("rejects unauthenticated legacy coexistence before healthy store admission", async () => {
+    state.health.mockResolvedValue({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
+    const rejection = new Error("legacy and active LCM homes coexist without authenticated migration evidence");
+    const migrate = vi.fn(() => { throw rejection; });
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+
+    let observed: unknown;
+    try {
+      await runCli(["node", "lcm", "store", "text"], { migrate, sleep });
+    } catch (error) {
+      observed = error;
+    }
+
+    expect(observed).toBe(rejection);
+    expect(observed).toMatchObject({
+      message: "legacy and active LCM homes coexist without authenticated migration evidence",
+    });
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.health).not.toHaveBeenCalled();
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+  });
+
+  it("defers verified PostgreSQL store mutation admission to the daemon", async () => {
+    const root = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-store-pg-"));
+    const lcmDir = join(root, ".lcm");
+    const caFile = join(root, "ca.pem");
+    actualFs.mkdirSync(lcmDir, { recursive: true });
+    actualFs.writeFileSync(join(lcmDir, "config.json"), JSON.stringify({
+      storage: { backend: "postgresql" },
+    }));
+    actualFs.writeFileSync(caFile, "test-ca\n");
+    const previousRuntime = {
+      home: state.runtimeHome,
+      pid: state.runtimePidPath,
+      token: state.runtimeTokenPath,
+    };
+    const previousEnv = {
+      url: process.env.LCM_POSTGRES_URL,
+      caFile: process.env.LCM_POSTGRES_CA_FILE,
+      migrationRole: process.env.LCM_POSTGRES_MIGRATION_ROLE,
+    };
+    state.runtimeHome = root;
+    state.runtimePidPath = join(lcmDir, "daemon.pid");
+    state.runtimeTokenPath = join(lcmDir, "daemon.token");
+    state.storageBackend = "postgresql";
+    process.env.LCM_POSTGRES_URL = "postgresql://lcm:secret@localhost:5432/lcm";
+    process.env.LCM_POSTGRES_CA_FILE = caFile;
+    process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_migrator";
+    state.health.mockResolvedValue({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "postgresql",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+
+    try {
+      expect(await invoke(["store", "memory"], { migrate, sleep })).toBeUndefined();
+      expect(state.health).toHaveBeenCalledOnce();
+      expect(migrate).toHaveBeenCalledOnce();
+      expect(state.ensureDaemon).not.toHaveBeenCalled();
+      expect(state.post).toHaveBeenCalledWith("/store", expect.objectContaining({
+        text: "memory",
+      }));
+      expect(migrate.mock.invocationCallOrder[0])
+        .toBeLessThan(state.health.mock.invocationCallOrder[0]!);
+    } finally {
+      state.runtimeHome = previousRuntime.home;
+      state.runtimePidPath = previousRuntime.pid;
+      state.runtimeTokenPath = previousRuntime.token;
+      if (previousEnv.url === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = previousEnv.url;
+      if (previousEnv.caFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = previousEnv.caFile;
+      if (previousEnv.migrationRole === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE;
+      else process.env.LCM_POSTGRES_MIGRATION_ROLE = previousEnv.migrationRole;
+      actualFs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it.each([
