@@ -215,7 +215,7 @@ describe("persistence read route boundaries", () => {
     const factory = postgresqlFactory(injectedFactory());
     await invoke(createDescribeHandler(postgresqlConfig(), factory), { nodeId: "n", cwd: "/remote" });
     expectLast(200, { node: { id: "node" } });
-    expect(mocks.openProject).toHaveBeenCalledWith({ id: "/remote", canonical: "/remote" });
+    expect(mocks.openProject).toHaveBeenCalledWith({ id: "/remote", canonical: "/remote" }, undefined, expect.any(AbortSignal));
     expect(mocks.createFactory).not.toHaveBeenCalled();
   });
 
@@ -436,9 +436,10 @@ describe("persistence read route boundaries", () => {
 
   it("passes the live publication token and request cancellation into read storage", async () => {
     const token = {} as never;
-    const openExistingProject = vi.fn(async (_identity: unknown, observedToken: unknown): Promise<ProjectStorage> => ({
+    const openExistingProject = vi.fn(async (_identity: unknown, observedToken: unknown, observedSignal: unknown): Promise<ProjectStorage> => ({
       close: mocks.projectClose,
       observedToken,
+      observedSignal,
     } as unknown as ProjectStorage));
     const factory = { ...injectedFactory(), openExistingProject };
     const controller = new AbortController();
@@ -452,7 +453,7 @@ describe("persistence read route boundaries", () => {
     );
     await vi.waitFor(() => expect(openExistingProject).toHaveBeenCalled());
     expect(mocks.projectIdentity).toHaveBeenCalledWith("/ok", config.storage, token);
-    expect(openExistingProject).toHaveBeenCalledWith({ id: "/ok", canonical: "/ok" }, token);
+    expect(openExistingProject).toHaveBeenCalledWith({ id: "/ok", canonical: "/ok" }, token, controller.signal);
     controller.abort();
     await vi.waitFor(() => expect(mocks.projectClose).toHaveBeenCalled());
     release?.({ id: "node" });

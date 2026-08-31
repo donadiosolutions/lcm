@@ -21,6 +21,7 @@ import type {
   StorageIdentityContext,
 } from "../contracts.js";
 import { StorageOperationError } from "../errors.js";
+import { composeAbortSignals } from "../../daemon/cancellation.js";
 import type {
   PostgreSqlConnectionSettings,
   PostgreSqlQueryExecutor,
@@ -299,7 +300,6 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
   private readonly projects = new Set<ProjectStorage>();
   private readonly pendingOperations = new Set<Promise<void>>();
   private readonly abortController = new AbortController();
-  private readonly identities: PostgreSqlIdentityRepository;
   private closed = false;
   private closePromise: Promise<void> | undefined;
 
@@ -308,9 +308,6 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
     private readonly homeDir: string,
     private readonly dependencies: PostgreSqlFactoryDependencies,
   ) {
-    this.identities = new PostgreSqlIdentityRepository(
-      new FactorySignalExecutor(runtime, this.abortController.signal),
-    );
   }
 
   projectExists(
@@ -324,18 +321,21 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
   openExistingProject(
     identity: StorageIdentityContext,
     publicationLockToken?: BackendPublicationLockToken,
+    signal?: AbortSignal,
   ): Promise<ProjectStorage | null> {
-    return this.openResolvedProject(identity, "openExistingProject", publicationLockToken);
+    return this.openResolvedProject(identity, "openExistingProject", publicationLockToken, signal);
   }
 
   async openProject(
     identity: StorageIdentityContext,
     publicationLockToken?: BackendPublicationLockToken,
+    signal?: AbortSignal,
   ): Promise<ProjectStorage> {
     const storage = await this.openResolvedProject(
       identity,
       "openProject",
       publicationLockToken,
+      signal,
     );
     if (storage === null) throw initializationError(identity.id, "openProject");
     return storage;
@@ -375,11 +375,13 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
     identity: StorageIdentityContext,
     operation: "openExistingProject" | "openProject",
     publicationLockToken?: BackendPublicationLockToken,
+    signal?: AbortSignal,
   ): Promise<ProjectStorage | null> {
     const work = this.openResolvedProjectAttempt(
       identity,
       operation,
       publicationLockToken,
+      signal,
     );
     const settled = work.then(() => undefined, () => undefined);
     this.pendingOperations.add(settled);
@@ -391,14 +393,17 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
     identity: StorageIdentityContext,
     operation: "openExistingProject" | "openProject",
     publicationLockToken?: BackendPublicationLockToken,
+    signal?: AbortSignal,
   ): Promise<ProjectStorage | null> {
     const remote = await this.runProjectOperation(
       identity,
       operation,
       publicationLockToken,
+      signal,
     );
     if (remote === null) return null;
     this.assertOpen(identity.id, operation);
+    if (signal?.aborted) throw operationError(operation);
     const onClose = (closed: ProjectStorage): void => {
       this.projects.delete(closed);
     };
@@ -417,6 +422,7 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
         );
     try {
       this.assertOpen(identity.id, operation);
+      if (signal?.aborted) throw operationError(operation);
       this.projects.add(storage);
       return storage;
     } catch (error) {
@@ -425,6 +431,10 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
       } catch {
         // Preserve the sanitized admission failure as the primary error.
       }
+      if (this.closed) throw new StorageOperationError(
+        "STORAGE_CLOSED", "postgresql", identity.id, "factory", operation,
+      );
+      if (signal?.aborted) throw operationError(operation);
       throw safeFactoryError(error, identity.id, operation);
     }
   }
@@ -433,6 +443,7 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
     identity: StorageIdentityContext,
     operation: "projectExists" | "openExistingProject" | "openProject",
     publicationLockToken?: BackendPublicationLockToken,
+    signal?: AbortSignal,
   ): Promise<RemoteProject | null> {
     try {
       this.assertOpen(identity.id, operation);
@@ -440,17 +451,26 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
       return Promise.reject(error);
     }
     const work = (async (): Promise<RemoteProject | null> => {
+      const composition = composeAbortSignals([signal, this.abortController.signal]);
       try {
+        if (signal?.aborted) throw operationError(operation);
         assertIdentity(identity, operation);
         this.assertOpen(identity.id, operation);
         const before = publicationLockToken === undefined
           ? await this.capturePublicationWitness()
           : this.assertPublicationToken(publicationLockToken);
         this.assertOpen(identity.id, operation);
+        if (signal?.aborted) throw operationError(operation);
         const expectedNormalizedPath = this.dependencies.normalizePath(
           identity.selectedPath,
         );
-        const remote = await this.identities.getProject(identity.id);
+        this.assertOpen(identity.id, operation);
+        const identities = new PostgreSqlIdentityRepository(
+          new FactorySignalExecutor(this.runtime, composition.signal),
+        );
+        const remote = await identities.getProject(identity.id);
+        this.assertOpen(identity.id, operation);
+        if (signal?.aborted) throw operationError(operation);
         if (remote !== null) {
           assertRemoteIdentity(
             remote,
@@ -461,6 +481,8 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
         }
         if (publicationLockToken === undefined) {
           const after = await this.capturePublicationWitness();
+          this.assertOpen(identity.id, operation);
+          if (signal?.aborted) throw operationError(operation);
           if (backendPublicationCanonicalSha256(before)
               !== backendPublicationCanonicalSha256(after)) {
             throw initializationError(identity.id, operation);
@@ -469,9 +491,16 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
           this.assertPublicationToken(publicationLockToken);
         }
         this.assertOpen(identity.id, operation);
+        if (signal?.aborted) throw operationError(operation);
         return remote;
       } catch (error) {
+        if (this.closed) throw new StorageOperationError(
+          "STORAGE_CLOSED", "postgresql", identity.id, "factory", operation,
+        );
+        if (signal?.aborted) throw operationError(operation);
         throw safeFactoryError(error, identity.id, operation);
+      } finally {
+        composition.cleanup();
       }
     })();
     const settled = work.then(() => undefined, () => undefined);

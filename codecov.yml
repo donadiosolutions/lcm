@@ -47,7 +47,7 @@ component_management:
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
-        # Keep the #691 pre/post read-admission response fence and runtime identity here.
+        # Keep the #691 pre/post read-admission response fence, the #700 buffered-response cancellation fence, and runtime identity here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
@@ -68,6 +68,7 @@ component_management:
     - component_id: "unit-daemon-routes"
       name: "Unit - Daemon Routes"
       paths:
+        # The #700 cancellation-aware open lifecycle and compact/restore response handling remain route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -86,13 +87,14 @@ component_management:
     - component_id: "unit-local-persistence"
       name: "Unit - Local Persistence"
       paths:
+        # The #700 SQLite signal fences and single-owner cleanup remain local-persistence-owned.
         - "src/db/"
         - "src/storage/sqlite/"
         - "src/store/"
     - component_id: "unit-storage-abstractions"
       name: "Unit - Storage Abstractions"
       paths:
-        # Keep the #691 journal witness and incomplete-evidence admission seam here.
+        # Keep the #691 journal witness and incomplete-evidence admission seam, plus the #700 optional abort-signal project-open contract, here.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
         - "^src/storage/capabilities\\.ts$"
@@ -173,6 +175,7 @@ component_management:
     - component_id: "integration-postgresql-runtime"
       name: "Integration - PostgreSQL Runtime"
       paths:
+        # The #700 caller/factory-shutdown signal composition and facade cleanup remain PostgreSQL-runtime-owned.
         - "^src/daemon/staged-postgresql\\.ts$"
         - "^src/storage/postgresql/client-config\\.ts$"
         - "^src/storage/postgresql/contracts\\.ts$"

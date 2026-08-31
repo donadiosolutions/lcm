@@ -19,6 +19,8 @@ import {
   withBackendPublicationConsumerLockAsync,
 } from "../../../src/storage/backend-publication.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
+import { makeMockStorageFactory } from "./mock-storage-factory.js";
+import type { ProjectStorage } from "../../../src/storage/contracts.js";
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -483,6 +485,103 @@ describe("daemon route publication admission", () => {
       expect(response.headers.get("X-Write-Head")).toBe("set-by-write-head");
       expect(response.headers.get("X-Removed")).toBeNull();
       await expect(response.text()).resolves.toBe("buffered-response");
+    } finally {
+      if (daemon) await daemon.stop();
+      rmSync(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it("does not flush swallowed cancellation as an empty buffered read success", async () => {
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = mkdtempSync(join(tmpdir(), "lcm-route-cancel-buffer-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    const lcmDir = join(tempHome, ".lcm");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    const configPath = join(lcmDir, "config.json");
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    let daemon: DaemonInstance | undefined;
+    const started = deferred<void>();
+    try {
+      daemon = await createDaemon(loadDaemonConfig(configPath, {
+        daemon: { port: 0, idleTimeoutMs: 0 },
+      }), { publicationConfigPath: configPath });
+      daemon.registerRoute("POST", "/cancel-buffer", async (_req, res, _body, context) => {
+        started.resolve();
+        await new Promise<void>(resolve => context?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+        // Simulate a legacy handler that swallows cancellation into empty 200.
+        res.writeHead(200);
+        res.end();
+      }, "read");
+      const response = fetch(`http://127.0.0.1:${daemon.address().port}/cancel-buffer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      await started.promise;
+      await daemon.stop();
+      const settled = await response.catch(() => undefined);
+      expect(settled?.status).not.toBe(200);
+    } finally {
+      if (daemon) await daemon.stop();
+      rmSync(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it("does not turn operation-scoped restore cancellation into orientation-only success", async () => {
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = mkdtempSync(join(tmpdir(), "lcm-route-restore-cancel-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    const lcmDir = join(tempHome, ".lcm");
+    const projectDir = join(tempHome, "project");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+    const configPath = join(lcmDir, "config.json");
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    let daemon: DaemonInstance | undefined;
+    const openStarted = deferred<void>();
+    const projectClose = vi.fn(async () => undefined);
+    const project = { close: projectClose } as unknown as ProjectStorage;
+    let observedSignal: AbortSignal | undefined;
+    const storageFactory = makeMockStorageFactory({
+      openProject: async (_identity, _token, signal) => {
+        observedSignal = signal;
+        openStarted.resolve();
+        await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
+        return project;
+      },
+    });
+    try {
+      daemon = await createDaemon(loadDaemonConfig(configPath, {
+        daemon: { port: 0, idleTimeoutMs: 0 },
+      }), {
+        publicationConfigPath: configPath,
+        _createStorageBackendFactory: async () => storageFactory,
+      });
+      const responsePromise = fetch(`http://127.0.0.1:${daemon.address().port}/restore`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd: projectDir, session_id: "session", client: "codex" }),
+      });
+      await openStarted.promise;
+      const stopping = daemon.stop();
+      await stopping;
+      const response = await responsePromise.catch(() => undefined);
+      expect(observedSignal?.aborted).toBe(true);
+      expect(projectClose).toHaveBeenCalledOnce();
+      expect(response?.status).not.toBe(200);
+      if (response) await expect(response.text()).resolves.not.toContain("# Orientation");
     } finally {
       if (daemon) await daemon.stop();
       rmSync(tempHome, { recursive: true, force: true });

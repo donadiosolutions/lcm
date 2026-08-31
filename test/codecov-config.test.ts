@@ -482,7 +482,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(205);
   });
 
-  test("keeps response-fence and #726/#737/#742 files in their intended components", () => {
+  test("keeps response-fence and #700/#726/#737/#742 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -496,10 +496,16 @@ describe("Codecov configuration", () => {
       ["src/connectors/installer.ts", "unit-connectors"],
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
+      ["src/daemon/routes/compact.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
+      ["src/storage/contracts.ts", "unit-storage-abstractions"],
+      ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
+      ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],
