@@ -49,12 +49,14 @@ describe("Vitest artifact-root configuration", () => {
       mkdtempSync: createTemporaryDirectory,
       chmodSync: secureDirectory,
       temporaryRoot: () => "/tmp",
+      registerProcessExit: vi.fn(),
     });
     const second = createVitestRunRoot({
       environment,
       mkdtempSync: createTemporaryDirectory,
       chmodSync: secureDirectory,
       temporaryRoot: () => "/tmp",
+      registerProcessExit: vi.fn(),
     });
 
     expect(createTemporaryDirectory).toHaveBeenNthCalledWith(
@@ -161,6 +163,274 @@ describe("Vitest artifact-root configuration", () => {
     } finally {
       rmSync(parent, { recursive: true, force: true });
     }
+  });
+
+  it("rolls back a newly created explicit root when chmod fails", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-vitest-config-explicit-rollback-"));
+    const root = join(parent, "owned-root");
+    const chmodFailure = new Error("explicit chmod failed");
+
+    try {
+      expect(() => createVitestRunRoot({
+        environment: { LCM_TEST_ARTIFACT_ROOT: root },
+        chmodSync: (path, mode) => {
+          chmodSync(path, mode);
+          throw chmodFailure;
+        },
+      })).toThrow(chmodFailure);
+      expect(() => lstatSync(root)).toThrow();
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back a newly created default root when chmod fails", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-vitest-config-default-rollback-"));
+    let root = "";
+    const chmodFailure = new Error("default chmod failed");
+
+    try {
+      expect(() => createVitestRunRoot({
+        environment: {},
+        temporaryRoot: () => parent,
+        mkdtempSync: (prefix) => {
+          root = mkdtempSync(prefix);
+          return root;
+        },
+        chmodSync: (path, mode) => {
+          chmodSync(path, mode);
+          throw chmodFailure;
+        },
+        registerProcessExit: vi.fn(),
+      })).toThrow(chmodFailure);
+      expect(root).not.toBe("");
+      expect(() => lstatSync(root)).toThrow();
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back a secured default root when exit registration fails", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-vitest-config-register-rollback-"));
+    let root = "";
+    const registrationFailure = new Error("registration failed");
+
+    try {
+      expect(() => createVitestRunRoot({
+        environment: {},
+        temporaryRoot: () => parent,
+        mkdtempSync: (prefix) => {
+          root = mkdtempSync(prefix);
+          return root;
+        },
+        registerProcessExit: () => {
+          throw registrationFailure;
+        },
+      })).toThrow(registrationFailure);
+      expect(() => lstatSync(root)).toThrow();
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the setup error when rollback removal fails", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-vitest-config-rollback-error-"));
+    const root = join(parent, "owned-root");
+    const chmodFailure = new Error("original chmod failed");
+    const rollbackFailure = new Error("rollback rm failed");
+
+    try {
+      expect(() => createVitestRunRoot({
+        environment: { LCM_TEST_ARTIFACT_ROOT: root },
+        chmodSync: () => {
+          throw chmodFailure;
+        },
+        rmSync: () => {
+          throw rollbackFailure;
+        },
+      })).toThrow(chmodFailure);
+      expect(() => lstatSync(root)).not.toThrow();
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("does not remove a root when validation or mkdir fails before ownership", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-vitest-config-no-ownership-"));
+    const existingRoot = join(parent, "existing-root");
+    mkdirSync(existingRoot);
+    writeFileSync(join(existingRoot, "sentinel"), "keep");
+    const rollback = vi.fn();
+    const mkdirFailure = new Error("mkdir failed");
+
+    try {
+      expect(() => createVitestRunRoot({
+        environment: { LCM_TEST_ARTIFACT_ROOT: existingRoot },
+        rmSync: rollback,
+      })).toThrow();
+      expect(rollback).not.toHaveBeenCalled();
+      expect(() => createVitestRunRoot({
+        environment: { LCM_TEST_ARTIFACT_ROOT: join(parent, "mkdir-failure") },
+        mkdirSync: () => {
+          throw mkdirFailure;
+        },
+        rmSync: rollback,
+      })).toThrow(mkdirFailure);
+      expect(rollback).not.toHaveBeenCalled();
+      expect(lstatSync(join(existingRoot, "sentinel")).isFile()).toBe(true);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let a second explicit claimant delete the first retained root", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-vitest-config-explicit-claim-"));
+    const root = join(parent, "shared-root");
+    const rollback = vi.fn();
+
+    try {
+      expect(createVitestRunRoot({
+        environment: { LCM_TEST_ARTIFACT_ROOT: root },
+      })).toBe(root);
+      writeFileSync(join(root, "sentinel"), "keep");
+      expect(() => createVitestRunRoot({
+        environment: { LCM_TEST_ARTIFACT_ROOT: root },
+        rmSync: rollback,
+      })).toThrow();
+      expect(rollback).not.toHaveBeenCalled();
+      expect(lstatSync(join(root, "sentinel")).isFile()).toBe(true);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [0, "success"],
+    [1, "failure"],
+    [130, "interruption"],
+    [0, "no-tests"],
+  ])("cleans a default root on process exit (%s, %s)", (code, _reason) => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-vitest-config-exit-"));
+    let root = "";
+    let listener: ((code: number) => void) | undefined;
+
+    try {
+      root = createVitestRunRoot({
+        environment: {},
+        temporaryRoot: () => parent,
+        registerProcessExit: (registered) => {
+          listener = registered;
+        },
+      });
+      expect(lstatSync(root).isDirectory()).toBe(true);
+      listener?.(code);
+      expect(() => lstatSync(root)).toThrow();
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("retains an explicit root and registers no exit listener", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-vitest-config-explicit-retain-"));
+    const root = join(parent, "owned-root");
+    const register = vi.fn();
+
+    try {
+      createVitestRunRoot({
+        environment: { LCM_TEST_ARTIFACT_ROOT: root },
+        registerProcessExit: register,
+      });
+      writeFileSync(join(root, "sentinel"), "keep");
+      expect(register).not.toHaveBeenCalled();
+      expect(lstatSync(join(root, "sentinel")).isFile()).toBe(true);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("makes default exit cleanup idempotent and removes exactly once", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-vitest-config-exit-once-"));
+    let listener: ((code: number) => void) | undefined;
+    const remove = vi.fn(rmSync);
+
+    try {
+      const root = createVitestRunRoot({
+        environment: {},
+        temporaryRoot: () => parent,
+        registerProcessExit: (registered) => {
+          listener = registered;
+        },
+        rmSync: remove,
+      });
+      listener?.(0);
+      listener?.(0);
+      expect(remove).toHaveBeenCalledTimes(1);
+      expect(remove).toHaveBeenCalledWith(root, { recursive: true, force: true });
+      expect(() => lstatSync(root)).toThrow();
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("swallows exit cleanup failures without changing process.exitCode", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-vitest-config-exit-failure-"));
+    let listener: ((code: number) => void) | undefined;
+    const removeFailure = new Error("exit cleanup failed");
+    const previousExitCode = process.exitCode;
+    process.exitCode = 73;
+
+    try {
+      createVitestRunRoot({
+        environment: {},
+        temporaryRoot: () => parent,
+        registerProcessExit: (registered) => {
+          listener = registered;
+        },
+        rmSync: () => {
+          throw removeFailure;
+        },
+      });
+      expect(() => listener?.(1)).not.toThrow();
+      expect(process.exitCode).toBe(73);
+    } finally {
+      process.exitCode = previousExitCode;
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps two default exit listeners scoped to their captured roots", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-vitest-config-exit-isolation-"));
+    const listeners: Array<(code: number) => void> = [];
+
+    try {
+      const first = createVitestRunRoot({
+        environment: {},
+        temporaryRoot: () => parent,
+        registerProcessExit: (listener) => listeners.push(listener),
+      });
+      const second = createVitestRunRoot({
+        environment: {},
+        temporaryRoot: () => parent,
+        registerProcessExit: (listener) => listeners.push(listener),
+      });
+      expect(listeners).toHaveLength(2);
+      listeners[0](0);
+      expect(() => lstatSync(first)).toThrow();
+      expect(lstatSync(second).isDirectory()).toBe(true);
+      listeners[1](1);
+      expect(() => lstatSync(second)).toThrow();
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("creates and registers one root lazily through the resolver", () => {
+    const createRunRoot = vi.fn(() => "/tmp/lcm-vitest-run-lazy-lifecycle");
+    const resolver = createVitestConfigurationResolver({ createRunRoot });
+    expect(createRunRoot).not.toHaveBeenCalled();
+    resolver();
+    resolver();
+    expect(createRunRoot).toHaveBeenCalledTimes(1);
   });
 
   it("derives isolated artifact paths while preserving the established projects and thresholds", () => {

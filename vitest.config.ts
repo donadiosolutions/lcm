@@ -1,4 +1,4 @@
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { defineConfig, type UserConfig } from "vitest/config";
@@ -17,6 +17,8 @@ export interface VitestRunRootDependencies {
   readonly mkdirSync?: typeof mkdirSync;
   readonly chmodSync?: typeof chmodSync;
   readonly lstatSync?: typeof lstatSync;
+  readonly rmSync?: typeof rmSync;
+  readonly registerProcessExit?: (listener: (code: number) => void) => void;
   readonly temporaryRoot?: () => string;
 }
 
@@ -57,21 +59,46 @@ export function createVitestRunRoot(
   const createDirectory = dependencies.mkdirSync ?? mkdirSync;
   const secureDirectory = dependencies.chmodSync ?? chmodSync;
   const inspectPath = dependencies.lstatSync ?? lstatSync;
+  const removeDirectory = dependencies.rmSync ?? rmSync;
+  const registerProcessExit = dependencies.registerProcessExit
+    ?? ((listener: (code: number) => void) => process.once("exit", listener));
   const override = environment.LCM_TEST_ARTIFACT_ROOT;
+  let root: string;
 
   if (override === undefined || override === "") {
     const temporaryRoot = dependencies.temporaryRoot ?? tmpdir;
-    const root = createTemporaryDirectory(join(temporaryRoot(), "lcm-vitest-run-"));
-    secureDirectory(root, 0o700);
-    return root;
-  }
-  if (override.trim() !== override || override.trim() === "" || !isAbsolute(override)) {
-    throw new Error("LCM_TEST_ARTIFACT_ROOT must be an absolute, unpadded path");
+    root = createTemporaryDirectory(join(temporaryRoot(), "lcm-vitest-run-"));
+  } else {
+    if (override.trim() !== override || override.trim() === "" || !isAbsolute(override)) {
+      throw new Error("LCM_TEST_ARTIFACT_ROOT must be an absolute, unpadded path");
+    }
+
+    assertFreshExplicitRoot(override, createDirectory, inspectPath);
+    root = override;
   }
 
-  assertFreshExplicitRoot(override, createDirectory, inspectPath);
-  secureDirectory(override, 0o700);
-  return override;
+  let cleaned = false;
+  const cleanup = (): void => {
+    if (cleaned) return;
+    cleaned = true;
+    try {
+      removeDirectory(root, { recursive: true, force: true });
+    } catch {
+      // Cleanup is best effort and must not interfere with process exit.
+    }
+  };
+
+  try {
+    secureDirectory(root, 0o700);
+    if (override === undefined || override === "") {
+      registerProcessExit(cleanup);
+    }
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+
+  return root;
 }
 
 export function createVitestConfiguration(root: string): UserConfig {
