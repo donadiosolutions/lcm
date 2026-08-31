@@ -59,6 +59,106 @@ function withTempHome<T>(fn: (cwd: string, home: string) => T): T {
 }
 
 describe("native Codex MCP runner", () => {
+  it("refuses an injected runner without add after preflight", () => {
+    withTempHome((cwd) => {
+      const runner = { get: () => [], remove: () => undefined };
+      expect(() => installConnector("codex", "mcp", cwd, { codexMcpRunner: runner, persistTransport: false }))
+        .toThrow(/does not provide add/iu);
+    });
+  });
+
+  it("fails readback when injected add does not produce canonical state", () => {
+    withTempHome((cwd) => {
+      const runner = { get: () => [], add: () => undefined, remove: () => undefined };
+      expect(() => installConnector("codex", "mcp", cwd, { codexMcpRunner: runner, persistTransport: false }))
+        .toThrow(/failed JSON readback verification/iu);
+    });
+  });
+
+  it("refuses removal when state becomes unverified after preflight", () => {
+    withTempHome((cwd) => {
+      let gets = 0;
+      let removes = 0;
+      const runner = {
+        get: () => ++gets === 1 ? [validEntry()] : [{ ...validEntry(), custom: "collision" }],
+        add: () => undefined,
+        remove: () => { removes += 1; },
+      };
+      const result = removeConnector("codex", cwd, { codexMcpRunner: runner });
+      expect(result).toMatchObject({ success: false, removed: false });
+      expect(result.failures).toEqual(expect.arrayContaining([expect.stringMatching(/unverified Codex MCP/iu)]));
+      expect(removes).toBe(0);
+    });
+  });
+
+  it("refuses removal when an injected runner omits remove", () => {
+    withTempHome((cwd) => {
+      const runner = { get: () => [validEntry()], add: () => undefined };
+      const result = removeConnector("codex", cwd, { codexMcpRunner: runner });
+      expect(result).toMatchObject({ success: false, removed: false });
+      expect(result.failures).toEqual(expect.arrayContaining([expect.stringMatching(/does not provide remove/iu)]));
+    });
+  });
+
+  it("fails closed if pathname authority changes after native removal preflight", () => {
+    withTempHome((cwd) => {
+      let removes = 0;
+      let checks = 0;
+      const runner = {
+        get: () => [validEntry()],
+        add: () => undefined,
+        remove: () => { removes += 1; },
+        get pathnameBased() { return checks++ > 0; },
+      };
+      const result = removeConnector("codex", cwd, { codexMcpRunner: runner });
+      expect(result).toMatchObject({ success: false, removed: false });
+      expect(result.failures).toEqual(expect.arrayContaining([expect.stringMatching(/pathname-based native state/iu)]));
+      expect(removes).toBe(0);
+    });
+  });
+  it("refuses default pathname-based native add before any MCP mutation", () => {
+    withTempHome((cwd) => {
+      let adds = 0;
+      let added = false;
+      const runner: CodexCliRunner = (request) => {
+        if (request.argv[1] === "add") {
+          adds += 1;
+          added = true;
+          return { status: 0, stdout: "" };
+        }
+        if (added) return { status: 0, stdout: JSON.stringify(validEntry()) };
+        return {
+          status: 1,
+          stderr: "No MCP server named 'lcm' found.",
+          stdout: "",
+        };
+      };
+
+      expect(() => installConnector("codex", "mcp", cwd, {
+        codexCliRunner: runner,
+        persistTransport: false,
+      })).toThrow(/manual|pathname|native|descriptor/iu);
+      expect(adds).toBe(0);
+    });
+  });
+
+  it("refuses default pathname-based native removal before any MCP mutation", () => {
+    withTempHome((cwd) => {
+      let removals = 0;
+      const runner: CodexCliRunner = (request) => {
+        if (request.argv[1] === "remove") {
+          removals += 1;
+          return { status: 0, stdout: "" };
+        }
+        return { status: 0, stdout: JSON.stringify(validEntry()) };
+      };
+      const result = removeConnector("codex", cwd, { codexCliRunner: runner });
+      expect(result).toMatchObject({ success: false, removed: false });
+      expect(result).toMatchObject({ failures: [expect.stringMatching(/Automatic Codex MCP removal is unavailable/iu)] });
+      expect(removals).toBe(0);
+    });
+  });
+
   it("passes exact argv and bounded safe process options through the injected low-level seam", () => {
     withTempHome((cwd, home) => {
       const calls: CodexRunRequest[] = [];
@@ -141,7 +241,9 @@ describe("native Codex MCP runner", () => {
   ] as const)("returns a deterministic error when %s", (_caseName, result, message) => {
     withTempHome((cwd) => {
       const runner: CodexCliRunner = () => ({ status: 0, stdout: JSON.stringify(validEntry()), ...result });
-      expect(() => installConnector("codex", "mcp", cwd, { codexCliRunner: runner, persistTransport: false })).toThrow(message);
+      expect(() => installConnector("codex", "mcp", cwd, { codexCliRunner: runner, persistTransport: false })).toThrow(
+        _caseName === "wrong name" ? /Automatic Codex MCP add is unavailable/iu : message,
+      );
     });
   });
 
@@ -154,7 +256,9 @@ describe("native Codex MCP runner", () => {
   ] as const)("rejects %s", (_caseName, stdout, message) => {
     withTempHome((cwd) => {
       const runner: CodexCliRunner = () => ({ status: 0, stdout });
-      expect(() => installConnector("codex", "mcp", cwd, { codexCliRunner: runner, persistTransport: false })).toThrow(message);
+      expect(() => installConnector("codex", "mcp", cwd, { codexCliRunner: runner, persistTransport: false })).toThrow(
+        _caseName === "wrong name" ? /Automatic Codex MCP add is unavailable/iu : message,
+      );
     });
   });
 
@@ -228,42 +332,49 @@ describe("native Codex MCP runner", () => {
         }
         return { status: 0, stdout: "" };
       };
-      expect(() => installConnector("codex", "mcp", cwd, { codexCliRunner: runner, persistTransport: false })).toThrow("Codex MCP lcm entry failed JSON readback verification");
-      expect(calls).toContainEqual(["mcp", "add", "lcm", "--", "lcm", "mcp"]);
+      expect(() => installConnector("codex", "mcp", cwd, { codexCliRunner: runner, persistTransport: false })).toThrow(/Automatic Codex MCP add is unavailable/iu);
+      expect(calls).not.toContainEqual(["mcp", "add", "lcm", "--", "lcm", "mcp"]);
     });
   });
 
   it("allows explicit Codex removal only for an exact owned entry and verifies removal", () => {
     withTempHome((cwd) => {
       let present = true;
-      const calls: readonly string[][] = [];
-      const runner: CodexCliRunner = (request) => {
-        (calls as string[][]).push([...request.argv]);
-        if (request.argv[1] === "get") return { status: 0, stdout: present ? JSON.stringify(validEntry()) : "[]" };
-        present = false;
-        return { status: 0, stdout: "" };
+      const runner = {
+        get: () => present ? [validEntry()] : [],
+        add: () => undefined,
+        remove: () => { present = false; },
       };
-      const result = removeConnector("codex", cwd, { codexCliRunner: runner, queryCodexMcp: true });
+      const result = removeConnector("codex", cwd, { codexMcpRunner: runner });
       expect(result).toMatchObject({ success: true, removed: true });
-      expect(calls).toEqual([
-        ["mcp", "get", "lcm", "--json"],
-        ["mcp", "remove", "lcm"],
-        ["mcp", "get", "lcm", "--json"],
-      ]);
     });
   });
 
   it("reports a deterministic removal readback failure", () => {
     withTempHome((cwd) => {
-      const runner: CodexCliRunner = (request) => ({
-        status: 0,
-        stdout: request.argv[1] === "get" ? JSON.stringify(validEntry()) : "",
-      });
-      expect(removeConnector("codex", cwd, { codexCliRunner: runner })).toMatchObject({
+      const runner = {
+        get: () => [validEntry()],
+        add: () => undefined,
+        remove: () => undefined,
+      };
+      expect(removeConnector("codex", cwd, { codexMcpRunner: runner })).toMatchObject({
         success: false,
         removed: false,
         failures: ["mcp: Codex MCP lcm entry remained after removal"],
       });
+    });
+  });
+
+  it("retains low-level Codex argv coverage for native inventory inspection", () => {
+    withTempHome((cwd) => {
+      const calls: readonly string[][] = [];
+      const runner: CodexCliRunner = (request) => {
+        (calls as string[][]).push([...request.argv]);
+        if (request.argv[1] === "get") return { status: 0, stdout: JSON.stringify(validEntry()) };
+        return { status: 0, stdout: "" };
+      };
+      expect(listConnectorInventory(cwd, { codexCliRunner: runner }).codexMcp.state).toBe("installed");
+      expect(calls).toHaveLength(1);
     });
   });
 

@@ -174,6 +174,31 @@ default CLI bundle with `lcm connectors install codex --transport cli`. The
 explicit MCP bundle does not retain or install the CLI-only managed
 `~/.codex/AGENTS.md` entry.
 
+Connector install and removal protect filesystem-backed project and home
+targets with Linux proc-descriptor-anchored traversal. Existing parent
+directories are authenticated without following intermediate symlinks; missing
+parents are then created one component at a time. The selected project root or
+captured home root may itself be a symlink, but a redirected descendant parent
+(including an in-root alias) is refused before connector files, native MCP
+state, or the stored transport choice are mutated. Public results and errors
+continue to use ordinary display paths.
+
+This guarantee is intentionally Linux-specific. Filesystem-backed connector
+install/remove refuse on macOS, other non-Linux platforms, or when strict
+directory/no-follow/nonblocking flags or `/proc/self/fd` descriptor lookup are
+unavailable. Manual/no-write guidance, `lcm install`, `lcm doctor`, connector
+listing, inventory inspection, and verified legacy read-only branches remain
+usable. The traversal uses proc descriptors; it is not portable `openat` and
+does not provide a final-leaf linearizable unlink or a portable
+descriptor-relative compare-and-swap guarantee (the separate #713 and #681
+contracts remain unchanged).
+
+The default native Codex MCP runner can inspect canonical state, but automatic
+`codex mcp add/remove` is refused because the child process mutates ordinary
+pathname `CODEX_HOME`. Follow the emitted manual guidance, or supply an
+explicit trusted `CodexMcpRunner` seam to programmatic callers. Read-only
+inventory remains pathname-based and is not mutation-safety proof.
+
 Set recommended environment variables:
 
 ```bash
