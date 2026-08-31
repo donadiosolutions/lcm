@@ -1174,11 +1174,12 @@ describe('installConnector — Codex native hooks', () => {
     );
   });
 
-  it('deletes Codex AGENTS.md when only the minimal managed rule remains', () => {
+  it('neutralizes Codex AGENTS.md when only the minimal managed rule remains', () => {
     installConnector('codex', 'rules', tmpDir);
 
     expect(removeConnector('codex', 'rules', tmpDir)).toBe(true);
-    expect(existsSync(join(tmpDir, '.codex', 'AGENTS.md'))).toBe(false);
+    expect(readFileSync(join(tmpDir, '.codex', 'AGENTS.md'), 'utf-8')).toBe('');
+    expect(removeConnector('codex', 'rules', tmpDir)).toBe(false);
   });
 
   it('preserves existing user content when installing Codex rules', () => {
@@ -1349,7 +1350,7 @@ describe('installConnector — Codex native hooks', () => {
 
     expect(removeConnector('codex', 'hook', tmpDir)).toBe(true);
     expect(listConnectors(tmpDir).some(c => c.agentId === 'codex' && c.type === 'hook')).toBe(false);
-    expect(existsSync(result.path)).toBe(false);
+    expect(readFileSync(result.path, 'utf-8')).toBe('{}\n');
   });
 
   it('preserves an unrelated legacy Codex hooks file while installing the global hook', () => {
@@ -1387,7 +1388,7 @@ describe('installConnector — Codex native hooks', () => {
         persistTransport: false,
         codexMcpRunner: { get: () => [] },
       }).success).toBe(true);
-      expect(existsSync(legacyPath)).toBe(false);
+      expect(readFileSync(legacyPath, 'utf-8')).toBe('{}\n');
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;
@@ -1603,7 +1604,7 @@ describe('removeConnector — rules', () => {
     expect(readFileSync(rulesPath, 'utf-8')).toBe(`${heading}\n`);
   });
 
-  it('deletes the file when all duplicate recognized blocks are removed', () => {
+  it('neutralizes the file when all duplicate recognized blocks are removed', () => {
     const rulesPath = join(tmpDir, 'CLAUDE.md');
     writeFileSync(
       rulesPath,
@@ -1611,7 +1612,8 @@ describe('removeConnector — rules', () => {
     );
 
     expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
-    expect(existsSync(rulesPath)).toBe(false);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe('');
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(false);
   });
 
   it.each([
@@ -1630,15 +1632,15 @@ describe('removeConnector — rules', () => {
   it.each([
     ['LF', '\n' as TestMarkdownEol],
     ['CRLF', '\r\n' as TestMarkdownEol],
-  ])('deletes rules with only blank lines outside a managed block (%s)', (_description, eol) => {
+  ])('neutralizes rules with only blank lines outside a managed block (%s)', (_description, eol) => {
     const rulesPath = join(tmpDir, 'CLAUDE.md');
     writeFileSync(rulesPath, ['', generatedRulesContent(eol), ''].join(eol));
 
     expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
-    expect(existsSync(rulesPath)).toBe(false);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe('');
   });
 
-  it('removes a generated same-marker block at the file boundaries', () => {
+  it('neutralizes a generated same-marker block at the file boundaries', () => {
     const rulesPath = join(tmpDir, 'CLAUDE.md');
     writeFileSync(
       rulesPath,
@@ -1646,7 +1648,7 @@ describe('removeConnector — rules', () => {
     );
 
     expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
-    expect(existsSync(rulesPath)).toBe(false);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe('');
   });
 
   it('recognizes whitespace-indented standalone marker lines', () => {
@@ -1737,11 +1739,13 @@ describe('removeConnector — MCP JSON', () => {
 });
 
 describe('removeConnector — skill', () => {
-  it('removes SKILL.md', () => {
+  it('neutralizes SKILL.md without listing it as installed', () => {
     const result = installConnector('claude-code', 'skill', tmpDir);
     const removed = removeConnector('claude-code', 'skill', tmpDir);
     expect(removed).toBe(true);
-    expect(() => readFileSync(result.path, 'utf-8')).toThrow();
+    expect(readFileSync(result.path, 'utf-8')).toBe('');
+    expect(listConnectors(tmpDir).some((entry) => entry.path === result.path)).toBe(false);
+    expect(removeConnector('claude-code', 'skill', tmpDir)).toBe(false);
   });
 
   it('returns false when skill not installed', () => {

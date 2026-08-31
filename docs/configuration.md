@@ -189,9 +189,26 @@ directory/no-follow/nonblocking flags or `/proc/self/fd` descriptor lookup are
 unavailable. Manual/no-write guidance, `lcm install`, `lcm doctor`, connector
 listing, inventory inspection, and verified legacy read-only branches remain
 usable. The traversal uses proc descriptors; it is not portable `openat` and
-does not provide a final-leaf linearizable unlink or a portable
-descriptor-relative compare-and-swap guarantee (the separate #713 and #681
-contracts remain unchanged).
+does not provide portable descriptor-relative compare-and-swap.
+
+Within that Linux boundary, LCM retains one authenticated, no-follow writable
+descriptor for each connector leaf it mutates. Removal never unlinks a public
+connector pathname. A wholly LCM-owned skill or rules file is rewritten to
+empty bytes, and a Codex hooks file containing only LCM hooks is rewritten to
+the valid neutral JSON `{}\n`. These neutral artifacts are not reported as
+installed, and removing them again is an idempotent not-installed result.
+
+Install rollback likewise restores a previously existing file only through its
+retained original descriptor after the exact expected post-mutation bytes,
+mode, device, and inode still match. If another file has replaced the public
+pathname, LCM preserves that replacement byte-for-byte, restores the original
+inode, and reports rollback as incomplete with the ordinary display path. A
+file created during the failed transaction is neutralized through its retained
+exclusive-create descriptor, but physical absence cannot be re-established
+without a pathname race, so rollback reports that residual artifact as
+incomplete. This is Linux `/proc/self/fd` anchoring, not portable `openat`, and
+it does not resolve the separate #681 compare-and-swap boundary for unanchored
+transport configuration.
 
 The default native Codex MCP runner can inspect canonical state, but automatic
 `codex mcp add/remove` is refused because the child process mutates ordinary

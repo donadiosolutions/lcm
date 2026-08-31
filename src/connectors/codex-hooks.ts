@@ -1,4 +1,16 @@
-import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  ftruncateSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { ConnectorTransport } from "./types.js";
@@ -279,13 +291,48 @@ export function installCodexHooks(
 }
 
 export function removeCodexHooks(hooksPath: string): boolean {
-  let existing = "";
-  try { existing = readFileSync(hooksPath, "utf-8"); } catch { return false; }
-  const result = removeCodexHooksContent(existing);
-  if (result.state === "unchanged") return false;
-  if (result.state === "remove") unlinkSync(hooksPath);
-  else writeFileSync(hooksPath, result.content);
-  return true;
+  let descriptor: number;
+  try {
+    descriptor = openSync(
+      hooksPath,
+      constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+  } catch {
+    return false;
+  }
+  try {
+    const before = fstatSync(descriptor);
+    if (!before.isFile()) return false;
+    const size = Number(before.size);
+    if (!Number.isSafeInteger(size) || size < 0) return false;
+    const bytes = Buffer.alloc(size);
+    let offset = 0;
+    while (offset < size) {
+      const count = readSync(descriptor, bytes, offset, size - offset, offset);
+      if (count <= 0) return false;
+      offset += count;
+    }
+    const result = removeCodexHooksContent(bytes.toString("utf-8"));
+    if (result.state === "unchanged") return false;
+    const updated = Buffer.from(result.state === "remove" ? "{}\n" : result.content, "utf-8");
+    ftruncateSync(descriptor, 0);
+    offset = 0;
+    while (offset < updated.length) {
+      const count = writeSync(descriptor, updated, offset, updated.length - offset, offset);
+      if (count <= 0) return false;
+      offset += count;
+    }
+    const after = fstatSync(descriptor);
+    if (after.dev !== before.dev || after.ino !== before.ino) return false;
+    try {
+      const publicStats = lstatSync(hooksPath);
+      return publicStats.isFile() && publicStats.dev === before.dev && publicStats.ino === before.ino;
+    } catch {
+      return false;
+    }
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 export function hasCodexHooks(hooksPath: string): boolean {

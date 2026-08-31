@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -120,11 +120,53 @@ describe("Codex hook configuration boundaries", () => {
     expect(removeCodexHooks(hooksPath)).toBe(false);
   });
 
-  it("deletes a file containing only LCM hooks", () => {
+  it("writes valid neutral JSON for a file containing only LCM hooks", () => {
     mkdirSync(join(dir, "nested"), { recursive: true });
     installCodexHooks(hooksPath, configPath);
     expect(removeCodexHooks(hooksPath)).toBe(true);
-    expect(existsSync(hooksPath)).toBe(false);
+    expect(readFileSync(hooksPath, "utf-8")).toBe("{}\n");
+    expect(hasCodexHooks(hooksPath)).toBe(false);
+    expect(removeCodexHooks(hooksPath)).toBe(false);
+  });
+
+  it("keeps a public replacement byte-for-byte when removal begins on the authenticated descriptor", async () => {
+    installCodexHooks(hooksPath, configPath);
+    const replacement = join(dir, "replacement-hooks.json");
+    const original = join(dir, "authenticated-hooks.json");
+    writeFileSync(replacement, '{"sentinel":"preserve"}\n');
+    let swapped = false;
+    let unlinkCalls = 0;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        ftruncateSync: (descriptor: number, length?: number) => {
+          if (!swapped && actual.readlinkSync(`/proc/self/fd/${descriptor}`) === hooksPath) {
+            actual.renameSync(hooksPath, original);
+            actual.renameSync(replacement, hooksPath);
+            swapped = true;
+          }
+          return actual.ftruncateSync(descriptor, length);
+        },
+        unlinkSync: (...args: Parameters<typeof actual.unlinkSync>) => {
+          unlinkCalls += 1;
+          return actual.unlinkSync(...args);
+        },
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      expect(module.removeCodexHooks(hooksPath)).toBe(false);
+      expect(swapped).toBe(true);
+      expect(readFileSync(hooksPath, "utf-8")).toBe('{"sentinel":"preserve"}\n');
+      expect(readFileSync(original, "utf-8")).toBe("{}\n");
+      expect(unlinkCalls).toBe(0);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
   });
 
   it("keeps broad discovery permissive while exact inspection requires the native PostToolUse hook", () => {
