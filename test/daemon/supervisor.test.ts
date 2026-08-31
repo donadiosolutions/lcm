@@ -648,7 +648,13 @@ describe("systemd-user supervisor", () => {
     };
     const spec = makeSpec("systemd-user", nested, { launchEnvironment: environment });
     const observed = managerText(spec, "active", 601, "running", environment)
-      .replace("Environment=", `Environment=PATH=${longPath} TMPDIR=${daemonTemp} TMP=${daemonTemp} TEMP=${daemonTemp} `);
+      .replace("Environment=", `Environment=TMPDIR=${daemonTemp} TMP=${daemonTemp} TEMP=${daemonTemp} `);
+    expect(observed).not.toContain(`PATH=${longPath}`);
+    expect(observed).not.toContain("HOME=/home/test");
+    expect(observed).not.toContain("LCM_SUMMARY_PROVIDER=openai");
+    expect(observed).toContain(`TMPDIR=${daemonTemp}`);
+    expect(observed).toContain(`TMP=${daemonTemp}`);
+    expect(observed).toContain(`TEMP=${daemonTemp}`);
     const runner = fakeRunner([
       { code: 1, stderr: "Unit is not-found" },
       { code: 0, stdout: "started" },
@@ -659,7 +665,10 @@ describe("systemd-user supervisor", () => {
       platform: "linux",
       uid: 501,
       environment,
-    }).start(spec)).rejects.toThrow("manager command");
+    }).start(spec)).resolves.toMatchObject({
+      kind: "systemd-user",
+      managerPid: 601,
+    });
     const args = runner.calls[1]!.args;
     expect(args.some((value) => value.startsWith("--setenv=PATH="))).toBe(false);
     expect(args.some((value) => value.startsWith("--setenv=HOME="))).toBe(false);
@@ -670,6 +679,7 @@ describe("systemd-user supervisor", () => {
     expect(args).toContain(`TMPDIR=${daemonTemp}`);
     expect(args).toContain(`TMP=${daemonTemp}`);
     expect(args).toContain(`TEMP=${daemonTemp}`);
+    expect(args).toContain(`PATH=${longPath}`);
   });
 
   it("rejects a state-root parent redirect before systemd-run", async () => {
