@@ -311,6 +311,82 @@ describe("canonical supervisor identity", () => {
     }
   });
 
+  it("keeps child-only launch values out of the launchd plist dictionary", async () => {
+    const root = makeRoot();
+    const environment = {
+      HOME: "/home/managed",
+      PATH: "/usr/bin",
+      LCM_SUMMARY_PROVIDER: "openai",
+      LCM_POSTGRES_MIGRATION_ROLE: " migration_role ",
+    };
+    const spec = makeSpec("launchd-user", root, { launchEnvironment: environment });
+    const launchedEnvironment = {
+      ...environment,
+      LCM_POSTGRES_MIGRATION_ROLE: "migration_role",
+    };
+    const runner = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdPrintText(spec, "running", 502, launchedEnvironment) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: runner.run,
+      platform: "darwin",
+      uid: 501,
+      environment,
+    }).start(spec)).resolves.toMatchObject({ managerPid: 502 });
+    const plist = readFileSync(join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`), "utf8");
+    for (const name of ["HOME", "PATH", "LCM_SUMMARY_PROVIDER", "LCM_POSTGRES_MIGRATION_ROLE"] as const) {
+      expect(plist).not.toContain(`<key>${name}</key>`);
+    }
+    for (const assignment of [
+      "HOME=/home/managed",
+      "PATH=/usr/bin",
+      "LCM_SUMMARY_PROVIDER=openai",
+      "LCM_POSTGRES_MIGRATION_ROLE=migration_role",
+    ]) expect(plist).toContain(`<string>${assignment}</string>`);
+    const changedSpec = makeSpec("launchd-user", root, {
+      launchEnvironment: { ...environment, HOME: "/home/other" },
+    });
+    expect(launchdEnvironmentDigest(spec, launchedEnvironment)).not.toBe(
+      launchdEnvironmentDigest(changedSpec, { ...launchedEnvironment, HOME: "/home/other" }),
+    );
+    expect(plist).toContain(
+      `<key>LCM_SUPERVISOR_ENV_DIGEST</key><string>${launchdEnvironmentDigest(spec, launchedEnvironment)}</string>`,
+    );
+  });
+
+  it("rejects an extra child environment key in an absent launchd plist", async () => {
+    const root = makeRoot();
+    const spec = makeSpec("launchd-user", root, {
+      launchEnvironment: { HOME: "/home/managed", PATH: "/usr/bin" },
+    });
+    const initial = fakeRunner([
+      { code: 113, stderr: "Could not find service" },
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdPrintText(spec, "running", 502) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: initial.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(spec)).resolves.toMatchObject({ managerPid: 502 });
+    const plistPath = join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`);
+    const tampered = readFileSync(plistPath, "utf8").replace(
+      "</dict><key>RunAtLoad</key><true/>",
+      "<key>LCM_SUMMARY_PROVIDER</key><string>openai</string></dict><key>RunAtLoad</key><true/>",
+    );
+    writeFileSync(plistPath, tampered, { mode: 0o600 });
+    const absent = fakeRunner([{ code: 113, stderr: "Could not find service" }]);
+    await expect(createSupervisor("launchd-user", {
+      run: absent.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(spec)).rejects.toThrow("manager command");
+    expect(absent.calls.some(({ args }) => args[0] === "bootstrap")).toBe(false);
+    expect(readFileSync(plistPath, "utf8")).toBe(tampered);
+  });
+
   it("uses the private directory owner when process.getuid is unavailable", () => {
     const root = makeRoot();
     const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
@@ -394,9 +470,8 @@ describe("canonical supervisor identity", () => {
         expect(startArgs.join(" ")).not.toContain("LoadCredential=LCM_POSTGRES_MIGRATION_ROLE");
       } else {
         const plist = readFileSync(join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`), "utf8");
-        expect(plist).toContain(`<string>LCM_POSTGRES_MIGRATION_ROLE=${normalizedMigrationRole}</string>`);
+        expect(plist).not.toContain(`<key>LCM_POSTGRES_MIGRATION_ROLE</key>`);
         expect(plist).not.toContain(`<string>LCM_POSTGRES_MIGRATION_ROLE=${migrationRole}</string>`);
-        expect(plist).toContain("<key>LCM_POSTGRES_MIGRATION_ROLE</key><string>lcm_migration</string>");
         expect(plist).not.toContain("LCM_CREDENTIAL_LCM_POSTGRES_MIGRATION_ROLE");
       }
     }

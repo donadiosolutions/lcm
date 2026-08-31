@@ -1256,7 +1256,11 @@ function plistEnvironment(
 ): string {
   const credentialFiles = spec.credentialFiles === undefined ? [] : spec.credentialFiles;
   const values = new Map<string, string>();
-  for (const [name, value] of Object.entries(normalizedManagedLaunchEnvironment(spec, environment))) values.set(name, value);
+  const normalizedEnvironment = normalizedManagedLaunchEnvironment(spec, environment);
+  // launchd's dictionary is the manager-owned identity surface.  Keep only
+  // the stable temporary triple from the child projection here; all other
+  // allow-listed values remain digest-bound in ProgramArguments/env -i.
+  for (const name of MANAGED_DAEMON_TEMP_NAMES) values.set(name, normalizedEnvironment[name]!);
   values.set("LCM_SUPERVISOR_MARKER", spec.marker);
   values.set("LCM_SUPERVISOR_SCOPE", spec.scopeDigest);
   values.set("LCM_SUPERVISOR_STATE_ROOT", spec.stateRoot);
@@ -1516,27 +1520,31 @@ function privatePlistMatchesStableIdentity(
     if (ids !== credentialNames.join(",")) return false;
   }
   const expectedEnvironmentNames = new Set([
-    ...Object.keys(normalizedEnvironment),
     ...Object.keys(expectedMetadata),
+    ...MANAGED_DAEMON_TEMP_NAMES,
     ...(spec.entrypoint === undefined ? [] : ["LCM_SUPERVISOR_ENTRYPOINT"]),
     ...(spec.runtimeDigest === undefined ? [] : ["LCM_SUPERVISOR_RUNTIME_DIGEST"]),
     ...(spec.storageBackend === undefined ? [] : ["LCM_SUPERVISOR_STORAGE_BACKEND"]),
     ...(spec.postgresCaFile === undefined ? [] : ["LCM_POSTGRES_CA_FILE"]),
   ]);
-  if (allowEnvironmentDrift && temporaryValuesAreAbsent) {
-    for (const name of MANAGED_DAEMON_TEMP_NAMES) expectedEnvironmentNames.delete(name);
-  }
   // Credential keys are validated individually above and are the only
   // EnvironmentVariables keys permitted to vary between a descriptor being
   // retired and its replacement: absence-only cleanup may remove or add one
   // managed credential set without changing launch identity.  Exclude them
   // from the identity key count so drift-mode retirement stays valid.
-  const parsedEnvironmentKeyCount = [...parsed.environment.keys()].filter(
+  const parsedEnvironmentNames = new Set([...parsed.environment.keys()].filter(
     (name) =>
       name !== "LCM_CREDENTIAL_DIRECTORY"
       && name !== "LCM_SYSTEMD_CRED_IDS"
       && !/^LCM_CREDENTIAL_[A-Z0-9_]+_FILE$/u.test(name),
-  ).length;
+  ));
+  const environmentNamesMatch = (expectedNames: ReadonlySet<string>): boolean =>
+    parsedEnvironmentNames.size === expectedNames.size
+    && [...expectedNames].every((name) => parsedEnvironmentNames.has(name));
+  const legacyEnvironmentNames = new Set(expectedEnvironmentNames);
+  for (const name of MANAGED_DAEMON_TEMP_NAMES) legacyEnvironmentNames.delete(name);
+  if (!environmentNamesMatch(expectedEnvironmentNames)
+    && !(allowEnvironmentDrift && temporaryValuesAreAbsent && environmentNamesMatch(legacyEnvironmentNames))) return false;
   const allowedNames = new Set([
     ...MANAGED_LAUNCH_ENV_ALLOWLIST,
     ...MANAGED_DAEMON_TEMP_NAMES,
@@ -1556,7 +1564,6 @@ function privatePlistMatchesStableIdentity(
     "LCM_SYSTEMD_CRED_IDS",
     ...credentialNames.map((name) => `LCM_CREDENTIAL_${name}_FILE`),
   ]);
-  if (!allowEnvironmentDrift && parsedEnvironmentKeyCount !== expectedEnvironmentNames.size) return false;
   if (![...parsed.environment.keys()].every((name) => allowedNames.has(name))) return false;
   if (![...assignments.keys()].every((name) => allowedNames.has(name))) return false;
   const expectedAssignmentNames = new Set<string>();
