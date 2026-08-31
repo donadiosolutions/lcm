@@ -118,7 +118,7 @@ const expectedComponents = [
   },
   {
     component_id: "unit-llm-prompts",
-    name: "Unit - LLM and Prompts",
+    name: "Unit - LLM, Responses, and Prompts",
     paths: ["src/llm/", "src/prompts/"],
   },
   {

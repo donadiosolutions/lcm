@@ -78,8 +78,9 @@ component_management:
       paths:
         - "src/mcp/"
     - component_id: "unit-llm-prompts"
-      name: "Unit - LLM and Prompts"
+      name: "Unit - LLM, Responses, and Prompts"
       paths:
+        # The #779 authenticated Responses terminal gateway remains LLM-owned.
         - "src/llm/"
         - "src/prompts/"
     - component_id: "unit-local-persistence"

@@ -1005,6 +1005,17 @@ only `https://chatgpt.com/backend-api/codex/responses`, whether or not a
 but its absence does not select the public API route. Redirects and ambiguous
 request or shutdown outcomes fail closed.
 
+Gateway success follows the Responses protocol rather than an exact Codex CLI
+version or HTTP transport EOF. LCM accepts only a complete, well-formed
+`response.completed` event whose response status is `completed`, then closes the
+one-use upstream stream itself. A client may close after consuming that terminal
+event without turning a successful compaction into a failure. EOF before a
+terminal event, malformed or mismatched SSE event data, bytes decoded after the
+terminal frame in the same upstream chunk, and `response.failed` or
+`response.incomplete` events fail closed. Once a valid terminal frame is
+accepted, unread queued or future upstream bytes are canceled and never relayed.
+This behavior has no configuration option.
+
 ```json
 {
   "llm": {

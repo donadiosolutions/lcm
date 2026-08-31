@@ -8,6 +8,30 @@ import {
 } from "../../src/llm/codex-responses-gateway.js";
 
 const PROMPT = "SYSTEM: summarize only\n\nUSER: transcript text";
+const COMPLETED_SSE = [
+  "event: response.completed",
+  'data: {"type":"response.completed","response":{"status":"completed"}}',
+  "",
+  "",
+].join("\n");
+const FIRST_DELTA_SSE = [
+  "event: response.output_text.delta",
+  'data: {"type":"response.output_text.delta","delta":"first"}',
+  "",
+  "",
+].join("\n");
+const SECOND_DELTA_SSE = [
+  "event: response.output_text.delta",
+  'data: {"type":"response.output_text.delta","delta":"second"}',
+  "",
+  "",
+].join("\n");
+const LITE_DELTA_SSE = [
+  "event: response.output_text.delta",
+  'data: {"type":"response.output_text.delta","delta":"lite-ok"}',
+  "",
+  "",
+].join("\n");
 
 type Capture = {
   body: unknown;
@@ -310,14 +334,14 @@ describe("Codex Responses zero-tools gateway", () => {
     const endedResponse = makeFakeResponse(true);
     endedResponse.writableEnded = true;
     const endedRelay = await utils.relaySse(
-      new Response(new TextEncoder().encode("data: ended\n\n")).body as ReadableStream<Uint8Array>,
+      new Response(new TextEncoder().encode(COMPLETED_SSE)).body as ReadableStream<Uint8Array>,
       endedResponse as unknown as ServerResponse,
       signal,
     );
     expect(endedRelay).toBeUndefined();
 
     await expect(utils.relaySse(
-      new Response("ok").body as ReadableStream<Uint8Array>,
+      new Response(COMPLETED_SSE).body as ReadableStream<Uint8Array>,
       makeFakeResponse(true) as unknown as ServerResponse,
       signal,
     )).resolves.toBeUndefined();
@@ -367,6 +391,219 @@ describe("Codex Responses zero-tools gateway", () => {
     await expect(utils.closeServer(callbackString as never)).rejects.toThrow("close callback");
   });
 
+  it("parses semantic terminal SSE events across field variants and bounds buffered input", () => {
+    const utils = __codexResponsesGatewayTestUtils;
+    const encoder = new TextEncoder();
+    expect(utils.classifyResponsesSseEvent("", "")).toBe("pending");
+    expect(utils.classifyResponsesSseEvent("other", "not-json")).toBe("failed");
+    expect(utils.classifyResponsesSseEvent("other", "[]")).toBe("failed");
+    expect(utils.classifyResponsesSseEvent("other", '{"type":42}')).toBe("failed");
+    expect(utils.classifyResponsesSseEvent(
+      "",
+      '{"type":"response.completed","response":{"status":"completed"}}',
+    )).toBe("completed");
+    expect(utils.classifyResponsesSseEvent(
+      "response.completed",
+      '{"type":"response.completed","response":{"status":"completed","error":null}}',
+    )).toBe("completed");
+    expect(utils.classifyResponsesSseEvent(
+      "other",
+      '{"type":"response.completed","response":{"status":"completed"}}',
+    )).toBe("failed");
+    expect(utils.classifyResponsesSseEvent(
+      "response.completed",
+      '{"type":"response.completed","response":[]}',
+    )).toBe("failed");
+    expect(utils.classifyResponsesSseEvent(
+      "response.completed",
+      '{"type":"response.completed","response":{"status":"failed"}}',
+    )).toBe("failed");
+
+    const multiline = utils.createResponsesSseObserver();
+    multiline.observe(encoder.encode([
+      "event:response.completed",
+      'data:{"type":"response.completed",',
+      'data:"response":{"status":"completed"}}',
+      "",
+      "",
+    ].join("\n")));
+    expect(multiline.terminalState).toBe("completed");
+
+    const carriageReturns = utils.createResponsesSseObserver();
+    carriageReturns.observe(encoder.encode(
+      'event: response.completed\rdata: {"type":"response.completed","response":{"status":"completed"}}\r\r',
+    ));
+    expect(carriageReturns.terminalState).toBe("completed");
+
+    const splitCrLf = utils.createResponsesSseObserver();
+    splitCrLf.observe(encoder.encode(": first\r"));
+    splitCrLf.observe(encoder.encode("\n"));
+    expect(splitCrLf.finish()).toBe("pending");
+
+    const splitCarriageReturn = utils.createResponsesSseObserver();
+    splitCarriageReturn.observe(encoder.encode(": first\r"));
+    splitCarriageReturn.observe(encoder.encode(": second\r\r"));
+    expect(splitCarriageReturn.finish()).toBe("pending");
+
+    const terminalSuffix = utils.createResponsesSseObserver();
+    terminalSuffix.observe(encoder.encode(`${COMPLETED_SSE}post-terminal`));
+    expect(terminalSuffix.terminalState).toBe("failed");
+
+    const partial = utils.createResponsesSseObserver();
+    partial.observe(encoder.encode(": ignored\n\n"));
+    expect(partial.finish()).toBe("pending");
+
+    const oversizedChunk = utils.createResponsesSseObserver();
+    expect(() => oversizedChunk.observe(encoder.encode(`event:${"x".repeat(1024 * 1024 + 1)}`))).toThrow(
+      "codex responses gateway did not complete",
+    );
+
+    const oversizedLine = utils.createResponsesSseObserver();
+    const linePart = "x".repeat(600 * 1024);
+    oversizedLine.observe(encoder.encode(`event:${linePart}`));
+    expect(() => oversizedLine.observe(encoder.encode(linePart))).toThrow(
+      "codex responses gateway did not complete",
+    );
+
+    const oversizedData = utils.createResponsesSseObserver();
+    const dataPart = "x".repeat(512 * 1024);
+    oversizedData.observe(encoder.encode(`event: response.completed\ndata: ${dataPart}\n`));
+    expect(() => oversizedData.observe(encoder.encode(`data: ${dataPart}\n`))).toThrow(
+      "codex responses gateway did not complete",
+    );
+
+    const invalidUtf8 = utils.createResponsesSseObserver();
+    invalidUtf8.observe(new Uint8Array([0xc3]));
+    expect(() => invalidUtf8.finish()).toThrow();
+    expect(() => utils.flushResponsesSseDecoder({ decode: () => "post-terminal" })).toThrow(
+      "codex responses gateway did not complete",
+    );
+  });
+
+  it("ends terminal relay without entering ordinary backpressure or awaiting upstream cancellation", async () => {
+    const utils = __codexResponsesGatewayTestUtils;
+    const encoder = new TextEncoder();
+    const signal = new AbortController().signal;
+
+    const backpressured = makeFakeResponse(false);
+    await expect(utils.relaySse(
+      new Response(encoder.encode(COMPLETED_SSE)).body as ReadableStream<Uint8Array>,
+      backpressured as unknown as ServerResponse,
+      signal,
+    )).resolves.toBeUndefined();
+    expect(backpressured.write).not.toHaveBeenCalled();
+    expect(backpressured.end).toHaveBeenCalledWith(encoder.encode(COMPLETED_SSE));
+
+    let cancelCalled = false;
+    let releaseCancel: (() => void) | undefined;
+    const untrustedCancel = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(COMPLETED_SSE));
+      },
+      cancel() {
+        cancelCalled = true;
+        return new Promise<void>((resolve) => { releaseCancel = resolve; });
+      },
+    });
+    let settled = false;
+    const abortUpstream = vi.fn();
+    const cancellationRelay = utils.relaySse(
+      untrustedCancel,
+      makeFakeResponse(true) as unknown as ServerResponse,
+      signal,
+      undefined,
+      abortUpstream,
+    ).then(() => { settled = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    try {
+      expect(settled).toBe(true);
+      expect(cancelCalled).toBe(true);
+      expect(abortUpstream).toHaveBeenCalledOnce();
+    } finally {
+      releaseCancel?.();
+    }
+    await cancellationRelay;
+
+    const rejectingCancel = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(COMPLETED_SSE));
+      },
+      cancel() {
+        return Promise.reject(new Error("cancel rejected"));
+      },
+    });
+    await expect(utils.relaySse(
+      rejectingCancel,
+      makeFakeResponse(true) as unknown as ServerResponse,
+      signal,
+    )).resolves.toBeUndefined();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    let queuedSuffixCancelled = false;
+    const queuedSuffix = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(COMPLETED_SSE));
+        controller.enqueue(new Uint8Array([0xc3]));
+      },
+      cancel() {
+        queuedSuffixCancelled = true;
+      },
+    });
+    const terminalOnlyResponse = makeFakeResponse(true);
+    await expect(utils.relaySse(
+      queuedSuffix,
+      terminalOnlyResponse as unknown as ServerResponse,
+      signal,
+    )).resolves.toBeUndefined();
+    expect(terminalOnlyResponse.end).toHaveBeenCalledWith(encoder.encode(COMPLETED_SSE));
+    expect(queuedSuffixCancelled).toBe(true);
+  });
+
+  it("keeps semantic completion when downstream close fires synchronously during terminal end", async () => {
+    let handler: ((request: IncomingMessage, response: ServerResponse) => void) | undefined;
+    const fakeServer = makeFakeServer();
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response(COMPLETED_SSE, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+      _createServer: ((requestHandler) => {
+        handler = requestHandler;
+        return fakeServer;
+      }) as unknown as typeof createServer,
+    });
+    gateways.push(gateway);
+    const requestBody = validBody();
+    const request = new EventEmitter() as IncomingMessage;
+    Object.assign(request, {
+      resume: vi.fn(),
+      url: `${gateway.capabilityPath}/responses`,
+      method: "POST",
+      headers: {
+        authorization: "Bearer test-token",
+        "content-length": String(Buffer.byteLength(requestBody)),
+      },
+      rawHeaders: [
+        "Authorization", "Bearer test-token",
+        "Content-Length", String(Buffer.byteLength(requestBody)),
+      ],
+      complete: true,
+      [Symbol.asyncIterator]: async function* () { yield requestBody; },
+    });
+    const response = makeFakeResponse(true);
+    response.end = vi.fn(() => {
+      response.emit("close");
+      response.writableEnded = true;
+    });
+
+    handler?.(request, response as unknown as ServerResponse);
+
+    await expect(gateway.waitForCompletion()).resolves.toBeUndefined();
+    expect(gateway.requestCompleted).toBe(true);
+    expect(response.end).toHaveBeenCalledOnce();
+  });
+
   it("rewrites a hostile Codex request to one exact zero-tools Responses payload and relays split SSE bytes", async () => {
     let capture: Capture | undefined;
     const upstream = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -381,9 +618,10 @@ describe("Codex Responses zero-tools gateway", () => {
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Set-Cookie", "must-not-be-relayed");
-      res.write("data: first\n\n");
+      res.write(FIRST_DELTA_SSE);
       setTimeout(() => {
-        res.write("data: second\n\n");
+        res.write(SECOND_DELTA_SSE);
+        res.write(COMPLETED_SSE);
         res.end();
       }, 5);
     });
@@ -442,7 +680,7 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toMatch(/^text\/event-stream/);
     expect(response.headers.get("set-cookie")).toBeNull();
-    expect(Buffer.from(bytes).toString("utf8")).toBe("data: first\n\ndata: second\n\n");
+    expect(Buffer.from(bytes).toString("utf8")).toBe(`${FIRST_DELTA_SSE}${SECOND_DELTA_SSE}${COMPLETED_SSE}`);
     expect(capture).toBeDefined();
     expect(gateway.requestAccepted).toBe(true);
     expect(gateway.requestCompleted).toBe(true);
@@ -509,7 +747,7 @@ describe("Codex Responses zero-tools gateway", () => {
         url: req.url ?? "",
       };
       res.writeHead(200, { "content-type": "text/event-stream" });
-      res.end("data: lite-ok\n\n");
+      res.end(`${LITE_DELTA_SSE}${COMPLETED_SSE}`);
     });
     upstreams.push(upstream);
     const upstreamUrl = await listen(upstream);
@@ -544,7 +782,7 @@ describe("Codex Responses zero-tools gateway", () => {
     });
 
     expect(response.status).toBe(200);
-    expect(await response.text()).toBe("data: lite-ok\n\n");
+    expect(await response.text()).toBe(`${LITE_DELTA_SSE}${COMPLETED_SSE}`);
     expect(capture?.headers["x-openai-internal-codex-responses-lite"]).toBe("true");
     expect(capture?.headers.authorization).toBe("Bearer managed-token");
     const body = capture?.body as Record<string, unknown>;
@@ -579,7 +817,7 @@ describe("Codex Responses zero-tools gateway", () => {
     const { url: upstreamUrl } = await listenSimpleUpstream((_req, res) => {
       upstreamCalls += 1;
       res.writeHead(200, { "content-type": "text/event-stream" });
-      res.end("data: ok\n\n");
+      res.end(COMPLETED_SSE);
     });
     const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
     gateways.push(gateway);
@@ -604,7 +842,7 @@ describe("Codex Responses zero-tools gateway", () => {
   it("rejects missing, malformed, duplicate, and incomplete managed auth", async () => {
     const { url: upstreamUrl } = await listenSimpleUpstream((_req, res) => {
       res.writeHead(200, { "content-type": "text/event-stream" });
-      res.end("data: ok\n\n");
+      res.end(COMPLETED_SSE);
     });
     const cases: Array<Record<string, string>> = [
       {},
@@ -632,7 +870,7 @@ describe("Codex Responses zero-tools gateway", () => {
   it("rejects malformed, compressed, empty, oversized, and mismatched-length bodies", async () => {
     const { url: upstreamUrl } = await listenSimpleUpstream((_req, res) => {
       res.writeHead(200, { "content-type": "text/event-stream" });
-      res.end("data: ok\n\n");
+      res.end(COMPLETED_SSE);
     });
     const cases: Array<{ headers?: Record<string, string>; body: string; status?: number }> = [
       { body: "not json" },
@@ -661,7 +899,7 @@ describe("Codex Responses zero-tools gateway", () => {
   it("bounds chunked bodies and rejects duplicate managed headers", async () => {
     const { url: upstreamUrl } = await listenSimpleUpstream((_req, res) => {
       res.writeHead(200, { "content-type": "text/event-stream" });
-      res.end("data: ok\n\n");
+      res.end(COMPLETED_SSE);
     });
     const oversized = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
     gateways.push(oversized);
@@ -696,7 +934,7 @@ describe("Codex Responses zero-tools gateway", () => {
     const { url: upstreamUrl } = await listenSimpleUpstream(async (req, res) => {
       captured.push(await readBody(req));
       res.writeHead(200, { "content-type": "text/event-stream" });
-      res.end("data: ok\n\n");
+      res.end(COMPLETED_SSE);
     });
     const valid = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
     gateways.push(valid);
@@ -752,7 +990,7 @@ describe("Codex Responses zero-tools gateway", () => {
     const { url: upstreamUrl } = await listenSimpleUpstream((req, res) => {
       seen.push(req.url ?? "");
       res.writeHead(200, { "content-type": "text/event-stream" });
-      res.end("data: ok\n\n");
+      res.end(COMPLETED_SSE);
     });
     const chatGateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
     const apiGateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
@@ -769,7 +1007,7 @@ describe("Codex Responses zero-tools gateway", () => {
       expect(init?.redirect).toBe("error");
       expect(init?.method).toBe("POST");
       expect(init?.signal).toBeInstanceOf(AbortSignal);
-      return new Response("data: ok\n\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+      return new Response(COMPLETED_SSE, { status: 200, headers: { "content-type": "text/event-stream" } });
     };
     const chatGateway = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: fetchImpl });
     const apiGateway = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: fetchImpl });
@@ -782,7 +1020,7 @@ describe("Codex Responses zero-tools gateway", () => {
     ]);
     const noContentType = await createCodexResponsesGateway({
       prompt: PROMPT,
-      _fetch: async () => new Response(new TextEncoder().encode("data: ok\n\n"), { status: 200 }),
+      _fetch: async () => new Response(new TextEncoder().encode(COMPLETED_SSE), { status: 200 }),
     });
     gateways.push(noContentType);
     const noContentTypeResponse = await fetchGateway(noContentType);
@@ -794,7 +1032,7 @@ describe("Codex Responses zero-tools gateway", () => {
     const destinations: string[] = [];
     const fetchImpl: typeof fetch = async (input) => {
       destinations.push(String(input));
-      return new Response("data: ok\n\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+      return new Response(COMPLETED_SSE, { status: 200, headers: { "content-type": "text/event-stream" } });
     };
     const accountlessOAuth = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: fetchImpl });
     const projectKey = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: fetchImpl });
@@ -972,11 +1210,133 @@ describe("Codex Responses zero-tools gateway", () => {
     await expect(gateway.waitForCompletion()).rejects.toThrow("codex responses gateway did not complete");
   });
 
+  it("rejects a clean upstream EOF before response.completed", async () => {
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response(
+        "event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n",
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    });
+    gateways.push(gateway);
+
+    await fetchGateway(gateway)
+      .then(async (response) => response.arrayBuffer())
+      .catch(() => undefined);
+
+    await expect(gateway.waitForCompletion()).rejects.toThrow("codex responses gateway did not complete");
+    expect(gateway.requestCompleted).toBe(false);
+  });
+
+  it("rejects incomplete UTF-8 buffered after response.completed", async () => {
+    const terminalWithTruncatedUtf8 = Buffer.concat([
+      Buffer.from(COMPLETED_SSE, "utf8"),
+      Buffer.from([0xc3]),
+    ]);
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response(terminalWithTruncatedUtf8, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+    gateways.push(gateway);
+
+    await fetchGateway(gateway)
+      .then(async (response) => response.arrayBuffer())
+      .catch(() => undefined);
+
+    await expect(gateway.waitForCompletion()).rejects.toThrow("codex responses gateway did not complete");
+    expect(gateway.requestCompleted).toBe(false);
+  });
+
+  it.each([
+    ["malformed completion data", "event: response.completed\ndata: not-json\n\n"],
+    [
+      "mismatched completion data",
+      "event: response.completed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n",
+    ],
+    [
+      "completion data with an error",
+      "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"error\":{\"code\":\"server_error\"}}}\n\n",
+    ],
+    [
+      "failed terminal event",
+      "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n",
+    ],
+    [
+      "incomplete terminal event",
+      "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n",
+    ],
+    [
+      "malformed non-terminal event before completion",
+      `event: response.in_progress\ndata: not-json\n\n${COMPLETED_SSE}`,
+    ],
+  ])("rejects %s", async (_label, terminalEvent) => {
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response(terminalEvent, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+    gateways.push(gateway);
+
+    await fetchGateway(gateway)
+      .then(async (response) => response.arrayBuffer())
+      .catch(() => undefined);
+
+    await expect(gateway.waitForCompletion()).rejects.toThrow("codex responses gateway did not complete");
+    expect(gateway.requestCompleted).toBe(false);
+  });
+
+  it("completes when the client closes after receiving a split response.completed event", async () => {
+    let upstreamSignal: AbortSignal | undefined;
+    let upstreamCancelled = false;
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      upstreamSignal = init?.signal;
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("event: response.com"));
+          controller.enqueue(new TextEncoder().encode(
+            "pleted\r\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\r\n\r\n",
+          ));
+          init?.signal?.addEventListener("abort", () => {
+            controller.error(new Error("downstream closed after terminal event"));
+          }, { once: true });
+        },
+        cancel() {
+          upstreamCancelled = true;
+        },
+      }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    };
+    const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: fetchImpl });
+    gateways.push(gateway);
+
+    const response = await fetchGateway(gateway);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+    let received = "";
+    while (!received.includes("response.completed")) {
+      const chunk = await reader!.read();
+      expect(chunk.done).toBe(false);
+      received += decoder.decode(chunk.value, { stream: true });
+    }
+    await reader!.cancel();
+
+    await expect(gateway.waitForCompletion()).resolves.toBeUndefined();
+    expect(gateway.requestAccepted).toBe(true);
+    expect(gateway.requestCompleted).toBe(true);
+    expect(upstreamSignal?.aborted).toBe(true);
+    expect(upstreamCancelled).toBe(true);
+  });
+
   it("fails completion when the upstream stream is aborted or the gateway closes", async () => {
     const { url: upstreamUrl } = await listenSimpleUpstream((_req, res) => {
       res.writeHead(200, { "content-type": "text/event-stream" });
-      res.write("data: partial\n\n");
-      setTimeout(() => res.end("data: late\n\n"), 100);
+      res.write("event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n");
+      setTimeout(() => res.end(COMPLETED_SSE), 100);
     });
     const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
     gateways.push(gateway);
@@ -992,7 +1352,7 @@ describe("Codex Responses zero-tools gateway", () => {
     const { url: upstreamUrl } = await listenSimpleUpstream(async (req, res) => {
       captures.push(await readBody(req));
       res.writeHead(200, { "content-type": "text/event-stream" });
-      res.end("data: ok\n\n");
+      res.end(COMPLETED_SSE);
     });
     const one = await createCodexResponsesGateway({ prompt: "prompt-one", _upstreamUrl: upstreamUrl });
     const two = await createCodexResponsesGateway({ prompt: "prompt-two", _upstreamUrl: upstreamUrl });
@@ -1171,7 +1531,7 @@ describe("Codex Responses zero-tools gateway", () => {
     const endedServer = makeFakeServer();
     const endedGateway = await createCodexResponsesGateway({
       prompt: PROMPT,
-      _fetch: async () => new Response(new TextEncoder().encode("data: ended\n\n"), {
+      _fetch: async () => new Response(new TextEncoder().encode(COMPLETED_SSE), {
         status: 200,
         headers: { "content-type": "text/event-stream" },
       }),
