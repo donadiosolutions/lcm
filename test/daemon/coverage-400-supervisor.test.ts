@@ -18,6 +18,7 @@ const fsFaults = vi.hoisted(() => ({
   write: false,
   unlink: false,
   open: false,
+  openPath: undefined as string | undefined,
   openCode: undefined as string | undefined,
   close: false,
   mkdir: false,
@@ -33,7 +34,7 @@ vi.mock("node:fs", async (importOriginal) => {
       return actual.writeSync(...args);
     },
     openSync: (...args: Parameters<typeof actual.openSync>) => {
-      if (fsFaults.open) {
+      if (fsFaults.open && (fsFaults.openPath === undefined || String(args[0]) === fsFaults.openPath)) {
         const error = new Error("open unavailable") as NodeJS.ErrnoException;
         if (fsFaults.openCode !== undefined) error.code = fsFaults.openCode;
         throw error;
@@ -1519,12 +1520,26 @@ describe("supervisor coverage: credentials and private launch files", () => {
     expect(readFileSync(plist, "utf8")).toContain("RunAtLoad");
     expect(lstatSync(plist).mode & 0o777).toBe(0o600);
     fsFaults.open = true;
+    fsFaults.openPath = plist;
     fsFaults.openCode = "EACCES";
     try {
       const readFailure = runQueue([absent, absent]);
       await expect(createSupervisor("launchd-user", { run: readFailure.run, platform: "darwin", uid: 501 }).start(value)).rejects.toThrow("manager command");
     } finally {
       fsFaults.open = false;
+      fsFaults.openPath = undefined;
+      fsFaults.openCode = undefined;
+    }
+    fsFaults.open = true;
+    fsFaults.openPath = plist;
+    fsFaults.openCode = "ELOOP";
+    try {
+      const loopFailure = runQueue([absent, absent]);
+      await expect(createSupervisor("launchd-user", { run: loopFailure.run, platform: "darwin", uid: 501 }).start(value)).rejects.toThrow("manager command");
+      expect(loopFailure.calls.map(({ args }) => args[0])).toEqual(["print", "print"]);
+    } finally {
+      fsFaults.open = false;
+      fsFaults.openPath = undefined;
       fsFaults.openCode = undefined;
     }
     const stop = runQueue([{ code: 0, stdout: launchdText(value, "running", 88) }, { code: 0, stdout: "bootout" }, absent]);
@@ -1562,6 +1577,39 @@ describe("supervisor coverage: credentials and private launch files", () => {
     expect(sleep).toHaveBeenCalledWith(50);
     expect(runner.calls.filter(({ args }) => args[0] === "bootstrap")).toHaveLength(1);
     expect(runner.calls.filter(({ args }) => args[0] === "bootout")).toHaveLength(0);
+  });
+
+  it("rejects a launchd plist containing an unexpected environment key", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const initial = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 554) },
+    ]);
+    await expect(createSupervisor("launchd-user", {
+      run: initial.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(value)).resolves.toMatchObject({ managerPid: 554 });
+
+    const plist = join(stateRoot, `daemon.${value.shortDigest}.${value.nonce}.plist`);
+    const unexpected = readFileSync(plist, "utf8").replace(
+      "</dict><key>RunAtLoad</key>",
+      "<key>LCM_CREDENTIAL_UNKNOWN_FILE</key><string>/tmp/unknown</string></dict><key>RunAtLoad</key>",
+    );
+    expect(unexpected).toContain("LCM_CREDENTIAL_UNKNOWN_FILE");
+    writeFileSync(plist, unexpected);
+
+    const retry = runQueue([absent, absent]);
+    await expect(createSupervisor("launchd-user", {
+      run: retry.run,
+      platform: "darwin",
+      uid: 501,
+    }).start(value)).rejects.toThrow("manager command");
+    expect(retry.calls.map(({ args }) => args[0])).toEqual(["print", "print"]);
+    expect(readFileSync(plist, "utf8")).toBe(unexpected);
   });
 
   it("uses the bounded host timer for launchd post-start re-observation", async () => {
@@ -2373,11 +2421,15 @@ describe("supervisor coverage: credentials and private launch files", () => {
       fsFaults.unlink = false;
     }
     const openRunner = runQueue([absent, absent]);
+    const openRoot = root();
+    const openSpec = spec("launchd-user", openRoot);
+    fsFaults.openPath = join(openRoot, `daemon.${openSpec.shortDigest}.${openSpec.nonce}.plist`);
     fsFaults.open = true;
     try {
-      await expect(createSupervisor("launchd-user", { run: openRunner.run, platform: "darwin", uid: 501 }).start(spec("launchd-user", root()))).rejects.toThrow("manager command");
+      await expect(createSupervisor("launchd-user", { run: openRunner.run, platform: "darwin", uid: 501 }).start(openSpec)).rejects.toThrow("manager command");
     } finally {
       fsFaults.open = false;
+      fsFaults.openPath = undefined;
     }
     const mkdirRunner = runQueue([absent, absent]);
     fsFaults.mkdir = true;
@@ -2413,6 +2465,44 @@ describe("supervisor coverage: credentials and private launch files", () => {
       expect(existsSync(cleanupPath)).toBe(false);
     } finally {
       if (cleanupDescriptor !== undefined) Object.defineProperty(process, "getuid", cleanupDescriptor);
+    }
+  });
+
+  it("starts and cleans up launchd when process.getuid is unavailable", async () => {
+    const stateRoot = root();
+    const value = spec("launchd-user", stateRoot);
+    const plist = join(stateRoot, `daemon.${value.shortDigest}.${value.nonce}.plist`);
+    const absent = { code: 113, stderr: "Could not find service" };
+    const startRunner = runQueue([
+      absent,
+      { code: 0, stdout: "bootstrapped" },
+      { code: 0, stdout: launchdText(value, "running", 555) },
+    ]);
+    const stopRunner = runQueue([
+      { code: 0, stdout: launchdText(value, "running", 555) },
+      { code: 0, stdout: "bootout" },
+      absent,
+    ]);
+    const uidDescriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    Object.defineProperty(process, "getuid", { configurable: true, value: undefined, writable: true });
+    try {
+      await expect(createSupervisor("launchd-user", {
+        run: startRunner.run,
+        platform: "darwin",
+        uid: 501,
+      }).start(value)).resolves.toMatchObject({ managerPid: 555 });
+      expect(startRunner.calls.map(({ args }) => args[0])).toEqual(["print", "bootstrap", "print"]);
+      expect(existsSync(plist)).toBe(true);
+
+      await expect(createSupervisor("launchd-user", {
+        run: stopRunner.run,
+        platform: "darwin",
+        uid: 501,
+      }).stopAndAwaitAbsent(value)).resolves.toBeUndefined();
+      expect(stopRunner.calls.map(({ args }) => args[0])).toEqual(["print", "bootout", "print"]);
+      expect(existsSync(plist)).toBe(false);
+    } finally {
+      if (uidDescriptor !== undefined) Object.defineProperty(process, "getuid", uidDescriptor);
     }
   });
 
