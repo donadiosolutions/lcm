@@ -40,6 +40,18 @@ export type GrepScope = (typeof CANONICAL_GREP_SCOPES)[number];
 export type GrepScopeInput = GrepScope | "all";
 export const DEFAULT_GREP_SCOPE: GrepScope = "both";
 
+/** Canonical search modes exposed by grep operations. */
+export const CANONICAL_GREP_MODES = Object.freeze(["full_text", "regex"] as const);
+export type GrepMode = (typeof CANONICAL_GREP_MODES)[number];
+export const DEFAULT_GREP_MODE: GrepMode = "full_text";
+
+/** Normalize grep mode at input boundaries; only omitted mode defaults. */
+export function normalizeGrepMode(input: unknown): GrepMode | null {
+  if (input === undefined) return DEFAULT_GREP_MODE;
+  if (typeof input !== "string") return null;
+  return CANONICAL_GREP_MODES.includes(input as GrepMode) ? (input as GrepMode) : null;
+}
+
 /** Normalize search layers, rejecting malformed values before storage access. */
 export function normalizeSearchLayers(input: unknown): SearchLayer[] | null {
   if (input === undefined) {
@@ -131,7 +143,7 @@ export interface DescribeResult {
 
 export interface GrepInput {
   query: string;
-  mode: "regex" | "full_text";
+  mode: GrepMode;
   scope: GrepScope;
   conversationId?: number;
   since?: Date;
@@ -293,6 +305,13 @@ export class RetrievalEngine {
   async grep(input: GrepInput): Promise<GrepResult> {
     const { query, mode, scope, conversationId, since, before, limit } = input;
 
+    if (!CANONICAL_GREP_MODES.includes(mode as GrepMode)) {
+      throw new Error("Invalid grep mode");
+    }
+    if (!CANONICAL_GREP_SCOPES.includes(scope as GrepScope)) {
+      throw new Error("Invalid grep scope");
+    }
+
     const searchInput = { query, mode, conversationId, since, before, limit };
 
     let messages: MessageSearchResult[] = [];
@@ -302,14 +321,12 @@ export class RetrievalEngine {
       messages = await this.conversationStore.searchMessages(searchInput);
     } else if (scope === "summaries") {
       summaries = await this.summaryStore.searchSummaries(searchInput);
-    } else if (scope === "both") {
-      // scope === "both" — run in parallel
+    } else {
+      // Scope validation above makes the remaining canonical value "both".
       [messages, summaries] = await Promise.all([
         this.conversationStore.searchMessages(searchInput),
         this.summaryStore.searchSummaries(searchInput),
       ]);
-    } else {
-      throw new Error("Invalid grep scope");
     }
 
     messages.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());

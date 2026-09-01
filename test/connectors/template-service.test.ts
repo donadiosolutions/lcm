@@ -137,7 +137,8 @@ describe("transport-pure guidance", () => {
     expect(skill).toContain("lcm_store");
     expect(skill).toContain("lcm_doctor");
     expect(skill).not.toMatch(/\blcm\s+(?:search|grep|describe|expand|store|doctor)\b/iu);
-    expect(skill).not.toMatch(/\bregex\b|\blayers\b/iu);
+    expect(skill).not.toMatch(/\blayers\b/iu);
+    expect(skill).toContain("`mode` optionally selects `full_text` or `regex`");
     expect(skill).toContain(
       "exactly one `type:<classification>` tag, literal `scope:project` or `scope:user`, `project:<repo>`, and optional `source:<actual-thread-uuid>`",
     );
@@ -153,6 +154,13 @@ describe("transport-pure guidance", () => {
     const readOnlyBoundary = "Read-only work still performs required LCM retrieval and durable storage unless the user explicitly forbids memory access or storage; LCM memory operations do not modify project files, Git, host configuration, or services.";
     expect(cli).toContain(readOnlyBoundary);
     expect(skill).toContain(readOnlyBoundary);
+  });
+
+  it("documents the MCP grep mode contract", () => {
+    const operations = readFileSync(join(process.cwd(), "src/connectors/templates/guidance/operations.mcp.md"), "utf8");
+    expect(operations).toContain("`mode` optionally selects `full_text` or `regex`");
+    expect(operations).toContain("defaults to `full_text`");
+    expect(operations).toContain("regex pattern");
   });
 
   it("uses the exact memory header and emits feedback only for actual IDs", () => {

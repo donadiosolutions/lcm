@@ -75,6 +75,13 @@ describe("MCP tool definitions", () => {
     expect(search.inputSchema.properties.layers.default).toEqual(["episodic", "promoted"]);
     expect(grep.inputSchema.properties.scope.enum).toEqual(["messages", "summaries", "both"]);
     expect(grep.inputSchema.properties.scope.default).toBe("both");
+    expect(grep.inputSchema.properties.mode.enum).toEqual(["full_text", "regex"]);
+    expect(grep.inputSchema.properties.mode.default).toBe("full_text");
+    expect(grep.inputSchema.properties.mode.description).toContain("full-text");
+    expect(grep.inputSchema.properties.mode.description).toContain("regex");
+    expect(grep.inputSchema.properties.query.description).toBe(
+      "Keyword, phrase, or pattern to search; interpretation follows mode (full_text by default, regex when selected)",
+    );
     expect(search.description).toContain("promoted");
     expect(search.description).not.toContain("Qdrant");
     expect(search.description).not.toContain("semantic");

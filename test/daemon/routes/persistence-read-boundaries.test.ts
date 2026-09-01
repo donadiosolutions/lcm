@@ -271,6 +271,20 @@ describe("persistence read route boundaries", () => {
     await invoke(handler, { query: "q", cwd: "/bad", scope: "invalid" });
     expectLast(400, { error: "invalid scope" });
     expect(mocks.validate).not.toHaveBeenCalled();
+    for (const mode of [null, 1, [], {}, "unknown"]) {
+      mocks.validate.mockClear();
+      const projectExistsCalls = mocks.projectExists.mock.calls.length;
+      await invoke(handler, { query: "q", cwd: "/bad", mode });
+      expectLast(400, { error: "invalid mode" });
+      expect(mocks.validate).not.toHaveBeenCalled();
+      expect(mocks.projectExists.mock.calls.length).toBe(projectExistsCalls);
+    }
+    mocks.validate.mockClear();
+    const projectExistsCalls = mocks.projectExists.mock.calls.length;
+    await invoke(handler, { query: "q", cwd: "/bad", mode: null, scope: "invalid" });
+    expectLast(400, { error: "invalid mode" });
+    expect(mocks.validate).not.toHaveBeenCalled();
+    expect(mocks.projectExists.mock.calls.length).toBe(projectExistsCalls);
     await invoke(handler, { query: "q", scope: "all" });
     expectLast(200, { matches: [] });
     await invoke(handler, { query: "q" });
@@ -283,6 +297,8 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { matches: [] });
     await invoke(handler, { query: "q", cwd: "/ok" });
     expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "both", since: undefined });
+    await invoke(handler, { query: "q", cwd: "/ok", mode: "full_text", scope: "messages" });
+    expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "messages", since: undefined });
     await invoke(handler, { query: "q", cwd: "/ok", mode: "regex", scope: "messages", since: "2025" });
     expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "regex", scope: "messages", since: "2025" });
     await invoke(handler, { query: "q", cwd: "/ok", scope: "summaries" });

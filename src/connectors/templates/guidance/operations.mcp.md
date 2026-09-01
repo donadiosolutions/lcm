@@ -8,6 +8,7 @@
 - `lcm_grep`
   Search prior context for an exact text match.
   - `query` is the exact term or phrase [required]
+  - `mode` optionally selects `full_text` or `regex`; it defaults to `full_text`. `full_text` performs literal/full-text matching, while `regex` interprets the query as a regex pattern
   - `sessionId` optionally limits the search to one session
   - `since` optionally sets an ISO datetime lower bound
 - `lcm_describe`

@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   CANONICAL_GREP_SCOPES,
+  CANONICAL_GREP_MODES,
   CANONICAL_SEARCH_LAYERS,
+  DEFAULT_GREP_MODE,
   DEFAULT_GREP_SCOPE,
   DEFAULT_SEARCH_LAYERS,
   normalizeGrepScope,
+  normalizeGrepMode,
   normalizeSearchLayers,
 } from "../src/retrieval.js";
 
@@ -12,10 +15,13 @@ describe("canonical memory operation contracts", () => {
   it("exposes immutable canonical values and defaults", () => {
     expect(CANONICAL_SEARCH_LAYERS).toEqual(["episodic", "promoted"]);
     expect(CANONICAL_GREP_SCOPES).toEqual(["messages", "summaries", "both"]);
+    expect(CANONICAL_GREP_MODES).toEqual(["full_text", "regex"]);
     expect(DEFAULT_SEARCH_LAYERS).toEqual(["episodic", "promoted"]);
     expect(DEFAULT_GREP_SCOPE).toBe("both");
+    expect(DEFAULT_GREP_MODE).toBe("full_text");
     expect(Object.isFrozen(CANONICAL_SEARCH_LAYERS)).toBe(true);
     expect(Object.isFrozen(CANONICAL_GREP_SCOPES)).toBe(true);
+    expect(Object.isFrozen(CANONICAL_GREP_MODES)).toBe(true);
     expect(Object.isFrozen(DEFAULT_SEARCH_LAYERS)).toBe(true);
   });
 
@@ -55,5 +61,16 @@ describe("canonical memory operation contracts", () => {
 
   it.each([null, 1, "unknown", [], {}])("rejects invalid grep scope %j", (input) => {
     expect(normalizeGrepScope(input)).toBeNull();
+  });
+
+  it.each([[undefined, "full_text"], ["full_text", "full_text"], ["regex", "regex"]])(
+    "normalizes valid grep mode %j",
+    (input, expected) => {
+      expect(normalizeGrepMode(input)).toBe(expected);
+    },
+  );
+
+  it.each([null, 1, "unknown", [], {}])("rejects invalid grep mode %j", (input) => {
+    expect(normalizeGrepMode(input)).toBeNull();
   });
 });

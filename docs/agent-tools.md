@@ -69,6 +69,7 @@ Search conversation history by keyword or regex across raw messages and summarie
 | Param | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `query` | string | ✅ | — | Keyword, phrase, or regex to search |
+| `mode` | string | | `full_text` | `full_text` for literal/full-text matching or `regex` for regular-expression matching |
 | `scope` | string | | `"both"` | `"messages"`, `"summaries"`, or `"both"` |
 | `sessionId` | string | | — | Filter to a specific session |
 | `since` | string | | — | ISO datetime lower bound |
@@ -83,6 +84,9 @@ lcm_grep(query: 'ECONNREFUSED')
 
 # Search only summaries for a specific term
 lcm_grep(query: 'config\\.threshold', scope: 'summaries')
+
+# Interpret the query as a regular expression
+lcm_grep(query: 'config\\.(threshold|limit)', mode: 'regex')
 ```
 
 The deprecated `all` scope remains accepted as a compatibility input and is
