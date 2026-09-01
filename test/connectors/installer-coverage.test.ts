@@ -494,12 +494,14 @@ describe("installer defensive branches", () => {
       openMode = "normal";
       rmSync(skillPath, { force: true });
       readMode = "tamper-skill";
-      expect(() => module.installConnector("claude-code", "skill", directory)).toThrow(/ownership verification/iu);
+      expect(() => module.installConnector("claude-code", "skill", directory))
+        .toThrow(/Concurrent connector mutation changed requested state/iu);
 
       readMode = "normal";
       rmSync(mcpPath, { force: true });
       readMode = "tamper-mcp";
-      expect(() => module.installConnector("claude-code", "mcp", directory)).toThrow(/ownership verification/iu);
+      expect(() => module.installConnector("claude-code", "mcp", directory))
+        .toThrow(/Concurrent connector mutation changed requested state/iu);
 
       openMode = "denied";
       const inventory = module.listConnectorInventory(directory);
@@ -2007,7 +2009,7 @@ describe("installer descriptor edge branches", () => {
       rmSync(join(directory, ".claude", "skills", "lcm-memory", "SKILL.md"), { force: true });
       returnZero = true;
       expect(() => module.installConnector("claude-code", "skill", directory))
-        .toThrow(/failed ownership verification/iu);
+        .toThrow(/Concurrent connector mutation changed requested state/iu);
     } finally {
       vi.doUnmock("node:fs");
       vi.resetModules();
@@ -2231,6 +2233,429 @@ describe("installer descriptor edge branches", () => {
     }
   });
 
+  it.each([
+    ["regular-file type", "type", /not a regular file/iu],
+    ["descriptor identity", "identity", /identity changed/iu],
+  ] as const)("restores after a post-truncate %s safety failure", async (_label, fault, message) => {
+    const installed = installConnector("claude-code", "skill", directory);
+    const skillPath = installed.path;
+    const prior = readFileSync(skillPath);
+    let afterTruncate = false;
+    let injected = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          const result = actual.ftruncateSync(descriptor, length);
+          if (isSkill(descriptor)) afterTruncate = true;
+          return result;
+        }) as typeof actual.ftruncateSync,
+        fstatSync: ((descriptor: number) => {
+          const stats = actual.fstatSync(descriptor);
+          if (!afterTruncate || injected || !isSkill(descriptor)) return stats;
+          injected = true;
+          return new Proxy(stats, {
+            get(target, property) {
+              if (fault === "type" && property === "isFile") return () => false;
+              if (fault === "identity" && property === "ino") return Number(target.ino) + 1;
+              return Reflect.get(target, property, target);
+            },
+          });
+        }) as typeof actual.fstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.removeConnector("claude-code", "skill", directory)).toThrow(message);
+      expect(injected).toBe(true);
+      expect(readFileSync(skillPath)).toEqual(prior);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("preserves the primary safety failure when requested state is absent", async () => {
+    const configPath = join(directory, "safety-request-mismatch-config.json");
+    const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    let afterTruncate = false;
+    let injected = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          const result = actual.ftruncateSync(descriptor, length);
+          if (isSkill(descriptor)) afterTruncate = true;
+          return result;
+        }) as typeof actual.ftruncateSync,
+        fstatSync: ((descriptor: number) => {
+          const stats = actual.fstatSync(descriptor);
+          if (!afterTruncate || injected || !isSkill(descriptor)) return stats;
+          injected = true;
+          return new Proxy(stats, {
+            get(target, property) {
+              if (property === "nlink") return 2;
+              return Reflect.get(target, property, target);
+            },
+          });
+        }) as typeof actual.fstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cursor", "cli", directory, {
+        configPath,
+        persistTransport: false,
+      })).toThrow(/multiply linked/iu);
+      expect(injected).toBe(true);
+      expect(readFileSync(skillPath)).toHaveLength(0);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["current descriptor type", "current-type"],
+    ["requested-state readback", "requested-read"],
+  ] as const)("preserves the primary safety failure after a %s fault", async (_label, fault) => {
+    const installed = installConnector("claude-code", "skill", directory);
+    const skillPath = installed.path;
+    let afterTruncateStats = 0;
+    let failRequestedRead = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      let afterTruncate = false;
+      return {
+        ...actual,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          const result = actual.ftruncateSync(descriptor, length);
+          if (isSkill(descriptor)) afterTruncate = true;
+          return result;
+        }) as typeof actual.ftruncateSync,
+        fstatSync: ((descriptor: number) => {
+          const stats = actual.fstatSync(descriptor);
+          if (!afterTruncate || !isSkill(descriptor)) return stats;
+          afterTruncateStats += 1;
+          if (afterTruncateStats === 1) {
+            return new Proxy(stats, {
+              get(target, property) {
+                if (property === "nlink") return 2;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          if (fault === "current-type" && afterTruncateStats === 2) {
+            return new Proxy(stats, {
+              get(target, property) {
+                if (property === "isFile") return () => false;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          if (fault === "requested-read" && afterTruncateStats === 3) failRequestedRead = true;
+          return stats;
+        }) as typeof actual.fstatSync,
+        readSync: ((descriptor: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          if (failRequestedRead && isSkill(descriptor)) {
+            failRequestedRead = false;
+            throw Object.assign(new Error("injected requested-state read failure"), { code: "EIO" });
+          }
+          return actual.readSync(descriptor, buffer, offset, length, position);
+        }) as typeof actual.readSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.removeConnector("claude-code", "skill", directory)).toThrow(/multiply linked/iu);
+      expect(afterTruncateStats).toBeGreaterThanOrEqual(2);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["link-count drift", "link-count", /link count changed during emergency restoration/iu],
+    ["zero write", "zero-write", /made no progress/iu],
+    ["verification mismatch", "verify", /restoration verification failed/iu],
+  ] as const)("reports emergency restoration %s", async (_label, fault, evidence) => {
+    const installed = installConnector("claude-code", "skill", directory);
+    const skillPath = installed.path;
+    const aliasPath = join(directory, `${fault}-alias.md`);
+    const secondAliasPath = join(directory, `${fault}-second-alias.md`);
+    let truncates = 0;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          if (!isSkill(descriptor)) return actual.ftruncateSync(descriptor, length);
+          truncates += 1;
+          if (truncates === 1) actual.linkSync(skillPath, aliasPath);
+          if (truncates === 2 && fault === "link-count") actual.linkSync(skillPath, secondAliasPath);
+          return actual.ftruncateSync(descriptor, length);
+        }) as typeof actual.ftruncateSync,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          if (fault === "zero-write" && truncates === 2 && isSkill(descriptor)) return 0;
+          return actual.writeSync(descriptor, data, offset, length, position);
+        }) as typeof actual.writeSync,
+        readSync: ((descriptor: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          const read = actual.readSync(descriptor, buffer, offset, length, position);
+          if (fault === "verify" && truncates === 2 && isSkill(descriptor) && read > 0) {
+            buffer[offset] = buffer[offset] === 0x78 ? 0x79 : 0x78;
+          }
+          return read;
+        }) as typeof actual.readSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      let caught: unknown;
+      try { module.removeConnector("claude-code", "skill", directory); } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toMatch(/multiply linked/iu);
+      expect((caught as Error).message).toMatch(/emergency restoration failed/iu);
+      expect((caught as Error).message).toMatch(evidence);
+      expect(truncates).toBe(2);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["primitive", "primitive"],
+    ["coded", "coded"],
+    ["concurrent", "concurrent"],
+    ["authentication", "authentication"],
+    ["safety", "safety"],
+  ] as const)("preserves the primary %s write failure during recovery", async (_label, fault) => {
+    const configPath = join(directory, `${fault}-write-recovery-config.json`);
+    const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    const concurrent = Buffer.from("concurrent recovery bytes\n", "utf-8");
+    const aliasPath = join(directory, "write-recovery-safety-alias.md");
+    let truncates = 0;
+    let requestedWriteFailed = false;
+    let recoveryAuthenticationPending = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        fstatSync: ((descriptor: number) => {
+          if (fault === "authentication" && recoveryAuthenticationPending && isSkill(descriptor)) {
+            recoveryAuthenticationPending = false;
+            throw Object.assign(new Error("recovery authentication unavailable"), { code: "EIO" });
+          }
+          return actual.fstatSync(descriptor);
+        }) as typeof actual.fstatSync,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          if (!isSkill(descriptor)) return actual.ftruncateSync(descriptor, length);
+          truncates += 1;
+          if (truncates === 2 && fault === "primitive") throw "primitive restoration failure";
+          if (truncates === 2 && fault === "coded") {
+            throw Object.assign(new Error("coded restoration failure"), { code: "ERESTORE" });
+          }
+          return actual.ftruncateSync(descriptor, length);
+        }) as typeof actual.ftruncateSync,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          if (!requestedWriteFailed && isSkill(descriptor)) {
+            requestedWriteFailed = true;
+            if (fault === "primitive") throw "primitive write failure";
+            if (fault === "coded") throw Object.assign(new Error("coded write failure"), { code: "EWRITE" });
+            if (fault === "authentication") {
+              recoveryAuthenticationPending = true;
+              throw Object.assign(new Error("authentication write failure"), { code: "EWRITE" });
+            }
+            if (fault === "safety") {
+              actual.writeSync(descriptor, data, offset, length, position);
+              actual.linkSync(skillPath, aliasPath);
+              return 0;
+            }
+            actual.writeSync(descriptor, concurrent, 0, concurrent.length, 0);
+            return 0;
+          }
+          return actual.writeSync(descriptor, data, offset, length, position);
+        }) as typeof actual.writeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      let caught: unknown;
+      try {
+        module.installConnector("cursor", "cli", directory, { configPath, persistTransport: false });
+      } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(Error);
+      if (fault === "primitive") {
+        expect((caught as Error).message).toMatch(/primitive write failure.*pre-mutation restoration failed.*primitive restoration failure/iu);
+      } else if (fault === "coded") {
+        expect((caught as Error).message).toMatch(/coded write failure.*pre-mutation restoration failed.*coded restoration failure/iu);
+      } else if (fault === "authentication") {
+        expect((caught as Error).message).toMatch(/authentication write failure.*pre-mutation restoration failed.*recovery authentication unavailable/iu);
+      } else if (fault === "safety") {
+        expect((caught as Error).message).toMatch(/multiply linked/iu);
+        expect(readFileSync(aliasPath)).toEqual(readFileSync(skillPath));
+      } else {
+        expect((caught as Error).message).toMatch(/made no progress/iu);
+        expect(readFileSync(skillPath)).toEqual(concurrent);
+      }
+      expect(requestedWriteFailed).toBe(true);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("preserves a post-write safety failure when requested-state comparison faults", async () => {
+    const configPath = join(directory, "post-write-safety-read-config.json");
+    const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    let afterWrite = false;
+    let safetyInjected = false;
+    let currentAuthenticated = false;
+    let requestedStateStarted = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          const written = actual.writeSync(descriptor, data, offset, length, position);
+          if (isSkill(descriptor)) afterWrite = true;
+          return written;
+        }) as typeof actual.writeSync,
+        fstatSync: ((descriptor: number) => {
+          const stats = actual.fstatSync(descriptor);
+          if (!afterWrite || !isSkill(descriptor)) return stats;
+          if (!safetyInjected) {
+            safetyInjected = true;
+            return new Proxy(stats, {
+              get(target, property) {
+                if (property === "nlink") return 2;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          if (!currentAuthenticated) currentAuthenticated = true;
+          else requestedStateStarted = true;
+          return stats;
+        }) as typeof actual.fstatSync,
+        readSync: ((descriptor: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          if (requestedStateStarted && isSkill(descriptor)) {
+            requestedStateStarted = false;
+            throw Object.assign(new Error("injected safety comparison read failure"), { code: "EIO" });
+          }
+          return actual.readSync(descriptor, buffer, offset, length, position);
+        }) as typeof actual.readSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cursor", "cli", directory, {
+        configPath,
+        persistTransport: false,
+      })).toThrow(/multiply linked/iu);
+      expect(safetyInjected).toBe(true);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["capture", "capture", /pre-mutation state/iu],
+    ["final admission", "admission", /pre-mutation state/iu],
+  ] as const)("rejects descriptor drift at %s", async (_label, fault, message) => {
+    const configPath = join(directory, `${fault}-state-drift-config.json`);
+    const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    let writableDescriptor: number | undefined;
+    let writableReads = 0;
+    let postCaptureStats = 0;
+    let injected = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const descriptor = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          let displayPath = String(path);
+          const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(displayPath);
+          if (match) displayPath = join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]);
+          if (displayPath === skillPath && (Number(flags) & actual.constants.O_RDWR) !== 0) writableDescriptor = descriptor;
+          return descriptor;
+        }) as typeof actual.openSync,
+        readSync: ((descriptor: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          const read = actual.readSync(descriptor, buffer, offset, length, position);
+          if (descriptor === writableDescriptor) writableReads += 1;
+          return read;
+        }) as typeof actual.readSync,
+        fstatSync: ((descriptor: number) => {
+          const stats = actual.fstatSync(descriptor);
+          if (descriptor !== writableDescriptor || writableReads < 2 || injected) return stats;
+          postCaptureStats += 1;
+          if ((fault === "capture" && postCaptureStats === 1)
+            || (fault === "admission" && postCaptureStats === 2)) {
+            injected = true;
+            return new Proxy(stats, {
+              get(target, property) {
+                if (property === "size") return Number(target.size) + 1;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          return stats;
+        }) as typeof actual.fstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cursor", "cli", directory, {
+        configPath,
+        persistTransport: false,
+      })).toThrow(message);
+      expect(injected).toBe(true);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
   it("restores the retained original after ftruncate and write failures", async () => {
     const configPath = join(directory, "descriptor-errors-config.json");
     const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
@@ -2425,6 +2850,7 @@ describe("installer descriptor edge branches", () => {
     const initial = installConnector("cursor", "mcp", root, { configPath, persistTransport: false });
     const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
     let receiptFailureArmed = false;
+    let postWriteStats = 0;
 
     vi.resetModules();
     vi.doMock("node:fs", async () => {
@@ -2434,15 +2860,13 @@ describe("installer descriptor edge branches", () => {
       };
       return {
         ...actual,
-        ftruncateSync: ((descriptor: number, length?: number) => {
-          if (!receiptFailureArmed && isSkill(descriptor)) {
-            receiptFailureArmed = true;
-            throw Object.assign(new Error("injected truncate failure"), { code: "EIO" });
-          }
-          return actual.ftruncateSync(descriptor, length);
-        }) as typeof actual.ftruncateSync,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          const written = actual.writeSync(descriptor, data, offset, length, position);
+          if (isSkill(descriptor)) receiptFailureArmed = true;
+          return written;
+        }) as typeof actual.writeSync,
         fstatSync: ((descriptor: number) => {
-          if (receiptFailureArmed && isSkill(descriptor)) {
+          if (receiptFailureArmed && isSkill(descriptor) && ++postWriteStats === 3) {
             receiptFailureArmed = false;
             throw receiptFailure;
           }

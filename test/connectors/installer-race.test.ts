@@ -25,6 +25,17 @@ const mocks = vi.hoisted(() => ({
   swapTruncateReplacement: "",
   swapTruncateOriginal: "",
   swapTruncateOccurred: false,
+  linkBeforeTruncatePath: "",
+  linkBeforeTruncateAlias: "",
+  linkBeforeTruncateOccurred: false,
+  failEmergencyRestore: false,
+  linkedTruncateCalls: 0,
+  postWritePath: "",
+  postWriteAction: "",
+  postWriteBytes: "",
+  postWriteMode: 0,
+  postWriteArmed: false,
+  postWriteOccurred: false,
   unlinkCalls: 0,
 }));
 
@@ -64,9 +75,18 @@ vi.mock("node:fs", async (importOriginal) => {
       return descriptor;
     },
     ftruncateSync: (descriptor: number, length?: number) => {
+      let descriptorPath = "";
+      try { descriptorPath = actual.readlinkSync(`/proc/self/fd/${descriptor}`); } catch { /* not a tracked leaf */ }
+      if (descriptorPath === mocks.linkBeforeTruncatePath) {
+        mocks.linkedTruncateCalls += 1;
+        if (!mocks.linkBeforeTruncateOccurred) {
+          actual.linkSync(descriptorPath, mocks.linkBeforeTruncateAlias);
+          mocks.linkBeforeTruncateOccurred = true;
+        } else if (mocks.failEmergencyRestore) {
+          throw Object.assign(new Error("injected emergency restoration failure"), { code: "EIO" });
+        }
+      }
       if (mocks.swapTruncatePath && !mocks.swapTruncateOccurred) {
-        let descriptorPath = "";
-        try { descriptorPath = actual.readlinkSync(`/proc/self/fd/${descriptor}`); } catch { /* not a tracked leaf */ }
         if (descriptorPath === mocks.swapTruncatePath) {
           renameSync(mocks.swapTruncatePath, mocks.swapTruncateOriginal);
           renameSync(mocks.swapTruncateReplacement, mocks.swapTruncatePath);
@@ -75,6 +95,30 @@ vi.mock("node:fs", async (importOriginal) => {
       }
       return actual.ftruncateSync(descriptor, length);
     },
+    writeSync: (...args: Parameters<typeof actual.writeSync>) => {
+      const written = actual.writeSync(...args);
+      let descriptorPath = "";
+      try { descriptorPath = actual.readlinkSync(`/proc/self/fd/${args[0]}`); } catch { /* not a tracked leaf */ }
+      if (descriptorPath === mocks.postWritePath && !mocks.postWriteOccurred) mocks.postWriteArmed = true;
+      return written;
+    },
+    fstatSync: ((...args: Parameters<typeof actual.fstatSync>) => {
+      const descriptor = args[0];
+      let descriptorPath = "";
+      try { descriptorPath = actual.readlinkSync(`/proc/self/fd/${descriptor}`); } catch { /* not a tracked leaf */ }
+      if (descriptorPath === mocks.postWritePath && mocks.postWriteArmed && !mocks.postWriteOccurred) {
+        mocks.postWriteArmed = false;
+        mocks.postWriteOccurred = true;
+        if (mocks.postWriteAction === "bytes") {
+          const bytes = Buffer.from(mocks.postWriteBytes, "utf-8");
+          actual.ftruncateSync(descriptor, 0);
+          if (bytes.length > 0) actual.writeSync(descriptor, bytes, 0, bytes.length, 0);
+        } else if (mocks.postWriteAction === "mode") {
+          actual.fchmodSync(descriptor, mocks.postWriteMode);
+        }
+      }
+      return actual.fstatSync(...args);
+    }) as typeof actual.fstatSync,
     unlinkSync: (...args: Parameters<typeof actual.unlinkSync>) => {
       mocks.unlinkCalls += 1;
       return actual.unlinkSync(...args);
@@ -100,6 +144,17 @@ describe("Claude connector removal races", () => {
     mocks.swapTruncateReplacement = "";
     mocks.swapTruncateOriginal = "";
     mocks.swapTruncateOccurred = false;
+    mocks.linkBeforeTruncatePath = "";
+    mocks.linkBeforeTruncateAlias = "";
+    mocks.linkBeforeTruncateOccurred = false;
+    mocks.failEmergencyRestore = false;
+    mocks.linkedTruncateCalls = 0;
+    mocks.postWritePath = "";
+    mocks.postWriteAction = "";
+    mocks.postWriteBytes = "";
+    mocks.postWriteMode = 0;
+    mocks.postWriteArmed = false;
+    mocks.postWriteOccurred = false;
     mocks.unlinkCalls = 0;
     if (tempHome) rmSync(tempHome, { recursive: true, force: true });
     tempHome = "";
@@ -216,6 +271,101 @@ describe("Claude connector removal races", () => {
     expect(readConnectorTransport(configPath, "claude-code")).toBe("cli");
     expect(readFileSync(installed.path)).toEqual(installedBytes);
     expect(readFileSync(aliasPath)).toEqual(installedBytes);
+  });
+
+  it("restores connector and alias when a hard link appears at truncate", () => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-hard-link-truncate-"));
+    const installed = installConnector("claude-code", "skill", tempHome);
+    const aliasPath = join(tempHome, "truncate-race-alias.md");
+    const prior = readFileSync(installed.path);
+    chmodSync(installed.path, 0o640);
+
+    mocks.linkBeforeTruncatePath = installed.path;
+    mocks.linkBeforeTruncateAlias = aliasPath;
+
+    expect(() => removeConnector("claude-code", "skill", tempHome))
+      .toThrow(/multiply linked/iu);
+
+    expect(mocks.linkBeforeTruncateOccurred).toBe(true);
+    expect(mocks.linkedTruncateCalls).toBeGreaterThanOrEqual(2);
+    expect(readFileSync(installed.path)).toEqual(prior);
+    expect(readFileSync(aliasPath)).toEqual(prior);
+    expect(statSync(installed.path).mode & 0o777).toBe(0o640);
+    expect(statSync(aliasPath).mode & 0o777).toBe(0o640);
+  });
+
+  it("preserves concurrent bytes written before receipt creation", () => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-receipt-bytes-"));
+    const configPath = join(tempHome, "config.json");
+    const initial = installConnector("cursor", "mcp", tempHome, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    const concurrent = "concurrent user bytes\n";
+
+    mocks.postWritePath = skillPath;
+    mocks.postWriteAction = "bytes";
+    mocks.postWriteBytes = concurrent;
+
+    expect(() => installConnector("cursor", "cli", tempHome, { configPath, persistTransport: false }))
+      .toThrow(/requested.*state|concurrent mutation/iu);
+
+    expect(mocks.postWriteOccurred).toBe(true);
+    expect(readFileSync(skillPath, "utf-8")).toBe(concurrent);
+  });
+
+  it("preserves concurrent mode drift before receipt creation", () => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-receipt-mode-"));
+    const configPath = join(tempHome, "config.json");
+    const initial = installConnector("cursor", "mcp", tempHome, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    const prior = readFileSync(skillPath);
+    chmodSync(skillPath, 0o640);
+
+    mocks.postWritePath = skillPath;
+    mocks.postWriteAction = "mode";
+    mocks.postWriteMode = 0o600;
+
+    expect(() => installConnector("cursor", "cli", tempHome, { configPath, persistTransport: false }))
+      .toThrow(/requested.*state|concurrent mutation/iu);
+
+    expect(mocks.postWriteOccurred).toBe(true);
+    expect(readFileSync(skillPath)).not.toEqual(prior);
+    expect(statSync(skillPath).mode & 0o777).toBe(0o600);
+  });
+
+  it("uses an exact bytes-and-mode receipt for compensation", () => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-exact-receipt-"));
+    const configPath = join(tempHome, "config.json");
+    const initial = installConnector("cursor", "mcp", tempHome, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    const prior = readFileSync(skillPath);
+    chmodSync(skillPath, 0o640);
+
+    expect(() => installConnector("cursor", "cli", tempHome, {
+      configPath,
+      persistTransport: false,
+      failAt: "complete",
+    })).toThrow(/Injected connector installer failure/iu);
+
+    expect(readFileSync(skillPath)).toEqual(prior);
+    expect(statSync(skillPath).mode & 0o777).toBe(0o640);
+  });
+
+  it("reports emergency restoration failure after the primary hard-link failure", () => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-emergency-restore-failure-"));
+    const installed = installConnector("claude-code", "skill", tempHome);
+    const aliasPath = join(tempHome, "failed-restore-alias.md");
+
+    mocks.linkBeforeTruncatePath = installed.path;
+    mocks.linkBeforeTruncateAlias = aliasPath;
+    mocks.failEmergencyRestore = true;
+
+    let caught: unknown;
+    try { removeConnector("claude-code", "skill", tempHome); } catch (error) { caught = error; }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/multiply linked/iu);
+    expect((caught as Error).message).toMatch(/emergency restoration failed.*injected emergency restoration failure/iu);
+    expect(mocks.linkBeforeTruncateOccurred).toBe(true);
   });
 
   it("reports a strict skill replacement and retains the stored transport", () => {
