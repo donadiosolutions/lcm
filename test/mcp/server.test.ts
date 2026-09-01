@@ -68,6 +68,18 @@ describe("MCP tool definitions", () => {
     expect(tool!.description).toContain("episodic");
   });
 
+  it("advertises canonical search and grep contracts with defaults", () => {
+    const search = getMcpToolDefinitions().find((t: any) => t.name === "lcm_search") as any;
+    const grep = getMcpToolDefinitions().find((t: any) => t.name === "lcm_grep") as any;
+    expect(search.inputSchema.properties.layers.items.enum).toEqual(["episodic", "promoted"]);
+    expect(search.inputSchema.properties.layers.default).toEqual(["episodic", "promoted"]);
+    expect(grep.inputSchema.properties.scope.enum).toEqual(["messages", "summaries", "both"]);
+    expect(grep.inputSchema.properties.scope.default).toBe("both");
+    expect(search.description).toContain("promoted");
+    expect(search.description).not.toContain("Qdrant");
+    expect(search.description).not.toContain("semantic");
+  });
+
   it("lcm_store describes fields without embedding agent policy", () => {
     const tool = getMcpToolDefinitions().find((t: any) => t.name === "lcm_store");
     const description = tool!.inputSchema.properties.tags.description;

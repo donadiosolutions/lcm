@@ -26,6 +26,59 @@ type RetrievalSummaryStore = Pick<
   | "searchSummaries"
 >;
 
+/** Canonical memory layers exposed by search operations. */
+export const CANONICAL_SEARCH_LAYERS = Object.freeze(["episodic", "promoted"] as const);
+export type SearchLayer = (typeof CANONICAL_SEARCH_LAYERS)[number];
+/** Deprecated, non-advertised boundary alias; normalizes to promoted, whose canonical key is returned. */
+export type SearchLayerInput = SearchLayer | "semantic";
+export const DEFAULT_SEARCH_LAYERS = CANONICAL_SEARCH_LAYERS;
+
+/** Canonical conversation-history scopes exposed by grep operations. */
+export const CANONICAL_GREP_SCOPES = Object.freeze(["messages", "summaries", "both"] as const);
+export type GrepScope = (typeof CANONICAL_GREP_SCOPES)[number];
+/** Deprecated, non-advertised boundary alias accepted for compatibility. */
+export type GrepScopeInput = GrepScope | "all";
+export const DEFAULT_GREP_SCOPE: GrepScope = "both";
+
+/** Normalize search layers, rejecting malformed values before storage access. */
+export function normalizeSearchLayers(input: unknown): SearchLayer[] | null {
+  if (input === undefined) {
+    return [...DEFAULT_SEARCH_LAYERS];
+  }
+  if (!Array.isArray(input)) {
+    return null;
+  }
+
+  const normalized: SearchLayer[] = [];
+  for (const layer of input) {
+    if (typeof layer !== "string") {
+      return null;
+    }
+    const canonical = layer === "semantic" ? "promoted" : layer;
+    if (!CANONICAL_SEARCH_LAYERS.includes(canonical as SearchLayer)) {
+      return null;
+    }
+    if (!normalized.includes(canonical as SearchLayer)) {
+      normalized.push(canonical as SearchLayer);
+    }
+  }
+  return normalized;
+}
+
+/** Normalize grep scope, rejecting malformed values before storage access. */
+export function normalizeGrepScope(input: unknown): GrepScope | null {
+  if (input === undefined) {
+    return DEFAULT_GREP_SCOPE;
+  }
+  if (typeof input !== "string") {
+    return null;
+  }
+  if (input === "all") {
+    return "both";
+  }
+  return CANONICAL_GREP_SCOPES.includes(input as GrepScope) ? (input as GrepScope) : null;
+}
+
 // ── Public interfaces ────────────────────────────────────────────────────────
 
 export interface DescribeResult {
@@ -79,7 +132,7 @@ export interface DescribeResult {
 export interface GrepInput {
   query: string;
   mode: "regex" | "full_text";
-  scope: "messages" | "summaries" | "both";
+  scope: GrepScope;
   conversationId?: number;
   since?: Date;
   before?: Date;
@@ -249,12 +302,14 @@ export class RetrievalEngine {
       messages = await this.conversationStore.searchMessages(searchInput);
     } else if (scope === "summaries") {
       summaries = await this.summaryStore.searchSummaries(searchInput);
-    } else {
+    } else if (scope === "both") {
       // scope === "both" — run in parallel
       [messages, summaries] = await Promise.all([
         this.conversationStore.searchMessages(searchInput),
         this.summaryStore.searchSummaries(searchInput),
       ]);
+    } else {
+      throw new Error("Invalid grep scope");
     }
 
     messages.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
