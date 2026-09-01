@@ -178,6 +178,65 @@ describe("mocked server states unavailable from Node HTTP", () => {
     expect(state.closeFactory).toHaveBeenCalledOnce();
   });
 
+  it("retries a rejected storage factory close on a later stop", async () => {
+    const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }));
+    let rejectControlledClose!: (reason?: unknown) => void;
+    const controlledClose = new Promise<void>((_resolve, reject) => { rejectControlledClose = reject; });
+    let signalCloseStarted!: () => void;
+    const closeStarted = new Promise<void>(resolve => { signalCloseStarted = resolve; });
+    let totalCalls = 0;
+    let activeCalls = 0;
+    let maxActiveCalls = 0;
+    let firstStopSettled = false;
+    const startedStops: Promise<void>[] = [];
+
+    try {
+      state.closeFactory.mockImplementation(async () => {
+        totalCalls += 1;
+        activeCalls += 1;
+        maxActiveCalls = Math.max(maxActiveCalls, activeCalls);
+        try {
+          if (totalCalls === 1) {
+            signalCloseStarted();
+            void controlledClose.catch(() => undefined);
+            await controlledClose;
+          }
+        } finally {
+          activeCalls -= 1;
+        }
+      });
+
+      const firstStop = daemon.stop().then(() => { firstStopSettled = true; });
+      startedStops.push(firstStop);
+      await closeStarted;
+      const secondStop = daemon.stop();
+      startedStops.push(secondStop);
+      await secondStop;
+
+      expect(firstStopSettled).toBe(false);
+      expect(totalCalls).toBe(1);
+      expect(activeCalls).toBe(1);
+      expect(maxActiveCalls).toBe(1);
+
+      rejectControlledClose(new Error("controlled close failure"));
+      await firstStop;
+      expect(firstStopSettled).toBe(true);
+
+      const retryStop = daemon.stop();
+      startedStops.push(retryStop);
+      await retryStop;
+      expect(totalCalls).toBe(2);
+      const idempotentStop = daemon.stop();
+      startedStops.push(idempotentStop);
+      await idempotentStop;
+      expect(totalCalls).toBe(2);
+    } finally {
+      rejectControlledClose(new Error("cleanup close failure"));
+      await Promise.allSettled(startedStops);
+      state.closeFactory.mockReset().mockResolvedValue(undefined);
+    }
+  });
+
   it("uses the first value of an authorization header array", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-server-array-auth-"));
     const lcmDir = join(dir, ".lcm");

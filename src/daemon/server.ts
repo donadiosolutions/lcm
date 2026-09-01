@@ -617,7 +617,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const closeStorageFactory = async (): Promise<void> => {
     if (storageFactoryClosed) return;
     storageFactoryClosed = true;
-    await storageFactory.close();
+    try {
+      await storageFactory.close();
+    } catch (error) {
+      storageFactoryClosed = false;
+      throw error;
+    }
   };
   try {
   const routes = new Map<string, RegisteredRoute>();
