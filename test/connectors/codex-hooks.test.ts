@@ -198,6 +198,67 @@ describe("Codex hook configuration boundaries", () => {
     }
   });
 
+  it.each([
+    ["non-file descriptor", "non-file"],
+    ["changed descriptor device", "device"],
+    ["changed descriptor inode", "inode"],
+  ] as const)("rejects a %s after reading and restores exact state", async (_label, fault) => {
+    installCodexHooks(hooksPath, configPath);
+    chmodSync(hooksPath, 0o640);
+    const installed = readFileSync(hooksPath);
+    let injectNextStat = false;
+    let initialReadCompleted = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isHooksDescriptor = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === hooksPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        fstatSync: ((descriptor: number) => {
+          const value = actual.fstatSync(descriptor);
+          if (!isHooksDescriptor(descriptor) || !injectNextStat) return value;
+          injectNextStat = false;
+          return new Proxy(value, {
+            get(target, property) {
+              if (property === "isFile" && fault === "non-file") return () => false;
+              if (property === "dev" && fault === "device") return Number(target.dev) + 1;
+              if (property === "ino" && fault === "inode") return Number(target.ino) + 1;
+              return Reflect.get(target, property, target);
+            },
+          });
+        }) as typeof actual.fstatSync,
+        readSync: ((descriptor: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number | null) => {
+          const count = actual.readSync(descriptor, buffer, offset, length, position);
+          if (!initialReadCompleted
+            && isHooksDescriptor(descriptor)
+            && typeof position === "number"
+            && position + count === installed.length) {
+            initialReadCompleted = true;
+            injectNextStat = true;
+          }
+          return count;
+        }) as typeof actual.readSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      let caught: unknown;
+      try { module.removeCodexHooks(hooksPath); } catch (error) { caught = error; }
+      expect(initialReadCompleted).toBe(true);
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toBe(`Codex hooks descriptor identity changed at ${hooksPath}`);
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
+      expect(readFileSync(hooksPath)).toEqual(installed);
+      expect(statSync(hooksPath).mode & 0o777).toBe(0o640);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
   it("rejects hooks larger than 4 MiB before allocation or mutation", async () => {
     installCodexHooks(hooksPath, configPath);
     const installed = readFileSync(hooksPath);
@@ -299,6 +360,129 @@ describe("Codex hook configuration boundaries", () => {
     try {
       const module = await import("../../src/connectors/codex-hooks.js");
       expect(() => module.removeCodexHooks(hooksPath)).toThrow(/made no progress/iu);
+      expect(readFileSync(hooksPath)).toEqual(installed);
+      expect(statSync(hooksPath).mode & 0o777).toBe(0o640);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["changed mode", "mode", "made no progress", false],
+    ["changed size", "size", "injected primitive write failure", true],
+  ] as const)("reports a %s during restoration verification", async (
+    _label,
+    fault,
+    primaryContext,
+    primitivePrimary,
+  ) => {
+    installCodexHooks(hooksPath, configPath);
+    chmodSync(hooksPath, 0o640);
+    const installed = readFileSync(hooksPath);
+    let primaryFailed = false;
+    let verifyRestorationMetadata = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isHooksDescriptor = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === hooksPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        fchmodSync: ((descriptor: number, mode: number) => {
+          const result = actual.fchmodSync(descriptor, mode);
+          if (isHooksDescriptor(descriptor)) verifyRestorationMetadata = true;
+          return result;
+        }) as typeof actual.fchmodSync,
+        fstatSync: ((descriptor: number) => {
+          const value = actual.fstatSync(descriptor);
+          if (!isHooksDescriptor(descriptor) || !verifyRestorationMetadata) return value;
+          verifyRestorationMetadata = false;
+          return new Proxy(value, {
+            get(target, property) {
+              if (property === "mode" && fault === "mode") return Number(target.mode) ^ 0o001;
+              if (property === "size" && fault === "size") return Number(target.size) + 1;
+              return Reflect.get(target, property, target);
+            },
+          });
+        }) as typeof actual.fstatSync,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          if (isHooksDescriptor(descriptor) && !primaryFailed) {
+            primaryFailed = true;
+            if (primitivePrimary) throw "injected primitive write failure";
+            return 0;
+          }
+          return actual.writeSync(descriptor, data, offset, length, position);
+        }) as typeof actual.writeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      let caught: unknown;
+      try { module.removeCodexHooks(hooksPath); } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toContain("Codex hooks restoration failed");
+      expect((caught as Error).message).toContain(primaryContext);
+      expect((caught as Error).message).toContain(hooksPath);
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
+      expect(readFileSync(hooksPath)).toEqual(installed);
+      expect(statSync(hooksPath).mode & 0o777).toBe(0o640);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["short restored read", "short-read"],
+    ["mismatched restored bytes", "mismatched-bytes"],
+  ] as const)("reports %s during restoration verification", async (_label, fault) => {
+    installCodexHooks(hooksPath, configPath);
+    chmodSync(hooksPath, 0o640);
+    const installed = readFileSync(hooksPath);
+    let primaryFailed = false;
+    let restorationWritten = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isHooksDescriptor = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === hooksPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        readSync: ((descriptor: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number | null) => {
+          if (isHooksDescriptor(descriptor) && restorationWritten && fault === "short-read") return 0;
+          const count = actual.readSync(descriptor, buffer, offset, length, position);
+          if (isHooksDescriptor(descriptor) && restorationWritten && count > 0) {
+            (buffer as Uint8Array)[offset] ^= 0xff;
+          }
+          return count;
+        }) as typeof actual.readSync,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          if (!isHooksDescriptor(descriptor)) return actual.writeSync(descriptor, data, offset, length, position);
+          if (!primaryFailed) {
+            primaryFailed = true;
+            return 0;
+          }
+          const count = actual.writeSync(descriptor, data, offset, length, position);
+          if (count === length) restorationWritten = true;
+          return count;
+        }) as typeof actual.writeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      let caught: unknown;
+      try { module.removeCodexHooks(hooksPath); } catch (error) { caught = error; }
+      expect(restorationWritten).toBe(true);
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toContain("Codex hooks restoration failed");
+      expect((caught as Error).message).toContain("made no progress");
+      expect((caught as Error).message).toContain(hooksPath);
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
       expect(readFileSync(hooksPath)).toEqual(installed);
       expect(statSync(hooksPath).mode & 0o777).toBe(0o640);
     } finally {
