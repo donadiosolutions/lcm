@@ -775,7 +775,7 @@ class ConnectorMutationAuthority {
     }
 
     try {
-      const stats = descriptorStats(descriptor, displayPath);
+      const stats = mutationDescriptorStats(descriptor, displayPath);
       if (registered.state === "regular"
         && (stats.dev !== registered.dev || stats.ino !== registered.ino)) {
         throw new ConnectorPathChangedError(displayPath);
@@ -844,7 +844,8 @@ class ConnectorMutationAuthority {
         }
 
         if (lease.initial.state === "regular") {
-          writeDescriptor(lease.descriptor, lease.initial.content);
+          writeDescriptor(lease.descriptor, lease.path, lease.initial.content);
+          mutationDescriptorStats(lease.descriptor, lease.path);
           fchmodSync(lease.descriptor, lease.initial.mode);
           const restoredStats = descriptorStats(lease.descriptor, lease.path);
           const restored = readDescriptor(lease.descriptor, lease.path);
@@ -859,7 +860,7 @@ class ConnectorMutationAuthority {
             failures.push(`${lease.path}: public path no longer identifies the restored original inode`);
           }
         } else {
-          writeDescriptor(lease.descriptor, Buffer.alloc(0));
+          writeDescriptor(lease.descriptor, lease.path, Buffer.alloc(0));
           failures.push(`${lease.path}: physical absence cannot be safely restored; created inode was neutralized`);
         }
       } catch (error) {
@@ -945,7 +946,7 @@ function recordDescriptorMutation(filePath: string, handle: MutationDescriptor):
 function mutateDescriptor(filePath: string, handle: MutationDescriptor, content: Buffer): Buffer {
   activeMutationAuthority!.beginMutation(handle.lease);
   try {
-    writeDescriptor(handle.descriptor, content);
+    writeDescriptor(handle.descriptor, filePath, content);
   } catch (error) {
     try { activeMutationAuthority!.recordMutation(handle.lease); } catch { /* preserve the write failure */ }
     throw error;
@@ -956,6 +957,14 @@ function mutateDescriptor(filePath: string, handle: MutationDescriptor, content:
 function descriptorStats(descriptor: number, filePath: string): ReturnType<typeof fstatSync> {
   const stats = fstatSync(descriptor);
   if (!stats.isFile()) throw skillCollision(filePath);
+  return stats;
+}
+
+function mutationDescriptorStats(descriptor: number, filePath: string): ReturnType<typeof fstatSync> {
+  const stats = descriptorStats(descriptor, filePath);
+  if (stats.nlink !== 1) {
+    throw new Error(`Refusing connector mutation through a multiply linked file at ${filePath}`);
+  }
   return stats;
 }
 
@@ -975,10 +984,12 @@ function readDescriptor(descriptor: number, filePath: string): Buffer {
   return offset === size ? content : content.subarray(0, offset);
 }
 
-function writeDescriptor(descriptor: number, content: Buffer): void {
+function writeDescriptor(descriptor: number, filePath: string, content: Buffer): void {
+  mutationDescriptorStats(descriptor, filePath);
   ftruncateSync(descriptor, 0);
   let offset = 0;
   while (offset < content.length) {
+    mutationDescriptorStats(descriptor, filePath);
     const bytesWritten = writeSync(descriptor, content, offset, content.length - offset, offset);
     if (bytesWritten <= 0) throw new Error("LCM connector write made no progress");
     offset += bytesWritten;

@@ -1,6 +1,7 @@
 import {
   closeSync,
   constants,
+  fchmodSync,
   fstatSync,
   ftruncateSync,
   lstatSync,
@@ -18,6 +19,8 @@ import type { ConnectorTransport } from "./types.js";
 export const CODEX_HOOKS_PATH = "~/.codex/hooks.json";
 export const CODEX_CONFIG_PATH = "~/.codex/config.toml";
 export const LEGACY_CODEX_HOOKS_PATHS = [".codex/hooks.json"] as const;
+
+const MAX_CODEX_HOOKS_BYTES = 4 * 1024 * 1024;
 
 export type CodexPostToolHookState = "absent" | "incomplete" | "installed";
 
@@ -290,6 +293,81 @@ export function installCodexHooks(
   writeFileSync(hooksPath, mergeCodexHooksContent(existing, transport));
 }
 
+type CodexHooksDescriptorIdentity = Readonly<{
+  dev: number | bigint;
+  ino: number | bigint;
+}>;
+
+function assertCodexHooksMutationDescriptor(
+  descriptor: number,
+  hooksPath: string,
+  identity: CodexHooksDescriptorIdentity,
+): ReturnType<typeof fstatSync> {
+  const stats = fstatSync(descriptor);
+  if (!stats.isFile() || stats.dev !== identity.dev || stats.ino !== identity.ino) {
+    throw new Error(`Codex hooks descriptor identity changed at ${hooksPath}`);
+  }
+  if (stats.nlink !== 1) {
+    throw new Error(`Refusing connector mutation through a multiply linked file at ${hooksPath}`);
+  }
+  return stats;
+}
+
+function writeCodexHooksDescriptor(
+  descriptor: number,
+  hooksPath: string,
+  identity: CodexHooksDescriptorIdentity,
+  content: Buffer,
+): void {
+  assertCodexHooksMutationDescriptor(descriptor, hooksPath, identity);
+  ftruncateSync(descriptor, 0);
+  let offset = 0;
+  while (offset < content.length) {
+    assertCodexHooksMutationDescriptor(descriptor, hooksPath, identity);
+    const count = writeSync(descriptor, content, offset, content.length - offset, offset);
+    if (count <= 0) throw new Error(`Codex hooks write made no progress at ${hooksPath}`);
+    offset += count;
+  }
+}
+
+function readCodexHooksDescriptor(
+  descriptor: number,
+  size: number,
+): Buffer | undefined {
+  const bytes = Buffer.alloc(size);
+  let offset = 0;
+  while (offset < size) {
+    const count = readSync(descriptor, bytes, offset, size - offset, offset);
+    if (count <= 0) return undefined;
+    offset += count;
+  }
+  return bytes;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function restoreCodexHooksDescriptor(
+  descriptor: number,
+  hooksPath: string,
+  identity: CodexHooksDescriptorIdentity,
+  content: Buffer,
+  mode: number,
+): void {
+  writeCodexHooksDescriptor(descriptor, hooksPath, identity, content);
+  assertCodexHooksMutationDescriptor(descriptor, hooksPath, identity);
+  fchmodSync(descriptor, mode);
+  const restoredStats = assertCodexHooksMutationDescriptor(descriptor, hooksPath, identity);
+  if ((Number(restoredStats.mode) & 0o777) !== mode || restoredStats.size !== content.length) {
+    throw new Error(`Codex hooks restoration verification failed at ${hooksPath}`);
+  }
+  const restored = readCodexHooksDescriptor(descriptor, content.length);
+  if (!restored?.equals(content)) {
+    throw new Error(`Codex hooks restoration verification failed at ${hooksPath}`);
+  }
+}
+
 export function removeCodexHooks(hooksPath: string): boolean {
   let descriptor: number;
   try {
@@ -303,24 +381,37 @@ export function removeCodexHooks(hooksPath: string): boolean {
   try {
     const before = fstatSync(descriptor);
     if (!before.isFile()) return false;
+    if (before.nlink !== 1) {
+      throw new Error(`Refusing connector mutation through a multiply linked file at ${hooksPath}`);
+    }
     const size = Number(before.size);
     if (!Number.isSafeInteger(size) || size < 0) return false;
-    const bytes = Buffer.alloc(size);
-    let offset = 0;
-    while (offset < size) {
-      const count = readSync(descriptor, bytes, offset, size - offset, offset);
-      if (count <= 0) return false;
-      offset += count;
+    if (size > MAX_CODEX_HOOKS_BYTES) {
+      throw new Error(`Refusing to read Codex hooks larger than 4 MiB at ${hooksPath}`);
     }
+    const bytes = readCodexHooksDescriptor(descriptor, size);
+    if (!bytes) return false;
     const result = removeCodexHooksContent(bytes.toString("utf-8"));
     if (result.state === "unchanged") return false;
     const updated = Buffer.from(result.state === "remove" ? "{}\n" : result.content, "utf-8");
-    ftruncateSync(descriptor, 0);
-    offset = 0;
-    while (offset < updated.length) {
-      const count = writeSync(descriptor, updated, offset, updated.length - offset, offset);
-      if (count <= 0) return false;
-      offset += count;
+    const identity = { dev: before.dev, ino: before.ino };
+    try {
+      writeCodexHooksDescriptor(descriptor, hooksPath, identity, updated);
+    } catch (primaryError) {
+      try {
+        restoreCodexHooksDescriptor(
+          descriptor,
+          hooksPath,
+          identity,
+          bytes,
+          Number(before.mode) & 0o777,
+        );
+      } catch (restorationError) {
+        throw new Error(
+          `Codex hooks restoration failed at ${hooksPath} after ${errorMessage(primaryError)}: ${errorMessage(restorationError)}`,
+        );
+      }
+      throw primaryError;
     }
     const after = fstatSync(descriptor);
     if (after.dev !== before.dev || after.ino !== before.ino) return false;

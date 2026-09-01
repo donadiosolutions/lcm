@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   chmodSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -187,6 +188,34 @@ describe("Claude connector removal races", () => {
     expect(mocks.swapOpenOccurred).toBe(true);
     expect(readFileSync(installed.path, "utf-8")).toContain("replacement");
     expect(() => readFileSync(replacement, "utf-8")).toThrow(/ENOENT/iu);
+  });
+
+  it("refuses direct removal through a multiply linked retained skill descriptor", () => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-hard-link-remove-"));
+    const configPath = join(tempHome, "config.json");
+    const installed = installConnector("claude-code", "skill", tempHome);
+    const aliasPath = join(tempHome, "skill-alias.md");
+    const installedBytes = readFileSync(installed.path);
+    linkSync(installed.path, aliasPath);
+
+    let caught: unknown;
+    try { removeConnector("claude-code", "skill", tempHome); } catch (error) { caught = error; }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain(installed.path);
+    expect((caught as Error).message).not.toContain("/proc/self/fd/");
+    expect(readFileSync(installed.path)).toEqual(installedBytes);
+    expect(readFileSync(aliasPath)).toEqual(installedBytes);
+
+    setConnectorTransport(configPath, "claude-code", "cli");
+    const result = removeConnector("claude-code", { cwd: tempHome, configPath });
+    expect(result).toEqual(expect.objectContaining({
+      success: false,
+      failures: expect.arrayContaining([expect.stringMatching(/skill:/iu)]),
+    }));
+    expect(readConnectorTransport(configPath, "claude-code")).toBe("cli");
+    expect(readFileSync(installed.path)).toEqual(installedBytes);
+    expect(readFileSync(aliasPath)).toEqual(installedBytes);
   });
 
   it("reports a strict skill replacement and retains the stored transport", () => {
@@ -380,6 +409,38 @@ describe("Claude connector removal races", () => {
     expect(readFileSync(skillPath, "utf-8")).toBe("public sentinel\n");
     expect(readFileSync(original)).toEqual(prior);
     expect(statSync(original).mode & 0o777).toBe(0o640);
+  });
+
+  it("refuses rollback restoration after the retained inode gains a hard link", () => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-hard-link-rollback-"));
+    const configPath = join(tempHome, "config.json");
+    const initial = installConnector("cursor", "mcp", tempHome, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    const aliasPath = join(tempHome, "rollback-skill-alias.md");
+    const prior = readFileSync(skillPath);
+    let staged = Buffer.alloc(0);
+
+    let caught: unknown;
+    try {
+      installConnector("cursor", "cli", tempHome, {
+        configPath,
+        persistTransport: false,
+        failAt: "complete",
+        onPhase: (phase) => {
+          if (phase !== "complete") return;
+          staged = readFileSync(skillPath);
+          linkSync(skillPath, aliasPath);
+        },
+      });
+    } catch (error) { caught = error; }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("rollback incomplete");
+    expect((caught as Error).message).toContain(skillPath);
+    expect((caught as Error).message).not.toContain("/proc/self/fd/");
+    expect(staged).not.toEqual(prior);
+    expect(readFileSync(skillPath)).toEqual(staged);
+    expect(readFileSync(aliasPath)).toEqual(staged);
   });
 
   it("neutralizes an originally absent created inode while preserving a rollback replacement", () => {

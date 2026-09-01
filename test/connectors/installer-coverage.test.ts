@@ -2174,6 +2174,63 @@ describe("installer descriptor edge branches", () => {
     }
   });
 
+  it("rechecks link count after lease acquisition and before the first mutation", async () => {
+    const configPath = join(directory, "post-lease-hard-link-config.json");
+    const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    const aliasPath = join(directory, "post-lease-skill-alias.md");
+    const prior = readFileSync(skillPath);
+    let writableDescriptor: number | undefined;
+    let writableStats = 0;
+    let aliasCreated = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const descriptor = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          let displayPath = String(path);
+          const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(displayPath);
+          if (match) displayPath = join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]);
+          if (displayPath === skillPath && (Number(flags) & actual.constants.O_RDWR) !== 0) {
+            writableDescriptor = descriptor;
+          }
+          return descriptor;
+        }) as typeof actual.openSync,
+        fstatSync: ((descriptor: number) => {
+          const value = actual.fstatSync(descriptor);
+          if (descriptor === writableDescriptor) {
+            writableStats += 1;
+            if (writableStats === 2) {
+              actual.linkSync(skillPath, aliasPath);
+              aliasCreated = true;
+            }
+          }
+          return value;
+        }) as typeof actual.fstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      let caught: unknown;
+      try {
+        module.installConnector("cursor", "cli", directory, { configPath, persistTransport: false });
+      } catch (error) { caught = error; }
+
+      expect(aliasCreated).toBe(true);
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toContain(skillPath);
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
+      expect(readFileSync(skillPath)).toEqual(prior);
+      expect(readFileSync(aliasPath)).toEqual(prior);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
   it("restores the retained original after ftruncate and write failures", async () => {
     const configPath = join(directory, "descriptor-errors-config.json");
     const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });

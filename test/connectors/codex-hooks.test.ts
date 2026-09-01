@@ -1,5 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -129,6 +139,219 @@ describe("Codex hook configuration boundaries", () => {
     expect(removeCodexHooks(hooksPath)).toBe(false);
   });
 
+  it("refuses to mutate a multiply linked hook file", () => {
+    installCodexHooks(hooksPath, configPath);
+    const aliasPath = join(dir, "hooks-alias.json");
+    const installed = readFileSync(hooksPath);
+    linkSync(hooksPath, aliasPath);
+
+    let caught: unknown;
+    try { removeCodexHooks(hooksPath); } catch (error) { caught = error; }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain(hooksPath);
+    expect((caught as Error).message).not.toContain("/proc/self/fd/");
+    expect(readFileSync(hooksPath)).toEqual(installed);
+    expect(readFileSync(aliasPath)).toEqual(installed);
+  });
+
+  it("rechecks link count after reading and before standalone mutation", async () => {
+    installCodexHooks(hooksPath, configPath);
+    const aliasPath = join(dir, "late-hooks-alias.json");
+    const installed = readFileSync(hooksPath);
+    let aliasCreated = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isHooksDescriptor = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === hooksPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        readSync: ((descriptor: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number | null) => {
+          const count = actual.readSync(descriptor, buffer, offset, length, position);
+          if (!aliasCreated
+            && isHooksDescriptor(descriptor)
+            && typeof position === "number"
+            && position + count === installed.length) {
+            actual.linkSync(hooksPath, aliasPath);
+            aliasCreated = true;
+          }
+          return count;
+        }) as typeof actual.readSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      let caught: unknown;
+      try { module.removeCodexHooks(hooksPath); } catch (error) { caught = error; }
+      expect(aliasCreated).toBe(true);
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toContain(hooksPath);
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
+      expect(readFileSync(hooksPath)).toEqual(installed);
+      expect(readFileSync(aliasPath)).toEqual(installed);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("rejects hooks larger than 4 MiB before allocation or mutation", async () => {
+    installCodexHooks(hooksPath, configPath);
+    const installed = readFileSync(hooksPath);
+    let truncateCalls = 0;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        fstatSync: ((descriptor: number) => {
+          const value = actual.fstatSync(descriptor);
+          return new Proxy(value, {
+            get(target, property) {
+              if (property === "size") return (4 * 1024 * 1024) + 1;
+              return Reflect.get(target, property, target);
+            },
+          });
+        }) as typeof actual.fstatSync,
+        ftruncateSync: ((...args: Parameters<typeof actual.ftruncateSync>) => {
+          truncateCalls += 1;
+          return actual.ftruncateSync(...args);
+        }) as typeof actual.ftruncateSync,
+      };
+    });
+    const allocation = vi.spyOn(Buffer, "alloc");
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      expect(() => module.removeCodexHooks(hooksPath)).toThrow(hooksPath);
+      expect(allocation).not.toHaveBeenCalled();
+      expect(truncateCalls).toBe(0);
+      expect(readFileSync(hooksPath)).toEqual(installed);
+    } finally {
+      allocation.mockRestore();
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("continues positive short writes until the complete hook document is written", async () => {
+    installCodexHooks(hooksPath, configPath);
+    let shortWrites = 0;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isHooksDescriptor = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === hooksPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          if (!isHooksDescriptor(descriptor)) return actual.writeSync(descriptor, data, offset, length, position);
+          shortWrites += 1;
+          const count = Math.min(length, 1);
+          return actual.writeSync(descriptor, data, offset, count, position);
+        }) as typeof actual.writeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      expect(module.removeCodexHooks(hooksPath)).toBe(true);
+      expect(shortWrites).toBeGreaterThan(1);
+      expect(readFileSync(hooksPath, "utf-8")).toBe("{}\n");
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["zero progress", false],
+    ["partial progress followed by zero", true],
+  ] as const)("restores exact bytes and mode after %s", async (_label, partialFirst) => {
+    installCodexHooks(hooksPath, configPath);
+    chmodSync(hooksPath, 0o640);
+    const installed = readFileSync(hooksPath);
+    let writeCalls = 0;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isHooksDescriptor = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === hooksPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          if (!isHooksDescriptor(descriptor)) return actual.writeSync(descriptor, data, offset, length, position);
+          writeCalls += 1;
+          if (partialFirst && writeCalls === 1) {
+            return actual.writeSync(descriptor, data, offset, Math.min(length, 2), position);
+          }
+          if (writeCalls === (partialFirst ? 2 : 1)) return 0;
+          return actual.writeSync(descriptor, data, offset, length, position);
+        }) as typeof actual.writeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      expect(() => module.removeCodexHooks(hooksPath)).toThrow(/made no progress/iu);
+      expect(readFileSync(hooksPath)).toEqual(installed);
+      expect(statSync(hooksPath).mode & 0o777).toBe(0o640);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("reports restoration failure with the primary write context", async () => {
+    installCodexHooks(hooksPath, configPath);
+    let targetTruncates = 0;
+    let primaryFailed = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isHooksDescriptor = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === hooksPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          if (isHooksDescriptor(descriptor)) {
+            targetTruncates += 1;
+            if (targetTruncates === 2) throw new Error("injected restoration truncate failure");
+          }
+          return actual.ftruncateSync(descriptor, length);
+        }) as typeof actual.ftruncateSync,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          if (isHooksDescriptor(descriptor) && !primaryFailed) {
+            primaryFailed = true;
+            return 0;
+          }
+          return actual.writeSync(descriptor, data, offset, length, position);
+        }) as typeof actual.writeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      let caught: unknown;
+      try { module.removeCodexHooks(hooksPath); } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toMatch(/restor.*fail/iu);
+      expect((caught as Error).message).toContain("made no progress");
+      expect((caught as Error).message).toContain(hooksPath);
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
+      expect((caught as Error & { cause?: unknown }).cause).toBeUndefined();
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
   it("keeps a public replacement byte-for-byte when removal begins on the authenticated descriptor", async () => {
     installCodexHooks(hooksPath, configPath);
     const replacement = join(dir, "replacement-hooks.json");
@@ -171,10 +394,8 @@ describe("Codex hook configuration boundaries", () => {
 
   it.each([
     ["non-file descriptor", "non-file", "unchanged"],
-    ["oversized descriptor", "oversized", "unchanged"],
     ["negative descriptor size", "negative", "unchanged"],
     ["short descriptor read", "short-read", "unchanged"],
-    ["zero-progress descriptor write", "short-write", "empty"],
     ["changed descriptor identity", "changed-identity", "neutral"],
     ["unreadable public leaf", "unreadable-leaf", "neutral"],
   ] as const)("fails closed for a %s without unlinking by pathname", async (_label, fault, expected) => {
@@ -198,15 +419,15 @@ describe("Codex hook configuration boundaries", () => {
               },
             });
           }
-          if (fstatCalls === 1 && (fault === "oversized" || fault === "negative")) {
+          if (fstatCalls === 1 && fault === "negative") {
             return new Proxy(value, {
               get(target, property) {
-                if (property === "size") return fault === "oversized" ? Number.MAX_SAFE_INTEGER + 1 : -1;
+                if (property === "size") return -1;
                 return Reflect.get(target, property, target);
               },
             });
           }
-          if (fstatCalls === 2 && fault === "changed-identity") {
+          if (fstatCalls === 4 && fault === "changed-identity") {
             return new Proxy(value, {
               get(target, property) {
                 if (property === "ino") return Number(target.ino) + 1;
@@ -219,9 +440,6 @@ describe("Codex hook configuration boundaries", () => {
         readSync: ((...args: Parameters<typeof actual.readSync>) => (
           fault === "short-read" ? 0 : actual.readSync(...args)
         )) as typeof actual.readSync,
-        writeSync: ((...args: Parameters<typeof actual.writeSync>) => (
-          fault === "short-write" ? 0 : actual.writeSync(...args)
-        )) as typeof actual.writeSync,
         lstatSync: ((path: Parameters<typeof actual.lstatSync>[0], options?: Parameters<typeof actual.lstatSync>[1]) => {
           if (fault === "unreadable-leaf" && String(path) === hooksPath) {
             throw Object.assign(new Error("leaf denied"), { code: "EACCES" });
