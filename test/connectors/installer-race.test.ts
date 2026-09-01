@@ -291,7 +291,8 @@ describe("Claude connector removal races", () => {
     tempHome = mkdtempSync(join(tmpdir(), "lcm-codex-hook-strict-race-"));
     process.env.HOME = tempHome;
     const configPath = join(tempHome, "config.json");
-    const installed = installConnector("codex", "cli", tempHome, { configPath });
+    const codexMcpRunner = { get: () => [] };
+    const installed = installConnector("codex", "cli", tempHome, { configPath, codexMcpRunner });
     const hookPath = installed.paths!.find((path) => path.endsWith("hooks.json"))!;
     const replacement = join(tempHome, "strict-hook-replacement.json");
     const original = join(tempHome, "strict-authenticated-hooks.json");
@@ -300,7 +301,7 @@ describe("Claude connector removal races", () => {
     mocks.swapTruncatePath = hookPath;
     mocks.swapTruncateReplacement = replacement;
     mocks.swapTruncateOriginal = original;
-    const result = removeConnector("codex", { cwd: tempHome, configPath });
+    const result = removeConnector("codex", { cwd: tempHome, configPath, codexMcpRunner });
 
     expect(result).toEqual(expect.objectContaining({
       success: false,
