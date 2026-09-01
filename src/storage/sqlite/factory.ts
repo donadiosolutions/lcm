@@ -177,6 +177,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       ...[...this.projects].map((project) => project.health()),
       ...idleProjects.map((project) => this.probeKnownProject(project)),
     ]);
+    if (this.closed) return { status: "closed", backend: "sqlite" };
     const unavailable = projectHealth.find((health) => health.status === "unavailable");
     if (!unavailable) return { status: "healthy", backend: "sqlite" };
     return {

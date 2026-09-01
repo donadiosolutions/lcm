@@ -280,9 +280,10 @@ raw driver errors, SQL text, or bound values. Operation failures follow the same
 rule: useful diagnostics may name the backend, project identity, and repository
 domain, but secret-bearing and dialect-specific details remain inside the
 adapter and logs' existing safety boundaries.
-Once factory shutdown begins, an in-flight factory health probe reports the
-closed state and exposes no runtime detail, even if the underlying probe later
-settles with a healthy, unavailable, or failed result.
+For PostgreSQL and SQLite, once factory shutdown begins, an in-flight factory
+health probe reports only the closed state and exposes no project or runtime
+detail, even if an underlying probe later settles healthy, unavailable, or
+failed. Factory shutdown does not wait for otherwise unbounded health probes.
 For PostgreSQL and SQLite, once project shutdown begins, project health reports
 the closed state with the project identity and exposes no query detail, even if
 its probe settles later. A failed SQLite project close clears the in-progress
