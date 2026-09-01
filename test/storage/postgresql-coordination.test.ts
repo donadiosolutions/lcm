@@ -16,7 +16,11 @@ import {
   PostgreSqlLeaseFenceError,
   PostgreSqlWorkCoordinator,
 } from "../../src/storage/postgresql/coordination.js";
-import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
+import {
+  normalizePostgreSqlError,
+  PostgreSqlStorageOperationError,
+} from "../../src/storage/postgresql/errors.js";
+import { PostgreSqlCoordinationRepository } from "../../src/storage/postgresql/memory-repositories.js";
 import { StorageOperationError } from "../../src/storage/errors.js";
 
 const projectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
@@ -124,6 +128,64 @@ function coordinator(
 }
 
 describe("PostgreSQL work coordination", () => {
+  it("retains repository machine identity when normalizing driver cancellation", async () => {
+    const driverError = Object.assign(
+      new Error("private SQL message with bound secret and postgres://url"),
+      {
+        code: "57014",
+        detail: "secret detail",
+        schema: "private_schema",
+        table: "private_table",
+        routine: "private_routine",
+        address: "10.0.0.7",
+      },
+    );
+    const harness = rootExecutor(() => { throw driverError; });
+    const repository = new PostgreSqlCoordinationRepository(
+      harness.executor,
+      projectId,
+      machineId,
+    );
+
+    await expect(repository.getSessionIngest("session-a"))
+      .rejects.toBe(driverError);
+    const context = harness.query.mock.calls[0]?.[1] as PostgreSqlQueryOptions;
+    const normalized = normalizePostgreSqlError(driverError, context);
+    expect(normalized).toBeInstanceOf(PostgreSqlStorageOperationError);
+    expect(normalized).toMatchObject({
+      projectId,
+      domain: "coordination",
+      operation: "getSessionIngest",
+      machineId,
+      sqlState: "57014",
+      retryable: false,
+    });
+    expect(normalized.toJSON()).toEqual({
+      name: "StorageOperationError",
+      code: "STORAGE_OPERATION_FAILED",
+      backend: "postgresql",
+      projectId,
+      domain: "coordination",
+      operation: "getSessionIngest",
+      retryable: false,
+      message: `postgresql coordination operation failed for project ${projectId}`,
+      sqlState: "57014",
+      machineId,
+    });
+    const serialized = JSON.stringify(normalized);
+    for (const canary of [
+      "private SQL message",
+      "secret detail",
+      "private_schema",
+      "private_table",
+      "private_routine",
+      "10.0.0.7",
+      "postgres://url",
+    ]) {
+      expect(serialized).not.toContain(canary);
+    }
+  });
+
   it("derives trigger-compatible deterministic project lock names", () => {
     expect(
       derivePostgreSqlAdvisoryLockName(

@@ -7,6 +7,7 @@ import {
   type PostgreSqlTransactionOptions,
   type PostgreSqlTransactionScopeExecutor,
 } from "../../src/storage/postgresql/index.js";
+import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
 
 const PROJECT_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
 const MACHINE_ID = "0195d250-0000-7000-8000-000000000002";
@@ -84,6 +85,81 @@ class FakeRuntime implements PostgreSqlProjectStorageRuntime {
 }
 
 describe("PostgreSqlProjectStorage", () => {
+  it("aborts and awaits a coordination repository operation with project and machine identity", async () => {
+    let queryObserved!: () => void;
+    const observed = new Promise<void>((resolve) => { queryObserved = resolve; });
+    let operationRejected!: (error: unknown) => void;
+    const runtime = new FakeRuntime(async (_config, options) => {
+      queryObserved();
+      await new Promise<never>((_resolve, reject) => {
+        operationRejected = reject;
+        options.signal?.addEventListener("abort", () => {
+          reject(new PostgreSqlStorageOperationError(
+            "STORAGE_OPERATION_FAILED",
+            {
+              domain: options.domain,
+              operation: options.operation,
+              projectId: options.projectId,
+              machineId: options.machineId,
+            },
+            null,
+            false,
+          ));
+        }, { once: true });
+      });
+    });
+    const storage = new PostgreSqlProjectStorage(
+      runtime,
+      PROJECT_ID,
+      MACHINE_ID,
+      () => undefined,
+    );
+    const operation = storage.coordination.getSessionIngest("session-secret");
+    await queryObserved;
+    const closing = storage.close();
+    await expect(operation).rejects.toMatchObject({
+      projectId: PROJECT_ID,
+      domain: "coordination",
+      operation: "getSessionIngest",
+      machineId: MACHINE_ID,
+      sqlState: null,
+      retryable: false,
+    });
+    await expect(closing).resolves.toBeUndefined();
+    expect(runtime.queryConfigs).toHaveLength(1);
+    expect(runtime.queryOptions[0]).toMatchObject({
+      domain: "coordination",
+      operation: "getSessionIngest",
+      projectId: PROJECT_ID,
+      machineId: MACHINE_ID,
+      signal: expect.any(AbortSignal),
+    });
+    const serialized = JSON.stringify(await operation.catch((error) => error));
+    expect(Object.keys(JSON.parse(serialized)).sort()).toEqual([
+      "backend",
+      "code",
+      "domain",
+      "machineId",
+      "message",
+      "name",
+      "operation",
+      "projectId",
+      "retryable",
+      "sqlState",
+    ]);
+    for (const canary of [
+      "session-secret",
+      "SELECT ingest_key",
+      "private driver cancellation",
+      "postgres://private",
+      "10.0.0.8",
+      "bound-resource",
+    ]) {
+      expect(serialized).not.toContain(canary);
+    }
+    expect(operationRejected).toBeDefined();
+  });
+
   it("composes the complete public project repository facade", async () => {
     const runtime = new FakeRuntime();
     const storage = new PostgreSqlProjectStorage(
