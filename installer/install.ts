@@ -630,7 +630,8 @@ function historicalSkillDigest(content: string): string {
 }
 
 function ownedCanonicalSkill(existing: string, generated: string): boolean {
-  return existing === generated
+  return existing.length === 0
+    || existing === generated
     || hasCanonicalSkillMarker(existing)
     || LCM_HISTORICAL_SKILL_SHA256.includes(
       historicalSkillDigest(existing) as (typeof LCM_HISTORICAL_SKILL_SHA256)[number],
