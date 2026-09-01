@@ -139,6 +139,10 @@ describe("MCP service coverage", () => {
       expect(mocks.post).toHaveBeenCalledWith("/search", {
         query: "needle", limit: 2, cwd: "/coverage/project",
       });
+      await call("lcm_grep", { query: "needle", mode: "regex", ignored: "secret" });
+      expect(mocks.post).toHaveBeenLastCalledWith("/grep", {
+        query: "needle", mode: "regex", cwd: "/coverage/project",
+      });
       await expect(call("not_a_tool", { ignored: true })).resolves.toMatchObject({
         isError: true,
         content: [{ text: "Unknown tool: not_a_tool" }],
