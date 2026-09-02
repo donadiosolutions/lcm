@@ -6,6 +6,13 @@ small and visible: use `lcm doctor` to inspect the installation and
 offline process-kill protocol, and a PID or pathname by itself is never
 authority to stop a process.
 
+Daemon cleanup coalesces concurrent close initiation, and a successful close
+remains latched; if the selected storage factory reports a close failure, a
+second attempt in the same terminal cleanup pass retries it. PostgreSQL is
+currently retryable because it clears its failed close memo, while SQLite close
+is permanently memoized over `Promise.allSettled` and cannot reject. No API,
+configuration, or schema migration is involved.
+
 ## Service-manager ownership
 
 On Linux, a normal background start is owned by the current user's

@@ -617,7 +617,16 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const closeStorageFactory = async (): Promise<void> => {
     if (storageFactoryClosed) return;
     storageFactoryClosed = true;
-    await storageFactory.close();
+    try {
+      await storageFactory.close();
+    } catch (error) {
+      storageFactoryClosed = false;
+      throw error;
+    }
+  };
+  const closeStorageFactoryForTerminalCleanup = async (): Promise<void> => {
+    await settleCleanup(closeStorageFactory);
+    await settleCleanup(closeStorageFactory);
   };
   try {
   const routes = new Map<string, RegisteredRoute>();
@@ -1027,7 +1036,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     if (proxyManager) {
       await settleCleanup(() => proxyManager.stop());
     }
-    await settleCleanup(closeStorageFactory);
+    await closeStorageFactoryForTerminalCleanup();
   };
 
   return await new Promise((resolve, reject) => {
@@ -1076,7 +1085,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
             await settleCleanup(() => proxyManager.stop());
           }
           await settleCleanup(() => serverClosed);
-          await settleCleanup(closeStorageFactory);
+          await closeStorageFactoryForTerminalCleanup();
         },
         registerRoute: (method, path, handler, requestedAdmission) => {
           const key = `${method} ${path}`;
@@ -1113,7 +1122,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       const processor = constructedProcessor;
       await settleCleanup(() => processor.stopAndWait());
     }
-    await settleCleanup(closeStorageFactory);
+    await closeStorageFactoryForTerminalCleanup();
     throw error;
   }
 }
