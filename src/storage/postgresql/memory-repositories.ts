@@ -491,6 +491,7 @@ class RepositoryAccess {
     private readonly executor: RepositoryExecutor,
     projectId: string,
     private readonly domain: RepositoryDomain,
+    private readonly machineId?: string,
   ) {
     this.projectId = uuidV7(
       projectId,
@@ -506,6 +507,7 @@ class RepositoryAccess {
       domain: this.domain,
       operation,
       projectId: this.projectId,
+      ...(this.machineId === undefined ? {} : { machineId: this.machineId }),
     };
   }
 
@@ -1785,6 +1787,7 @@ implements CoordinationRepository {
       executor,
       this.projectId,
       "coordination",
+      this.machineId,
     );
   }
 
