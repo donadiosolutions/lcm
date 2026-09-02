@@ -723,6 +723,11 @@ class ConnectorMutationAuthority {
     return this.operations.has(displayPath);
   }
 
+  private recordReceipt(displayPath: string, receipt: ConnectorLeafReceipt): void {
+    if (!this.receipts.has(displayPath)) this.mutationOrder.push(displayPath);
+    this.receipts.set(displayPath, receipt);
+  }
+
   mutate(displayPath: string, decide: (base: ConnectorLeafState) => ConnectorLeafDecision): ConnectorLeafMutationResult {
     const operationPath = this.operationPath(displayPath);
     const parentOperationPath = this.parentOperations.get(displayPath);
@@ -733,17 +738,21 @@ class ConnectorMutationAuthority {
       if (!snapshot || snapshot.state === "non-file") throw skillCollision(displayPath);
       return snapshot.state === "absent" ? { state: "absent" as const } : snapshot;
     })();
-    const result = mutateConnectorLeaf({
-      displayPath,
-      operationPath,
-      parentOperationPath,
-      expected,
-      decide,
-    }, prior);
-    if (result.changed) {
-      this.receipts.set(displayPath, result.receipt);
-      if (!prior) this.mutationOrder.push(displayPath);
+    let result: ConnectorLeafMutationResult;
+    try {
+      result = mutateConnectorLeaf({
+        displayPath,
+        operationPath,
+        parentOperationPath,
+        expected,
+        decide,
+      }, prior);
+    } catch (error) {
+      const receipt = (error as Error & { connectorLeafReceipt?: ConnectorLeafReceipt }).connectorLeafReceipt;
+      if (receipt?.mutationCommitted) this.recordReceipt(displayPath, receipt);
+      throw error;
     }
+    if (result.changed) this.recordReceipt(displayPath, result.receipt);
     return result;
   }
 
@@ -757,10 +766,17 @@ class ConnectorMutationAuthority {
 
   compensateOwnedFiles(): string[] {
     const failures: string[] = [];
+    const compensated: ConnectorLeafReceipt[] = [];
     for (const path of [...this.mutationOrder].reverse()) {
       const receipt = this.receipts.get(path);
       if (!receipt) continue;
-      failures.push(...compensateConnectorLeaf(receipt));
+      const receiptFailures = compensateConnectorLeaf(receipt);
+      if (receiptFailures.length > 0) failures.push(...receiptFailures);
+      else compensated.push(receipt);
+    }
+    for (const receipt of compensated) {
+      const cleanupFailures = finalizeConnectorLeaf(receipt);
+      failures.push(...cleanupFailures.map((failure) => `compensated receipt finalization: ${failure}`));
     }
     return failures;
   }

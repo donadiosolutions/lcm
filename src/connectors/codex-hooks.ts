@@ -17,7 +17,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { ConnectorTransport } from "./types.js";
 
@@ -331,7 +331,9 @@ export type ConnectorLeafReceipt = {
   readonly transactionDisplayPath: string;
   readonly transactionOperationPath: string;
   initialHoldOperationPath?: string;
+  initialHoldState?: Extract<ConnectorLeafState, { state: "regular" }>;
   currentHoldOperationPath?: string;
+  currentHoldState?: Extract<ConnectorLeafState, { state: "regular" }>;
   mutationCommitted: boolean;
   recoveryRequired: boolean;
 };
@@ -410,8 +412,14 @@ function validateTransactionDirectory(tx: { operation: string; display: string }
   }
 }
 
-function stageCandidate(path: string, content: Buffer, mode: number): void {
-  const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK, mode);
+function stageCandidate(
+  path: string,
+  content: Buffer,
+  mode: number,
+  applyUmask: boolean,
+): Extract<ConnectorLeafState, { state: "regular" }> {
+  const effectiveMode = applyUmask ? mode & ~process.umask() : mode;
+  const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK, effectiveMode);
   try {
     let offset = 0;
     while (offset < content.length) {
@@ -419,17 +427,24 @@ function stageCandidate(path: string, content: Buffer, mode: number): void {
       if (count <= 0) throw new Error("connector candidate write made no progress");
       offset += count;
     }
-    fchmodSync(fd, mode);
+    fchmodSync(fd, effectiveMode);
     fsyncSync(fd);
     const stats = fstatSync(fd);
-    if (!stats.isFile() || leafMode(stats) !== mode || Number(stats.size) !== content.length) throw new Error("connector candidate verification failed");
+    if (!stats.isFile() || leafMode(stats) !== effectiveMode || Number(stats.size) !== content.length) throw new Error("connector candidate verification failed");
     const readback = readLeaf(fd, content.length);
     if (!readback.equals(content)) throw new Error("connector candidate readback mismatch");
     const after = fstatSync(fd);
     if (!after.isFile() || after.dev !== stats.dev || after.ino !== stats.ino
-      || leafMode(after) !== mode || Number(after.size) !== content.length) {
+      || leafMode(after) !== effectiveMode || Number(after.size) !== content.length) {
       throw new Error("connector candidate changed while being staged");
     }
+    return {
+      state: "regular",
+      content: Buffer.from(readback),
+      mode: effectiveMode,
+      dev: stats.dev,
+      ino: stats.ino,
+    };
   } finally { closeSync(fd); }
 }
 
@@ -446,11 +461,47 @@ function sanitizeLeafError(error: unknown, operation: ConnectorLeafOperation, tx
   return wrapped;
 }
 
-function unlinkPublicIfExact(publicPath: string, candidatePath: string, displayPath: string): void {
-  const publicState = captureConnectorLeaf(displayPath, publicPath);
-  const candidateState = captureConnectorLeaf(displayPath, candidatePath);
-  if (publicState.state === "regular" && candidateState.state === "regular" && stateEqual(publicState, candidateState)) {
-    safeUnlink(publicPath);
+function recoveryDisplayPath(tx: { operation: string; display: string }, operationPath: string): string {
+  return join(tx.display, basename(operationPath));
+}
+
+function republishMovedEntry(
+  hold: string,
+  operation: Pick<ConnectorLeafOperation, "displayPath" | "operationPath">,
+  tx: { operation: string; display: string },
+  context: string,
+): Error {
+  const recoveryPath = recoveryDisplayPath(tx, hold);
+  try {
+    linkSync(hold, operation.operationPath);
+  } catch (error) {
+    const detail = String(error);
+    return new Error(`${context} at ${operation.displayPath}; recovery artifact retained at ${recoveryPath} (${detail})`);
+  }
+  try {
+    safeUnlink(hold);
+    return new Error(`${context} at ${operation.displayPath}; recovery republished the moved entry without replacement`);
+  } catch (error) {
+    const detail = String(error);
+    return new Error(`${context} at ${operation.displayPath}; recovery artifact retained at ${recoveryPath} (${detail})`);
+  }
+}
+
+function unlinkPrivateIfExact(
+  path: string,
+  expected: Extract<ConnectorLeafState, { state: "regular" }>,
+  displayPath: string,
+  tx: { operation: string; display: string },
+): string | undefined {
+  try {
+    const observed = captureConnectorLeaf(displayPath, path);
+    if (!stateEqual(observed, expected)) {
+      return `${displayPath}: cleanup incomplete; recovery artifact retained at ${recoveryDisplayPath(tx, path)}`;
+    }
+    safeUnlink(path);
+    return undefined;
+  } catch {
+    return `${displayPath}: cleanup incomplete; recovery artifact retained at ${recoveryDisplayPath(tx, path)}`;
   }
 }
 
@@ -459,7 +510,7 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
   const observed = captureConnectorLeaf(operation.displayPath, operation.operationPath);
   if (!stateEqual(observed, expected)) throw Object.assign(new Error(`Connector path changed before mutation at ${operation.displayPath}`), { code: "EAGAIN" });
   const decision = operation.decide({ ...observed, ...(observed.state === "regular" ? { content: Buffer.from(observed.content) } : {}) });
-  if (decision.state === "unchanged") {
+  if (decision.state === "unchanged" || (decision.state === "absent" && observed.state === "absent")) {
     if (priorReceipt) return { changed: false, receipt: priorReceipt };
     return {
       changed: false,
@@ -478,68 +529,116 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
   }
   const tx = priorReceipt ? { operation: priorReceipt.transactionOperationPath, display: priorReceipt.transactionDisplayPath } : transactionDir(operation.parentOperationPath, dirname(operation.displayPath));
   const candidate = decision.state === "regular" ? join(tx.operation, `candidate-${Date.now()}-${randomBytes(4).toString("hex")}`) : undefined;
+  let publicationCommitted = false;
+  let committedReceipt: ConnectorLeafReceipt | undefined;
+  let validatedHold: string | undefined;
   try {
     validateTransactionDirectory(tx);
+    let stagedState: Extract<ConnectorLeafState, { state: "regular" }> | undefined;
     if (candidate) {
       const regularDecision = decision as Extract<ConnectorLeafDecision, { state: "regular" }>;
-      stageCandidate(candidate, regularDecision.content, regularDecision.mode);
+      stagedState = stageCandidate(candidate, regularDecision.content, regularDecision.mode, expected.state === "absent");
     }
     let hold: string | undefined;
     if (expected.state === "regular") {
       const holdName = priorReceipt ? `superseded-${randomBytes(4).toString("hex")}` : "initial";
       hold = join(tx.operation, holdName);
       renameSync(operation.operationPath, hold);
-      const claimed = captureConnectorLeaf(operation.displayPath, hold);
-      if (!stateEqual(claimed, expected)) {
-        try { linkSync(hold, operation.operationPath); } catch { /* retain recovery artifact */ }
-        throw new Error(`Connector leaf claim validation failed at ${operation.displayPath}`);
+      let claimed: ConnectorLeafState | undefined;
+      try { claimed = captureConnectorLeaf(operation.displayPath, hold); } catch { /* recovery below */ }
+      if (!claimed || !stateEqual(claimed, expected)) {
+        throw republishMovedEntry(hold, operation, tx, "Connector leaf claim validation failed");
       }
+      validatedHold = hold;
     }
     if (decision.state === "regular") {
       try { linkSync(candidate!, operation.operationPath); }
       catch (error) { throw error; }
-      const publicState = captureConnectorLeaf(operation.displayPath, operation.operationPath);
-      const candidateState = captureConnectorLeaf(operation.displayPath, candidate!);
-      if (!stateEqual(publicState, candidateState)) {
-        unlinkPublicIfExact(operation.operationPath, candidate!, operation.displayPath);
-        throw new Error(`Connector candidate publication verification failed at ${operation.displayPath}`);
-      }
-      const receipt: ConnectorLeafReceipt = {
+      publicationCommitted = true;
+      const priorCurrentHold = priorReceipt?.currentHoldOperationPath;
+      const receipt: ConnectorLeafReceipt = priorReceipt ?? {
         displayPath: operation.displayPath,
         operationPath: operation.operationPath,
         parentOperationPath: operation.parentOperationPath,
-        initial: priorReceipt?.initial ?? expected,
-        current: publicState,
+        initial: expected,
+        current: stagedState!,
         transactionDisplayPath: tx.display,
         transactionOperationPath: tx.operation,
-        initialHoldOperationPath: priorReceipt?.initialHoldOperationPath ?? (expected.state === "regular" ? hold : undefined),
-        currentHoldOperationPath: candidate,
         mutationCommitted: true,
         recoveryRequired: false,
       };
-      if (priorReceipt?.currentHoldOperationPath && priorReceipt.currentHoldOperationPath !== candidate) safeUnlink(priorReceipt.currentHoldOperationPath);
-      if (hold && hold !== receipt.initialHoldOperationPath) safeUnlink(hold);
+      if (!receipt.initialHoldOperationPath && receipt.initial.state === "regular") {
+        receipt.initialHoldOperationPath = hold;
+        receipt.initialHoldState = receipt.initial;
+      }
+      receipt.current = stagedState!;
+      receipt.currentHoldOperationPath = candidate;
+      receipt.currentHoldState = stagedState!;
+      receipt.mutationCommitted = true;
+      committedReceipt = receipt;
+      const publicState = captureConnectorLeaf(operation.displayPath, operation.operationPath);
+      const candidateState = captureConnectorLeaf(operation.displayPath, candidate!);
+      if (publicState.state !== "regular" || candidateState.state !== "regular"
+        || !stateEqual(publicState, candidateState)) {
+        throw new Error(`Connector candidate publication verification failed at ${operation.displayPath}`);
+      }
+      receipt.current = publicState;
+      receipt.currentHoldState = publicState;
+      const cleanupFailures: string[] = [];
+      if (priorCurrentHold && priorCurrentHold !== candidate && expected.state === "regular") {
+        const failure = unlinkPrivateIfExact(priorCurrentHold, expected, operation.displayPath, tx);
+        if (failure) cleanupFailures.push(failure);
+      }
+      if (hold && hold !== receipt.initialHoldOperationPath && expected.state === "regular") {
+        const failure = unlinkPrivateIfExact(hold, expected, operation.displayPath, tx);
+        if (failure) cleanupFailures.push(failure);
+      }
+      if (cleanupFailures.length > 0) {
+        receipt.recoveryRequired = true;
+        throw new Error(cleanupFailures.join("; "));
+      }
       return { changed: true, content: decision.content, receipt };
     }
-    const receipt: ConnectorLeafReceipt = {
+    const priorCurrentHold = priorReceipt?.currentHoldOperationPath;
+    const receipt: ConnectorLeafReceipt = priorReceipt ?? {
       displayPath: operation.displayPath,
       operationPath: operation.operationPath,
       parentOperationPath: operation.parentOperationPath,
-      initial: priorReceipt?.initial ?? expected,
+      initial: expected,
       current: { state: "absent" },
       transactionDisplayPath: tx.display,
       transactionOperationPath: tx.operation,
-      initialHoldOperationPath: priorReceipt?.initialHoldOperationPath ?? (expected.state === "regular" ? hold : undefined),
-      currentHoldOperationPath: hold,
       mutationCommitted: true,
       recoveryRequired: false,
     };
-    if (priorReceipt?.currentHoldOperationPath && priorReceipt.currentHoldOperationPath !== hold) safeUnlink(priorReceipt.currentHoldOperationPath);
+    if (!receipt.initialHoldOperationPath && receipt.initial.state === "regular") {
+      receipt.initialHoldOperationPath = hold;
+      receipt.initialHoldState = receipt.initial;
+    }
+    receipt.current = { state: "absent" };
+    receipt.currentHoldOperationPath = hold;
+    receipt.currentHoldState = expected as Extract<ConnectorLeafState, { state: "regular" }>;
+    receipt.mutationCommitted = true;
+    if (priorCurrentHold && priorCurrentHold !== hold && expected.state === "regular") {
+      const failure = unlinkPrivateIfExact(priorCurrentHold, expected, operation.displayPath, tx);
+      if (failure) {
+        receipt.recoveryRequired = true;
+        throw new Error(failure);
+      }
+    }
     return { changed: true, receipt };
   } catch (error) {
-    const primary = sanitizeLeafError(error, operation, tx);
+    const failure = validatedHold && decision.state === "regular" && !publicationCommitted
+      ? republishMovedEntry(
+        validatedHold,
+        operation,
+        tx,
+        `Connector candidate publication failed (${String(error)})`,
+      )
+      : error;
+    const primary = sanitizeLeafError(failure, operation, tx);
     const cleanupFailures: string[] = [];
-    if (candidate) {
+    if (candidate && !publicationCommitted) {
       try { safeUnlink(candidate); }
       catch (cleanupError) { cleanupFailures.push(`candidate cleanup failed (${sanitizeLeafError(cleanupError, operation, tx).message})`); }
     }
@@ -552,33 +651,69 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
       }
     }
     if (cleanupFailures.length > 0) primary.message = `${primary.message}; ${cleanupFailures.join("; ")}`;
+    if (committedReceipt) {
+      committedReceipt.recoveryRequired = true;
+      Object.assign(primary, { connectorLeafReceipt: committedReceipt });
+    }
     throw primary;
   }
 }
 
 export function compensateConnectorLeaf(receipt: ConnectorLeafReceipt): readonly string[] {
   const failures: string[] = [];
+  let rollbackHold: string | undefined;
+  let rollbackClaimed = false;
+  let compensationCommitted = false;
   try {
     if (!receipt.mutationCommitted) return failures;
+    let initialHold: string | undefined;
+    if (receipt.initial.state === "regular") {
+      initialHold = receipt.initialHoldOperationPath;
+      if (!initialHold) throw new Error("initial hold unavailable");
+      const retainedInitial = captureConnectorLeaf(receipt.displayPath, initialHold);
+      if (!stateEqual(retainedInitial, receipt.initial)) throw new Error("initial hold changed");
+    }
     if (receipt.current.state === "regular") {
       const now = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
       if (!stateEqual(now, receipt.current)) throw new Error("current receipt changed");
-      const rollbackHold = join(receipt.transactionOperationPath, `rollback-${randomBytes(4).toString("hex")}`);
+      rollbackHold = join(receipt.transactionOperationPath, `rollback-${randomBytes(4).toString("hex")}`);
       renameSync(receipt.operationPath, rollbackHold);
-      const claimed = captureConnectorLeaf(receipt.displayPath, rollbackHold);
-      if (!stateEqual(claimed, receipt.current)) throw new Error("current receipt changed after rollback claim");
+      let claimed: ConnectorLeafState | undefined;
+      try { claimed = captureConnectorLeaf(receipt.displayPath, rollbackHold); } catch { /* recovery below */ }
+      if (!claimed || !stateEqual(claimed, receipt.current)) {
+        const recoveryFailure = republishMovedEntry(
+          rollbackHold,
+          {
+            displayPath: receipt.displayPath,
+            operationPath: receipt.operationPath,
+          },
+          { operation: receipt.transactionOperationPath, display: receipt.transactionDisplayPath },
+          "current receipt changed after rollback claim",
+        );
+        rollbackHold = undefined;
+        throw recoveryFailure;
+      }
+      rollbackClaimed = true;
       if (receipt.initial.state === "regular") {
-        if (!receipt.initialHoldOperationPath) throw new Error("initial hold unavailable");
-        linkSync(receipt.initialHoldOperationPath, receipt.operationPath);
+        linkSync(initialHold!, receipt.operationPath);
+        compensationCommitted = true;
         const restored = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
         if (!stateEqual(restored, receipt.initial)) throw new Error("initial receipt restoration mismatch");
+      } else {
+        compensationCommitted = true;
       }
-      safeUnlink(rollbackHold);
+      const cleanupFailure = unlinkPrivateIfExact(
+        rollbackHold,
+        receipt.current,
+        receipt.displayPath,
+        { operation: receipt.transactionOperationPath, display: receipt.transactionDisplayPath },
+      );
+      if (cleanupFailure) throw new Error(cleanupFailure);
     } else if (receipt.initial.state === "regular") {
-      if (!receipt.initialHoldOperationPath) throw new Error("initial hold unavailable");
       const now = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
       if (now.state !== "absent") throw new Error("current receipt changed");
-      linkSync(receipt.initialHoldOperationPath, receipt.operationPath);
+      linkSync(initialHold!, receipt.operationPath);
+      compensationCommitted = true;
       const restored = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
       if (!stateEqual(restored, receipt.initial)) throw new Error("initial receipt restoration mismatch");
     } else {
@@ -587,7 +722,15 @@ export function compensateConnectorLeaf(receipt: ConnectorLeafReceipt): readonly
     }
   } catch (error) {
     receipt.recoveryRequired = true;
-    const message = error instanceof Error ? error.message : String(error);
+    const failure = rollbackHold && rollbackClaimed && !compensationCommitted
+      ? republishMovedEntry(
+        rollbackHold,
+        { displayPath: receipt.displayPath, operationPath: receipt.operationPath },
+        { operation: receipt.transactionOperationPath, display: receipt.transactionDisplayPath },
+        `rollback failed (${String(error)})`,
+      )
+      : error;
+    const message = failure instanceof Error ? failure.message : String(failure);
     failures.push(`${receipt.displayPath}: rollback incomplete (${message})`);
   }
   return failures;
@@ -595,11 +738,34 @@ export function compensateConnectorLeaf(receipt: ConnectorLeafReceipt): readonly
 
 export function finalizeConnectorLeaf(receipt: ConnectorLeafReceipt): readonly string[] {
   const failures: string[] = [];
-  for (const path of new Set([receipt.currentHoldOperationPath, receipt.initialHoldOperationPath])) {
-    if (!path) continue;
-    try { safeUnlink(path); } catch (error) { failures.push(`${receipt.displayPath}: cleanup failed at ${receipt.transactionDisplayPath}`); }
+  const tx = { operation: receipt.transactionOperationPath, display: receipt.transactionDisplayPath };
+  const holds = new Map<string, Extract<ConnectorLeafState, { state: "regular" }> | undefined>();
+  if (receipt.currentHoldOperationPath) {
+    holds.set(
+      receipt.currentHoldOperationPath,
+      receipt.currentHoldState ?? (receipt.current.state === "regular" ? receipt.current : undefined),
+    );
   }
-  try { rmdirSync(receipt.transactionOperationPath); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") failures.push(`${receipt.displayPath}: cleanup failed at ${receipt.transactionDisplayPath}`); }
+  if (receipt.initialHoldOperationPath) {
+    holds.set(
+      receipt.initialHoldOperationPath,
+      receipt.initialHoldState ?? (receipt.initial.state === "regular" ? receipt.initial : undefined),
+    );
+  }
+  for (const [path, expected] of holds) {
+    if (!expected) {
+      failures.push(`${receipt.displayPath}: cleanup incomplete; recovery artifact retained at ${recoveryDisplayPath(tx, path)}`);
+      continue;
+    }
+    const failure = unlinkPrivateIfExact(path, expected, receipt.displayPath, tx);
+    if (failure) failures.push(failure);
+  }
+  try { rmdirSync(receipt.transactionOperationPath); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" && failures.length === 0) {
+      failures.push(`${receipt.displayPath}: cleanup incomplete; recovery artifact retained at ${receipt.transactionDisplayPath}`);
+    }
+  }
+  if (failures.length > 0) receipt.recoveryRequired = true;
   return failures;
 }
 

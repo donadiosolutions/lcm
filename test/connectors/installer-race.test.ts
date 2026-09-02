@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   chmodSync,
+  existsSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -160,6 +162,62 @@ describe("Claude connector removal races", () => {
     tempHome = "";
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
+  });
+
+  it("compensates a first publication that fails receipt verification", async () => {
+    tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-first-receipt-"));
+    const rulesPath = join(tempHome, ".clinerules", "lcm.md");
+    let publicationArmed = false;
+    const descriptors = new Map<number, boolean>();
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const display = (value: import("node:fs").PathLike): string => {
+        const text = String(value);
+        const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(text);
+        if (!match) return text;
+        try { return join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { return text; }
+      };
+      return {
+        ...actual,
+        linkSync: ((existing: import("node:fs").PathLike, target: import("node:fs").PathLike) => {
+          const result = actual.linkSync(existing, target);
+          if (String(existing).includes("candidate-") && display(target) === rulesPath) publicationArmed = true;
+          return result;
+        }) as typeof actual.linkSync,
+        openSync: ((path: import("node:fs").PathLike, flags: import("node:fs").OpenMode, mode?: number) => {
+          const fd = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          const failIdentity = publicationArmed && display(path) === rulesPath;
+          if (failIdentity) publicationArmed = false;
+          descriptors.set(fd, failIdentity);
+          return fd;
+        }) as typeof actual.openSync,
+        fstatSync: ((fd: number, options?: import("node:fs").StatOptions) => {
+          const stats = actual.fstatSync(fd, options as never);
+          if (!descriptors.get(fd)) return stats;
+          return new Proxy(stats, {
+            get: (target, property) => property === "ino"
+              ? Number(target.ino) + 1
+              : Reflect.get(target, property, target),
+          });
+        }) as typeof actual.fstatSync,
+        closeSync: ((fd: number) => {
+          descriptors.delete(fd);
+          return actual.closeSync(fd);
+        }) as typeof actual.closeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cline", "cli", tempHome, {
+        persistTransport: false,
+      })).toThrow(/publication verification failed/iu);
+      expect(existsSync(rulesPath)).toBe(false);
+      expect(readdirSync(dirname(rulesPath)).filter((entry) => entry.startsWith(".lcm-connector-txn-"))).toEqual([]);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
   });
 
   it("treats settings that disappear during removal as already absent", () => {

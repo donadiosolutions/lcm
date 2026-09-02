@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -3036,6 +3037,40 @@ describe("installer descriptor edge branches", () => {
       const root = join(directory, "final-cleanup-failure");
       expect(() => module.installConnector("cline", "rules", root)).toThrow(/connector cleanup incomplete/iu);
       expect(readFileSync(join(root, ".clinerules", "lcm.md"), "utf-8")).toContain("lcm");
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("reports cleanup failure after successful bundle compensation", async () => {
+    let denyTransactionRemoval = false;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        rmdirSync: ((path: fs.PathLike) => {
+          if (denyTransactionRemoval && String(path).includes(".lcm-connector-txn-")) {
+            throw Object.assign(new Error("compensated transaction cleanup denied"), { code: "EIO" });
+          }
+          return actual.rmdirSync(path);
+        }) as typeof actual.rmdirSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      const root = join(directory, "compensated-cleanup-failure");
+      const rulesPath = join(root, ".clinerules", "lcm.md");
+      expect(() => module.installConnector("cline", "cli", root, {
+        persistTransport: false,
+        failAt: "complete",
+        onPhase: (phase) => {
+          if (phase === "complete") denyTransactionRemoval = true;
+        },
+      })).toThrow(/compensated receipt finalization.*cleanup incomplete/iu);
+      expect(existsSync(rulesPath)).toBe(false);
+      expect(readdirSync(dirname(rulesPath)).filter((entry) => entry.startsWith(".lcm-connector-txn-"))).toHaveLength(1);
     } finally {
       vi.doUnmock("node:fs");
       vi.resetModules();
