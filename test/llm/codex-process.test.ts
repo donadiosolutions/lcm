@@ -7,6 +7,13 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { createCodexProcessSummarizer } from "../../src/llm/codex-process.js";
 import { createAbortError, isAbortError } from "../../src/daemon/cancellation.js";
 
+const processStartTime = vi.hoisted(() => vi.fn((pid: number) => pid === 9517 ? "controlled-birth-9517" : null));
+
+vi.mock("../../src/private-mutation-lock.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/private-mutation-lock.js")>()),
+  processStartTime,
+}));
+
 vi.mock("../../src/llm/codex-responses-gateway.js", () => ({
   createCodexResponsesGateway: vi.fn(async () => ({
     baseUrl: "http://127.0.0.1:32123/test-capability",
@@ -403,15 +410,19 @@ describe("createCodexProcessSummarizer", () => {
     expect(witnessStore.add).toHaveBeenCalledOnce();
   });
 
-  it("uses the default process birth probe for witness entries", async () => {
+  it("publishes a witness from the controlled default process birth probe", async () => {
     const child = makeChild();
     (child as FakeChild & { pid: number }).pid = 9517;
     const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/daemon-runtime.json" };
     const summarizer = createCodexProcessSummarizer({
-      ...baseDeps(child), daemonInstanceId: "daemon-a", witnessStore,
+      ...baseDeps(child), daemonInstanceId: "daemon-a", witnessStore, platform: "win32",
     } as never);
     await expect(summarizer("text")).resolves.toBe("summary");
-    expect(witnessStore.add).toHaveBeenCalledWith(expect.objectContaining({ processStartTime: null }));
+    expect(witnessStore.add).toHaveBeenCalledWith(expect.objectContaining({
+      pid: 9517,
+      pgid: null,
+      processStartTime: "controlled-birth-9517",
+    }));
   });
 
   afterEach(() => {
