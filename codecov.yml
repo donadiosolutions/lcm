@@ -168,7 +168,7 @@ component_management:
       name: "Integration - Service Managers and Legacy Migration"
       paths:
         - "^src/daemon/health-observation\\.ts$"
-        # Lifecycle consumes the same canonical #691 entrypoint comparison as the CLI.
+        # Lifecycle consumes the same canonical #691 entrypoint comparison as the CLI and keeps #804's kernel-cgroup listener witness manager-owned.
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"
