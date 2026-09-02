@@ -186,6 +186,7 @@ type SupervisorObservationBase = Readonly<{
   credentialDirectory?: string;
   credentialFiles?: readonly CredentialFileReference[];
   managerPid?: number;
+  controlGroup?: string;
   name?: string;
 }>;
 
@@ -1076,6 +1077,14 @@ function observationBase(spec: SupervisorSpec, values: Map<string, string>): Sup
   const storageBackend = metadata(values, "LCM_SUPERVISOR_STORAGE_BACKEND");
   const postgresCaFile = metadata(values, "LCM_POSTGRES_CA_FILE");
   const managerPid = parsePid(lookup(values, "MainPID", "pid", "PID", "process.pid", "ProcessID"));
+  const controlGroupValue = lookup(values, "ControlGroup");
+  const controlGroup = spec.kind === "systemd-user"
+    && typeof controlGroupValue === "string"
+    && Buffer.byteLength(controlGroupValue, "utf8") <= 4 * 1024
+    && /^\/(?:[A-Za-z0-9_.:@-]+\/)*[A-Za-z0-9_.:@-]+$/u.test(controlGroupValue)
+    && controlGroupValue.endsWith(`/${spec.systemdUnit}`)
+    ? controlGroupValue
+    : undefined;
   const launchEnvironmentDigest = metadata(values, "LCM_SUPERVISOR_ENV_DIGEST");
   const credentialDirectory = metadata(values, "LCM_CREDENTIAL_DIRECTORY");
   const credentialFiles = MANAGED_CREDENTIAL_NAMES.flatMap((name) => {
@@ -1099,6 +1108,7 @@ function observationBase(spec: SupervisorSpec, values: Map<string, string>): Sup
     ...(credentialDirectory === undefined ? {} : { credentialDirectory }),
     ...(credentialFiles.length === 0 ? {} : { credentialFiles: Object.freeze(credentialFiles) }),
     ...(managerPid === undefined ? {} : { managerPid }),
+    ...(controlGroup === undefined ? {} : { controlGroup }),
     name: spec.name,
   };
 }
@@ -2139,7 +2149,7 @@ function systemdProbeArgs(spec: SupervisorSpec): readonly string[] {
     "--user",
     "show",
     "--no-pager",
-    `--property=LoadState,ActiveState,SubState,MainPID,Environment,ExecMainStartTimestamp,FragmentPath`,
+    `--property=LoadState,ActiveState,SubState,MainPID,ControlGroup,Environment,ExecMainStartTimestamp,FragmentPath`,
     spec.systemdUnit,
   ];
 }

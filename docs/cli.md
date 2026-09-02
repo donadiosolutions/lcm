@@ -171,6 +171,16 @@ policy. If a daemon reaches its idle timeout and exits normally, the next LCM
 request recreates the registered service. This keeps idle terminals quiet while
 retaining a single, authenticated service owner.
 
+On Linux, managed-daemon admission also proves that the configured
+`127.0.0.1` listener belongs to the authenticated systemd service. LCM first
+uses direct process-descriptor evidence when the caller can read it. If a
+`PrivateTmp` user namespace intentionally hides those descriptor links, LCM
+uses the operating system's fixed `ss` socket-diagnostic command to compare
+the listener's kernel cgroup with systemd's exact `ControlGroup` for the
+registered service. Missing tools, malformed output, mixed ownership, or a
+cgroup mismatch remain fail-closed; health plus a matching PID is never enough
+to authorize reuse or replacement.
+
 Health observation has three outcomes. An HTTP response (including an error
 status, malformed body, or a body timeout after headers) stays on the normal
 authenticated path. A transport failure or deadline before any response is a

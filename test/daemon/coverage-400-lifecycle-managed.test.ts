@@ -1588,6 +1588,45 @@ describe("issue 400 managed ensure admission matrix", () => {
     };
     await expect(ensureDaemon(ownerOptions)).resolves.toMatchObject({ connected: false, spawned: false });
   });
+
+  it("admits the authenticated managed listener through its kernel cgroup witness when PID descriptors are unreadable", async () => {
+    const controlGroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/lcm-daemon-0123456789abcdef0123.service";
+    const socketProbe = vi.fn((command: string) => command === "/usr/bin/ss"
+      ? {
+          status: 0,
+          stdout: `LISTEN 0 511 127.0.0.1:${43_201} 0.0.0.0:* ino:12345 sk:1 cgroup:${controlGroup} <->\n`,
+          stderr: "",
+        }
+      : { status: 1, stdout: "", stderr: "unexpected command" });
+    const fixture = createFixture({
+      fetch: sequenceFetch([
+        healthy(4242),
+        healthy(4242),
+        response({}, 200),
+      ]),
+      isAlive: () => true,
+      spawnSync: socketProbe as never,
+    });
+    writeFileSync(fixture.pidPath, "4242");
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => observation(
+      spec,
+      "registered-running-valid",
+      { managerPid: 4242, controlGroup },
+    ));
+
+    const result = await ensureDaemon(optionsFor(fixture, {
+      _listeningPortsOverride: undefined,
+      _linuxSsPathOverride: "/usr/bin/ss",
+    } as Partial<EnsureDaemonOptions>));
+
+    expect(result).toMatchObject({
+      connected: true,
+      spawned: false,
+      pid: 4242,
+      startMethod: "systemd-user",
+    });
+  });
 });
 
 describe("issue 400 managed start, cleanup, deadline, and process seams", () => {
