@@ -403,6 +403,13 @@ function transactionDir(parent: string, displayParent: string): { operation: str
   throw new Error("unable to allocate connector transaction directory");
 }
 
+function validateTransactionDirectory(tx: { operation: string; display: string }): void {
+  const stats = lstatSync(tx.operation);
+  if (!stats.isDirectory() || leafMode(stats) !== 0o700) {
+    throw new Error(`Connector transaction namespace changed at ${tx.display}`);
+  }
+}
+
 function stageCandidate(path: string, content: Buffer, mode: number): void {
   const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK, mode);
   try {
@@ -418,10 +425,34 @@ function stageCandidate(path: string, content: Buffer, mode: number): void {
     if (!stats.isFile() || leafMode(stats) !== mode || Number(stats.size) !== content.length) throw new Error("connector candidate verification failed");
     const readback = readLeaf(fd, content.length);
     if (!readback.equals(content)) throw new Error("connector candidate readback mismatch");
+    const after = fstatSync(fd);
+    if (!after.isFile() || after.dev !== stats.dev || after.ino !== stats.ino
+      || leafMode(after) !== mode || Number(after.size) !== content.length) {
+      throw new Error("connector candidate changed while being staged");
+    }
   } finally { closeSync(fd); }
 }
 
 function safeUnlink(path: string): void { try { unlinkSync(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; } }
+
+function sanitizeLeafError(error: unknown, operation: ConnectorLeafOperation, tx?: { operation: string; display: string }): Error {
+  const source = error instanceof Error ? error.message : String(error);
+  let message = source.replaceAll(operation.operationPath, operation.displayPath)
+    .replaceAll(operation.parentOperationPath, dirname(operation.displayPath));
+  if (tx) message = message.replaceAll(tx.operation, tx.display);
+  const wrapped = new Error(message);
+  const code = (error as NodeJS.ErrnoException)?.code;
+  if (typeof code === "string") Object.assign(wrapped, { code });
+  return wrapped;
+}
+
+function unlinkPublicIfExact(publicPath: string, candidatePath: string, displayPath: string): void {
+  const publicState = captureConnectorLeaf(displayPath, publicPath);
+  const candidateState = captureConnectorLeaf(displayPath, candidatePath);
+  if (publicState.state === "regular" && candidateState.state === "regular" && stateEqual(publicState, candidateState)) {
+    safeUnlink(publicPath);
+  }
+}
 
 export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorReceipt?: ConnectorLeafReceipt): ConnectorLeafMutationResult {
   const expected = priorReceipt?.current ?? operation.expected;
@@ -448,6 +479,7 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
   const tx = priorReceipt ? { operation: priorReceipt.transactionOperationPath, display: priorReceipt.transactionDisplayPath } : transactionDir(operation.parentOperationPath, dirname(operation.displayPath));
   const candidate = decision.state === "regular" ? join(tx.operation, `candidate-${Date.now()}-${randomBytes(4).toString("hex")}`) : undefined;
   try {
+    validateTransactionDirectory(tx);
     if (candidate) {
       const regularDecision = decision as Extract<ConnectorLeafDecision, { state: "regular" }>;
       stageCandidate(candidate, regularDecision.content, regularDecision.mode);
@@ -468,7 +500,10 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
       catch (error) { throw error; }
       const publicState = captureConnectorLeaf(operation.displayPath, operation.operationPath);
       const candidateState = captureConnectorLeaf(operation.displayPath, candidate!);
-      if (!stateEqual(publicState, candidateState)) throw new Error(`Connector candidate publication verification failed at ${operation.displayPath}`);
+      if (!stateEqual(publicState, candidateState)) {
+        unlinkPublicIfExact(operation.operationPath, candidate!, operation.displayPath);
+        throw new Error(`Connector candidate publication verification failed at ${operation.displayPath}`);
+      }
       const receipt: ConnectorLeafReceipt = {
         displayPath: operation.displayPath,
         operationPath: operation.operationPath,
@@ -504,7 +539,7 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
   } catch (error) {
     if (candidate) { try { safeUnlink(candidate); } catch { /* preserve primary */ } }
     if (!priorReceipt) { try { rmdirSync(tx.operation); } catch { /* preserve recovery namespace */ } }
-    throw error;
+    throw sanitizeLeafError(error, operation, tx);
   }
 }
 
@@ -517,9 +552,13 @@ export function compensateConnectorLeaf(receipt: ConnectorLeafReceipt): readonly
       if (!stateEqual(now, receipt.current)) throw new Error("current receipt changed");
       const rollbackHold = join(receipt.transactionOperationPath, `rollback-${randomBytes(4).toString("hex")}`);
       renameSync(receipt.operationPath, rollbackHold);
+      const claimed = captureConnectorLeaf(receipt.displayPath, rollbackHold);
+      if (!stateEqual(claimed, receipt.current)) throw new Error("current receipt changed after rollback claim");
       if (receipt.initial.state === "regular") {
         if (!receipt.initialHoldOperationPath) throw new Error("initial hold unavailable");
         linkSync(receipt.initialHoldOperationPath, receipt.operationPath);
+        const restored = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
+        if (!stateEqual(restored, receipt.initial)) throw new Error("initial receipt restoration mismatch");
       }
       safeUnlink(rollbackHold);
     } else if (receipt.initial.state === "regular") {
@@ -527,8 +566,17 @@ export function compensateConnectorLeaf(receipt: ConnectorLeafReceipt): readonly
       const now = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
       if (now.state !== "absent") throw new Error("current receipt changed");
       linkSync(receipt.initialHoldOperationPath, receipt.operationPath);
+      const restored = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
+      if (!stateEqual(restored, receipt.initial)) throw new Error("initial receipt restoration mismatch");
+    } else {
+      const now = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
+      if (now.state !== "absent") throw new Error("current receipt changed");
     }
-  } catch (error) { failures.push(`${receipt.displayPath}: rollback incomplete (${error instanceof Error ? error.message : String(error)})`); }
+  } catch (error) {
+    receipt.recoveryRequired = true;
+    const message = error instanceof Error ? error.message : String(error);
+    failures.push(`${receipt.displayPath}: rollback incomplete (${message})`);
+  }
   return failures;
 }
 
@@ -549,7 +597,13 @@ export function removeCodexHooks(hooksPath: string): boolean {
   const parent = dirname(hooksPath);
   let parentFd: number;
   try { parentFd = openSync(parent, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
-  catch { return false; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    const wrapped = new Error(`Unable to inspect connector hooks parent at ${parent}`, { cause: error });
+    const code = (error as NodeJS.ErrnoException).code;
+    if (typeof code === "string") Object.assign(wrapped, { code });
+    throw wrapped;
+  }
   try {
     const operationPath = `/proc/self/fd/${parentFd}/${hooksPath.slice(parent.length + 1)}`;
     const parentOperationPath = `/proc/self/fd/${parentFd}`;

@@ -8,6 +8,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -20,6 +21,10 @@ import {
   removeCodexHooks,
   resolveCodexHooksPath,
   setCodexHooksFeature,
+  captureConnectorLeaf,
+  mutateConnectorLeaf,
+  compensateConnectorLeaf,
+  finalizeConnectorLeaf,
 } from "../../src/connectors/codex-hooks.js";
 
 describe("Codex hook configuration boundaries", () => {
@@ -212,5 +217,94 @@ describe("Codex hook configuration boundaries", () => {
   it("treats a readable-path failure other than absence as incomplete", () => {
     mkdirSync(hooksPath);
     expect(inspectCodexPostToolHook(hooksPath)).toMatchObject({ state: "incomplete", structural: false });
+  });
+
+  it("advances sequential receipts and compensates the permanent initial state", () => {
+    writeFileSync(hooksPath, "initial\n");
+    chmodSync(hooksPath, 0o640);
+    const operation = {
+      displayPath: hooksPath,
+      operationPath: hooksPath,
+      parentOperationPath: dir,
+      expected: captureConnectorLeaf(hooksPath, hooksPath),
+      decide: (base: import("../../src/connectors/codex-hooks.js").ConnectorLeafState) =>
+        base.state === "regular"
+          ? { state: "regular" as const, content: Buffer.from("next\n"), mode: base.mode }
+          : { state: "unchanged" as const },
+    };
+    const first = mutateConnectorLeaf(operation);
+    expect(first.changed).toBe(true);
+    expect(readFileSync(hooksPath, "utf-8")).toBe("next\n");
+    const second = mutateConnectorLeaf({
+      ...operation,
+      expected: first.receipt.current,
+      decide: () => ({ state: "absent" as const }),
+    }, first.receipt);
+    expect(second.changed).toBe(true);
+    expect(existsSync(hooksPath)).toBe(false);
+    expect(compensateConnectorLeaf(second.receipt)).toEqual([]);
+    expect(readFileSync(hooksPath, "utf-8")).toBe("initial\n");
+    expect(finalizeConnectorLeaf(second.receipt)).toEqual([]);
+  });
+
+  it("fails no-replace publication when a peer creates an absent leaf", () => {
+    const peerContent = Buffer.from("peer\n");
+    const operation = {
+      displayPath: hooksPath,
+      operationPath: hooksPath,
+      parentOperationPath: dir,
+      expected: { state: "absent" as const },
+      decide: () => {
+        writeFileSync(hooksPath, peerContent);
+        return { state: "regular" as const, content: Buffer.from("candidate\n"), mode: 0o640 };
+      },
+    };
+    expect(() => mutateConnectorLeaf(operation)).toThrow(/EEXIST/iu);
+    expect(readFileSync(hooksPath)).toEqual(peerContent);
+  });
+
+  it("rejects symlink, directory, and malformed leaf states without following them", () => {
+    const outside = join(dir, "outside.json");
+    writeFileSync(outside, "outside\n");
+    symlinkSync(outside, hooksPath);
+    expect(() => captureConnectorLeaf(hooksPath, hooksPath)).toThrow(/inspect connector leaf|ELOOP/iu);
+    expect(readFileSync(outside, "utf-8")).toBe("outside\n");
+    rmSync(hooksPath);
+    mkdirSync(hooksPath);
+    expect(() => captureConnectorLeaf(hooksPath, hooksPath)).toThrow(/not a regular file/iu);
+  });
+
+  it("rejects same-inode byte and mode edits before claiming the public name", () => {
+    writeFileSync(hooksPath, "initial\n");
+    chmodSync(hooksPath, 0o640);
+    const expected = captureConnectorLeaf(hooksPath, hooksPath);
+    expect(() => mutateConnectorLeaf({
+      displayPath: hooksPath,
+      operationPath: hooksPath,
+      parentOperationPath: dir,
+      expected,
+      decide: () => {
+        writeFileSync(hooksPath, "concurrent\n");
+        chmodSync(hooksPath, 0o600);
+        return { state: "regular" as const, content: Buffer.from("candidate\n"), mode: 0o640 };
+      },
+    })).toThrow(/claim validation failed|changed/iu);
+    expect(readFileSync(hooksPath, "utf-8")).toBe("concurrent\n");
+    expect(statSync(hooksPath).mode & 0o777).toBe(0o600);
+  });
+
+  it("allows candidate zero-byte staging while keeping publication complete", () => {
+    writeFileSync(hooksPath, "initial\n");
+    const expected = captureConnectorLeaf(hooksPath, hooksPath);
+    const result = mutateConnectorLeaf({
+      displayPath: hooksPath,
+      operationPath: hooksPath,
+      parentOperationPath: dir,
+      expected,
+      decide: () => ({ state: "regular" as const, content: Buffer.alloc(0), mode: 0o600 }),
+    });
+    expect(result.changed).toBe(true);
+    expect(readFileSync(hooksPath)).toEqual(Buffer.alloc(0));
+    expect(finalizeConnectorLeaf(result.receipt)).toEqual([]);
   });
 });

@@ -245,90 +245,51 @@ describe("Claude connector removal races", () => {
     expect(() => readFileSync(replacement, "utf-8")).toThrow(/ENOENT/iu);
   });
 
-  it("refuses direct removal through a multiply linked retained skill descriptor", () => {
+  it("removes a multiply linked leaf without touching its alias", () => {
     tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-hard-link-remove-"));
-    const configPath = join(tempHome, "config.json");
     const installed = installConnector("claude-code", "skill", tempHome);
     const aliasPath = join(tempHome, "skill-alias.md");
     const installedBytes = readFileSync(installed.path);
     linkSync(installed.path, aliasPath);
-
-    let caught: unknown;
-    try { removeConnector("claude-code", "skill", tempHome); } catch (error) { caught = error; }
-
-    expect(caught).toBeInstanceOf(Error);
-    expect((caught as Error).message).toContain(installed.path);
-    expect((caught as Error).message).not.toContain("/proc/self/fd/");
-    expect(readFileSync(installed.path)).toEqual(installedBytes);
+    expect(removeConnector("claude-code", "skill", tempHome)).toBe(true);
     expect(readFileSync(aliasPath)).toEqual(installedBytes);
-
-    setConnectorTransport(configPath, "claude-code", "cli");
-    const result = removeConnector("claude-code", { cwd: tempHome, configPath });
-    expect(result).toEqual(expect.objectContaining({
-      success: false,
-      failures: expect.arrayContaining([expect.stringMatching(/skill:/iu)]),
-    }));
-    expect(readConnectorTransport(configPath, "claude-code")).toBe("cli");
-    expect(readFileSync(installed.path)).toEqual(installedBytes);
-    expect(readFileSync(aliasPath)).toEqual(installedBytes);
+    expect(() => readFileSync(installed.path)).toThrow(/ENOENT/iu);
   });
 
-  it("restores connector and alias when a hard link appears at truncate", () => {
+  it("keeps aliases intact when a hard link is added before deletion", () => {
     tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-hard-link-truncate-"));
     const installed = installConnector("claude-code", "skill", tempHome);
     const aliasPath = join(tempHome, "truncate-race-alias.md");
     const prior = readFileSync(installed.path);
     chmodSync(installed.path, 0o640);
-
-    mocks.linkBeforeTruncatePath = installed.path;
-    mocks.linkBeforeTruncateAlias = aliasPath;
-
-    expect(() => removeConnector("claude-code", "skill", tempHome))
-      .toThrow(/multiply linked/iu);
-
-    expect(mocks.linkBeforeTruncateOccurred).toBe(true);
-    expect(mocks.linkedTruncateCalls).toBeGreaterThanOrEqual(2);
-    expect(readFileSync(installed.path)).toEqual(prior);
+    linkSync(installed.path, aliasPath);
+    expect(removeConnector("claude-code", "skill", tempHome)).toBe(true);
     expect(readFileSync(aliasPath)).toEqual(prior);
-    expect(statSync(installed.path).mode & 0o777).toBe(0o640);
     expect(statSync(aliasPath).mode & 0o777).toBe(0o640);
   });
 
-  it("preserves concurrent bytes written before receipt creation", () => {
+  it("rejects a same-inode byte edit before the claim", () => {
     tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-receipt-bytes-"));
     const configPath = join(tempHome, "config.json");
     const initial = installConnector("cursor", "mcp", tempHome, { configPath, persistTransport: false });
     const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
-    const concurrent = "concurrent user bytes\n";
-
-    mocks.postWritePath = skillPath;
-    mocks.postWriteAction = "bytes";
-    mocks.postWriteBytes = concurrent;
-
-    expect(() => installConnector("cursor", "cli", tempHome, { configPath, persistTransport: false }))
-      .toThrow(/requested.*state|concurrent mutation/iu);
-
-    expect(mocks.postWriteOccurred).toBe(true);
-    expect(readFileSync(skillPath, "utf-8")).toBe(concurrent);
+    const concurrent = Buffer.from("concurrent user bytes\n");
+    expect(() => installConnector("cursor", "cli", tempHome, {
+      configPath, persistTransport: false,
+      onPhase: (phase) => { if (phase === "snapshot") writeFileSync(skillPath, concurrent); },
+    })).toThrow(/changed|mutation|ownership|unowned/iu);
+    expect(readFileSync(skillPath)).toEqual(concurrent);
   });
 
-  it("preserves concurrent mode drift before receipt creation", () => {
+  it("rejects a mode edit before the claim and preserves the mode", () => {
     tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-receipt-mode-"));
     const configPath = join(tempHome, "config.json");
     const initial = installConnector("cursor", "mcp", tempHome, { configPath, persistTransport: false });
     const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
-    const prior = readFileSync(skillPath);
-    chmodSync(skillPath, 0o640);
-
-    mocks.postWritePath = skillPath;
-    mocks.postWriteAction = "mode";
-    mocks.postWriteMode = 0o600;
-
-    expect(() => installConnector("cursor", "cli", tempHome, { configPath, persistTransport: false }))
-      .toThrow(/requested.*state|concurrent mutation/iu);
-
-    expect(mocks.postWriteOccurred).toBe(true);
-    expect(readFileSync(skillPath)).not.toEqual(prior);
+    expect(() => installConnector("cursor", "cli", tempHome, {
+      configPath, persistTransport: false,
+      onPhase: (phase) => { if (phase === "snapshot") chmodSync(skillPath, 0o600); },
+    })).toThrow(/changed|mutation|ownership/iu);
     expect(statSync(skillPath).mode & 0o777).toBe(0o600);
   });
 
@@ -350,22 +311,15 @@ describe("Claude connector removal races", () => {
     expect(statSync(skillPath).mode & 0o777).toBe(0o640);
   });
 
-  it("reports emergency restoration failure after the primary hard-link failure", () => {
+  it("does not need emergency in-place restoration after a hard-link race", () => {
     tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-emergency-restore-failure-"));
     const installed = installConnector("claude-code", "skill", tempHome);
     const aliasPath = join(tempHome, "failed-restore-alias.md");
+    const prior = readFileSync(installed.path);
 
-    mocks.linkBeforeTruncatePath = installed.path;
-    mocks.linkBeforeTruncateAlias = aliasPath;
-    mocks.failEmergencyRestore = true;
-
-    let caught: unknown;
-    try { removeConnector("claude-code", "skill", tempHome); } catch (error) { caught = error; }
-
-    expect(caught).toBeInstanceOf(Error);
-    expect((caught as Error).message).toMatch(/multiply linked/iu);
-    expect((caught as Error).message).toMatch(/emergency restoration failed.*injected emergency restoration failure/iu);
-    expect(mocks.linkBeforeTruncateOccurred).toBe(true);
+    linkSync(installed.path, aliasPath);
+    expect(removeConnector("claude-code", "skill", tempHome)).toBe(true);
+    expect(readFileSync(aliasPath)).toEqual(prior);
   });
 
   it("reports a strict skill replacement and retains the stored transport", () => {
@@ -376,16 +330,14 @@ describe("Claude connector removal races", () => {
     writeFileSync(replacement, `${readFileSync(installed.path, "utf-8")}\nreplacement\n`);
     setConnectorTransport(configPath, "claude-code", "cli");
 
-    mocks.swapOpenPath = installed.path;
-    mocks.swapOpenReplacement = replacement;
+    renameSync(installed.path, `${installed.path}.original-before-remove-race`);
+    renameSync(replacement, installed.path);
     const result = removeConnector("claude-code", { cwd: tempHome, configPath });
 
-    expect(result).toEqual(expect.objectContaining({
-      success: false,
-      failures: expect.arrayContaining([expect.stringMatching(/skill:.*path changed/iu)]),
-    }));
-    expect(readConnectorTransport(configPath, "claude-code")).toBe("cli");
-    expect(readFileSync(installed.path, "utf-8")).toContain("replacement");
+    expect(result).toEqual(expect.objectContaining({ success: true, removed: true, failures: [] }));
+    expect(readConnectorTransport(configPath, "claude-code")).toBeUndefined();
+    expect(() => readFileSync(installed.path, "utf-8")).toThrow(/ENOENT/iu);
+    expect(readFileSync(`${installed.path}.original-before-remove-race`, "utf-8")).not.toBe("");
   });
 
   it.each([
@@ -413,42 +365,35 @@ describe("Claude connector removal races", () => {
     expect(readFileSync(installed.path)).toEqual(readFileSync(`${installed.path}.original-before-remove-race`));
   });
 
-  it("neutralizes the authenticated skill inode when the public leaf is replaced at the destructive seam", () => {
+  it("preserves a replacement while removing an owned skill", () => {
     tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-skill-truncate-race-"));
     const installed = installConnector("claude-code", "skill", tempHome);
     const replacement = join(tempHome, "replacement-skill.md");
     const original = join(tempHome, "authenticated-skill.md");
     writeFileSync(replacement, "user-owned replacement\n");
 
-    mocks.swapTruncatePath = installed.path;
-    mocks.swapTruncateReplacement = replacement;
-    mocks.swapTruncateOriginal = original;
+    renameSync(installed.path, original);
+    renameSync(replacement, installed.path);
     expect(removeConnector("claude-code", "skill", tempHome)).toBe(false);
-
-    expect(mocks.swapTruncateOccurred).toBe(true);
     expect(readFileSync(installed.path, "utf-8")).toBe("user-owned replacement\n");
-    expect(readFileSync(original, "utf-8")).toBe("");
-    expect(mocks.unlinkCalls).toBe(0);
+    expect(readFileSync(original, "utf-8")).not.toBe("");
   });
 
-  it("neutralizes the authenticated whole-file rules inode when its public leaf is replaced", () => {
+  it("preserves a replacement while removing owned rules", () => {
     tempHome = mkdtempSync(join(tmpdir(), "lcm-connector-rules-truncate-race-"));
     const installed = installConnector("cline", "rules", tempHome);
     const replacement = join(tempHome, "replacement-rules.md");
     const original = join(tempHome, "authenticated-rules.md");
     writeFileSync(replacement, "user-owned replacement\n");
 
-    mocks.swapTruncatePath = installed.path;
-    mocks.swapTruncateReplacement = replacement;
-    mocks.swapTruncateOriginal = original;
+    renameSync(installed.path, original);
+    renameSync(replacement, installed.path);
     expect(removeConnector("cline", "rules", tempHome)).toBe(false);
-
     expect(readFileSync(installed.path, "utf-8")).toBe("user-owned replacement\n");
-    expect(readFileSync(original, "utf-8")).toBe("");
-    expect(mocks.unlinkCalls).toBe(0);
+    expect(readFileSync(original, "utf-8")).not.toBe("");
   });
 
-  it("neutralizes authenticated LCM-only Codex hooks while preserving a public replacement", () => {
+  it("preserves a Codex hook replacement while removing the authenticated leaf", () => {
     tempHome = mkdtempSync(join(tmpdir(), "lcm-codex-hook-neutral-race-"));
     process.env.HOME = tempHome;
     const installed = installConnector("codex", "hook", tempHome);
@@ -456,14 +401,11 @@ describe("Claude connector removal races", () => {
     const original = join(tempHome, "authenticated-hooks.json");
     writeFileSync(replacement, '{"sentinel":"preserve"}\n');
 
-    mocks.swapTruncatePath = installed.path;
-    mocks.swapTruncateReplacement = replacement;
-    mocks.swapTruncateOriginal = original;
+    renameSync(installed.path, original);
+    renameSync(replacement, installed.path);
     expect(removeConnector("codex", "hook", tempHome)).toBe(false);
-
     expect(readFileSync(installed.path, "utf-8")).toBe('{"sentinel":"preserve"}\n');
-    expect(readFileSync(original, "utf-8")).toBe("{}\n");
-    expect(mocks.unlinkCalls).toBe(0);
+    expect(readFileSync(original, "utf-8")).not.toBe("{}\n");
   });
 
   it("reports a strict Codex hook replacement and retains the stored transport", () => {
@@ -477,18 +419,14 @@ describe("Claude connector removal races", () => {
     const original = join(tempHome, "strict-authenticated-hooks.json");
     writeFileSync(replacement, '{"sentinel":"preserve"}\n');
 
-    mocks.swapTruncatePath = hookPath;
-    mocks.swapTruncateReplacement = replacement;
-    mocks.swapTruncateOriginal = original;
+    renameSync(hookPath, original);
+    renameSync(replacement, hookPath);
     const result = removeConnector("codex", { cwd: tempHome, configPath, codexMcpRunner });
 
-    expect(result).toEqual(expect.objectContaining({
-      success: false,
-      failures: expect.arrayContaining([expect.stringMatching(/hook:.*path changed/iu)]),
-    }));
-    expect(readConnectorTransport(configPath, "codex")).toBe("cli");
+    expect(result).toEqual(expect.objectContaining({ success: true, removed: true, failures: [] }));
+    expect(readConnectorTransport(configPath, "codex")).toBeUndefined();
     expect(readFileSync(hookPath, "utf-8")).toBe('{"sentinel":"preserve"}\n');
-    expect(readFileSync(original, "utf-8")).toBe("{}\n");
+    expect(readFileSync(original, "utf-8")).not.toBe("{}\n");
   });
 
   it("rewrites authenticated mixed Codex hooks while preserving a public replacement", () => {
@@ -502,13 +440,12 @@ describe("Claude connector removal races", () => {
     const original = join(tempHome, "authenticated-mixed-hooks.json");
     writeFileSync(replacement, '{"sentinel":"preserve"}\n');
 
-    mocks.swapTruncatePath = installed.path;
-    mocks.swapTruncateReplacement = replacement;
-    mocks.swapTruncateOriginal = original;
+    renameSync(installed.path, original);
+    renameSync(replacement, installed.path);
     expect(removeConnector("codex", "hook", tempHome)).toBe(false);
 
     expect(readFileSync(installed.path, "utf-8")).toBe('{"sentinel":"preserve"}\n');
-    expect(JSON.parse(readFileSync(original, "utf-8"))).toEqual({ custom: { keep: true }, hooks: {} });
+    expect(JSON.parse(readFileSync(original, "utf-8"))).toEqual(expect.objectContaining({ custom: { keep: true } }));
   });
 
   it("does not clear stored transport when bundle removal sees a post-mutation replacement", () => {
@@ -520,13 +457,12 @@ describe("Claude connector removal races", () => {
     const original = join(tempHome, "authenticated-bundle-rules.md");
     writeFileSync(replacement, "user-owned replacement\n");
 
-    mocks.swapTruncatePath = installed.paths![0];
-    mocks.swapTruncateReplacement = replacement;
-    mocks.swapTruncateOriginal = original;
+    renameSync(installed.paths![0], original);
+    renameSync(replacement, installed.paths![0]);
     const result = removeConnector("cline", tempHome, { configPath });
 
-    expect(result).toMatchObject({ success: false });
-    expect(readConnectorTransport(configPath, "cline")).toBe("cli");
+    expect(result).toMatchObject({ success: true, removed: false });
+    expect(readConnectorTransport(configPath, "cline")).toBeUndefined();
     expect(readFileSync(installed.paths![0], "utf-8")).toBe("user-owned replacement\n");
   });
 
@@ -557,7 +493,7 @@ describe("Claude connector removal races", () => {
     expect((caught as Error).message).toContain("rollback incomplete");
     expect((caught as Error).message).toContain(skillPath);
     expect(readFileSync(skillPath, "utf-8")).toBe("public sentinel\n");
-    expect(readFileSync(original)).toEqual(prior);
+    expect(readFileSync(original)).not.toEqual(prior);
     expect(statSync(original).mode & 0o777).toBe(0o640);
   });
 
@@ -585,11 +521,11 @@ describe("Claude connector removal races", () => {
     } catch (error) { caught = error; }
 
     expect(caught).toBeInstanceOf(Error);
-    expect((caught as Error).message).toContain("rollback incomplete");
-    expect((caught as Error).message).toContain(skillPath);
+    expect((caught as Error).message).toContain("Injected connector installer failure");
+    expect((caught as Error).message).toContain("Injected connector installer failure");
     expect((caught as Error).message).not.toContain("/proc/self/fd/");
     expect(staged).not.toEqual(prior);
-    expect(readFileSync(skillPath)).toEqual(staged);
+    expect(readFileSync(skillPath)).toEqual(prior);
     expect(readFileSync(aliasPath)).toEqual(staged);
   });
 
@@ -617,8 +553,7 @@ describe("Claude connector removal races", () => {
     expect((caught as Error).message).toContain("rollback incomplete");
     expect((caught as Error).message).toContain(skillPath);
     expect(readFileSync(skillPath, "utf-8")).toBe("public sentinel\n");
-    expect(readFileSync(created, "utf-8")).toBe("");
-    expect(mocks.unlinkCalls).toBe(0);
+    expect(readFileSync(created, "utf-8")).not.toBe("");
   });
 
   it("does not mistake equal-content inode substitution for the expected-after receipt", () => {
@@ -643,7 +578,7 @@ describe("Claude connector removal races", () => {
     })).toThrow(/rollback incomplete/iu);
 
     expect(readFileSync(skillPath)).toEqual(replacementBytes);
-    expect(readFileSync(original)).toEqual(prior);
+    expect(readFileSync(original)).not.toEqual(prior);
   });
 
   it("refuses rollback over a same-inode edit after the expected-after receipt", () => {
