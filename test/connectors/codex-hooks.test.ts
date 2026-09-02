@@ -623,4 +623,235 @@ describe("Codex hook configuration boundaries", () => {
     writeFileSync(parentFile, "not a directory");
     expect(() => removeCodexHooks(join(parentFile, "hooks.json"))).toThrow(/Unable to inspect connector hooks parent/iu);
   });
+
+  it("covers primitive leaf failures and already-absent cleanup", async () => {
+    const faults = {
+      captureWithoutCode: false,
+      stagePrimitive: false,
+      removeParentWithoutCode: false,
+      removeMutationPrimitive: false,
+      rmdirAsAlreadyAbsent: false,
+      unlinkAsAlreadyAbsent: false,
+    };
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          if (faults.captureWithoutCode && String(path) === hooksPath) {
+            throw new Error("capture without errno");
+          }
+          if (faults.removeParentWithoutCode && String(path) === dir) {
+            throw new Error("parent without errno");
+          }
+          if (faults.stagePrimitive && String(path).includes("candidate-")) {
+            throw "primitive stage failure";
+          }
+          return mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+        }) as typeof actual.openSync,
+        mkdirSync: ((path: fs.PathLike, options?: fs.MakeDirectoryOptions | number) => {
+          if (faults.removeMutationPrimitive && String(path).includes(".lcm-connector-txn-")) {
+            throw "primitive transaction failure";
+          }
+          return actual.mkdirSync(path, options as never);
+        }) as typeof actual.mkdirSync,
+        unlinkSync: ((path: fs.PathLike) => {
+          if (faults.unlinkAsAlreadyAbsent) {
+            faults.unlinkAsAlreadyAbsent = false;
+            actual.unlinkSync(path);
+            throw Object.assign(new Error("already absent"), { code: "ENOENT" });
+          }
+          return actual.unlinkSync(path);
+        }) as typeof actual.unlinkSync,
+        rmdirSync: ((path: fs.PathLike) => {
+          if (faults.rmdirAsAlreadyAbsent) {
+            faults.rmdirAsAlreadyAbsent = false;
+            actual.rmdirSync(path);
+            throw Object.assign(new Error("already absent"), { code: "ENOENT" });
+          }
+          return actual.rmdirSync(path);
+        }) as typeof actual.rmdirSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      writeFileSync(hooksPath, "base\n");
+      faults.captureWithoutCode = true;
+      expect(() => module.captureConnectorLeaf(hooksPath, hooksPath)).toThrow(/capture without errno|Unable to inspect/iu);
+      faults.captureWithoutCode = false;
+
+      faults.stagePrimitive = true;
+      faults.rmdirAsAlreadyAbsent = true;
+      expect(() => module.mutateConnectorLeaf({
+        displayPath: hooksPath,
+        operationPath: hooksPath,
+        parentOperationPath: dir,
+        expected: module.captureConnectorLeaf(hooksPath, hooksPath),
+        decide: () => ({ state: "regular" as const, content: Buffer.from("next\n"), mode: 0o600 }),
+      })).toThrow(/primitive stage failure/iu);
+      faults.stagePrimitive = false;
+
+      const absentPath = join(dir, "absent.json");
+      const seeded = module.mutateConnectorLeaf({
+        displayPath: absentPath,
+        operationPath: absentPath,
+        parentOperationPath: dir,
+        expected: { state: "absent" as const },
+        decide: () => ({ state: "regular" as const, content: Buffer.from("published\n"), mode: 0o600 }),
+      });
+      faults.unlinkAsAlreadyAbsent = true;
+      faults.rmdirAsAlreadyAbsent = true;
+      expect(module.finalizeConnectorLeaf(seeded.receipt)).toEqual([]);
+
+      faults.removeParentWithoutCode = true;
+      expect(() => module.removeCodexHooks(hooksPath)).toThrow(/Unable to inspect connector hooks parent/iu);
+      faults.removeParentWithoutCode = false;
+
+      writeFileSync(hooksPath, JSON.stringify({ hooks: {
+        SessionStart: [{ hooks: [{ type: "command", command: "lcm restore --client codex" }] }],
+      } }));
+      faults.removeMutationPrimitive = true;
+      expect(() => module.removeCodexHooks(hooksPath)).toThrow(/primitive transaction failure/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("covers publication cleanup, absent receipt sequencing, and primitive rollback errors", async () => {
+    const faults = {
+      publicationIdentityCaptures: 0,
+      remainingIdentityCaptures: 0,
+      primitiveRollback: false,
+      failCandidateCleanup: false,
+    };
+    const descriptors = new Map<number, { path: string; fakeIdentity: boolean }>();
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const display = (value: fs.PathLike): string => {
+        const text = String(value);
+        const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(text);
+        if (!match) return text;
+        try { return join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { return text; }
+      };
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const fd = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          const shown = display(path);
+          const fakeIdentity = faults.remainingIdentityCaptures > 0 && shown === hooksPath;
+          if (fakeIdentity) faults.remainingIdentityCaptures -= 1;
+          descriptors.set(fd, { path: shown, fakeIdentity });
+          return fd;
+        }) as typeof actual.openSync,
+        fstatSync: ((fd: number, options?: fs.StatOptions) => {
+          const stats = actual.fstatSync(fd, options as never);
+          if (!descriptors.get(fd)?.fakeIdentity) return stats;
+          return new Proxy(stats, {
+            get: (target, property) => property === "ino" ? Number(target.ino) + 1 : Reflect.get(target, property, target),
+          });
+        }) as typeof actual.fstatSync,
+        linkSync: ((existing: fs.PathLike, target: fs.PathLike) => {
+          const result = actual.linkSync(existing, target);
+          if (String(existing).includes("candidate-") && display(target) === hooksPath) {
+            faults.remainingIdentityCaptures = faults.publicationIdentityCaptures;
+          }
+          return result;
+        }) as typeof actual.linkSync,
+        renameSync: ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+          if (faults.primitiveRollback && String(newPath).includes("rollback-")) throw "primitive rollback failure";
+          return actual.renameSync(oldPath, newPath);
+        }) as typeof actual.renameSync,
+        unlinkSync: ((path: fs.PathLike) => {
+          if (faults.failCandidateCleanup && String(path).includes("candidate-")) {
+            throw Object.assign(new Error("candidate cleanup denied"), { code: "EIO" });
+          }
+          return actual.unlinkSync(path);
+        }) as typeof actual.unlinkSync,
+        closeSync: ((fd: number) => { descriptors.delete(fd); return actual.closeSync(fd); }) as typeof actual.closeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      writeFileSync(hooksPath, "base\n");
+      faults.publicationIdentityCaptures = 1;
+      expect(() => module.mutateConnectorLeaf({
+        displayPath: hooksPath,
+        operationPath: hooksPath,
+        parentOperationPath: dir,
+        expected: module.captureConnectorLeaf(hooksPath, hooksPath),
+        decide: () => ({ state: "regular" as const, content: Buffer.from("next\n"), mode: 0o600 }),
+      })).toThrow(/publication verification failed/iu);
+      expect(existsSync(hooksPath)).toBe(false);
+
+      writeFileSync(hooksPath, "base\n");
+      const persistentExpected = module.captureConnectorLeaf(hooksPath, hooksPath);
+      faults.publicationIdentityCaptures = 2;
+      expect(() => module.mutateConnectorLeaf({
+        displayPath: hooksPath,
+        operationPath: hooksPath,
+        parentOperationPath: dir,
+        expected: persistentExpected,
+        decide: () => ({ state: "regular" as const, content: Buffer.from("next\n"), mode: 0o600 }),
+      })).toThrow(/publication verification failed/iu);
+      faults.publicationIdentityCaptures = 0;
+      faults.remainingIdentityCaptures = 0;
+
+      const absentPath = join(dir, "absent-sequence.json");
+      const first = module.mutateConnectorLeaf({
+        displayPath: absentPath,
+        operationPath: absentPath,
+        parentOperationPath: dir,
+        expected: { state: "absent" as const },
+        decide: () => ({ state: "regular" as const, content: Buffer.from("one\n"), mode: 0o600 }),
+      });
+      const second = module.mutateConnectorLeaf({
+        displayPath: absentPath,
+        operationPath: absentPath,
+        parentOperationPath: dir,
+        expected: first.receipt.current,
+        decide: () => ({ state: "absent" as const }),
+      }, first.receipt);
+      expect(second.receipt.initial).toEqual({ state: "absent" });
+      expect(module.compensateConnectorLeaf(second.receipt)).toEqual([]);
+      expect(module.finalizeConnectorLeaf(second.receipt)).toEqual([]);
+
+      const redundantAbsentPath = join(dir, "redundant-absent.json");
+      const redundantAbsent = module.mutateConnectorLeaf({
+        displayPath: redundantAbsentPath,
+        operationPath: redundantAbsentPath,
+        parentOperationPath: dir,
+        expected: { state: "absent" as const },
+        decide: () => ({ state: "absent" as const }),
+      });
+      expect(redundantAbsent.receipt.current).toEqual({ state: "absent" });
+      expect(module.finalizeConnectorLeaf(redundantAbsent.receipt)).toEqual([]);
+
+      const rollbackPath = join(dir, "rollback.json");
+      writeFileSync(rollbackPath, "initial\n");
+      const rollbackSeed = module.mutateConnectorLeaf({
+        displayPath: rollbackPath,
+        operationPath: rollbackPath,
+        parentOperationPath: dir,
+        expected: module.captureConnectorLeaf(rollbackPath, rollbackPath),
+        decide: () => ({ state: "regular" as const, content: Buffer.from("current\n"), mode: 0o600 }),
+      });
+      faults.primitiveRollback = true;
+      expect(module.compensateConnectorLeaf(rollbackSeed.receipt)).toEqual([
+        expect.stringMatching(/primitive rollback failure/iu),
+      ]);
+      faults.primitiveRollback = false;
+
+      writeFileSync(hooksPath, JSON.stringify({ custom: true, hooks: {
+        SessionStart: [{ hooks: [{ type: "command", command: "lcm restore --client codex" }] }],
+      } }));
+      faults.failCandidateCleanup = true;
+      expect(() => module.removeCodexHooks(hooksPath)).toThrow(/cleanup failed/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
 });

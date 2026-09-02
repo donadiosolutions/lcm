@@ -2884,4 +2884,518 @@ describe("installer descriptor edge branches", () => {
       vi.resetModules();
     }
   });
+
+  it("reinstalls and leaves historical empty skill leaves uninstalled", () => {
+    const root = join(directory, "empty-skill-ownership");
+    const skillPath = join(root, ".claude", "skills", "lcm-memory", "SKILL.md");
+    mkdirSync(dirname(skillPath), { recursive: true });
+    writeFileSync(skillPath, "");
+    expect(removeConnector("claude-code", "skill", root)).toBe(false);
+    expect(installConnector("claude-code", "skill", root).success).toBe(true);
+    expect(readFileSync(skillPath, "utf-8")).toContain("lcm-managed-skill:v1");
+  });
+
+  it("covers native Codex preflight and removal authority branches", () => {
+    withTempHome((cwd) => {
+      const absentNative = () => ({
+        status: 1,
+        stdout: "",
+        stderr: "No MCP server named 'lcm' found.",
+      });
+      expect(() => installConnector("codex", "mcp", cwd, {
+        codexCliRunner: absentNative,
+        persistTransport: false,
+      })).toThrow(/pathname-based native state/iu);
+
+      const noncanonicalNative = () => ({
+        status: 0,
+        stdout: JSON.stringify(codexEntry({ transport: { type: "sse" } })),
+        stderr: "",
+      });
+      expect(() => installConnector("codex", "mcp", cwd, {
+        codexCliRunner: noncanonicalNative,
+        persistTransport: false,
+      })).toThrow(/Refusing to overwrite an unverified Codex MCP entry/iu);
+
+      let nativeRemoves = 0;
+      const canonicalNative = (request: { argv: readonly string[] }) => {
+        if (request.argv[1] === "remove") nativeRemoves += 1;
+        return { status: 0, stdout: JSON.stringify(codexEntry()), stderr: "" };
+      };
+      expect(removeConnector("codex", { cwd, codexCliRunner: canonicalNative })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/pathname-based native state/iu)]),
+      }));
+      expect(nativeRemoves).toBe(0);
+
+      expect(() => installConnector("codex", "mcp", cwd, {
+        codexCliRunner: () => ({ status: 0, stdout: "not-json", stderr: "" }),
+        persistTransport: false,
+      })).toThrow(/malformed JSON/iu);
+    });
+
+    withTempHome((cwd) => {
+      let entries: readonly Record<string, unknown>[] = [codexEntry()];
+      let gets = 0;
+      let removes = 0;
+      const changedAfterPreflight = {
+        get: () => (++gets === 1 ? entries : [codexEntry({ extra: true })]),
+        add: () => undefined,
+        remove: () => { removes += 1; entries = []; },
+      };
+      expect(removeConnector("codex", { cwd, codexMcpRunner: changedAfterPreflight })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/unverified Codex MCP/iu)]),
+      }));
+      expect(removes).toBe(0);
+
+      let pathnameChecks = 0;
+      const pathnameChanged = {
+        get: () => [codexEntry()],
+        add: () => undefined,
+        remove: () => { removes += 1; },
+        get pathnameBased() { return pathnameChecks++ > 0; },
+      };
+      expect(removeConnector("codex", { cwd, codexMcpRunner: pathnameChanged })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/pathname-based native state/iu)]),
+      }));
+
+      expect(removeConnector("codex", {
+        cwd,
+        codexMcpRunner: { get: () => [codexEntry()], add: () => undefined },
+      })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/does not provide remove/iu)]),
+      }));
+
+      expect(removeConnector("codex", {
+        cwd,
+        codexMcpRunner: {
+          get: () => [codexEntry()],
+          add: () => undefined,
+          remove: () => undefined,
+        },
+      })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/remained after removal/iu)]),
+      }));
+    });
+  });
+
+  it("skips untouched implicit Codex MCP state and selects low-level runners", () => {
+    withTempHome((cwd) => {
+      const calls: readonly string[][] = [];
+      const runner = (request: { argv: readonly string[] }) => {
+        (calls as string[][]).push([...request.argv]);
+        return {
+          status: 1,
+          stdout: "",
+          stderr: "No MCP server named 'lcm' found.",
+        };
+      };
+      expect(installConnector("codex", undefined, {
+        cwd,
+        persistTransport: false,
+        queryCodexMcp: false,
+        codexCliRunner: runner,
+      }).success).toBe(true);
+      expect(calls).toEqual([]);
+
+      expect(installConnector("codex", "cli", cwd, {
+        persistTransport: false,
+        codexCliRunner: runner,
+      }).success).toBe(true);
+      expect(calls.length).toBeGreaterThan(0);
+
+      calls.length = 0;
+      expect(removeConnector("codex", { cwd, codexCliRunner: runner })).toMatchObject({
+        success: true,
+        removed: true,
+      });
+      expect(calls.length).toBeGreaterThan(0);
+    });
+  });
+
+  it("reports final transaction cleanup failure without reverting publication", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        rmdirSync: ((path: fs.PathLike) => {
+          if (String(path).includes(".lcm-connector-txn-")) {
+            throw Object.assign(new Error("transaction cleanup denied"), { code: "EIO" });
+          }
+          return actual.rmdirSync(path);
+        }) as typeof actual.rmdirSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      const root = join(directory, "final-cleanup-failure");
+      expect(() => module.installConnector("cline", "rules", root)).toThrow(/connector cleanup incomplete/iu);
+      expect(readFileSync(join(root, ".clinerules", "lcm.md"), "utf-8")).toContain("lcm");
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("classifies post-decision skill claim errno outcomes", async () => {
+    const roots = new Map<string, string>([
+      [join(directory, "remove-skill-enoent"), "ENOENT"],
+      [join(directory, "remove-skill-eloop"), "ELOOP"],
+      [join(directory, "remove-skill-strict-eisdir"), "EISDIR"],
+      [join(directory, "remove-skill-eacces"), "EACCES"],
+    ]);
+    const skillErrors = new Map<string, string>();
+    for (const [root, code] of roots) {
+      const installed = installConnector("claude-code", "skill", root);
+      skillErrors.set(installed.path, code);
+    }
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const display = (value: fs.PathLike): string => {
+        const text = String(value);
+        const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(text);
+        if (!match) return text;
+        try { return join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { return text; }
+      };
+      return {
+        ...actual,
+        renameSync: ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+          const code = skillErrors.get(display(oldPath));
+          if (code) throw Object.assign(new Error(`claim ${code}`), { code });
+          return actual.renameSync(oldPath, newPath);
+        }) as typeof actual.renameSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(module.removeConnector("claude-code", "skill", [...roots.keys()][0])).toBe(false);
+      expect(module.removeConnector("claude-code", "skill", [...roots.keys()][1])).toBe(false);
+      expect(module.removeConnector("claude-code", {
+        cwd: [...roots.keys()][2],
+        configPath: join([...roots.keys()][2], "config.json"),
+      })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/unowned LCM skill|claim EISDIR/iu)]),
+      }));
+      expect(() => module.removeConnector("claude-code", "skill", [...roots.keys()][3]))
+        .toThrow(/Unable to inspect LCM skill.*EACCES/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("covers private authority map invariants through deterministic Map seams", () => {
+    const originalGet = Map.prototype.get;
+    let fault: "" | "parent" | "compensate-receipt" | "finalize-receipt" = "";
+    const get = vi.spyOn(Map.prototype, "get").mockImplementation(function (this: Map<unknown, unknown>, key: unknown) {
+      const value = originalGet.call(this, key);
+      if (fault === "parent" && typeof value === "string" && /^\/proc\/self\/fd\/\d+$/u.test(value)) {
+        fault = "";
+        return undefined;
+      }
+      if ((fault === "compensate-receipt" || fault === "finalize-receipt")
+        && value && typeof value === "object" && "transactionOperationPath" in value) {
+        fault = "";
+        return undefined;
+      }
+      return value;
+    });
+    try {
+      fault = "parent";
+      expect(() => installConnector("cline", "rules", join(directory, "missing-parent-map")))
+        .toThrow(/Unmapped connector mutation parent/iu);
+
+      const compensationRoot = join(directory, "missing-compensation-receipt");
+      expect(() => installConnector("cline", "cli", compensationRoot, {
+        configPath: join(compensationRoot, "config.json"),
+        persistTransport: false,
+        failAt: "complete",
+        onPhase: (phase) => { if (phase === "complete") fault = "compensate-receipt"; },
+      })).toThrow(/Injected connector installer failure at complete/iu);
+      expect(fault).toBe("");
+
+      const finalizationRoot = join(directory, "missing-finalization-receipt");
+      expect(installConnector("cline", "cli", finalizationRoot, {
+        configPath: join(finalizationRoot, "config.json"),
+        persistTransport: false,
+        onPhase: (phase) => { if (phase === "complete") fault = "finalize-receipt"; },
+      }).success).toBe(true);
+      expect(fault).toBe("");
+    } finally {
+      get.mockRestore();
+    }
+  });
+
+  it("covers result-content fallbacks when the leaf seam returns without deciding", async () => {
+    let fallback: Buffer | undefined = Buffer.from("returned-content\n");
+    vi.resetModules();
+    vi.doMock("../../src/connectors/codex-hooks.js", async () => {
+      const actual = await vi.importActual<typeof import("../../src/connectors/codex-hooks.js")>("../../src/connectors/codex-hooks.js");
+      return {
+        ...actual,
+        mutateConnectorLeaf: ((operation: import("../../src/connectors/codex-hooks.js").ConnectorLeafOperation) => ({
+          changed: false,
+          content: fallback,
+          receipt: {
+            displayPath: operation.displayPath,
+            operationPath: operation.operationPath,
+            parentOperationPath: operation.parentOperationPath,
+            initial: operation.expected,
+            current: operation.expected,
+            transactionDisplayPath: "",
+            transactionOperationPath: "",
+            mutationCommitted: false,
+            recoveryRequired: false,
+          },
+        })) as typeof actual.mutateConnectorLeaf,
+        finalizeConnectorLeaf: () => [],
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(module.installConnector("cline", "rules", join(directory, "content-fallback")).success).toBe(true);
+      fallback = undefined;
+      expect(module.installConnector("cline", "rules", join(directory, "empty-fallback")).success).toBe(true);
+    } finally {
+      vi.doUnmock("../../src/connectors/codex-hooks.js");
+      vi.resetModules();
+    }
+  });
+
+  it("tracks one receipt when two Codex writes intentionally alias a leaf", () => {
+    withTempHome((cwd) => {
+      const codex = AGENTS.find((agent) => agent.id === "codex")!;
+      const originalHook = codex.configPaths.hook;
+      codex.configPaths.hook = "~/.codex/config.toml";
+      try {
+        expect(installConnector("codex", "hook", cwd).success).toBe(true);
+        expect(readFileSync(join(process.env.HOME!, ".codex", "config.toml"), "utf-8")).toContain('"hooks"');
+      } finally {
+        codex.configPaths.hook = originalHook;
+      }
+    });
+  });
+
+  it("rechecks skill ownership inside the mutation callback after preflight", async () => {
+    const fixtureRoot = join(directory, "skill-race-fixture");
+    const canonicalPath = installConnector("cursor", "skill", fixtureRoot).path;
+    const canonical = readFileSync(canonicalPath);
+    const root = join(directory, "skill-race-target");
+    const skillPath = join(root, ".cursor", "skills", "lcm-memory", "SKILL.md");
+    mkdirSync(dirname(skillPath), { recursive: true });
+    writeFileSync(skillPath, Buffer.alloc(canonical.length, 0x78));
+    let fakePreflightOpens = 0;
+    let preflight = false;
+    const descriptors = new Map<number, boolean>();
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const display = (value: fs.PathLike): string => {
+        const text = String(value);
+        const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(text);
+        if (!match) return text;
+        try { return join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { return text; }
+      };
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const fd = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          const fake = preflight && display(path) === skillPath && fakePreflightOpens++ < 2;
+          descriptors.set(fd, fake);
+          return fd;
+        }) as typeof actual.openSync,
+        readSync: ((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          if (!descriptors.get(fd)) return actual.readSync(fd, buffer, offset, length, position);
+          const available = Math.max(0, canonical.length - (position ?? 0));
+          const count = Math.min(length, available);
+          canonical.copy(buffer, offset, position ?? 0, (position ?? 0) + count);
+          return count;
+        }) as typeof actual.readSync,
+        closeSync: ((fd: number) => { descriptors.delete(fd); return actual.closeSync(fd); }) as typeof actual.closeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cursor", "cli", root, {
+        configPath: join(root, "config.json"),
+        persistTransport: false,
+        onPhase: (phase) => { if (phase === "stage") preflight = true; },
+      })).toThrow(/Refusing to overwrite an unowned LCM skill/iu);
+      expect(readFileSync(skillPath)).toEqual(Buffer.alloc(canonical.length, 0x78));
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("revalidates legacy and current Codex hook decisions against captured state", async () => {
+    const managedOnly = Buffer.from(JSON.stringify({ hooks: {
+      SessionStart: [{ hooks: [{ type: "command", command: "lcm restore --client codex" }] }],
+    } }));
+    const mixed = Buffer.from(JSON.stringify({ custom: true, hooks: {
+      SessionStart: [{ hooks: [
+        { type: "command", command: "lcm restore --client codex" },
+        { type: "command", command: "echo keep" },
+      ] }],
+    } }));
+    type Behavior = {
+      kind: "ephemeral" | "fake" | "replace";
+      count: number;
+      at?: number;
+      fake?: Buffer;
+      replacement?: Buffer;
+    };
+    const behaviors = new Map<string, Behavior>();
+    const descriptors = new Map<number, { path: string; fake?: Buffer; ephemeral: boolean; replace?: Buffer }>();
+    const originalHome = process.env.HOME;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const display = (value: fs.PathLike): string => {
+        const text = String(value);
+        const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(text);
+        if (!match) return text;
+        try { return join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { return text; }
+      };
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const shown = display(path);
+          const behavior = behaviors.get(shown);
+          if (behavior) behavior.count += 1;
+          const selected = behavior?.count === (behavior?.at ?? 2) ? behavior : undefined;
+          if (selected?.kind === "ephemeral") {
+            actual.mkdirSync(dirname(shown), { recursive: true });
+            actual.writeFileSync(shown, selected.fake!);
+          }
+          const fd = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          descriptors.set(fd, {
+            path: shown,
+            fake: selected?.kind === "fake" ? selected.fake : undefined,
+            ephemeral: selected?.kind === "ephemeral",
+            replace: selected?.kind === "replace" ? selected.replacement : undefined,
+          });
+          return fd;
+        }) as typeof actual.openSync,
+        readSync: ((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          const fake = descriptors.get(fd)?.fake;
+          if (!fake) return actual.readSync(fd, buffer, offset, length, position);
+          const start = position ?? 0;
+          const count = Math.min(length, Math.max(0, fake.length - start));
+          fake.copy(buffer, offset, start, start + count);
+          return count;
+        }) as typeof actual.readSync,
+        closeSync: ((fd: number) => {
+          const state = descriptors.get(fd);
+          descriptors.delete(fd);
+          const result = actual.closeSync(fd);
+          if (state?.ephemeral) actual.rmSync(state.path, { force: true });
+          if (state?.replace) actual.writeFileSync(state.path, state.replace);
+          return result;
+        }) as typeof actual.closeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+
+      const absentLegacyRoot = join(directory, "legacy-absent-recheck");
+      const absentLegacy = join(absentLegacyRoot, ".codex", "hooks.json");
+      const absentLegacyHome = join(absentLegacyRoot, "home");
+      mkdirSync(absentLegacyHome, { recursive: true });
+      process.env.HOME = absentLegacyHome;
+      behaviors.set(absentLegacy, { kind: "ephemeral", count: 0, at: 4, fake: managedOnly });
+      expect(module.installConnector("codex", "cli", absentLegacyRoot, {
+        configPath: join(absentLegacyRoot, "config.json"),
+        codexMcpRunner: { get: () => [], add: () => undefined, remove: () => undefined },
+        persistTransport: false,
+      }).success).toBe(true);
+      expect(existsSync(absentLegacy)).toBe(false);
+
+      const staleLegacyRoot = join(directory, "legacy-stale-recheck");
+      const staleLegacy = join(staleLegacyRoot, ".codex", "hooks.json");
+      const staleLegacyHome = join(staleLegacyRoot, "home");
+      mkdirSync(dirname(staleLegacy), { recursive: true });
+      mkdirSync(staleLegacyHome, { recursive: true });
+      process.env.HOME = staleLegacyHome;
+      const invalidLegacy = Buffer.alloc(mixed.length, 0x78);
+      writeFileSync(staleLegacy, invalidLegacy);
+      behaviors.set(staleLegacy, { kind: "fake", count: 0, at: 4, fake: mixed });
+      expect(module.installConnector("codex", "cli", staleLegacyRoot, {
+        configPath: join(staleLegacyRoot, "config.json"),
+        codexMcpRunner: { get: () => [], add: () => undefined, remove: () => undefined },
+        persistTransport: false,
+      }).success).toBe(true);
+      expect(readFileSync(staleLegacy)).toEqual(invalidLegacy);
+
+      const absentCurrentRoot = join(directory, "current-absent-recheck");
+      const absentCurrentHome = join(absentCurrentRoot, "home");
+      const absentCurrent = join(absentCurrentHome, ".codex", "hooks.json");
+      mkdirSync(dirname(absentCurrent), { recursive: true });
+      process.env.HOME = absentCurrentHome;
+      behaviors.set(absentCurrent, { kind: "ephemeral", count: 0, fake: managedOnly });
+      expect(module.removeConnector("codex", "hook", absentCurrentRoot)).toBe(false);
+      expect(existsSync(absentCurrent)).toBe(false);
+
+      const unchangedRoot = join(directory, "current-unchanged-recheck");
+      const unchangedHome = join(unchangedRoot, "home");
+      const unchangedPath = join(unchangedHome, ".codex", "hooks.json");
+      mkdirSync(dirname(unchangedPath), { recursive: true });
+      process.env.HOME = unchangedHome;
+      const invalidCurrent = Buffer.alloc(managedOnly.length, 0x78);
+      writeFileSync(unchangedPath, invalidCurrent);
+      behaviors.set(unchangedPath, { kind: "fake", count: 0, fake: managedOnly });
+      expect(module.removeConnector("codex", "hook", unchangedRoot)).toBe(false);
+      expect(readFileSync(unchangedPath)).toEqual(invalidCurrent);
+
+      const compatibleRaceRoot = join(directory, "current-compatible-eagain");
+      const compatibleRaceHome = join(compatibleRaceRoot, "home");
+      const compatibleRacePath = join(compatibleRaceHome, ".codex", "hooks.json");
+      mkdirSync(dirname(compatibleRacePath), { recursive: true });
+      process.env.HOME = compatibleRaceHome;
+      writeFileSync(compatibleRacePath, managedOnly);
+      behaviors.set(compatibleRacePath, {
+        kind: "replace",
+        count: 0,
+        replacement: Buffer.from("compatible replacement\n"),
+      });
+      expect(module.removeConnector("codex", "hook", compatibleRaceRoot)).toBe(false);
+      expect(readFileSync(compatibleRacePath, "utf-8")).toBe("compatible replacement\n");
+
+      const strictRaceRoot = join(directory, "current-strict-eagain");
+      const strictRaceHome = join(strictRaceRoot, "home");
+      const strictRacePath = join(strictRaceHome, ".codex", "hooks.json");
+      mkdirSync(dirname(strictRacePath), { recursive: true });
+      process.env.HOME = strictRaceHome;
+      writeFileSync(strictRacePath, managedOnly);
+      behaviors.set(strictRacePath, {
+        kind: "replace",
+        count: 0,
+        replacement: Buffer.from("strict replacement\n"),
+      });
+      expect(module.removeConnector("codex", {
+        cwd: strictRaceRoot,
+        configPath: join(strictRaceRoot, "config.json"),
+        codexMcpRunner: { get: () => [], add: () => undefined, remove: () => undefined },
+      })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/hook.*changed before mutation/iu)]),
+      }));
+      expect(readFileSync(strictRacePath, "utf-8")).toBe("strict replacement\n");
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
 });

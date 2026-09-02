@@ -435,11 +435,11 @@ function stageCandidate(path: string, content: Buffer, mode: number): void {
 
 function safeUnlink(path: string): void { try { unlinkSync(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; } }
 
-function sanitizeLeafError(error: unknown, operation: ConnectorLeafOperation, tx?: { operation: string; display: string }): Error {
+function sanitizeLeafError(error: unknown, operation: ConnectorLeafOperation, tx: { operation: string; display: string }): Error {
   const source = error instanceof Error ? error.message : String(error);
   let message = source.replaceAll(operation.operationPath, operation.displayPath)
     .replaceAll(operation.parentOperationPath, dirname(operation.displayPath));
-  if (tx) message = message.replaceAll(tx.operation, tx.display);
+  message = message.replaceAll(tx.operation, tx.display);
   const wrapped = new Error(message);
   const code = (error as NodeJS.ErrnoException)?.code;
   if (typeof code === "string") Object.assign(wrapped, { code });
