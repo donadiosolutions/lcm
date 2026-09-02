@@ -154,6 +154,7 @@ function systemdText(
     `ActiveState=${state}`,
     `SubState=${state === "active" ? "running" : state}`,
     `MainPID=${state === "active" ? pid : 0}`,
+    `ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/${value.systemdUnit}`,
     `Environment=LCM_SUPERVISOR_MARKER=${value.marker} LCM_SUPERVISOR_SCOPE=${value.scopeDigest} LCM_SUPERVISOR_PORT=${value.port} LCM_SUPERVISOR_NONCE=${value.nonce} LCM_SUPERVISOR_EXECUTABLE=${value.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(value.args)} LCM_SUPERVISOR_CWD=${value.cwd ?? ""} LCM_SUPERVISOR_ENV_DIGEST=${environmentDigest}${extra}`,
   ].join("\n");
 }
@@ -240,6 +241,36 @@ describe("supervisor coverage: validation and bounded parsing", () => {
     expect(() => createSupervisorSpec({ kind: "systemd-user", stateRoot, port: 1, executable: "/bin/node", credentialDirectory: "" })).toThrow("credential directory");
     expect(() => createSupervisorSpec({ kind: "systemd-user", stateRoot, port: 1, executable: "/bin/node", stopTimeoutMs: 60_001 })).toThrow("timeout");
     expect(createSupervisorSpec({ kind: "systemd-user", stateRoot, port: 1, executable: "/bin/node", nonce: undefined }).nonce).toMatch(/^[A-Za-z0-9]/u);
+  });
+
+  it("retains only an exact bounded systemd control-group witness", async () => {
+    const value = spec("systemd-user");
+    const expected = `/user.slice/user-1000.slice/user@1000.service/app.slice/${value.systemdUnit}`;
+    const exact = createSupervisor("systemd-user", {
+      run: runQueue([{ code: 0, stdout: systemdText(value, "active", 515) }]).run,
+      platform: "linux",
+    });
+    await expect(exact.probe(value)).resolves.toMatchObject({
+      kind: "registered-running-valid",
+      managerPid: 515,
+      controlGroup: expected,
+    });
+
+    for (const malformed of [
+      "relative",
+      "/user.slice/foreign.service",
+      `/user.slice/${"x".repeat(4 * 1024)}/${value.systemdUnit}`,
+      `/user.slice/bad group/${value.systemdUnit}`,
+    ]) {
+      const output = systemdText(value, "active", 515).replace(expected, malformed);
+      const supervisor = createSupervisor("systemd-user", {
+        run: runQueue([{ code: 0, stdout: output }]).run,
+        platform: "linux",
+      });
+      const observed = await supervisor.probe(value);
+      expect(observed).toMatchObject({ kind: "registered-running-valid", managerPid: 515 });
+      expect(observed).not.toHaveProperty("controlGroup");
+    }
   });
 
   it("handles command result aliases, bounded output, and unavailable reason text", async () => {

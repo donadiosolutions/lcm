@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { __lifecycleTestUtils } from "../../src/daemon/lifecycle.js";
 import {
   createSupervisor,
   createSupervisorSpec,
@@ -340,6 +341,37 @@ describe("real user-systemd daemon lifecycle", () => {
       await cleanupFixture(fixture);
     }
     expect(existsSync(fixture.root)).toBe(false);
+  });
+
+  linuxSystemd("proves the exact loopback listener from manager cgroup evidence without PID descriptor access", { timeout: 60_000 }, async () => {
+    const fixture = await createFixture();
+    try {
+      const started = await fixture.supervisor.start(fixture.spec);
+      await waitForHealth(fixture, started.managerPid!);
+      const observed = await fixture.supervisor.probe(fixture.spec);
+      expect(observed).toMatchObject({
+        kind: "registered-running-valid",
+        managerPid: started.managerPid,
+      });
+      if (observed.kind !== "registered-running-valid") {
+        throw new Error("systemd integration did not retain the running manager observation");
+      }
+      expect(observed.controlGroup).toMatch(new RegExp(`/${fixture.spec.systemdUnit.replaceAll(".", "\\.")}$`, "u"));
+      const ssPath = __lifecycleTestUtils.resolveLinuxSsPath();
+      expect(ssPath).not.toBeNull();
+      expect(__lifecycleTestUtils.findListeningTcpPorts(
+        started.managerPid!,
+        "linux",
+        spawnSync,
+        join(fixture.root, "intentionally-unreadable-proc"),
+        fixture.port,
+        null,
+        observed.controlGroup,
+        ssPath,
+      )).toEqual([fixture.port]);
+    } finally {
+      await cleanupFixture(fixture);
+    }
   });
 
   linuxSystemd("recreates a terminal clean-exit unit after a registered-not-running observation", { timeout: 60_000 }, async () => {

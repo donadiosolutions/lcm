@@ -1551,7 +1551,7 @@ describe("systemd-user supervisor", () => {
     ]);
     await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).stopAndAwaitAbsent(spec)).resolves.toBeUndefined();
     expect(runner.calls[2].args).toEqual(["--user", "reset-failed", spec.systemdUnit]);
-    expect(runner.calls[3].args).toEqual(["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,Environment,ExecMainStartTimestamp,FragmentPath", spec.systemdUnit]);
+    expect(runner.calls[3].args).toEqual(["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,ControlGroup,Environment,ExecMainStartTimestamp,FragmentPath", spec.systemdUnit]);
   });
 
   it("refuses a reset-failed failure other than exact not-found", async () => {
@@ -1899,13 +1899,14 @@ describe("systemd-user supervisor", () => {
     ].join(" ");
     const runner = fakeRunner([{
       code: 0,
-      stdout: `LoadState=loaded\nActiveState=active\nMainPID=515\nEnvironment=${environment}`,
+      stdout: `LoadState=loaded\nActiveState=active\nMainPID=515\nControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/${spec.systemdUnit}\nEnvironment=${environment}`,
     }]);
     await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).probe(spec)).resolves.toMatchObject({
       kind: "registered-running-valid",
       managerPid: 515,
       scopeDigest: spec.scopeDigest,
       nonce: spec.nonce,
+      controlGroup: `/user.slice/user-1000.slice/user@1000.service/app.slice/${spec.systemdUnit}`,
     });
   });
 

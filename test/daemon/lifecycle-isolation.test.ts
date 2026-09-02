@@ -90,7 +90,7 @@ describe("systemd manager command-vector harness", () => {
       "--user",
       "show",
       "--no-pager",
-      "--property=LoadState,ActiveState,SubState,MainPID,Environment,ExecMainStartTimestamp,FragmentPath",
+      "--property=LoadState,ActiveState,SubState,MainPID,ControlGroup,Environment,ExecMainStartTimestamp,FragmentPath",
       unit,
     ] as const;
     const startArgs = ["--user", "--no-block", `--unit=${unit}`, "/usr/bin/env", "-i"] as const;
