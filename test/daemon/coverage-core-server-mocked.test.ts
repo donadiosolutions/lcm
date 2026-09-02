@@ -178,7 +178,7 @@ describe("mocked server states unavailable from Node HTTP", () => {
     expect(state.closeFactory).toHaveBeenCalledOnce();
   });
 
-  it("retries a rejected storage factory close on a later stop", async () => {
+  it("retries a rejected storage factory close within the terminal stop", async () => {
     const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }));
     let rejectControlledClose!: (reason?: unknown) => void;
     const controlledClose = new Promise<void>((_resolve, reject) => { rejectControlledClose = reject; });
@@ -221,10 +221,6 @@ describe("mocked server states unavailable from Node HTTP", () => {
       rejectControlledClose(new Error("controlled close failure"));
       await firstStop;
       expect(firstStopSettled).toBe(true);
-
-      const retryStop = daemon.stop();
-      startedStops.push(retryStop);
-      await retryStop;
       expect(totalCalls).toBe(2);
       const idempotentStop = daemon.stop();
       startedStops.push(idempotentStop);
