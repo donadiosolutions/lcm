@@ -1,7 +1,7 @@
 import type { DaemonConfig } from "../config.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
-import { createRetrievalEngine } from "../../retrieval.js";
+import { createRetrievalEngine, normalizeSearchLayers } from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
 import { StorageOperationError } from "../../storage/errors.js";
@@ -14,13 +14,17 @@ export function createSearchHandler(config: DaemonConfig, storageFactory?: Stora
   return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
     const { query, limit = 5, layers, tags } = input;
-    const activeLayers: string[] = layers ?? ["episodic", "promoted"];
-    const filterTags: string[] | undefined = Array.isArray(tags) && tags.length > 0 ? tags : undefined;
-
     if (!query) {
       sendJson(res, 400, { error: "query is required" });
       return;
     }
+
+    const activeLayers = normalizeSearchLayers(layers);
+    if (!activeLayers) {
+      sendJson(res, 400, { error: "invalid layers" });
+      return;
+    }
+    const filterTags: string[] | undefined = Array.isArray(tags) && tags.length > 0 ? tags : undefined;
 
     let cwd: string | undefined;
     if (input.cwd) {

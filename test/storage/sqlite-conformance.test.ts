@@ -10,7 +10,7 @@ import { createStorageBackendFactory } from "../../src/storage/factory.js";
 import type { StorageBackendFactory } from "../../src/storage/contracts.js";
 import { normalizeStorageError, StorageOperationError } from "../../src/storage/errors.js";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
-import { SqliteExecutor } from "../../src/storage/sqlite/executor.js";
+import { sqliteExecutorFor, SqliteExecutor } from "../../src/storage/sqlite/executor.js";
 import { SqliteProjectStorage } from "../../src/storage/sqlite/project-storage.js";
 import { assertSqliteReady } from "../../src/storage/sqlite/health.js";
 import {
@@ -18,7 +18,12 @@ import {
   createSqliteRepositoryStores,
 } from "../../src/storage/sqlite/repositories.js";
 import { sessionInstructionsScopeHash } from "../../src/storage/session-instructions.js";
-import { closeLcmConnection, getPoolStats, isLcmConnectionOpen } from "../../src/db/connection.js";
+import {
+  closeLcmConnection,
+  getLcmConnection,
+  getPoolStats,
+  isLcmConnectionOpen,
+} from "../../src/db/connection.js";
 import { runLcmMigrations } from "../../src/db/migration.js";
 import { createTemporaryDirectory } from "../fixtures/runtime.js";
 import { defineCoreStorageConformance, type StorageContractHarness } from "./conformance.js";
@@ -878,6 +883,241 @@ describe("SQLite storage backend conformance", () => {
     writeFileSync(dbPath, "not a SQLite database");
     expect(await factory.health()).toMatchObject({ status: "unavailable", backend: "sqlite" });
     await factory.close();
+  });
+
+  it.each([
+    { outcome: "healthy" as const },
+    { outcome: "unavailable" as const },
+  ])("factory health returns closed for a deferred active project (%s)", async ({ outcome }) => {
+    const root = createTemporaryDirectory("lcm-storage-active-health-race-");
+    const identity = projectIdentity(root);
+    const dbPath = join(root, "active-health-race.db");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath }),
+    });
+    const storage = await factory.openProject(identity);
+    let releaseTransaction!: () => void;
+    let markEntered!: () => void;
+    const release = new Promise<void>((resolve) => { releaseTransaction = resolve; });
+    const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+    const timeline: string[] = [];
+    let quickCheckCount = 0;
+    let healthSettled = false;
+    let closeSettled = false;
+    let transaction: Promise<void> | undefined;
+    let health: Promise<Awaited<ReturnType<typeof factory.health>>> | undefined;
+    let closing: Promise<void> | undefined;
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    const prepareSpy = vi.spyOn(DatabaseSync.prototype, "prepare").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      if (sql === "PRAGMA quick_check(1)") {
+        quickCheckCount += 1;
+        timeline.push("probe");
+        if (outcome === "unavailable") {
+          return { all: () => [{ quick_check: "private-active-health-race-sentinel" }] } as never;
+        }
+      }
+      return originalPrepare.call(this, sql);
+    });
+    const originalExec = DatabaseSync.prototype.exec;
+    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      const result = originalExec.call(this, sql);
+      if (sql === "COMMIT") timeline.push("transaction-complete");
+      return result;
+    });
+    try {
+      transaction = storage.transaction(async () => {
+        markEntered();
+        await release;
+      });
+      await entered;
+
+      health = factory.health().then((result) => {
+        healthSettled = true;
+        timeline.push("health-complete");
+        return result;
+      });
+      // Let factory.health queue the active project probe behind the held transaction.
+      await Promise.resolve();
+      closing = factory.close().then(() => {
+        closeSettled = true;
+        timeline.push("factory-close-complete");
+      });
+      await Promise.resolve();
+      expect(quickCheckCount).toBe(0);
+      expect(healthSettled).toBe(false);
+      expect(closeSettled).toBe(false);
+
+      releaseTransaction();
+      await transaction;
+      const [result] = await Promise.all([health, closing]);
+      expect(result).toEqual({ status: "closed", backend: "sqlite" });
+      expect(JSON.stringify(result)).not.toContain("private-active-health-race-sentinel");
+      expect(JSON.stringify(result)).not.toContain("active-health-race.db");
+      expect(quickCheckCount).toBe(1);
+      expect(timeline.indexOf("transaction-complete"), timeline.join(",")).toBeLessThan(timeline.indexOf("probe"));
+      expect(timeline.indexOf("probe"), timeline.join(",")).toBeLessThan(timeline.indexOf("factory-close-complete"));
+      expect(isLcmConnectionOpen(dbPath)).toBe(false);
+
+      const inspection = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        const row = inspection.prepare(
+          "SELECT COUNT(*) AS count FROM sqlite_master WHERE name LIKE '__lcm_storage_health_probe_%'",
+        ).get() as { count: number };
+        expect(row.count).toBe(0);
+      } finally {
+        inspection.close();
+      }
+    } finally {
+      releaseTransaction();
+      await Promise.allSettled([
+        ...(transaction ? [transaction] : []),
+        ...(health ? [health] : []),
+        ...(closing ? [closing] : []),
+      ]);
+      prepareSpy.mockRestore();
+      execSpy.mockRestore();
+      await Promise.allSettled([factory.close()]);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { outcome: "healthy" as const },
+    { outcome: "unavailable" as const },
+  ])("factory health returns closed for a deferred idle-known-project (%s)", async ({ outcome }) => {
+    const root = createTemporaryDirectory("lcm-storage-idle-health-race-");
+    const identity = projectIdentity(root);
+    const dbPath = join(root, "idle-health-race.db");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: (project) => ({ id: project.id, dbPath }),
+    });
+    const storage = await factory.openProject(identity);
+    const retainedDb = getLcmConnection(dbPath);
+    await storage.close();
+
+    const executor = sqliteExecutorFor(retainedDb, identity.id, () => undefined);
+    let releaseTransaction!: () => void;
+    let markEntered!: () => void;
+    const release = new Promise<void>((resolve) => { releaseTransaction = resolve; });
+    const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+    const timeline: string[] = [];
+    const postCloseProbeSql: string[] = [];
+    let factoryClosed = false;
+    let quickCheckCount = 0;
+    let healthSettled = false;
+    let transaction: Promise<void> | undefined;
+    let health: Promise<Awaited<ReturnType<typeof factory.health>>> | undefined;
+    let closing: Promise<void> | undefined;
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    const prepareSpy = vi.spyOn(DatabaseSync.prototype, "prepare").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      if (sql === "PRAGMA quick_check(1)") {
+        quickCheckCount += 1;
+        timeline.push("probe");
+        if (outcome === "unavailable") {
+          return { all: () => [{ quick_check: "private-idle-health-race-sentinel" }] } as never;
+        }
+      }
+      return originalPrepare.call(this, sql);
+    });
+    const originalExec = DatabaseSync.prototype.exec;
+    const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      if (factoryClosed) postCloseProbeSql.push(sql);
+      const result = originalExec.call(this, sql);
+      if (sql === "COMMIT") timeline.push("transaction-complete");
+      return result;
+    });
+    try {
+      transaction = executor.transaction(async () => {
+        markEntered();
+        await release;
+      });
+      await entered;
+
+      health = factory.health().then((result) => {
+        healthSettled = true;
+        timeline.push("health-complete");
+        return result;
+      });
+      const poolPollCap = 1000;
+      let probeReferenceObserved = false;
+      for (let attempt = 0; attempt < poolPollCap; attempt += 1) {
+        const connection = getPoolStats().connections.find(entry => entry.path === dbPath);
+        if (connection?.refs === 2) {
+          probeReferenceObserved = true;
+          break;
+        }
+        await Promise.resolve();
+      }
+      if (!probeReferenceObserved) {
+        throw new Error(`idle probe reference was not acquired within ${poolPollCap} microtasks`);
+      }
+      expect(quickCheckCount).toBe(0);
+      expect(healthSettled).toBe(false);
+
+      closing = factory.close().then(() => {
+        factoryClosed = true;
+        timeline.push("factory-close-complete");
+      });
+      await closing;
+      expect(healthSettled).toBe(false);
+      expect(quickCheckCount).toBe(0);
+
+      releaseTransaction();
+      await transaction;
+      const [result] = await Promise.all([health]);
+      expect(result).toEqual({ status: "closed", backend: "sqlite" });
+      expect(JSON.stringify(result)).not.toContain("private-idle-health-race-sentinel");
+      expect(JSON.stringify(result)).not.toContain("idle-health-race.db");
+      expect(quickCheckCount).toBe(1);
+      expect(timeline.indexOf("factory-close-complete"), timeline.join(",")).toBeLessThan(timeline.indexOf("transaction-complete"));
+      expect(timeline.indexOf("transaction-complete"), timeline.join(",")).toBeLessThan(timeline.indexOf("probe"));
+      expect(timeline.indexOf("probe"), timeline.join(",")).toBeLessThan(timeline.indexOf("health-complete"));
+      if (outcome === "healthy") {
+        // Factory shutdown is non-draining: an already in-flight idle probe may
+        // still run BEGIN IMMEDIATE, temporary DDL, and ROLLBACK afterward.
+        expect(postCloseProbeSql).toContain("BEGIN IMMEDIATE");
+        expect(postCloseProbeSql.some(sql => sql.startsWith("CREATE TABLE main.\"__lcm_storage_health_probe_"))).toBe(true);
+        expect(postCloseProbeSql).toContain("ROLLBACK");
+      }
+      expect(getPoolStats().connections.find(entry => entry.path === dbPath))
+        .toMatchObject({ path: dbPath, refs: 1 });
+
+      closeLcmConnection(dbPath, retainedDb);
+      expect(getPoolStats().connections.some(entry => entry.path === dbPath)).toBe(false);
+      const inspection = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        const row = inspection.prepare(
+          "SELECT COUNT(*) AS count FROM sqlite_master WHERE name LIKE '__lcm_storage_health_probe_%'",
+        ).get() as { count: number };
+        expect(row.count).toBe(0);
+      } finally {
+        inspection.close();
+      }
+    } finally {
+      releaseTransaction();
+      await Promise.allSettled([
+        ...(transaction ? [transaction] : []),
+        ...(health ? [health] : []),
+        ...(closing ? [closing] : []),
+      ]);
+      prepareSpy.mockRestore();
+      execSpy.mockRestore();
+      closeLcmConnection(dbPath, retainedDb);
+      await Promise.allSettled([factory.close()]);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("probes active projects for integrity and serialized write readiness", async () => {
