@@ -174,7 +174,8 @@ retaining a single, authenticated service owner.
 On Linux, managed-daemon admission also proves that the configured
 `127.0.0.1` listener belongs to the authenticated systemd service. LCM first
 uses direct process-descriptor evidence when the caller can read it. If a
-`PrivateTmp` user namespace intentionally hides those descriptor links, LCM
+`PrivateTmp`-isolated user unit runs in a sibling user namespace that hides
+those descriptor links, LCM
 uses the operating system's fixed `ss` socket-diagnostic command to compare
 the listener's kernel cgroup with systemd's exact `ControlGroup` for the
 registered service. Missing tools, malformed output, mixed ownership, or a
