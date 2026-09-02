@@ -115,7 +115,7 @@ describe("PostgreSqlProjectStorage", () => {
       () => undefined,
     );
     const operation = storage.coordination.getSessionIngest("session-secret");
-    await queryObserved;
+    await observed;
     const closing = storage.close();
     await expect(operation).rejects.toMatchObject({
       projectId: PROJECT_ID,
