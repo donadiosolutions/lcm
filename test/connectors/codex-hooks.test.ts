@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import * as fs from "node:fs";
 import {
   enableCodexHooksFeature,
   hasCodexHooks,
@@ -306,5 +307,320 @@ describe("Codex hook configuration boundaries", () => {
     expect(result.changed).toBe(true);
     expect(readFileSync(hooksPath)).toEqual(Buffer.alloc(0));
     expect(finalizeConnectorLeaf(result.receipt)).toEqual([]);
+  });
+
+  it("covers sequential receipt cleanup and no-op compensation", () => {
+    writeFileSync(hooksPath, "one\n");
+    const expected = captureConnectorLeaf(hooksPath, hooksPath);
+    const first = mutateConnectorLeaf({
+      displayPath: hooksPath, operationPath: hooksPath, parentOperationPath: dir, expected,
+      decide: () => ({ state: "regular" as const, content: Buffer.from("two\n"), mode: 0o600 }),
+    });
+    const second = mutateConnectorLeaf({
+      displayPath: hooksPath, operationPath: hooksPath, parentOperationPath: dir,
+      expected: first.receipt.current,
+      decide: () => ({ state: "regular" as const, content: Buffer.from("three\n"), mode: 0o600 }),
+    }, first.receipt);
+    expect(second.receipt.initialHoldOperationPath).toBe(first.receipt.initialHoldOperationPath);
+    const unchanged = mutateConnectorLeaf({
+      displayPath: hooksPath, operationPath: hooksPath, parentOperationPath: dir,
+      expected: second.receipt.current,
+      decide: () => ({ state: "unchanged" as const }),
+    }, second.receipt);
+    expect(unchanged).toEqual({ changed: false, receipt: second.receipt });
+    expect(compensateConnectorLeaf(second.receipt)).toEqual([]);
+    expect(readFileSync(hooksPath, "utf-8")).toBe("one\n");
+    expect(finalizeConnectorLeaf(second.receipt)).toEqual([]);
+    expect(compensateConnectorLeaf({
+      ...second.receipt, mutationCommitted: false,
+    })).toEqual([]);
+  });
+
+  it("accepts an empty managed skill input and exercises native MCP refusal paths", async () => {
+    writeFileSync(hooksPath, "");
+    const installer = await import("../../src/connectors/installer.js");
+    // An empty historical skill is owned and can be replaced by reinstall.
+    expect(() => installer.installConnector("claude-code", "skill", dir)).not.toThrow();
+
+    const absentRunner = { get: () => [], add: undefined, remove: () => undefined };
+    expect(() => installer.installConnector("codex", "mcp", dir, {
+      codexMcpRunner: absentRunner as never, persistTransport: false,
+    })).toThrow(/does not provide add/iu);
+    let malformedGets = 0;
+    const malformedRunner = {
+      get: () => (malformedGets++ < 3 ? [] : [{ name: "lcm", transport: { type: "sse" } }]),
+      add: () => undefined,
+      remove: () => undefined,
+    };
+    expect(() => installer.installConnector("codex", "mcp", dir, {
+      codexMcpRunner: malformedRunner, persistTransport: false,
+    })).toThrow(/readback verification/iu);
+    expect(installer.removeConnector("codex", {
+      cwd: dir,
+      codexMcpRunner: { get: () => [{ name: "lcm", transport: { type: "stdio" } }], add: () => undefined, remove: () => undefined },
+    })).toMatchObject({ success: false });
+  });
+
+  it("covers capture, staging, namespace, and cleanup fault boundaries", async () => {
+    const faults = {
+      capture: "" as string,
+      tx: "" as string,
+      candidate: "" as string,
+      publishArmed: false,
+      rollbackDrift: false,
+      unlink: false,
+      fstatCounts: new Map<number, number>(),
+      descriptors: new Map<number, string>(),
+    };
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const display = (value: fs.PathLike): string => {
+        const text = String(value);
+        const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(text);
+        if (!match) return text;
+        try { return join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { return text; }
+      };
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const shown = display(path);
+          if (shown === hooksPath && faults.capture === "open") throw Object.assign(new Error("capture open"), { code: "EIO" });
+          const fd = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          faults.descriptors.set(fd, shown);
+          faults.fstatCounts.set(fd, 0);
+          return fd;
+        }) as typeof actual.openSync,
+        fstatSync: ((fd: number, options?: fs.StatOptions) => {
+          const shown = faults.descriptors.get(fd);
+          const stats = actual.fstatSync(fd, options as never);
+          const count = (faults.fstatCounts.get(fd) ?? 0) + 1;
+          faults.fstatCounts.set(fd, count);
+          if (shown === hooksPath && faults.capture === "size") {
+            return new Proxy(stats, { get: (target, prop) => prop === "size" ? -1 : Reflect.get(target, prop, target) });
+          }
+          if (shown === hooksPath && faults.capture === "identity" && count > 1) {
+            return new Proxy(stats, { get: (target, prop) => prop === "ino" ? Number(target.ino) + 1 : Reflect.get(target, prop, target) });
+          }
+          if (shown === hooksPath && faults.publishArmed) {
+            faults.publishArmed = false;
+            return new Proxy(stats, { get: (target, prop) => prop === "mode" ? Number(target.mode) ^ 1 : Reflect.get(target, prop, target) });
+          }
+          if (shown?.includes("candidate-") && faults.candidate === "verify" && count === 1) {
+            return new Proxy(stats, { get: (target, prop) => prop === "size" ? Number(target.size) + 1 : Reflect.get(target, prop, target) });
+          }
+          if (shown?.includes("candidate-") && faults.candidate === "changed" && count > 1) {
+            return new Proxy(stats, { get: (target, prop) => prop === "ino" ? Number(target.ino) + 1 : Reflect.get(target, prop, target) });
+          }
+          return stats;
+        }) as typeof actual.fstatSync,
+        readSync: ((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          if (faults.candidate === "zero-read" && faults.descriptors.get(fd) === hooksPath) return 0;
+          const count = actual.readSync(fd, buffer, offset, length, position);
+          if (faults.descriptors.get(fd)?.includes("candidate-") && faults.candidate === "mismatch" && count > 0) buffer[offset] ^= 0xff;
+          return count;
+        }) as typeof actual.readSync,
+        writeSync: ((fd: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          if (faults.candidate === "zero-write" && faults.descriptors.get(fd)?.includes("candidate-")) return 0;
+          return actual.writeSync(fd, data, offset, length, position);
+        }) as typeof actual.writeSync,
+        linkSync: ((existing: fs.PathLike, target: fs.PathLike) => {
+          if (faults.candidate === "publish" && String(existing).includes("candidate-")) faults.publishArmed = true;
+          return actual.linkSync(existing, target);
+        }) as typeof actual.linkSync,
+        renameSync: ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+          const result = actual.renameSync(oldPath, newPath);
+          if (faults.rollbackDrift && String(newPath).includes("rollback-")) {
+            faults.rollbackDrift = false;
+            actual.writeFileSync(newPath, "drift\n");
+          }
+          return result;
+        }) as typeof actual.renameSync,
+        mkdirSync: ((path: fs.PathLike, options?: fs.MakeDirectoryOptions | number) => {
+          const shown = String(path);
+          if (shown.includes(".lcm-connector-txn-") && faults.tx === "collision") throw Object.assign(new Error("collision"), { code: "EEXIST" });
+          if (shown.includes(".lcm-connector-txn-") && faults.tx === "error") throw Object.assign(new Error("mkdir failed"), { code: "EIO" });
+          return actual.mkdirSync(path, options as never);
+        }) as typeof actual.mkdirSync,
+        lstatSync: ((path: fs.PathLike, options?: fs.StatOptions) => {
+          const shown = String(path);
+          if (shown.includes(".lcm-connector-txn-") && faults.tx === "invalid") {
+            const stats = actual.lstatSync(path, options as never);
+            return new Proxy(stats, { get: (target, prop) => prop === "mode" ? 0o755 : Reflect.get(target, prop, target) });
+          }
+          return actual.lstatSync(path, options as never);
+        }) as typeof actual.lstatSync,
+        unlinkSync: ((path: fs.PathLike) => {
+          if (faults.unlink && String(path).includes("candidate-")) throw Object.assign(new Error("unlink denied"), { code: "EIO" });
+          return actual.unlinkSync(path);
+        }) as typeof actual.unlinkSync,
+        closeSync: ((fd: number) => { faults.descriptors.delete(fd); faults.fstatCounts.delete(fd); return actual.closeSync(fd); }) as typeof actual.closeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      const op = (expected: import("../../src/connectors/codex-hooks.js").ConnectorLeafState) => ({
+        displayPath: hooksPath, operationPath: hooksPath, parentOperationPath: dir, expected,
+        decide: () => ({ state: "regular" as const, content: Buffer.from("next\n"), mode: 0o600 }),
+      });
+      writeFileSync(hooksPath, "base\n");
+      faults.capture = "size";
+      expect(() => module.captureConnectorLeaf(hooksPath, hooksPath)).toThrow(/Unable to read connector leaf/iu);
+      faults.capture = "identity";
+      expect(() => module.captureConnectorLeaf(hooksPath, hooksPath)).toThrow(/changed while being read/iu);
+      faults.capture = "";
+      faults.candidate = "zero-read";
+      expect(() => module.captureConnectorLeaf(hooksPath, hooksPath)).toThrow(/short connector leaf read/iu);
+      faults.candidate = "zero-write";
+      expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/no progress/iu);
+      faults.capture = "";
+      faults.tx = "invalid";
+      expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/invalid transaction directory/iu);
+      faults.tx = "";
+      faults.candidate = "mismatch";
+      expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/readback mismatch/iu);
+      faults.candidate = "changed";
+      expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/changed while being staged/iu);
+      faults.candidate = "verify";
+      expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/verification failed/iu);
+      faults.candidate = "";
+      expect(() => module.mutateConnectorLeaf({
+        ...op(module.captureConnectorLeaf(hooksPath, hooksPath)),
+        expected: { state: "absent" as const },
+        decide: () => ({ state: "unchanged" as const }),
+      })).toThrow(/changed before mutation/iu);
+      faults.candidate = "mismatch";
+      faults.unlink = true;
+      expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/readback mismatch.*cleanup failed/iu);
+      faults.unlink = false;
+      writeFileSync(hooksPath, JSON.stringify({ custom: true, hooks: { SessionStart: [{ hooks: [{ type: "command", command: "lcm restore --client codex" }] }] } }));
+      faults.unlink = true;
+      expect(() => module.removeCodexHooks(hooksPath)).toThrow(/cleanup failed/iu);
+      faults.unlink = false;
+      faults.tx = "error";
+      expect(() => module.removeCodexHooks(hooksPath)).toThrow(/mkdir failed|Unable to/iu);
+      faults.tx = "";
+      faults.candidate = "";
+      const rollbackSeed = module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)));
+      faults.rollbackDrift = true;
+      expect(module.compensateConnectorLeaf(rollbackSeed.receipt)[0]).toContain("rollback incomplete");
+      faults.tx = "collision";
+      expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/unable to allocate/iu);
+      faults.tx = "error";
+      expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/mkdir failed/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("covers compensation receipt guards and monotonic cleanup failures", () => {
+    writeFileSync(hooksPath, "namespace\n");
+    const seeded = mutateConnectorLeaf({
+      displayPath: hooksPath, operationPath: hooksPath, parentOperationPath: dir,
+      expected: captureConnectorLeaf(hooksPath, hooksPath),
+      decide: () => ({ state: "regular" as const, content: Buffer.from("published\n"), mode: 0o600 }),
+    });
+    chmodSync(seeded.receipt.transactionOperationPath, 0o755);
+    expect(() => mutateConnectorLeaf({
+      displayPath: hooksPath, operationPath: hooksPath, parentOperationPath: dir,
+      expected: seeded.receipt.current,
+      decide: () => ({ state: "absent" as const }),
+    }, seeded.receipt)).toThrow(/transaction namespace changed/iu);
+    finalizeConnectorLeaf(seeded.receipt);
+
+    const tx = join(dir, "tx");
+    mkdirSync(tx);
+    const currentPath = join(tx, "current");
+    const initialPath = join(tx, "initial");
+    writeFileSync(currentPath, "current\n");
+    writeFileSync(initialPath, "initial\n");
+    const current = captureConnectorLeaf(hooksPath, currentPath);
+    const absent = { state: "absent" as const };
+    expect(compensateConnectorLeaf({
+      displayPath: hooksPath, operationPath: currentPath, parentOperationPath: dir,
+      initial: current, current, transactionDisplayPath: tx, transactionOperationPath: tx,
+      mutationCommitted: false, recoveryRequired: false,
+    })).toEqual([]);
+    expect(compensateConnectorLeaf({
+      displayPath: hooksPath, operationPath: currentPath, parentOperationPath: dir,
+      initial: current, current, transactionDisplayPath: tx, transactionOperationPath: tx,
+      mutationCommitted: true, recoveryRequired: false,
+    })[0]).toContain("rollback incomplete");
+    const noInitialHold = {
+      displayPath: hooksPath, operationPath: currentPath, parentOperationPath: dir,
+      initial: current, current, transactionDisplayPath: tx, transactionOperationPath: tx,
+      mutationCommitted: true, recoveryRequired: false,
+    };
+    const regularMismatchPath = join(tx, "regular-mismatch");
+    const wrongInitialPath = join(tx, "wrong-initial");
+    writeFileSync(regularMismatchPath, "current\n");
+    writeFileSync(wrongInitialPath, "wrong\n");
+    const regularMismatch = captureConnectorLeaf(hooksPath, regularMismatchPath);
+    expect(compensateConnectorLeaf({
+      displayPath: hooksPath, operationPath: regularMismatchPath, parentOperationPath: dir,
+      initial: regularMismatch, current: regularMismatch, transactionDisplayPath: tx, transactionOperationPath: tx,
+      initialHoldOperationPath: wrongInitialPath, mutationCommitted: true, recoveryRequired: false,
+    })[0]).toContain("rollback incomplete");
+    const absentNoHoldPath = join(tx, "absent-no-hold");
+    const absentNoHold = {
+      displayPath: hooksPath, operationPath: absentNoHoldPath, parentOperationPath: dir,
+      initial: current, current: absent, transactionDisplayPath: tx, transactionOperationPath: tx,
+      mutationCommitted: true, recoveryRequired: false,
+    };
+    expect(compensateConnectorLeaf(absentNoHold)[0]).toContain("rollback incomplete");
+    expect(compensateConnectorLeaf(noInitialHold)[0]).toContain("rollback incomplete");
+    expect(compensateConnectorLeaf({
+      ...noInitialHold, initialHoldOperationPath: initialPath,
+    })[0]).toContain("rollback incomplete");
+    expect(compensateConnectorLeaf({
+      displayPath: hooksPath, operationPath: currentPath, parentOperationPath: dir,
+      initial: current, current: absent, transactionDisplayPath: tx, transactionOperationPath: tx,
+      mutationCommitted: true, recoveryRequired: false,
+    })[0]).toContain("rollback incomplete");
+    const absentWithHold = {
+      displayPath: hooksPath, operationPath: hooksPath, parentOperationPath: dir,
+      initial: current, current: absent, transactionDisplayPath: tx, transactionOperationPath: tx,
+      initialHoldOperationPath: initialPath, mutationCommitted: true, recoveryRequired: false,
+    };
+    expect(compensateConnectorLeaf(absentWithHold)[0]).toContain("rollback incomplete");
+    rmSync(hooksPath, { force: true });
+    expect(compensateConnectorLeaf({ ...absentWithHold, operationPath: hooksPath })[0]).toContain("rollback incomplete");
+    const absentInitial = {
+      displayPath: hooksPath, operationPath: hooksPath, parentOperationPath: dir,
+      initial: absent, current: absent, transactionDisplayPath: tx, transactionOperationPath: tx,
+      mutationCommitted: true, recoveryRequired: false,
+    };
+    writeFileSync(hooksPath, "unexpected\n");
+    expect(compensateConnectorLeaf(absentInitial)[0]).toContain("rollback incomplete");
+    rmSync(hooksPath);
+    expect(compensateConnectorLeaf(absentInitial)).toEqual([]);
+
+    const finalTx = join(dir, "final-tx");
+    mkdirSync(finalTx);
+    const holdDirectory = join(finalTx, "hold");
+    mkdirSync(holdDirectory);
+    writeFileSync(join(finalTx, "unknown"), "keep\n");
+    const cleanup = finalizeConnectorLeaf({
+      displayPath: hooksPath, operationPath: hooksPath, parentOperationPath: dir,
+      initial: absent, current: absent, transactionDisplayPath: finalTx, transactionOperationPath: finalTx,
+      currentHoldOperationPath: holdDirectory, mutationCommitted: true, recoveryRequired: false,
+    });
+    expect(cleanup.join(";")).toContain("cleanup failed");
+  });
+
+  it("fails closed for unsupported platforms and parent inspection faults", async () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
+    try {
+      expect(() => removeCodexHooks(hooksPath)).toThrow(/requires Linux/iu);
+    } finally {
+      Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+    }
+    const missingParent = join(dir, "missing", "hooks.json");
+    expect(removeCodexHooks(missingParent)).toBe(false);
+    const parentFile = join(dir, "parent-file");
+    writeFileSync(parentFile, "not a directory");
+    expect(() => removeCodexHooks(join(parentFile, "hooks.json"))).toThrow(/Unable to inspect connector hooks parent/iu);
   });
 });

@@ -872,15 +872,6 @@ function readOptionalRegularFileNoFollow(filePath: string): Buffer | undefined {
   }
 }
 
-function writeRegularFileNoFollow(filePath: string, content: Buffer, mode = 0o666): Buffer {
-  const result = activeMutationAuthority!.mutate(filePath, (base) => ({
-    state: "regular",
-    content: Buffer.from(content),
-    mode: base.state === "regular" ? base.mode : mode,
-  }));
-  return result.content ? Buffer.from(result.content) : Buffer.from(content);
-}
-
 function updateRegularFileNoFollow(
   filePath: string,
   update: (existing: Buffer, created: boolean) => Buffer | undefined,

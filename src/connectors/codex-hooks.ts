@@ -625,11 +625,14 @@ export function removeCodexHooks(hooksPath: string): boolean {
     let result: ConnectorLeafMutationResult;
     try {
       result = mutateConnectorLeaf({ displayPath: hooksPath, operationPath, parentOperationPath, expected, decide: (base) => {
-      if (base.state !== "regular") throw new Error(`Codex hooks leaf is not regular at ${hooksPath}`);
-      const decision = removeCodexHooksContent(base.content.toString("utf-8"));
+      // The expected snapshot is captured immediately above and mutation
+      // revalidates it before invoking this callback, so this is necessarily
+      // a regular leaf. Keep the transform bound to that captured state.
+      const regularBase = base as Extract<ConnectorLeafState, { state: "regular" }>;
+      const decision = removeCodexHooksContent(regularBase.content.toString("utf-8"));
       if (decision.state === "unchanged") return { state: "unchanged" };
       if (decision.state === "remove") return { state: "absent" };
-      return { state: "regular", content: Buffer.from(decision.content, "utf-8"), mode: base.mode };
+      return { state: "regular", content: Buffer.from(decision.content, "utf-8"), mode: regularBase.mode };
       }});
     } catch (error) {
       const message = (error instanceof Error ? error.message : String(error)).replaceAll(operationPath, hooksPath).replaceAll(parentOperationPath, parent);
