@@ -537,9 +537,22 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
     if (priorReceipt?.currentHoldOperationPath && priorReceipt.currentHoldOperationPath !== hold) safeUnlink(priorReceipt.currentHoldOperationPath);
     return { changed: true, receipt };
   } catch (error) {
-    if (candidate) { try { safeUnlink(candidate); } catch { /* preserve primary */ } }
-    if (!priorReceipt) { try { rmdirSync(tx.operation); } catch { /* preserve recovery namespace */ } }
-    throw sanitizeLeafError(error, operation, tx);
+    const primary = sanitizeLeafError(error, operation, tx);
+    const cleanupFailures: string[] = [];
+    if (candidate) {
+      try { safeUnlink(candidate); }
+      catch (cleanupError) { cleanupFailures.push(`candidate cleanup failed (${sanitizeLeafError(cleanupError, operation, tx).message})`); }
+    }
+    if (!priorReceipt) {
+      try { rmdirSync(tx.operation); }
+      catch (cleanupError) {
+        if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") {
+          cleanupFailures.push(`transaction cleanup failed (${sanitizeLeafError(cleanupError, operation, tx).message})`);
+        }
+      }
+    }
+    if (cleanupFailures.length > 0) primary.message = `${primary.message}; ${cleanupFailures.join("; ")}`;
+    throw primary;
   }
 }
 
