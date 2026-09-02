@@ -182,6 +182,7 @@ describe("mocked server states unavailable from Node HTTP", () => {
     const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }));
     let rejectControlledClose!: (reason?: unknown) => void;
     const controlledClose = new Promise<void>((_resolve, reject) => { rejectControlledClose = reject; });
+    void controlledClose.catch(() => undefined);
     let signalCloseStarted!: () => void;
     const closeStarted = new Promise<void>(resolve => { signalCloseStarted = resolve; });
     let totalCalls = 0;
@@ -198,7 +199,6 @@ describe("mocked server states unavailable from Node HTTP", () => {
         try {
           if (totalCalls === 1) {
             signalCloseStarted();
-            void controlledClose.catch(() => undefined);
             await controlledClose;
           }
         } finally {
