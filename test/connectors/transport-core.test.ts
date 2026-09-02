@@ -131,7 +131,7 @@ describe("connector transport core", () => {
       expect(installed.paths.some((path) => path.endsWith("SKILL.md"))).toBe(true);
       expect(existsSync(join(directory, ".cursor", "mcp.json"))).toBe(false);
       expect(removeConnector("cursor", directory, options)).toMatchObject({ success: true });
-      expect(readFileSync(join(directory, ".cursor", "skills", "lcm-memory", "SKILL.md"), "utf8")).toBe("");
+      expect(existsSync(join(directory, ".cursor", "skills", "lcm-memory", "SKILL.md"))).toBe(false);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

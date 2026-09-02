@@ -2,16 +2,13 @@ import {
   closeSync,
   constants,
   existsSync,
-  fchmodSync,
   fstatSync,
-  ftruncateSync,
   lstatSync,
   mkdirSync,
   openSync,
   realpathSync,
   readSync,
   readlinkSync,
-  writeSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -29,6 +26,14 @@ import {
   mergeCodexHooksContent,
   removeCodexHooksContent,
   setCodexHooksFeature,
+  captureConnectorLeaf,
+  mutateConnectorLeaf,
+  compensateConnectorLeaf,
+  finalizeConnectorLeaf,
+  type ConnectorLeafDecision,
+  type ConnectorLeafReceipt,
+  type ConnectorLeafState,
+  type ConnectorLeafMutationResult,
 } from "./codex-hooks.js";
 import {
   canonicalHookCommand,
@@ -495,32 +500,6 @@ type RegularOwnedFileSnapshot = Readonly<{
 }>;
 type OwnedFileSnapshot = AbsentOwnedFileSnapshot | NonFileOwnedFileSnapshot | RegularOwnedFileSnapshot;
 
-type OwnedFileReceipt = Readonly<{
-  content: Buffer;
-  mode: number;
-  dev: number | bigint;
-  ino: number | bigint;
-}>;
-
-type DescriptorState = OwnedFileReceipt;
-
-type OwnedFileLease = {
-  readonly path: string;
-  readonly descriptor: number;
-  readonly initial: OwnedFileSnapshot;
-  readonly created: boolean;
-  mutationAttempted?: boolean;
-  receipt?: OwnedFileReceipt;
-  receiptError?: string;
-};
-
-class ConnectorPathChangedError extends Error {
-  constructor(path: string) {
-    super(`Connector path changed after authenticated mutation at ${path}`);
-    this.name = "ConnectorPathChangedError";
-  }
-}
-
 /**
  * Linux-only authority for connector mutations. Descendants are addressed
  * through retained directory descriptors in /proc; ordinary display paths
@@ -529,11 +508,13 @@ class ConnectorPathChangedError extends Error {
 class ConnectorMutationAuthority {
   private readonly roots = new Map<string, RootHandle>();
   private readonly operations = new Map<string, string>();
+  private readonly parentOperations = new Map<string, string>();
   private readonly procDisplays = new Map<string, string>();
   private readonly absent = new Set<string>();
   private readonly descriptors: number[] = [];
-  private readonly snapshots = new Map<string, OwnedFileSnapshot>();
-  private readonly leases = new Map<string, OwnedFileLease>();
+  readonly snapshots = new Map<string, OwnedFileSnapshot>();
+  readonly receipts = new Map<string, ConnectorLeafReceipt>();
+  private readonly mutationOrder: string[] = [];
 
   constructor(targets: readonly MutationTargetSpec[]) {
     try {
@@ -726,6 +707,7 @@ class ConnectorMutationAuthority {
     }
     const leaf = parts.at(-1)!;
     this.operations.set(target.displayPath, this.childPath(fd, leaf, target.displayPath));
+    this.parentOperations.set(target.displayPath, `/proc/self/fd/${fd}`);
   }
 
   operationPath(displayPath: string): string {
@@ -741,133 +723,53 @@ class ConnectorMutationAuthority {
     return this.operations.has(displayPath);
   }
 
+  mutate(displayPath: string, decide: (base: ConnectorLeafState) => ConnectorLeafDecision): ConnectorLeafMutationResult {
+    const operationPath = this.operationPath(displayPath);
+    const parentOperationPath = this.parentOperations.get(displayPath);
+    if (!parentOperationPath) throw new Error(`Unmapped connector mutation parent ${displayPath}`);
+    const prior = this.receipts.get(displayPath);
+    const expected = prior?.current ?? (() => {
+      const snapshot = this.snapshots.get(displayPath);
+      if (!snapshot || snapshot.state === "non-file") throw skillCollision(displayPath);
+      return snapshot.state === "absent" ? { state: "absent" as const } : snapshot;
+    })();
+    const result = mutateConnectorLeaf({
+      displayPath,
+      operationPath,
+      parentOperationPath,
+      expected,
+      decide,
+    }, prior);
+    if (result.changed) {
+      this.receipts.set(displayPath, result.receipt);
+      if (!prior) this.mutationOrder.push(displayPath);
+    }
+    return result;
+  }
+
   registerSnapshots(snapshots: readonly OwnedFileSnapshot[]): void {
     for (const snapshot of snapshots) this.snapshots.set(snapshot.path, snapshot);
   }
 
-  private openLeaf(displayPath: string, flags: number, mode?: number): number {
-    const operationPath = this.operationPath(displayPath);
-    return mode === undefined
-      ? openSync(operationPath, flags | NO_FOLLOW_FLAGS)
-      : openSync(operationPath, flags | NO_FOLLOW_FLAGS, mode);
-  }
-
-  acquireLease(displayPath: string, create: boolean, mode: number): OwnedFileLease | undefined {
-    const existing = this.leases.get(displayPath);
-    if (existing) return existing;
-
-    const registered = this.snapshots.get(displayPath);
-    if (!registered) throw new Error(`Unmapped connector mutation target ${displayPath}`);
-    if (registered.state === "non-file") throw skillCollision(displayPath);
-    if (registered.state === "absent" && !create) return undefined;
-
-    let descriptor: number;
-    const created = registered.state === "absent";
-    if (created) {
-      try {
-        descriptor = this.openLeaf(displayPath, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL, mode);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-          throw new ConnectorPathChangedError(displayPath);
-        }
-        throw error;
-      }
-    } else {
-      descriptor = this.openLeaf(displayPath, constants.O_RDWR);
-    }
-
-    try {
-      const stats = mutationDescriptorStats(descriptor, displayPath);
-      if (registered.state === "regular"
-        && (stats.dev !== registered.dev || stats.ino !== registered.ino)) {
-        throw new ConnectorPathChangedError(displayPath);
-      }
-      const lease = { path: displayPath, descriptor, initial: registered, created };
-      this.leases.set(displayPath, lease);
-      this.recordProcDisplay(`/proc/self/fd/${descriptor}`, displayPath);
-      this.descriptors.push(descriptor);
-      return lease;
-    } catch (error) {
-      closeSync(descriptor);
-      throw error;
-    }
-  }
-
-  recordMutation(lease: OwnedFileLease, requested: DescriptorState): Buffer {
-    lease.mutationAttempted = true;
-    try {
-      if (!descriptorStateEquals(lease.descriptor, lease.path, requested, 1)) {
-        throw new Error(`Concurrent connector mutation changed requested state at ${lease.path}`);
-      }
-      lease.receipt = {
-        content: Buffer.from(requested.content),
-        mode: requested.mode,
-        dev: requested.dev,
-        ino: requested.ino,
-      };
-      lease.receiptError = undefined;
-      return Buffer.from(requested.content);
-    } catch (error) {
-      lease.receipt = undefined;
-      lease.receiptError = this.displayError(error).message;
-      throw error;
-    }
-  }
-
-  beginMutation(lease: OwnedFileLease): void {
-    lease.mutationAttempted = true;
-    lease.receipt = undefined;
-    lease.receiptError = undefined;
-  }
-
-  pathIdentifiesLease(lease: OwnedFileLease): boolean {
-    return pathStillIdentifiesDescriptor(lease.path, fstatSync(lease.descriptor));
-  }
-
   hasMutations(): boolean {
-    return [...this.leases.values()].some((lease) => lease.mutationAttempted === true);
+    return this.receipts.size > 0;
   }
 
   compensateOwnedFiles(): string[] {
     const failures: string[] = [];
-    for (const lease of this.leases.values()) {
-      if (!lease.mutationAttempted) continue;
-      if (!lease.receipt) {
-        failures.push(`${lease.path}: exact expected-after receipt unavailable${lease.receiptError ? ` (${lease.receiptError})` : ""}`);
-        continue;
-      }
-      try {
-        const receipt = lease.receipt;
-        if (!descriptorStateEquals(lease.descriptor, lease.path, receipt, 1)) {
-          throw new Error(`expected-after receipt changed at ${lease.path}`);
-        }
+    for (const path of [...this.mutationOrder].reverse()) {
+      const receipt = this.receipts.get(path);
+      if (!receipt) continue;
+      failures.push(...compensateConnectorLeaf(receipt));
+    }
+    return failures;
+  }
 
-        if (lease.initial.state === "regular") {
-          const restoredState = {
-            content: lease.initial.content,
-            mode: lease.initial.mode,
-            dev: receipt.dev,
-            ino: receipt.ino,
-          };
-          writeDescriptor(lease.descriptor, lease.path, receipt, restoredState, true);
-          if (!descriptorStateEquals(lease.descriptor, lease.path, restoredState, 1)) {
-            throw new Error(`original inode restoration failed at ${lease.path}`);
-          }
-          if (!this.pathIdentifiesLease(lease)) {
-            failures.push(`${lease.path}: public path no longer identifies the restored original inode`);
-          }
-        } else {
-          writeDescriptor(lease.descriptor, lease.path, receipt, {
-            content: Buffer.alloc(0),
-            mode: receipt.mode,
-            dev: receipt.dev,
-            ino: receipt.ino,
-          });
-          failures.push(`${lease.path}: physical absence cannot be safely restored; created inode was neutralized`);
-        }
-      } catch (error) {
-        failures.push(`${lease.path}: ${this.displayError(error).message}`);
-      }
+  finalizeOwnedFiles(): string[] {
+    const failures: string[] = [];
+    for (const path of this.mutationOrder) {
+      const receipt = this.receipts.get(path);
+      if (receipt) failures.push(...finalizeConnectorLeaf(receipt));
     }
     return failures;
   }
@@ -908,7 +810,10 @@ function withMutationAuthority<T>(targets: readonly MutationTargetSpec[], callba
   const prior = activeMutationAuthority;
   activeMutationAuthority = authority;
   try {
-    return callback();
+    const result = callback();
+    const cleanupFailures = authority.finalizeOwnedFiles();
+    if (cleanupFailures.length > 0) throw new Error(`connector cleanup incomplete (${cleanupFailures.join("; ")})`);
+    return result;
   } catch (error) {
     throw authority.displayError(error);
   } finally {
@@ -927,149 +832,10 @@ function openNoFollowUnmapped(filePath: string, flags: number): number {
   return openSync(filePath, safeFlags);
 }
 
-type MutationDescriptor = Readonly<{
-  descriptor: number;
-  created: boolean;
-  lease: OwnedFileLease;
-}>;
-
-function acquireMutationDescriptor(filePath: string, create: boolean, mode = 0o666): MutationDescriptor | undefined {
-  const lease = activeMutationAuthority!.acquireLease(filePath, create, mode);
-  return lease && { descriptor: lease.descriptor, created: lease.created, lease };
-}
-
-function recordDescriptorMutation(
-  filePath: string,
-  handle: MutationDescriptor,
-  requested: DescriptorState,
-): Buffer {
-  const content = activeMutationAuthority!.recordMutation(handle.lease, requested);
-  const stable = activeMutationAuthority!.pathIdentifiesLease(handle.lease);
-  if (!stable) throw new ConnectorPathChangedError(filePath);
-  return content;
-}
-
-function mutateDescriptor(filePath: string, handle: MutationDescriptor, content: Buffer): Buffer {
-  const prior = captureMutationState(handle.descriptor, filePath);
-  const requested = {
-    content: Buffer.from(content),
-    mode: prior.mode,
-    dev: prior.dev,
-    ino: prior.ino,
-  };
-  activeMutationAuthority!.beginMutation(handle.lease);
-  writeDescriptor(handle.descriptor, filePath, prior, requested);
-  return recordDescriptorMutation(filePath, handle, requested);
-}
-
 function descriptorStats(descriptor: number, filePath: string): ReturnType<typeof fstatSync> {
   const stats = fstatSync(descriptor);
   if (!stats.isFile()) throw skillCollision(filePath);
   return stats;
-}
-
-function mutationDescriptorStats(descriptor: number, filePath: string): ReturnType<typeof fstatSync> {
-  const stats = descriptorStats(descriptor, filePath);
-  if (stats.nlink !== 1) {
-    throw new Error(`Refusing connector mutation through a multiply linked file at ${filePath}`);
-  }
-  return stats;
-}
-
-class ConnectorMutationSafetyError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ConnectorMutationSafetyError";
-  }
-}
-
-type DescriptorAuthentication = Readonly<{
-  dev: number | bigint;
-  ino: number | bigint;
-  nlink: number;
-}>;
-
-function authenticatedDescriptorStats(
-  descriptor: number,
-  filePath: string,
-  authentication: DescriptorAuthentication,
-): ReturnType<typeof fstatSync> {
-  const stats = fstatSync(descriptor);
-  if (!stats.isFile()) {
-    throw new ConnectorMutationSafetyError(`Connector mutation descriptor is not a regular file at ${filePath}`);
-  }
-  if (stats.dev !== authentication.dev || stats.ino !== authentication.ino) {
-    throw new ConnectorMutationSafetyError(`Connector mutation descriptor identity changed at ${filePath}`);
-  }
-  if (stats.nlink !== authentication.nlink) {
-    throw new ConnectorMutationSafetyError(
-      authentication.nlink === 1
-        ? `Refusing connector mutation through a multiply linked file at ${filePath}`
-        : `Connector mutation descriptor link count changed during emergency restoration at ${filePath}`,
-    );
-  }
-  return stats;
-}
-
-function stateAuthentication(state: DescriptorState, nlink: number): DescriptorAuthentication {
-  return { dev: state.dev, ino: state.ino, nlink };
-}
-
-function modeOf(stats: ReturnType<typeof fstatSync>): number {
-  return Number(stats.mode) & 0o777;
-}
-
-function readExpectedDescriptorBytes(
-  descriptor: number,
-  expected: Buffer,
-): Buffer | undefined {
-  const observed = Buffer.alloc(expected.length);
-  let offset = 0;
-  while (offset < observed.length) {
-    const bytesRead = readSync(descriptor, observed, offset, observed.length - offset, offset);
-    if (bytesRead === 0) return undefined;
-    offset += bytesRead;
-  }
-  return observed;
-}
-
-function descriptorStateEquals(
-  descriptor: number,
-  filePath: string,
-  expected: DescriptorState,
-  nlink: number,
-): boolean {
-  const authentication = stateAuthentication(expected, nlink);
-  const before = authenticatedDescriptorStats(descriptor, filePath, authentication);
-  if (modeOf(before) !== expected.mode || Number(before.size) !== expected.content.length) return false;
-  const content = readExpectedDescriptorBytes(descriptor, expected.content);
-  const after = authenticatedDescriptorStats(descriptor, filePath, authentication);
-  return content !== undefined
-    && modeOf(after) === expected.mode
-    && Number(after.size) === expected.content.length
-    && content.equals(expected.content);
-}
-
-function captureMutationState(descriptor: number, filePath: string): DescriptorState {
-  const before = mutationDescriptorStats(descriptor, filePath);
-  const content = readDescriptor(descriptor, filePath);
-  const after = mutationDescriptorStats(descriptor, filePath);
-  const size = Number(before.size);
-  if (before.dev !== after.dev
-    || before.ino !== after.ino
-    || modeOf(before) !== modeOf(after)
-    || before.size !== after.size
-    || !Number.isSafeInteger(size)
-    || size < 0
-    || content.length !== size) {
-    throw new Error(`Concurrent connector mutation changed pre-mutation state at ${filePath}`);
-  }
-  return {
-    content: Buffer.from(content),
-    mode: modeOf(before),
-    dev: before.dev,
-    ino: before.ino,
-  };
 }
 
 function readDescriptor(descriptor: number, filePath: string): Buffer {
@@ -1086,197 +852,6 @@ function readDescriptor(descriptor: number, filePath: string): Buffer {
     offset += bytesRead;
   }
   return offset === size ? content : content.subarray(0, offset);
-}
-
-function writeCompleteDescriptor(
-  descriptor: number,
-  filePath: string,
-  content: Buffer,
-  authentication: DescriptorAuthentication,
-): void {
-  let offset = 0;
-  while (offset < content.length) {
-    authenticatedDescriptorStats(descriptor, filePath, authentication);
-    const bytesWritten = writeSync(descriptor, content, offset, content.length - offset, offset);
-    if (bytesWritten <= 0) throw new Error("LCM connector write made no progress");
-    offset += bytesWritten;
-  }
-}
-
-function restoreDescriptorState(
-  descriptor: number,
-  filePath: string,
-  target: DescriptorState,
-  authentication: DescriptorAuthentication,
-): void {
-  authenticatedDescriptorStats(descriptor, filePath, authentication);
-  ftruncateSync(descriptor, 0);
-  authenticatedDescriptorStats(descriptor, filePath, authentication);
-  writeCompleteDescriptor(descriptor, filePath, target.content, authentication);
-  authenticatedDescriptorStats(descriptor, filePath, authentication);
-  fchmodSync(descriptor, target.mode);
-  authenticatedDescriptorStats(descriptor, filePath, authentication);
-  const verified = {
-    content: target.content,
-    mode: target.mode,
-    dev: authentication.dev,
-    ino: authentication.ino,
-  };
-  if (!descriptorStateEquals(descriptor, filePath, verified, authentication.nlink)) {
-    throw new Error(`Connector descriptor restoration verification failed at ${filePath}`);
-  }
-}
-
-function errorWithRestorationFailure(primary: unknown, label: string, restorationError: unknown): Error {
-  const primaryMessage = primary instanceof Error ? primary.message : String(primary);
-  const restorationMessage = restorationError instanceof Error ? restorationError.message : String(restorationError);
-  const combined = new Error(`${primaryMessage}; ${label} (${restorationMessage})`);
-  const code = (primary as NodeJS.ErrnoException)?.code;
-  if (typeof code === "string") Object.assign(combined, { code });
-  return combined;
-}
-
-function currentAuthentication(
-  descriptor: number,
-  filePath: string,
-): { stats: ReturnType<typeof fstatSync>; authentication: DescriptorAuthentication } {
-  const stats = fstatSync(descriptor);
-  if (!stats.isFile()) {
-    throw new ConnectorMutationSafetyError(`Connector mutation descriptor is not a regular file at ${filePath}`);
-  }
-  return {
-    stats,
-    authentication: { dev: stats.dev, ino: stats.ino, nlink: stats.nlink },
-  };
-}
-
-function recoverFromSafetyFailure(
-  descriptor: number,
-  filePath: string,
-  prior: DescriptorState,
-  requested: DescriptorState,
-  primary: ConnectorMutationSafetyError,
-): never {
-  let current: ReturnType<typeof currentAuthentication>;
-  try {
-    current = currentAuthentication(descriptor, filePath);
-  } catch {
-    throw primary;
-  }
-  const requestedOnCurrent = {
-    content: requested.content,
-    mode: requested.mode,
-    dev: current.authentication.dev,
-    ino: current.authentication.ino,
-  };
-  try {
-    if (!descriptorStateEquals(
-      descriptor,
-      filePath,
-      requestedOnCurrent,
-      current.authentication.nlink,
-    )) throw primary;
-  } catch (error) {
-    if (error === primary) throw error;
-    throw primary;
-  }
-
-  const restorationTarget = {
-    content: prior.content,
-    mode: prior.mode,
-    dev: current.authentication.dev,
-    ino: current.authentication.ino,
-  };
-  try {
-    restoreDescriptorState(
-      descriptor,
-      filePath,
-      restorationTarget,
-      current.authentication,
-    );
-  } catch (restorationError) {
-    throw errorWithRestorationFailure(primary, "emergency restoration failed", restorationError);
-  }
-  throw primary;
-}
-
-function recoverFromWriteFailure(
-  descriptor: number,
-  filePath: string,
-  prior: DescriptorState,
-  lastKnown: DescriptorState,
-  requested: DescriptorState,
-  primary: unknown,
-): never {
-  const authentication = stateAuthentication(prior, 1);
-  try {
-    authenticatedDescriptorStats(descriptor, filePath, authentication);
-  } catch (authenticationError) {
-    if (authenticationError instanceof ConnectorMutationSafetyError) {
-      return recoverFromSafetyFailure(descriptor, filePath, prior, requested, authenticationError);
-    }
-    throw errorWithRestorationFailure(primary, "pre-mutation restoration failed", authenticationError);
-  }
-  try {
-    if (descriptorStateEquals(descriptor, filePath, prior, 1)) throw primary;
-    if (!descriptorStateEquals(descriptor, filePath, lastKnown, 1)) throw primary;
-    restoreDescriptorState(descriptor, filePath, prior, authentication);
-  } catch (restorationError) {
-    if (restorationError === primary) throw restorationError;
-    throw errorWithRestorationFailure(primary, "pre-mutation restoration failed", restorationError);
-  }
-  throw primary;
-}
-
-function writeDescriptor(
-  descriptor: number,
-  filePath: string,
-  prior: DescriptorState,
-  requested: DescriptorState,
-  forceMode = false,
-): void {
-  const authentication = stateAuthentication(prior, 1);
-  let mutationStarted = false;
-  let lastKnown = prior;
-  try {
-    if (!descriptorStateEquals(descriptor, filePath, prior, 1)) {
-      throw new Error(`Concurrent connector mutation changed pre-mutation state at ${filePath}`);
-    }
-    authenticatedDescriptorStats(descriptor, filePath, authentication);
-    mutationStarted = true;
-    lastKnown = { ...prior, content: Buffer.alloc(0) };
-    ftruncateSync(descriptor, 0);
-    authenticatedDescriptorStats(descriptor, filePath, authentication);
-
-    let offset = 0;
-    while (offset < requested.content.length) {
-      authenticatedDescriptorStats(descriptor, filePath, authentication);
-      const bytesWritten = writeSync(
-        descriptor,
-        requested.content,
-        offset,
-        requested.content.length - offset,
-        offset,
-      );
-      if (bytesWritten <= 0) throw new Error("LCM connector write made no progress");
-      offset += bytesWritten;
-      lastKnown = { ...prior, content: Buffer.from(requested.content.subarray(0, offset)) };
-      authenticatedDescriptorStats(descriptor, filePath, authentication);
-    }
-
-    authenticatedDescriptorStats(descriptor, filePath, authentication);
-    if (forceMode) {
-      fchmodSync(descriptor, requested.mode);
-      lastKnown = { ...lastKnown, mode: requested.mode };
-      authenticatedDescriptorStats(descriptor, filePath, authentication);
-    }
-  } catch (error) {
-    if (!mutationStarted) throw error;
-    if (error instanceof ConnectorMutationSafetyError) {
-      return recoverFromSafetyFailure(descriptor, filePath, prior, requested, error);
-    }
-    return recoverFromWriteFailure(descriptor, filePath, prior, lastKnown, requested, error);
-  }
 }
 
 function readRegularFileNoFollow(filePath: string): Buffer {
@@ -1298,8 +873,12 @@ function readOptionalRegularFileNoFollow(filePath: string): Buffer | undefined {
 }
 
 function writeRegularFileNoFollow(filePath: string, content: Buffer, mode = 0o666): Buffer {
-  const handle = acquireMutationDescriptor(filePath, true, mode)!;
-  return mutateDescriptor(filePath, handle, content);
+  const result = activeMutationAuthority!.mutate(filePath, (base) => ({
+    state: "regular",
+    content: Buffer.from(content),
+    mode: base.state === "regular" ? base.mode : mode,
+  }));
+  return result.content ? Buffer.from(result.content) : Buffer.from(content);
 }
 
 function updateRegularFileNoFollow(
@@ -1308,22 +887,19 @@ function updateRegularFileNoFollow(
   mode = 0o666,
   create = true,
 ): Buffer {
-  const handle = acquireMutationDescriptor(filePath, create, mode);
-  if (!handle) throw Object.assign(new Error(`Connector mutation target is absent: ${filePath}`), { code: "ENOENT" });
-  const existing = readDescriptor(handle.descriptor, filePath);
-  const updated = update(existing, handle.created);
-  if (updated === undefined) return existing;
-  return mutateDescriptor(filePath, handle, updated);
-}
-
-function pathStillIdentifiesDescriptor(filePath: string, stats: ReturnType<typeof fstatSync>): boolean {
-  try {
-    const current = lstatSync(ioPath(filePath));
-    return current.isFile() && current.dev === stats.dev && current.ino === stats.ino;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
+  const snapshot = activeMutationAuthority!.snapshots?.get(filePath);
+  if (!create && snapshot?.state === "absent" && !activeMutationAuthority!.receipts?.has(filePath)) {
+    throw Object.assign(new Error(`Connector mutation target is absent: ${filePath}`), { code: "ENOENT" });
   }
+  let resultContent: Buffer | undefined;
+  const result = activeMutationAuthority!.mutate(filePath, (base) => {
+    const existing = base.state === "regular" ? Buffer.from(base.content) : Buffer.alloc(0);
+    const updated = update(existing, base.state === "absent");
+    resultContent = updated ? Buffer.from(updated) : existing;
+    if (updated === undefined) return { state: "unchanged" };
+    return { state: "regular", content: Buffer.from(updated), mode: base.state === "regular" ? base.mode : mode };
+  });
+  return resultContent ?? result.content ?? Buffer.alloc(0);
 }
 
 function preflightSkill(filePath: string, generated: string): void {
@@ -1331,7 +907,7 @@ function preflightSkill(filePath: string, generated: string): void {
   try {
     existing = readOptionalRegularFileNoFollow(filePath);
   } catch (error) {
-    if (["ELOOP", "EISDIR", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+    if (["ELOOP", "EISDIR", "ENOTDIR", "ENOENT", "EAGAIN"].includes((error as NodeJS.ErrnoException).code ?? "")) {
       throw skillCollision(filePath);
     }
     const code = (error as NodeJS.ErrnoException).code;
@@ -1344,15 +920,15 @@ function preflightSkill(filePath: string, generated: string): void {
 function installSkill(content: string, filePath: string): void {
   preflightSkill(filePath, content);
   const expected = Buffer.from(managedSkillContent(content), 'utf-8');
-  let handle: MutationDescriptor | undefined;
   try {
-    handle = acquireMutationDescriptor(filePath, true, 0o666)!;
-    if (!handle.created) {
-      const existing = readDescriptor(handle.descriptor, filePath);
-      if (!isOwnedSkill(existing, content)) throw skillCollision(filePath);
-      if (existing.equals(expected)) return;
-    }
-    mutateDescriptor(filePath, handle, expected);
+    activeMutationAuthority!.mutate(filePath, (base) => {
+      if (base.state === "regular") {
+        if (!isOwnedSkill(base.content, content)) throw skillCollision(filePath);
+        if (base.content.equals(expected)) return { state: "unchanged" };
+        return { state: "regular", content: expected, mode: base.mode };
+      }
+      return { state: "regular", content: expected, mode: 0o666 };
+    });
   } catch (error) {
     if (["ELOOP", "EISDIR", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
       throw skillCollision(filePath);
@@ -1362,15 +938,20 @@ function installSkill(content: string, filePath: string): void {
 }
 
 function removeSkill(filePath: string, generated: string | readonly string[], strict = false): boolean {
-  let handle: MutationDescriptor | undefined;
   try {
-    handle = acquireMutationDescriptor(filePath, false);
-    if (!handle) return false;
+    const snapshot = activeMutationAuthority!.snapshots?.get(filePath);
+    if (!snapshot || snapshot.state === "absent") return false;
+    const result = activeMutationAuthority!.mutate(filePath, (base) => {
+      if (base.state !== "regular" || base.content.length === 0) return { state: "unchanged" };
+      if (!isOwnedSkill(base.content, generated)) {
+        if (strict) throw new Error(`Refusing to remove an unowned LCM skill at ${filePath}`);
+        return { state: "unchanged" };
+      }
+      return { state: "absent" };
+    });
+    return result.changed;
   } catch (error) {
-    if (error instanceof ConnectorPathChangedError) {
-      if (strict) throw error;
-      return false;
-    }
+    if (!strict && (error as NodeJS.ErrnoException).code === "EAGAIN") return false;
     if (error instanceof Error && error.message.startsWith("Refusing to overwrite an unowned LCM skill")) {
       if (strict) throw error;
       return false;
@@ -1382,19 +963,6 @@ function removeSkill(filePath: string, generated: string | readonly string[], st
     }
     const code = (error as NodeJS.ErrnoException).code;
     throw new Error(`Unable to inspect LCM skill at ${filePath}${typeof code === "string" ? `: ${code}` : ""}`, { cause: error });
-  }
-  try {
-    const content = readDescriptor(handle.descriptor, filePath);
-    if (content.length === 0) return false;
-    if (!isOwnedSkill(content, generated)) {
-      if (strict) throw new Error(`Refusing to remove an unowned LCM skill at ${filePath}`);
-      return false;
-    }
-    mutateDescriptor(filePath, handle, Buffer.alloc(0));
-    return true;
-  } catch (error) {
-    if (!strict && error instanceof ConnectorPathChangedError) return false;
-    throw error;
   }
 }
 
@@ -1482,7 +1050,7 @@ function removeMcpJson(filePath: string, strict = false): boolean {
     }, 0o666, false);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
-    if (!strict && error instanceof ConnectorPathChangedError) return false;
+    if (!strict && ((error as NodeJS.ErrnoException).code === "EAGAIN")) return false;
     throw error;
   }
   return removed;
@@ -1522,7 +1090,7 @@ function removeClaudeHooks(filePath: string, strict = false): boolean {
     }, 0o666, false);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    if (!strict && error instanceof ConnectorPathChangedError) return false;
+    if (!strict && ((error as NodeJS.ErrnoException).code === "EAGAIN")) return false;
     throw error;
   }
   return removed;
@@ -1717,18 +1285,24 @@ function installComponent(
       if (!hookConfigPath) throw new Error(`No config path defined for ${agent.name} with type hook`);
       const hooksPath = resolveConfigPath(hookConfigPath, cwd);
       const configPath = resolveConfigPath(CODEX_CONFIG_PATH, cwd);
-      const existingConfig = readOptionalRegularFileNoFollow(configPath)?.toString("utf-8") ?? "";
-      const updatedConfig = setCodexHooksFeature(existingConfig);
-      if (updatedConfig !== existingConfig) writeRegularFileNoFollow(configPath, Buffer.from(updatedConfig, "utf-8"));
-      const existingHooks = readOptionalRegularFileNoFollow(hooksPath)?.toString("utf-8") ?? "";
-      writeRegularFileNoFollow(hooksPath, Buffer.from(mergeCodexHooksContent(existingHooks, transport), "utf-8"));
+      updateRegularFileNoFollow(configPath, (existing) => {
+        const updated = setCodexHooksFeature(existing.toString("utf-8"));
+        return updated === existing.toString("utf-8") ? undefined : Buffer.from(updated, "utf-8");
+      });
+      updateRegularFileNoFollow(hooksPath, (existing) => Buffer.from(mergeCodexHooksContent(existing.toString("utf-8"), transport), "utf-8"));
       for (const legacyPath of LEGACY_CODEX_HOOKS_PATHS.map((path) => resolveConfigPath(path, cwd))) {
         if (legacyPath !== hooksPath) {
           const legacyContent = readOptionalRegularFileNoFollow(legacyPath)?.toString("utf-8");
           if (legacyContent !== undefined) {
             const result = removeCodexHooksContent(legacyContent);
-            if (result.state === "remove") writeRegularFileNoFollow(legacyPath, Buffer.from("{}\n", "utf-8"));
-            else if (result.state === "rewrite") writeRegularFileNoFollow(legacyPath, Buffer.from(result.content, "utf-8"));
+            if (result.state === "remove") {
+              activeMutationAuthority!.mutate(legacyPath, (base) => base.state === "regular" ? { state: "absent" } : { state: "unchanged" });
+            } else if (result.state === "rewrite") {
+              updateRegularFileNoFollow(legacyPath, (existing) => {
+                const next = removeCodexHooksContent(existing.toString("utf-8"));
+                return next.state === "rewrite" ? Buffer.from(next.content, "utf-8") : undefined;
+              }, 0o666, false);
+            }
           }
         }
       }
@@ -1797,13 +1371,16 @@ function removeComponent(agent: Agent, surface: ConnectorSurface, cwd: string, s
     const result = removeCodexHooksContent(content);
     if (result.state === "unchanged") return false;
     try {
-      writeRegularFileNoFollow(
-        resolvedPath,
-        Buffer.from(result.state === "remove" ? "{}\n" : result.content, "utf-8"),
-      );
-      return true;
+      const mutation = activeMutationAuthority!.mutate(resolvedPath, (base) => {
+        if (base.state !== "regular") return { state: "unchanged" };
+        const next = removeCodexHooksContent(base.content.toString("utf-8"));
+        if (next.state === "unchanged") return { state: "unchanged" };
+        if (next.state === "remove") return { state: "absent" };
+        return { state: "regular", content: Buffer.from(next.content, "utf-8"), mode: base.mode };
+      });
+      return mutation.changed;
     } catch (error) {
-      if (!strictSkill && error instanceof ConnectorPathChangedError) return false;
+      if (!strictSkill && (error as NodeJS.ErrnoException).code === "EAGAIN") return false;
       throw error;
     }
   }
@@ -1817,26 +1394,22 @@ function removeComponent(agent: Agent, surface: ConnectorSurface, cwd: string, s
     ], strictSkill);
   }
 
-  let handle: MutationDescriptor | undefined;
   try {
-    handle = acquireMutationDescriptor(resolvedPath, false);
-    if (!handle) return false;
+    const snapshot = activeMutationAuthority!.snapshots?.get(resolvedPath);
+    if (!snapshot || snapshot.state === "absent") return false;
+    const mutation = activeMutationAuthority!.mutate(resolvedPath, (base) => {
+      if (base.state !== "regular") return { state: "unchanged" };
+      const content = base.content.toString("utf-8");
+      if (!hasManagedBlock(content)) return { state: "unchanged" };
+      const cleaned = removeMarkers(content);
+      const eol = establishedMarkdownEol(cleaned);
+      const updated = cleaned === "" ? { state: "absent" as const } : { state: "regular" as const, content: Buffer.from(normalizeMarkdownEof(cleaned, eol), "utf-8"), mode: base.mode };
+      return updated;
+    });
+    return mutation.changed;
   } catch (error) {
     if (strictSkill) throw error;
     return false;
-  }
-  try {
-    descriptorStats(handle.descriptor, resolvedPath);
-    const content = readDescriptor(handle.descriptor, resolvedPath).toString("utf-8");
-    if (!hasManagedBlock(content)) return false;
-    const cleaned = removeMarkers(content);
-    const eol = establishedMarkdownEol(cleaned);
-    const updated = cleaned === "" ? Buffer.alloc(0) : Buffer.from(normalizeMarkdownEof(cleaned, eol), "utf-8");
-    mutateDescriptor(resolvedPath, handle, updated);
-    return true;
-  } catch (error) {
-    if (!strictSkill && error instanceof ConnectorPathChangedError) return false;
-    throw error;
   }
 }
 

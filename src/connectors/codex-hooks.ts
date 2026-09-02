@@ -3,15 +3,20 @@ import {
   constants,
   fchmodSync,
   fstatSync,
-  ftruncateSync,
+  fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
+  rmdirSync,
+  renameSync,
   readFileSync,
   readSync,
   writeFileSync,
   writeSync,
+  unlinkSync,
 } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { ConnectorTransport } from "./types.js";
@@ -20,7 +25,6 @@ export const CODEX_HOOKS_PATH = "~/.codex/hooks.json";
 export const CODEX_CONFIG_PATH = "~/.codex/config.toml";
 export const LEGACY_CODEX_HOOKS_PATHS = [".codex/hooks.json"] as const;
 
-const MAX_CODEX_HOOKS_BYTES = 4 * 1024 * 1024;
 
 export type CodexPostToolHookState = "absent" | "incomplete" | "installed";
 
@@ -219,6 +223,7 @@ function readHooksConfigFromContent(content: string): CodexHooksConfig {
 }
 
 export function enableCodexHooksFeature(configPath: string): void {
+  // Legacy installCodexHooks config writer; Bug #713 leaf transactions use installConnector.
   mkdirSync(dirname(configPath), { recursive: true });
   let existing = "";
   try {
@@ -286,6 +291,7 @@ export function installCodexHooks(
   configPath: string,
   transport: ConnectorTransport = "cli",
 ): void {
+  // Legacy two-path helper; callers requiring Bug #713 guarantees use installConnector.
   mkdirSync(dirname(hooksPath), { recursive: true });
   enableCodexHooksFeature(configPath);
   let existing = "";
@@ -293,137 +299,282 @@ export function installCodexHooks(
   writeFileSync(hooksPath, mergeCodexHooksContent(existing, transport));
 }
 
-type CodexHooksDescriptorIdentity = Readonly<{
-  dev: number | bigint;
-  ino: number | bigint;
+export type ConnectorLeafState =
+  | Readonly<{ state: "absent" }>
+  | Readonly<{
+      state: "regular";
+      content: Buffer;
+      mode: number;
+      dev: number | bigint;
+      ino: number | bigint;
+    }>;
+
+export type ConnectorLeafDecision =
+  | Readonly<{ state: "unchanged" }>
+  | Readonly<{ state: "absent" }>
+  | Readonly<{ state: "regular"; content: Buffer; mode: number }>;
+
+export type ConnectorLeafOperation = Readonly<{
+  displayPath: string;
+  operationPath: string;
+  parentOperationPath: string;
+  expected: ConnectorLeafState;
+  decide: (base: ConnectorLeafState) => ConnectorLeafDecision;
 }>;
 
-function assertCodexHooksMutationDescriptor(
-  descriptor: number,
-  hooksPath: string,
-  identity: CodexHooksDescriptorIdentity,
-): ReturnType<typeof fstatSync> {
-  const stats = fstatSync(descriptor);
-  if (!stats.isFile() || stats.dev !== identity.dev || stats.ino !== identity.ino) {
-    throw new Error(`Codex hooks descriptor identity changed at ${hooksPath}`);
-  }
-  if (stats.nlink !== 1) {
-    throw new Error(`Refusing connector mutation through a multiply linked file at ${hooksPath}`);
-  }
-  return stats;
-}
+export type ConnectorLeafReceipt = {
+  readonly displayPath: string;
+  readonly operationPath: string;
+  readonly parentOperationPath: string;
+  readonly initial: ConnectorLeafState;
+  current: ConnectorLeafState;
+  readonly transactionDisplayPath: string;
+  readonly transactionOperationPath: string;
+  initialHoldOperationPath?: string;
+  currentHoldOperationPath?: string;
+  mutationCommitted: boolean;
+  recoveryRequired: boolean;
+};
 
-function writeCodexHooksDescriptor(
-  descriptor: number,
-  hooksPath: string,
-  identity: CodexHooksDescriptorIdentity,
-  content: Buffer,
-): void {
-  assertCodexHooksMutationDescriptor(descriptor, hooksPath, identity);
-  ftruncateSync(descriptor, 0);
-  let offset = 0;
-  while (offset < content.length) {
-    assertCodexHooksMutationDescriptor(descriptor, hooksPath, identity);
-    const count = writeSync(descriptor, content, offset, content.length - offset, offset);
-    if (count <= 0) throw new Error(`Codex hooks write made no progress at ${hooksPath}`);
-    offset += count;
-  }
-}
+const leafFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
-function readCodexHooksDescriptor(
-  descriptor: number,
-  size: number,
-): Buffer | undefined {
-  const bytes = Buffer.alloc(size);
+function leafMode(stats: ReturnType<typeof fstatSync>): number { return Number(stats.mode) & 0o777; }
+
+function readLeaf(descriptor: number, size: number): Buffer {
+  const out = Buffer.alloc(size);
   let offset = 0;
   while (offset < size) {
-    const count = readSync(descriptor, bytes, offset, size - offset, offset);
-    if (count <= 0) return undefined;
+    const count = readSync(descriptor, out, offset, size - offset, offset);
+    if (count <= 0) throw new Error("short connector leaf read");
     offset += count;
   }
-  return bytes;
+  return out;
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+function stateEqual(left: ConnectorLeafState, right: ConnectorLeafState): boolean {
+  if (left.state !== right.state) return false;
+  return left.state === "absent" || (
+    left.mode === (right as Extract<ConnectorLeafState, { state: "regular" }>).mode
+    && left.dev === (right as Extract<ConnectorLeafState, { state: "regular" }>).dev
+    && left.ino === (right as Extract<ConnectorLeafState, { state: "regular" }>).ino
+    && left.content.equals((right as Extract<ConnectorLeafState, { state: "regular" }>).content)
+  );
 }
 
-function restoreCodexHooksDescriptor(
-  descriptor: number,
-  hooksPath: string,
-  identity: CodexHooksDescriptorIdentity,
-  content: Buffer,
-  mode: number,
-): void {
-  writeCodexHooksDescriptor(descriptor, hooksPath, identity, content);
-  assertCodexHooksMutationDescriptor(descriptor, hooksPath, identity);
-  fchmodSync(descriptor, mode);
-  const restoredStats = assertCodexHooksMutationDescriptor(descriptor, hooksPath, identity);
-  if ((Number(restoredStats.mode) & 0o777) !== mode || restoredStats.size !== content.length) {
-    throw new Error(`Codex hooks restoration verification failed at ${hooksPath}`);
-  }
-  const restored = readCodexHooksDescriptor(descriptor, content.length);
-  if (!restored?.equals(content)) {
-    throw new Error(`Codex hooks restoration verification failed at ${hooksPath}`);
-  }
-}
-
-export function removeCodexHooks(hooksPath: string): boolean {
+export function captureConnectorLeaf(displayPath: string, operationPath: string): ConnectorLeafState {
   let descriptor: number;
-  try {
-    descriptor = openSync(
-      hooksPath,
-      constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-    );
-  } catch {
-    return false;
+  try { descriptor = openSync(operationPath, leafFlags); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { state: "absent" };
+    const wrapped = new Error(`Unable to inspect connector leaf at ${displayPath}`, { cause: error });
+    const code = (error as NodeJS.ErrnoException).code;
+    if (typeof code === "string") Object.assign(wrapped, { code });
+    throw wrapped;
   }
   try {
     const before = fstatSync(descriptor);
-    if (!before.isFile()) return false;
-    if (before.nlink !== 1) {
-      throw new Error(`Refusing connector mutation through a multiply linked file at ${hooksPath}`);
-    }
+    if (!before.isFile()) throw new Error(`Connector leaf is not a regular file at ${displayPath}`);
     const size = Number(before.size);
-    if (!Number.isSafeInteger(size) || size < 0) return false;
-    if (size > MAX_CODEX_HOOKS_BYTES) {
-      throw new Error(`Refusing to read Codex hooks larger than 4 MiB at ${hooksPath}`);
-    }
-    const bytes = readCodexHooksDescriptor(descriptor, size);
-    if (!bytes) return false;
-    const result = removeCodexHooksContent(bytes.toString("utf-8"));
-    if (result.state === "unchanged") return false;
-    const updated = Buffer.from(result.state === "remove" ? "{}\n" : result.content, "utf-8");
-    const identity = { dev: before.dev, ino: before.ino };
-    try {
-      writeCodexHooksDescriptor(descriptor, hooksPath, identity, updated);
-    } catch (primaryError) {
-      try {
-        restoreCodexHooksDescriptor(
-          descriptor,
-          hooksPath,
-          identity,
-          bytes,
-          Number(before.mode) & 0o777,
-        );
-      } catch (restorationError) {
-        throw new Error(
-          `Codex hooks restoration failed at ${hooksPath} after ${errorMessage(primaryError)}: ${errorMessage(restorationError)}`,
-        );
-      }
-      throw primaryError;
-    }
+    if (!Number.isSafeInteger(size) || size < 0) throw new Error(`Unable to read connector leaf at ${displayPath}`);
+    const content = readLeaf(descriptor, size);
     const after = fstatSync(descriptor);
-    if (after.dev !== before.dev || after.ino !== before.ino) return false;
-    try {
-      const publicStats = lstatSync(hooksPath);
-      return publicStats.isFile() && publicStats.dev === before.dev && publicStats.ino === before.ino;
-    } catch {
-      return false;
+    const mode = leafMode(before);
+    if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino || leafMode(after) !== mode || Number(after.size) !== size) {
+      throw new Error(`Connector leaf changed while being read at ${displayPath}`);
     }
-  } finally {
-    closeSync(descriptor);
+    return { state: "regular", content, mode, dev: before.dev, ino: before.ino };
+  } finally { closeSync(descriptor); }
+}
+
+function transactionDir(parent: string, displayParent: string): { operation: string; display: string } {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const name = `.lcm-connector-txn-${randomBytes(16).toString("hex")}`;
+    const operation = join(parent, name);
+    try {
+      mkdirSync(operation, { mode: 0o700 });
+      const stats = lstatSync(operation);
+      if (!stats.isDirectory() || leafMode(stats) !== 0o700) throw new Error("invalid transaction directory");
+      return { operation, display: join(displayParent, name) };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw error;
+    }
   }
+  throw new Error("unable to allocate connector transaction directory");
+}
+
+function stageCandidate(path: string, content: Buffer, mode: number): void {
+  const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK, mode);
+  try {
+    let offset = 0;
+    while (offset < content.length) {
+      const count = writeSync(fd, content, offset, content.length - offset, offset);
+      if (count <= 0) throw new Error("connector candidate write made no progress");
+      offset += count;
+    }
+    fchmodSync(fd, mode);
+    fsyncSync(fd);
+    const stats = fstatSync(fd);
+    if (!stats.isFile() || leafMode(stats) !== mode || Number(stats.size) !== content.length) throw new Error("connector candidate verification failed");
+    const readback = readLeaf(fd, content.length);
+    if (!readback.equals(content)) throw new Error("connector candidate readback mismatch");
+  } finally { closeSync(fd); }
+}
+
+function safeUnlink(path: string): void { try { unlinkSync(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; } }
+
+export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorReceipt?: ConnectorLeafReceipt): ConnectorLeafMutationResult {
+  const expected = priorReceipt?.current ?? operation.expected;
+  const observed = captureConnectorLeaf(operation.displayPath, operation.operationPath);
+  if (!stateEqual(observed, expected)) throw Object.assign(new Error(`Connector path changed before mutation at ${operation.displayPath}`), { code: "EAGAIN" });
+  const decision = operation.decide({ ...observed, ...(observed.state === "regular" ? { content: Buffer.from(observed.content) } : {}) });
+  if (decision.state === "unchanged") {
+    if (priorReceipt) return { changed: false, receipt: priorReceipt };
+    return {
+      changed: false,
+      receipt: {
+        displayPath: operation.displayPath,
+        operationPath: operation.operationPath,
+        parentOperationPath: operation.parentOperationPath,
+        initial: expected,
+        current: expected,
+        transactionDisplayPath: "",
+        transactionOperationPath: "",
+        mutationCommitted: false,
+        recoveryRequired: false,
+      },
+    };
+  }
+  const tx = priorReceipt ? { operation: priorReceipt.transactionOperationPath, display: priorReceipt.transactionDisplayPath } : transactionDir(operation.parentOperationPath, dirname(operation.displayPath));
+  const candidate = decision.state === "regular" ? join(tx.operation, `candidate-${Date.now()}-${randomBytes(4).toString("hex")}`) : undefined;
+  try {
+    if (candidate) {
+      const regularDecision = decision as Extract<ConnectorLeafDecision, { state: "regular" }>;
+      stageCandidate(candidate, regularDecision.content, regularDecision.mode);
+    }
+    let hold: string | undefined;
+    if (expected.state === "regular") {
+      const holdName = priorReceipt ? `superseded-${randomBytes(4).toString("hex")}` : "initial";
+      hold = join(tx.operation, holdName);
+      renameSync(operation.operationPath, hold);
+      const claimed = captureConnectorLeaf(operation.displayPath, hold);
+      if (!stateEqual(claimed, expected)) {
+        try { linkSync(hold, operation.operationPath); } catch { /* retain recovery artifact */ }
+        throw new Error(`Connector leaf claim validation failed at ${operation.displayPath}`);
+      }
+    }
+    if (decision.state === "regular") {
+      try { linkSync(candidate!, operation.operationPath); }
+      catch (error) { throw error; }
+      const publicState = captureConnectorLeaf(operation.displayPath, operation.operationPath);
+      const candidateState = captureConnectorLeaf(operation.displayPath, candidate!);
+      if (!stateEqual(publicState, candidateState)) throw new Error(`Connector candidate publication verification failed at ${operation.displayPath}`);
+      const receipt: ConnectorLeafReceipt = {
+        displayPath: operation.displayPath,
+        operationPath: operation.operationPath,
+        parentOperationPath: operation.parentOperationPath,
+        initial: priorReceipt?.initial ?? expected,
+        current: publicState,
+        transactionDisplayPath: tx.display,
+        transactionOperationPath: tx.operation,
+        initialHoldOperationPath: priorReceipt?.initialHoldOperationPath ?? (expected.state === "regular" ? hold : undefined),
+        currentHoldOperationPath: candidate,
+        mutationCommitted: true,
+        recoveryRequired: false,
+      };
+      if (priorReceipt?.currentHoldOperationPath && priorReceipt.currentHoldOperationPath !== candidate) safeUnlink(priorReceipt.currentHoldOperationPath);
+      if (hold && hold !== receipt.initialHoldOperationPath) safeUnlink(hold);
+      return { changed: true, content: decision.content, receipt };
+    }
+    const receipt: ConnectorLeafReceipt = {
+      displayPath: operation.displayPath,
+      operationPath: operation.operationPath,
+      parentOperationPath: operation.parentOperationPath,
+      initial: priorReceipt?.initial ?? expected,
+      current: { state: "absent" },
+      transactionDisplayPath: tx.display,
+      transactionOperationPath: tx.operation,
+      initialHoldOperationPath: priorReceipt?.initialHoldOperationPath ?? (expected.state === "regular" ? hold : undefined),
+      currentHoldOperationPath: hold,
+      mutationCommitted: true,
+      recoveryRequired: false,
+    };
+    if (priorReceipt?.currentHoldOperationPath && priorReceipt.currentHoldOperationPath !== hold) safeUnlink(priorReceipt.currentHoldOperationPath);
+    return { changed: true, receipt };
+  } catch (error) {
+    if (candidate) { try { safeUnlink(candidate); } catch { /* preserve primary */ } }
+    if (!priorReceipt) { try { rmdirSync(tx.operation); } catch { /* preserve recovery namespace */ } }
+    throw error;
+  }
+}
+
+export function compensateConnectorLeaf(receipt: ConnectorLeafReceipt): readonly string[] {
+  const failures: string[] = [];
+  try {
+    if (!receipt.mutationCommitted) return failures;
+    if (receipt.current.state === "regular") {
+      const now = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
+      if (!stateEqual(now, receipt.current)) throw new Error("current receipt changed");
+      const rollbackHold = join(receipt.transactionOperationPath, `rollback-${randomBytes(4).toString("hex")}`);
+      renameSync(receipt.operationPath, rollbackHold);
+      if (receipt.initial.state === "regular") {
+        if (!receipt.initialHoldOperationPath) throw new Error("initial hold unavailable");
+        linkSync(receipt.initialHoldOperationPath, receipt.operationPath);
+      }
+      safeUnlink(rollbackHold);
+    } else if (receipt.initial.state === "regular") {
+      if (!receipt.initialHoldOperationPath) throw new Error("initial hold unavailable");
+      const now = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
+      if (now.state !== "absent") throw new Error("current receipt changed");
+      linkSync(receipt.initialHoldOperationPath, receipt.operationPath);
+    }
+  } catch (error) { failures.push(`${receipt.displayPath}: rollback incomplete (${error instanceof Error ? error.message : String(error)})`); }
+  return failures;
+}
+
+export function finalizeConnectorLeaf(receipt: ConnectorLeafReceipt): readonly string[] {
+  const failures: string[] = [];
+  for (const path of new Set([receipt.currentHoldOperationPath, receipt.initialHoldOperationPath])) {
+    if (!path) continue;
+    try { safeUnlink(path); } catch (error) { failures.push(`${receipt.displayPath}: cleanup failed at ${receipt.transactionDisplayPath}`); }
+  }
+  try { rmdirSync(receipt.transactionOperationPath); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") failures.push(`${receipt.displayPath}: cleanup failed at ${receipt.transactionDisplayPath}`); }
+  return failures;
+}
+
+export type ConnectorLeafMutationResult = Readonly<{ changed: boolean; content?: Buffer; receipt: ConnectorLeafReceipt }>;
+
+export function removeCodexHooks(hooksPath: string): boolean {
+  if (process.platform !== "linux") throw new Error("Connector filesystem mutation requires Linux proc-descriptor anchoring");
+  const parent = dirname(hooksPath);
+  let parentFd: number;
+  try { parentFd = openSync(parent, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  catch { return false; }
+  try {
+    const operationPath = `/proc/self/fd/${parentFd}/${hooksPath.slice(parent.length + 1)}`;
+    const parentOperationPath = `/proc/self/fd/${parentFd}`;
+    const expected = captureConnectorLeaf(hooksPath, operationPath);
+    if (expected.state === "absent") return false;
+    let result: ConnectorLeafMutationResult;
+    try {
+      result = mutateConnectorLeaf({ displayPath: hooksPath, operationPath, parentOperationPath, expected, decide: (base) => {
+      if (base.state !== "regular") throw new Error(`Codex hooks leaf is not regular at ${hooksPath}`);
+      const decision = removeCodexHooksContent(base.content.toString("utf-8"));
+      if (decision.state === "unchanged") return { state: "unchanged" };
+      if (decision.state === "remove") return { state: "absent" };
+      return { state: "regular", content: Buffer.from(decision.content, "utf-8"), mode: base.mode };
+      }});
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : String(error)).replaceAll(operationPath, hooksPath).replaceAll(parentOperationPath, parent);
+      const wrapped = new Error(message);
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (typeof code === "string") Object.assign(wrapped, { code });
+      throw wrapped;
+    }
+    const failures = result.changed ? finalizeConnectorLeaf(result.receipt) : [];
+    if (failures.length) throw new Error(failures.join("; "));
+    return result.changed;
+  } finally { closeSync(parentFd); }
 }
 
 export function hasCodexHooks(hooksPath: string): boolean {

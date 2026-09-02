@@ -193,24 +193,29 @@ listing, inventory inspection, and verified legacy read-only branches remain
 usable. The traversal uses proc descriptors; it is not portable `openat` and
 does not provide portable descriptor-relative compare-and-swap.
 
-Within that Linux boundary, LCM retains one authenticated, no-follow writable
-descriptor for each connector leaf it mutates. Removal never unlinks a public
-connector pathname. A wholly LCM-owned skill or rules file is rewritten to
-empty bytes, and a Codex hooks file containing only LCM hooks is rewritten to
-the valid neutral JSON `{}\n`. These neutral artifacts are not reported as
-installed, and removing them again is an idempotent not-installed result.
+Within that Linux boundary, LCM stages every replacement in a private,
+mode-0700 transaction directory. Existing leaves are claimed by an atomic
+rename and exact device/inode/bytes/mode validation; complete candidates are
+published with a no-replace hard link. LCM never truncates, writes, or chmods
+a public leaf or its original inode. A wholly LCM-owned skill, rules file, or
+Codex hooks file is physically removed after a validated claim. Historical
+empty skills/rules and `{}` hooks remain recognized as neutral, not installed,
+and reinstallable; removing one again is a no-op.
 
-Install rollback likewise restores a previously existing file only through its
-retained original descriptor after the exact expected post-mutation bytes,
-mode, device, and inode still match. If another file has replaced the public
-pathname, LCM preserves that replacement byte-for-byte, restores the original
-inode, and reports rollback as incomplete with the ordinary display path. A
-file created during the failed transaction is neutralized through its retained
-exclusive-create descriptor, but physical absence cannot be re-established
-without a pathname race, so rollback reports that residual artifact as
-incomplete. This is Linux `/proc/self/fd` anchoring, not portable `openat`, and
-it does not resolve the separate #681 compare-and-swap boundary for unanchored
-transport configuration.
+Rollback is receipt-bound and namespace-only. It moves the current public entry
+only when its exact receipt still matches, then restores the permanent initial
+entry with a no-replace hard link. Concurrent edits, chmods, replacements,
+symlinks, directories, and aliases are preserved; a non-linkable or mismatched
+entry remains at a named recovery path and reports `rollback incomplete`.
+Compensation runs in reverse mutation order and never recursively deletes
+unknown files. Existing-leaf replacement has a short intentional `ENOENT`
+window between claim and candidate publication, so a concurrent reader such as
+Codex may briefly observe the hooks file as absent. The guarantee is
+synchronous no-data-loss and pathname-race preservation, not crash consistency:
+a process kill or power loss may leave a transaction directory for manual
+inspection. This is Linux `/proc/self/fd` anchoring, not portable `openat`, and
+it does not resolve the separate #681 transport-config CAS or #715 parent-path
+boundaries.
 
 The default native Codex MCP runner can inspect canonical state, but automatic
 `codex mcp add/remove` is refused because the child process mutates ordinary
