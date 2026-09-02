@@ -482,7 +482,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(205);
   });
 
-  test("keeps response-fence and #700/#709/#710/#756/#726/#734/#737/#742/#760 files in their intended components", () => {
+  test("keeps response-fence and #700/#709/#710/#756/#726/#734/#737/#742/#760/#804 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -504,6 +504,8 @@ describe("Codecov configuration", () => {
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
+      ["src/daemon/lifecycle.ts", "integration-service-managers"],
+      ["src/daemon/supervisor.ts", "integration-service-managers"],
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],

@@ -187,6 +187,8 @@ export type EnsureDaemonOptions = {
   _listeningPortsOverride?: (pid: number) => number[];
   /** @internal Deterministic trusted Windows PowerShell seam for lifecycle tests. */
   _windowsPowerShellPathOverride?: string | null;
+  /** @internal Deterministic trusted Linux socket-diagnostic seam for lifecycle tests. */
+  _linuxSsPathOverride?: string | null;
   /** @internal Isolated manager seam used by lifecycle tests and adapters. */
   _supervisorOverride?: Supervisor;
   /** @internal Alias retained for integrations that inject a supervisor. */
@@ -994,6 +996,15 @@ function resolveWindowsPowerShellPath(
   );
 }
 
+function resolveLinuxSsPath(
+  fileExists: (path: string) => boolean = existsSync,
+): string | null {
+  for (const candidate of ["/usr/bin/ss", "/usr/sbin/ss"]) {
+    if (fileExists(candidate)) return candidate;
+  }
+  return null;
+}
+
 function readPlatformProcessCommand(
   pid: number,
   platform: NodeJS.Platform,
@@ -1065,13 +1076,18 @@ function findListeningTcpPorts(
   procRoot = "/proc",
   targetPort?: number,
   windowsNetstatPath = resolveWindowsNetstatPath(process.env.SystemRoot, process.env.WINDIR),
+  systemdControlGroup?: string,
+  linuxSsPath = resolveLinuxSsPath(),
 ): number[] {
   if (platform === "linux") {
     try {
       const socketInodes = new Set<string>();
-      for (const entry of readdirSync(join(procRoot, String(pid), "fd"))) {
+      const descriptorEntries = readdirSync(join(procRoot, String(pid), "fd"));
+      let readableDescriptors = 0;
+      for (const entry of descriptorEntries) {
         try {
           const target = readlinkSync(join(procRoot, String(pid), "fd", entry));
+          readableDescriptors += 1;
           const match = /^socket:\[(\d+)\]$/.exec(target);
           if (match) socketInodes.add(match[1]);
         } catch {
@@ -1100,7 +1116,44 @@ function findListeningTcpPorts(
           if (Number.isInteger(port) && port >= 1 && port <= 65_535 && (targetPort === undefined || port === targetPort)) ports.add(port);
         }
       }
-      return [...ports].sort((a, b) => a - b);
+      if (ports.size > 0 || readableDescriptors > 0 || descriptorEntries.length === 0) {
+        return [...ports].sort((a, b) => a - b);
+      }
+    } catch {
+      // A process in a sibling user namespace can expose the fd directory
+      // while denying every descriptor target. Fall through to the bounded
+      // manager-cgroup witness instead of treating that isolation as absence.
+    }
+    if (
+      targetPort === undefined
+      || !Number.isInteger(targetPort)
+      || targetPort < 1
+      || targetPort > 65_535
+      || typeof systemdControlGroup !== "string"
+      || !/^\/(?:[A-Za-z0-9_.:@-]+\/)*[A-Za-z0-9_.:@-]+$/u.test(systemdControlGroup)
+      || Buffer.byteLength(systemdControlGroup, "utf8") > 4 * 1024
+      || linuxSsPath === null
+    ) return [];
+    try {
+      const result = spawnSyncImpl(linuxSsPath, ["-H", "-ltnpe4", `sport = :${String(targetPort)}`], {
+        encoding: "utf-8",
+        timeout: 1000,
+        maxBuffer: 64 * 1024,
+        shell: false,
+        windowsHide: true,
+      });
+      if (result.status !== 0 || typeof result.stdout !== "string") return [];
+      const localEndpoint = `127.0.0.1:${String(targetPort)}`;
+      const matchingRows = result.stdout.split(/\r?\n/).filter((row) => {
+        const columns = row.trim().split(/\s+/);
+        return columns[0] === "LISTEN" && columns[3] === localEndpoint;
+      });
+      if (matchingRows.length === 0) return [];
+      const everyRowOwned = matchingRows.every((row) => {
+        const cgroups = row.trim().split(/\s+/).filter((column) => column.startsWith("cgroup:"));
+        return cgroups.length === 1 && cgroups[0] === `cgroup:${systemdControlGroup}`;
+      });
+      return everyRowOwned ? [targetPort] : [];
     } catch {
       return [];
     }
@@ -1654,6 +1707,9 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
         dependencies.environment.WINDIR,
       )
     : opts._windowsPowerShellPathOverride;
+  const linuxSsPath = opts._linuxSsPathOverride === undefined
+    ? resolveLinuxSsPath()
+    : opts._linuxSsPathOverride;
   let restartedForParent = false;
 
   if (testScope && opts.expectedEntrypoint !== undefined && opts.expectedEntrypoint !== testScope.entrypoint) {
@@ -1682,7 +1738,10 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     };
   }
 
-  function endpointIdentityMatches(health: HealthResponse | null): boolean {
+  function endpointIdentityMatches(
+    health: HealthResponse | null,
+    systemdControlGroup?: string,
+  ): boolean {
     if (!isRecognizedDaemonHealth(health) || health?.pid === undefined) return false;
     if (expectedOwnerId !== undefined && health.ownerId !== expectedOwnerId) return false;
     const pid = readOwnedPid();
@@ -1695,6 +1754,9 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
           dependencies.spawnSync,
           procRoot,
           opts.port,
+          undefined,
+          systemdControlGroup,
+          linuxSsPath,
         );
     return listenerPorts.includes(opts.port);
   }
@@ -1842,11 +1904,14 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     health: HealthResponse | null,
     spawned: boolean,
     startMethod: EnsureDaemonResult["startMethod"],
-    access: { alreadyVerified: true } | { alreadyVerified: false; deadline: number },
+    access: { alreadyVerified: true; systemdControlGroup?: string } | { alreadyVerified: false; deadline: number },
     warning?: string,
     allowParentWarning = false,
   ): Promise<EnsureDaemonResult | null> {
-    if (health === null || !endpointIdentityMatches(health)) return null;
+    if (health === null || !endpointIdentityMatches(
+      health,
+      access.alreadyVerified ? access.systemdControlGroup : undefined,
+    )) return null;
     if (!healthVersionMatches(health, expectedVersion)) return null;
     if (!healthStorageBackendMatches(health, expectedStorageBackend)) return null;
     let verifiedHealth = health;
@@ -1979,6 +2044,9 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
           dependencies.spawnSync,
           procRoot,
           opts.port,
+          undefined,
+          observation.controlGroup,
+          linuxSsPath,
         );
     return listenerPorts.includes(opts.port);
   }
@@ -2500,7 +2568,16 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
         && isAlive(observation.managerPid)
         && (opts._listeningPortsOverride
           ? opts._listeningPortsOverride(observation.managerPid).includes(opts.port)
-          : findListeningTcpPorts(observation.managerPid, platform, dependencies.spawnSync, procRoot, opts.port).includes(opts.port));
+          : findListeningTcpPorts(
+              observation.managerPid,
+              platform,
+              dependencies.spawnSync,
+              procRoot,
+              opts.port,
+              undefined,
+              secondProbe.controlGroup,
+              linuxSsPath,
+            ).includes(opts.port));
       if (!sameManager || !sameEndpoint) {
         return refusalResult("ambiguous", "managed daemon manager or endpoint identity changed during the no-response observation", { pid: observation.managerPid });
       }
@@ -2571,7 +2648,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
       authenticated,
       false,
       managerKind,
-      { alreadyVerified: true },
+      { alreadyVerified: true, systemdControlGroup: finalProbe.controlGroup },
       undefined,
       true,
     );
@@ -2713,7 +2790,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
                 authenticated,
                 true,
                 managerKind,
-                { alreadyVerified: true },
+                { alreadyVerified: true, systemdControlGroup: finalProbe.controlGroup },
                 undefined,
                 true,
               );
@@ -3368,6 +3445,9 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
         dependencies.environment.WINDIR,
       )
     : opts._windowsPowerShellPathOverride;
+  const linuxSsPath = opts._linuxSsPathOverride === undefined
+    ? resolveLinuxSsPath()
+    : opts._linuxSsPathOverride;
   const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
   const expectedEntrypoint = testScope?.entrypoint
     ?? opts.expectedEntrypoint
@@ -3803,7 +3883,16 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
       if (managerPid === undefined || readOwnedPid() !== managerPid || !isAlive(managerPid)) return false;
       const listenerPorts = opts._listeningPortsOverride
         ? opts._listeningPortsOverride(managerPid)
-        : findListeningTcpPorts(managerPid, platform, dependencies.spawnSync, procRoot, opts.port);
+        : findListeningTcpPorts(
+            managerPid,
+            platform,
+            dependencies.spawnSync,
+            procRoot,
+            opts.port,
+            undefined,
+            observation.controlGroup,
+            linuxSsPath,
+          );
       return listenerPorts.includes(opts.port);
     };
     const secondProbeMatches = async (): Promise<boolean> => {
@@ -3972,6 +4061,7 @@ export const __lifecycleTestUtils = {
   isProcessAlive,
   parentInvariantWarning,
   requireRegularFileDescriptor,
+  resolveLinuxSsPath,
   resolveWindowsNetstatPath,
   resolveLifecycleDependencies,
   lifecycleUnitName,
