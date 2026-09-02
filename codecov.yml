@@ -47,7 +47,7 @@ component_management:
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
-        # Keep the #691 pre/post read-admission response fence, the #700 buffered-response cancellation fence, and runtime identity here.
+        # Keep the #691/#700 response fences, #701 terminal factory-close retry, and runtime identity here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
