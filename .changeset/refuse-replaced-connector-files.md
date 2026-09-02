@@ -11,3 +11,4 @@ recovery artifacts are reported when compensation cannot restore the receipt.
 
 Sanitize connector removal and rollback diagnostics so retained descriptor
 operation paths and nested low-level error causes are never exposed publicly.
+Refuse connector leaves larger than 4 MiB before read allocation or mutation.

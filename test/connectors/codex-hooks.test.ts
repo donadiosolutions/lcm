@@ -12,6 +12,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  truncateSync,
   writeSync,
   writeFileSync,
 } from "node:fs";
@@ -31,6 +32,21 @@ import {
   compensateConnectorLeaf,
   finalizeConnectorLeaf,
 } from "../../src/connectors/codex-hooks.js";
+
+function serializedErrorSurface(value: unknown): string {
+  const seen = new Set<object>();
+  const snapshot = (item: unknown): unknown => {
+    if (item === null || typeof item !== "object") return item;
+    if (seen.has(item)) return "[circular]";
+    seen.add(item);
+    const keys = new Set([
+      ...Object.keys(item),
+      ...(item instanceof Error ? ["name", "message", "cause", "code"] : []),
+    ]);
+    return Object.fromEntries([...keys].map((key) => [key, snapshot((item as Record<string, unknown>)[key])]));
+  };
+  return JSON.stringify(snapshot(value));
+}
 
 describe("Codex hook configuration boundaries", () => {
   let dir: string;
@@ -277,6 +293,154 @@ describe("Codex hook configuration boundaries", () => {
     rmSync(hooksPath);
     mkdirSync(hooksPath);
     expect(() => captureConnectorLeaf(hooksPath, hooksPath)).toThrow(/not a regular file/iu);
+  });
+
+  it.each([
+    ["sparse", true],
+    ["declared", false],
+  ] as const)("rejects a %s 4 MiB+1 leaf before allocation, reads, or mutation", async (_label, sparse) => {
+    writeFileSync(hooksPath, "owned\n");
+    if (sparse) truncateSync(hooksPath, (4 * 1024 * 1024) + 1);
+    const original = sparse ? undefined : readFileSync(hooksPath);
+    let leafReads = 0;
+    let mutations = 0;
+    const leafDescriptors = new Set<number>();
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const descriptor = mode === undefined
+            ? actual.openSync(path, flags)
+            : actual.openSync(path, flags, mode);
+          try {
+            if (actual.readlinkSync(`/proc/self/fd/${descriptor}`) === hooksPath) {
+              leafDescriptors.add(descriptor);
+            }
+          } catch { /* not the connector leaf */ }
+          return descriptor;
+        }) as typeof actual.openSync,
+        fstatSync: ((descriptor: number, options?: fs.StatOptions) => {
+          const stats = actual.fstatSync(descriptor, options as never);
+          if (sparse || !leafDescriptors.has(descriptor)) return stats;
+          return new Proxy(stats, {
+            get: (target, property) => property === "size"
+              ? (4 * 1024 * 1024) + 1
+              : Reflect.get(target, property, target),
+          });
+        }) as typeof actual.fstatSync,
+        readSync: ((...args: Parameters<typeof actual.readSync>) => {
+          if (leafDescriptors.has(args[0])) leafReads += 1;
+          return actual.readSync(...args);
+        }) as typeof actual.readSync,
+        renameSync: ((...args: Parameters<typeof actual.renameSync>) => {
+          mutations += 1;
+          return actual.renameSync(...args);
+        }) as typeof actual.renameSync,
+        linkSync: ((...args: Parameters<typeof actual.linkSync>) => {
+          mutations += 1;
+          return actual.linkSync(...args);
+        }) as typeof actual.linkSync,
+        unlinkSync: ((...args: Parameters<typeof actual.unlinkSync>) => {
+          mutations += 1;
+          return actual.unlinkSync(...args);
+        }) as typeof actual.unlinkSync,
+        closeSync: ((descriptor: number) => {
+          leafDescriptors.delete(descriptor);
+          return actual.closeSync(descriptor);
+        }) as typeof actual.closeSync,
+      };
+    });
+    const allocation = vi.spyOn(Buffer, "alloc");
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      expect(() => module.removeCodexHooks(hooksPath)).toThrow(
+        `Refusing to read connector leaf larger than 4 MiB at ${hooksPath}`,
+      );
+      expect(allocation).not.toHaveBeenCalled();
+      expect(leafReads).toBe(0);
+      expect(mutations).toBe(0);
+      if (sparse) expect(statSync(hooksPath).size).toBe((4 * 1024 * 1024) + 1);
+      else expect(readFileSync(hooksPath)).toEqual(original);
+    } finally {
+      allocation.mockRestore();
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("rejects an oversized connector decision before creating a transaction namespace", () => {
+    writeFileSync(hooksPath, "base\n");
+    const expected = captureConnectorLeaf(hooksPath, hooksPath);
+    const oversized = Buffer.alloc((4 * 1024 * 1024) + 1);
+
+    expect(() => mutateConnectorLeaf({
+      displayPath: hooksPath,
+      operationPath: hooksPath,
+      parentOperationPath: dir,
+      expected,
+      decide: () => ({ state: "regular" as const, content: oversized, mode: 0o600 }),
+    })).toThrow(`Refusing to read connector leaf larger than 4 MiB at ${hooksPath}`);
+    expect(readFileSync(hooksPath, "utf-8")).toBe("base\n");
+    expect(readdirSync(dir).filter((entry) => entry.startsWith(".lcm-connector-txn-"))).toEqual([]);
+  });
+
+  it("sanitizes the initial symlink capture error and its complete error surface", () => {
+    const outside = join(dir, "outside.json");
+    writeFileSync(outside, "outside\n");
+    symlinkSync(outside, hooksPath);
+    let caught: unknown;
+    try { removeCodexHooks(hooksPath); } catch (error) { caught = error; }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as NodeJS.ErrnoException).code).toBe("ELOOP");
+    expect((caught as Error).message).toContain(hooksPath);
+    expect((caught as Error & { cause?: unknown }).cause).toBeUndefined();
+    const surface = serializedErrorSurface(caught);
+    expect(surface).toContain(hooksPath);
+    expect(surface).not.toContain("/proc/self/fd/");
+    expect(readFileSync(outside, "utf-8")).toBe("outside\n");
+  });
+
+  it("sanitizes an injected initial open failure and all nested enumerable paths", async () => {
+    writeFileSync(hooksPath, "owned\n");
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const shown = String(path);
+          if (shown.startsWith("/proc/self/fd/") && shown.endsWith("/hooks.json")) {
+            const nested = Object.assign(new Error(`nested failure at ${shown}`), { detail: shown });
+            throw Object.assign(new Error(`open denied at ${shown}`, { cause: nested }), {
+              code: "EACCES",
+              operationPath: shown,
+            });
+          }
+          return mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+        }) as typeof actual.openSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      let caught: unknown;
+      try { module.removeCodexHooks(hooksPath); } catch (error) { caught = error; }
+
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as NodeJS.ErrnoException).code).toBe("EACCES");
+      expect((caught as Error).message).toContain(hooksPath);
+      expect((caught as Error & { cause?: unknown }).cause).toBeUndefined();
+      const surface = serializedErrorSurface(caught);
+      expect(surface).toContain(hooksPath);
+      expect(surface).not.toContain("/proc/self/fd/");
+      expect(readFileSync(hooksPath, "utf-8")).toBe("owned\n");
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
   });
 
   it("rejects same-inode byte and mode edits before claiming the public name", () => {

@@ -202,6 +202,10 @@ Codex hooks file is physically removed after a validated claim. Historical
 empty skills/rules and `{}` hooks remain recognized as neutral, not installed,
 and reinstallable; removing one again is a no-op.
 
+Connector leaves and requested replacements are limited to 4 MiB (4,194,304
+bytes). LCM rejects an oversized leaf before allocating a read buffer or
+starting a transaction, so the public connector path remains untouched.
+
 Rollback is receipt-bound and namespace-only. It moves the current public entry
 only when its exact receipt still matches, then restores the permanent initial
 entry with a no-replace hard link. Concurrent edits, chmods, replacements,

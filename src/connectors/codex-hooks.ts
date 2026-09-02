@@ -339,10 +339,21 @@ export type ConnectorLeafReceipt = {
 };
 
 const leafFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const MAX_CONNECTOR_LEAF_BYTES = 4 * 1024 * 1024;
 
 function leafMode(stats: ReturnType<typeof fstatSync>): number { return Number(stats.mode) & 0o777; }
 
-function readLeaf(descriptor: number, size: number): Buffer {
+function assertConnectorLeafReadSize(size: number, displayPath: string): void {
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw new Error(`Unable to read connector leaf at ${displayPath}`);
+  }
+  if (size > MAX_CONNECTOR_LEAF_BYTES) {
+    throw new Error(`Refusing to read connector leaf larger than 4 MiB at ${displayPath}`);
+  }
+}
+
+function readLeaf(descriptor: number, size: number, displayPath: string): Buffer {
+  assertConnectorLeafReadSize(size, displayPath);
   const out = Buffer.alloc(size);
   let offset = 0;
   while (offset < size) {
@@ -377,8 +388,7 @@ export function captureConnectorLeaf(displayPath: string, operationPath: string)
     const before = fstatSync(descriptor);
     if (!before.isFile()) throw new Error(`Connector leaf is not a regular file at ${displayPath}`);
     const size = Number(before.size);
-    if (!Number.isSafeInteger(size) || size < 0) throw new Error(`Unable to read connector leaf at ${displayPath}`);
-    const content = readLeaf(descriptor, size);
+    const content = readLeaf(descriptor, size, displayPath);
     const after = fstatSync(descriptor);
     const mode = leafMode(before);
     if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino || leafMode(after) !== mode || Number(after.size) !== size) {
@@ -417,6 +427,7 @@ function stageCandidate(
   content: Buffer,
   mode: number,
   applyUmask: boolean,
+  displayPath: string,
 ): Extract<ConnectorLeafState, { state: "regular" }> {
   const effectiveMode = applyUmask ? mode & ~process.umask() : mode;
   const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK, effectiveMode);
@@ -431,7 +442,7 @@ function stageCandidate(
     fsyncSync(fd);
     const stats = fstatSync(fd);
     if (!stats.isFile() || leafMode(stats) !== effectiveMode || Number(stats.size) !== content.length) throw new Error("connector candidate verification failed");
-    const readback = readLeaf(fd, content.length);
+    const readback = readLeaf(fd, content.length, displayPath);
     if (!readback.equals(content)) throw new Error("connector candidate readback mismatch");
     const after = fstatSync(fd);
     if (!after.isFile() || after.dev !== stats.dev || after.ino !== stats.ino
@@ -510,6 +521,9 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
   const observed = captureConnectorLeaf(operation.displayPath, operation.operationPath);
   if (!stateEqual(observed, expected)) throw Object.assign(new Error(`Connector path changed before mutation at ${operation.displayPath}`), { code: "EAGAIN" });
   const decision = operation.decide({ ...observed, ...(observed.state === "regular" ? { content: Buffer.from(observed.content) } : {}) });
+  if (decision.state === "regular") {
+    assertConnectorLeafReadSize(decision.content.length, operation.displayPath);
+  }
   if (decision.state === "unchanged" || (decision.state === "absent" && observed.state === "absent")) {
     if (priorReceipt) return { changed: false, receipt: priorReceipt };
     return {
@@ -537,7 +551,13 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
     let stagedState: Extract<ConnectorLeafState, { state: "regular" }> | undefined;
     if (candidate) {
       const regularDecision = decision as Extract<ConnectorLeafDecision, { state: "regular" }>;
-      stagedState = stageCandidate(candidate, regularDecision.content, regularDecision.mode, expected.state === "absent");
+      stagedState = stageCandidate(
+        candidate,
+        regularDecision.content,
+        regularDecision.mode,
+        expected.state === "absent",
+        operation.displayPath,
+      );
     }
     let hold: string | undefined;
     if (expected.state === "regular") {
@@ -786,10 +806,10 @@ export function removeCodexHooks(hooksPath: string): boolean {
   try {
     const operationPath = `/proc/self/fd/${parentFd}/${hooksPath.slice(parent.length + 1)}`;
     const parentOperationPath = `/proc/self/fd/${parentFd}`;
-    const expected = captureConnectorLeaf(hooksPath, operationPath);
-    if (expected.state === "absent") return false;
     let result: ConnectorLeafMutationResult;
     try {
+      const expected = captureConnectorLeaf(hooksPath, operationPath);
+      if (expected.state === "absent") return false;
       result = mutateConnectorLeaf({ displayPath: hooksPath, operationPath, parentOperationPath, expected, decide: (base) => {
       // The expected snapshot is captured immediately above and mutation
       // revalidates it before invoking this callback, so this is necessarily
