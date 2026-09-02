@@ -48,7 +48,8 @@ vi.mock("../../../src/daemon/server.js", async (importOriginal) => ({
 }));
 vi.mock("../../../src/db/migration.js", () => ({ runLcmMigrations: mocks.migrate }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
-vi.mock("../../../src/retrieval.js", () => ({
+vi.mock("../../../src/retrieval.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/retrieval.js")>(),
   createRetrievalEngine: () => ({
     describe: mocks.describe,
     grep: mocks.grep,
@@ -264,6 +265,28 @@ describe("persistence read route boundaries", () => {
     const handler = createGrepHandler(config);
     await invoke(handler, "");
     expectLast(400, { error: "query is required" });
+    await invoke(handler, { query: "q", scope: "invalid" });
+    expectLast(400, { error: "invalid scope" });
+    mocks.validate.mockClear();
+    await invoke(handler, { query: "q", cwd: "/bad", scope: "invalid" });
+    expectLast(400, { error: "invalid scope" });
+    expect(mocks.validate).not.toHaveBeenCalled();
+    for (const mode of [null, 1, [], {}, "unknown"]) {
+      mocks.validate.mockClear();
+      const projectExistsCalls = mocks.projectExists.mock.calls.length;
+      await invoke(handler, { query: "q", cwd: "/bad", mode });
+      expectLast(400, { error: "invalid mode" });
+      expect(mocks.validate).not.toHaveBeenCalled();
+      expect(mocks.projectExists.mock.calls.length).toBe(projectExistsCalls);
+    }
+    mocks.validate.mockClear();
+    const projectExistsCalls = mocks.projectExists.mock.calls.length;
+    await invoke(handler, { query: "q", cwd: "/bad", mode: null, scope: "invalid" });
+    expectLast(400, { error: "invalid mode" });
+    expect(mocks.validate).not.toHaveBeenCalled();
+    expect(mocks.projectExists.mock.calls.length).toBe(projectExistsCalls);
+    await invoke(handler, { query: "q", scope: "all" });
+    expectLast(200, { matches: [] });
     await invoke(handler, { query: "q" });
     expectLast(200, { matches: [] });
     mocks.validate.mockImplementationOnce(() => { throw new Error("bad cwd"); });
@@ -274,8 +297,14 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { matches: [] });
     await invoke(handler, { query: "q", cwd: "/ok" });
     expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "both", since: undefined });
+    await invoke(handler, { query: "q", cwd: "/ok", mode: "full_text", scope: "messages" });
+    expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "messages", since: undefined });
     await invoke(handler, { query: "q", cwd: "/ok", mode: "regex", scope: "messages", since: "2025" });
     expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "regex", scope: "messages", since: "2025" });
+    await invoke(handler, { query: "q", cwd: "/ok", scope: "summaries" });
+    expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "summaries", since: undefined });
+    await invoke(handler, { query: "q", cwd: "/ok", scope: "all" });
+    expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "both", since: undefined });
     mocks.grep.mockRejectedValueOnce(new Error("grep broke"));
     await invoke(handler, { query: "q", cwd: "/ok" });
     expectLast(200, { matches: [] });
@@ -348,6 +377,17 @@ describe("persistence read route boundaries", () => {
     const handler = createSearchHandler(config);
     await invoke(handler, "");
     expectLast(400, { error: "query is required" });
+    await invoke(handler, { query: "q", layers: ["invalid"] });
+    expectLast(400, { error: "invalid layers" });
+    await invoke(handler, { query: "q", layers: "episodic" });
+    expectLast(400, { error: "invalid layers" });
+    mocks.validate.mockClear();
+    await invoke(handler, { query: "q", cwd: "/bad", layers: ["invalid"] });
+    expectLast(400, { error: "invalid layers" });
+    expect(mocks.validate).not.toHaveBeenCalled();
+    await invoke(handler, { query: "q", layers: ["semantic"] });
+    expectLast(200, { episodic: [], promoted: [] });
+    expect(mocks.promotedSearch).not.toHaveBeenCalled();
     mocks.validate.mockImplementationOnce(() => { throw new Error("bad cwd"); });
     await invoke(handler, { query: "q", cwd: "/bad" });
     expectLast(400, { error: "bad cwd" });
@@ -369,6 +409,11 @@ describe("persistence read route boundaries", () => {
     await invoke(handler, { query: "q", cwd: "/ok", tags: ["a"], limit: 1 });
     expectLast(200, { episodic: [{ id: "match", tags: ["a", "b"] }], promoted: [{ id: "promoted" }] });
     expect(mocks.promotedSearch).toHaveBeenLastCalledWith("q", 1, ["a"]);
+
+    mocks.promotedSearch.mockResolvedValueOnce([{ id: "legacy-promoted" }]);
+    await invoke(handler, { query: "q", cwd: "/ok", layers: ["semantic"] });
+    expectLast(200, { episodic: [], promoted: [{ id: "legacy-promoted" }] });
+    expect(mocks.promotedSearch).toHaveBeenLastCalledWith("q", 5, undefined);
 
     mocks.grep.mockResolvedValueOnce({ messages: [{ id: "all" }], summaries: [], matches: [] });
     await invoke(handler, { query: "q", cwd: "/ok", tags: [], layers: ["episodic"] });
@@ -431,6 +476,19 @@ describe("persistence read route boundaries", () => {
       await invoke(handler, body);
     }
 
+    expect(openExistingProject).not.toHaveBeenCalled();
+  });
+
+  it("rejects invalid search contracts before cwd or storage admission", async () => {
+    const openExistingProject = vi.fn(async () => {
+      throw new Error("storage admission should not run for invalid contract");
+    });
+    const factory = { ...postgresqlFactory(injectedFactory()), openExistingProject };
+    mocks.validate.mockClear();
+    await invoke(createSearchHandler(postgresqlConfig(), factory), { query: "q", cwd: "/bad", layers: ["nope"] });
+    await invoke(createGrepHandler(postgresqlConfig(), factory), { query: "q", cwd: "/bad", scope: "nope" });
+    expectLast(400, { error: "invalid scope" });
+    expect(mocks.validate).not.toHaveBeenCalled();
     expect(openExistingProject).not.toHaveBeenCalled();
   });
 
