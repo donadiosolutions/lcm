@@ -108,7 +108,12 @@ values into public errors. Aborted active queries are cancelled by a bounded,
 one-shot TLS client using the checked-out backend PID; an uncertain target
 connection is destroyed rather than returned to the pool. Sanitized PostgreSQL
 cancellation errors retain scoped project and machine identity while excluding
-SQL text, query values, and driver details.
+SQL text, query values, and driver details. Machine-owning coordination
+operations and explicitly fence-bound summary, context, and shared-core
+operations preserve that machine identity in query and transaction cancellation
+context; deliberately unfenced project readers remain machine-less. The
+sanitization boundary continues to exclude SQL, bound values, raw driver
+details, and transport metadata.
 
 Ordered SQL files are packaged in `dist` and checked against an explicit
 SHA-256 manifest before execution. The runner takes a database-scoped

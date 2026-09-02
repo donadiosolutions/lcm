@@ -820,6 +820,9 @@ class RepositoryCore {
       domain,
       operation,
       projectId: this.projectId,
+      ...(this.fence === undefined
+        ? {}
+        : { machineId: this.fence.machineId }),
       ...(this.signal === undefined ? {} : { signal: this.signal }),
     };
   }
