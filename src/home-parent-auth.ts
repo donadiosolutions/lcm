@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { dirname, resolve, join } from "node:path";
+import { resolve, join } from "node:path";
 import {
   assertPrivateDirectory,
   openPrivateDirectory,
@@ -170,6 +170,11 @@ export function hostUidForNamespaceUid(ranges: readonly UidMapRange[], uid: numb
   return range === undefined ? undefined : range.outside + uid - range.inside;
 }
 
+export function namespaceUidForParentUid(ranges: readonly UidMapRange[], uid: number): number | undefined {
+  const range = ranges.find((candidate) => uid >= candidate.outside && uid < candidate.outside + candidate.length);
+  return range === undefined ? undefined : range.inside + uid - range.outside;
+}
+
 export function readProcText(path: string, label: string, maxBytes = 4 * 1024): string {
   let content: string;
   try { content = readFileSync(path, "utf8"); } catch (error) { throw new Error(`${label} is unavailable: ${String(error)}`); }
@@ -201,7 +206,7 @@ export function classifyHomeParent(
     if (observation.parentUid === overflow) {
       if (current === undefined) throw new Error("overflow home parent cannot be authenticated without current UID");
       const map = parseUidMap(readProcText("/proc/self/uid_map", "uid_map"));
-      if (hostUidForNamespaceUid(map, 0) !== undefined) throw new Error("overflow home parent is not trusted in a root-mapped namespace");
+      if (namespaceUidForParentUid(map, 0) !== undefined) throw new Error("overflow home parent is not trusted in a root-mapped namespace");
       if (!options.rootPresent) throw new Error("overflow home parent requires a direct-root witness");
       const privateRootPath = resolve(join(options.witnessRoot, ".lcm"));
       const privateRoot = openPrivateDirectory(privateRootPath, { expectedUid: current });
@@ -226,7 +231,7 @@ export function classifyHomeParent(
     }
   }
   if (current === undefined) return "current-user";
-  if (current !== undefined && observation.parentUid === current) return "current-user";
+  if (observation.parentUid === current) return "current-user";
   throw new Error("home parent owner is not trusted");
 }
 

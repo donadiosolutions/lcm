@@ -957,7 +957,9 @@ describe("runtime home rename failures", () => {
   });
 
   it("continues when directory fsync is explicitly unsupported", () => {
-    const paths = legacyHome();
+    const parent = mkdtempSync(join(tmpdir(), "lcm-runtime-fsync-parent-"));
+    homes.push(parent);
+    const paths = legacyHome(parent);
     fsControl.fsyncError = Object.assign(new Error("directory sync unsupported"), { code: "EINVAL" });
 
     expect(migrateLegacyHomeIfNeeded(paths.home).migrated).toBe(true);

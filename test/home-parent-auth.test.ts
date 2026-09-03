@@ -21,6 +21,7 @@ vi.mock("node:fs", async () => {
 });
 import {
   hostUidForNamespaceUid,
+  namespaceUidForParentUid,
   classifyHomeParent,
   observationFromPaths,
   parseHomeParentWitness,
@@ -59,6 +60,9 @@ describe("home parent authentication", () => {
     expect(hostUidForNamespaceUid(ranges, 0)).toBe(1000);
     expect(hostUidForNamespaceUid(ranges, 1005)).toBe(2005);
     expect(hostUidForNamespaceUid(ranges, 99)).toBeUndefined();
+    expect(namespaceUidForParentUid(ranges, 1000)).toBe(0);
+    expect(namespaceUidForParentUid(ranges, 2005)).toBe(1005);
+    expect(namespaceUidForParentUid(ranges, 99)).toBeUndefined();
   });
 
   it.each(["", "0 0 0\n", "0 0 1\n0 2 1\n", "bad map\n"])(
@@ -141,6 +145,28 @@ describe("home parent authentication", () => {
     });
     expect(() => classifyHomeParent(observation(0), { rootPresent: false, witnessRoot: "/home/user" }))
       .toThrow("owner");
+  });
+
+  it("does not treat namespace UID zero mapped to the current user as host-root mapping", () => {
+    const home = fs.mkdtempSync("/tmp/lcm-home-parent-current-root-");
+    const root = join(home, ".lcm");
+    fs.mkdirSync(root, { mode: 0o700 });
+    const live = observationFromPaths({
+      ...observation(65534),
+      homePath: home,
+      parentPath: dirname(home),
+    });
+    fs.writeFileSync(join(root, "home-parent-witness.json"), witnessContent(live), { mode: 0o600 });
+    procFiles({
+      "/proc/self/uid_map": "0 1000 1\n",
+      "/proc/sys/kernel/overflowuid": "65534\n",
+    });
+    try {
+      expect(classifyHomeParent(live, { rootPresent: true, witnessRoot: home }))
+        .toBe("witnessed-system-root");
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("exercises the non-Linux parent-owner branch directly", () => {

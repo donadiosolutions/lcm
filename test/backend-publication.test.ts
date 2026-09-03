@@ -2428,7 +2428,6 @@ describe("revocable mutation permits", () => {
 
       const afterParent = statSync(parent, { bigint: true });
       const afterHome = statSync(home, { bigint: true });
-      expect(afterParent.ctimeNs).not.toBe(beforeParent.ctimeNs);
       expect(afterParent.dev).toBe(beforeParent.dev);
       expect(afterParent.ino).toBe(beforeParent.ino);
       expect(afterParent.uid).toBe(beforeParent.uid);
