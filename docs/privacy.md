@@ -203,9 +203,10 @@ The `Security` section of the doctor output shows:
   messages before handing them to the daemon response layer, which sanitizes
   top-level error strings again before serialization. They retain their legacy
   HTTP `200` status and null-result response shape. SQLite details become a
-  `database constraint error` and host-local POSIX or Windows paths become
-  `<path>`; URL slashes and diagnostic context following a delimiter remain
-  intact.
+  `database constraint error`. Host-local POSIX, Windows, and UNC paths become
+  `<path>`; quoted paths may contain spaces, while unquoted paths stop at
+  whitespace so arbitrary trailing prose remains intact. URL authorities and
+  slashes remain unchanged.
   There are no configuration options for this defense-in-depth behavior.
 - Hook project paths retain leading and trailing whitespace. Directories whose names differ only by that whitespace remain separate LCM projects.
 - Hook errors are attached to a project sidecar only when the reported working directory is an existing directory. Invalid paths are recorded in the bounded fallback log without creating project metadata.

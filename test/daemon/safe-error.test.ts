@@ -8,22 +8,22 @@ describe("sanitizeError", () => {
   });
 
   it("strips POSIX paths containing spaces", () => {
-    const result = sanitizeError("ENOENT: no such file /Users/a/My Files/x");
-    expect(result).toBe("ENOENT: no such file <path>");
+    const result = sanitizeError("ENOENT: no such file '/Users/a/My Files/x'");
+    expect(result).toBe("ENOENT: no such file '<path>'");
   });
 
   it("strips Windows paths containing spaces", () => {
-    const result = sanitizeError("ENOENT: no such file C:\\Users\\a\\My Files\\x");
-    expect(result).toBe("ENOENT: no such file <path>");
+    const result = sanitizeError("ENOENT: no such file \"C:\\Users\\a\\My Files\\x\"");
+    expect(result).toBe("ENOENT: no such file \"<path>\"");
   });
 
   it("stops at delimiters and preserves URL slashes", () => {
-    const result = sanitizeError("failed at /Users/a/My Files/x: see https://example.test/x");
-    expect(result).toBe("failed at <path>: see https://example.test/x");
+    const result = sanitizeError("failed at '/Users/a/My Files/x': see https://example.test/x");
+    expect(result).toBe("failed at '<path>': see https://example.test/x");
   });
 
   it("is idempotent after replacing absolute paths", () => {
-    const input = "failed at C:\\Users\\a\\My Files\\x";
+    const input = "failed at \"C:\\Users\\a\\My Files\\x\"";
     const sanitized = sanitizeError(input);
     expect(sanitizeError(sanitized)).toBe(sanitized);
   });
@@ -42,9 +42,23 @@ describe("sanitizeError", () => {
     ["file:///Users/pedro/secret.db", "file://<path>"],
     ["/Users/José/file", "<path>"],
     ["\\\\server\\share\\file", "<path>"],
-    ["/tmp/file (copy).db", "<path>"],
+    ["/tmp/file(copy).db", "<path>"],
+    ["open '/tmp/file (copy).db'", "open '<path>'"],
     ["C:\\Users\\a\\secret.db#fragment", "<path>#fragment"],
     ["C:\\Users\\a\\secret.db\t=> denied", "<path>\t=> denied"],
+    ["open /var/lib/lcm during startup", "open <path> during startup"],
+    ["open /var/lib/lcm when opening", "open <path> when opening"],
+    ["open /var/lib/lcm is missing", "open <path> is missing"],
+    ["open /var/lib/lcm was locked", "open <path> was locked"],
+    ["open /var/lib/lcm failed", "open <path> failed"],
+    ["root /", "root /"],
+    ["root //", "root //"],
+    ["open '/Users/a/My Files/x' during startup", "open '<path>' during startup"],
+    ["open \"C:\\Users\\a\\My Files\\x\" during startup", "open \"<path>\" during startup"],
+    ["FILE:///Users/pedro/secret.db", "FILE://<path>"],
+    ["file://localhost/Users/pedro/secret.db", "file://localhost<path>"],
+    ["https://[::1]/secret", "https://[::1]/secret"],
+    ["/tmp/file[1].txt", "<path>"],
   ] as const)("sanitizes adversarial path form %#", (input, expected) => {
     expect(sanitizeError(input)).toBe(expected);
   });
