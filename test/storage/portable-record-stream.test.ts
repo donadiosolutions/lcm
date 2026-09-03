@@ -715,6 +715,90 @@ describe("portable record stream public seam", () => {
     expectDeepFrozen(manifest);
   });
 
+  it("classifies negative-zero manifest counts before checksum canonicalization", () => {
+    const input = makeManifestInput();
+    const domains = input.domains as PortableDomainManifest[];
+    const invalid = {
+      ...input,
+      domains: domains.map((entry, index) => index === 0
+        ? { ...entry, recordCount: -0 }
+        : entry),
+    };
+    invalid.contentSha256 = aggregateContentSha256(
+      PORTABLE_RECORD_SCHEMA_SHA256,
+      invalid.domains.map((entry) => entry.prefixSha256),
+    );
+
+    expectSanitizedCode(() => createPortableManifest(invalid as never), "malformed-manifest");
+
+    const forgedManifest = withManifestChecksum(invalid) as unknown as PortableManifest;
+    expectSanitizedCode(() => serializePortableManifest(forgedManifest), "malformed-manifest");
+    expectSanitizedCode(() => negotiatePortableManifest(forgedManifest), "malformed-manifest");
+    expectSanitizedCode(() => createPortableBatch(createBatchInput(forgedManifest, "machines", {
+      predecessor: null,
+      records: [records.machines[0]],
+      complete: true,
+    })), "malformed-manifest");
+
+    const wire = `${referenceCanonicalJson(forgedManifest).replace('"recordCount":0', '"recordCount":-0')}\n`;
+    expectSanitizedCode(
+      () => parsePortableManifest(Buffer.from(wire, "utf8")),
+      "malformed-manifest",
+    );
+  });
+
+  it("keeps negative-zero checkpoint verification classified as checkpoint-mismatch", () => {
+    const manifest = makeManifest();
+    const batch = asPortableBatch(createPortableBatch(createBatchInput(manifest, "machines", {
+      predecessor: null,
+      records: [records.machines[0]],
+      complete: true,
+    })));
+    const input = makeManifestInput();
+    const domains = input.domains as PortableDomainManifest[];
+    const invalid = {
+      ...input,
+      domains: domains.map((entry, index) => index === 0
+        ? { ...entry, recordCount: -0 }
+        : entry),
+    };
+    invalid.contentSha256 = aggregateContentSha256(
+      PORTABLE_RECORD_SCHEMA_SHA256,
+      invalid.domains.map((entry) => entry.prefixSha256),
+    );
+    const forgedManifest = withManifestChecksum(invalid) as unknown as PortableManifest;
+
+    expectCode(
+      () => verifyPortableCheckpoint(batch.checkpoint, forgedManifest),
+      "checkpoint-mismatch",
+    );
+  });
+
+  it("keeps negative-zero record payloads classified as malformed-record", () => {
+    const value = {
+      memoryId: "memory-763",
+      content: "negative-zero record test",
+      metadata: { source: "bug-763" },
+      sourceProjectId: null,
+      sourceSummaryId: null,
+      sessionId: "session-763",
+      depth: 0,
+      confidence: -0,
+      createdAt: TIMESTAMP,
+      archivedAt: null,
+    };
+    const input = {
+      domain: "promoted-memories" as const,
+      ordinal: 0,
+      value,
+      context: { projectIdentity: PROJECT_IDENTITY },
+    };
+    const valid = createPortableRecord({ ...input, value: { ...value, confidence: 0 } } as never);
+    expect(valid.value).toMatchObject({ memoryId: "memory-763", confidence: 0 });
+
+    expectSanitizedCode(() => createPortableRecord(input as never), "malformed-record");
+  });
+
   it("requires one canonical six-digit UTC capturedAt dialect", () => {
     const canonical = makeSourceDescription({ capturedAt: "2026-08-13T12:34:56.789000Z" });
     expect(() => createPortableManifest(makeManifestInput(canonical) as never)).not.toThrow();

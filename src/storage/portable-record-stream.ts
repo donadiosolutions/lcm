@@ -428,6 +428,7 @@ function validateManifest(value: unknown, requireChecksum = true): PortableManif
       item.domain !== domain
       || item.domainVersion !== 1
       || !isSafeCount(item.recordCount)
+      || Object.is(item.recordCount, -0)
       || !isSha256(item.prefixSha256)
     ) fail("malformed-manifest");
     const coverage = validateCoverage(item.coverage);
