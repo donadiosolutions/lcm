@@ -1906,9 +1906,10 @@ function writeJournal(
     return fail("unresolved-publication", "backend publication journal already exists");
   }
   observer("before-journal-write", path);
+  // The checksum check is journal-protocol admission under its lock; the
+  // generic durable helper performs unconditional publication when present.
   atomicWritePrivateFileDurable(path, journalContent(journal), {
     requireAbsent: expectedChecksum === undefined,
-    expectedContentSha256: current === null ? null : sha256(current.raw),
     maxExistingBytes: MAX_JOURNAL_BYTES,
   });
   observer("after-journal-write", path);
