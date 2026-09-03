@@ -402,6 +402,27 @@ readback. A present nonterminal, mismatched, or quarantined row is never treated
 as pruned. The worker and its operator CLI remain a separate explicit delivery
 path; they do not replace or weaken #617's daemon project-storage routing.
 
+### Portable durable file writes
+
+`atomicWritePrivateFileDurable` has an intentionally narrow portable contract.
+With `requireAbsent: true`, it fully writes, fsyncs, and mode-tightens a
+temporary inode, then uses an exclusive same-directory hard link for durable
+no-clobber creation. Without `requireAbsent`, it performs the bounded existing
+file safety preflight and then publishes the completed candidate with an
+unconditional same-directory atomic rename. The preflight rejects an unsafe,
+oversized, non-regular, wrong-owner, or multiply linked destination, but it is
+not a descriptor-relative mutation and does not close a same-UID replacement
+race after the final check.
+
+The helper rejects the legacy `expectedContentSha256` option, including when
+its value is `null` or `undefined`, before opening the parent, creating a
+temporary path, or writing. Callers that need conditional replacement must own
+a protocol-specific operation and recovery grammar, such as the migration
+manifest publication protocol. Application locks coordinate cooperating LCM
+writers only; they cannot constrain an arbitrary same-UID, non-cooperating
+editor. This contract therefore makes no portable pathname-CAS claim and
+documents the remaining same-UID limitation explicitly.
+
 ## Data model
 
 ### Conversations and messages

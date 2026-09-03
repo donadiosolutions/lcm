@@ -507,25 +507,26 @@ function refreshHomeParentWitness(topology: HomeTopology, homeDir: string, autho
     }
     const content = witnessContent(parentObservation(topology, homeDir));
     assertRootParent(topology, homeDir);
-    let expectedContentSha256: string | undefined;
+    let existingPresent = false;
     try {
-      const existing = readBoundedRegularFile(path, {
+      readBoundedRegularFile(path, {
         allowedRoot: resolve(rootPath),
         maxBytes: 8 * 1024,
         expectedUid: currentUid(),
         allowedModes: [PRIVATE_FILE_MODE],
         requireSingleLink: true,
       });
-      expectedContentSha256 = sha256(existing);
+      existingPresent = true;
     } catch (error) {
       if (!isMissing(error)) throw error;
     }
     assertPrivateDirectory(root, rootPath, root.witness, currentUid());
     assertRootParent(topology, homeDir);
+    // The witness is admission evidence under the cooperating LCM lock; the
+    // durable helper's present-file publication remains unconditional.
     atomicWritePrivateFileDurable(path, content, {
       expectedUid: currentUid(),
-      requireAbsent: expectedContentSha256 === undefined,
-      expectedContentSha256,
+      requireAbsent: !existingPresent,
       maxExistingBytes: 8 * 1024,
     });
   } finally {

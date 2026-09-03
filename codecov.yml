@@ -20,6 +20,7 @@ component_management:
       name: "Unit - Configuration and Security"
       paths:
         # The #691 connector-doctor fallback uses the lock-free config snapshot here.
+        # #681 keeps durable configuration writes in this existing component.
         - "^src/config-manager\\.ts$"
         - "^src/config-projection\\.ts$"
         - "^src/generated-patterns\\.ts$"
@@ -99,6 +100,7 @@ component_management:
       name: "Unit - Storage Abstractions"
       paths:
         # Keep the #691 journal witness and incomplete-evidence admission seam, plus the #700 optional abort-signal project-open contract, here.
+        # #681 retains backend-publication durable-write ownership here.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
         - "^src/storage/capabilities\\.ts$"
@@ -115,6 +117,7 @@ component_management:
     - component_id: "unit-migration-cutover"
       name: "Unit - Migration and Cutover"
       paths:
+        # #681 leaves protocol-specific manifest replacement in this component.
         - "src/migration/"
     - component_id: "unit-local-event-storage"
       name: "Unit - Local Event Storage"

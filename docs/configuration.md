@@ -191,7 +191,13 @@ directory/no-follow/nonblocking flags or `/proc/self/fd` descriptor lookup are
 unavailable. Manual/no-write guidance, `lcm install`, `lcm doctor`, connector
 listing, inventory inspection, and verified legacy read-only branches remain
 usable. The traversal uses proc descriptors; it is not portable `openat` and
-does not provide portable descriptor-relative compare-and-swap.
+does not provide portable descriptor-relative compare-and-swap. Generic durable
+configuration writes use an unconditional atomic rename after a bounded safety
+preflight; their application locks coordinate cooperating LCM writers but are
+not an operating-system compare-and-swap against arbitrary same-UID edits.
+The legacy `expectedContentSha256` option is rejected before mutation. Callers
+that need conditional replacement must use a protocol-specific operation; see
+the [architecture contract](architecture.md#portable-durable-file-writes).
 
 Within that Linux boundary, LCM stages every replacement in a private,
 mode-0700 transaction directory. Before the public link exists, it creates an
@@ -228,7 +234,7 @@ or power loss may leave a transaction directory for manual inspection. A
 same-inode write that changes A to B and back to A before observation is
 necessarily indistinguishable from no change. This is Linux
 `/proc/self/fd` anchoring, not portable `openat`, and it does not resolve the
-separate #681 transport-config CAS or #715 parent-path boundaries.
+generic durable-write contract in #681 or the #715 parent-path boundaries.
 
 The default native Codex MCP runner can inspect canonical state, but automatic
 `codex mcp add/remove` is refused because the child process mutates ordinary

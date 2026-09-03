@@ -1840,7 +1840,6 @@ function stageRevision(
       content,
       {
         expectedUid,
-        expectedContentSha256: null,
         requireAbsent: true,
         maxExistingBytes: MAX_MANIFEST_BYTES,
       },
@@ -2140,7 +2139,6 @@ export class MigrationManifestStore {
             this.#observer("before-head-publication", headPath);
             atomicWritePrivateFileDurable(headPath, migrationManifestHeadContent(head), {
               expectedUid: this.#expectedUid,
-              expectedContentSha256: null,
               requireAbsent: true,
               maxExistingBytes: MAX_MANIFEST_BYTES,
             });
@@ -2530,7 +2528,6 @@ export class MigrationManifestStore {
             this.#observer("before-head-publication", headPath);
             atomicWritePrivateFileDurable(headPath, migrationManifestHeadContent(head), {
               expectedUid: this.#expectedUid,
-              expectedContentSha256: null,
               requireAbsent: true,
               maxExistingBytes: MAX_MANIFEST_BYTES,
             });

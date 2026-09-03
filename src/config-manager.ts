@@ -248,10 +248,9 @@ function writeConfigAtomic(
 ): void {
   const directory = dirname(configPath);
   ensurePrivateDirectory(directory);
+  // The caller's observation selects exclusive create for an absent file;
+  // present-file publication is intentionally unconditional under the config lock.
   atomicWritePrivateFileDurable(configPath, content, {
-    expectedContentSha256: observedContent === null
-      ? null
-      : createHash("sha256").update(observedContent).digest("hex"),
     maxExistingBytes: MAX_CONFIG_BYTES,
     requireAbsent: observedContent === null,
     finalMode: 0o600,
@@ -334,9 +333,10 @@ export async function applyBackendPublicationConfigFile(
       }
     } else {
       const recoveryFile = input.file as Extract<BackendPublicationRecoveryFile, { presence: "present" }>;
+      // Coordinator witnesses are admission/recovery evidence, not portable
+      // CAS; the present-file durable write is unconditional under its locks.
       atomicWritePrivateFileDurable(configPath, candidateContent, {
         requireAbsent: before.presence === "absent",
-        expectedContentSha256: before.presence === "present" ? before.rawSha256 : null,
         maxExistingBytes: 4 * 1024 * 1024,
         finalMode: recoveryFile.mode,
       });
