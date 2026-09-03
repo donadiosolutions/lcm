@@ -775,17 +775,28 @@ describe("portable record stream public seam", () => {
   });
 
   it("keeps negative-zero record payloads classified as malformed-record", () => {
-    const manifest = makeManifest();
-    const record = {
-      ...records["promoted-memories"][0],
-      value: { ...records["promoted-memories"][0].value, confidence: -0 },
+    const value = {
+      memoryId: "memory-763",
+      content: "negative-zero record test",
+      metadata: { source: "bug-763" },
+      sourceProjectId: null,
+      sourceSummaryId: null,
+      sessionId: "session-763",
+      depth: 0,
+      confidence: -0,
+      createdAt: TIMESTAMP,
+      archivedAt: null,
     };
+    const input = {
+      domain: "promoted-memories" as const,
+      ordinal: 0,
+      value,
+      context: { projectIdentity: PROJECT_IDENTITY },
+    };
+    const valid = createPortableRecord({ ...input, value: { ...value, confidence: 0 } } as never);
+    expect(valid.value).toMatchObject({ memoryId: "memory-763", confidence: 0 });
 
-    expectCode(() => createPortableBatch(createBatchInput(manifest, "promoted-memories", {
-      predecessor: null,
-      records: [record],
-      complete: false,
-    })), "malformed-record");
+    expectSanitizedCode(() => createPortableRecord(input as never), "malformed-record");
   });
 
   it("requires one canonical six-digit UTC capturedAt dialect", () => {
