@@ -1263,6 +1263,23 @@ describe("portable record stream public seam", () => {
   it("still reads available zero-record domains", async () => {
     const source = new FakePortableSource({ ...records, "passive-events": [] });
     const stream = await createPortableRecordStream(source);
+    const manifest = stream.describe();
+    const expectedPrefix = initialDomainPrefix(PORTABLE_RECORD_SCHEMA_SHA256, "passive-events");
+    const domainManifest = manifest.domains.find((entry) => entry.domain === "passive-events");
+    expect(domainManifest).toEqual({
+      domain: "passive-events",
+      domainVersion: 1,
+      coverage: {
+        state: "available",
+        evidenceSha256: referenceSha256(["task-2-coverage", "passive-events", "available"]),
+      },
+      recordCount: 0,
+      prefixSha256: expectedPrefix,
+    });
+    expect(manifest).toMatchObject({
+      version: 1,
+      schemaSha256: PORTABLE_RECORD_SCHEMA_SHA256,
+    });
     const verifyBaseline = source.verifyCalls.length;
     const pageBaseline = source.pageCalls.length;
     const batch = await stream.readBatch({
@@ -1270,12 +1287,66 @@ describe("portable record stream public seam", () => {
       maxRecords: 1,
       maxBytes: PORTABLE_LIMITS.maxBatchBytes,
     });
-    expect(batch.records).toEqual([]);
-    expect(batch.framedBytes).toBe(0);
-    expect(batch.complete).toBe(true);
+
+    const checkpointBody = {
+      version: 1 as const,
+      manifestSha256: manifest.manifestSha256,
+      domain: "passive-events" as const,
+      nextOrdinal: 0,
+      recordCount: 0,
+      prefixSha256: expectedPrefix,
+      lastRecordIdentitySha256: null,
+      lastRecordSha256: null,
+      previousCheckpointSha256: null,
+      complete: true,
+    };
+    expect(batch).toEqual({
+      version: 1,
+      manifestSha256: manifest.manifestSha256,
+      domain: "passive-events",
+      records: [],
+      framedBytes: 0,
+      complete: true,
+      priorCheckpointSha256: null,
+      checkpoint: {
+        ...checkpointBody,
+        checkpointSha256: referenceSha256(checkpointBody),
+      },
+    });
+    expect(batch.checkpoint.checkpointSha256).toBe(referenceSha256(checkpointBody));
     expect(source.verifyCalls).toHaveLength(verifyBaseline + 2);
     expect(source.pageCalls).toHaveLength(pageBaseline + 1);
-    expect(source.pageCalls.at(-1)).toMatchObject({ domain: "passive-events", afterOrdinal: 0, includePredecessor: false });
+    expect(source.pageCalls.slice(pageBaseline)).toEqual([{
+      domain: "passive-events",
+      afterOrdinal: 0,
+      includePredecessor: false,
+      maxRecords: PORTABLE_LIMITS.maxBatchRecords,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    }]);
+    expect(source.verifyCalls.slice(verifyBaseline)).toEqual([
+      {
+        sourceIdentitySha256: manifest.source.sourceIdentitySha256,
+        sourceWitnessSha256: manifest.source.sourceWitnessSha256,
+        contentSha256: manifest.contentSha256,
+        manifestSha256: manifest.manifestSha256,
+      },
+      {
+        sourceIdentitySha256: manifest.source.sourceIdentitySha256,
+        sourceWitnessSha256: manifest.source.sourceWitnessSha256,
+        contentSha256: manifest.contentSha256,
+        manifestSha256: manifest.manifestSha256,
+      },
+    ]);
+    expectDeepFrozen(batch);
+    expectDeepFrozen(batch.records);
+    expectDeepFrozen(batch.checkpoint);
+    expect(() => (batch.records as PortableRecord[]).push(records.messages[0])).toThrow();
+    expect(() => {
+      (batch as unknown as { domain: PortableDomain }).domain = "messages";
+    }).toThrow();
+    expect(() => {
+      (batch.checkpoint as unknown as { nextOrdinal: number }).nextOrdinal = 1;
+    }).toThrow();
     await stream.close();
   });
 
