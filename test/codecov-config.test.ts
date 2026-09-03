@@ -55,6 +55,7 @@ const expectedComponents = [
       "^src/config-manager\\.ts$",
       "^src/config-projection\\.ts$",
       "^src/generated-patterns\\.ts$",
+      "^src/home-parent-auth\\.ts$",
       "^src/legacy-names\\.ts$",
       "^src/runtime-paths\\.ts$",
       "^src/runtime-root\\.ts$",
@@ -449,7 +450,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(205);
+    expect(productionFiles).toHaveLength(206);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -479,7 +480,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(205);
+    expect(ownershipCounts.size).toBe(206);
   });
 
   test("keeps response-fence and #700/#701/#709/#710/#756/#726/#734/#737/#742/#760/#804 files in their intended components", () => {
@@ -493,6 +494,7 @@ describe("Codecov configuration", () => {
     const expectedOwners = [
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
+      ["src/home-parent-auth.ts", "unit-configuration-security"],
       ["src/connectors/installer.ts", "unit-connectors"],
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],

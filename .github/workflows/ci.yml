@@ -146,6 +146,7 @@ jobs:
           LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR: ${{ runner.temp }}/lcm-systemd-${{ github.run_id }}-${{ github.run_attempt }}
           LCM_LIFECYCLE_DAEMON_PORT: "48322"
           LCM_LIFECYCLE_EXPECTED_SCOPES: "1"
+          LCM_RUNTIME_PATHS_SYSTEMD_INTEGRATION: "1"
         run: |
           set -Eeuo pipefail
           barrier_dir="$LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR"
@@ -175,6 +176,7 @@ jobs:
             test/daemon/lifecycle-isolation.test.ts \
             test/daemon/lifecycle-systemd.integration.test.ts \
             test/daemon/systemd-credential-loader.test.ts \
+            test/runtime-paths-systemd.integration.test.ts \
             --testNamePattern "uses and removes one exact run-owned transient unit|starts and admits a healthy managed unit with exact identity and cleanup|restarts a wedged registered unit through systemd without legacy signal fallback|recreates a terminal clean-exit unit after a registered-not-running observation|refuses stale manager identity before mutation and never falls back to legacy signals|refuses clean-environment drift before admitting an existing unit"
           npx vitest run \
             test/daemon/systemd-credential-loader.test.ts \
