@@ -553,7 +553,9 @@ SQLite keeps its existing best-effort behavior when SQLite is selected. The
 PostgreSQL routes never open a project SQLite database or return a false empty
 read result as fallback. The raw hook-facing `POST /prompt-search` endpoint
 still lets the prompt hook treat optional hint failure as non-fatal, while
-identity errors remain visible as admission failures. Setting
+identity errors remain visible as admission failures. A typed surfacing-log
+failure under the selected PostgreSQL backend returns a sanitized HTTP `503`;
+PostgreSQL never falls back to SQLite for that failure. Setting
 `restoration.promptSearchMaxResults` to `0` suppresses returned hints but does
 not bypass PostgreSQL identity or storage admission. Disabled compaction and
 empty ingestion still authenticate the selected backend before returning their

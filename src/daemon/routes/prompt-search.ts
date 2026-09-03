@@ -6,6 +6,7 @@ import type { RecallFeedback } from "../../db/recall.js";
 import { selectMemoryHintsWithinBudget } from "../../hooks/memory-context.js";
 import { validateCwd } from "../validate-cwd.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
+import { StorageOperationError } from "../../storage/errors.js";
 import {
   storageRouteFailureResponse,
   withProjectStorage,
@@ -323,12 +324,22 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
               }
             : undefined;
 
-          // Log surfacing events (best-effort, never throws)
+          // Selected-PostgreSQL typed failures are authoritative; all other
+          // surfacing-log failures remain best-effort.
           try {
             if (logSurfacing) {
               await project.recall.logSurfacing(ids, session_id ?? null);
             }
-          } catch { /* non-fatal */ }
+          } catch (error) {
+            if (
+              config.storage.backend === "postgresql"
+              && error instanceof StorageOperationError
+              && error.backend === config.storage.backend
+            ) {
+              throw error;
+            }
+            // SQLite and ordinary failures remain best-effort.
+          }
 
           return debugResponse ? { hints, ids, debug: debugResponse } : { hints, ids };
         },
