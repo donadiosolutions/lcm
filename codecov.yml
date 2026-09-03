@@ -39,6 +39,8 @@ component_management:
       name: "Unit - Connectors"
       paths:
         # Codex MCP absence classification (#716) remains connector-owned.
+        # Immutable publication certificates and alias-race compensation (#713)
+        # remain within this connector component.
         - "src/connectors/"
     - component_id: "unit-hooks"
       name: "Unit - Hooks"
