@@ -532,11 +532,12 @@ function retainedJournal(
   staging: string,
   phase: "published" | "retaining",
   retainedPath: string | null,
+  operationId = "0123456789abcdef0123456789abcdef0123456789abcdef",
 ): void {
   const payload = {
     version: 2,
     phase,
-    operationId: "0123456789abcdef0123456789abcdef0123456789abcdef",
+    operationId,
     sourceName: ".lossless-claude",
     targetName: ".lcm",
     stagingName: basename(staging),
@@ -882,6 +883,51 @@ describe("runtime home rename failures", () => {
     expect(readFileSync(join(paths.next, "value.txt"), "utf-8")).toBe("value");
     expect(readFileSync(join(paths.legacy, "value.txt"), "utf-8")).toBe("value");
     expect(existsSync(join(paths.home, ".lcm-legacy-migration.json"))).toBe(true);
+  });
+
+  it("rejects a nonterminal journal injected at witness refresh", () => {
+    const paths = legacyHome();
+    processControl.procFiles.set("/proc/self/uid_map", "0 0 1\n");
+    fsControl.fstatHook = (path, stat) => path === "/tmp"
+      ? Object.assign(stat as object, { uid: 0n })
+      : stat;
+    fsControl.statHook = (path, stat) => path === "/tmp"
+      ? Object.assign(stat as object, { uid: 0n })
+      : stat;
+    let rootOpens = 0;
+    let injectedFd: number | undefined;
+    let injectedFdClosed = false;
+    let injectedJournal: string | undefined;
+    const journalPath = join(paths.home, ".lcm-legacy-migration.json");
+    fsControl.openHook = (path, fd) => {
+      if (path === paths.next) {
+        rootOpens += 1;
+        if (rootOpens === 7) {
+          const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+            operationId: string;
+            stagingName: string;
+          };
+          const staging = join(paths.home, journal.stagingName);
+          fsControl.openHook = undefined;
+          retainedJournal(paths.home, paths.legacy, paths.next, staging, "retaining", staging, journal.operationId);
+          injectedJournal = readFileSync(journalPath, "utf8");
+          injectedFd = fd;
+        }
+      }
+    };
+    fsControl.closeHook = (_path, fd) => {
+      if (fd === injectedFd) injectedFdClosed = true;
+    };
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow(
+      "cannot refresh home parent witness while legacy migration is nonterminal",
+    );
+    expect(rootOpens).toBe(7);
+    expect(injectedFd).toBeDefined();
+    expect(existsSync(join(paths.next, "home-parent-witness.json"))).toBe(false);
+    expect(readFileSync(journalPath, "utf8")).toBe(injectedJournal);
+    expect(JSON.parse(readFileSync(journalPath, "utf8"))).toMatchObject({ phase: "retaining" });
+    expect(injectedFdClosed).toBe(true);
   });
 
   it("falls back to copy-and-remove for cross-device renames", () => {
