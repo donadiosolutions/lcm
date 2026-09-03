@@ -10,12 +10,20 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
+import {
+  classifyHomeParent,
+  parentModeIsSafe,
+  observationFromPaths,
+  type ParentAuthority,
+} from "../home-parent-auth.js";
 
 type HomeLockDirectoryStat = Readonly<{
   mode: bigint;
   uid: bigint;
+  gid: bigint;
   dev: bigint;
   ino: bigint;
+  ctimeNs: bigint;
 }>;
 
 /** A sanitized validation refusal raised by retained HOME topology checks. */
@@ -37,10 +45,15 @@ export type HomeLockTopology = Readonly<{
   homeFd: number;
   parentFd: number;
   homeMode: number;
+  homeUid: bigint;
+  homeGid: bigint;
   homeDev: bigint;
   homeIno: bigint;
   parentDev: bigint;
   parentIno: bigint;
+  parentUid: bigint;
+  parentGid: bigint;
+  parentMode: number;
   expectedUid: number | undefined;
 }>;
 
@@ -70,18 +83,55 @@ function assertTopologySecurity(
   parent: HomeLockDirectoryStat,
   home: HomeLockDirectoryStat,
   expectedUid: number | undefined,
+  homePath: string,
+  parentPath: string,
 ): void {
   const parentUid = Number(parent.uid);
   const homeUid = Number(home.uid);
   const parentMode = Number(parent.mode & 0o7777n);
   const homeMode = Number(home.mode & 0o7777n);
-  if (
-    (expectedUid !== undefined && homeUid !== expectedUid)
-    || (expectedUid !== undefined && parentUid !== expectedUid && parentUid !== 0)
-    || ((homeMode & 0o022) !== 0 && (parentMode & 0o077) !== 0)
-    || ((parentMode & 0o022) !== 0 && !(parentUid === 0 && (parentMode & 0o1000) !== 0))
-  ) {
+  if (expectedUid !== undefined && homeUid !== expectedUid) {
     return topologyError("HOME lock parent is not trusted");
+  }
+  let authority: ParentAuthority;
+  try {
+    authority = classifyHomeParent(observationFromPaths({
+    homePath,
+    homeDev: String(home.dev),
+    homeIno: String(home.ino),
+    homeUid,
+    parentPath,
+    parentDev: String(parent.dev),
+    parentIno: String(parent.ino),
+    parentMode,
+    parentUid,
+    parentGid: String(parent.gid),
+    parentCtimeNs: String(parent.ctimeNs),
+    }), { rootPresent: true, witnessRoot: homePath });
+  } catch {
+    return topologyError("HOME lock parent is not trusted");
+  }
+  if (!parentModeIsSafe(parentMode, authority)
+    || ((homeMode & 0o022) !== 0 && (parentMode & 0o077) !== 0)) {
+    return topologyError("HOME lock parent is not trusted");
+  }
+}
+
+function assertRetainedMetadata(topology: HomeLockTopology): void {
+  const parent = directoryStat(topology.parentFd);
+  const home = directoryStat(topology.homeFd);
+  if (
+    parent.dev !== topology.parentDev
+    || parent.ino !== topology.parentIno
+    || parent.uid !== topology.parentUid
+    || parent.gid !== topology.parentGid
+    || Number(parent.mode & 0o7777n) !== topology.parentMode
+    || home.dev !== topology.homeDev
+    || home.ino !== topology.homeIno
+    || home.uid !== topology.homeUid
+    || home.gid !== topology.homeGid
+  ) {
+    return topologyError("HOME lock topology changed during validation");
   }
 }
 
@@ -91,7 +141,8 @@ export function assertHomeLockTopology(topology: HomeLockTopology): void {
   const home = directoryStat(topology.homeFd);
   assertDirectoryIdentity(parent, topology.parentPath, "HOME lock grandparent");
   assertDirectoryIdentity(home, topology.homePath, "HOME lock parent");
-  assertTopologySecurity(parent, home, topology.expectedUid);
+  assertTopologySecurity(parent, home, topology.expectedUid, topology.homePath, topology.parentPath);
+  assertRetainedMetadata(topology);
 }
 
 /** Open and authenticate HOME plus its parent without following leaf symlinks. */
@@ -113,17 +164,22 @@ export function openHomeLockTopology(
     const home = directoryStat(homeFd);
     assertDirectoryIdentity(parent, parentPath, "HOME lock grandparent");
     assertDirectoryIdentity(home, homePath, "HOME lock parent");
-    assertTopologySecurity(parent, home, expectedUid);
+    assertTopologySecurity(parent, home, expectedUid, homePath, parentPath);
     return {
       homePath,
       parentPath,
       homeFd,
       parentFd,
       homeMode: Number(home.mode & 0o7777n),
+      homeUid: home.uid,
+      homeGid: home.gid,
       homeDev: home.dev,
       homeIno: home.ino,
       parentDev: parent.dev,
       parentIno: parent.ino,
+      parentUid: parent.uid,
+      parentGid: parent.gid,
+      parentMode: Number(parent.mode & 0o7777n),
       expectedUid,
     };
   } catch (error) {

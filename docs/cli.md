@@ -203,6 +203,18 @@ modify that user's files and runtime state. When recovery is refused, inspect
 the host with `lcm doctor`, restore the manager, and retry one explicit
 `lcm daemon restart`.
 
+On Linux, a normal host-context `lcm install` records an owner-only,
+checksummed witness that the canonical HOME parent was observed as host UID 0.
+A `PrivateTmp` user namespace may use that direct-host-root-observed,
+integrity-checked historical evidence only when its parent appears as the
+kernel overflow UID and `/proc/self/uid_map` proves host UID 0 is unmapped.
+The canonical HOME and parent paths, device/inode identities, parent mode, and
+parent ctime must still match. Missing, malformed, unsafe, stale, or changed
+evidence fails closed; rerun `lcm install` once from a normal host context.
+This witness is not a secret, MAC, or cryptographically unforgeable root
+credential. Same-UID processes remain outside the filesystem security boundary
+and can edit or delete the witness along with other runtime state.
+
 If a connector was removed or its installed paths are stale after an upgrade,
 repair it through the connector manager and then re-run doctor:
 

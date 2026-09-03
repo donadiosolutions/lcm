@@ -9,6 +9,7 @@ import {
   mkdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -17,7 +18,7 @@ import {
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const renameControl = vi.hoisted(() => ({
@@ -63,7 +64,20 @@ const fsControl = vi.hoisted(() => ({
 const processControl = vi.hoisted(() => ({
   procStat: undefined as string | undefined,
   procStatError: undefined as Error | undefined,
+  witnessError: undefined as NodeJS.ErrnoException | undefined,
+  procFiles: new Map<string, string>(),
 }));
+
+const homeParentControl = vi.hoisted(() => ({ unsafeMode: false }));
+
+vi.mock("../src/home-parent-auth.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/home-parent-auth.js")>("../src/home-parent-auth.js");
+  return {
+    ...actual,
+    parentModeIsSafe: (mode: number, authority: import("../src/home-parent-auth.js").ParentAuthority) =>
+      homeParentControl.unsafeMode ? false : actual.parentModeIsSafe(mode, authority),
+  };
+});
 
 vi.mock("node:fs", async () => {
   const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
@@ -95,6 +109,16 @@ vi.mock("node:fs", async () => {
       return hook === undefined
         ? stat
         : hook(fsControl.fdPaths.get(fd) ?? "", stat) as ReturnType<typeof actual.fstatSync>;
+    },
+    readFileSync: (path: string | Buffer | URL, options?: unknown) => {
+      const key = String(path);
+      const replacement = processControl.procFiles.get(key);
+      if (replacement !== undefined) {
+        if (typeof options === "string") return replacement;
+        if (options && typeof options === "object" && "encoding" in options) return replacement;
+        return Buffer.from(replacement);
+      }
+      return actual.readFileSync(path as never, options as never);
     },
     closeSync: (fd: number): void => {
       fsControl.closeHook?.(fsControl.fdPaths.get(fd) ?? "", fd);
@@ -202,6 +226,9 @@ vi.mock("../src/security-files.js", async () => {
     ...actual,
     readBoundedRegularFile: (...args: Parameters<typeof actual.readBoundedRegularFile>): string => {
       const [path] = args;
+      if (String(path).endsWith("home-parent-witness.json") && processControl.witnessError !== undefined) {
+        throw processControl.witnessError;
+      }
       if (path.startsWith("/proc/") && processControl.procStatError !== undefined) {
         throw processControl.procStatError;
       }
@@ -219,6 +246,7 @@ import {
   lcmHomeDir,
   migrateLegacyHomeIfNeeded,
 } from "../src/runtime-paths.js";
+import { classifyHomeParent, observationFromPaths } from "../src/home-parent-auth.js";
 import { withBackendPublicationConsumerLock } from "../src/storage/backend-publication.js";
 
 const homes: string[] = [];
@@ -259,17 +287,64 @@ afterEach(() => {
   fsControl.fdPaths.clear();
   processControl.procStat = undefined;
   processControl.procStatError = undefined;
+  processControl.witnessError = undefined;
+  processControl.procFiles.clear();
+  homeParentControl.unsafeMode = false;
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
 });
 
-function legacyHome(): { home: string; legacy: string; next: string } {
-  const home = mkdtempSync(join(tmpdir(), "lcm-runtime-errors-"));
+function legacyHome(base = tmpdir()): { home: string; legacy: string; next: string } {
+  const home = mkdtempSync(join(base, "lcm-runtime-errors-"));
   homes.push(home);
   const legacy = legacyLcmHomeDir(home);
   mkdirSync(legacy, { recursive: true });
   writeFileSync(join(legacy, "value.txt"), "value");
   return { home, legacy, next: lcmHomeDir(home) };
 }
+
+it("accepts an overflow-owned parent only with a direct-root witness", () => {
+  const home = mkdtempSync(join(tmpdir(), "lcm-runtime-overflow-witness-"));
+  homes.push(home);
+  const root = lcmHomeDir(home);
+  mkdirSync(root, { mode: 0o700 });
+  const parent = dirname(home);
+  const homeStat = lstatSync(home, { bigint: true });
+  const parentStat = lstatSync(parent, { bigint: true });
+  const payload = {
+    version: 1,
+    homePath: realpathSync(home),
+    homeDev: String(homeStat.dev),
+    homeIno: String(homeStat.ino),
+    parentPath: realpathSync(parent),
+    parentDev: String(parentStat.dev),
+    parentIno: String(parentStat.ino),
+    parentMode: Number(parentStat.mode & 0o7777n),
+    parentUid: 0,
+    parentGid: String(parentStat.gid),
+    parentCtimeNs: String(parentStat.ctimeNs),
+  };
+  const checksum = createHash("sha256").update(canonical(payload)).digest("hex");
+  writeFileSync(
+    join(root, "home-parent-witness.json"),
+    `${canonical({ ...payload, checksumSha256: checksum })}\n`,
+    { mode: 0o600 },
+  );
+  processControl.procFiles.set("/proc/sys/kernel/overflowuid", "65534\n");
+  processControl.procFiles.set("/proc/self/uid_map", "1000 1000 1\n");
+  expect(classifyHomeParent(observationFromPaths({
+    homePath: realpathSync(home),
+    homeDev: String(homeStat.dev),
+    homeIno: String(homeStat.ino),
+    homeUid: Number(homeStat.uid),
+    parentPath: realpathSync(parent),
+    parentDev: String(parentStat.dev),
+    parentIno: String(parentStat.ino),
+    parentMode: Number(parentStat.mode & 0o7777n),
+    parentUid: 65534,
+    parentGid: String(parentStat.gid),
+    parentCtimeNs: String(parentStat.ctimeNs),
+  }), { rootPresent: true, witnessRoot: home })).toBe("witnessed-system-root");
+});
 
 function processStartTime(pid = process.pid): string | null {
   try {
@@ -457,11 +532,12 @@ function retainedJournal(
   staging: string,
   phase: "published" | "retaining",
   retainedPath: string | null,
+  operationId = "0123456789abcdef0123456789abcdef0123456789abcdef",
 ): void {
   const payload = {
     version: 2,
     phase,
-    operationId: "0123456789abcdef0123456789abcdef0123456789abcdef",
+    operationId,
     sourceName: ".lossless-claude",
     targetName: ".lcm",
     stagingName: basename(staging),
@@ -809,6 +885,59 @@ describe("runtime home rename failures", () => {
     expect(existsSync(join(paths.home, ".lcm-legacy-migration.json"))).toBe(true);
   });
 
+  it("rejects a nonterminal journal injected at witness refresh", () => {
+    const paths = legacyHome("/tmp");
+    processControl.procFiles.set("/proc/self/uid_map", "0 0 1\n");
+    fsControl.fstatHook = (path, stat) => path === "/tmp"
+      ? Object.assign(stat as object, { uid: 0n })
+      : stat;
+    fsControl.statHook = (path, stat) => path === "/tmp"
+      ? Object.assign(stat as object, { uid: 0n })
+      : stat;
+    let injectedFd: number | undefined;
+    let injectedFdClosed = false;
+    let injectionArmed = false;
+    let injectionOccurred = false;
+    let injectedJournal: string | undefined;
+    const journalPath = join(paths.home, ".lcm-legacy-migration.json");
+    fsControl.writeHook = (_path, _fd, content) => {
+      if (!injectionArmed
+        && content.toString().includes('"phase":"retained"')
+        && existsSync(paths.next)
+        && !existsSync(join(paths.next, "home-parent-witness.json"))) {
+        injectionArmed = true;
+      }
+    };
+    fsControl.openHook = (path, fd) => {
+      if (injectionArmed && !injectionOccurred && path === paths.next) {
+        const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+          operationId: string;
+          stagingName: string;
+        };
+        const staging = join(paths.home, journal.stagingName);
+        injectionOccurred = true;
+        retainedJournal(paths.home, paths.legacy, paths.next, staging, "retaining", staging, journal.operationId);
+        injectedJournal = readFileSync(journalPath, "utf8");
+        injectedFd = fd;
+        fsControl.openHook = undefined;
+      }
+    };
+    fsControl.closeHook = (_path, fd) => {
+      if (fd === injectedFd) injectedFdClosed = true;
+    };
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow(
+      "cannot refresh home parent witness while legacy migration is nonterminal",
+    );
+    expect(injectionArmed).toBe(true);
+    expect(injectionOccurred).toBe(true);
+    expect(injectedFd).toBeDefined();
+    expect(existsSync(join(paths.next, "home-parent-witness.json"))).toBe(false);
+    expect(readFileSync(journalPath, "utf8")).toBe(injectedJournal);
+    expect(JSON.parse(readFileSync(journalPath, "utf8"))).toMatchObject({ phase: "retaining" });
+    expect(injectedFdClosed).toBe(true);
+  });
+
   it("falls back to copy-and-remove for cross-device renames", () => {
     const paths = legacyHome();
     renameControl.error = Object.assign(new Error("cross-device"), { code: "EXDEV" });
@@ -828,7 +957,9 @@ describe("runtime home rename failures", () => {
   });
 
   it("continues when directory fsync is explicitly unsupported", () => {
-    const paths = legacyHome();
+    const parent = mkdtempSync(join(tmpdir(), "lcm-runtime-fsync-parent-"));
+    homes.push(parent);
+    const paths = legacyHome(parent);
     fsControl.fsyncError = Object.assign(new Error("directory sync unsupported"), { code: "EINVAL" });
 
     expect(migrateLegacyHomeIfNeeded(paths.home).migrated).toBe(true);
@@ -862,6 +993,23 @@ describe("runtime home rename failures", () => {
     fsControl.lstatErrorPath = paths.legacy;
 
     expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("synthetic lstat failure");
+  });
+
+  it("rejects a legacy directory whose owner is not trusted", () => {
+    const paths = legacyHome();
+    fsControl.fstatHook = (path, stat) => path === paths.legacy
+      ? Object.assign(stat as object, { uid: BigInt((process.getuid?.() ?? 0) + 1) })
+      : stat;
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("legacy LCM home is not a trusted directory");
+  });
+
+  it("rejects an unauthenticated coexistence of legacy and active roots", () => {
+    const paths = legacyHome();
+    mkdirSync(paths.next, { mode: 0o700 });
+
+    expect(() => migrateLegacyHomeIfNeeded(paths.home))
+      .toThrow("legacy and active LCM homes coexist without authenticated migration evidence");
   });
 
   it("preserves a root creation mkdir failure", () => {
@@ -931,8 +1079,38 @@ describe("runtime home rename failures", () => {
   it("accepts a root-owned sticky parent as an authenticated home parent", () => {
     const home = mkdtempSync("/tmp/lcm-runtime-sticky-parent-");
     homes.push(home);
+    processControl.procFiles.set("/proc/self/uid_map", "0 0 1\n");
+    fsControl.fstatHook = (path, stat) => path === "/tmp"
+      ? Object.assign(stat as object, { uid: 0n })
+      : stat;
+    fsControl.statHook = (path, stat) => path === "/tmp"
+      ? Object.assign(stat as object, { uid: 0n })
+      : stat;
 
     expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
+  });
+
+  it("propagates a non-missing parent witness read failure", () => {
+    const home = mkdtempSync("/tmp/lcm-runtime-parent-witness-error-");
+    homes.push(home);
+    processControl.procFiles.set("/proc/self/uid_map", "0 0 1\n");
+    processControl.witnessError = Object.assign(new Error("witness permission denied"), { code: "EACCES" });
+    fsControl.fstatHook = (path, stat) => path === "/tmp"
+      ? Object.assign(stat as object, { uid: 0n })
+      : stat;
+    fsControl.statHook = (path, stat) => path === "/tmp"
+      ? Object.assign(stat as object, { uid: 0n })
+      : stat;
+
+    expect(() => bootstrapLcmHome(home)).toThrow("witness permission denied");
+  });
+
+  it("fails closed when the authenticated parent mode is rejected", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-parent-mode-"));
+    homes.push(home);
+    homeParentControl.unsafeMode = true;
+
+    expect(() => bootstrapLcmHome(home)).toThrow("home parent has unsafe writable mode");
   });
 
   it("propagates a non-exclusive bootstrap-lock open failure", () => {
@@ -1024,6 +1202,17 @@ describe("runtime home rename failures", () => {
     writeFileSync(join(home, ".lcm-root-bootstrap.lock"), "another process\n", { mode: 0o600 });
 
     expect(() => bootstrapLcmHome(home)).toThrow("could not be authenticated");
+  });
+
+  it("reports contention for a bootstrap lock owned by a live process", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-lock-live-owner-"));
+    homes.push(home);
+    writeBootstrapLock(home, {
+      pid: process.pid,
+      processStartTime: processStartTime(),
+    });
+
+    expect(() => bootstrapLcmHome(home)).toThrow(BootstrapLockContentionError);
   });
 
   it("rejects a bootstrap lock with tampered owner metadata", () => {

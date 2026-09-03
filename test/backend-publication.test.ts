@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
@@ -2408,6 +2408,48 @@ describe("revocable mutation permits", () => {
       throw new Error("callback failed");
     })).toThrow("callback failed");
     expect(statSync(home).mode & 0o7777).toBe(0o755);
+  });
+
+  it("keeps the backend publication lock valid across unrelated sibling entry churn", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-consumer-ctime-churn-parent-"));
+    const home = join(parent, "home");
+    mkdirSync(home, { mode: 0o755 });
+    roots.push(parent);
+
+    const beforeParent = statSync(parent, { bigint: true });
+    const beforeHome = statSync(home, { bigint: true });
+    const parentCanonical = resolve(realpathSync(parent));
+    const homeCanonical = resolve(realpathSync(home));
+
+    withBackendPublicationConsumerLock(home, () => {
+      const sibling = join(parent, "unrelated-sibling");
+      mkdirSync(sibling, { mode: 0o700 });
+      rmSync(sibling, { recursive: true, force: true });
+
+      const afterParent = statSync(parent, { bigint: true });
+      const afterHome = statSync(home, { bigint: true });
+      expect(afterParent.dev).toBe(beforeParent.dev);
+      expect(afterParent.ino).toBe(beforeParent.ino);
+      expect(afterParent.uid).toBe(beforeParent.uid);
+      expect(afterParent.gid).toBe(beforeParent.gid);
+      expect(Number(afterParent.mode & 0o7777n)).toBe(Number(beforeParent.mode & 0o7777n));
+      expect(afterHome.dev).toBe(beforeHome.dev);
+      expect(afterHome.ino).toBe(beforeHome.ino);
+      expect(afterHome.uid).toBe(beforeHome.uid);
+      expect(afterHome.gid).toBe(beforeHome.gid);
+      expect(resolve(realpathSync(parent))).toBe(parentCanonical);
+      expect(resolve(realpathSync(home))).toBe(homeCanonical);
+    });
+
+    const topology = openHomeLockTopology(home);
+    try {
+      expect(() => assertHomeLockTopology({
+        ...topology,
+        parentMode: topology.parentMode ^ 0o001,
+      })).toThrow("topology changed during validation");
+    } finally {
+      closeHomeLockTopology(topology);
+    }
   });
 
   it("rejects unsafe or non-canonical HOME lock parents", () => {
