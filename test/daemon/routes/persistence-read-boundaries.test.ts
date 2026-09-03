@@ -193,9 +193,9 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { node: { id: "node" } });
     expect(mocks.projectClose).toHaveBeenCalled();
     expect(mocks.factoryClose).toHaveBeenCalled();
-    mocks.describe.mockRejectedValueOnce(new Error("describe broke"));
+    mocks.describe.mockRejectedValueOnce(new Error("SQLITE_CONSTRAINT at /private/describe.db"));
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
-    expectLast(200, { node: null, error: "describe broke" });
+    expectLast(200, { node: null, error: "database constraint error" });
     expect(mocks.projectClose).toHaveBeenCalled();
     mocks.describe.mockRejectedValueOnce("failure");
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
@@ -245,9 +245,9 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { expanded: null, error: "project not found" });
     await invoke(handler, { nodeId: "n", cwd: "/ok", depth: 3 });
     expect(mocks.expand).toHaveBeenLastCalledWith({ summaryIds: ["n"], maxDepth: 3 });
-    mocks.expand.mockRejectedValueOnce(new Error("expand broke"));
+    mocks.expand.mockRejectedValueOnce(new Error("expand failed at C:\\Users\\operator\\private.db"));
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
-    expectLast(200, { expanded: null, error: "expand broke" });
+    expectLast(200, { expanded: null, error: "expand failed at <path>" });
     expect(mocks.projectClose).toHaveBeenCalled();
     mocks.expand.mockRejectedValueOnce("failure");
     await invoke(handler, { nodeId: "n", cwd: "/ok" });

@@ -4,6 +4,7 @@ import type { RouteHandler } from "../server.js";
 import { createRetrievalEngine } from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
+import { sanitizeError } from "../safe-error.js";
 import {
   storageRouteFailureResponse,
   withProjectStorage,
@@ -46,7 +47,10 @@ export function createDescribeHandler(config: DaemonConfig, storageFactory?: Sto
         sendJson(res, storageFailure.status, storageFailure.body);
         return;
       }
-      sendJson(res, 200, { node: null, error: err instanceof Error ? err.message : "describe failed" });
+      sendJson(res, 200, {
+        node: null,
+        error: err instanceof Error ? sanitizeError(err.message) : "describe failed",
+      });
     }
   };
 }
