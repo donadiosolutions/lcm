@@ -2,20 +2,22 @@ import { spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
+  mkdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
   statSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { describe, expect, it } from "vitest";
-import { bootstrapLcmHome } from "../src/runtime-paths.js";
+import { namespaceUidForParentUid, parseHomeParentWitness, parseUidMap } from "../src/home-parent-auth.js";
 
 const enabled = process.platform === "linux"
   && process.env.LCM_RUNTIME_PATHS_SYSTEMD_INTEGRATION === "1";
 const sentinel = "LCM_RUNTIME_PATHS_SYSTEMD_SENTINEL=admitted";
 
 describe.runIf(enabled)("runtime paths user-systemd namespace integration", () => {
-  it("proves the constrained user-systemd path and performs real admission", () => {
+  it("bootstraps the constrained user-systemd path without a preseeded witness", () => {
     const runRoot = process.env.LCM_RUNTIME_PATHS_SYSTEMD_RUN_ROOT;
     if (runRoot === undefined || runRoot.length === 0) {
       throw new Error("runtime paths integration requires LCM_RUNTIME_PATHS_SYSTEMD_RUN_ROOT");
@@ -25,8 +27,17 @@ describe.runIf(enabled)("runtime paths user-systemd namespace integration", () =
       throw new Error("runtime paths integration setup failed: run root path is not canonical");
     }
     const rootStat = statSync(canonicalRoot);
-    expect(rootStat.uid, "run root must be owned by host root").toBe(0);
-    expect(rootStat.gid, "run root must be owned by host root group").toBe(0);
+    if (rootStat.uid !== 0 || rootStat.gid !== 0) {
+      // The harness itself may run inside a constrained user namespace; the
+      // host-root owner then appears as the kernel overflow identity with no
+      // root mapping. Any other owner is a setup failure.
+      const overflowUid = Number(readFileSync("/proc/sys/kernel/overflowuid", "utf8").trim());
+      const overflowGid = Number(readFileSync("/proc/sys/kernel/overflowgid", "utf8").trim());
+      const ranges = parseUidMap(readFileSync("/proc/self/uid_map", "utf8"));
+      expect(namespaceUidForParentUid(ranges, 0), "harness must not map host root").toBeUndefined();
+      expect(rootStat.uid, "run root must be owned by host root").toBe(overflowUid);
+      expect(rootStat.gid, "run root must be owned by host root group").toBe(overflowGid);
+    }
     expect(rootStat.mode & 0o7777, "run root must have exact mode 1777").toBe(0o1777);
 
     const home = mkdtempSync(join(canonicalRoot, "home-"));
@@ -34,13 +45,16 @@ describe.runIf(enabled)("runtime paths user-systemd namespace integration", () =
       expect(dirname(realpathSync(home))).toBe(canonicalRoot);
       expect(statSync(home).mode & 0o7777).toBe(0o700);
       expect(statSync(home).uid).toBe(process.getuid?.());
-      bootstrapLcmHome(home);
-      expect(existsSync(join(home, ".lcm", "home-parent-witness.json"))).toBe(true);
+      // The private root exists but no host context has minted a witness. The
+      // constrained child must bootstrap it through the user-manager host view.
+      mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+      const witnessFile = join(home, ".lcm", "home-parent-witness.json");
+      expect(existsSync(witnessFile), "witness must be absent before the child runs").toBe(false);
 
       const runtimePath = join(process.cwd(), "dist", "src", "runtime-paths.js");
       const authPath = join(process.cwd(), "dist", "src", "home-parent-auth.js");
       const child = [
-        "import { realpathSync, readFileSync, statSync } from 'node:fs';",
+        "import { existsSync, realpathSync, readFileSync, statSync } from 'node:fs';",
         "import { dirname } from 'node:path';",
         `import { parseUidMap, namespaceUidForParentUid } from ${JSON.stringify(`file://${authPath}`)};`,
         `const expectedSentinel = ${JSON.stringify(sentinel)};`,
@@ -56,8 +70,10 @@ describe.runIf(enabled)("runtime paths user-systemd namespace integration", () =
         "if (homeStat.uid !== process.getuid() || (homeStat.mode & 0o7777) !== 0o700) throw new Error('child HOME topology is invalid');",
         "const ranges = parseUidMap(readFileSync('/proc/self/uid_map', 'utf8'));",
         "if (namespaceUidForParentUid(ranges, 0) !== undefined) throw new Error('child root is mapped');",
+        "if (existsSync(home + '/.lcm/home-parent-witness.json')) throw new Error('child observed a preseeded witness');",
         `const runtime = await import(${JSON.stringify(`file://${runtimePath}`)});`,
         "runtime.migrateLegacyHomeIfNeeded(home);",
+        "if (!existsSync(home + '/.lcm/home-parent-witness.json')) throw new Error('child did not create the witness');",
         "process.stdout.write(expectedSentinel + '\\n');",
       ].join(" ");
       const result = spawnSync("systemd-run", [
@@ -75,6 +91,19 @@ describe.runIf(enabled)("runtime paths user-systemd namespace integration", () =
       expect(result.signal, "user-systemd child must not be signalled").toBeNull();
       expect(result.stderr, "user-systemd child stderr must be empty").toBe("");
       expect(result.stdout.trim(), "user-systemd child must emit one admission sentinel").toBe(sentinel);
+
+      const witnessStat = statSync(witnessFile);
+      expect(witnessStat.mode & 0o7777).toBe(0o600);
+      expect(witnessStat.uid).toBe(process.getuid?.());
+      const witness = parseHomeParentWitness(readFileSync(witnessFile, "utf8"));
+      const parentStat = statSync(canonicalRoot, { bigint: true });
+      expect(witness.homePath).toBe(home);
+      expect(witness.parentPath).toBe(canonicalRoot);
+      expect(witness.parentUid).toBe(0);
+      expect(witness.parentDev).toBe(String(parentStat.dev));
+      expect(witness.parentIno).toBe(String(parentStat.ino));
+      expect(witness.parentMode).toBe(0o1777);
+      expect(witness.parentCtimeNs).toBe(String(parentStat.ctimeNs));
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

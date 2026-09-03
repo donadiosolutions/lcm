@@ -210,7 +210,25 @@ integrity-checked historical evidence only when its parent appears as the
 kernel overflow UID and `/proc/self/uid_map` proves host UID 0 is unmapped.
 The canonical HOME and parent paths, device/inode identities, parent mode, and
 parent ctime must still match. Missing, malformed, unsafe, stale, or changed
-evidence fails closed; rerun `lcm install` once from a normal host context.
+evidence fails closed.
+
+When the witness is genuinely absent (no file at all), a constrained
+namespace can bootstrap it without a host-context install. LCM asks the
+per-user service manager, through the fixed `/usr/bin/systemd-run --user
+--wait --collect --pipe --quiet` launcher with no mount, PID, or system-scope
+properties, to run a bounded same-UID Node helper that opens the canonical
+HOME parent without following symlinks and reports its owner, identity, mode,
+ctime, and its own `/proc/self/uid_map`. The helper's TMPDIR is the
+authenticated HOME, never host `/tmp`. LCM accepts that evidence only when
+the helper's namespace maps UID 0 to host UID 0, the parent owner is UID 0,
+and the device, inode, mode, and ctime equal the caller's retained
+observation; it then records the witness under the normal publication locks.
+A missing user manager, timeout, signal, nonzero exit, any stderr output,
+malformed or non-canonical output, a non-root helper namespace, a non-root or
+overflow owner, or a topology mismatch fails closed. An existing witness that
+is malformed, unsafe, stale, or unreadable is never replaced through this
+helper; remove it deliberately or rerun `lcm install` from a normal host
+context.
 This witness is not a secret, MAC, or cryptographically unforgeable root
 credential. Same-UID processes remain outside the filesystem security boundary
 and can edit or delete the witness along with other runtime state.
