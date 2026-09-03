@@ -303,6 +303,94 @@ describe("prompt-search route coverage", () => {
     expect(projectClose).toHaveBeenCalledOnce();
   });
 
+  it("returns a cause-free 503 for PostgreSQL surfacing-log failure", async () => {
+    const failure = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      "/tmp",
+      "recall",
+      "logSurfacing",
+    );
+    state.searchResults = [result()];
+    state.logError = failure;
+    const postgres = config();
+    postgres.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://user:secret@db.example/lcm",
+        poolMax: 5,
+        connectionTimeoutMs: 10_000,
+        idleTimeoutMs: 30_000,
+        statementTimeoutMs: 60_000,
+      },
+    };
+    const output = response();
+
+    await createPromptSearchHandler(postgres)(
+      {} as never,
+      output.res,
+      JSON.stringify({ query: "q", cwd: "/tmp" }),
+    );
+
+    expect(output.status()).toBe(503);
+    expect(output.json()).toEqual(failure.toJSON());
+    expect(state.closed).toEqual(["project"]);
+    expect(state.factoryClosed).toBe(1);
+  });
+
+  it("keeps ordinary PostgreSQL surfacing-log failures best-effort", async () => {
+    state.searchResults = [result()];
+    state.logError = new Error("transient logging failure");
+    const postgres = config();
+    postgres.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://user:secret@db.example/lcm",
+        poolMax: 5,
+        connectionTimeoutMs: 10_000,
+        idleTimeoutMs: 30_000,
+        statementTimeoutMs: 60_000,
+      },
+    };
+    const output = response();
+
+    await createPromptSearchHandler(postgres)(
+      {} as never,
+      output.res,
+      JSON.stringify({ query: "q", cwd: "/tmp" }),
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({
+      hints: ["remember unique implementation decision memory-1"],
+      ids: ["memory-1"],
+    });
+  });
+
+  it("keeps typed SQLite surfacing-log failures best-effort", async () => {
+    state.searchResults = [result()];
+    state.logError = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "sqlite",
+      "/tmp",
+      "recall",
+      "logSurfacing",
+    );
+    const output = response();
+
+    await createPromptSearchHandler(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ query: "q", cwd: "/tmp" }),
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({
+      hints: ["remember unique implementation decision memory-1"],
+      ids: ["memory-1"],
+    });
+  });
+
   it("does not close a database when opening it fails", async () => {
     state.connectionError = new Error("open failed");
     expect(await call(JSON.stringify({ query: "q", cwd: "/tmp" }))).toEqual({ hints: [] });
