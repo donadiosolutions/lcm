@@ -3,6 +3,9 @@
  * internal file paths, stack traces, or database schema details.
  */
 const PATH_WORD_PATTERN = /^[\p{L}\p{N}\p{M}]$/u;
+const URL_SCHEME_START_PATTERN = /^[A-Za-z]$/u;
+const URL_SCHEME_CHARACTER_PATTERN = /^[A-Za-z\d+.-]$/u;
+const WHITESPACE_PATTERN = /\s/u;
 const PATH_DELIMITERS = new Set(["#", "&", "=", "|", ",", ";", ":", "!", "?", ")", "]", "}", "'", '"', "<", ">"]);
 
 function isPathWord(char: string | undefined): boolean {
@@ -14,18 +17,44 @@ function isFileUrlPathStart(chars: readonly string[], index: number): boolean {
   return prefix.endsWith("file://") || prefix.endsWith("file://localhost");
 }
 
-function isUrlAuthorityPathStart(chars: readonly string[], index: number): boolean {
-  let start = index - 1;
-  while (start >= 0 && !/\s/u.test(chars[start])) start -= 1;
-  const authority = chars.slice(start + 1, index).join("");
-  const separator = authority.indexOf("://");
-  return separator > 0 && /^[A-Za-z][A-Za-z\d+.-]*$/u.test(authority.slice(0, separator));
+function findUrlAuthorityPathStarts(chars: readonly string[]): Uint8Array {
+  const pathStarts = new Uint8Array(chars.length);
+  let tokenStart = 0;
+  let schemeCandidate = true;
+  let separator = -1;
+  let validScheme = false;
+
+  for (let index = 0; index < chars.length; index += 1) {
+    const char = chars[index];
+    if (WHITESPACE_PATTERN.test(char)) {
+      tokenStart = index + 1;
+      schemeCandidate = true;
+      separator = -1;
+      validScheme = false;
+      continue;
+    }
+    if (separator < 0) {
+      if (char === ":" && chars[index + 1] === "/" && chars[index + 2] === "/") {
+        separator = index;
+        validScheme = index > tokenStart && schemeCandidate;
+        continue;
+      }
+      const schemeCharacter = index === tokenStart
+        ? URL_SCHEME_START_PATTERN.test(char)
+        : URL_SCHEME_CHARACTER_PATTERN.test(char);
+      schemeCandidate &&= schemeCharacter;
+      continue;
+    }
+    if (validScheme && char === "/" && index > separator + 2) pathStarts[index] = 1;
+  }
+
+  return pathStarts;
 }
 
-function isPosixPathStart(chars: readonly string[], index: number): boolean {
+function isPosixPathStart(chars: readonly string[], index: number, urlAuthorityPathStarts: Uint8Array): boolean {
   if (chars[index] !== "/" || chars[index + 1] === "/") return false;
   if (isFileUrlPathStart(chars, index)) return true;
-  if (isUrlAuthorityPathStart(chars, index)) return false;
+  if (urlAuthorityPathStarts[index] === 1) return false;
   const previous = chars[index - 1];
   return previous === undefined || (!isPathWord(previous) && previous !== "/");
 }
@@ -88,20 +117,20 @@ function scanAbsolutePath(chars: readonly string[], start: number, windows: bool
       continue;
     }
     if (char === " " || char === "\t" || char === "\n" || char === "\r" || PATH_DELIMITERS.has(char)) break;
-    if (char === "[") { index += 1; continue; }
     index += 1;
   }
-  return sawPathCharacter ? index : start;
+  return index;
 }
 
 function sanitizeAbsolutePaths(message: string): string {
   const chars = Array.from(message);
+  const urlAuthorityPathStarts = findUrlAuthorityPathStarts(chars);
   const sanitized: string[] = [];
   for (let index = 0; index < chars.length;) {
     const quote = chars[index] === "'" || chars[index] === '"' ? chars[index] : undefined;
     const start = quote === undefined ? index : index + 1;
     const windows = isWindowsDrivePathStart(chars, start) || isUncPathStart(chars, start);
-    const posix = isPosixPathStart(chars, start);
+    const posix = isPosixPathStart(chars, start, urlAuthorityPathStarts);
     if (!windows && !posix) {
       sanitized.push(chars[index]);
       index += 1;

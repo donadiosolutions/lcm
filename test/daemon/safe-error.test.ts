@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { sanitizeError } from "../../src/daemon/safe-error.js";
 
 describe("sanitizeError", () => {
@@ -59,8 +59,31 @@ describe("sanitizeError", () => {
     ["file://localhost/Users/pedro/secret.db", "file://localhost<path>"],
     ["https://[::1]/secret", "https://[::1]/secret"],
     ["/tmp/file[1].txt", "<path>"],
+    ["open /tmp/💥payload failed", "open <path> failed"],
+    ["open '/tmp/file\nfailed", "open '<path>\nfailed"],
   ] as const)("sanitizes adversarial path form %#", (input, expected) => {
     expect(sanitizeError(input)).toBe(expected);
+  });
+
+  it("bounds URL authority classification work by input length", () => {
+    const path = Array.from({ length: 128 }, (_, index) => `segment-${index}`).join("/");
+    const input = `request failed for https://example.test/${path}`;
+    const originalTest = RegExp.prototype.test;
+    let whitespaceChecks = 0;
+    const testSpy = vi.spyOn(RegExp.prototype, "test").mockImplementation(function (value: string): boolean {
+      if (this.source === "\\s" && this.flags === "u") whitespaceChecks += 1;
+      return Reflect.apply(originalTest, this, [value]);
+    });
+
+    let result: string;
+    try {
+      result = sanitizeError(input);
+    } finally {
+      testSpy.mockRestore();
+    }
+
+    expect(result).toBe(input);
+    expect(whitespaceChecks).toBeLessThanOrEqual(Array.from(input).length);
   });
 
   it("replaces SQLite constraint details with generic message", () => {
