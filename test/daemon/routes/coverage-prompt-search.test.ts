@@ -367,6 +367,41 @@ describe("prompt-search route coverage", () => {
     });
   });
 
+  it("keeps mismatched typed PostgreSQL surfacing-log failures best-effort", async () => {
+    state.searchResults = [result()];
+    state.logError = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "sqlite",
+      "/tmp",
+      "recall",
+      "logSurfacing",
+    );
+    const postgres = config();
+    postgres.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://user:secret@db.example/lcm",
+        poolMax: 5,
+        connectionTimeoutMs: 10_000,
+        idleTimeoutMs: 30_000,
+        statementTimeoutMs: 60_000,
+      },
+    };
+    const output = response();
+
+    await createPromptSearchHandler(postgres)(
+      {} as never,
+      output.res,
+      JSON.stringify({ query: "q", cwd: "/tmp" }),
+    );
+
+    expect(output.status()).toBe(200);
+    expect(output.json()).toEqual({
+      hints: ["remember unique implementation decision memory-1"],
+      ids: ["memory-1"],
+    });
+  });
+
   it("keeps typed SQLite surfacing-log failures best-effort", async () => {
     state.searchResults = [result()];
     state.logError = new StorageOperationError(

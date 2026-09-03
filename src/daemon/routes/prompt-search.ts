@@ -331,7 +331,11 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
               await project.recall.logSurfacing(ids, session_id ?? null);
             }
           } catch (error) {
-            if (config.storage.backend === "postgresql" && error instanceof StorageOperationError) {
+            if (
+              config.storage.backend === "postgresql"
+              && error instanceof StorageOperationError
+              && error.backend === config.storage.backend
+            ) {
               throw error;
             }
             // SQLite and ordinary failures remain best-effort.
