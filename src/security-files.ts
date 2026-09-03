@@ -1031,8 +1031,6 @@ export type DurablePrivateWriteOptions = Readonly<{
   expectedUid?: number;
   /** Require the destination to be absent rather than replacing it. */
   requireAbsent?: boolean;
-  /** Bind replacement to the content observed by the caller while locked. */
-  expectedContentSha256?: string | null;
   /** Bound the precondition read independently of the replacement size. */
   maxExistingBytes?: number;
   /** Authenticated owner-only mode to place on the temporary descriptor before publication. */
@@ -1041,24 +1039,28 @@ export type DurablePrivateWriteOptions = Readonly<{
   random?: (size: number) => Buffer;
 }>;
 
-function sha256Bytes(value: string | Uint8Array): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
 /**
  * Publish a bounded private file durably in one directory.
  *
  * The parent is retained and revalidated for the complete operation.  The
  * temporary inode is fully written, mode-tightened, and fsynced before it is
- * linked or renamed into place; the parent is then fsynced as well.  Callers
- * that replace an existing file should supply the hash observed under their
- * mutation lock so an external edit fails closed before publication.
+ * linked or renamed into place; the parent is then fsynced as well.
+ * `requireAbsent` uses an exclusive hard link for portable no-clobber create.
+ * Without it, publication is an unconditional same-directory rename after
+ * the bounded existing-file safety preflight.  Parent and leaf checks reject
+ * observed unsafe state but are not descriptor-relative mutation and cannot
+ * close a same-UID substitution after the final check.  Application locks
+ * serialize cooperating LCM writers only; callers needing conditional
+ * replacement must own a protocol-specific operation and recovery grammar.
  */
 export function atomicWritePrivateFileDurable(
   path: string,
   content: string | Uint8Array,
   options: DurablePrivateWriteOptions = {},
 ): void {
+  if (Object.hasOwn(options, "expectedContentSha256")) {
+    throw new Error("conditional durable replacement is unsupported; use a protocol-specific operation");
+  }
   const finalMode = options.finalMode ?? PRIVATE_FILE_MODE;
   if (!isOwnerOnlyFileMode(finalMode)) {
     throw new Error("private durable publication mode must be owner-only");
@@ -1070,27 +1072,22 @@ export function atomicWritePrivateFileDurable(
     dev: BigInt(parent.witness.dev),
     ino: BigInt(parent.witness.ino),
   };
-  const expected = options.expectedContentSha256;
   const current = (() => {
     try {
-      const observed = readBoundedRegularFileWithStat(path, {
+      readBoundedRegularFileWithStat(path, {
         allowedRoot: directory,
         maxBytes: options.maxExistingBytes ?? Math.max(Buffer.byteLength(content), 1) + 1,
         expectedUid,
         allowedModes: OWNER_ONLY_FILE_MODES,
         requireSingleLink: true,
       });
-      return sha256Bytes(observed.content);
+      return true;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
       throw error;
     }
   })();
-  if (expected !== undefined && current !== expected) {
-    parent.close();
-    throw new Error("private file changed before durable publication");
-  }
-  if (options.requireAbsent && current !== null) {
+  if (options.requireAbsent && current) {
     parent.close();
     throw new Error("private file already exists");
   }

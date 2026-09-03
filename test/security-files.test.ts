@@ -569,7 +569,42 @@ describe("private filesystem primitives", () => {
     expect(() => openPrivateDirectory(path)).toThrow();
   });
 
-  it("durably publishes an exclusive file and binds replacements to their observed bytes", () => {
+  it("rejects legacy conditional publication before a pathname replacement can be overwritten", () => {
+    const root = makeRoot();
+    const path = join(root, "durable.json");
+    const initial = "initial\n";
+    const candidate = "candidate\n";
+    writeFileSync(path, initial, { mode: 0o600 });
+    const initialStat = lstatSync(path);
+    const expectedContentSha256 = createHash("sha256").update(initial).digest("hex");
+    const temporaryPath = join(root, `.durable.json.${"11".repeat(12)}.tmp`);
+    let renameCalls = 0;
+    const originalRename = renameSync;
+
+    expect(() => withPatchedFs(
+      "renameSync",
+      ((from: string, to: string) => {
+        renameCalls += 1;
+        expect(to).toBe(path);
+        unlinkSync(path);
+        writeFileSync(path, "same-uid replacement\n", { mode: 0o600 });
+        return originalRename(from, to);
+      }) as typeof renameSync,
+      () => atomicWritePrivateFileDurable(path, candidate, {
+        expectedContentSha256,
+        random: () => Buffer.alloc(12, 0x11),
+      } as never),
+    )).toThrow("conditional durable replacement is unsupported; use a protocol-specific operation");
+
+    expect(renameCalls).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe(initial);
+    const finalStat = lstatSync(path);
+    expect(finalStat.dev).toBe(initialStat.dev);
+    expect(finalStat.ino).toBe(initialStat.ino);
+    expect(existsSync(temporaryPath)).toBe(false);
+  });
+
+  it("durably publishes an exclusive file and rejects legacy conditional options", () => {
     const root = makeRoot();
     const path = join(root, "durable.json");
     atomicWritePrivateFileDurable(path, "first", { requireAbsent: true });
@@ -577,15 +612,16 @@ describe("private filesystem primitives", () => {
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(() => atomicWritePrivateFileDurable(path, "second", { requireAbsent: true }))
       .toThrow("already exists");
-    expect(() => atomicWritePrivateFileDurable(path, "second", {
-      expectedContentSha256: "0".repeat(64),
-    })).toThrow("changed before");
-
     const digest = createHash("sha256").update("first").digest("hex");
-    atomicWritePrivateFileDurable(path, "second", { expectedContentSha256: digest });
+    for (const expectedContentSha256 of [digest, "0".repeat(64), null, undefined]) {
+      expect(() => atomicWritePrivateFileDurable(path, "second", {
+        expectedContentSha256,
+      } as never)).toThrow("conditional durable replacement is unsupported; use a protocol-specific operation");
+      expect(readFileSync(path, "utf8")).toBe("first");
+    }
+    atomicWritePrivateFileDurable(path, "second");
     expect(readFileSync(path, "utf8")).toBe("second");
     expect(() => atomicWritePrivateFileDurable(path, "third", {
-      expectedContentSha256: digest,
       maxExistingBytes: 1,
     })).toThrow();
   });
