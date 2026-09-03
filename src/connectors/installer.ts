@@ -3,15 +3,12 @@ import {
   constants,
   existsSync,
   fstatSync,
-  ftruncateSync,
   lstatSync,
   mkdirSync,
   openSync,
   realpathSync,
   readSync,
   readlinkSync,
-  unlinkSync,
-  writeSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -29,6 +26,14 @@ import {
   mergeCodexHooksContent,
   removeCodexHooksContent,
   setCodexHooksFeature,
+  captureConnectorLeaf,
+  mutateConnectorLeaf,
+  compensateConnectorLeaf,
+  finalizeConnectorLeaf,
+  type ConnectorLeafDecision,
+  type ConnectorLeafObservation,
+  type ConnectorLeafReceipt,
+  type ConnectorLeafMutationResult,
 } from "./codex-hooks.js";
 import {
   canonicalHookCommand,
@@ -458,6 +463,7 @@ function withoutManagedSkillMarker(content: string): string {
 }
 
 function isOwnedSkill(content: Buffer, generated: string | readonly string[]): boolean {
+  if (content.length === 0) return true;
   const generatedContents = typeof generated === "string" ? [generated] : generated;
   const generatedBuffers = generatedContents.flatMap((candidate) => [
     Buffer.from(candidate, 'utf-8'),
@@ -482,6 +488,18 @@ type MutationTargetSpec = Readonly<{
 
 type RootHandle = Readonly<{ rootPath: string; canonicalPath: string; fd: number }>;
 
+type AbsentOwnedFileSnapshot = Readonly<{ path: string; state: "absent" }>;
+type NonFileOwnedFileSnapshot = Readonly<{ path: string; state: "non-file" }>;
+type RegularOwnedFileSnapshot = Readonly<{
+  path: string;
+  state: "regular";
+  content: Buffer;
+  mode: number;
+  dev: number | bigint;
+  ino: number | bigint;
+}>;
+type OwnedFileSnapshot = AbsentOwnedFileSnapshot | NonFileOwnedFileSnapshot | RegularOwnedFileSnapshot;
+
 /**
  * Linux-only authority for connector mutations. Descendants are addressed
  * through retained directory descriptors in /proc; ordinary display paths
@@ -490,9 +508,14 @@ type RootHandle = Readonly<{ rootPath: string; canonicalPath: string; fd: number
 class ConnectorMutationAuthority {
   private readonly roots = new Map<string, RootHandle>();
   private readonly operations = new Map<string, string>();
+  private readonly parentOperations = new Map<string, string>();
   private readonly procDisplays = new Map<string, string>();
   private readonly absent = new Set<string>();
   private readonly descriptors: number[] = [];
+  readonly snapshots = new Map<string, OwnedFileSnapshot>();
+  readonly receipts = new Map<string, ConnectorLeafReceipt>();
+  private readonly failureEvidence = new Map<string, unknown>();
+  private readonly mutationOrder: string[] = [];
 
   constructor(targets: readonly MutationTargetSpec[]) {
     try {
@@ -522,7 +545,7 @@ class ConnectorMutationAuthority {
   private withDisplay(error: unknown, displayPath: string): Error {
     const sanitized = this.displayError(error).message;
     const message = sanitized.includes(displayPath) ? sanitized : `${sanitized} at ${displayPath}`;
-    const wrapped = new Error(message, { cause: error });
+    const wrapped = new Error(message);
     const code = (error as NodeJS.ErrnoException)?.code;
     if (typeof code === "string") Object.assign(wrapped, { code });
     return wrapped;
@@ -685,6 +708,7 @@ class ConnectorMutationAuthority {
     }
     const leaf = parts.at(-1)!;
     this.operations.set(target.displayPath, this.childPath(fd, leaf, target.displayPath));
+    this.parentOperations.set(target.displayPath, `/proc/self/fd/${fd}`);
   }
 
   operationPath(displayPath: string): string {
@@ -700,6 +724,95 @@ class ConnectorMutationAuthority {
     return this.operations.has(displayPath);
   }
 
+  private recordReceipt(displayPath: string, receipt: ConnectorLeafReceipt): void {
+    if (!this.receipts.has(displayPath)) this.mutationOrder.push(displayPath);
+    this.receipts.set(displayPath, receipt);
+  }
+
+  mutate(displayPath: string, decide: (base: ConnectorLeafObservation) => ConnectorLeafDecision): ConnectorLeafMutationResult {
+    const operationPath = this.operationPath(displayPath);
+    const parentOperationPath = this.parentOperations.get(displayPath);
+    if (!parentOperationPath) throw new Error(`Unmapped connector mutation parent ${displayPath}`);
+    const prior = this.receipts.get(displayPath);
+    const expected = prior?.current ?? (() => {
+      const snapshot = this.snapshots.get(displayPath);
+      if (!snapshot || snapshot.state === "non-file") throw skillCollision(displayPath);
+      if (snapshot.state === "absent") return { state: "absent" as const };
+      return Object.freeze({
+        state: "regular" as const,
+        sha256: createHash("sha256").update(snapshot.content).digest("hex"),
+        size: snapshot.content.length,
+        mode: snapshot.mode & 0o7777,
+        dev: BigInt(snapshot.dev).toString(10),
+        ino: BigInt(snapshot.ino).toString(10),
+      });
+    })();
+    let result: ConnectorLeafMutationResult;
+    try {
+      result = mutateConnectorLeaf({
+        displayPath,
+        operationPath,
+        parentOperationPath,
+        expected,
+        decide,
+      }, prior);
+    } catch (error) {
+      const receipt = (error as Error & { connectorLeafReceipt?: ConnectorLeafReceipt }).connectorLeafReceipt;
+      if (receipt?.mutationCommitted) this.recordReceipt(displayPath, receipt);
+      const failureEvidence = (error as Error & { connectorLeafFailureEvidence?: unknown }).connectorLeafFailureEvidence;
+      if (failureEvidence) this.failureEvidence.set(displayPath, failureEvidence);
+      throw error;
+    }
+    if (result.changed) this.recordReceipt(displayPath, result.receipt);
+    return result;
+  }
+
+  registerSnapshots(snapshots: readonly OwnedFileSnapshot[]): void {
+    for (const snapshot of snapshots) {
+      if (snapshot.state === "regular") {
+        this.snapshots.set(snapshot.path, Object.freeze({
+          ...snapshot,
+          content: Buffer.from(snapshot.content),
+          mode: snapshot.mode & 0o7777,
+          dev: typeof snapshot.dev === "bigint" ? BigInt(snapshot.dev) : Number(snapshot.dev),
+          ino: typeof snapshot.ino === "bigint" ? BigInt(snapshot.ino) : Number(snapshot.ino),
+        }));
+      } else {
+        this.snapshots.set(snapshot.path, Object.freeze({ ...snapshot }));
+      }
+    }
+  }
+
+  hasMutations(): boolean {
+    return this.receipts.size > 0;
+  }
+
+  compensateOwnedFiles(): string[] {
+    const failures: string[] = [];
+    const compensated: ConnectorLeafReceipt[] = [];
+    for (const path of [...this.mutationOrder].reverse()) {
+      const receipt = this.receipts.get(path);
+      if (!receipt) continue;
+      const receiptFailures = compensateConnectorLeaf(receipt);
+      if (receiptFailures.failures.length > 0) failures.push(...receiptFailures.failures);
+      else compensated.push(receiptFailures.receipt);
+    }
+    for (const receipt of compensated) {
+      const cleanupResult = finalizeConnectorLeaf(receipt);
+      failures.push(...cleanupResult.failures.map((failure) => `compensated receipt finalization: ${failure}`));
+    }
+    return failures;
+  }
+
+  finalizeOwnedFiles(): string[] {
+    const failures: string[] = [];
+    for (const path of this.mutationOrder) {
+      const receipt = this.receipts.get(path);
+      if (receipt) failures.push(...finalizeConnectorLeaf(receipt).failures);
+    }
+    return failures;
+  }
+
   displayError(error: unknown): Error {
     const message = error instanceof Error ? error.message : String(error);
     let sanitized = message;
@@ -708,8 +821,9 @@ class ConnectorMutationAuthority {
     for (const [operationPath, displayPath] of [...mappings.entries()].sort(([left], [right]) => right.length - left.length)) {
       sanitized = sanitized.replaceAll(operationPath, displayPath);
     }
+    sanitized = sanitized.replaceAll(/\/proc\/self\/fd\/\d+(?:\/[^\s;,)]+)*/gu, "connector recovery path");
     if (!(error instanceof Error)) return new Error(sanitized);
-    const wrapped = new Error(sanitized, { cause: error });
+    const wrapped = new Error(sanitized);
     const code = (error as NodeJS.ErrnoException).code;
     if (typeof code === "string") Object.assign(wrapped, { code });
     return wrapped;
@@ -736,7 +850,10 @@ function withMutationAuthority<T>(targets: readonly MutationTargetSpec[], callba
   const prior = activeMutationAuthority;
   activeMutationAuthority = authority;
   try {
-    return callback();
+    const result = callback();
+    const cleanupFailures = authority.finalizeOwnedFiles();
+    if (cleanupFailures.length > 0) throw new Error(`connector cleanup incomplete (${cleanupFailures.join("; ")})`);
+    return result;
   } catch (error) {
     throw authority.displayError(error);
   } finally {
@@ -745,12 +862,9 @@ function withMutationAuthority<T>(targets: readonly MutationTargetSpec[], callba
   }
 }
 
-function openNoFollow(filePath: string, flags: number, mode?: number): number {
+function openNoFollow(filePath: string, flags: number): number {
   const safeFlags = flags | NO_FOLLOW_FLAGS;
-  const operationPath = ioPath(filePath);
-  return mode === undefined
-    ? openSync(operationPath, safeFlags)
-    : openSync(operationPath, safeFlags, mode);
+  return openSync(ioPath(filePath), safeFlags);
 }
 
 function openNoFollowUnmapped(filePath: string, flags: number): number {
@@ -767,6 +881,9 @@ function descriptorStats(descriptor: number, filePath: string): ReturnType<typeo
 function readDescriptor(descriptor: number, filePath: string): Buffer {
   const stats = descriptorStats(descriptor, filePath);
   const size = Number(stats.size);
+  if (size > 4 * 1024 * 1024) {
+    throw new Error(`Refusing to read LCM file larger than 4 MiB at ${filePath}`);
+  }
   if (!Number.isSafeInteger(size) || size < 0) {
     throw new Error(`Unable to read LCM file at ${filePath}: invalid file size`);
   }
@@ -774,20 +891,15 @@ function readDescriptor(descriptor: number, filePath: string): Buffer {
   let offset = 0;
   while (offset < size) {
     const bytesRead = readSync(descriptor, content, offset, size - offset, offset);
-    if (bytesRead === 0) break;
+    if (bytesRead === 0) throw new Error(`Unable to read LCM file at ${filePath}: short read`);
     offset += bytesRead;
   }
-  return offset === size ? content : content.subarray(0, offset);
-}
-
-function writeDescriptor(descriptor: number, content: Buffer): void {
-  ftruncateSync(descriptor, 0);
-  let offset = 0;
-  while (offset < content.length) {
-    const bytesWritten = writeSync(descriptor, content, offset, content.length - offset, offset);
-    if (bytesWritten <= 0) throw new Error("LCM connector write made no progress");
-    offset += bytesWritten;
+  const after = fstatSync(descriptor);
+  if (!after.isFile() || Number(after.size) !== size || after.dev !== stats.dev || after.ino !== stats.ino
+    || (Number(after.mode) & 0o7777) !== (Number(stats.mode) & 0o7777)) {
+    throw new Error(`Unable to read LCM file at ${filePath}: file changed while being read`);
   }
+  return content;
 }
 
 function readRegularFileNoFollow(filePath: string): Buffer {
@@ -808,74 +920,25 @@ function readOptionalRegularFileNoFollow(filePath: string): Buffer | undefined {
   }
 }
 
-function writeRegularFileNoFollow(filePath: string, content: Buffer, mode = 0o666): Buffer {
-  const descriptor = openNoFollow(filePath, constants.O_RDWR | constants.O_CREAT, mode);
-  try {
-    descriptorStats(descriptor, filePath);
-    writeDescriptor(descriptor, content);
-    return readDescriptor(descriptor, filePath);
-  } finally {
-    closeSync(descriptor);
-  }
-}
-
 function updateRegularFileNoFollow(
   filePath: string,
   update: (existing: Buffer, created: boolean) => Buffer | undefined,
   mode = 0o666,
   create = true,
 ): Buffer {
-  let descriptor: number;
-  let created = false;
-  if (create) {
-    try {
-      descriptor = openNoFollow(filePath, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL, mode);
-      created = true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      descriptor = openNoFollow(filePath, constants.O_RDWR);
-    }
-  } else {
-    descriptor = openNoFollow(filePath, constants.O_RDWR);
+  const snapshot = activeMutationAuthority!.snapshots?.get(filePath);
+  if (!create && snapshot?.state === "absent" && !activeMutationAuthority!.receipts?.has(filePath)) {
+    throw Object.assign(new Error(`Connector mutation target is absent: ${filePath}`), { code: "ENOENT" });
   }
-  try {
-    descriptorStats(descriptor, filePath);
-    const existing = readDescriptor(descriptor, filePath);
-    const updated = update(existing, created);
-    if (updated === undefined) return existing;
-    writeDescriptor(descriptor, updated);
-    return readDescriptor(descriptor, filePath);
-  } finally {
-    closeSync(descriptor);
-  }
-}
-
-function pathStillIdentifiesDescriptor(filePath: string, stats: ReturnType<typeof fstatSync>): boolean {
-  try {
-    const current = lstatSync(ioPath(filePath));
-    return current.isFile() && current.dev === stats.dev && current.ino === stats.ino;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
-  }
-}
-
-function unlinkRegularFileNoFollow(filePath: string): boolean {
-  let descriptor: number;
-  try {
-    descriptor = openNoFollow(filePath, constants.O_RDONLY);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
-  }
-  try {
-    const stats = descriptorStats(descriptor, filePath);
-    if (!pathStillIdentifiesDescriptor(filePath, stats)) return false;
-    unlinkSync(ioPath(filePath));
-    return true;
-  } finally {
-    closeSync(descriptor);
-  }
+  let resultContent: Buffer | undefined;
+  const result = activeMutationAuthority!.mutate(filePath, (base) => {
+    const existing = base.state === "regular" ? Buffer.from(base.content) : Buffer.alloc(0);
+    const updated = update(existing, base.state === "absent");
+    resultContent = updated ? Buffer.from(updated) : existing;
+    if (updated === undefined) return { state: "unchanged" };
+    return { state: "regular", content: Buffer.from(updated), mode: base.state === "regular" ? base.certificate.mode : mode };
+  });
+  return resultContent ?? result.content ?? Buffer.alloc(0);
 }
 
 function preflightSkill(filePath: string, generated: string): void {
@@ -883,7 +946,7 @@ function preflightSkill(filePath: string, generated: string): void {
   try {
     existing = readOptionalRegularFileNoFollow(filePath);
   } catch (error) {
-    if (["ELOOP", "EISDIR", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+    if (["ELOOP", "EISDIR", "ENOTDIR", "ENOENT", "EAGAIN"].includes((error as NodeJS.ErrnoException).code ?? "")) {
       throw skillCollision(filePath);
     }
     const code = (error as NodeJS.ErrnoException).code;
@@ -896,48 +959,48 @@ function preflightSkill(filePath: string, generated: string): void {
 function installSkill(content: string, filePath: string): void {
   preflightSkill(filePath, content);
   const expected = Buffer.from(managedSkillContent(content), 'utf-8');
-  let descriptor: number | undefined;
-  let created = false;
   try {
-    try {
-      descriptor = openNoFollow(
-        filePath,
-        constants.O_RDWR | constants.O_CREAT | constants.O_EXCL,
-        0o666,
-      );
-      created = true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      descriptor = openNoFollow(filePath, constants.O_RDWR);
-    }
-    descriptorStats(descriptor, filePath);
-    if (!created) {
-      const existing = readDescriptor(descriptor, filePath);
-      if (!isOwnedSkill(existing, content)) throw skillCollision(filePath);
-      if (existing.equals(expected)) return;
-    }
-    writeDescriptor(descriptor, expected);
-    if (!pathStillIdentifiesDescriptor(filePath, fstatSync(descriptor))) {
-      throw new Error(`Installed LCM skill path changed during ownership verification at ${filePath}`);
-    }
-    if (!readDescriptor(descriptor, filePath).equals(expected)) {
-      throw new Error(`Installed LCM skill failed ownership verification at ${filePath}`);
-    }
+    activeMutationAuthority!.mutate(filePath, (base) => {
+      if (base.state === "regular") {
+        if (!isOwnedSkill(base.content, content)) throw skillCollision(filePath);
+        if (base.content.equals(expected)) return { state: "unchanged" };
+        return { state: "regular", content: expected, mode: base.certificate.mode };
+      }
+      return { state: "regular", content: expected, mode: 0o666 };
+    });
   } catch (error) {
     if (["ELOOP", "EISDIR", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
       throw skillCollision(filePath);
     }
     throw error;
-  } finally {
-    if (descriptor !== undefined) closeSync(descriptor);
   }
 }
 
 function removeSkill(filePath: string, generated: string | readonly string[], strict = false): boolean {
-  let descriptor: number;
   try {
-    descriptor = openNoFollow(filePath, constants.O_RDONLY);
+    const snapshot = activeMutationAuthority!.snapshots?.get(filePath);
+    if (!snapshot || snapshot.state === "absent") return false;
+    const result = activeMutationAuthority!.mutate(filePath, (base) => {
+      if (base.state !== "regular" || base.content.length === 0) return { state: "unchanged" };
+      if (!isOwnedSkill(base.content, generated)) {
+        if (strict) throw new Error(`Refusing to remove an unowned LCM skill at ${filePath}`);
+        return { state: "unchanged" };
+      }
+      return { state: "absent" };
+    });
+    return result.changed;
   } catch (error) {
+    if (!strict && (error as NodeJS.ErrnoException).code === "EAGAIN") return false;
+    if (error instanceof Error && error.message.startsWith("Refusing to overwrite an unowned LCM skill")) {
+      if (strict) throw error;
+      return false;
+    }
+    if (error instanceof Error && error.message.startsWith("Refusing to remove an unowned LCM skill")) {
+      // This diagnostic is emitted only by the strict callback branch above;
+      // a compatibility removal cannot produce it. Preserve the strict
+      // refusal without retaining an unreachable compatibility arm.
+      throw error;
+    }
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     if (["ELOOP", "EISDIR", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
       if (strict) throw skillCollision(filePath);
@@ -945,33 +1008,6 @@ function removeSkill(filePath: string, generated: string | readonly string[], st
     }
     const code = (error as NodeJS.ErrnoException).code;
     throw new Error(`Unable to inspect LCM skill at ${filePath}${typeof code === "string" ? `: ${code}` : ""}`, { cause: error });
-  }
-  try {
-    let stats: ReturnType<typeof fstatSync>;
-    try {
-      stats = descriptorStats(descriptor, filePath);
-    } catch (error) {
-      if (!strict && error instanceof Error && error.message.startsWith("Refusing to overwrite an unowned LCM skill")) {
-        return false;
-      }
-      throw error;
-    }
-    const content = readDescriptor(descriptor, filePath);
-    if (!isOwnedSkill(content, generated)) {
-      if (strict) throw new Error(`Refusing to remove an unowned LCM skill at ${filePath}`);
-      return false;
-    }
-    if (!pathStillIdentifiesDescriptor(filePath, stats)) {
-      if (strict) throw new Error(`Refusing to remove a changed LCM skill at ${filePath}`);
-      return false;
-    }
-    unlinkSync(ioPath(filePath));
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
-  } finally {
-    closeSync(descriptor);
   }
 }
 
@@ -997,7 +1033,7 @@ function installMcpJson(filePath: string, strict = false): void {
   let changed = false;
   const verifiedBytes = updateRegularFileNoFollow(filePath, (existingBytes, created) => {
     let existing: Record<string, unknown> = {};
-    if (!created) {
+    if (!created && existingBytes.length > 0) {
       try {
         existing = parseJsonObject(filePath, existingBytes);
       } catch (error) {
@@ -1022,10 +1058,7 @@ function installMcpJson(filePath: string, strict = false): void {
     return Buffer.from(JSON.stringify(existing, null, 2) + '\n', 'utf-8');
   });
   if (!changed) return;
-  const verified = parseJsonObject(filePath, verifiedBytes);
-  if (!isOwnedMcpEntry(verified.mcpServers && (verified.mcpServers as Record<string, unknown>).lcm)) {
-    throw new Error(`Installed MCP entry failed ownership verification at ${filePath}`);
-  }
+  parseJsonObject(filePath, verifiedBytes);
 }
 
 function removeMcpJson(filePath: string, strict = false): boolean {
@@ -1062,6 +1095,7 @@ function removeMcpJson(filePath: string, strict = false): boolean {
     }, 0o666, false);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    if (!strict && ((error as NodeJS.ErrnoException).code === "EAGAIN")) return false;
     throw error;
   }
   return removed;
@@ -1089,7 +1123,7 @@ function readJsonObject(filePath: string): Record<string, unknown> {
   return parseJsonObject(filePath, readRegularFileNoFollow(filePath));
 }
 
-function removeClaudeHooks(filePath: string): boolean {
+function removeClaudeHooks(filePath: string, strict = false): boolean {
   let removed = false;
   try {
     updateRegularFileNoFollow(filePath, (content) => {
@@ -1101,6 +1135,7 @@ function removeClaudeHooks(filePath: string): boolean {
     }, 0o666, false);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if (!strict && ((error as NodeJS.ErrnoException).code === "EAGAIN")) return false;
     throw error;
   }
   return removed;
@@ -1295,18 +1330,24 @@ function installComponent(
       if (!hookConfigPath) throw new Error(`No config path defined for ${agent.name} with type hook`);
       const hooksPath = resolveConfigPath(hookConfigPath, cwd);
       const configPath = resolveConfigPath(CODEX_CONFIG_PATH, cwd);
-      const existingConfig = readOptionalRegularFileNoFollow(configPath)?.toString("utf-8") ?? "";
-      const updatedConfig = setCodexHooksFeature(existingConfig);
-      if (updatedConfig !== existingConfig) writeRegularFileNoFollow(configPath, Buffer.from(updatedConfig, "utf-8"));
-      const existingHooks = readOptionalRegularFileNoFollow(hooksPath)?.toString("utf-8") ?? "";
-      writeRegularFileNoFollow(hooksPath, Buffer.from(mergeCodexHooksContent(existingHooks, transport), "utf-8"));
+      updateRegularFileNoFollow(configPath, (existing) => {
+        const updated = setCodexHooksFeature(existing.toString("utf-8"));
+        return updated === existing.toString("utf-8") ? undefined : Buffer.from(updated, "utf-8");
+      });
+      updateRegularFileNoFollow(hooksPath, (existing) => Buffer.from(mergeCodexHooksContent(existing.toString("utf-8"), transport), "utf-8"));
       for (const legacyPath of LEGACY_CODEX_HOOKS_PATHS.map((path) => resolveConfigPath(path, cwd))) {
         if (legacyPath !== hooksPath) {
           const legacyContent = readOptionalRegularFileNoFollow(legacyPath)?.toString("utf-8");
           if (legacyContent !== undefined) {
             const result = removeCodexHooksContent(legacyContent);
-            if (result.state === "remove") unlinkRegularFileNoFollow(legacyPath);
-            else if (result.state === "rewrite") writeRegularFileNoFollow(legacyPath, Buffer.from(result.content, "utf-8"));
+            if (result.state === "remove") {
+              activeMutationAuthority!.mutate(legacyPath, (base) => base.state === "regular" ? { state: "absent" } : { state: "unchanged" });
+            } else if (result.state === "rewrite") {
+              updateRegularFileNoFollow(legacyPath, (existing) => {
+                const next = removeCodexHooksContent(existing.toString("utf-8"));
+                return next.state === "rewrite" ? Buffer.from(next.content, "utf-8") : undefined;
+              }, 0o666, false);
+            }
           }
         }
       }
@@ -1374,11 +1415,21 @@ function removeComponent(agent: Agent, surface: ConnectorSurface, cwd: string, s
     if (content === undefined) return false;
     const result = removeCodexHooksContent(content);
     if (result.state === "unchanged") return false;
-    if (result.state === "remove") return unlinkRegularFileNoFollow(resolvedPath);
-    writeRegularFileNoFollow(resolvedPath, Buffer.from(result.content, "utf-8"));
-    return true;
+    try {
+      const mutation = activeMutationAuthority!.mutate(resolvedPath, (base) => {
+        if (base.state !== "regular") return { state: "unchanged" };
+        const next = removeCodexHooksContent(base.content.toString("utf-8"));
+        if (next.state === "unchanged") return { state: "unchanged" };
+        if (next.state === "remove") return { state: "absent" };
+        return { state: "regular", content: Buffer.from(next.content, "utf-8"), mode: base.certificate.mode };
+      });
+      return mutation.changed;
+    } catch (error) {
+      if (!strictSkill && (error as NodeJS.ErrnoException).code === "EAGAIN") return false;
+      throw error;
+    }
   }
-  if (surface === "hook" && agent.id === "claude-code") return removeClaudeHooks(resolvedPath);
+  if (surface === "hook" && agent.id === "claude-code") return removeClaudeHooks(resolvedPath, strictSkill);
   if (surface === "mcp") return removeMcpJson(resolvedPath);
   if (surface === "skill") {
     const skillPath = join(resolvedPath, "lcm-memory", "SKILL.md");
@@ -1388,27 +1439,22 @@ function removeComponent(agent: Agent, surface: ConnectorSurface, cwd: string, s
     ], strictSkill);
   }
 
-  let descriptor: number;
   try {
-    descriptor = openNoFollow(resolvedPath, constants.O_RDWR);
-  } catch {
+    const snapshot = activeMutationAuthority!.snapshots?.get(resolvedPath);
+    if (!snapshot || snapshot.state === "absent") return false;
+    const mutation = activeMutationAuthority!.mutate(resolvedPath, (base) => {
+      if (base.state !== "regular") return { state: "unchanged" };
+      const content = base.content.toString("utf-8");
+      if (!hasManagedBlock(content)) return { state: "unchanged" };
+      const cleaned = removeMarkers(content);
+      const eol = establishedMarkdownEol(cleaned);
+      const updated = cleaned === "" ? { state: "absent" as const } : { state: "regular" as const, content: Buffer.from(normalizeMarkdownEof(cleaned, eol), "utf-8"), mode: base.certificate.mode };
+      return updated;
+    });
+    return mutation.changed;
+  } catch (error) {
+    if (strictSkill) throw error;
     return false;
-  }
-  try {
-    const stats = descriptorStats(descriptor, resolvedPath);
-    const content = readDescriptor(descriptor, resolvedPath).toString("utf-8");
-    if (!hasManagedBlock(content)) return false;
-    const cleaned = removeMarkers(content);
-    const eol = establishedMarkdownEol(cleaned);
-    if (cleaned === "") {
-      if (!pathStillIdentifiesDescriptor(resolvedPath, stats)) return false;
-      unlinkSync(ioPath(resolvedPath));
-    } else {
-      writeDescriptor(descriptor, Buffer.from(normalizeMarkdownEof(cleaned, eol), "utf-8"));
-    }
-    return true;
-  } finally {
-    closeSync(descriptor);
   }
 }
 
@@ -1707,8 +1753,6 @@ function compensateCodexMcp(runner: CodexMcpRunner, prior: readonly CodexMcpEntr
   if (!codexMcpEntriesEqual(restored, prior)) throw new Error("Codex MCP compensation readback mismatch");
 }
 
-type OwnedFileSnapshot = { readonly path: string; readonly content?: Buffer; readonly mode?: number; readonly nonFile?: boolean };
-
 function snapshotOwnedFiles(paths: readonly string[], anchored = true): OwnedFileSnapshot[] {
   const snapshots: OwnedFileSnapshot[] = [];
   for (const path of [...new Set(paths)]) {
@@ -1717,11 +1761,11 @@ function snapshotOwnedFiles(paths: readonly string[], anchored = true): OwnedFil
       descriptor = anchored ? openNoFollow(path, constants.O_RDONLY) : openNoFollowUnmapped(path, constants.O_RDONLY);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        snapshots.push({ path });
+        snapshots.push({ path, state: "absent" });
         continue;
       }
       if (["ELOOP", "EISDIR", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
-        snapshots.push({ path, nonFile: true });
+        snapshots.push({ path, state: "non-file" });
         continue;
       }
       throw error;
@@ -1729,10 +1773,17 @@ function snapshotOwnedFiles(paths: readonly string[], anchored = true): OwnedFil
     try {
       const stats = fstatSync(descriptor);
       if (!stats.isFile()) {
-        snapshots.push({ path, nonFile: true });
+        snapshots.push({ path, state: "non-file" });
         continue;
       }
-      snapshots.push({ path, content: readDescriptor(descriptor, path), mode: stats.mode & 0o777 });
+      snapshots.push({
+        path,
+        state: "regular",
+        content: readDescriptor(descriptor, path),
+        mode: Number(stats.mode) & 0o7777,
+        dev: stats.dev,
+        ino: stats.ino,
+      });
     } finally {
       closeSync(descriptor);
     }
@@ -1741,27 +1792,16 @@ function snapshotOwnedFiles(paths: readonly string[], anchored = true): OwnedFil
 }
 
 function fileSnapshotsEqual(left: readonly OwnedFileSnapshot[], right: readonly OwnedFileSnapshot[]): boolean {
-  return left.every((snapshot, index) => {
+  return left.length === right.length && left.every((snapshot, index) => {
     const other = right[index];
-    return snapshot.path === other.path
-      && snapshot.nonFile === other.nonFile
-      && snapshot.mode === other.mode
-      && ((snapshot.content === undefined && other.content === undefined)
-        || (snapshot.content !== undefined && other.content !== undefined && snapshot.content.equals(other.content)));
+    if (!other || snapshot.path !== other.path || snapshot.state !== other.state) return false;
+    if (snapshot.state !== "regular" || other.state !== "regular") return true;
+    return snapshot.mode === other.mode
+      && snapshot.dev === other.dev
+      && snapshot.ino === other.ino
+      && snapshot.content.length === other.content.length
+      && snapshot.content.equals(other.content);
   });
-}
-
-function restoreOwnedFiles(snapshots: readonly OwnedFileSnapshot[]): void {
-  for (const snapshot of snapshots) {
-    if (snapshot.nonFile) continue;
-    if (snapshot.content === undefined) {
-      try { unlinkRegularFileNoFollow(snapshot.path); } catch { /* preserve a non-file user surface */ }
-      continue;
-    }
-    // A file snapshot always records its mode; absent snapshots have no content
-    // and return through the branch above.
-    writeRegularFileNoFollow(snapshot.path, snapshot.content, snapshot.mode!);
-  }
 }
 
 function phase(options: ConnectorInstallerOptions, name: ConnectorInstallPhase): void {
@@ -1903,6 +1943,7 @@ function installTransportBundle(
   const priorTransport = readConnectorTransport(configFile, agent.id);
   const paths = allOwnedPaths(agent, cwd);
   const snapshots = snapshotOwnedFiles(paths);
+  activeMutationAuthority!.registerSnapshots(snapshots);
   const codexMcpTouched = agent.id === "codex" && (
     targetSurfaces.includes("mcp")
     || options.queryCodexMcp === true
@@ -1973,33 +2014,36 @@ function installTransportBundle(
     };
   } catch (error) {
     const failures: string[] = [];
-    filesMutated ||= !fileSnapshotsEqual(snapshots, snapshotOwnedFiles(paths));
+    filesMutated ||= activeMutationAuthority!.hasMutations()
+      || !fileSnapshotsEqual(snapshots, snapshotOwnedFiles(paths));
     configMutated ||= !fileSnapshotsEqual(configSnapshot, snapshotOwnedFiles([configFile], false));
     if (runner && priorCodexMcp && codexMcpMutationAttempted) {
       try {
         codexMcpMutated ||= !codexMcpEntriesEqual(runner.get(), priorCodexMcp);
       } catch (readbackError) {
         codexMcpMutated = true;
-        failures.push(`Codex MCP state readback: ${String(readbackError)}`);
+        failures.push(`Codex MCP state readback: ${activeMutationAuthority!.displayError(readbackError).message}`);
       }
     }
     if (filesMutated) {
-      try {
-        restoreOwnedFiles(snapshots);
-        if (!fileSnapshotsEqual(snapshots, snapshotOwnedFiles(paths))) throw new Error("owned state compensation readback mismatch");
-      } catch (restoreError) { failures.push(`owned state: ${String(restoreError)}`); }
+      const ownedFailures = activeMutationAuthority!.compensateOwnedFiles();
+      failures.push(...ownedFailures.map((failure) => `owned state: ${failure}`));
     }
     if (runner && priorCodexMcp && codexMcpMutated) {
-      try { compensateCodexMcp(runner, priorCodexMcp); } catch (restoreError) { failures.push(`Codex MCP state: ${String(restoreError)}`); }
+      try { compensateCodexMcp(runner, priorCodexMcp); } catch (restoreError) {
+        failures.push(`Codex MCP state: ${activeMutationAuthority!.displayError(restoreError).message}`);
+      }
     }
     if (configMutated) {
       try {
         restoreTransportChoice(configFile, agent.id, priorTransport);
         if (readConnectorTransport(configFile, agent.id) !== priorTransport) throw new Error("transport config compensation readback mismatch");
-      } catch (restoreError) { failures.push(`transport config: ${String(restoreError)}`); }
+      } catch (restoreError) {
+        failures.push(`transport config: ${activeMutationAuthority!.displayError(restoreError).message}`);
+      }
     }
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(failures.length > 0 ? `${detail}; rollback incomplete (${failures.join("; ")})` : detail, { cause: error });
+    const detail = activeMutationAuthority!.displayError(error).message;
+    throw new Error(failures.length > 0 ? `${detail}; rollback incomplete (${failures.join("; ")})` : detail);
   }
 }
 
@@ -2011,7 +2055,11 @@ function withInstallAuthority<T>(agent: Agent, surfaces: readonly ConnectorSurfa
   if (!existsSync(cwd) && createRoot) mkdirSync(cwd);
   if (createRoot && !existsSync(homedir())) mkdirSync(homedir(), { recursive: true });
   const specs = mutationTargetsForPaths(agent, cwd, surfaces, createRoot);
-  return withMutationAuthority(specs, callback);
+  return withMutationAuthority(specs, () => {
+    const snapshots = snapshotOwnedFiles(specs.map((spec) => spec.displayPath));
+    activeMutationAuthority?.registerSnapshots(snapshots);
+    return callback();
+  });
 }
 
 function parseInstallerArguments(
@@ -2064,6 +2112,7 @@ export function installConnector(
 function removeTransportBundle(agent: Agent, cwd: string, options: ConnectorInstallerOptions): RemoveResult {
   const configFile = options.configPath ?? defaultConfigPath();
   const failures: string[] = [];
+  const failureMessage = (error: unknown): string => activeMutationAuthority!.displayError(error).message;
   const paths: string[] = allOwnedPaths(agent, cwd);
   const hadAnchoredTarget = paths.some((path) => activeMutationAuthority!.hasTarget(path));
   let removed = false;
@@ -2074,7 +2123,7 @@ function removeTransportBundle(agent: Agent, cwd: string, options: ConnectorInst
     : undefined;
   if (codexMcp) {
     try { preflightCodexMcpRemove(codexMcp); } catch (error) {
-      failures.push(`mcp: ${error instanceof Error ? error.message : String(error)}`);
+      failures.push(`mcp: ${failureMessage(error)}`);
       return { success: false, removed: false, paths, failures };
     }
   }
@@ -2082,7 +2131,7 @@ function removeTransportBundle(agent: Agent, cwd: string, options: ConnectorInst
     const settingsPath = surfacePath(agent, "hook", cwd);
     if (settingsPath) {
       try { removed = removeClaudeNativeMcp(settingsPath) || removed; } catch (error) {
-        failures.push(`native-mcp: ${error instanceof Error ? error.message : String(error)}`);
+        failures.push(`native-mcp: ${failureMessage(error)}`);
       }
     }
   }
@@ -2090,12 +2139,12 @@ function removeTransportBundle(agent: Agent, cwd: string, options: ConnectorInst
     try {
       removed = removeSurface(agent, surface, cwd, codexMcp, true) || removed;
     } catch (error) {
-      failures.push(`${surface}: ${error instanceof Error ? error.message : String(error)}`);
+      failures.push(`${surface}: ${failureMessage(error)}`);
     }
   }
   if (failures.length === 0 && (removed || hadAnchoredTarget)) {
     try { clearConnectorTransport(configFile, agent.id); } catch (error) {
-      failures.push(`transport config: ${error instanceof Error ? error.message : String(error)}`);
+      failures.push(`transport config: ${failureMessage(error)}`);
     }
   }
   return { success: failures.length === 0, removed, paths, failures };
@@ -2163,7 +2212,7 @@ export function listConnectors(cwd: string = process.cwd()): InstalledConnector[
         const skillPath = join(resolvedPath, 'lcm-memory', 'SKILL.md');
         try {
           const content = readOptionalRegularFileNoFollow(skillPath);
-          if (content !== undefined && isOwnedSkill(content, [
+          if (content !== undefined && content.length > 0 && isOwnedSkill(content, [
             generateContent(agent, type, "cli"),
             generateContent(agent, type, "mcp"),
           ])) {

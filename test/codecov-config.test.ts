@@ -482,7 +482,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(205);
   });
 
-  test("keeps response-fence and #700/#701/#709/#710/#756/#726/#734/#737/#742/#760/#804 files in their intended components", () => {
+  test("keeps response-fence and #700/#701/#709/#710/#713/#756/#726/#734/#737/#742/#760/#804 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -493,7 +493,9 @@ describe("Codecov configuration", () => {
     const expectedOwners = [
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
+      ["src/connectors/codex-hooks.ts", "unit-connectors"],
       ["src/connectors/installer.ts", "unit-connectors"],
+      ["installer/install.ts", "unit-installation"],
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
       ["src/daemon/routes/compact.ts", "unit-daemon-routes"],

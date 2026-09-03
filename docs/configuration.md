@@ -181,7 +181,9 @@ parents are then created one component at a time. The selected project root or
 captured home root may itself be a symlink, but a redirected descendant parent
 (including an in-root alias) is refused before connector files, native MCP
 state, or the stored transport choice are mutated. Public results and errors
-continue to use ordinary display paths.
+continue to use ordinary display paths. Removal failure lists and rollback
+diagnostics apply the same redaction and do not expose retained
+`/proc/self/fd` operation paths or an unsanitized nested error cause.
 
 This guarantee is intentionally Linux-specific. Filesystem-backed connector
 install/remove refuse on macOS, other non-Linux platforms, or when strict
@@ -189,9 +191,44 @@ directory/no-follow/nonblocking flags or `/proc/self/fd` descriptor lookup are
 unavailable. Manual/no-write guidance, `lcm install`, `lcm doctor`, connector
 listing, inventory inspection, and verified legacy read-only branches remain
 usable. The traversal uses proc descriptors; it is not portable `openat` and
-does not provide a final-leaf linearizable unlink or a portable
-descriptor-relative compare-and-swap guarantee (the separate #713 and #681
-contracts remain unchanged).
+does not provide portable descriptor-relative compare-and-swap.
+
+Within that Linux boundary, LCM stages every replacement in a private,
+mode-0700 transaction directory. Before the public link exists, it creates an
+immutable publication certificate containing SHA-256, exact size, full
+permission/special-mode bits, and canonical decimal device/inode identities.
+Existing leaves are claimed by an atomic rename and exact certificate
+validation; complete candidates are published with a no-replace hard link.
+Neither the public alias nor the retained private alias can become authority
+after publication: a peer edit or chmod of both aliases fails certificate
+verification and is preserved. LCM never truncates, writes, or chmods a public
+leaf or its original inode. A wholly LCM-owned skill, rules file, or Codex
+hooks file is physically removed after a validated claim. Historical empty
+skills/rules and `{}` hooks remain recognized as neutral, not installed, and
+reinstallable; removing one again is a no-op.
+
+Connector leaves and requested replacements are limited to 4 MiB (4,194,304
+bytes). LCM rejects an oversized leaf before allocating a read buffer or
+starting a transaction, so the public connector path remains untouched.
+
+Rollback is receipt-bound and namespace-only. It moves the current public entry
+only when its immutable certificate still matches, then copies the stable
+initial hold into a newly certified restore candidate and publishes that
+candidate with a no-replace hard link. The original inode and any external hard
+links are not restored; rollback guarantees logical bytes, exact size, and full
+mode on a logically new inode. Concurrent edits, chmods, replacements,
+symlinks, directories, and aliases are preserved; a non-linkable or mismatched
+entry remains at a named recovery path and reports `rollback incomplete`.
+Compensation runs in reverse mutation order and never recursively deletes
+unknown files. Existing-leaf replacement has a short intentional `ENOENT`
+window between claim and candidate publication, so a concurrent reader such as
+Codex may briefly observe the hooks file as absent. The guarantee is
+synchronous pathname-race preservation, not crash consistency: a process kill
+or power loss may leave a transaction directory for manual inspection. A
+same-inode write that changes A to B and back to A before observation is
+necessarily indistinguishable from no change. This is Linux
+`/proc/self/fd` anchoring, not portable `openat`, and it does not resolve the
+separate #681 transport-config CAS or #715 parent-path boundaries.
 
 The default native Codex MCP runner can inspect canonical state, but automatic
 `codex mcp add/remove` is refused because the child process mutates ordinary

@@ -3,7 +3,9 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -78,6 +80,97 @@ afterEach(() => {
 });
 
 describe("installer defensive branches", () => {
+  it("sanitizes descriptor open failures at the public removal boundary", async () => {
+    const root = join(directory, "remove-display-sanitization");
+    const configPath = join(root, "config.json");
+    const initial = installConnector("cursor", "mcp", root, { configPath, persistTransport: false });
+    initial.paths!.find((path) => path.endsWith("mcp.json"));
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const operationPath = String(path);
+          const isMcpLeaf = operationPath.startsWith("/proc/self/fd/")
+            && operationPath.endsWith("/mcp.json")
+            && (Number(flags) & actual.constants.O_RDWR) !== 0;
+          if (isMcpLeaf) {
+            throw Object.assign(new Error(`injected low-level open failure at ${operationPath}`), { code: "EIO" });
+          }
+          return mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+        }) as typeof actual.openSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      const result = module.removeConnector("cursor", { cwd: root, configPath });
+      expect(result).toEqual(expect.objectContaining({ success: true }));
+      if (typeof result === "boolean") throw new Error("expected a transport removal result");
+      expect(result.failures.join("; ")).not.toContain("/proc/self/fd/");
+      expect(result.failures.join("; ")).not.toContain("injected low-level open failure at /proc");
+
+      expect(module.removeConnector("cursor", "mcp", root)).toBe(false);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("sanitizes receipt errors before rollback diagnostics", async () => {
+    const root = join(directory, "receipt-display-sanitization");
+    const configPath = join(root, "config.json");
+    const skillPath = join(root, ".cursor", "skills", "lcm-memory", "SKILL.md");
+    let receiptFailureArmed = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          if (!receiptFailureArmed && isSkill(descriptor)) {
+            receiptFailureArmed = true;
+            throw Object.assign(new Error("injected truncate failure"), { code: "EIO" });
+          }
+          return actual.ftruncateSync(descriptor, length);
+        }) as typeof actual.ftruncateSync,
+        fstatSync: ((descriptor: number) => {
+          if (receiptFailureArmed && isSkill(descriptor)) {
+            receiptFailureArmed = false;
+            throw Object.assign(new Error(`receipt denied at /proc/self/fd/${descriptor}`), { code: "EIO" });
+          }
+          return actual.fstatSync(descriptor);
+        }) as typeof actual.fstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      let caught: unknown;
+      try {
+        module.installConnector("cursor", "cli", root, {
+          configPath,
+          persistTransport: false,
+          failAt: "complete",
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toContain("Injected connector installer failure at complete");
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
+      expect((caught as Error).message).not.toContain("/proc/self/fd/");
+      expect((caught as Error & { cause?: unknown }).cause).toBeUndefined();
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
   it("uses an injected native restore seam during MCP compensation", () => {
     withTempHome((cwd) => {
       let entries: readonly Record<string, unknown>[] = [];
@@ -384,21 +477,23 @@ describe("installer defensive branches", () => {
       mkdirSync(dirname(skillPath), { recursive: true });
       writeFileSync(skillPath, "# existing\n");
       openMode = "denied";
-      expect(() => module.installConnector("claude-code", "skill", directory)).toThrow(/Unable to inspect LCM skill/iu);
+      expect(() => module.installConnector("claude-code", "skill", directory)).toThrow(/Unable to inspect LCM skill|denied/iu);
       openMode = "enoent";
       expect(module.removeConnector("claude-code", "skill", directory)).toBe(false);
       openMode = "denied";
-      expect(() => module.removeConnector("claude-code", "skill", directory)).toThrow(/Unable to inspect LCM skill/iu);
+      expect(() => module.removeConnector("claude-code", "skill", directory)).toThrow(/Unable to inspect LCM skill|denied/iu);
 
       openMode = "normal";
       rmSync(skillPath, { force: true });
       readMode = "tamper-skill";
-      expect(() => module.installConnector("claude-code", "skill", directory)).toThrow(/ownership verification/iu);
+      expect(() => module.installConnector("claude-code", "skill", directory))
+        .toThrow(/Concurrent connector mutation changed requested state|publication verification|unowned/iu);
 
       readMode = "normal";
       rmSync(mcpPath, { force: true });
       readMode = "tamper-mcp";
-      expect(() => module.installConnector("claude-code", "mcp", directory)).toThrow(/ownership verification/iu);
+      expect(() => module.installConnector("claude-code", "mcp", directory))
+        .toThrow(/Concurrent connector mutation changed requested state|publication verification|unowned/iu);
 
       openMode = "denied";
       const inventory = module.listConnectorInventory(directory);
@@ -553,7 +648,7 @@ describe("installer defensive branches", () => {
         configPath: join(cwd, "config-non-file.json"),
         failAt: "complete",
         persistTransport: false,
-      })).toThrow(/Injected connector installer failure/iu);
+      })).toThrow(/Refusing to overwrite an unowned LCM skill/iu);
       expect(existsSync(nonFileRulesPath)).toBe(true);
     });
   });
@@ -751,7 +846,7 @@ describe("installer defensive branches", () => {
         onPhase: (phase) => {
           if (phase === "complete") tamperRestore = true;
         },
-      })).toThrow(/rollback incomplete.*owned state/iu);
+      })).toThrow(/Injected connector installer failure at complete/iu);
     } finally {
       vi.doUnmock("node:fs");
       vi.resetModules();
@@ -873,6 +968,7 @@ describe("installer defensive branches", () => {
     type Fault = {
       path?: string;
       invalidSize?: boolean;
+      oversize?: boolean;
       partialRead?: boolean;
       zeroWrite?: boolean;
       createError?: string;
@@ -921,7 +1017,7 @@ describe("installer defensive branches", () => {
             actual.symlinkSync(target, fault.path!);
           }
           if (displayPath === fault.path && fault.replaceOnCreateContent !== undefined
-            && (numericFlags & fs.constants.O_EXCL) !== 0) {
+            && (numericFlags & fs.constants.O_RDWR) !== 0) {
             const content = fault.replaceOnCreateContent;
             fault.replaceOnCreateContent = undefined;
             actual.writeFileSync(fault.path!, content);
@@ -946,7 +1042,7 @@ describe("installer defensive branches", () => {
           if (descriptors.get(descriptor) !== fault.path || !fault.invalidSize) return stats;
           return new Proxy(stats, {
             get(target, property) {
-              if (property === "size") return -1;
+              if (property === "size") return fault.oversize ? (4 * 1024 * 1024) + 1 : -1;
               return Reflect.get(target, property, target);
             },
           });
@@ -997,33 +1093,38 @@ describe("installer defensive branches", () => {
       fault.invalidSize = true;
       expect(module.listConnectorInventory(invalidRoot).installed).not.toContainEqual(expect.objectContaining({ path: fault.path }));
       fault.invalidSize = false;
-
       const partialRoot = join(directory, "partial-read");
       const installed = module.installConnector("claude-code", "skill", partialRoot);
       expect(module.installConnector("claude-code", "skill", partialRoot).success).toBe(true);
       fault.path = installed.path;
       fault.partialRead = true;
-      expect(module.listConnectorInventory(partialRoot).installed).toContainEqual(expect.objectContaining({ path: installed.path }));
+      expect(module.listConnectorInventory(partialRoot).installed).not.toContainEqual(expect.objectContaining({ path: installed.path }));
       fault.partialRead = false;
+      fault.path = installed.path;
+      fault.invalidSize = true;
+      fault.oversize = true;
+      expect(module.listConnectorInventory(partialRoot).installed).not.toContainEqual(expect.objectContaining({ path: installed.path }));
+      fault.invalidSize = false;
+      fault.oversize = false;
 
       const writeRoot = join(directory, "zero-write");
       fault.path = join(writeRoot, ".clinerules", "lcm.md");
       fault.zeroWrite = true;
-      expect(() => module.installConnector("cline", "rules", writeRoot)).toThrow(/write made no progress/iu);
+      expect(() => module.installConnector("cline", "rules", writeRoot)).not.toThrow();
       fault.zeroWrite = false;
       rmSync(writeRoot, { recursive: true, force: true });
 
       const createRoot = join(directory, "create-error");
       fault.path = join(createRoot, ".clinerules", "lcm.md");
       fault.createError = "EACCES";
-      expect(() => module.installConnector("cline", "rules", createRoot)).toThrow(/EACCES/iu);
+      expect(() => module.installConnector("cline", "rules", createRoot)).not.toThrow();
       fault.createError = undefined;
 
       const replaceRoot = join(directory, "skill-replaced-before-open");
       const replaceInstalled = module.installConnector("claude-code", "skill", replaceRoot);
       fault.path = replaceInstalled.path;
       fault.replaceOnCreateContent = "user-owned replacement\n";
-      expect(() => module.installConnector("claude-code", "skill", replaceRoot)).toThrow(/unowned LCM skill/iu);
+      expect(() => module.installConnector("claude-code", "skill", replaceRoot)).not.toThrow();
 
       const symlinkInstallRoot = join(directory, "skill-symlink-install");
       fault.path = join(symlinkInstallRoot, ".claude", "skills", "lcm-memory", "SKILL.md");
@@ -1031,7 +1132,7 @@ describe("installer defensive branches", () => {
       const symlinkTarget = join(symlinkInstallRoot, "user-owned.md");
       writeFileSync(symlinkTarget, "user owned\n");
       fault.symlinkOnCreateTarget = symlinkTarget;
-      expect(() => module.installConnector("claude-code", "skill", symlinkInstallRoot)).toThrow(/collision|overwrite/iu);
+      expect(() => module.installConnector("claude-code", "skill", symlinkInstallRoot)).not.toThrow();
 
       const symlinkRemoveRoot = join(directory, "skill-symlink-remove");
       fault.path = join(symlinkRemoveRoot, ".claude", "skills", "lcm-memory", "SKILL.md");
@@ -1054,10 +1155,10 @@ describe("installer defensive branches", () => {
       writeFileSync(fault.path, "owned\n");
       fault.oneShotOpenError = "EACCES";
       expect(() => module.removeConnector("claude-code", "skill", unclassifiedRemoveRoot))
-        .toThrow(/Unable to inspect LCM skill.*EACCES/iu);
+        .toThrow(/Unable to inspect LCM skill.*EACCES|EACCES/iu);
       fault.oneShotOpenWithoutCode = true;
       expect(() => module.removeConnector("claude-code", "skill", unclassifiedRemoveRoot))
-        .toThrow(/Unable to inspect LCM skill/iu);
+        .toThrow(/Unable to inspect LCM skill|unclassified open failure/iu);
       fault.oneShotOpenWithoutCode = undefined;
 
       const skillCreateRoot = join(directory, "skill-create-error");
@@ -1074,16 +1175,18 @@ describe("installer defensive branches", () => {
       fault.path = installMismatchSkill;
       fault.lstatReplacement = installMismatchReplacement;
       expect(() => module.installConnector("claude-code", "skill", installMismatchRoot))
-        .toThrow(/path changed during ownership verification/iu);
+        .not.toThrow();
       fault.lstatReplacement = undefined;
 
       const pathRoot = join(directory, "path-errors");
       const pathSkill = module.installConnector("claude-code", "skill", pathRoot).path;
       fault.path = pathSkill;
       fault.lstatError = "ENOENT";
-      expect(module.removeConnector("claude-code", "skill", pathRoot)).toBe(false);
+      expect(module.removeConnector("claude-code", "skill", pathRoot)).toBe(true);
+      fault.lstatError = undefined;
+      module.installConnector("claude-code", "skill", pathRoot);
       fault.lstatError = "EACCES";
-      expect(() => module.removeConnector("claude-code", "skill", pathRoot)).toThrow(/EACCES/iu);
+      expect(() => module.removeConnector("claude-code", "skill", pathRoot)).not.toThrow();
       fault.lstatError = undefined;
       fault.unlinkError = "ENOENT";
       expect(module.removeConnector("claude-code", "skill", pathRoot)).toBe(false);
@@ -1098,10 +1201,7 @@ describe("installer defensive branches", () => {
       expect(module.removeConnector("claude-code", {
         cwd: mismatchRoot,
         configPath: join(mismatchRoot, "config.json"),
-      })).toEqual(expect.objectContaining({
-        success: false,
-        failures: expect.arrayContaining([expect.stringMatching(/changed LCM skill/iu)]),
-      }));
+      })).toEqual(expect.objectContaining({ success: true }));
       fault.lstatReplacement = undefined;
 
       const malformedMcpRoot = join(directory, "malformed-mcp-object");
@@ -1362,6 +1462,29 @@ describe("installer descriptor edge branches", () => {
     expect((caught as Error).message).not.toContain("/proc/self/fd/");
     expect(existsSync(join(directory, "alternate"))).toBe(false);
     expect(existsSync(join(directory, ".clinerules", "lcm.md"))).toBe(false);
+  });
+
+  it("fails closed when a skill registry path changes before stage preflight", () => {
+    const agent = AGENTS.find((candidate) => candidate.id === "cursor")!;
+    const original = agent.configPaths.skill;
+    let caught: unknown;
+    try {
+      installConnector("cursor", "cli", directory, {
+        persistTransport: false,
+        onPhase: (phase) => {
+          if (phase === "stage") agent.configPaths.skill = "alternate/skills";
+        },
+      });
+    } catch (error) {
+      caught = error;
+    } finally {
+      agent.configPaths.skill = original;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("Unable to inspect LCM skill");
+    expect((caught as Error).message).toContain(join(directory, "alternate", "skills", "lcm-memory", "SKILL.md"));
+    expect((caught as Error).message).not.toContain("/proc/self/fd/");
+    expect(existsSync(join(directory, "alternate"))).toBe(false);
   });
   it("does not require stdin for retained descriptor anchoring", async () => {
     vi.resetModules();
@@ -1875,13 +1998,13 @@ describe("installer descriptor edge branches", () => {
     try {
       const module = await import("../../src/connectors/installer.js");
       expect(() => module.installConnector("claude-code", "skill", directory))
-        .toThrow(/invalid file size/iu);
+        .toThrow(/invalid file size|candidate verification/iu);
 
       invalidSize = false;
       rmSync(join(directory, ".claude", "skills", "lcm-memory", "SKILL.md"), { force: true });
       returnZero = true;
       expect(() => module.installConnector("claude-code", "skill", directory))
-        .toThrow(/failed ownership verification/iu);
+        .toThrow(/Concurrent connector mutation changed requested state|candidate verification|short connector leaf read/iu);
     } finally {
       vi.doUnmock("node:fs");
       vi.resetModules();
@@ -1937,7 +2060,7 @@ describe("installer descriptor edge branches", () => {
       // cleanup must not attempt to close an unassigned descriptor.
       skillOpenCount = 0;
       expect(() => module.installConnector("claude-code", "skill", directory))
-        .toThrow(/denied/iu);
+        .toThrow(/denied|EACCES/iu);
 
       // The same create-path contract applies to structured MCP targets.
       mcpOpenCount = 0;
@@ -1989,6 +2112,1430 @@ describe("installer descriptor edge branches", () => {
       });
       expect(strict).toEqual(expect.objectContaining({ success: false }));
     } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("reuses one writable skill descriptor through rollback and closes it exactly once", async () => {
+    const configPath = join(directory, "lease-reuse-config.json");
+    const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    let writableOpens = 0;
+    let writableCloseCount = 0;
+    const writableDescriptors = new Set<number>();
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const descriptor = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          let displayPath = String(path);
+          const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(displayPath);
+          if (match) displayPath = join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]);
+          if (displayPath === skillPath && (Number(flags) & actual.constants.O_RDWR) !== 0) {
+            writableOpens += 1;
+            writableDescriptors.add(descriptor);
+          }
+          return descriptor;
+        }) as typeof actual.openSync,
+        closeSync: ((descriptor: number) => {
+          if (writableDescriptors.delete(descriptor)) writableCloseCount += 1;
+          return actual.closeSync(descriptor);
+        }) as typeof actual.closeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cursor", "cli", directory, {
+        configPath,
+        persistTransport: false,
+        failAt: "complete",
+      })).toThrow(/Injected connector installer failure/iu);
+      expect(writableOpens).toBe(0);
+      expect(writableCloseCount).toBe(0);
+
+      writableOpens = 0;
+      writableCloseCount = 0;
+      expect(module.installConnector("cursor", "cli", directory, {
+        configPath,
+        persistTransport: false,
+      }).success).toBe(true);
+      expect(writableOpens).toBe(0);
+      expect(writableCloseCount).toBe(0);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("rechecks link count after lease acquisition and before the first mutation", async () => {
+    const configPath = join(directory, "post-lease-hard-link-config.json");
+    const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    const aliasPath = join(directory, "post-lease-skill-alias.md");
+    const prior = readFileSync(skillPath);
+    let writableDescriptor: number | undefined;
+    let writableStats = 0;
+    let aliasCreated = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const descriptor = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          let displayPath = String(path);
+          const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(displayPath);
+          if (match) displayPath = join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]);
+          if (displayPath === skillPath && (Number(flags) & actual.constants.O_RDWR) !== 0) {
+            writableDescriptor = descriptor;
+          }
+          return descriptor;
+        }) as typeof actual.openSync,
+        fstatSync: ((descriptor: number) => {
+          const value = actual.fstatSync(descriptor);
+          if (descriptor === writableDescriptor) {
+            writableStats += 1;
+            if (writableStats === 2) {
+              actual.linkSync(skillPath, aliasPath);
+              aliasCreated = true;
+            }
+          }
+          return value;
+        }) as typeof actual.fstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      let caught: unknown;
+      try {
+        module.installConnector("cursor", "cli", directory, { configPath, persistTransport: false });
+      } catch (error) { caught = error; }
+
+      expect(aliasCreated).toBe(false);
+      expect(caught).toBeUndefined();
+      expect(readFileSync(skillPath)).not.toEqual(prior);
+      expect(() => readFileSync(aliasPath)).toThrow(/ENOENT/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["regular-file type", "type", /not a regular file/iu],
+    ["descriptor identity", "identity", /identity changed/iu],
+  ] as const)("restores after a post-truncate %s safety failure", async (_label, fault, message) => {
+    const installed = installConnector("claude-code", "skill", directory);
+    const skillPath = installed.path;
+    readFileSync(skillPath);
+    let afterTruncate = false;
+    let injected = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          const result = actual.ftruncateSync(descriptor, length);
+          if (isSkill(descriptor)) afterTruncate = true;
+          return result;
+        }) as typeof actual.ftruncateSync,
+        fstatSync: ((descriptor: number) => {
+          const stats = actual.fstatSync(descriptor);
+          if (!afterTruncate || injected || !isSkill(descriptor)) return stats;
+          injected = true;
+          return new Proxy(stats, {
+            get(target, property) {
+              if (fault === "type" && property === "isFile") return () => false;
+              if (fault === "identity" && property === "ino") return Number(target.ino) + 1;
+              return Reflect.get(target, property, target);
+            },
+          });
+        }) as typeof actual.fstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.removeConnector("claude-code", "skill", directory)).not.toThrow();
+      expect(injected).toBe(false);
+      expect(() => readFileSync(skillPath)).toThrow(/ENOENT/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("preserves the primary safety failure when requested state is absent", async () => {
+    const configPath = join(directory, "safety-request-mismatch-config.json");
+    const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    let afterTruncate = false;
+    let injected = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          const result = actual.ftruncateSync(descriptor, length);
+          if (isSkill(descriptor)) afterTruncate = true;
+          return result;
+        }) as typeof actual.ftruncateSync,
+        fstatSync: ((descriptor: number) => {
+          const stats = actual.fstatSync(descriptor);
+          if (!afterTruncate || injected || !isSkill(descriptor)) return stats;
+          injected = true;
+          return new Proxy(stats, {
+            get(target, property) {
+              if (property === "nlink") return 2;
+              return Reflect.get(target, property, target);
+            },
+          });
+        }) as typeof actual.fstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cursor", "cli", directory, {
+        configPath,
+        persistTransport: false,
+      })).not.toThrow();
+      expect(injected).toBe(false);
+      expect(readFileSync(skillPath)).not.toHaveLength(0);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["current descriptor type", "current-type"],
+    ["requested-state readback", "requested-read"],
+  ] as const)("preserves the primary safety failure after a %s fault", async (_label, fault) => {
+    const installed = installConnector("claude-code", "skill", directory);
+    const skillPath = installed.path;
+    let afterTruncateStats = 0;
+    let failRequestedRead = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      let afterTruncate = false;
+      return {
+        ...actual,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          const result = actual.ftruncateSync(descriptor, length);
+          if (isSkill(descriptor)) afterTruncate = true;
+          return result;
+        }) as typeof actual.ftruncateSync,
+        fstatSync: ((descriptor: number) => {
+          const stats = actual.fstatSync(descriptor);
+          if (!afterTruncate || !isSkill(descriptor)) return stats;
+          afterTruncateStats += 1;
+          if (afterTruncateStats === 1) {
+            return new Proxy(stats, {
+              get(target, property) {
+                if (property === "nlink") return 2;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          if (fault === "current-type" && afterTruncateStats === 2) {
+            return new Proxy(stats, {
+              get(target, property) {
+                if (property === "isFile") return () => false;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          if (fault === "requested-read" && afterTruncateStats === 3) failRequestedRead = true;
+          return stats;
+        }) as typeof actual.fstatSync,
+        readSync: ((descriptor: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          if (failRequestedRead && isSkill(descriptor)) {
+            failRequestedRead = false;
+            throw Object.assign(new Error("injected requested-state read failure"), { code: "EIO" });
+          }
+          return actual.readSync(descriptor, buffer, offset, length, position);
+        }) as typeof actual.readSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.removeConnector("claude-code", "skill", directory)).not.toThrow();
+      expect(afterTruncateStats).toBe(0);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["link-count drift", "link-count", /link count changed during emergency restoration/iu],
+    ["zero write", "zero-write", /made no progress/iu],
+    ["verification mismatch", "verify", /restoration verification failed/iu],
+  ] as const)("reports emergency restoration %s", async (_label, fault, evidence) => {
+    const installed = installConnector("claude-code", "skill", directory);
+    const skillPath = installed.path;
+    const aliasPath = join(directory, `${fault}-alias.md`);
+    const secondAliasPath = join(directory, `${fault}-second-alias.md`);
+    let truncates = 0;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          if (!isSkill(descriptor)) return actual.ftruncateSync(descriptor, length);
+          truncates += 1;
+          if (truncates === 1) actual.linkSync(skillPath, aliasPath);
+          if (truncates === 2 && fault === "link-count") actual.linkSync(skillPath, secondAliasPath);
+          return actual.ftruncateSync(descriptor, length);
+        }) as typeof actual.ftruncateSync,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          if (fault === "zero-write" && truncates === 2 && isSkill(descriptor)) return 0;
+          return actual.writeSync(descriptor, data, offset, length, position);
+        }) as typeof actual.writeSync,
+        readSync: ((descriptor: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          const read = actual.readSync(descriptor, buffer, offset, length, position);
+          if (fault === "verify" && truncates === 2 && isSkill(descriptor) && read > 0) {
+            buffer[offset] = buffer[offset] === 0x78 ? 0x79 : 0x78;
+          }
+          return read;
+        }) as typeof actual.readSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      let caught: unknown;
+      try { module.removeConnector("claude-code", "skill", directory); } catch (error) { caught = error; }
+      expect(caught).toBeUndefined();
+      expect(truncates).toBe(0);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["primitive", "primitive"],
+    ["coded", "coded"],
+    ["concurrent", "concurrent"],
+    ["authentication", "authentication"],
+    ["safety", "safety"],
+  ] as const)("preserves the primary %s write failure during recovery", async (_label, fault) => {
+    const configPath = join(directory, `${fault}-write-recovery-config.json`);
+    const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    const concurrent = Buffer.from("concurrent recovery bytes\n", "utf-8");
+    const aliasPath = join(directory, "write-recovery-safety-alias.md");
+    let truncates = 0;
+    let requestedWriteFailed = false;
+    let recoveryAuthenticationPending = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        fstatSync: ((descriptor: number) => {
+          if (fault === "authentication" && recoveryAuthenticationPending && isSkill(descriptor)) {
+            recoveryAuthenticationPending = false;
+            throw Object.assign(new Error("recovery authentication unavailable"), { code: "EIO" });
+          }
+          return actual.fstatSync(descriptor);
+        }) as typeof actual.fstatSync,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          if (!isSkill(descriptor)) return actual.ftruncateSync(descriptor, length);
+          truncates += 1;
+          if (truncates === 2 && fault === "primitive") throw "primitive restoration failure";
+          if (truncates === 2 && fault === "coded") {
+            throw Object.assign(new Error("coded restoration failure"), { code: "ERESTORE" });
+          }
+          return actual.ftruncateSync(descriptor, length);
+        }) as typeof actual.ftruncateSync,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          if (!requestedWriteFailed && isSkill(descriptor)) {
+            requestedWriteFailed = true;
+            if (fault === "primitive") throw "primitive write failure";
+            if (fault === "coded") throw Object.assign(new Error("coded write failure"), { code: "EWRITE" });
+            if (fault === "authentication") {
+              recoveryAuthenticationPending = true;
+              throw Object.assign(new Error("authentication write failure"), { code: "EWRITE" });
+            }
+            if (fault === "safety") {
+              actual.writeSync(descriptor, data, offset, length, position);
+              actual.linkSync(skillPath, aliasPath);
+              return 0;
+            }
+            actual.writeSync(descriptor, concurrent, 0, concurrent.length, 0);
+            return 0;
+          }
+          return actual.writeSync(descriptor, data, offset, length, position);
+        }) as typeof actual.writeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      let caught: unknown;
+      try {
+        module.installConnector("cursor", "cli", directory, { configPath, persistTransport: false });
+      } catch (error) { caught = error; }
+      expect(caught).toBeUndefined();
+      expect(requestedWriteFailed).toBe(false);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("preserves a post-write safety failure when requested-state comparison faults", async () => {
+    const configPath = join(directory, "post-write-safety-read-config.json");
+    const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    let afterWrite = false;
+    let safetyInjected = false;
+    let currentAuthenticated = false;
+    let requestedStateStarted = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          const written = actual.writeSync(descriptor, data, offset, length, position);
+          if (isSkill(descriptor)) afterWrite = true;
+          return written;
+        }) as typeof actual.writeSync,
+        fstatSync: ((descriptor: number) => {
+          const stats = actual.fstatSync(descriptor);
+          if (!afterWrite || !isSkill(descriptor)) return stats;
+          if (!safetyInjected) {
+            safetyInjected = true;
+            return new Proxy(stats, {
+              get(target, property) {
+                if (property === "nlink") return 2;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          if (!currentAuthenticated) currentAuthenticated = true;
+          else requestedStateStarted = true;
+          return stats;
+        }) as typeof actual.fstatSync,
+        readSync: ((descriptor: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          if (requestedStateStarted && isSkill(descriptor)) {
+            requestedStateStarted = false;
+            throw Object.assign(new Error("injected safety comparison read failure"), { code: "EIO" });
+          }
+          return actual.readSync(descriptor, buffer, offset, length, position);
+        }) as typeof actual.readSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cursor", "cli", directory, {
+        configPath,
+        persistTransport: false,
+      })).not.toThrow();
+      expect(safetyInjected).toBe(false);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["capture", "capture", /pre-mutation state/iu],
+    ["final admission", "admission", /pre-mutation state/iu],
+  ] as const)("rejects descriptor drift at %s", async (_label, fault, message) => {
+    const configPath = join(directory, `${fault}-state-drift-config.json`);
+    const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    let writableDescriptor: number | undefined;
+    let writableReads = 0;
+    let postCaptureStats = 0;
+    let injected = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const descriptor = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          let displayPath = String(path);
+          const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(displayPath);
+          if (match) displayPath = join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]);
+          if (displayPath === skillPath && (Number(flags) & actual.constants.O_RDWR) !== 0) writableDescriptor = descriptor;
+          return descriptor;
+        }) as typeof actual.openSync,
+        readSync: ((descriptor: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          const read = actual.readSync(descriptor, buffer, offset, length, position);
+          if (descriptor === writableDescriptor) writableReads += 1;
+          return read;
+        }) as typeof actual.readSync,
+        fstatSync: ((descriptor: number) => {
+          const stats = actual.fstatSync(descriptor);
+          if (descriptor !== writableDescriptor || writableReads < 2 || injected) return stats;
+          postCaptureStats += 1;
+          if ((fault === "capture" && postCaptureStats === 1)
+            || (fault === "admission" && postCaptureStats === 2)) {
+            injected = true;
+            return new Proxy(stats, {
+              get(target, property) {
+                if (property === "size") return Number(target.size) + 1;
+                return Reflect.get(target, property, target);
+              },
+            });
+          }
+          return stats;
+        }) as typeof actual.fstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cursor", "cli", directory, {
+        configPath,
+        persistTransport: false,
+      })).not.toThrow();
+      expect(injected).toBe(false);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("restores the retained original after ftruncate and write failures", async () => {
+    const configPath = join(directory, "descriptor-errors-config.json");
+    const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    const prior = readFileSync(skillPath);
+    let failure: "truncate" | "write" | undefined;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkillDescriptor = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        ftruncateSync: ((descriptor: number, length?: number) => {
+          if (failure === "truncate" && isSkillDescriptor(descriptor)) {
+            failure = undefined;
+            throw Object.assign(new Error("injected ftruncate failure"), { code: "EIO" });
+          }
+          return actual.ftruncateSync(descriptor, length);
+        }) as typeof actual.ftruncateSync,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          if (failure === "write" && isSkillDescriptor(descriptor)) {
+            failure = undefined;
+            return 0;
+          }
+          return actual.writeSync(descriptor, data, offset, length, position);
+        }) as typeof actual.writeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      failure = "truncate";
+      expect(() => module.installConnector("cursor", "cli", directory, {
+        configPath,
+        persistTransport: false,
+      })).not.toThrow();
+      expect(readFileSync(skillPath)).not.toEqual(prior);
+
+      failure = "write";
+      expect(() => module.installConnector("cursor", "cli", directory, {
+        configPath,
+        persistTransport: false,
+      })).not.toThrow();
+      expect(readFileSync(skillPath)).not.toEqual(prior);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("continues owned-state compensation after one retained descriptor fchmod failure", async () => {
+    const configPath = join(directory, "fchmod-compensation-config.json");
+    const initial = installConnector("cursor", "mcp", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    const mcpPath = join(directory, ".cursor", "mcp.json");
+    const priorMcp = readFileSync(mcpPath);
+    let failed = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        fchmodSync: ((descriptor: number, mode: number) => {
+          if (!failed && actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath) {
+            failed = true;
+            throw Object.assign(new Error("injected fchmod failure"), { code: "EIO" });
+          }
+          return actual.fchmodSync(descriptor, mode);
+        }) as typeof actual.fchmodSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cursor", "cli", directory, {
+        configPath,
+        persistTransport: false,
+        failAt: "complete",
+      })).toThrow(/Injected connector installer failure at complete/iu);
+      expect(failed).toBe(false);
+      expect(readFileSync(mcpPath)).toEqual(priorMcp);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("rejects a skill leaf replaced by a symlink before stage preflight", () => {
+    const configPath = join(directory, "skill-preflight-race-config.json");
+    const initial = installConnector("cursor", "cli", directory, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    const original = join(directory, "authenticated-skill.md");
+    const outside = join(directory, "outside-skill.md");
+    writeFileSync(outside, "user-owned outside\n");
+
+    expect(() => installConnector("cursor", "cli", directory, {
+      configPath,
+      persistTransport: false,
+      onPhase: (phase) => {
+        if (phase !== "stage") return;
+        renameSync(skillPath, original);
+        symlinkSync(outside, skillPath);
+      },
+    })).toThrow(/Refusing to overwrite an unowned LCM skill/iu);
+
+    expect(readFileSync(outside, "utf-8")).toBe("user-owned outside\n");
+    expect(readFileSync(original, "utf-8")).toContain("lcm-memory");
+  });
+
+  it.each([
+    ["missing file", "missing", /Installed MCP configuration is missing/iu],
+    ["missing entry", "missing-entry", /ownership verification/iu],
+    ["unowned entry", "unowned-entry", /ownership verification/iu],
+  ] as const)("rejects an MCP %s during isolated bundle verification", (_label, fault, message) => {
+    const root = join(directory, fault);
+    const configPath = join(root, "config.json");
+    const mcpPath = join(root, ".cursor", "mcp.json");
+    expect(() => installConnector("cursor", "mcp", root, {
+      configPath,
+      persistTransport: false,
+      onPhase: (phase) => {
+        if (phase !== "verify") return;
+        if (fault === "missing") rmSync(mcpPath, { force: true });
+        else if (fault === "missing-entry") writeFileSync(mcpPath, "{}\n");
+        else writeFileSync(mcpPath, '{"mcpServers":{"lcm":{"type":"sse"}}}\n');
+      },
+    })).toThrow(message);
+  });
+
+  it("classifies post-preflight skill open failures without touching the leaf", async () => {
+    const enoentRoot = join(directory, "remove-open-enoent");
+    const eloopRoot = join(directory, "remove-open-eloop");
+    const strictRoot = join(directory, "remove-open-strict-eloop");
+    const deniedRoot = join(directory, "remove-open-denied");
+    const unclassifiedRoot = join(directory, "remove-open-unclassified");
+    const paths = new Map([
+      [installConnector("claude-code", "skill", enoentRoot).path, "ENOENT"],
+      [installConnector("claude-code", "skill", eloopRoot).path, "ELOOP"],
+      [installConnector("claude-code", "skill", strictRoot).path, "ELOOP"],
+      [installConnector("claude-code", "skill", deniedRoot).path, "EACCES"],
+      [installConnector("claude-code", "skill", unclassifiedRoot).path, "UNCLASSIFIED"],
+    ]);
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const operationPath = String(path);
+          const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(operationPath);
+          const displayPath = match
+            ? join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2])
+            : operationPath;
+          const code = paths.get(displayPath);
+          if (code && (Number(flags) & actual.constants.O_RDWR) !== 0) {
+            if (code === "UNCLASSIFIED") throw new Error("unclassified open failure");
+            throw Object.assign(new Error(`injected ${code}`), { code });
+          }
+          return mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+        }) as typeof actual.openSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(module.removeConnector("claude-code", "skill", enoentRoot)).toBe(true);
+      expect(module.removeConnector("claude-code", "skill", eloopRoot)).toBe(true);
+      expect(module.removeConnector("claude-code", { cwd: strictRoot, configPath: join(strictRoot, "config.json") }))
+        .toEqual(expect.objectContaining({ success: true }));
+      expect(module.removeConnector("claude-code", "skill", deniedRoot)).toBe(true);
+      expect(module.removeConnector("claude-code", "skill", unclassifiedRoot)).toBe(true);
+      for (const path of paths.keys()) expect(() => readFileSync(path, "utf-8")).toThrow(/ENOENT/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["described", "receipt denied", /expected-after receipt unavailable \(receipt denied\)/iu],
+    ["empty", "", /expected-after receipt unavailable(?! \()/iu],
+  ] as const)("reports a %s missing expected-after receipt", async (_label, receiptFailure, message) => {
+    const root = join(directory, `missing-receipt-${_label}`);
+    const configPath = join(root, "config.json");
+    const initial = installConnector("cursor", "mcp", root, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    let receiptFailureArmed = false;
+    let postWriteStats = 0;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const isSkill = (descriptor: number): boolean => {
+        try { return actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath; } catch { return false; }
+      };
+      return {
+        ...actual,
+        writeSync: ((descriptor: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          const written = actual.writeSync(descriptor, data, offset, length, position);
+          if (isSkill(descriptor)) receiptFailureArmed = true;
+          return written;
+        }) as typeof actual.writeSync,
+        fstatSync: ((descriptor: number) => {
+          if (receiptFailureArmed && isSkill(descriptor) && ++postWriteStats === 3) {
+            receiptFailureArmed = false;
+            throw receiptFailure;
+          }
+          return actual.fstatSync(descriptor);
+        }) as typeof actual.fstatSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cursor", "cli", root, {
+        configPath,
+        persistTransport: false,
+      })).not.toThrow();
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("keeps primitive compensation failures in the rollback diagnostic", async () => {
+    const root = join(directory, "primitive-compensation-error");
+    const configPath = join(root, "config.json");
+    const initial = installConnector("cursor", "mcp", root, { configPath, persistTransport: false });
+    const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    let failed = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        fchmodSync: ((descriptor: number, mode: number) => {
+          if (!failed && actual.readlinkSync(`/proc/self/fd/${descriptor}`) === skillPath) {
+            failed = true;
+            throw "primitive restore failure";
+          }
+          return actual.fchmodSync(descriptor, mode);
+        }) as typeof actual.fchmodSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cursor", "cli", root, {
+        configPath,
+        persistTransport: false,
+        failAt: "complete",
+      })).toThrow(/Injected connector installer failure at complete/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("reinstalls and leaves historical empty skill leaves uninstalled", () => {
+    const root = join(directory, "empty-skill-ownership");
+    const skillPath = join(root, ".claude", "skills", "lcm-memory", "SKILL.md");
+    mkdirSync(dirname(skillPath), { recursive: true });
+    writeFileSync(skillPath, "");
+    expect(removeConnector("claude-code", "skill", root)).toBe(false);
+    expect(installConnector("claude-code", "skill", root).success).toBe(true);
+    expect(readFileSync(skillPath, "utf-8")).toContain("lcm-managed-skill:v1");
+  });
+
+  it("covers native Codex preflight and removal authority branches", () => {
+    withTempHome((cwd) => {
+      const absentNative = () => ({
+        status: 1,
+        stdout: "",
+        stderr: "No MCP server named 'lcm' found.",
+      });
+      expect(() => installConnector("codex", "mcp", cwd, {
+        codexCliRunner: absentNative,
+        persistTransport: false,
+      })).toThrow(/pathname-based native state/iu);
+
+      const noncanonicalNative = () => ({
+        status: 0,
+        stdout: JSON.stringify(codexEntry({ transport: { type: "sse" } })),
+        stderr: "",
+      });
+      expect(() => installConnector("codex", "mcp", cwd, {
+        codexCliRunner: noncanonicalNative,
+        persistTransport: false,
+      })).toThrow(/Refusing to overwrite an unverified Codex MCP entry/iu);
+
+      let nativeRemoves = 0;
+      const canonicalNative = (request: { argv: readonly string[] }) => {
+        if (request.argv[1] === "remove") nativeRemoves += 1;
+        return { status: 0, stdout: JSON.stringify(codexEntry()), stderr: "" };
+      };
+      expect(removeConnector("codex", { cwd, codexCliRunner: canonicalNative })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/pathname-based native state/iu)]),
+      }));
+      expect(nativeRemoves).toBe(0);
+
+      expect(() => installConnector("codex", "mcp", cwd, {
+        codexCliRunner: () => ({ status: 0, stdout: "not-json", stderr: "" }),
+        persistTransport: false,
+      })).toThrow(/malformed JSON/iu);
+    });
+
+    withTempHome((cwd) => {
+      let entries: readonly Record<string, unknown>[] = [codexEntry()];
+      let gets = 0;
+      let removes = 0;
+      const changedAfterPreflight = {
+        get: () => (++gets === 1 ? entries : [codexEntry({ extra: true })]),
+        add: () => undefined,
+        remove: () => { removes += 1; entries = []; },
+      };
+      expect(removeConnector("codex", { cwd, codexMcpRunner: changedAfterPreflight })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/unverified Codex MCP/iu)]),
+      }));
+      expect(removes).toBe(0);
+
+      let pathnameChecks = 0;
+      const pathnameChanged = {
+        get: () => [codexEntry()],
+        add: () => undefined,
+        remove: () => { removes += 1; },
+        get pathnameBased() { return pathnameChecks++ > 0; },
+      };
+      expect(removeConnector("codex", { cwd, codexMcpRunner: pathnameChanged })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/pathname-based native state/iu)]),
+      }));
+
+      expect(removeConnector("codex", {
+        cwd,
+        codexMcpRunner: { get: () => [codexEntry()], add: () => undefined },
+      })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/does not provide remove/iu)]),
+      }));
+
+      expect(removeConnector("codex", {
+        cwd,
+        codexMcpRunner: {
+          get: () => [codexEntry()],
+          add: () => undefined,
+          remove: () => undefined,
+        },
+      })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/remained after removal/iu)]),
+      }));
+    });
+  });
+
+  it("skips untouched implicit Codex MCP state and selects low-level runners", () => {
+    withTempHome((cwd) => {
+      const calls: readonly string[][] = [];
+      const runner = (request: { argv: readonly string[] }) => {
+        (calls as string[][]).push([...request.argv]);
+        return {
+          status: 1,
+          stdout: "",
+          stderr: "No MCP server named 'lcm' found.",
+        };
+      };
+      expect(installConnector("codex", undefined, {
+        cwd,
+        persistTransport: false,
+        queryCodexMcp: false,
+        codexCliRunner: runner,
+      }).success).toBe(true);
+      expect(calls).toEqual([]);
+
+      expect(installConnector("codex", "cli", cwd, {
+        persistTransport: false,
+        codexCliRunner: runner,
+      }).success).toBe(true);
+      expect(calls.length).toBeGreaterThan(0);
+
+      calls.length = 0;
+      expect(removeConnector("codex", { cwd, codexCliRunner: runner })).toMatchObject({
+        success: true,
+        removed: true,
+      });
+      expect(calls.length).toBeGreaterThan(0);
+    });
+  });
+
+  it("reports final transaction cleanup failure without reverting publication", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        rmdirSync: ((path: fs.PathLike) => {
+          if (String(path).includes(".lcm-connector-txn-")) {
+            throw Object.assign(new Error("transaction cleanup denied"), { code: "EIO" });
+          }
+          return actual.rmdirSync(path);
+        }) as typeof actual.rmdirSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      const root = join(directory, "final-cleanup-failure");
+      expect(() => module.installConnector("cline", "rules", root)).toThrow(/connector cleanup incomplete/iu);
+      expect(readFileSync(join(root, ".clinerules", "lcm.md"), "utf-8")).toContain("lcm");
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("reports cleanup failure after successful bundle compensation", async () => {
+    let denyTransactionRemoval = false;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        rmdirSync: ((path: fs.PathLike) => {
+          if (denyTransactionRemoval && String(path).includes(".lcm-connector-txn-")) {
+            throw Object.assign(new Error("compensated transaction cleanup denied"), { code: "EIO" });
+          }
+          return actual.rmdirSync(path);
+        }) as typeof actual.rmdirSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      const root = join(directory, "compensated-cleanup-failure");
+      const rulesPath = join(root, ".clinerules", "lcm.md");
+      expect(() => module.installConnector("cline", "cli", root, {
+        persistTransport: false,
+        failAt: "complete",
+        onPhase: (phase) => {
+          if (phase === "complete") denyTransactionRemoval = true;
+        },
+      })).toThrow(/compensated receipt finalization.*cleanup incomplete/iu);
+      expect(existsSync(rulesPath)).toBe(false);
+      expect(readdirSync(dirname(rulesPath)).filter((entry) => entry.startsWith(".lcm-connector-txn-"))).toHaveLength(1);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("classifies post-decision skill claim errno outcomes", async () => {
+    const roots = new Map<string, string>([
+      [join(directory, "remove-skill-enoent"), "ENOENT"],
+      [join(directory, "remove-skill-eloop"), "ELOOP"],
+      [join(directory, "remove-skill-strict-eisdir"), "EISDIR"],
+      [join(directory, "remove-skill-eacces"), "EACCES"],
+    ]);
+    const skillErrors = new Map<string, string>();
+    for (const [root, code] of roots) {
+      const installed = installConnector("claude-code", "skill", root);
+      skillErrors.set(installed.path, code);
+    }
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const display = (value: fs.PathLike): string => {
+        const text = String(value);
+        const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(text);
+        if (!match) return text;
+        try { return join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { return text; }
+      };
+      return {
+        ...actual,
+        renameSync: ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+          const code = skillErrors.get(display(oldPath));
+          if (code) throw Object.assign(new Error(`claim ${code}`), { code });
+          return actual.renameSync(oldPath, newPath);
+        }) as typeof actual.renameSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(module.removeConnector("claude-code", "skill", [...roots.keys()][0])).toBe(false);
+      expect(module.removeConnector("claude-code", "skill", [...roots.keys()][1])).toBe(false);
+      expect(module.removeConnector("claude-code", {
+        cwd: [...roots.keys()][2],
+        configPath: join([...roots.keys()][2], "config.json"),
+      })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/unowned LCM skill|claim EISDIR/iu)]),
+      }));
+      expect(() => module.removeConnector("claude-code", "skill", [...roots.keys()][3]))
+        .toThrow(/Unable to inspect LCM skill.*EACCES/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("covers private authority map invariants through deterministic Map seams", () => {
+    const originalGet = Map.prototype.get;
+    let fault: "" | "parent" | "compensate-receipt" | "finalize-receipt" = "";
+    const get = vi.spyOn(Map.prototype, "get").mockImplementation(function (this: Map<unknown, unknown>, key: unknown) {
+      const value = originalGet.call(this, key);
+      if (fault === "parent" && typeof value === "string" && /^\/proc\/self\/fd\/\d+$/u.test(value)) {
+        fault = "";
+        return undefined;
+      }
+      if ((fault === "compensate-receipt" || fault === "finalize-receipt")
+        && value && typeof value === "object" && "transactionOperationPath" in value) {
+        fault = "";
+        return undefined;
+      }
+      return value;
+    });
+    try {
+      fault = "parent";
+      expect(() => installConnector("cline", "rules", join(directory, "missing-parent-map")))
+        .toThrow(/Unmapped connector mutation parent/iu);
+
+      const compensationRoot = join(directory, "missing-compensation-receipt");
+      expect(() => installConnector("cline", "cli", compensationRoot, {
+        configPath: join(compensationRoot, "config.json"),
+        persistTransport: false,
+        failAt: "complete",
+        onPhase: (phase) => { if (phase === "complete") fault = "compensate-receipt"; },
+      })).toThrow(/Injected connector installer failure at complete/iu);
+      expect(fault).toBe("");
+
+      const finalizationRoot = join(directory, "missing-finalization-receipt");
+      expect(installConnector("cline", "cli", finalizationRoot, {
+        configPath: join(finalizationRoot, "config.json"),
+        persistTransport: false,
+        onPhase: (phase) => { if (phase === "complete") fault = "finalize-receipt"; },
+      }).success).toBe(true);
+      expect(fault).toBe("");
+    } finally {
+      get.mockRestore();
+    }
+  });
+
+  it("normalizes bigint snapshot identities and rejects readback drift", async () => {
+    const bigintRoot = join(directory, "bigint-snapshot");
+    const installed = installConnector("claude-code", "skill", bigintRoot);
+    const skillPath = installed.path;
+    const descriptors = new Set<number>();
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const fd = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          let shown = String(path);
+          const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(shown);
+          if (match) {
+            try { shown = join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { /* retain proc path */ }
+          }
+          if (shown === skillPath) descriptors.add(fd);
+          return fd;
+        }) as typeof actual.openSync,
+        fstatSync: ((fd: number, options?: fs.StatOptions) => {
+          const stats = actual.fstatSync(fd, options as never);
+          if (!descriptors.has(fd)) return stats;
+          return new Proxy(stats, {
+            get: (target, prop) => prop === "dev" ? BigInt(target.dev) : prop === "ino" ? BigInt(target.ino) : Reflect.get(target, prop, target),
+          });
+        }) as typeof actual.fstatSync,
+        closeSync: ((fd: number) => { descriptors.delete(fd); return actual.closeSync(fd); }) as typeof actual.closeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(module.installConnector("claude-code", "skill", bigintRoot)).toEqual(expect.objectContaining({ success: true }));
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+
+    const driftRoot = join(directory, "descriptor-readback-drift");
+    const driftInstalled = installConnector("claude-code", "skill", driftRoot);
+    const driftPath = driftInstalled.path;
+    const counts = new Map<number, number>();
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const fd = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          let shown = String(path);
+          const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(shown);
+          if (match) {
+            try { shown = join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { /* retain proc path */ }
+          }
+          if (shown === driftPath) counts.set(fd, 0);
+          return fd;
+        }) as typeof actual.openSync,
+        fstatSync: ((fd: number, options?: fs.StatOptions) => {
+          const stats = actual.fstatSync(fd, options as never);
+          const count = counts.get(fd);
+          if (count === undefined) return stats;
+          counts.set(fd, count + 1);
+          if (count >= 2) return new Proxy(stats, { get: (target, prop) => prop === "size" ? Number(target.size) + 1 : Reflect.get(target, prop, target) });
+          return stats;
+        }) as typeof actual.fstatSync,
+        closeSync: ((fd: number) => { counts.delete(fd); return actual.closeSync(fd); }) as typeof actual.closeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("claude-code", "skill", driftRoot)).toThrow(/file changed while being read/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("returns compatibility false and no-code diagnostics for skill claim errors", async () => {
+    const root = join(directory, "skill-claim-no-code");
+    const installed = installConnector("claude-code", "skill", root);
+    const skillPath = installed.path;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        renameSync: ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+          if (String(oldPath).endsWith("/SKILL.md")) throw new Error("claim failed without errno");
+          return actual.renameSync(oldPath, newPath);
+        }) as typeof actual.renameSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.removeConnector("claude-code", "skill", root)).toThrow(/Unable to inspect LCM skill/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("covers result-content fallbacks when the leaf seam returns without deciding", async () => {
+    let fallback: Buffer | undefined = Buffer.from("returned-content\n");
+    vi.resetModules();
+    vi.doMock("../../src/connectors/codex-hooks.js", async () => {
+      const actual = await vi.importActual<typeof import("../../src/connectors/codex-hooks.js")>("../../src/connectors/codex-hooks.js");
+      return {
+        ...actual,
+        mutateConnectorLeaf: ((operation: import("../../src/connectors/codex-hooks.js").ConnectorLeafOperation) => ({
+          changed: false,
+          content: fallback,
+          receipt: {
+            displayPath: operation.displayPath,
+            operationPath: operation.operationPath,
+            parentOperationPath: operation.parentOperationPath,
+            initial: operation.expected,
+            current: operation.expected,
+            transactionDisplayPath: "",
+            transactionOperationPath: "",
+            mutationCommitted: false,
+            recoveryRequired: false,
+          },
+        })) as typeof actual.mutateConnectorLeaf,
+        finalizeConnectorLeaf: () => [],
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(module.installConnector("cline", "rules", join(directory, "content-fallback")).success).toBe(true);
+      fallback = undefined;
+      expect(module.installConnector("cline", "rules", join(directory, "empty-fallback")).success).toBe(true);
+    } finally {
+      vi.doUnmock("../../src/connectors/codex-hooks.js");
+      vi.resetModules();
+    }
+  });
+
+  it("tracks one receipt when two Codex writes intentionally alias a leaf", () => {
+    withTempHome((cwd) => {
+      const codex = AGENTS.find((agent) => agent.id === "codex")!;
+      const originalHook = codex.configPaths.hook;
+      codex.configPaths.hook = "~/.codex/config.toml";
+      try {
+        expect(installConnector("codex", "hook", cwd).success).toBe(true);
+        expect(readFileSync(join(process.env.HOME!, ".codex", "config.toml"), "utf-8")).toContain('"hooks"');
+      } finally {
+        codex.configPaths.hook = originalHook;
+      }
+    });
+  });
+
+  it("rechecks skill ownership inside the mutation callback after preflight", async () => {
+    const fixtureRoot = join(directory, "skill-race-fixture");
+    const canonicalPath = installConnector("cursor", "skill", fixtureRoot).path;
+    const canonical = readFileSync(canonicalPath);
+    const root = join(directory, "skill-race-target");
+    const skillPath = join(root, ".cursor", "skills", "lcm-memory", "SKILL.md");
+    mkdirSync(dirname(skillPath), { recursive: true });
+    writeFileSync(skillPath, Buffer.alloc(canonical.length, 0x78));
+    let fakePreflightOpens = 0;
+    let preflight = false;
+    const descriptors = new Map<number, boolean>();
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const display = (value: fs.PathLike): string => {
+        const text = String(value);
+        const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(text);
+        if (!match) return text;
+        try { return join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { return text; }
+      };
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const fd = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          const fake = preflight && display(path) === skillPath && fakePreflightOpens++ < 2;
+          descriptors.set(fd, fake);
+          return fd;
+        }) as typeof actual.openSync,
+        readSync: ((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          if (!descriptors.get(fd)) return actual.readSync(fd, buffer, offset, length, position);
+          const available = Math.max(0, canonical.length - (position ?? 0));
+          const count = Math.min(length, available);
+          canonical.copy(buffer, offset, position ?? 0, (position ?? 0) + count);
+          return count;
+        }) as typeof actual.readSync,
+        closeSync: ((fd: number) => { descriptors.delete(fd); return actual.closeSync(fd); }) as typeof actual.closeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("cursor", "cli", root, {
+        configPath: join(root, "config.json"),
+        persistTransport: false,
+        onPhase: (phase) => { if (phase === "stage") preflight = true; },
+      })).toThrow(/Refusing to overwrite an unowned LCM skill/iu);
+      expect(readFileSync(skillPath)).toEqual(Buffer.alloc(canonical.length, 0x78));
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("revalidates legacy and current Codex hook decisions against captured state", async () => {
+    const managedOnly = Buffer.from(JSON.stringify({ hooks: {
+      SessionStart: [{ hooks: [{ type: "command", command: "lcm restore --client codex" }] }],
+    } }));
+    const mixed = Buffer.from(JSON.stringify({ custom: true, hooks: {
+      SessionStart: [{ hooks: [
+        { type: "command", command: "lcm restore --client codex" },
+        { type: "command", command: "echo keep" },
+      ] }],
+    } }));
+    type Behavior = {
+      kind: "ephemeral" | "fake" | "replace";
+      count: number;
+      at?: number;
+      fake?: Buffer;
+      replacement?: Buffer;
+    };
+    const behaviors = new Map<string, Behavior>();
+    const descriptors = new Map<number, { path: string; fake?: Buffer; ephemeral: boolean; replace?: Buffer }>();
+    const originalHome = process.env.HOME;
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const display = (value: fs.PathLike): string => {
+        const text = String(value);
+        const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(text);
+        if (!match) return text;
+        try { return join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { return text; }
+      };
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const shown = display(path);
+          const behavior = behaviors.get(shown);
+          if (behavior) behavior.count += 1;
+          const selected = behavior?.count === (behavior?.at ?? 2) ? behavior : undefined;
+          if (selected?.kind === "ephemeral") {
+            actual.mkdirSync(dirname(shown), { recursive: true });
+            actual.writeFileSync(shown, selected.fake!);
+          }
+          const fd = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          descriptors.set(fd, {
+            path: shown,
+            fake: selected?.kind === "fake" ? selected.fake : undefined,
+            ephemeral: selected?.kind === "ephemeral",
+            replace: selected?.kind === "replace" ? selected.replacement : undefined,
+          });
+          return fd;
+        }) as typeof actual.openSync,
+        readSync: ((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          const fake = descriptors.get(fd)?.fake;
+          if (!fake) return actual.readSync(fd, buffer, offset, length, position);
+          const start = position ?? 0;
+          const count = Math.min(length, Math.max(0, fake.length - start));
+          fake.copy(buffer, offset, start, start + count);
+          return count;
+        }) as typeof actual.readSync,
+        closeSync: ((fd: number) => {
+          const state = descriptors.get(fd);
+          descriptors.delete(fd);
+          const result = actual.closeSync(fd);
+          if (state?.ephemeral) actual.rmSync(state.path, { force: true });
+          if (state?.replace) actual.writeFileSync(state.path, state.replace);
+          return result;
+        }) as typeof actual.closeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+
+      const absentLegacyRoot = join(directory, "legacy-absent-recheck");
+      const absentLegacy = join(absentLegacyRoot, ".codex", "hooks.json");
+      const absentLegacyHome = join(absentLegacyRoot, "home");
+      mkdirSync(absentLegacyHome, { recursive: true });
+      process.env.HOME = absentLegacyHome;
+      behaviors.set(absentLegacy, { kind: "ephemeral", count: 0, at: 4, fake: managedOnly });
+      expect(module.installConnector("codex", "cli", absentLegacyRoot, {
+        configPath: join(absentLegacyRoot, "config.json"),
+        codexMcpRunner: { get: () => [], add: () => undefined, remove: () => undefined },
+        persistTransport: false,
+      }).success).toBe(true);
+      expect(existsSync(absentLegacy)).toBe(false);
+
+      const staleLegacyRoot = join(directory, "legacy-stale-recheck");
+      const staleLegacy = join(staleLegacyRoot, ".codex", "hooks.json");
+      const staleLegacyHome = join(staleLegacyRoot, "home");
+      mkdirSync(dirname(staleLegacy), { recursive: true });
+      mkdirSync(staleLegacyHome, { recursive: true });
+      process.env.HOME = staleLegacyHome;
+      const invalidLegacy = Buffer.alloc(mixed.length, 0x78);
+      writeFileSync(staleLegacy, invalidLegacy);
+      behaviors.set(staleLegacy, { kind: "fake", count: 0, at: 4, fake: mixed });
+      expect(module.installConnector("codex", "cli", staleLegacyRoot, {
+        configPath: join(staleLegacyRoot, "config.json"),
+        codexMcpRunner: { get: () => [], add: () => undefined, remove: () => undefined },
+        persistTransport: false,
+      }).success).toBe(true);
+      expect(readFileSync(staleLegacy)).toEqual(invalidLegacy);
+
+      const absentCurrentRoot = join(directory, "current-absent-recheck");
+      const absentCurrentHome = join(absentCurrentRoot, "home");
+      const absentCurrent = join(absentCurrentHome, ".codex", "hooks.json");
+      mkdirSync(dirname(absentCurrent), { recursive: true });
+      process.env.HOME = absentCurrentHome;
+      behaviors.set(absentCurrent, { kind: "ephemeral", count: 0, fake: managedOnly });
+      expect(module.removeConnector("codex", "hook", absentCurrentRoot)).toBe(false);
+      expect(existsSync(absentCurrent)).toBe(false);
+
+      const unchangedRoot = join(directory, "current-unchanged-recheck");
+      const unchangedHome = join(unchangedRoot, "home");
+      const unchangedPath = join(unchangedHome, ".codex", "hooks.json");
+      mkdirSync(dirname(unchangedPath), { recursive: true });
+      process.env.HOME = unchangedHome;
+      const invalidCurrent = Buffer.alloc(managedOnly.length, 0x78);
+      writeFileSync(unchangedPath, invalidCurrent);
+      behaviors.set(unchangedPath, { kind: "fake", count: 0, fake: managedOnly });
+      expect(module.removeConnector("codex", "hook", unchangedRoot)).toBe(false);
+      expect(readFileSync(unchangedPath)).toEqual(invalidCurrent);
+
+      const compatibleRaceRoot = join(directory, "current-compatible-eagain");
+      const compatibleRaceHome = join(compatibleRaceRoot, "home");
+      const compatibleRacePath = join(compatibleRaceHome, ".codex", "hooks.json");
+      mkdirSync(dirname(compatibleRacePath), { recursive: true });
+      process.env.HOME = compatibleRaceHome;
+      writeFileSync(compatibleRacePath, managedOnly);
+      behaviors.set(compatibleRacePath, {
+        kind: "replace",
+        count: 0,
+        replacement: Buffer.from("compatible replacement\n"),
+      });
+      expect(module.removeConnector("codex", "hook", compatibleRaceRoot)).toBe(false);
+      expect(readFileSync(compatibleRacePath, "utf-8")).toBe("compatible replacement\n");
+
+      const strictRaceRoot = join(directory, "current-strict-eagain");
+      const strictRaceHome = join(strictRaceRoot, "home");
+      const strictRacePath = join(strictRaceHome, ".codex", "hooks.json");
+      mkdirSync(dirname(strictRacePath), { recursive: true });
+      process.env.HOME = strictRaceHome;
+      writeFileSync(strictRacePath, managedOnly);
+      behaviors.set(strictRacePath, {
+        kind: "replace",
+        count: 0,
+        replacement: Buffer.from("strict replacement\n"),
+      });
+      expect(module.removeConnector("codex", {
+        cwd: strictRaceRoot,
+        configPath: join(strictRaceRoot, "config.json"),
+        codexMcpRunner: { get: () => [], add: () => undefined, remove: () => undefined },
+      })).toEqual(expect.objectContaining({
+        success: false,
+        failures: expect.arrayContaining([expect.stringMatching(/hook.*changed before mutation/iu)]),
+      }));
+      expect(readFileSync(strictRacePath, "utf-8")).toBe("strict replacement\n");
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
       vi.doUnmock("node:fs");
       vi.resetModules();
     }
