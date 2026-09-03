@@ -483,7 +483,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(206);
   });
 
-  test("keeps response-fence and #700/#701/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804 files in their intended components", () => {
+  test("keeps response-fence and #700/#701/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
