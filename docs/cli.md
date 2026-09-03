@@ -117,6 +117,15 @@ exempt according to the command-routing policy. When connector inspection is
 unavailable, `connectors doctor` reads its stored transport hint through the
 same bounded, stable, lock-free configuration admission.
 
+The configuration read used by `lcm doctor` and by connector transport
+resolution is also lock-free and authenticated. This prevents a healthy
+managed daemon's short background publication reconciliation immediately after
+`lcm install` from causing the next doctor or `lcm connectors install codex`
+command to fail merely because the daemon temporarily owns the exclusive
+publication lock. Any subsequent configuration write, including an explicit
+transport preference, still takes the normal authenticated mutation lock and
+remains fail closed if that lock is held by another operation.
+
 ## Daemon-dependent resilience
 
 `lcm doctor` limits the complete daemon health exchange to two seconds. The

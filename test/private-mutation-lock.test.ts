@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   PrivateMutationLockContentionError,
   PrivateMutationPermitRevokedError,
+  readPrivateMutationLockOwner,
   trustedProcessBirthExecutableForTesting,
   withPrivateMutationLock,
   withPrivateMutationLocksAsync,
@@ -87,6 +88,18 @@ function strandOwnedLock(
 }
 
 describe("private mutation lock release recovery", () => {
+  it("reads only an authenticated owner record and treats absence as no owner", () => {
+    const { lockPath } = makeLock();
+    expect(readPrivateMutationLockOwner(lockPath)).toBeNull();
+    writeFileSync(lockPath, ownerContent("a".repeat(32)), { mode: 0o600 });
+    expect(readPrivateMutationLockOwner(lockPath)).toMatchObject({
+      pid: process.pid,
+      processStartTime: "0",
+    });
+    writeFileSync(lockPath, "{", { mode: 0o600 });
+    expect(() => readPrivateMutationLockOwner(lockPath)).toThrow("lock is malformed");
+  });
+
   it("recovers an owned lock when cleanup fails after a successful mutation", () => {
     const { lockPath } = makeLock();
     const releaseFailure = new Error("release observer failed");

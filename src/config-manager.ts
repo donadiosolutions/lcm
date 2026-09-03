@@ -459,15 +459,13 @@ function persistConnectorTransportConfig(
   writeConfigAtomic(configPath, persistedContent, file.observedContent);
 }
 
-/** Read one validated stored connector transport under the configuration lock. */
+/** Read one validated stored connector transport through stable lock-free admission. */
 export function readConnectorTransport(configPath: string, agentId: string): ConnectorTransport | undefined {
-  return withBackendPublicationConfigLock(configPath, (lockToken) => {
-    const file = readConfigContent(configPath);
-    const stored = parseStoredConfig(file.content);
-    const backend = configBackend(file.content);
-    assertBackendPublicationConfigAccess(configPath, backend, file.observedContent, undefined, lockToken);
-    return readConnectorTransportFromStored(stored, agentId);
-  });
+  // Transport resolution is a read-only preflight used by connector installs.
+  // Keep it admissible while the managed daemon performs a publication: the
+  // lock-free snapshot path authenticates the publication and double-reads the
+  // descriptor, while reserving the exclusive lock for the later setter.
+  return readConnectorTransportSnapshot(configPath, agentId);
 }
 
 type ConnectorTransportSnapshotOptions = Readonly<{
@@ -529,11 +527,15 @@ export function readConnectorTransportSnapshot(
 ): ConnectorTransport | undefined {
   const first = readConnectorConfigSnapshot(configPath);
   const backend = configBackend(first.content);
-  assertBackendPublicationConfigReadAccess(configPath, backend, first.witness);
+  const firstAdmission = assertBackendPublicationConfigReadAccess(configPath, backend, first.witness);
   options._afterFirstSnapshotForTesting?.();
   const second = readConnectorConfigSnapshot(configPath);
   if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
     throw new ConfigManagerError("Configuration changed during lock-free connector transport inspection.");
+  }
+  const secondAdmission = assertBackendPublicationConfigReadAccess(configPath, backend, second.witness);
+  if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
+    throw new ConfigManagerError("Backend publication changed during lock-free connector transport inspection.");
   }
   return readConnectorTransportFromStored(parseStoredConfig(second.content), agentId);
 }

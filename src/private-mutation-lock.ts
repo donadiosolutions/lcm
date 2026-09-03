@@ -13,7 +13,7 @@ const MAX_PRIVATE_MUTATION_LOCK_BYTES = 1024;
 const MAX_DISAPPEARED_OWNER_READ_RETRIES = 1;
 const abandonedMutationLocks = new Map<string, string>();
 
-type PrivateMutationLockOwner = {
+export type PrivateMutationLockOwner = {
   readonly version: 1;
   readonly pid: number;
   readonly processStartTime: string | null;
@@ -196,6 +196,19 @@ function readLockOwner(
     content,
     owner: owner as PrivateMutationLockOwner,
   };
+}
+
+/** @internal Read one authenticated lock owner for bounded convergence callers. */
+export function readPrivateMutationLockOwner(
+  lockPath: string,
+  label = "private mutation",
+): PrivateMutationLockOwner | null {
+  try {
+    return readLockOwner(lockPath, label).owner;
+  } catch (error) {
+    if (isMissingFileError(error)) return null;
+    throw error;
+  }
 }
 
 function createReclaimClaim(

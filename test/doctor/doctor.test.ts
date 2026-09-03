@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { renderGuidance } from "../../src/connectors/template-service.js";
 import { mergeClaudeSettings, REQUIRED_HOOKS } from "../../installer/install.js";
 import { legacyLcmMcpServerName } from "../../src/legacy-names.js";
@@ -11,6 +12,7 @@ import { LCM_MD_CONTENT } from "../../src/daemon/orientation.js";
 import { ensureDaemon, restartDaemon } from "../../src/daemon/lifecycle.js";
 import { emitDaemonNotice } from "../../src/hooks/daemon-notice.js";
 import { daemonRemediationMarkerPath } from "../../src/daemon/remediation.js";
+import { packageExecutable } from "../../src/runtime-root.js";
 import {
   clearProjectMapCache,
   hashProjectPath,
@@ -20,6 +22,7 @@ import * as projectMapModule from "../../src/project-map.js";
 import {
   BackendPublicationJournalError,
   backendPublicationCanonicalSha256,
+  withBackendPublicationConfigLockAsync,
 } from "../../src/storage/backend-publication.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
@@ -36,6 +39,7 @@ import { collectDetailedEventStats, collectEventStats } from "../../src/db/event
 const mockCollectEventStats = vi.mocked(collectEventStats);
 const mockCollectDetailedEventStats = vi.mocked(collectDetailedEventStats);
 let defaultDoctorHome: string;
+const TEST_RUNTIME_ENTRYPOINT = packageExecutable(import.meta.url, 3);
 
 beforeEach(() => {
   defaultDoctorHome = mkdtempSync(join(tmpdir(), "lcm-doctor-default-home-"));
@@ -97,6 +101,18 @@ function minimalDeps(overrides: Partial<Parameters<typeof runDoctor>[0]> = {}) {
     _assertBackendPublication: () => undefined,
     ...overrides,
   };
+}
+
+function writeLivePublicationOwner(home: string): void {
+  const stat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
+  const processStartTime = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? "";
+  writeFileSync(join(home, ".lcm.backend-publication.lock"), `${JSON.stringify({
+    version: 1,
+    pid: process.pid,
+    processStartTime,
+    nonce: "a".repeat(32),
+    createdAtMs: Date.now(),
+  })}\n`, { mode: 0o600 });
 }
 
 describe("doctor test fixture isolation", () => {
@@ -315,6 +331,175 @@ describe("runDoctor Claude integration ownership", () => {
 });
 
 describe("runDoctor project map checks", () => {
+  it("admits a doctor read while the publication lock is held", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-lock-contention-"));
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(home, ".lcm", "config.json"), "{}\n", { mode: 0o600 });
+    try {
+      await withBackendPublicationConfigLockAsync(join(home, ".lcm", "config.json"), async () => {
+        const results = await runDoctor(minimalDeps({ homedir: home, _assertBackendPublication: undefined }));
+        expect(results.find((result) => result.name === "config")).toMatchObject({ status: "pass" });
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("converges lifecycle admission only after authenticated daemon contention releases", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-lifecycle-contention-"));
+    const configPath = join(home, ".lcm", "config.json");
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    let signalLifecycleAttempt!: () => void;
+    const lifecycleAttempted = new Promise<void>(resolve => { signalLifecycleAttempt = resolve; });
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    vi.mocked(ensureDaemon)
+      .mockImplementationOnce(async () => {
+        signalLifecycleAttempt();
+        throw contention;
+      })
+      .mockResolvedValueOnce({ connected: false });
+    const deps = minimalDeps({
+      homedir: home,
+      _assertBackendPublication: undefined,
+      fetch: vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: process.pid, entrypoint: TEST_RUNTIME_ENTRYPOINT }),
+      }),
+      readFileSync: (path: string) => path.endsWith("daemon.token")
+        ? "doctor-token"
+        : minimalDeps().readFileSync(path),
+    });
+    let pending!: Promise<Awaited<ReturnType<typeof runDoctor>>>;
+    const holder = withBackendPublicationConfigLockAsync(configPath, async () => {
+      pending = runDoctor(deps);
+      await lifecycleAttempted;
+    });
+    // The holder callback returns after the first contention, releasing the
+    // lock while doctor remains in its bounded convergence helper.
+    await holder;
+    const results = await pending;
+    expect(results.find((result) => result.name === "daemon")).toBeDefined();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("keeps lifecycle contention fail closed for a foreign daemon owner", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-foreign-contention-"));
+    const configPath = join(home, ".lcm", "config.json");
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    let signalLifecycleAttempt!: () => void;
+    const lifecycleAttempted = new Promise<void>(resolve => { signalLifecycleAttempt = resolve; });
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    vi.mocked(ensureDaemon).mockImplementationOnce(async () => {
+      signalLifecycleAttempt();
+      throw contention;
+    });
+    const foreignPid = process.pid + 1;
+    const deps = minimalDeps({
+      homedir: home,
+      _assertBackendPublication: undefined,
+      fetch: vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: foreignPid, entrypoint: TEST_RUNTIME_ENTRYPOINT }),
+      }),
+    });
+    let pending!: Promise<Awaited<ReturnType<typeof runDoctor>>>;
+    const holder = withBackendPublicationConfigLockAsync(configPath, async () => {
+      pending = runDoctor(deps);
+      await lifecycleAttempted;
+    });
+    await holder;
+    const results = await pending;
+    expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+    expect(results.find((result) => result.name === "daemon")?.status).toBe("warn");
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("does not retry version-mismatch repair through daemon-owned contention", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-version-contention-"));
+    const configPath = join(home, ".lcm", "config.json");
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    let signalLifecycleAttempt!: () => void;
+    const lifecycleAttempted = new Promise<void>(resolve => { signalLifecycleAttempt = resolve; });
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    vi.mocked(restartDaemon).mockImplementationOnce(async () => {
+      signalLifecycleAttempt();
+      throw contention;
+    });
+    const deps = minimalDeps({
+      homedir: home,
+      _assertBackendPublication: undefined,
+      fetch: vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ status: "ok", version: "0.4.0", storageBackend: "sqlite", pid: process.pid, entrypoint: TEST_RUNTIME_ENTRYPOINT }),
+      }),
+    });
+    let pending!: Promise<Awaited<ReturnType<typeof runDoctor>>>;
+    const holder = withBackendPublicationConfigLockAsync(configPath, async () => {
+      pending = runDoctor(deps);
+      await lifecycleAttempted;
+    });
+    await holder;
+    await pending;
+    expect(vi.mocked(restartDaemon)).toHaveBeenCalledOnce();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it.each([
+    ["entrypoint", { entrypoint: "/foreign/lcm.mjs" }, {}],
+    ["runtime digest", { entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: "b".repeat(64) }, { _expectedRuntimeDigestForTesting: "a".repeat(64) }],
+  ] as const)("does not converge when authenticated daemon %s identity changes", async (_label, healthIdentity, seam) => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-identity-contention-"));
+    const configPath = join(home, ".lcm", "config.json");
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    vi.mocked(ensureDaemon).mockImplementationOnce(async () => { throw contention; });
+    const deps = minimalDeps({
+      homedir: home,
+      _assertBackendPublication: undefined,
+      ...seam,
+      fetch: vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: process.pid, ...healthIdentity }),
+      }),
+    });
+    const results = await runDoctor(deps);
+    expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+    expect(results.find((result) => result.name === "daemon")).toBeDefined();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("preserves typed contention at the convergence deadline", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-deadline-contention-"));
+    const configPath = join(home, ".lcm", "config.json");
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    vi.mocked(ensureDaemon).mockRejectedValue(contention);
+    let now = 0;
+    const sleeps: number[] = [];
+    const deps = minimalDeps({
+      homedir: home,
+      _assertBackendPublication: undefined,
+      _publicationConvergenceNow: () => now,
+      _publicationConvergenceSleep: async (delayMs) => { sleeps.push(delayMs); now += delayMs; },
+      fetch: vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: process.pid, entrypoint: TEST_RUNTIME_ENTRYPOINT }),
+      }),
+    });
+    const results = await runDoctor(deps);
+    expect(vi.mocked(ensureDaemon).mock.calls.length).toBeGreaterThan(1);
+    expect(sleeps.every(delay => delay <= 50)).toBe(true);
+    expect(results.find((result) => result.name === "daemon")).toBeDefined();
+    rmSync(home, { recursive: true, force: true });
+  });
+
   it("reports blocked publication admission without attempting repair", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-publication-blocked-"));
     try {

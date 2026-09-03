@@ -19,6 +19,7 @@ import {
   readConnectorTransportSnapshot,
   setConnectorTransport,
 } from "../../src/config-manager.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { withBackendPublicationConfigLockAsync } from "../../src/storage/backend-publication.js";
 
 const temporaryDirectories: string[] = [];
@@ -74,6 +75,28 @@ describe("persisted connector transport configuration", () => {
     });
   });
 
+  it("reads the public transport accessor while the publication lock is held", async () => {
+    const { configPath } = makeHome({
+      version: 1,
+      connectors: { transports: { codex: "mcp" } },
+    });
+
+    await withBackendPublicationConfigLockAsync(configPath, async () => {
+      expect(readConnectorTransport(configPath, "codex")).toBe("mcp");
+    });
+  });
+
+  it("keeps transport mutations serialized while the publication lock is held", async () => {
+    const { configPath } = makeHome({ version: 1 });
+
+    await withBackendPublicationConfigLockAsync(configPath, async () => {
+      expect(() => setConnectorTransport(configPath, "codex", "cli"))
+        .toThrow(PrivateMutationLockContentionError);
+      expect(readConnectorTransportSnapshot(configPath, "codex")).toBeUndefined();
+    });
+    expect(readConnectorTransport(configPath, "codex")).toBeUndefined();
+  });
+
   it("rejects connector config drift between lock-free snapshots", () => {
     const { configPath } = makeHome({
       version: 1,
@@ -85,6 +108,21 @@ describe("persisted connector transport configuration", () => {
         writeFileSync(configPath, JSON.stringify({ version: 1 }), { mode: 0o600 });
       },
     })).toThrow("Configuration changed during lock-free connector transport inspection");
+  });
+
+  it("rejects publication evidence that changes between snapshots", () => {
+    const { home, configPath } = makeHome({
+      version: 1,
+      connectors: { transports: { codex: "mcp" } },
+    });
+    const publicationDir = join(home, ".lcm", "backend-publication");
+    mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
+
+    expect(() => readConnectorTransportSnapshot(configPath, "codex", {
+      _afterFirstSnapshotForTesting: () => {
+        writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
+      },
+    })).toThrow("backend publication evidence is incomplete");
   });
 
   it("propagates non-absence failures from the initial connector snapshot probe", () => {

@@ -38,10 +38,14 @@ import {
 import { packageExecutable, packageRootFor } from "../runtime-root.js";
 import { sanitizeTerminalText } from "../terminal-sanitize.js";
 import { managedDaemonPath } from "../daemon/managed-path.js";
+import { daemonEntrypointMatches } from "../daemon/lifecycle-scope.js";
+import { RUNTIME_DIGEST } from "../daemon/version.js";
 import {
   ConfigValidationError,
   DEFAULT_DAEMON_PORT,
+  daemonConfigSnapshotWitnessEqual,
   parseDaemonConfig,
+  readDaemonConfigSnapshot,
   resolveDaemonConfigEnv,
   type LlmRetryPolicy,
   type ResolvedStorageConfig,
@@ -62,10 +66,16 @@ import {
 } from "../daemon/remediation.js";
 import {
   assertBackendPublicationConfigAccess,
+  assertBackendPublicationConfigReadAccess,
   withBackendPublicationConfigLock,
   BackendPublicationJournalError,
 } from "../storage/backend-publication.js";
 import { readBoundedRegularFile } from "../security-files.js";
+import {
+  PrivateMutationLockContentionError,
+  processStartTime,
+  readPrivateMutationLockOwner,
+} from "../private-mutation-lock.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -245,6 +255,53 @@ async function readDoctorAuthenticatedHealth(
   );
 }
 
+const LIFECYCLE_PUBLICATION_CONVERGENCE_MS = 2_000;
+const LIFECYCLE_PUBLICATION_CONVERGENCE_POLL_MS = 50;
+
+/** Retry lifecycle admission only while the exact authenticated daemon owns the lock. */
+async function runLifecycleWithPublicationConvergence<T>(
+  run: () => Promise<T>,
+  deps: DoctorDeps,
+  config: DoctorConfig,
+  initialHealthPid: number | undefined,
+  expectedVersion: string | undefined,
+  expectedEntrypoint: string,
+): Promise<T> {
+  const now = deps._publicationConvergenceNow ?? Date.now;
+  const sleep = deps._publicationConvergenceSleep
+    ?? ((delayMs: number) => new Promise<void>(resolve => setTimeout(resolve, delayMs)));
+  const deadline = now() + LIFECYCLE_PUBLICATION_CONVERGENCE_MS;
+  while (true) {
+    try {
+      return await run();
+    } catch (error) {
+      if (!(error instanceof PrivateMutationLockContentionError) || initialHealthPid === undefined) throw error;
+      const owner = readPrivateMutationLockOwner(
+        join(deps.homedir, ".lcm.backend-publication.lock"),
+        "backend publication",
+      );
+      if (
+        owner === null
+        || owner.pid !== initialHealthPid
+        || owner.processStartTime === null
+        || processStartTime(owner.pid) !== owner.processStartTime
+      ) throw error;
+      const health = await readDoctorAuthenticatedHealth(deps, config.port);
+      if (
+        health === null
+        || health.pid !== initialHealthPid
+        || health.version !== expectedVersion
+        || (health.storageBackend ?? "sqlite") !== config.storageBackend
+        || !daemonEntrypointMatches(health.entrypoint, expectedEntrypoint, process.platform)
+        || ((deps._expectedRuntimeDigestForTesting ?? RUNTIME_DIGEST) !== undefined
+          && health.runtimeDigest !== (deps._expectedRuntimeDigestForTesting ?? RUNTIME_DIGEST))
+        || now() >= deadline
+      ) throw error;
+      await sleep(Math.min(LIFECYCLE_PUBLICATION_CONVERGENCE_POLL_MS, Math.max(0, deadline - now())));
+    }
+  }
+}
+
 function storageReadinessFromHealth(
   health: DoctorDaemonHealth,
 ): DaemonStorageReadiness {
@@ -326,7 +383,84 @@ function authenticateConfigPublication(
   }
 }
 
+/**
+ * Read a valid daemon configuration without taking the publication mutation
+ * lock. Doctor only needs a stable, authenticated snapshot for its admission
+ * decision; repairs and other writes retain their own exclusive locks.
+ */
+function loadConfigLockFree(deps: DoctorDeps): DoctorConfig {
+  const resolvedConfigPath = configPath(deps.homedir);
+  try {
+    const first = readDaemonConfigSnapshot(resolvedConfigPath, resolveDaemonConfigEnv(process.env));
+    const firstAdmission = assertBackendPublicationConfigReadAccess(
+      resolvedConfigPath,
+      first.config.storage.backend,
+      first.witness,
+    );
+    const second = readDaemonConfigSnapshot(resolvedConfigPath, resolveDaemonConfigEnv(process.env));
+    if (
+      second.config.storage.backend !== first.config.storage.backend
+      || !daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
+    ) {
+      throw new BackendPublicationJournalError(
+        "unexpected-state",
+        "doctor config changed during lock-free read admission",
+      );
+    }
+    const secondAdmission = assertBackendPublicationConfigReadAccess(
+      resolvedConfigPath,
+      second.config.storage.backend,
+      second.witness,
+    );
+    if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
+      throw new BackendPublicationJournalError(
+        "unexpected-state",
+        "doctor backend publication changed during lock-free read admission",
+      );
+    }
+    const config = second.config;
+    return {
+      port: config.daemon.port,
+      storageBackend: config.storage.backend,
+      storage: config.storage,
+      summarizer: config.llm.provider,
+      apiMode: config.llm.apiMode,
+      reasoningEffort: config.llm.reasoningEffort,
+      fastMode: config.llm.fastMode,
+      requestTimeoutMs: config.llm.provider === "openai" ? config.llm.requestTimeoutMs : undefined,
+      retry: config.llm.provider === "openai" ? config.llm.retry : undefined,
+      publicationError: undefined,
+    };
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError) {
+      return {
+        port: DEFAULT_DAEMON_PORT,
+        storageBackend: "unavailable",
+        summarizer: "disabled",
+        publicationError: error,
+      };
+    }
+    const validationError = error instanceof ConfigValidationError
+      ? error
+      : new ConfigValidationError(
+        "$",
+        error instanceof Error ? error.message : String(error),
+      );
+    return {
+      port: DEFAULT_DAEMON_PORT,
+      storageBackend: "unavailable",
+      summarizer: "disabled",
+      validationError,
+      publicationError: new BackendPublicationJournalError(
+        "unsafe-storage",
+        "backend publication admission is blocked because config bytes could not be observed safely",
+      ),
+    };
+  }
+}
+
 function loadConfig(deps: DoctorDeps): DoctorConfig {
+  if (deps._assertBackendPublication === undefined) return loadConfigLockFree(deps);
   const resolvedConfigPath = configPath(deps.homedir);
   try {
     return withBackendPublicationConfigLock(resolvedConfigPath, (lockToken) => {
@@ -1017,14 +1151,23 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         expectedEntrypoint: runtimePath,
         enforceUserManagerParent: true,
       };
+      const invokeLifecycle = (restart: boolean): Promise<Awaited<ReturnType<typeof ensureDaemon>>> =>
+        runLifecycleWithPublicationConvergence(
+          () => restart ? restartDaemon(lifecycleOptions) : ensureDaemon(lifecycleOptions),
+          deps,
+          config,
+          initialHealthPid,
+          pkgVersion,
+          runtimePath,
+        );
       let lifecycleResult = versionMismatch
-        ? await restartDaemon(lifecycleOptions)
-        : await ensureDaemon(lifecycleOptions);
+        ? await invokeLifecycle(true)
+        : await invokeLifecycle(false);
       const repairedStaleConfiguration = !versionMismatch
         && !lifecycleResult.connected
         && lifecycleResult.refusalReason === "stale-config";
       if (repairedStaleConfiguration) {
-        lifecycleResult = await restartDaemon(lifecycleOptions);
+        lifecycleResult = await invokeLifecycle(true);
       }
       if (lifecycleResult.connected) daemonPid = lifecycleResult.pid ?? initialHealthPid;
 
