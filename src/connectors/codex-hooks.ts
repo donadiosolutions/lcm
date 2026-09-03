@@ -18,6 +18,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
+import { strict as assert } from "node:assert";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { ConnectorTransport } from "./types.js";
@@ -970,10 +971,15 @@ export function compensateConnectorLeaf(receipt: ConnectorLeafReceipt): Connecto
       rollbackClaimed = true;
       if (initialCertificate.state === "regular") {
         const initialState = captureConnectorLeaf(receipt.displayPath, initialHold!);
-        if (initialState.state !== "regular") throw new Error("initial hold changed");
+        if (initialState.state !== "regular" || !matchesCertificate(initialState, initialCertificate)) throw new Error("initial hold changed");
         const restorePath = join(receipt.transactionOperationPath, `restore-${randomBytes(4).toString("hex")}`);
         const restoreState = stageCandidate(restorePath, initialState.content, initialCertificate.mode, false, receipt.displayPath);
         const restoreCertificate = certificateFromState(restoreState);
+        assert.strictEqual(restoreCertificate.sha256, initialCertificate.sha256, "initial restore certificate digest mismatch");
+        assert.strictEqual(restoreCertificate.size, initialCertificate.size, "initial restore certificate size mismatch");
+        assert.strictEqual(restoreCertificate.mode, initialCertificate.mode & 0o7777, "initial restore certificate mode mismatch");
+        const restoreObservation = captureConnectorLeaf(receipt.displayPath, restorePath);
+        assert.strictEqual(matchesCertificate(restoreObservation, restoreCertificate), true, "initial restore candidate changed before publication");
         extraEvidence.push({
           kind: "restore",
           operationPath: restorePath,
@@ -981,10 +987,8 @@ export function compensateConnectorLeaf(receipt: ConnectorLeafReceipt): Connecto
           status: "retained",
           certificate: restoreCertificate as Extract<ConnectorLeafCertificate, { state: "regular" }>,
         });
-        // stageCandidate writes and verifies exactly initialState.content with
-        // initialCertificate.mode, so its returned state is logically bound to
-        // the immutable initial certificate. The certificate check below is
-        // intentionally limited to the newly linked inode identity.
+        // Keep the restore candidate bound to the immutable initial
+        // certificate before linking it into the public namespace.
         linkSync(restorePath, receipt.operationPath);
         compensationCommitted = true;
         const restored = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
@@ -1016,10 +1020,15 @@ export function compensateConnectorLeaf(receipt: ConnectorLeafReceipt): Connecto
       const now = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
       if (now.state !== "absent") throw new Error("current receipt changed");
       const initialState = captureConnectorLeaf(receipt.displayPath, initialHold!);
-      if (initialState.state !== "regular") throw new Error("initial hold changed");
+      if (initialState.state !== "regular" || !matchesCertificate(initialState, initialCertificate)) throw new Error("initial hold changed");
       const restorePath = join(receipt.transactionOperationPath, `restore-${randomBytes(4).toString("hex")}`);
       const restoreState = stageCandidate(restorePath, initialState.content, initialCertificate.mode, false, receipt.displayPath);
       const restoreCertificate = certificateFromState(restoreState);
+      assert.strictEqual(restoreCertificate.sha256, initialCertificate.sha256, "initial restore certificate digest mismatch");
+      assert.strictEqual(restoreCertificate.size, initialCertificate.size, "initial restore certificate size mismatch");
+      assert.strictEqual(restoreCertificate.mode, initialCertificate.mode & 0o7777, "initial restore certificate mode mismatch");
+      const restoreObservation = captureConnectorLeaf(receipt.displayPath, restorePath);
+      assert.strictEqual(matchesCertificate(restoreObservation, restoreCertificate), true, "initial restore candidate changed before publication");
       extraEvidence.push({
         kind: "restore",
         operationPath: restorePath,
@@ -1027,9 +1036,8 @@ export function compensateConnectorLeaf(receipt: ConnectorLeafReceipt): Connecto
         status: "retained",
         certificate: restoreCertificate as Extract<ConnectorLeafCertificate, { state: "regular" }>,
       });
-      // stageCandidate writes and verifies exactly initialState.content with
-      // initialCertificate.mode; only the newly linked inode still needs an
-      // observational certificate check below.
+      // Keep the restore candidate bound to the immutable initial
+      // certificate before linking it into the public namespace.
       linkSync(restorePath, receipt.operationPath);
       compensationCommitted = true;
       const restored = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);

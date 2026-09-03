@@ -1707,6 +1707,64 @@ describe("Codex hook configuration boundaries", () => {
     }
   });
 
+  it("does not adopt a drifted initial hold between validation and restore staging", async () => {
+    let initialHoldPath = "";
+    let writer = -1;
+    let editAfterValidatedInitial = false;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      const descriptors = new Map<number, string>();
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const fd = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          descriptors.set(fd, String(path));
+          return fd;
+        }) as typeof actual.openSync,
+        closeSync: ((fd: number) => {
+          const path = descriptors.get(fd);
+          const result = actual.closeSync(fd);
+          descriptors.delete(fd);
+          if (editAfterValidatedInitial && path === initialHoldPath) {
+            editAfterValidatedInitial = false;
+            actual.writeSync(writer, Buffer.from("peeredit"), 0, 8, 0);
+            actual.fchmodSync(writer, 0o640);
+          }
+          return result;
+        }) as typeof actual.closeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      for (const decision of [{ state: "regular" as const, content: Buffer.from("current!"), mode: 0o600 }, { state: "absent" as const }]) {
+        const path = join(dir, decision.state === "regular" ? "drifted-initial-regular" : "drifted-initial-absent");
+        writeFileSync(path, "initial!", { mode: 0o600 });
+        const seed = module.mutateConnectorLeaf({
+          displayPath: path,
+          operationPath: path,
+          parentOperationPath: dir,
+          expected: module.captureConnectorLeaf(path, path),
+          decide: () => decision,
+        });
+        initialHoldPath = seed.receipt.evidence.find((entry) => entry.kind === "initial")!.operationPath;
+        writer = fs.openSync(initialHoldPath, "r+");
+        editAfterValidatedInitial = true;
+        const compensated = module.compensateConnectorLeaf(seed.receipt);
+        expect(compensated.failures.join(";")).toMatch(/rollback incomplete/iu);
+        expect(decision.state === "regular" ? readFileSync(path, "utf-8") : existsSync(path)).toBe(decision.state === "regular" ? "current!" : false);
+        expect(readFileSync(initialHoldPath, "utf-8")).toBe("peeredit");
+        expect(statSync(initialHoldPath).mode & 0o7777).toBe(0o640);
+        closeSync(writer);
+        writer = -1;
+      }
+    } finally {
+      if (writer >= 0) closeSync(writer);
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
   it("covers immutable-certificate defensive seams and primitive diagnostics", async () => {
     const faults = {
       zeroWrite: false,
