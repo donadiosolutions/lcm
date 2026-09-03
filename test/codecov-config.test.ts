@@ -483,7 +483,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(206);
   });
 
-  test("keeps response-fence and #700/#701/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -495,6 +495,9 @@ describe("Codecov configuration", () => {
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
       ["src/home-parent-auth.ts", "unit-configuration-security"],
+      ["src/runtime-paths.ts", "unit-configuration-security"],
+      ["src/security-files.ts", "unit-configuration-security"],
+      ["src/project-map.ts", "unit-project-worktrees"],
       ["src/connectors/codex-hooks.ts", "unit-connectors"],
       ["src/connectors/installer.ts", "unit-connectors"],
       ["installer/install.ts", "unit-installation"],
@@ -511,6 +514,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
+      ["src/migration/manifest-store.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
       ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],

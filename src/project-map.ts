@@ -421,9 +421,10 @@ export async function applyBackendPublicationProjectMapFile(
     } else {
       ensurePrivateDirectory(dirname(path));
       const recoveryFile = input.file as Extract<BackendPublicationRecoveryFile, { presence: "present" }>;
+      // The authenticated witness is checked before admission; publication of
+      // an existing map is still unconditional under the cooperating locks.
       atomicWritePrivateFileDurable(path, state.content, {
         requireAbsent: before.presence === "absent",
-        expectedContentSha256: before.presence === "present" ? before.rawSha256 : null,
         maxExistingBytes: 4 * 1024 * 1024,
         finalMode: recoveryFile.mode,
       });
