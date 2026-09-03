@@ -84,7 +84,7 @@ describe("installer defensive branches", () => {
     const root = join(directory, "remove-display-sanitization");
     const configPath = join(root, "config.json");
     const initial = installConnector("cursor", "mcp", root, { configPath, persistTransport: false });
-    const mcpPath = initial.paths!.find((path) => path.endsWith("mcp.json"))!;
+    initial.paths!.find((path) => path.endsWith("mcp.json"));
 
     vi.resetModules();
     vi.doMock("node:fs", async () => {
@@ -968,6 +968,7 @@ describe("installer defensive branches", () => {
     type Fault = {
       path?: string;
       invalidSize?: boolean;
+      oversize?: boolean;
       partialRead?: boolean;
       zeroWrite?: boolean;
       createError?: string;
@@ -1041,7 +1042,7 @@ describe("installer defensive branches", () => {
           if (descriptors.get(descriptor) !== fault.path || !fault.invalidSize) return stats;
           return new Proxy(stats, {
             get(target, property) {
-              if (property === "size") return -1;
+              if (property === "size") return fault.oversize ? (4 * 1024 * 1024) + 1 : -1;
               return Reflect.get(target, property, target);
             },
           });
@@ -1092,14 +1093,19 @@ describe("installer defensive branches", () => {
       fault.invalidSize = true;
       expect(module.listConnectorInventory(invalidRoot).installed).not.toContainEqual(expect.objectContaining({ path: fault.path }));
       fault.invalidSize = false;
-
       const partialRoot = join(directory, "partial-read");
       const installed = module.installConnector("claude-code", "skill", partialRoot);
       expect(module.installConnector("claude-code", "skill", partialRoot).success).toBe(true);
       fault.path = installed.path;
       fault.partialRead = true;
-      expect(module.listConnectorInventory(partialRoot).installed).toContainEqual(expect.objectContaining({ path: installed.path }));
+      expect(module.listConnectorInventory(partialRoot).installed).not.toContainEqual(expect.objectContaining({ path: installed.path }));
       fault.partialRead = false;
+      fault.path = installed.path;
+      fault.invalidSize = true;
+      fault.oversize = true;
+      expect(module.listConnectorInventory(partialRoot).installed).not.toContainEqual(expect.objectContaining({ path: installed.path }));
+      fault.invalidSize = false;
+      fault.oversize = false;
 
       const writeRoot = join(directory, "zero-write");
       fault.path = join(writeRoot, ".clinerules", "lcm.md");
@@ -2226,7 +2232,7 @@ describe("installer descriptor edge branches", () => {
   ] as const)("restores after a post-truncate %s safety failure", async (_label, fault, message) => {
     const installed = installConnector("claude-code", "skill", directory);
     const skillPath = installed.path;
-    const prior = readFileSync(skillPath);
+    readFileSync(skillPath);
     let afterTruncate = false;
     let injected = false;
 

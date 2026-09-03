@@ -31,6 +31,7 @@ import {
   mutateConnectorLeaf,
   compensateConnectorLeaf,
   finalizeConnectorLeaf,
+  matchesCertificate,
 } from "../../src/connectors/codex-hooks.js";
 
 function serializedErrorSurface(value: unknown): string {
@@ -266,6 +267,103 @@ describe("Codex hook configuration boundaries", () => {
     expect(compensateConnectorLeaf(second.receipt)).toEqual([]);
     expect(readFileSync(hooksPath, "utf-8")).toBe("initial\n");
     expect(finalizeConnectorLeaf(second.receipt)).toEqual([]);
+  });
+
+  it("keeps staged certificate authority when both publication aliases are edited", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        linkSync: ((existing: fs.PathLike, target: fs.PathLike) => {
+          const result = actual.linkSync(existing, target);
+          if (String(existing).includes("candidate-") && String(target).endsWith("/hooks.json")) {
+            actual.writeFileSync(target, "peer-edit\n");
+            actual.chmodSync(target, 0o600);
+          }
+          return result;
+        }) as typeof actual.linkSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      writeFileSync(hooksPath, "initial\n", { mode: 0o640 });
+      let caught: unknown;
+      try {
+        module.mutateConnectorLeaf({
+          displayPath: hooksPath,
+          operationPath: hooksPath,
+          parentOperationPath: dir,
+          expected: module.captureConnectorLeaf(hooksPath, hooksPath),
+          decide: () => ({ state: "regular" as const, content: Buffer.from("candidate\n"), mode: 0o640 }),
+        });
+      } catch (error) { caught = error; }
+      const receipt = (caught as Error & { connectorLeafReceipt?: module.ConnectorLeafReceipt }).connectorLeafReceipt;
+      expect(receipt).toBeDefined();
+      expect(receipt!.current).toMatchObject({ state: "regular", sha256: expect.not.stringMatching(/^(?:0|f){64}$/) });
+      expect(Object.keys(receipt!)).not.toContain("operationPath");
+      expect(JSON.stringify(receipt)).not.toContain("/proc/self/fd/");
+      expect(module.compensateConnectorLeaf(receipt!)).toHaveLength(1);
+      expect(readFileSync(hooksPath, "utf-8")).toBe("peer-edit\n");
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("exercises certificate helpers and certified compensation paths", () => {
+    expect(matchesCertificate({ state: "absent" }, { state: "absent" })).toBe(true);
+    expect(matchesCertificate({ state: "unknown" } as never, { state: "absent" })).toBe(false);
+    expect(matchesCertificate({ state: "absent" }, null as never)).toBe(false);
+    expect(matchesCertificate({ state: "absent" }, { state: "unknown" } as never)).toBe(false);
+    const regularPath = join(dir, "certificate-regular");
+    writeFileSync(regularPath, "initial\n", { mode: 0o6755 });
+    const regular = mutateConnectorLeaf({
+      displayPath: regularPath,
+      operationPath: regularPath,
+      parentOperationPath: dir,
+      expected: captureConnectorLeaf(regularPath, regularPath),
+      decide: () => ({ state: "regular" as const, content: Buffer.from("next\n"), mode: 0o6755 }),
+    });
+    expect(compensateConnectorLeaf(regular.receipt)).toEqual([]);
+    expect(finalizeConnectorLeaf(regular.receipt)).toEqual([]);
+    const absentPath = join(dir, "certificate-absent");
+    writeFileSync(absentPath, "initial\n", { mode: 0o600 });
+    const absent = mutateConnectorLeaf({
+      displayPath: absentPath,
+      operationPath: absentPath,
+      parentOperationPath: dir,
+      expected: captureConnectorLeaf(absentPath, absentPath),
+      decide: () => ({ state: "absent" as const }),
+    });
+    expect(compensateConnectorLeaf(absent.receipt)).toEqual([]);
+    expect(finalizeConnectorLeaf(absent.receipt)).toEqual([]);
+    expect(hasCodexHooks(join(dir, "missing-hooks.json"))).toBe(false);
+    expect(inspectCodexPostToolHook(join(dir, "missing-hooks.json"))).toMatchObject({ state: "absent" });
+  });
+
+  it("compensates a committed standalone failure without exposing operation paths", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        linkSync: ((existing: fs.PathLike, target: fs.PathLike) => {
+          const result = actual.linkSync(existing, target);
+          if (String(existing).includes("candidate-")) actual.writeFileSync(target, "peer-edit\n");
+          return result;
+        }) as typeof actual.linkSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      writeFileSync(hooksPath, JSON.stringify({ hooks: { PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "lcm post-tool --client codex" }] }] }, custom: true }));
+      expect(() => module.removeCodexHooks(hooksPath)).toThrow(/standalone compensation incomplete|rollback incomplete/iu);
+      expect(readFileSync(hooksPath, "utf-8")).toBe("peer-edit\n");
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
   });
 
   it("fails no-replace publication when a peer creates an absent leaf", () => {
@@ -1322,7 +1420,7 @@ describe("Codex hook configuration boundaries", () => {
             failCandidatePublication = false;
             throw Object.assign(new Error("candidate publication denied"), { code: "EIO" });
           }
-          if (failInitialRestoration && String(existing).endsWith("/initial")) {
+          if (failInitialRestoration && String(existing).includes("/restore-")) {
             failInitialRestoration = false;
             throw Object.assign(new Error("initial restoration denied"), { code: "EIO" });
           }
@@ -1448,8 +1546,8 @@ describe("Codex hook configuration boundaries", () => {
       closeSync(writer);
       writer = -1;
       expect(existsSync(hooksPath)).toBe(false);
-      expect(first.receipt.current).toEqual({ state: "absent" });
-      expect(first.receipt.recoveryRequired).toBe(true);
+      expect(first.receipt.current).toMatchObject({ state: "regular", sha256: expect.any(String) });
+      expect(first.receipt.recoveryRequired).toBe(false);
     } finally {
       if (writer >= 0) closeSync(writer);
       vi.doUnmock("node:fs");
@@ -1486,9 +1584,9 @@ describe("Codex hook configuration boundaries", () => {
       });
       const initialWriter = openSync(restoration.receipt.initialHoldOperationPath!, "r+");
       editAfterInitialPublish = () => actualWrite(initialWriter, "peeredit");
-      expect(module.compensateConnectorLeaf(restoration.receipt).join(";")).toMatch(/restoration mismatch/iu);
+      expect(module.compensateConnectorLeaf(restoration.receipt)).toEqual([]);
       closeSync(initialWriter);
-      expect(readFileSync(restorationPath, "utf-8")).toBe("peeredit");
+      expect(readFileSync(restorationPath, "utf-8")).toBe("initial!");
 
       const cleanupPath = join(dir, "rollback-cleanup-race");
       writeFileSync(cleanupPath, "initial!", { mode: 0o600 });
@@ -1529,9 +1627,9 @@ describe("Codex hook configuration boundaries", () => {
       });
       const absentInitialWriter = openSync(absentRestore.receipt.initialHoldOperationPath!, "r+");
       editAfterInitialPublish = () => actualWrite(absentInitialWriter, "peeredit");
-      expect(module.compensateConnectorLeaf(absentRestore.receipt).join(";")).toMatch(/restoration mismatch/iu);
+      expect(module.compensateConnectorLeaf(absentRestore.receipt)).toEqual([]);
       closeSync(absentInitialWriter);
-      expect(readFileSync(absentRestorePath, "utf-8")).toBe("peeredit");
+      expect(readFileSync(absentRestorePath, "utf-8")).toBe("initial!");
     } finally {
       vi.doUnmock("node:fs");
       vi.resetModules();

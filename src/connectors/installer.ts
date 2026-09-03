@@ -514,6 +514,7 @@ class ConnectorMutationAuthority {
   private readonly descriptors: number[] = [];
   readonly snapshots = new Map<string, OwnedFileSnapshot>();
   readonly receipts = new Map<string, ConnectorLeafReceipt>();
+  private readonly failureEvidence = new Map<string, unknown>();
   private readonly mutationOrder: string[] = [];
 
   constructor(targets: readonly MutationTargetSpec[]) {
@@ -750,6 +751,8 @@ class ConnectorMutationAuthority {
     } catch (error) {
       const receipt = (error as Error & { connectorLeafReceipt?: ConnectorLeafReceipt }).connectorLeafReceipt;
       if (receipt?.mutationCommitted) this.recordReceipt(displayPath, receipt);
+      const failureEvidence = (error as Error & { connectorLeafFailureEvidence?: unknown }).connectorLeafFailureEvidence;
+      if (failureEvidence) this.failureEvidence.set(displayPath, failureEvidence);
       throw error;
     }
     if (result.changed) this.recordReceipt(displayPath, result.receipt);
@@ -757,7 +760,19 @@ class ConnectorMutationAuthority {
   }
 
   registerSnapshots(snapshots: readonly OwnedFileSnapshot[]): void {
-    for (const snapshot of snapshots) this.snapshots.set(snapshot.path, snapshot);
+    for (const snapshot of snapshots) {
+      if (snapshot.state === "regular") {
+        this.snapshots.set(snapshot.path, Object.freeze({
+          ...snapshot,
+          content: Buffer.from(snapshot.content),
+          mode: snapshot.mode & 0o7777,
+          dev: typeof snapshot.dev === "bigint" ? BigInt(snapshot.dev) : Number(snapshot.dev),
+          ino: typeof snapshot.ino === "bigint" ? BigInt(snapshot.ino) : Number(snapshot.ino),
+        }));
+      } else {
+        this.snapshots.set(snapshot.path, Object.freeze({ ...snapshot }));
+      }
+    }
   }
 
   hasMutations(): boolean {
@@ -857,6 +872,9 @@ function descriptorStats(descriptor: number, filePath: string): ReturnType<typeo
 function readDescriptor(descriptor: number, filePath: string): Buffer {
   const stats = descriptorStats(descriptor, filePath);
   const size = Number(stats.size);
+  if (size > 4 * 1024 * 1024) {
+    throw new Error(`Refusing to read LCM file larger than 4 MiB at ${filePath}`);
+  }
   if (!Number.isSafeInteger(size) || size < 0) {
     throw new Error(`Unable to read LCM file at ${filePath}: invalid file size`);
   }
@@ -864,10 +882,15 @@ function readDescriptor(descriptor: number, filePath: string): Buffer {
   let offset = 0;
   while (offset < size) {
     const bytesRead = readSync(descriptor, content, offset, size - offset, offset);
-    if (bytesRead === 0) break;
+    if (bytesRead === 0) throw new Error(`Unable to read LCM file at ${filePath}: short read`);
     offset += bytesRead;
   }
-  return offset === size ? content : content.subarray(0, offset);
+  const after = fstatSync(descriptor);
+  if (!after.isFile() || Number(after.size) !== size || after.dev !== stats.dev || after.ino !== stats.ino
+    || (Number(after.mode) & 0o7777) !== (Number(stats.mode) & 0o7777)) {
+    throw new Error(`Unable to read LCM file at ${filePath}: file changed while being read`);
+  }
+  return content;
 }
 
 function readRegularFileNoFollow(filePath: string): Buffer {
@@ -960,6 +983,10 @@ function removeSkill(filePath: string, generated: string | readonly string[], st
   } catch (error) {
     if (!strict && (error as NodeJS.ErrnoException).code === "EAGAIN") return false;
     if (error instanceof Error && error.message.startsWith("Refusing to overwrite an unowned LCM skill")) {
+      if (strict) throw error;
+      return false;
+    }
+    if (error instanceof Error && error.message.startsWith("Refusing to remove an unowned LCM skill")) {
       if (strict) throw error;
       return false;
     }
@@ -1742,7 +1769,7 @@ function snapshotOwnedFiles(paths: readonly string[], anchored = true): OwnedFil
         path,
         state: "regular",
         content: readDescriptor(descriptor, path),
-        mode: Number(stats.mode) & 0o777,
+        mode: Number(stats.mode) & 0o7777,
         dev: stats.dev,
         ino: stats.ino,
       });

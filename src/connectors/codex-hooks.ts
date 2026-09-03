@@ -16,7 +16,7 @@ import {
   writeSync,
   unlinkSync,
 } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { ConnectorTransport } from "./types.js";
@@ -307,7 +307,24 @@ export type ConnectorLeafState =
       mode: number;
       dev: number | bigint;
       ino: number | bigint;
+      readonly certificate?: ConnectorLeafCertificate;
     }>;
+
+/** Immutable authority value produced before a public hard link exists. */
+export type ConnectorLeafCertificate =
+  | Readonly<{ state: "absent" }>
+  | Readonly<{
+      state: "regular";
+      sha256: string;
+      size: number;
+      mode: number;
+      dev: string;
+      ino: string;
+    }>;
+
+export type ConnectorLeafObservation = Readonly<ConnectorLeafState & {
+  certificate?: ConnectorLeafCertificate;
+}>;
 
 export type ConnectorLeafDecision =
   | Readonly<{ state: "unchanged" }>
@@ -318,30 +335,133 @@ export type ConnectorLeafOperation = Readonly<{
   displayPath: string;
   operationPath: string;
   parentOperationPath: string;
-  expected: ConnectorLeafState;
-  decide: (base: ConnectorLeafState) => ConnectorLeafDecision;
+  expected: ConnectorLeafState | ConnectorLeafCertificate;
+  decide: (base: ConnectorLeafObservation) => ConnectorLeafDecision;
 }>;
 
-export type ConnectorLeafReceipt = {
+export type ConnectorLeafEvidenceKind =
+  | "staging" | "initial" | "current-public" | "current-private"
+  | "superseded" | "rollback" | "restore" | "detached" | "recovery";
+
+export type ConnectorLeafEvidence = Readonly<{
+  kind: ConnectorLeafEvidenceKind;
+  operationPath: string;
+  displayPath: string;
+  status: "retained" | "detached" | "retain-only";
+  certificate?: Extract<ConnectorLeafCertificate, { state: "regular" }>;
+  cleanupIdentity?: Readonly<{ dev: string; ino: string; type: "regular" }>;
+}>;
+
+export type ConnectorLeafFailureEvidence = Readonly<{
+  displayPath: string;
+  transactionDisplayPath: string;
+  evidence: readonly ConnectorLeafEvidence[];
+}>;
+
+export type ConnectorLeafCompensationResult = Readonly<{
+  receipt: ConnectorLeafReceipt;
+  compensated: boolean;
+  failures: readonly string[];
+}>;
+
+type ConnectorLeafFailureList = readonly string[] & {
+  readonly receipt: ConnectorLeafReceipt;
+  readonly compensated: boolean;
+  readonly failures: readonly string[];
+};
+type ConnectorLeafFinalizationList = readonly string[] & {
+  readonly receipt: ConnectorLeafReceipt;
+  readonly finalized: boolean;
+  readonly failures: readonly string[];
+};
+
+function resultList<T extends object>(failures: readonly string[], result: T): readonly string[] & T & { readonly failures: readonly string[] } {
+  const list = [...failures] as readonly string[] & T & { readonly failures: readonly string[] };
+  Object.defineProperty(list, "failures", { value: Object.freeze([...failures]), enumerable: false });
+  const record = result as { receipt?: unknown; compensated?: unknown; finalized?: unknown };
+  Object.defineProperty(list, "receipt", { value: record.receipt, enumerable: false });
+  Object.defineProperty(list, "compensated", { value: record.compensated, enumerable: false });
+  Object.defineProperty(list, "finalized", { value: record.finalized, enumerable: false });
+  return Object.freeze(list);
+}
+
+export type ConnectorLeafFinalizationResult = Readonly<{
+  receipt: ConnectorLeafReceipt;
+  finalized: boolean;
+  failures: readonly string[];
+}>;
+
+export type ConnectorLeafReceipt = Readonly<{
   readonly displayPath: string;
   readonly operationPath: string;
   readonly parentOperationPath: string;
-  readonly initial: ConnectorLeafState;
-  current: ConnectorLeafState;
+  readonly initial: ConnectorLeafCertificate | ConnectorLeafState;
+  readonly current: ConnectorLeafCertificate | ConnectorLeafState;
   readonly transactionDisplayPath: string;
   readonly transactionOperationPath: string;
-  initialHoldOperationPath?: string;
-  initialHoldState?: Extract<ConnectorLeafState, { state: "regular" }>;
-  currentHoldOperationPath?: string;
-  currentHoldState?: Extract<ConnectorLeafState, { state: "regular" }>;
-  mutationCommitted: boolean;
-  recoveryRequired: boolean;
-};
+  readonly initialHoldOperationPath?: string;
+  readonly initialHoldState?: Extract<ConnectorLeafState, { state: "regular" }>;
+  readonly currentHoldOperationPath?: string;
+  readonly currentHoldState?: Extract<ConnectorLeafState, { state: "regular" }>;
+  readonly evidence: readonly ConnectorLeafEvidence[];
+  readonly mutationCommitted: boolean;
+  readonly recoveryRequired: boolean;
+}>;
 
 const leafFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const MAX_CONNECTOR_LEAF_BYTES = 4 * 1024 * 1024;
 
-function leafMode(stats: ReturnType<typeof fstatSync>): number { return Number(stats.mode) & 0o777; }
+function leafMode(stats: ReturnType<typeof fstatSync>): number { return Number(stats.mode) & 0o7777; }
+
+function normalizedIdentity(value: number | bigint): string { return BigInt(value).toString(10); }
+
+function certificateFromState(state: ConnectorLeafState): ConnectorLeafCertificate {
+  if (state.state === "absent") return Object.freeze({ state: "absent" });
+  const cert = Object.freeze({
+    state: "regular" as const,
+    sha256: createHash("sha256").update(state.content).digest("hex"),
+    size: state.content.length,
+    mode: state.mode & 0o7777,
+    dev: normalizedIdentity(state.dev),
+    ino: normalizedIdentity(state.ino),
+  });
+  return cert;
+}
+
+function copyCertificate(value: ConnectorLeafCertificate): ConnectorLeafCertificate {
+  return value.state === "absent"
+    ? Object.freeze({ state: "absent" })
+    : Object.freeze({
+      state: "regular" as const,
+      sha256: value.sha256,
+      size: value.size,
+      mode: value.mode & 0o7777,
+      dev: BigInt(value.dev).toString(10),
+      ino: BigInt(value.ino).toString(10),
+    });
+}
+
+function isCertificate(value: unknown): value is ConnectorLeafCertificate {
+  if (!value || typeof value !== "object") return false;
+  const state = (value as { state?: unknown }).state;
+  if (state === "absent") return true;
+  if (state !== "regular") return false;
+  const candidate = value as Partial<Extract<ConnectorLeafCertificate, { state: "regular" }>>;
+  return typeof candidate.sha256 === "string"
+    && /^[0-9a-f]{64}$/u.test(candidate.sha256)
+    && Number.isSafeInteger(candidate.size) && (candidate.size ?? -1) >= 0
+    && Number.isSafeInteger(candidate.mode)
+    && typeof candidate.dev === "string" && typeof candidate.ino === "string";
+}
+
+function certificateEqual(left: ConnectorLeafCertificate, right: ConnectorLeafCertificate): boolean {
+  if (left.state !== right.state) return false;
+  if (left.state === "absent" || right.state === "absent") return true;
+  return (
+    left.sha256 === right.sha256 && left.size === right.size && left.mode === right.mode
+    && left.dev === right.dev && left.ino === right.ino
+  );
+}
 
 function assertConnectorLeafReadSize(size: number, displayPath: string): void {
   if (!Number.isSafeInteger(size) || size < 0) {
@@ -374,12 +494,71 @@ function stateEqual(left: ConnectorLeafState, right: ConnectorLeafState): boolea
   );
 }
 
+function stateMatchesCertificate(state: ConnectorLeafState, certificate: ConnectorLeafCertificate | ConnectorLeafState): boolean {
+  if (!certificate || typeof certificate !== "object") return false;
+  if (!isCertificate(certificate)) {
+    if (!("state" in certificate)) return false;
+    return stateEqual(state, certificate);
+  }
+  if (state.state !== certificate.state) return false;
+  return certificateEqual(certificateFromState(state), certificate);
+}
+
+/** Compare a stable observation with immutable authority; observations never grant authority. */
+export function matchesCertificate(
+  observation: ConnectorLeafObservation | ConnectorLeafState,
+  certificate: ConnectorLeafCertificate,
+): boolean {
+  return stateMatchesCertificate(observation, certificate);
+}
+
+function stateMatchesLogical(state: ConnectorLeafState, certificate: ConnectorLeafCertificate): boolean {
+  if (certificate.state !== state.state) return false;
+  if (certificate.state === "absent") return true;
+  if (state.state !== "regular") return false;
+  return state.content.length === certificate.size
+    && state.mode === certificate.mode
+    && createHash("sha256").update(state.content).digest("hex") === certificate.sha256;
+}
+
+function observationForDecision(state: ConnectorLeafState): ConnectorLeafObservation {
+  if (state.state === "absent") return Object.freeze({ state: "absent" as const, certificate: Object.freeze({ state: "absent" as const }) });
+  return Object.freeze({
+    ...state,
+    content: Buffer.from(state.content),
+    certificate: certificateFromState(state),
+  });
+}
+
+function uniqueEvidence(entries: readonly ConnectorLeafEvidence[]): readonly ConnectorLeafEvidence[] {
+  const seen = new Set<string>();
+  const out: ConnectorLeafEvidence[] = [];
+  for (const entry of entries) {
+    if (seen.has(entry.operationPath)) continue;
+    seen.add(entry.operationPath);
+    out.push(Object.freeze(entry));
+  }
+  return Object.freeze(out);
+}
+
+/** Keep operation/evidence paths private while retaining direct internal access. */
+function freezeReceipt(value: ConnectorLeafReceipt): ConnectorLeafReceipt {
+  for (const key of [
+    "operationPath", "parentOperationPath", "transactionDisplayPath", "transactionOperationPath",
+    "initialHoldOperationPath", "initialHoldState", "currentHoldOperationPath", "currentHoldState", "evidence",
+  ] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor) Object.defineProperty(value, key, { ...descriptor, enumerable: false });
+  }
+  return Object.freeze(value);
+}
+
 export function captureConnectorLeaf(displayPath: string, operationPath: string): ConnectorLeafState {
   let descriptor: number;
   try { descriptor = openSync(operationPath, leafFlags); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { state: "absent" };
-    const wrapped = new Error(`Unable to inspect connector leaf at ${displayPath}`, { cause: error });
+    const wrapped = new Error(`Unable to inspect connector leaf at ${displayPath}`);
     const code = (error as NodeJS.ErrnoException).code;
     if (typeof code === "string") Object.assign(wrapped, { code });
     throw wrapped;
@@ -394,7 +573,13 @@ export function captureConnectorLeaf(displayPath: string, operationPath: string)
     if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino || leafMode(after) !== mode || Number(after.size) !== size) {
       throw new Error(`Connector leaf changed while being read at ${displayPath}`);
     }
-    return { state: "regular", content, mode, dev: before.dev, ino: before.ino };
+    const result = { state: "regular" as const, content, mode, dev: before.dev, ino: before.ino };
+    Object.defineProperty(result, "certificate", {
+      value: certificateFromState(result),
+      enumerable: false,
+      configurable: false,
+    });
+    return result;
   } finally { closeSync(descriptor); }
 }
 
@@ -462,7 +647,7 @@ function stageCandidate(
 function safeUnlink(path: string): void { try { unlinkSync(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; } }
 
 function sanitizeLeafError(error: unknown, operation: ConnectorLeafOperation, tx: { operation: string; display: string }): Error {
-  const source = error instanceof Error ? error.message : String(error);
+  const source = error instanceof Error ? error.message : typeof error === "string" ? error : "connector mutation failed";
   let message = source.replaceAll(operation.operationPath, operation.displayPath)
     .replaceAll(operation.parentOperationPath, dirname(operation.displayPath));
   message = message.replaceAll(tx.operation, tx.display);
@@ -473,7 +658,7 @@ function sanitizeLeafError(error: unknown, operation: ConnectorLeafOperation, tx
 }
 
 function recoveryDisplayPath(tx: { operation: string; display: string }, operationPath: string): string {
-  return join(tx.display, basename(operationPath));
+  return join(tx.display || dirname(operationPath), basename(operationPath));
 }
 
 function republishMovedEntry(
@@ -486,27 +671,29 @@ function republishMovedEntry(
   try {
     linkSync(hold, operation.operationPath);
   } catch (error) {
-    const detail = String(error);
+    const code = (error as NodeJS.ErrnoException)?.code;
+    const detail = error instanceof Error && !error.message.includes("/proc/self/fd/") ? error.message : (typeof code === "string" ? code : "operation failed");
     return new Error(`${context} at ${operation.displayPath}; recovery artifact retained at ${recoveryPath} (${detail})`);
   }
   try {
     safeUnlink(hold);
     return new Error(`${context} at ${operation.displayPath}; recovery republished the moved entry without replacement`);
   } catch (error) {
-    const detail = String(error);
+    const code = (error as NodeJS.ErrnoException)?.code;
+    const detail = error instanceof Error && !error.message.includes("/proc/self/fd/") ? error.message : (typeof code === "string" ? code : "operation failed");
     return new Error(`${context} at ${operation.displayPath}; recovery artifact retained at ${recoveryPath} (${detail})`);
   }
 }
 
 function unlinkPrivateIfExact(
   path: string,
-  expected: Extract<ConnectorLeafState, { state: "regular" }>,
+  expected: ConnectorLeafCertificate | Extract<ConnectorLeafState, { state: "regular" }>,
   displayPath: string,
   tx: { operation: string; display: string },
 ): string | undefined {
   try {
     const observed = captureConnectorLeaf(displayPath, path);
-    if (!stateEqual(observed, expected)) {
+    if (!stateMatchesCertificate(observed, expected)) {
       return `${displayPath}: cleanup incomplete; recovery artifact retained at ${recoveryDisplayPath(tx, path)}`;
     }
     safeUnlink(path);
@@ -518,9 +705,13 @@ function unlinkPrivateIfExact(
 
 export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorReceipt?: ConnectorLeafReceipt): ConnectorLeafMutationResult {
   const expected = priorReceipt?.current ?? operation.expected;
+  if (!isCertificate(expected) && expected.state === "regular" && !Buffer.isBuffer(expected.content)) {
+    throw Object.assign(new Error(`Invalid connector publication certificate at ${operation.displayPath}`), { code: "EINVAL" });
+  }
+  const expectedCertificate = isCertificate(expected) ? copyCertificate(expected) : certificateFromState(expected);
   const observed = captureConnectorLeaf(operation.displayPath, operation.operationPath);
-  if (!stateEqual(observed, expected)) throw Object.assign(new Error(`Connector path changed before mutation at ${operation.displayPath}`), { code: "EAGAIN" });
-  const decision = operation.decide({ ...observed, ...(observed.state === "regular" ? { content: Buffer.from(observed.content) } : {}) });
+  if (!stateMatchesCertificate(observed, expectedCertificate)) throw Object.assign(new Error(`Connector path changed before mutation at ${operation.displayPath}`), { code: "EAGAIN" });
+  const decision = operation.decide(observationForDecision(observed));
   if (decision.state === "regular") {
     assertConnectorLeafReadSize(decision.content.length, operation.displayPath);
   }
@@ -528,17 +719,18 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
     if (priorReceipt) return { changed: false, receipt: priorReceipt };
     return {
       changed: false,
-      receipt: {
+      receipt: freezeReceipt({
         displayPath: operation.displayPath,
         operationPath: operation.operationPath,
         parentOperationPath: operation.parentOperationPath,
-        initial: expected,
-        current: expected,
+        initial: expectedCertificate,
+        current: expectedCertificate,
         transactionDisplayPath: "",
         transactionOperationPath: "",
         mutationCommitted: false,
         recoveryRequired: false,
-      },
+        evidence: Object.freeze([]),
+      }),
     };
   }
   const tx = priorReceipt ? { operation: priorReceipt.transactionOperationPath, display: priorReceipt.transactionDisplayPath } : transactionDir(operation.parentOperationPath, dirname(operation.displayPath));
@@ -549,26 +741,30 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
   try {
     validateTransactionDirectory(tx);
     let stagedState: Extract<ConnectorLeafState, { state: "regular" }> | undefined;
+    let stagedCertificate: Extract<ConnectorLeafCertificate, { state: "regular" }> | undefined;
+    let claimedState: Extract<ConnectorLeafState, { state: "regular" }> | undefined;
     if (candidate) {
       const regularDecision = decision as Extract<ConnectorLeafDecision, { state: "regular" }>;
       stagedState = stageCandidate(
         candidate,
         regularDecision.content,
         regularDecision.mode,
-        expected.state === "absent",
+        expectedCertificate.state === "absent",
         operation.displayPath,
       );
+      stagedCertificate = certificateFromState(stagedState) as Extract<ConnectorLeafCertificate, { state: "regular" }>;
     }
     let hold: string | undefined;
-    if (expected.state === "regular") {
+    if (expectedCertificate.state === "regular") {
       const holdName = priorReceipt ? `superseded-${randomBytes(4).toString("hex")}` : "initial";
       hold = join(tx.operation, holdName);
       renameSync(operation.operationPath, hold);
       let claimed: ConnectorLeafState | undefined;
       try { claimed = captureConnectorLeaf(operation.displayPath, hold); } catch { /* recovery below */ }
-      if (!claimed || !stateEqual(claimed, expected)) {
+      if (!claimed || !stateMatchesCertificate(claimed, expectedCertificate)) {
         throw republishMovedEntry(hold, operation, tx, "Connector leaf claim validation failed");
       }
+      claimedState = claimed.state === "regular" ? claimed : undefined;
       validatedHold = hold;
     }
     if (decision.state === "regular") {
@@ -576,73 +772,114 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
       catch (error) { throw error; }
       publicationCommitted = true;
       const priorCurrentHold = priorReceipt?.currentHoldOperationPath;
-      const receipt: ConnectorLeafReceipt = priorReceipt ?? {
+      const initialCertificate = priorReceipt?.initial
+        ? (isCertificate(priorReceipt.initial) ? copyCertificate(priorReceipt.initial) : certificateFromState(priorReceipt.initial))
+        : expectedCertificate;
+      const evidence = uniqueEvidence([
+        ...(priorReceipt?.evidence ?? []),
+        Object.freeze({ kind: priorReceipt ? "superseded" as const : "initial" as const, operationPath: hold ?? operation.operationPath, displayPath: hold ? recoveryDisplayPath(tx, hold) : operation.displayPath, status: "retained" as const, certificate: priorReceipt ? (expectedCertificate.state === "regular" ? expectedCertificate : undefined) : (expectedCertificate.state === "regular" ? expectedCertificate : undefined) }),
+        Object.freeze({ kind: "staging" as const, operationPath: candidate!, displayPath: recoveryDisplayPath(tx, candidate!), status: "retained" as const, certificate: stagedCertificate }),
+        Object.freeze({ kind: "current-public" as const, operationPath: operation.operationPath, displayPath: operation.displayPath, status: "retained" as const, certificate: stagedCertificate }),
+        Object.freeze({ kind: "current-private" as const, operationPath: candidate!, displayPath: recoveryDisplayPath(tx, candidate!), status: "retained" as const, certificate: stagedCertificate }),
+      ]);
+      const receipt: ConnectorLeafReceipt = freezeReceipt((priorReceipt ? {
+        ...priorReceipt,
+        initial: initialCertificate,
+        current: stagedCertificate!,
+        operationPath: operation.operationPath,
+        parentOperationPath: operation.parentOperationPath,
+        transactionDisplayPath: priorReceipt.transactionDisplayPath || tx.display,
+        transactionOperationPath: priorReceipt.transactionOperationPath || tx.operation,
+        initialHoldOperationPath: priorReceipt.initialHoldOperationPath ?? (expectedCertificate.state === "regular" ? hold : undefined),
+        initialHoldState: priorReceipt.initialHoldState ?? claimedState,
+        currentHoldOperationPath: candidate,
+        currentHoldState: stagedState,
+        mutationCommitted: true,
+        recoveryRequired: false,
+        evidence,
+      } : {
         displayPath: operation.displayPath,
         operationPath: operation.operationPath,
         parentOperationPath: operation.parentOperationPath,
-        initial: expected,
-        current: stagedState!,
+        initial: initialCertificate,
+        current: stagedCertificate!,
         transactionDisplayPath: tx.display,
         transactionOperationPath: tx.operation,
         mutationCommitted: true,
         recoveryRequired: false,
-      };
-      if (!receipt.initialHoldOperationPath && receipt.initial.state === "regular") {
-        receipt.initialHoldOperationPath = hold;
-        receipt.initialHoldState = receipt.initial;
-      }
-      receipt.current = stagedState!;
-      receipt.currentHoldOperationPath = candidate;
-      receipt.currentHoldState = stagedState!;
-      receipt.mutationCommitted = true;
+        initialHoldOperationPath: expectedCertificate.state === "regular" ? hold : undefined,
+        initialHoldState: expectedCertificate.state === "regular" ? claimedState : undefined,
+        currentHoldOperationPath: candidate,
+        currentHoldState: stagedState,
+        evidence,
+      }) as ConnectorLeafReceipt);
       committedReceipt = receipt;
       const publicState = captureConnectorLeaf(operation.displayPath, operation.operationPath);
       const candidateState = captureConnectorLeaf(operation.displayPath, candidate!);
       if (publicState.state !== "regular" || candidateState.state !== "regular"
-        || !stateEqual(publicState, candidateState)) {
+        || !stateMatchesCertificate(publicState, stagedCertificate!)
+        || !stateMatchesCertificate(candidateState, stagedCertificate!)) {
         throw new Error(`Connector candidate publication verification failed at ${operation.displayPath}`);
       }
-      receipt.current = publicState;
-      receipt.currentHoldState = publicState;
       const cleanupFailures: string[] = [];
-      if (priorCurrentHold && priorCurrentHold !== candidate && expected.state === "regular") {
-        const failure = unlinkPrivateIfExact(priorCurrentHold, expected, operation.displayPath, tx);
+      if (priorCurrentHold && priorCurrentHold !== candidate && expectedCertificate.state === "regular") {
+        const failure = unlinkPrivateIfExact(priorCurrentHold, expectedCertificate, operation.displayPath, tx);
         if (failure) cleanupFailures.push(failure);
       }
-      if (hold && hold !== receipt.initialHoldOperationPath && expected.state === "regular") {
-        const failure = unlinkPrivateIfExact(hold, expected, operation.displayPath, tx);
+      if (hold && hold !== receipt.initialHoldOperationPath && expectedCertificate.state === "regular") {
+        const failure = unlinkPrivateIfExact(hold, claimedState ?? expectedCertificate, operation.displayPath, tx);
         if (failure) cleanupFailures.push(failure);
       }
       if (cleanupFailures.length > 0) {
-        receipt.recoveryRequired = true;
         throw new Error(cleanupFailures.join("; "));
       }
       return { changed: true, content: decision.content, receipt };
     }
     const priorCurrentHold = priorReceipt?.currentHoldOperationPath;
-    const receipt: ConnectorLeafReceipt = priorReceipt ?? {
+    const initialCertificate = priorReceipt?.initial
+      ? (isCertificate(priorReceipt.initial) ? copyCertificate(priorReceipt.initial) : certificateFromState(priorReceipt.initial))
+      : expectedCertificate;
+    const receipt: ConnectorLeafReceipt = freezeReceipt((priorReceipt ? {
+      ...priorReceipt,
+      initial: initialCertificate,
+      current: Object.freeze({ state: "absent" as const }) as ConnectorLeafCertificate,
+      operationPath: operation.operationPath,
+      parentOperationPath: operation.parentOperationPath,
+      transactionDisplayPath: priorReceipt.transactionDisplayPath || tx.display,
+      transactionOperationPath: priorReceipt.transactionOperationPath || tx.operation,
+      initialHoldOperationPath: priorReceipt.initialHoldOperationPath ?? hold,
+      initialHoldState: priorReceipt.initialHoldState ?? claimedState,
+      currentHoldOperationPath: hold,
+      currentHoldState: expectedCertificate.state === "regular" ? claimedState : undefined,
+      mutationCommitted: true,
+      recoveryRequired: false,
+      evidence: uniqueEvidence([
+        ...(priorReceipt.evidence ?? []),
+        ...(hold ? [Object.freeze({ kind: priorReceipt ? "superseded" as const : "initial" as const, operationPath: hold, displayPath: recoveryDisplayPath(tx, hold), status: "retained" as const, certificate: expectedCertificate.state === "regular" ? expectedCertificate : undefined })] : []),
+        Object.freeze({ kind: "current-public" as const, operationPath: operation.operationPath, displayPath: operation.displayPath, status: "retained" as const }),
+      ]),
+    } : {
       displayPath: operation.displayPath,
       operationPath: operation.operationPath,
       parentOperationPath: operation.parentOperationPath,
-      initial: expected,
-      current: { state: "absent" },
+      initial: initialCertificate,
+      current: Object.freeze({ state: "absent" as const }) as ConnectorLeafCertificate,
       transactionDisplayPath: tx.display,
       transactionOperationPath: tx.operation,
       mutationCommitted: true,
       recoveryRequired: false,
-    };
-    if (!receipt.initialHoldOperationPath && receipt.initial.state === "regular") {
-      receipt.initialHoldOperationPath = hold;
-      receipt.initialHoldState = receipt.initial;
-    }
-    receipt.current = { state: "absent" };
-    receipt.currentHoldOperationPath = hold;
-    receipt.currentHoldState = expected as Extract<ConnectorLeafState, { state: "regular" }>;
-    receipt.mutationCommitted = true;
-    if (priorCurrentHold && priorCurrentHold !== hold && expected.state === "regular") {
-      const failure = unlinkPrivateIfExact(priorCurrentHold, expected, operation.displayPath, tx);
+      initialHoldOperationPath: expectedCertificate.state === "regular" ? hold : undefined,
+      initialHoldState: expectedCertificate.state === "regular" ? claimedState : undefined,
+      currentHoldOperationPath: hold,
+      currentHoldState: expectedCertificate.state === "regular" ? claimedState : undefined,
+      evidence: uniqueEvidence([
+        ...(hold ? [Object.freeze({ kind: "initial" as const, operationPath: hold, displayPath: recoveryDisplayPath(tx, hold), status: "retained" as const, certificate: expectedCertificate.state === "regular" ? expectedCertificate : undefined })] : []),
+        Object.freeze({ kind: "current-public" as const, operationPath: operation.operationPath, displayPath: operation.displayPath, status: "retained" as const }),
+      ]),
+    }) as ConnectorLeafReceipt);
+    if (priorCurrentHold && priorCurrentHold !== hold && expectedCertificate.state === "regular") {
+      const failure = unlinkPrivateIfExact(priorCurrentHold, expectedCertificate, operation.displayPath, tx);
       if (failure) {
-        receipt.recoveryRequired = true;
         throw new Error(failure);
       }
     }
@@ -653,7 +890,7 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
         validatedHold,
         operation,
         tx,
-        `Connector candidate publication failed (${String(error)})`,
+        "Connector candidate publication failed",
       )
       : error;
     const primary = sanitizeLeafError(failure, operation, tx);
@@ -672,35 +909,52 @@ export function mutateConnectorLeaf(operation: ConnectorLeafOperation, priorRece
     }
     if (cleanupFailures.length > 0) primary.message = `${primary.message}; ${cleanupFailures.join("; ")}`;
     if (committedReceipt) {
-      committedReceipt.recoveryRequired = true;
-      Object.assign(primary, { connectorLeafReceipt: committedReceipt });
+      Object.defineProperty(primary, "connectorLeafReceipt", {
+        value: committedReceipt,
+        enumerable: false,
+        configurable: false,
+      });
+    } else {
+      Object.defineProperty(primary, "connectorLeafFailureEvidence", {
+        value: Object.freeze({
+          displayPath: operation.displayPath,
+          transactionDisplayPath: tx.display,
+          evidence: uniqueEvidence([
+            ...(candidate ? [Object.freeze({ kind: "staging" as const, operationPath: candidate, displayPath: recoveryDisplayPath(tx, candidate), status: "retained" as const })] : []),
+            ...(validatedHold ? [Object.freeze({ kind: "recovery" as const, operationPath: validatedHold, displayPath: recoveryDisplayPath(tx, validatedHold), status: "retain-only" as const })] : []),
+          ]),
+        }),
+        enumerable: false,
+      });
     }
     throw primary;
   }
 }
 
-export function compensateConnectorLeaf(receipt: ConnectorLeafReceipt): readonly string[] {
+export function compensateConnectorLeaf(receipt: ConnectorLeafReceipt): ConnectorLeafFailureList {
   const failures: string[] = [];
   let rollbackHold: string | undefined;
   let rollbackClaimed = false;
   let compensationCommitted = false;
   try {
-    if (!receipt.mutationCommitted) return failures;
+    if (!receipt.mutationCommitted) return resultList(failures, { receipt, compensated: true });
+    const initialCertificate = isCertificate(receipt.initial) ? receipt.initial : certificateFromState(receipt.initial);
+    const currentCertificate = isCertificate(receipt.current) ? receipt.current : certificateFromState(receipt.current);
     let initialHold: string | undefined;
-    if (receipt.initial.state === "regular") {
+    if (initialCertificate.state === "regular") {
       initialHold = receipt.initialHoldOperationPath;
       if (!initialHold) throw new Error("initial hold unavailable");
       const retainedInitial = captureConnectorLeaf(receipt.displayPath, initialHold);
-      if (!stateEqual(retainedInitial, receipt.initial)) throw new Error("initial hold changed");
+      if (!stateMatchesCertificate(retainedInitial, initialCertificate)) throw new Error("initial hold changed");
     }
-    if (receipt.current.state === "regular") {
+    if (currentCertificate.state === "regular") {
       const now = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
-      if (!stateEqual(now, receipt.current)) throw new Error("current receipt changed");
+      if (!stateMatchesCertificate(now, currentCertificate)) throw new Error("current receipt changed");
       rollbackHold = join(receipt.transactionOperationPath, `rollback-${randomBytes(4).toString("hex")}`);
       renameSync(receipt.operationPath, rollbackHold);
       let claimed: ConnectorLeafState | undefined;
       try { claimed = captureConnectorLeaf(receipt.displayPath, rollbackHold); } catch { /* recovery below */ }
-      if (!claimed || !stateEqual(claimed, receipt.current)) {
+      if (!claimed || !stateMatchesCertificate(claimed, currentCertificate)) {
         const recoveryFailure = republishMovedEntry(
           rollbackHold,
           {
@@ -714,62 +968,79 @@ export function compensateConnectorLeaf(receipt: ConnectorLeafReceipt): readonly
         throw recoveryFailure;
       }
       rollbackClaimed = true;
-      if (receipt.initial.state === "regular") {
-        linkSync(initialHold!, receipt.operationPath);
+      if (initialCertificate.state === "regular") {
+        const initialState = captureConnectorLeaf(receipt.displayPath, initialHold!);
+        if (initialState.state !== "regular") throw new Error("initial hold changed");
+        const restorePath = join(receipt.transactionOperationPath, `restore-${randomBytes(4).toString("hex")}`);
+        const restoreState = stageCandidate(restorePath, initialState.content, initialCertificate.mode, false, receipt.displayPath);
+        const restoreCertificate = certificateFromState(restoreState);
+        if (!stateMatchesLogical(restoreState, initialCertificate)) throw new Error("restore candidate certificate mismatch");
+        linkSync(restorePath, receipt.operationPath);
         compensationCommitted = true;
         const restored = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
-        if (!stateEqual(restored, receipt.initial)) throw new Error("initial receipt restoration mismatch");
+        if (!stateMatchesLogical(restored, initialCertificate)) throw new Error("initial receipt restoration mismatch");
+        const restoreFailure = unlinkPrivateIfExact(restorePath, restoreCertificate, receipt.displayPath, { operation: receipt.transactionOperationPath, display: receipt.transactionDisplayPath });
+        if (restoreFailure) throw new Error(restoreFailure);
       } else {
         compensationCommitted = true;
       }
       const cleanupFailure = unlinkPrivateIfExact(
         rollbackHold,
-        receipt.current,
+        currentCertificate,
         receipt.displayPath,
         { operation: receipt.transactionOperationPath, display: receipt.transactionDisplayPath },
       );
       if (cleanupFailure) throw new Error(cleanupFailure);
-    } else if (receipt.initial.state === "regular") {
+    } else if (initialCertificate.state === "regular") {
       const now = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
       if (now.state !== "absent") throw new Error("current receipt changed");
-      linkSync(initialHold!, receipt.operationPath);
+      const initialState = captureConnectorLeaf(receipt.displayPath, initialHold!);
+      if (initialState.state !== "regular") throw new Error("initial hold changed");
+      const restorePath = join(receipt.transactionOperationPath, `restore-${randomBytes(4).toString("hex")}`);
+      const restoreState = stageCandidate(restorePath, initialState.content, initialCertificate.mode, false, receipt.displayPath);
+      const restoreCertificate = certificateFromState(restoreState);
+      if (!stateMatchesLogical(restoreState, initialCertificate)) throw new Error("restore candidate certificate mismatch");
+      linkSync(restorePath, receipt.operationPath);
       compensationCommitted = true;
       const restored = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
-      if (!stateEqual(restored, receipt.initial)) throw new Error("initial receipt restoration mismatch");
+      if (!stateMatchesLogical(restored, initialCertificate)) throw new Error("initial receipt restoration mismatch");
+      const restoreFailure = unlinkPrivateIfExact(restorePath, restoreCertificate, receipt.displayPath, { operation: receipt.transactionOperationPath, display: receipt.transactionDisplayPath });
+      if (restoreFailure) throw new Error(restoreFailure);
     } else {
       const now = captureConnectorLeaf(receipt.displayPath, receipt.operationPath);
       if (now.state !== "absent") throw new Error("current receipt changed");
     }
   } catch (error) {
-    receipt.recoveryRequired = true;
     const failure = rollbackHold && rollbackClaimed && !compensationCommitted
       ? republishMovedEntry(
         rollbackHold,
         { displayPath: receipt.displayPath, operationPath: receipt.operationPath },
         { operation: receipt.transactionOperationPath, display: receipt.transactionDisplayPath },
-        `rollback failed (${String(error)})`,
+        "rollback failed",
       )
       : error;
-    const message = failure instanceof Error ? failure.message : String(failure);
-    failures.push(`${receipt.displayPath}: rollback incomplete (${message})`);
+    const message = failure instanceof Error ? failure.message : typeof failure === "string" ? failure : "rollback failed";
+    const named = receipt.initialHoldOperationPath && message.includes("initial hold")
+      ? `${message}; recovery artifact retained at ${receipt.initialHoldOperationPath}` : message;
+    failures.push(`${receipt.displayPath}: rollback incomplete (${named})`);
   }
-  return failures;
+  return resultList(failures, { receipt, compensated: failures.length === 0 });
 }
 
-export function finalizeConnectorLeaf(receipt: ConnectorLeafReceipt): readonly string[] {
+export function finalizeConnectorLeaf(receipt: ConnectorLeafReceipt): ConnectorLeafFinalizationList {
   const failures: string[] = [];
   const tx = { operation: receipt.transactionOperationPath, display: receipt.transactionDisplayPath };
-  const holds = new Map<string, Extract<ConnectorLeafState, { state: "regular" }> | undefined>();
+  const holds = new Map<string, ConnectorLeafCertificate | Extract<ConnectorLeafState, { state: "regular" }> | undefined>();
   if (receipt.currentHoldOperationPath) {
     holds.set(
       receipt.currentHoldOperationPath,
-      receipt.currentHoldState ?? (receipt.current.state === "regular" ? receipt.current : undefined),
+      receipt.currentHoldState ?? (isCertificate(receipt.current) ? receipt.current : receipt.current.state === "regular" ? receipt.current : undefined),
     );
   }
   if (receipt.initialHoldOperationPath) {
     holds.set(
       receipt.initialHoldOperationPath,
-      receipt.initialHoldState ?? (receipt.initial.state === "regular" ? receipt.initial : undefined),
+      receipt.initialHoldState ?? (isCertificate(receipt.initial) ? receipt.initial : receipt.initial.state === "regular" ? receipt.initial : undefined),
     );
   }
   for (const [path, expected] of holds) {
@@ -785,8 +1056,7 @@ export function finalizeConnectorLeaf(receipt: ConnectorLeafReceipt): readonly s
       failures.push(`${receipt.displayPath}: cleanup incomplete; recovery artifact retained at ${receipt.transactionDisplayPath}`);
     }
   }
-  if (failures.length > 0) receipt.recoveryRequired = true;
-  return failures;
+  return resultList(failures, { receipt, finalized: failures.length === 0 });
 }
 
 export type ConnectorLeafMutationResult = Readonly<{ changed: boolean; content?: Buffer; receipt: ConnectorLeafReceipt }>;
@@ -798,13 +1068,15 @@ export function removeCodexHooks(hooksPath: string): boolean {
   try { parentFd = openSync(parent, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    const wrapped = new Error(`Unable to inspect connector hooks parent at ${parent}`, { cause: error });
+    const wrapped = new Error(`Unable to inspect connector hooks parent at ${parent}`);
     const code = (error as NodeJS.ErrnoException).code;
     if (typeof code === "string") Object.assign(wrapped, { code });
     throw wrapped;
   }
   try {
-    const operationPath = `/proc/self/fd/${parentFd}/${hooksPath.slice(parent.length + 1)}`;
+    const leaf = basename(hooksPath);
+    if (!leaf || leaf === "." || leaf === "..") throw new Error(`Unable to inspect connector hooks parent at ${parent}`);
+    const operationPath = `/proc/self/fd/${parentFd}/${leaf}`;
     const parentOperationPath = `/proc/self/fd/${parentFd}`;
     let result: ConnectorLeafMutationResult;
     try {
@@ -821,7 +1093,20 @@ export function removeCodexHooks(hooksPath: string): boolean {
       return { state: "regular", content: Buffer.from(decision.content, "utf-8"), mode: regularBase.mode };
       }});
     } catch (error) {
-      const message = (error instanceof Error ? error.message : String(error)).replaceAll(operationPath, hooksPath).replaceAll(parentOperationPath, parent);
+      const message = (error instanceof Error ? error.message : typeof error === "string" ? error : "connector hooks mutation failed").replaceAll(operationPath, hooksPath).replaceAll(parentOperationPath, parent);
+      const receipt = (error as Error & { connectorLeafReceipt?: ConnectorLeafReceipt }).connectorLeafReceipt;
+      if (receipt?.mutationCommitted) {
+        const compensation = compensateConnectorLeaf(receipt);
+        const finalization = compensation.length === 0 ? finalizeConnectorLeaf(receipt) : [];
+        const failures = [...compensation, ...finalization];
+        const outcome = failures.length === 0
+          ? "standalone committed mutation compensated"
+          : `standalone compensation incomplete (${failures.join("; ")})`;
+        const wrapped = new Error(`${message}; ${outcome}`);
+        const code = (error as NodeJS.ErrnoException)?.code;
+        if (typeof code === "string") Object.assign(wrapped, { code });
+        throw wrapped;
+      }
       const wrapped = new Error(message);
       const code = (error as NodeJS.ErrnoException)?.code;
       if (typeof code === "string") Object.assign(wrapped, { code });
@@ -838,7 +1123,20 @@ export function hasCodexHooks(hooksPath: string): boolean {
 }
 
 function readFileContent(path: string): string {
-  try { return readFileSync(path, "utf-8"); } catch { return ""; }
+  let descriptor: number;
+  try {
+    descriptor = openSync(path, leafFlags);
+  } catch { return ""; }
+  try {
+    const before = fstatSync(descriptor);
+    if (!before.isFile()) return "";
+    const content = readLeaf(descriptor, Number(before.size), path);
+    const after = fstatSync(descriptor);
+    if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino
+      || leafMode(after) !== leafMode(before) || Number(after.size) !== Number(before.size)) return "";
+    return content.toString("utf-8");
+  } catch { return ""; }
+  finally { closeSync(descriptor); }
 }
 
 /** Resolve the Codex hooks path using the same `~/` convention as installation. */
@@ -864,15 +1162,15 @@ function hasExactPostToolHook(value: unknown): boolean {
 
 /** Inspect only the exact native Codex PostToolUse contract; this function never writes. */
 export function inspectCodexPostToolHook(hooksPath: string): CodexPostToolHookInspection {
-  let value: unknown;
-  try {
-    value = JSON.parse(readFileSync(hooksPath, "utf-8"));
-  } catch (error) {
-    const state: CodexPostToolHookState = (error as NodeJS.ErrnoException).code === "ENOENT"
-      ? "absent"
-      : "incomplete";
-    return { path: hooksPath, state, structural: false };
+  const content = readFileContent(hooksPath);
+  if (!content) {
+    try { lstatSync(hooksPath); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path: hooksPath, state: "absent", structural: false };
+    }
+    return { path: hooksPath, state: "incomplete", structural: false };
   }
+  let value: unknown;
+  try { value = JSON.parse(content); } catch { return { path: hooksPath, state: "incomplete", structural: false }; }
 
   const structural = hasExactPostToolHook(value);
   return { path: hooksPath, state: structural ? "installed" : "incomplete", structural };
