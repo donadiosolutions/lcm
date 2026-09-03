@@ -205,6 +205,61 @@ describe("home parent authentication", () => {
     fs.rmSync(home, { recursive: true, force: true });
   });
 
+  it("fails closed for unsafe, symlinked, and replaced private roots", () => {
+    procFiles({
+      "/proc/sys/kernel/overflowuid": "65534\n",
+      "/proc/self/uid_map": "1000 1000 1\n",
+    });
+    const home = fs.mkdtempSync("/tmp/lcm-home-parent-root-");
+    const root = join(home, ".lcm");
+    fs.mkdirSync(root, { mode: 0o755 });
+    expect(() => classifyHomeParent(observation(65534), { rootPresent: true, witnessRoot: home }))
+      .toThrow("private directory mode");
+
+    fs.rmSync(root, { recursive: true, force: true });
+    const replacement = join(home, "replacement");
+    fs.mkdirSync(replacement, { mode: 0o700 });
+    fs.symlinkSync(replacement, root, "dir");
+    expect(() => classifyHomeParent(observation(65534), { rootPresent: true, witnessRoot: home }))
+      .toThrow();
+
+    fs.rmSync(root, { force: true });
+    fs.mkdirSync(root, { mode: 0o700 });
+    fs.renameSync(root, join(home, ".lcm-replaced"));
+    fs.symlinkSync(replacement, root, "dir");
+    expect(() => classifyHomeParent(observation(65534), { rootPresent: true, witnessRoot: home }))
+      .toThrow();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it("accepts an authenticated overflow-owned parent witness", () => {
+    procFiles({
+      "/proc/sys/kernel/overflowuid": "65534\n",
+      "/proc/self/uid_map": "1000 1000 1\n",
+    });
+    const home = fs.mkdtempSync("/tmp/lcm-home-parent-witness-");
+    const root = join(home, ".lcm");
+    fs.mkdirSync(root, { mode: 0o700 });
+    const homeStat = fs.statSync(home, { bigint: true });
+    const parentStat = fs.statSync(dirname(home), { bigint: true });
+    const live = observationFromPaths({
+      homePath: home,
+      homeDev: String(homeStat.dev),
+      homeIno: String(homeStat.ino),
+      homeUid: Number(homeStat.uid),
+      parentPath: dirname(home),
+      parentDev: String(parentStat.dev),
+      parentIno: String(parentStat.ino),
+      parentMode: Number(parentStat.mode & 0o7777n),
+      parentUid: 65534,
+      parentGid: String(parentStat.gid),
+      parentCtimeNs: String(parentStat.ctimeNs),
+    });
+    fs.writeFileSync(join(root, "home-parent-witness.json"), witnessContent(live), { mode: 0o600 });
+    expect(classifyHomeParent(live, { rootPresent: true, witnessRoot: home })).toBe("witnessed-system-root");
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
   it("accepts only a root-authorized sticky writable parent", () => {
     expect(parentModeIsSafe(0o1777, "direct-system-root")).toBe(true);
     expect(parentModeIsSafe(0o1777, "witnessed-system-root")).toBe(true);

@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
-import { readBoundedRegularFile } from "./security-files.js";
+import {
+  assertPrivateDirectory,
+  openPrivateDirectory,
+  readBoundedRegularFile,
+} from "./security-files.js";
 
 export const HOME_PARENT_WITNESS_VERSION = 1 as const;
 export const HOME_PARENT_WITNESS_NAME = "home-parent-witness.json";
@@ -199,18 +203,26 @@ export function classifyHomeParent(
       const map = parseUidMap(readProcText("/proc/self/uid_map", "uid_map"));
       if (hostUidForNamespaceUid(map, 0) !== undefined) throw new Error("overflow home parent is not trusted in a root-mapped namespace");
       if (!options.rootPresent) throw new Error("overflow home parent requires a direct-root witness");
-      const witness = parseHomeParentWitness(readBoundedRegularFile(witnessPath(options.witnessRoot), {
-        allowedRoot: resolve(join(options.witnessRoot, ".lcm")),
-        maxBytes: MAX_HOME_PARENT_WITNESS_BYTES,
-        expectedUid: current,
-        allowedModes: [0o600],
-        requireSingleLink: true,
-      }));
-      const expected = witnessPayload(observation);
-      for (const key of ["homePath", "homeDev", "homeIno", "parentPath", "parentDev", "parentIno", "parentMode", "parentUid", "parentCtimeNs"] as const) {
-        if (witness[key] !== expected[key]) throw new Error("home parent witness is stale or does not match the live topology");
+      const privateRootPath = resolve(join(options.witnessRoot, ".lcm"));
+      const privateRoot = openPrivateDirectory(privateRootPath, { expectedUid: current });
+      try {
+        assertPrivateDirectory(privateRoot, privateRootPath, privateRoot.witness, current);
+        const witness = parseHomeParentWitness(readBoundedRegularFile(witnessPath(options.witnessRoot), {
+          allowedRoot: privateRootPath,
+          maxBytes: MAX_HOME_PARENT_WITNESS_BYTES,
+          expectedUid: current,
+          allowedModes: [0o600],
+          requireSingleLink: true,
+        }));
+        assertPrivateDirectory(privateRoot, privateRootPath, privateRoot.witness, current);
+        const expected = witnessPayload(observation);
+        for (const key of ["homePath", "homeDev", "homeIno", "parentPath", "parentDev", "parentIno", "parentMode", "parentUid", "parentCtimeNs"] as const) {
+          if (witness[key] !== expected[key]) throw new Error("home parent witness is stale or does not match the live topology");
+        }
+        return "witnessed-system-root";
+      } finally {
+        privateRoot.close();
       }
-      return "witnessed-system-root";
     }
   }
   if (current === undefined) return "current-user";

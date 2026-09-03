@@ -45,10 +45,16 @@ export type HomeLockTopology = Readonly<{
   homeFd: number;
   parentFd: number;
   homeMode: number;
+  homeUid: bigint;
+  homeGid: bigint;
   homeDev: bigint;
   homeIno: bigint;
   parentDev: bigint;
   parentIno: bigint;
+  parentUid: bigint;
+  parentGid: bigint;
+  parentMode: number;
+  parentCtimeNs: bigint;
   expectedUid: number | undefined;
 }>;
 
@@ -112,6 +118,25 @@ function assertTopologySecurity(
   }
 }
 
+function assertRetainedMetadata(topology: HomeLockTopology): void {
+  const parent = directoryStat(topology.parentFd);
+  const home = directoryStat(topology.homeFd);
+  if (
+    parent.dev !== topology.parentDev
+    || parent.ino !== topology.parentIno
+    || parent.uid !== topology.parentUid
+    || parent.gid !== topology.parentGid
+    || Number(parent.mode & 0o7777n) !== topology.parentMode
+    || parent.ctimeNs !== topology.parentCtimeNs
+    || home.dev !== topology.homeDev
+    || home.ino !== topology.homeIno
+    || home.uid !== topology.homeUid
+    || home.gid !== topology.homeGid
+  ) {
+    return topologyError("HOME lock topology changed during validation");
+  }
+}
+
 /** Revalidate the retained HOME and parent descriptors against their paths. */
 export function assertHomeLockTopology(topology: HomeLockTopology): void {
   const parent = directoryStat(topology.parentFd);
@@ -119,6 +144,7 @@ export function assertHomeLockTopology(topology: HomeLockTopology): void {
   assertDirectoryIdentity(parent, topology.parentPath, "HOME lock grandparent");
   assertDirectoryIdentity(home, topology.homePath, "HOME lock parent");
   assertTopologySecurity(parent, home, topology.expectedUid, topology.homePath, topology.parentPath);
+  assertRetainedMetadata(topology);
 }
 
 /** Open and authenticate HOME plus its parent without following leaf symlinks. */
@@ -147,10 +173,16 @@ export function openHomeLockTopology(
       homeFd,
       parentFd,
       homeMode: Number(home.mode & 0o7777n),
+      homeUid: home.uid,
+      homeGid: home.gid,
       homeDev: home.dev,
       homeIno: home.ino,
       parentDev: parent.dev,
       parentIno: parent.ino,
+      parentUid: parent.uid,
+      parentGid: parent.gid,
+      parentMode: Number(parent.mode & 0o7777n),
+      parentCtimeNs: parent.ctimeNs,
       expectedUid,
     };
   } catch (error) {

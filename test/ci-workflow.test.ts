@@ -376,6 +376,8 @@ describe("CI workflow", () => {
       LCM_LIFECYCLE_DAEMON_PORT: "48322",
       LCM_LIFECYCLE_EXPECTED_SCOPES: "1",
       LCM_RUNTIME_PATHS_SYSTEMD_INTEGRATION: "1",
+      LCM_RUNTIME_PATHS_SYSTEMD_RUN_ROOT:
+        "${{ runner.temp }}/lcm-runtime-paths-${{ github.run_id }}-${{ github.run_attempt }}",
     });
     expect(integration?.run).toMatch(
       /systemd_state="\$\(systemctl --user is-system-running \|\| true\)"[\s\S]*case "\$systemd_state" in[\s\S]*running\|degraded\)\s*;;[\s\S]*\*\)[\s\S]*exit 1/u,
@@ -384,9 +386,22 @@ describe("CI workflow", () => {
     expect(integration?.run).toContain("test/daemon/lifecycle-systemd.integration.test.ts");
     expect(integration?.run).toContain("test/daemon/systemd-credential-loader.test.ts");
     expect(integration?.run).toContain("test/runtime-paths-systemd.integration.test.ts");
+    expect(integration?.run).toContain(
+      "npx vitest run test/runtime-paths-systemd.integration.test.ts",
+    );
+    expect(
+      integration?.run.match(/npx vitest run test\/runtime-paths-systemd\.integration\.test\.ts\b/gu),
+    ).toHaveLength(1);
+    expect(
+      integration?.run.match(/npx vitest run test\/runtime-paths-systemd\.integration\.test\.ts[^\n]*--testNamePattern/gu),
+    ).toBeNull();
     expect(integration?.run).not.toContain("PrivateTmp=no");
-    expect(integration?.run).not.toContain("--scope");
+    expect(integration?.run).not.toContain("--system");
     expect(integration?.run).not.toContain("PrivatePIDs=yes");
+    expect(integration?.run).not.toContain("--scope");
+    expect(integration?.run).not.toContain("/tmp:/tmp");
+    expect(integration?.run).not.toContain("map.includes");
+    expect(integration?.run).not.toContain("65534");
     expect(integration?.run).toContain(
       '--testNamePattern "observes the real user-systemd LoadCredential modes"',
     );

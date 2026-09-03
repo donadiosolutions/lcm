@@ -30,6 +30,8 @@ import {
 import {
   consumeBoundedRegularFile,
   atomicWritePrivateFileDurable,
+  assertPrivateDirectory,
+  openPrivateDirectory,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
 } from "./security-files.js";
@@ -479,6 +481,10 @@ function classifyHomeParent(topology: HomeTopology, homeDir: string, rootPresent
     rootPresent,
     witnessRoot: homeDir,
   });
+  // The shared classifier may read the private-root witness. Revalidate both
+  // retained descriptors and their canonical path after that read before any
+  // caller performs a pathname-based mutation.
+  assertRootParent(topology, homeDir);
   if (!parentModeIsSafe(topology.parent.witness.mode, authority)) {
     throw new Error("home parent has unsafe writable mode");
   }
@@ -488,29 +494,40 @@ function classifyHomeParent(topology: HomeTopology, homeDir: string, rootPresent
 function refreshHomeParentWitness(topology: HomeTopology, homeDir: string, authority: ParentAuthority): void {
   if (authority !== "direct-system-root") return;
   const rootPath = lcmHomeDir(homeDir);
-  const root = openPrivateRoot(rootPath);
-  root.close();
+  const root = openPrivateDirectory(rootPath, { expectedUid: currentUid() });
   const path = witnessPath(homeDir);
-  const content = witnessContent(parentObservation(topology, homeDir));
-  let expectedContentSha256: string | undefined;
   try {
-    const existing = readBoundedRegularFile(path, {
-      allowedRoot: resolve(rootPath),
-      maxBytes: 8 * 1024,
+    assertPrivateDirectory(root, rootPath, root.witness, currentUid());
+    const journal = readMigrationJournal(homeDir);
+    if (journal !== null && journal.phase !== "retained") {
+      throw new Error("cannot refresh home parent witness while legacy migration is nonterminal");
+    }
+    const content = witnessContent(parentObservation(topology, homeDir));
+    assertRootParent(topology, homeDir);
+    let expectedContentSha256: string | undefined;
+    try {
+      const existing = readBoundedRegularFile(path, {
+        allowedRoot: resolve(rootPath),
+        maxBytes: 8 * 1024,
+        expectedUid: currentUid(),
+        allowedModes: [PRIVATE_FILE_MODE],
+        requireSingleLink: true,
+      });
+      expectedContentSha256 = sha256(existing);
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
+    assertPrivateDirectory(root, rootPath, root.witness, currentUid());
+    assertRootParent(topology, homeDir);
+    atomicWritePrivateFileDurable(path, content, {
       expectedUid: currentUid(),
-      allowedModes: [PRIVATE_FILE_MODE],
-      requireSingleLink: true,
+      requireAbsent: expectedContentSha256 === undefined,
+      expectedContentSha256,
+      maxExistingBytes: 8 * 1024,
     });
-    expectedContentSha256 = sha256(existing);
-  } catch (error) {
-    if (!isMissing(error)) throw error;
+  } finally {
+    root.close();
   }
-  atomicWritePrivateFileDurable(path, content, {
-    expectedUid: currentUid(),
-    requireAbsent: expectedContentSha256 === undefined,
-    expectedContentSha256,
-    maxExistingBytes: 8 * 1024,
-  });
 }
 
 function lstatIfPresent(path: string): BigIntFileStat | undefined {
@@ -1849,9 +1866,9 @@ export function bootstrapLcmHome(homeDir: string = homedir()): RuntimeHomeBootst
     if (root === undefined) {
       const created = createPrivateRoot(topology, homeDir);
       created.root.close();
-      refreshHomeParentWitness(topology, homeDir, admission.parentAuthority);
-      const expected = treeWitnessOf(lcmHomeDir(homeDir));
       return admission.withFinalLock(() => {
+        refreshHomeParentWitness(topology, homeDir, admission.parentAuthority);
+        const expected = treeWitnessOf(lcmHomeDir(homeDir));
         const current = treeWitnessOf(lcmHomeDir(homeDir));
         if (!sameIdentity(current.identity, expected.identity) || current.hash !== expected.hash || current.mode !== PRIVATE_ROOT_MODE) {
           throw new Error("private LCM root changed before bootstrap handoff");
