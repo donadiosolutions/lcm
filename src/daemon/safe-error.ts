@@ -7,6 +7,7 @@ const URL_SCHEME_START_PATTERN = /^[A-Za-z]$/u;
 const URL_SCHEME_CHARACTER_PATTERN = /^[A-Za-z\d+.-]$/u;
 const WHITESPACE_PATTERN = /\s/u;
 const PATH_DELIMITERS = new Set(["#", "&", "=", "|", ",", ";", ":", "!", "?", ")", "]", "}", "'", '"', "<", ">"]);
+const URL_END_DELIMITERS = new Set(["|", ",", ";", ")", "]", "}", "'", '"', "<", ">"]);
 
 function isPathWord(char: string | undefined): boolean {
   return char !== undefined && (PATH_WORD_PATTERN.test(char) || "_.-@+~%$*".includes(char));
@@ -19,40 +20,53 @@ function isFileUrlPathStart(chars: readonly string[], index: number): boolean {
 
 function findUrlAuthorityPathStarts(chars: readonly string[]): Uint8Array {
   const pathStarts = new Uint8Array(chars.length);
-  let tokenStart = 0;
-  let schemeCandidate = true;
+  let schemeLength = 0;
   let separator = -1;
-  let validScheme = false;
+  let brackets = 0;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
     if (WHITESPACE_PATTERN.test(char)) {
-      tokenStart = index + 1;
-      schemeCandidate = true;
+      schemeLength = 0;
       separator = -1;
-      validScheme = false;
+      brackets = 0;
       continue;
     }
-    if (separator < 0) {
-      if (char === ":" && chars[index + 1] === "/" && chars[index + 2] === "/") {
-        separator = index;
-        validScheme = index > tokenStart && schemeCandidate;
-        continue;
-      }
-      const schemeCharacter = index === tokenStart
-        ? URL_SCHEME_START_PATTERN.test(char)
-        : URL_SCHEME_CHARACTER_PATTERN.test(char);
-      schemeCandidate &&= schemeCharacter;
+    if (separator >= 0 && char === "[") {
+      brackets += 1;
       continue;
     }
-    if (validScheme && char === "/" && index > separator + 2) pathStarts[index] = 1;
+    if (separator >= 0 && char === "]" && brackets > 0) {
+      brackets -= 1;
+      continue;
+    }
+    if (separator >= 0 && brackets === 0 && URL_END_DELIMITERS.has(char)) {
+      schemeLength = 0;
+      separator = -1;
+      continue;
+    }
+    if (separator >= 0) {
+      if (char === "/") pathStarts[index] = 1;
+      continue;
+    }
+    if (char === ":" && schemeLength > 0 && chars[index + 1] === "/" && chars[index + 2] === "/") {
+      separator = index;
+      pathStarts[index + 1] = 1;
+      pathStarts[index + 2] = 1;
+      continue;
+    }
+    if (schemeLength === 0) {
+      schemeLength = URL_SCHEME_START_PATTERN.test(char) ? 1 : 0;
+      continue;
+    }
+    schemeLength = URL_SCHEME_CHARACTER_PATTERN.test(char) ? schemeLength + 1 : 0;
   }
 
   return pathStarts;
 }
 
 function isPosixPathStart(chars: readonly string[], index: number, urlAuthorityPathStarts: Uint8Array): boolean {
-  if (chars[index] !== "/" || chars[index + 1] === "/") return false;
+  if (chars[index] !== "/") return false;
   if (isFileUrlPathStart(chars, index)) return true;
   if (urlAuthorityPathStarts[index] === 1) return false;
   const previous = chars[index - 1];
@@ -69,15 +83,22 @@ function isUncPathStart(chars: readonly string[], index: number): boolean {
   return !isPathWord(chars[index - 1]);
 }
 
-function scanAbsolutePath(chars: readonly string[], start: number, windows: boolean, quote?: string): number {
+function scanAbsolutePath(
+  chars: readonly string[],
+  start: number,
+  windows: boolean,
+  quote?: string,
+): { end: number; sawNonSeparator: boolean } {
   let index = start;
   let parentheses = 0;
   let brackets = 0;
   let sawPathCharacter = false;
+  let sawNonSeparator = false;
   while (index < chars.length) {
     const char = chars[index];
     if (isPathWord(char)) {
       sawPathCharacter = true;
+      sawNonSeparator = true;
       index += 1;
       continue;
     }
@@ -91,35 +112,41 @@ function scanAbsolutePath(chars: readonly string[], start: number, windows: bool
       continue;
     }
     if (quote !== undefined) {
-      if (char === quote) return index + 1;
+      if (char === quote) return { end: index + 1, sawNonSeparator };
       if (char === "\n" || char === "\r") break;
+      sawNonSeparator = true;
       index += 1;
       continue;
     }
     if (char === "(" && sawPathCharacter) {
       parentheses += 1;
+      sawNonSeparator = true;
       index += 1;
       continue;
     }
     if (char === ")" && parentheses > 0) {
       parentheses -= 1;
+      sawNonSeparator = true;
       index += 1;
       continue;
     }
     if (char === "[" && sawPathCharacter) {
       brackets += 1;
+      sawNonSeparator = true;
       index += 1;
       continue;
     }
     if (char === "]" && brackets > 0) {
       brackets -= 1;
+      sawNonSeparator = true;
       index += 1;
       continue;
     }
     if (char === " " || char === "\t" || char === "\n" || char === "\r" || PATH_DELIMITERS.has(char)) break;
+    sawNonSeparator = true;
     index += 1;
   }
-  return index;
+  return { end: index, sawNonSeparator };
 }
 
 function sanitizeAbsolutePaths(message: string): string {
@@ -136,8 +163,8 @@ function sanitizeAbsolutePaths(message: string): string {
       index += 1;
       continue;
     }
-    const end = scanAbsolutePath(chars, start, windows, quote);
-    if (end <= start + (windows && isWindowsDrivePathStart(chars, start) ? 3 : 1)) {
+    const { end, sawNonSeparator } = scanAbsolutePath(chars, start, windows, quote);
+    if ((posix && !sawNonSeparator) || end <= start + (windows && isWindowsDrivePathStart(chars, start) ? 3 : 1)) {
       sanitized.push(chars[index]);
       index += 1;
       continue;
