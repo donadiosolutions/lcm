@@ -370,7 +370,10 @@ function assertPathMatchesDirectory(handle: Pick<OpenDirectory, "fd">, path: str
   if (canonical !== requested) throw new Error(`${label} path is a symlink or non-canonical path`);
   const stat = fstatSync(handle.fd, { bigint: true }) as unknown as BigIntFileStat;
   const pathStat = statSync(canonical, { bigint: true }) as unknown as BigIntFileStat;
-  if (!sameIdentity(statIdentity(stat), statIdentity(pathStat))) {
+  if (!sameIdentity(statIdentity(stat), statIdentity(pathStat))
+    || stat.uid !== pathStat.uid
+    || stat.gid !== pathStat.gid
+    || modeOf(stat) !== modeOf(pathStat)) {
     throw new Error(`${label} changed during validation`);
   }
 }
