@@ -54,7 +54,6 @@ export type HomeLockTopology = Readonly<{
   parentUid: bigint;
   parentGid: bigint;
   parentMode: number;
-  parentCtimeNs: bigint;
   expectedUid: number | undefined;
 }>;
 
@@ -127,7 +126,6 @@ function assertRetainedMetadata(topology: HomeLockTopology): void {
     || parent.uid !== topology.parentUid
     || parent.gid !== topology.parentGid
     || Number(parent.mode & 0o7777n) !== topology.parentMode
-    || parent.ctimeNs !== topology.parentCtimeNs
     || home.dev !== topology.homeDev
     || home.ino !== topology.homeIno
     || home.uid !== topology.homeUid
@@ -182,7 +180,6 @@ export function openHomeLockTopology(
       parentUid: parent.uid,
       parentGid: parent.gid,
       parentMode: Number(parent.mode & 0o7777n),
-      parentCtimeNs: parent.ctimeNs,
       expectedUid,
     };
   } catch (error) {

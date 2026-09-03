@@ -257,6 +257,12 @@ describe("home parent authentication", () => {
     });
     fs.writeFileSync(join(root, "home-parent-witness.json"), witnessContent(live), { mode: 0o600 });
     expect(classifyHomeParent(live, { rootPresent: true, witnessRoot: home })).toBe("witnessed-system-root");
+    fs.writeFileSync(join(root, "home-parent-witness.json"), witnessContent({
+      ...live,
+      parentCtimeNs: String(BigInt(live.parentCtimeNs) + 1n),
+    }), { mode: 0o600 });
+    expect(() => classifyHomeParent(live, { rootPresent: true, witnessRoot: home }))
+      .toThrow("stale");
     fs.rmSync(home, { recursive: true, force: true });
   });
 
