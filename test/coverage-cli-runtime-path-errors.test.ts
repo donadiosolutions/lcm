@@ -293,8 +293,8 @@ afterEach(() => {
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
 });
 
-function legacyHome(): { home: string; legacy: string; next: string } {
-  const home = mkdtempSync(join(tmpdir(), "lcm-runtime-errors-"));
+function legacyHome(base = tmpdir()): { home: string; legacy: string; next: string } {
+  const home = mkdtempSync(join(base, "lcm-runtime-errors-"));
   homes.push(home);
   const legacy = legacyLcmHomeDir(home);
   mkdirSync(legacy, { recursive: true });
@@ -886,7 +886,7 @@ describe("runtime home rename failures", () => {
   });
 
   it("rejects a nonterminal journal injected at witness refresh", () => {
-    const paths = legacyHome();
+    const paths = legacyHome("/tmp");
     processControl.procFiles.set("/proc/self/uid_map", "0 0 1\n");
     fsControl.fstatHook = (path, stat) => path === "/tmp"
       ? Object.assign(stat as object, { uid: 0n })
@@ -894,25 +894,32 @@ describe("runtime home rename failures", () => {
     fsControl.statHook = (path, stat) => path === "/tmp"
       ? Object.assign(stat as object, { uid: 0n })
       : stat;
-    let rootOpens = 0;
     let injectedFd: number | undefined;
     let injectedFdClosed = false;
+    let injectionArmed = false;
+    let injectionOccurred = false;
     let injectedJournal: string | undefined;
     const journalPath = join(paths.home, ".lcm-legacy-migration.json");
+    fsControl.writeHook = (_path, _fd, content) => {
+      if (!injectionArmed
+        && content.toString().includes('"phase":"retained"')
+        && existsSync(paths.next)
+        && !existsSync(join(paths.next, "home-parent-witness.json"))) {
+        injectionArmed = true;
+      }
+    };
     fsControl.openHook = (path, fd) => {
-      if (path === paths.next) {
-        rootOpens += 1;
-        if (rootOpens === 7) {
-          const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
-            operationId: string;
-            stagingName: string;
-          };
-          const staging = join(paths.home, journal.stagingName);
-          fsControl.openHook = undefined;
-          retainedJournal(paths.home, paths.legacy, paths.next, staging, "retaining", staging, journal.operationId);
-          injectedJournal = readFileSync(journalPath, "utf8");
-          injectedFd = fd;
-        }
+      if (injectionArmed && !injectionOccurred && path === paths.next) {
+        const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+          operationId: string;
+          stagingName: string;
+        };
+        const staging = join(paths.home, journal.stagingName);
+        injectionOccurred = true;
+        retainedJournal(paths.home, paths.legacy, paths.next, staging, "retaining", staging, journal.operationId);
+        injectedJournal = readFileSync(journalPath, "utf8");
+        injectedFd = fd;
+        fsControl.openHook = undefined;
       }
     };
     fsControl.closeHook = (_path, fd) => {
@@ -922,7 +929,8 @@ describe("runtime home rename failures", () => {
     expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow(
       "cannot refresh home parent witness while legacy migration is nonterminal",
     );
-    expect(rootOpens).toBe(7);
+    expect(injectionArmed).toBe(true);
+    expect(injectionOccurred).toBe(true);
     expect(injectedFd).toBeDefined();
     expect(existsSync(join(paths.next, "home-parent-witness.json"))).toBe(false);
     expect(readFileSync(journalPath, "utf8")).toBe(injectedJournal);
@@ -1073,6 +1081,9 @@ describe("runtime home rename failures", () => {
     fsControl.fstatHook = (path, stat) => path === "/tmp"
       ? Object.assign(stat as object, { uid: 0n })
       : stat;
+    fsControl.statHook = (path, stat) => path === "/tmp"
+      ? Object.assign(stat as object, { uid: 0n })
+      : stat;
 
     expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
   });
@@ -1083,6 +1094,9 @@ describe("runtime home rename failures", () => {
     processControl.procFiles.set("/proc/self/uid_map", "0 0 1\n");
     processControl.witnessError = Object.assign(new Error("witness permission denied"), { code: "EACCES" });
     fsControl.fstatHook = (path, stat) => path === "/tmp"
+      ? Object.assign(stat as object, { uid: 0n })
+      : stat;
+    fsControl.statHook = (path, stat) => path === "/tmp"
       ? Object.assign(stat as object, { uid: 0n })
       : stat;
 
