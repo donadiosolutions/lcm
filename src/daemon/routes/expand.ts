@@ -5,6 +5,7 @@ import { createRetrievalEngine } from "../../retrieval.js";
 import { ExpansionOrchestrator } from "../../expansion.js";
 import { validateCwd } from "../validate-cwd.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
+import { sanitizeError } from "../safe-error.js";
 import {
   storageRouteFailureResponse,
   withProjectStorage,
@@ -48,7 +49,10 @@ export function createExpandHandler(config: DaemonConfig, storageFactory?: Stora
         sendJson(res, storageFailure.status, storageFailure.body);
         return;
       }
-      sendJson(res, 200, { expanded: null, error: err instanceof Error ? err.message : "expansion failed" });
+      sendJson(res, 200, {
+        expanded: null,
+        error: err instanceof Error ? sanitizeError(err.message) : "expansion failed",
+      });
     }
   };
 }

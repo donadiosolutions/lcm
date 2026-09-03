@@ -43,12 +43,20 @@ describe("server helper boundaries", () => {
     expect(resume).toHaveBeenCalledOnce();
   });
 
-  it.each([null, "text", { error: 3 }, { error: "failure /secret/path", keep: true }])("serializes response shape %#", data => {
+  it.each([
+    { data: null, expected: null },
+    { data: "text", expected: "text" },
+    { data: { error: 3 }, expected: { error: 3 } },
+    {
+      data: { error: "failure /secret/path", keep: true },
+      expected: { error: "failure <path>", keep: true },
+    },
+  ])("serializes response shape %#", ({ data, expected }) => {
     let body = "";
     const res = { writeHead: vi.fn(), end: vi.fn((value: string) => { body = value; }) };
     sendJson(res as never, 202, data);
     expect(res.writeHead).toHaveBeenCalledWith(202, { "Content-Type": "application/json" });
-    expect(JSON.parse(body)).toBeDefined();
+    expect(JSON.parse(body)).toEqual(expected);
   });
 });
 
