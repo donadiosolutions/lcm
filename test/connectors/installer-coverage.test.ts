@@ -3175,6 +3175,107 @@ describe("installer descriptor edge branches", () => {
     }
   });
 
+  it("normalizes bigint snapshot identities and rejects readback drift", async () => {
+    const bigintRoot = join(directory, "bigint-snapshot");
+    const installed = installConnector("claude-code", "skill", bigintRoot);
+    const skillPath = installed.path;
+    const descriptors = new Set<number>();
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const fd = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          let shown = String(path);
+          const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(shown);
+          if (match) {
+            try { shown = join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { /* retain proc path */ }
+          }
+          if (shown === skillPath) descriptors.add(fd);
+          return fd;
+        }) as typeof actual.openSync,
+        fstatSync: ((fd: number, options?: fs.StatOptions) => {
+          const stats = actual.fstatSync(fd, options as never);
+          if (!descriptors.has(fd)) return stats;
+          return new Proxy(stats, {
+            get: (target, prop) => prop === "dev" ? BigInt(target.dev) : prop === "ino" ? BigInt(target.ino) : Reflect.get(target, prop, target),
+          });
+        }) as typeof actual.fstatSync,
+        closeSync: ((fd: number) => { descriptors.delete(fd); return actual.closeSync(fd); }) as typeof actual.closeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(module.installConnector("claude-code", "skill", bigintRoot)).toEqual(expect.objectContaining({ success: true }));
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+
+    const driftRoot = join(directory, "descriptor-readback-drift");
+    const driftInstalled = installConnector("claude-code", "skill", driftRoot);
+    const driftPath = driftInstalled.path;
+    const counts = new Map<number, number>();
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const fd = mode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, mode);
+          let shown = String(path);
+          const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(shown);
+          if (match) {
+            try { shown = join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { /* retain proc path */ }
+          }
+          if (shown === driftPath) counts.set(fd, 0);
+          return fd;
+        }) as typeof actual.openSync,
+        fstatSync: ((fd: number, options?: fs.StatOptions) => {
+          const stats = actual.fstatSync(fd, options as never);
+          const count = counts.get(fd);
+          if (count === undefined) return stats;
+          counts.set(fd, count + 1);
+          if (count >= 2) return new Proxy(stats, { get: (target, prop) => prop === "size" ? Number(target.size) + 1 : Reflect.get(target, prop, target) });
+          return stats;
+        }) as typeof actual.fstatSync,
+        closeSync: ((fd: number) => { counts.delete(fd); return actual.closeSync(fd); }) as typeof actual.closeSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.installConnector("claude-code", "skill", driftRoot)).toThrow(/file changed while being read/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("returns compatibility false and no-code diagnostics for skill claim errors", async () => {
+    const root = join(directory, "skill-claim-no-code");
+    const installed = installConnector("claude-code", "skill", root);
+    const skillPath = installed.path;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        renameSync: ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+          if (String(oldPath).endsWith("/SKILL.md")) throw new Error("claim failed without errno");
+          return actual.renameSync(oldPath, newPath);
+        }) as typeof actual.renameSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/installer.js");
+      expect(() => module.removeConnector("claude-code", "skill", root)).toThrow(/Unable to inspect LCM skill/iu);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
   it("covers result-content fallbacks when the leaf seam returns without deciding", async () => {
     let fallback: Buffer | undefined = Buffer.from("returned-content\n");
     vi.resetModules();

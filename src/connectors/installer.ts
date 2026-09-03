@@ -31,8 +31,8 @@ import {
   compensateConnectorLeaf,
   finalizeConnectorLeaf,
   type ConnectorLeafDecision,
+  type ConnectorLeafObservation,
   type ConnectorLeafReceipt,
-  type ConnectorLeafState,
   type ConnectorLeafMutationResult,
 } from "./codex-hooks.js";
 import {
@@ -729,7 +729,7 @@ class ConnectorMutationAuthority {
     this.receipts.set(displayPath, receipt);
   }
 
-  mutate(displayPath: string, decide: (base: ConnectorLeafState) => ConnectorLeafDecision): ConnectorLeafMutationResult {
+  mutate(displayPath: string, decide: (base: ConnectorLeafObservation) => ConnectorLeafDecision): ConnectorLeafMutationResult {
     const operationPath = this.operationPath(displayPath);
     const parentOperationPath = this.parentOperations.get(displayPath);
     if (!parentOperationPath) throw new Error(`Unmapped connector mutation parent ${displayPath}`);
@@ -737,7 +737,15 @@ class ConnectorMutationAuthority {
     const expected = prior?.current ?? (() => {
       const snapshot = this.snapshots.get(displayPath);
       if (!snapshot || snapshot.state === "non-file") throw skillCollision(displayPath);
-      return snapshot.state === "absent" ? { state: "absent" as const } : snapshot;
+      if (snapshot.state === "absent") return { state: "absent" as const };
+      return Object.freeze({
+        state: "regular" as const,
+        sha256: createHash("sha256").update(snapshot.content).digest("hex"),
+        size: snapshot.content.length,
+        mode: snapshot.mode & 0o7777,
+        dev: BigInt(snapshot.dev).toString(10),
+        ino: BigInt(snapshot.ino).toString(10),
+      });
     })();
     let result: ConnectorLeafMutationResult;
     try {
@@ -786,12 +794,12 @@ class ConnectorMutationAuthority {
       const receipt = this.receipts.get(path);
       if (!receipt) continue;
       const receiptFailures = compensateConnectorLeaf(receipt);
-      if (receiptFailures.length > 0) failures.push(...receiptFailures);
-      else compensated.push(receipt);
+      if (receiptFailures.failures.length > 0) failures.push(...receiptFailures.failures);
+      else compensated.push(receiptFailures.receipt);
     }
     for (const receipt of compensated) {
-      const cleanupFailures = finalizeConnectorLeaf(receipt);
-      failures.push(...cleanupFailures.map((failure) => `compensated receipt finalization: ${failure}`));
+      const cleanupResult = finalizeConnectorLeaf(receipt);
+      failures.push(...cleanupResult.failures.map((failure) => `compensated receipt finalization: ${failure}`));
     }
     return failures;
   }
@@ -800,7 +808,7 @@ class ConnectorMutationAuthority {
     const failures: string[] = [];
     for (const path of this.mutationOrder) {
       const receipt = this.receipts.get(path);
-      if (receipt) failures.push(...finalizeConnectorLeaf(receipt));
+      if (receipt) failures.push(...finalizeConnectorLeaf(receipt).failures);
     }
     return failures;
   }
@@ -813,6 +821,7 @@ class ConnectorMutationAuthority {
     for (const [operationPath, displayPath] of [...mappings.entries()].sort(([left], [right]) => right.length - left.length)) {
       sanitized = sanitized.replaceAll(operationPath, displayPath);
     }
+    sanitized = sanitized.replaceAll(/\/proc\/self\/fd\/\d+(?:\/[^\s;,)]+)*/gu, "connector recovery path");
     if (!(error instanceof Error)) return new Error(sanitized);
     const wrapped = new Error(sanitized);
     const code = (error as NodeJS.ErrnoException).code;
@@ -927,7 +936,7 @@ function updateRegularFileNoFollow(
     const updated = update(existing, base.state === "absent");
     resultContent = updated ? Buffer.from(updated) : existing;
     if (updated === undefined) return { state: "unchanged" };
-    return { state: "regular", content: Buffer.from(updated), mode: base.state === "regular" ? base.mode : mode };
+    return { state: "regular", content: Buffer.from(updated), mode: base.state === "regular" ? base.certificate.mode : mode };
   });
   return resultContent ?? result.content ?? Buffer.alloc(0);
 }
@@ -955,7 +964,7 @@ function installSkill(content: string, filePath: string): void {
       if (base.state === "regular") {
         if (!isOwnedSkill(base.content, content)) throw skillCollision(filePath);
         if (base.content.equals(expected)) return { state: "unchanged" };
-        return { state: "regular", content: expected, mode: base.mode };
+        return { state: "regular", content: expected, mode: base.certificate.mode };
       }
       return { state: "regular", content: expected, mode: 0o666 };
     });
@@ -987,8 +996,10 @@ function removeSkill(filePath: string, generated: string | readonly string[], st
       return false;
     }
     if (error instanceof Error && error.message.startsWith("Refusing to remove an unowned LCM skill")) {
-      if (strict) throw error;
-      return false;
+      // This diagnostic is emitted only by the strict callback branch above;
+      // a compatibility removal cannot produce it. Preserve the strict
+      // refusal without retaining an unreachable compatibility arm.
+      throw error;
     }
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     if (["ELOOP", "EISDIR", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
@@ -1410,7 +1421,7 @@ function removeComponent(agent: Agent, surface: ConnectorSurface, cwd: string, s
         const next = removeCodexHooksContent(base.content.toString("utf-8"));
         if (next.state === "unchanged") return { state: "unchanged" };
         if (next.state === "remove") return { state: "absent" };
-        return { state: "regular", content: Buffer.from(next.content, "utf-8"), mode: base.mode };
+        return { state: "regular", content: Buffer.from(next.content, "utf-8"), mode: base.certificate.mode };
       });
       return mutation.changed;
     } catch (error) {
@@ -1437,7 +1448,7 @@ function removeComponent(agent: Agent, surface: ConnectorSurface, cwd: string, s
       if (!hasManagedBlock(content)) return { state: "unchanged" };
       const cleaned = removeMarkers(content);
       const eol = establishedMarkdownEol(cleaned);
-      const updated = cleaned === "" ? { state: "absent" as const } : { state: "regular" as const, content: Buffer.from(normalizeMarkdownEof(cleaned, eol), "utf-8"), mode: base.mode };
+      const updated = cleaned === "" ? { state: "absent" as const } : { state: "regular" as const, content: Buffer.from(normalizeMarkdownEof(cleaned, eol), "utf-8"), mode: base.certificate.mode };
       return updated;
     });
     return mutation.changed;

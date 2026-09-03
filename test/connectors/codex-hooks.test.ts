@@ -13,6 +13,7 @@ import {
   statSync,
   symlinkSync,
   truncateSync,
+  unlinkSync,
   writeSync,
   writeFileSync,
 } from "node:fs";
@@ -264,9 +265,10 @@ describe("Codex hook configuration boundaries", () => {
     }, first.receipt);
     expect(second.changed).toBe(true);
     expect(existsSync(hooksPath)).toBe(false);
-    expect(compensateConnectorLeaf(second.receipt)).toEqual([]);
+    const compensated = compensateConnectorLeaf(second.receipt);
+    expect(compensated.failures).toEqual([]);
     expect(readFileSync(hooksPath, "utf-8")).toBe("initial\n");
-    expect(finalizeConnectorLeaf(second.receipt)).toEqual([]);
+    expect(finalizeConnectorLeaf(compensated.receipt).failures).toEqual([]);
   });
 
   it("keeps staged certificate authority when both publication aliases are edited", async () => {
@@ -303,7 +305,7 @@ describe("Codex hook configuration boundaries", () => {
       expect(receipt!.current).toMatchObject({ state: "regular", sha256: expect.not.stringMatching(/^(?:0|f){64}$/) });
       expect(Object.keys(receipt!)).not.toContain("operationPath");
       expect(JSON.stringify(receipt)).not.toContain("/proc/self/fd/");
-      expect(module.compensateConnectorLeaf(receipt!)).toHaveLength(1);
+      expect(module.compensateConnectorLeaf(receipt!).failures).toHaveLength(1);
       expect(readFileSync(hooksPath, "utf-8")).toBe("peer-edit\n");
     } finally {
       vi.doUnmock("node:fs");
@@ -312,10 +314,10 @@ describe("Codex hook configuration boundaries", () => {
   });
 
   it("exercises certificate helpers and certified compensation paths", () => {
-    expect(matchesCertificate({ state: "absent" }, { state: "absent" })).toBe(true);
+    expect(matchesCertificate({ state: "absent", certificate: { state: "absent" } }, { state: "absent" })).toBe(true);
     expect(matchesCertificate({ state: "unknown" } as never, { state: "absent" })).toBe(false);
-    expect(matchesCertificate({ state: "absent" }, null as never)).toBe(false);
-    expect(matchesCertificate({ state: "absent" }, { state: "unknown" } as never)).toBe(false);
+    expect(matchesCertificate({ state: "absent", certificate: { state: "absent" } }, null as never)).toBe(false);
+    expect(matchesCertificate({ state: "absent", certificate: { state: "absent" } }, { state: "unknown" } as never)).toBe(false);
     const regularPath = join(dir, "certificate-regular");
     writeFileSync(regularPath, "initial\n", { mode: 0o6755 });
     const regular = mutateConnectorLeaf({
@@ -325,8 +327,9 @@ describe("Codex hook configuration boundaries", () => {
       expected: captureConnectorLeaf(regularPath, regularPath),
       decide: () => ({ state: "regular" as const, content: Buffer.from("next\n"), mode: 0o6755 }),
     });
-    expect(compensateConnectorLeaf(regular.receipt)).toEqual([]);
-    expect(finalizeConnectorLeaf(regular.receipt)).toEqual([]);
+    const compensated = compensateConnectorLeaf(regular.receipt);
+    expect(compensated.failures).toEqual([]);
+    expect(finalizeConnectorLeaf(compensated.receipt).failures).toEqual([]);
     const absentPath = join(dir, "certificate-absent");
     writeFileSync(absentPath, "initial\n", { mode: 0o600 });
     const absent = mutateConnectorLeaf({
@@ -336,10 +339,64 @@ describe("Codex hook configuration boundaries", () => {
       expected: captureConnectorLeaf(absentPath, absentPath),
       decide: () => ({ state: "absent" as const }),
     });
-    expect(compensateConnectorLeaf(absent.receipt)).toEqual([]);
-    expect(finalizeConnectorLeaf(absent.receipt)).toEqual([]);
+    expect(compensateConnectorLeaf(absent.receipt).failures).toEqual([]);
+    expect(finalizeConnectorLeaf(absent.receipt).failures).toEqual([]);
     expect(hasCodexHooks(join(dir, "missing-hooks.json"))).toBe(false);
     expect(inspectCodexPostToolHook(join(dir, "missing-hooks.json"))).toMatchObject({ state: "absent" });
+  });
+
+  it("enforces the immutable certificate and object-result contracts", () => {
+    const absentPath = join(dir, "contract-absent");
+    const absent = captureConnectorLeaf(absentPath, absentPath);
+    expect(absent).toEqual({ state: "absent", certificate: { state: "absent" } });
+    expect(Object.isFrozen(absent)).toBe(true);
+    expect(Object.isFrozen(absent.certificate)).toBe(true);
+    const path = join(dir, "contract-regular");
+    writeFileSync(path, "before\n", { mode: 0o6755 });
+    const observed = captureConnectorLeaf(path, path);
+    expect(Object.keys(observed)).toEqual(["state", "content", "certificate"]);
+    expect(Object.isFrozen(observed.certificate)).toBe(true);
+    expect(Object.keys(observed.certificate)).toEqual(["state", "sha256", "size", "mode", "dev", "ino"]);
+    expect(() => mutateConnectorLeaf({
+      displayPath: path,
+      operationPath: path,
+      parentOperationPath: dir,
+      expected: { state: "regular" } as never,
+      decide: () => ({ state: "unchanged" as const }),
+    })).toThrow(/invalid connector publication certificate/iu);
+    const result = mutateConnectorLeaf({
+      displayPath: path,
+      operationPath: path,
+      parentOperationPath: dir,
+      expected: observed.certificate,
+      decide: (base) => ({ state: "regular" as const, content: Buffer.from("after\n"), mode: base.certificate.mode }),
+    });
+    expect(Array.isArray(result)).toBe(false);
+    expect(Object.keys(result.receipt)).not.toContain("operationPath");
+    expect(result.receipt.evidence.filter((entry) => entry.operationPath.includes("candidate-") && entry.kind === "current-private")).toHaveLength(1);
+    const compensated = compensateConnectorLeaf(result.receipt);
+    expect(compensated.compensated).toBe(true);
+    expect(finalizeConnectorLeaf(compensated.receipt).finalized).toBe(true);
+  });
+
+  it("rejects malformed root leaf paths before mutation", () => {
+    expect(() => removeCodexHooks("/")).toThrow(/Unable to inspect connector hooks parent/iu);
+  });
+
+  it("retains a non-regular initial hold during compensation", () => {
+    const path = join(dir, "non-regular-initial");
+    writeFileSync(path, "initial\n");
+    const result = mutateConnectorLeaf({
+      displayPath: path,
+      operationPath: path,
+      parentOperationPath: dir,
+      expected: captureConnectorLeaf(path, path).certificate,
+      decide: (base) => ({ state: "regular" as const, content: Buffer.from("next\n"), mode: base.certificate.mode }),
+    });
+    const initial = result.receipt.evidence.find((entry) => entry.kind === "initial")!.operationPath;
+    unlinkSync(initial);
+    symlinkSync(path, initial);
+    expect(compensateConnectorLeaf(result.receipt).compensated).toBe(false);
   });
 
   it("compensates a committed standalone failure without exposing operation paths", async () => {
@@ -572,7 +629,7 @@ describe("Codex hook configuration boundaries", () => {
     });
     expect(result.changed).toBe(true);
     expect(readFileSync(hooksPath)).toEqual(Buffer.alloc(0));
-    expect(finalizeConnectorLeaf(result.receipt)).toEqual([]);
+    expect(finalizeConnectorLeaf(result.receipt).failures).toEqual([]);
   });
 
   it("honors the process umask when publishing a previously absent leaf", () => {
@@ -586,7 +643,7 @@ describe("Codex hook configuration boundaries", () => {
         decide: () => ({ state: "regular" as const, content: Buffer.from("private\n"), mode: 0o666 }),
       });
       expect(statSync(hooksPath).mode & 0o777).toBe(0o600);
-      expect(finalizeConnectorLeaf(result.receipt)).toEqual([]);
+      expect(finalizeConnectorLeaf(result.receipt).failures).toEqual([]);
     } finally {
       process.umask(previousUmask);
     }
@@ -608,8 +665,8 @@ describe("Codex hook configuration boundaries", () => {
       closeSync(writer);
     }
     const failures = finalizeConnectorLeaf(result.receipt);
-    expect(failures.join(";")).toMatch(/cleanup incomplete.*recovery/iu);
-    expect(readFileSync(result.receipt.initialHoldOperationPath!, "utf-8")).toBe("peeredit");
+    expect(failures.failures.join(";")).toMatch(/cleanup incomplete.*recovery/iu);
+    expect(readFileSync(result.receipt.evidence.find((entry) => entry.kind === "initial")!.operationPath, "utf-8")).toBe("peeredit");
   });
 
   it("refuses compensation before publishing a drifted initial hold", () => {
@@ -628,9 +685,9 @@ describe("Codex hook configuration boundaries", () => {
       closeSync(writer);
     }
     const failures = compensateConnectorLeaf(result.receipt);
-    expect(failures.join(";")).toMatch(/rollback incomplete/iu);
+    expect(failures.failures.join(";")).toMatch(/rollback incomplete/iu);
     expect(readFileSync(hooksPath, "utf-8")).toBe("current!");
-    expect(readFileSync(result.receipt.initialHoldOperationPath!, "utf-8")).toBe("peeredit");
+    expect(readFileSync(result.receipt.evidence.find((entry) => entry.kind === "initial")!.operationPath, "utf-8")).toBe("peeredit");
   });
 
   it("retains a drifted regular-to-absent generation during finalization", () => {
@@ -656,8 +713,8 @@ describe("Codex hook configuration boundaries", () => {
       closeSync(writer);
     }
     const failures = finalizeConnectorLeaf(second.receipt);
-    expect(failures.join(";")).toMatch(/cleanup incomplete.*recovery/iu);
-    expect(readFileSync(second.receipt.currentHoldOperationPath!, "utf-8")).toBe("peeredit");
+    expect(failures.failures.join(";")).toMatch(/cleanup incomplete.*recovery/iu);
+    expect(readFileSync(second.receipt.evidence.find((entry) => entry.kind === "superseded")!.operationPath, "utf-8")).toBe("peeredit");
   });
 
   it("covers sequential receipt cleanup and no-op compensation", () => {
@@ -672,19 +729,21 @@ describe("Codex hook configuration boundaries", () => {
       expected: first.receipt.current,
       decide: () => ({ state: "regular" as const, content: Buffer.from("three\n"), mode: 0o600 }),
     }, first.receipt);
-    expect(second.receipt.initialHoldOperationPath).toBe(first.receipt.initialHoldOperationPath);
+    expect(second.receipt.evidence.find((entry) => entry.kind === "initial")?.operationPath)
+      .toBe(first.receipt.evidence.find((entry) => entry.kind === "initial")?.operationPath);
     const unchanged = mutateConnectorLeaf({
       displayPath: hooksPath, operationPath: hooksPath, parentOperationPath: dir,
       expected: second.receipt.current,
       decide: () => ({ state: "unchanged" as const }),
     }, second.receipt);
     expect(unchanged).toEqual({ changed: false, receipt: second.receipt });
-    expect(compensateConnectorLeaf(second.receipt)).toEqual([]);
+    const compensated = compensateConnectorLeaf(second.receipt);
+    expect(compensated.failures).toEqual([]);
     expect(readFileSync(hooksPath, "utf-8")).toBe("one\n");
-    expect(finalizeConnectorLeaf(second.receipt)).toEqual([]);
+    expect(finalizeConnectorLeaf(compensated.receipt).failures).toEqual([]);
     expect(compensateConnectorLeaf({
       ...second.receipt, mutationCommitted: false,
-    })).toEqual([]);
+    }).failures).toEqual([]);
   });
 
   it("accepts an empty managed skill input and exercises native MCP refusal paths", async () => {
@@ -763,8 +822,15 @@ describe("Codex hook configuration boundaries", () => {
           if (shown?.includes("candidate-") && faults.candidate === "changed" && count > 1) {
             return new Proxy(stats, { get: (target, prop) => prop === "ino" ? Number(target.ino) + 1 : Reflect.get(target, prop, target) });
           }
+          if (shown?.includes("candidate-") && faults.candidate === "staged" && count >= 3) {
+            return new Proxy(stats, { get: (target, prop) => prop === "ino" ? Number(target.ino) + 1 : Reflect.get(target, prop, target) });
+          }
           return stats;
         }) as typeof actual.fstatSync,
+        fchmodSync: ((fd: number, mode: number) => {
+          if (faults.restoreModeMismatch && (descriptors.get(fd) ?? "").includes("restore-")) return;
+          return actual.fchmodSync(fd, mode);
+        }) as typeof actual.fchmodSync,
         readSync: ((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
           if (faults.candidate === "zero-read" && faults.descriptors.get(fd) === hooksPath) return 0;
           const count = actual.readSync(fd, buffer, offset, length, position);
@@ -831,9 +897,11 @@ describe("Codex hook configuration boundaries", () => {
       faults.candidate = "mismatch";
       expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/readback mismatch/iu);
       faults.candidate = "changed";
-      expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/changed while being staged/iu);
+      expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/changed while being (?:read|staged)/iu);
       faults.candidate = "verify";
-      expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/verification failed/iu);
+      expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/verification failed|short connector leaf read/iu);
+      faults.candidate = "staged";
+      expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/changed while being staged/iu);
       faults.candidate = "";
       expect(() => module.mutateConnectorLeaf({
         ...op(module.captureConnectorLeaf(hooksPath, hooksPath)),
@@ -854,7 +922,7 @@ describe("Codex hook configuration boundaries", () => {
       faults.candidate = "";
       const rollbackSeed = module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)));
       faults.rollbackDrift = true;
-      expect(module.compensateConnectorLeaf(rollbackSeed.receipt)[0]).toContain("rollback incomplete");
+      expect(module.compensateConnectorLeaf(rollbackSeed.receipt).failures[0]).toContain("rollback incomplete");
       faults.tx = "collision";
       expect(() => module.mutateConnectorLeaf(op(module.captureConnectorLeaf(hooksPath, hooksPath)))).toThrow(/unable to allocate/iu);
       faults.tx = "error";
@@ -892,12 +960,12 @@ describe("Codex hook configuration boundaries", () => {
       displayPath: hooksPath, operationPath: currentPath, parentOperationPath: dir,
       initial: current, current, transactionDisplayPath: tx, transactionOperationPath: tx,
       mutationCommitted: false, recoveryRequired: false,
-    })).toEqual([]);
+    }).failures).toEqual([]);
     expect(compensateConnectorLeaf({
       displayPath: hooksPath, operationPath: currentPath, parentOperationPath: dir,
       initial: current, current, transactionDisplayPath: tx, transactionOperationPath: tx,
       mutationCommitted: true, recoveryRequired: false,
-    })[0]).toContain("rollback incomplete");
+    }).failures[0]).toContain("rollback incomplete");
     const noInitialHold = {
       displayPath: hooksPath, operationPath: currentPath, parentOperationPath: dir,
       initial: current, current, transactionDisplayPath: tx, transactionOperationPath: tx,
@@ -911,41 +979,41 @@ describe("Codex hook configuration boundaries", () => {
     expect(compensateConnectorLeaf({
       displayPath: hooksPath, operationPath: regularMismatchPath, parentOperationPath: dir,
       initial: regularMismatch, current: regularMismatch, transactionDisplayPath: tx, transactionOperationPath: tx,
-      initialHoldOperationPath: wrongInitialPath, mutationCommitted: true, recoveryRequired: false,
-    })[0]).toContain("rollback incomplete");
+      evidence: [{ kind: "initial", operationPath: wrongInitialPath, displayPath: wrongInitialPath, status: "retained", certificate: regularMismatch.certificate }], mutationCommitted: true, recoveryRequired: false,
+    }).failures[0]).toContain("rollback incomplete");
     const absentNoHoldPath = join(tx, "absent-no-hold");
     const absentNoHold = {
       displayPath: hooksPath, operationPath: absentNoHoldPath, parentOperationPath: dir,
       initial: current, current: absent, transactionDisplayPath: tx, transactionOperationPath: tx,
       mutationCommitted: true, recoveryRequired: false,
     };
-    expect(compensateConnectorLeaf(absentNoHold)[0]).toContain("rollback incomplete");
-    expect(compensateConnectorLeaf(noInitialHold)[0]).toContain("rollback incomplete");
+    expect(compensateConnectorLeaf(absentNoHold).failures[0]).toContain("rollback incomplete");
+    expect(compensateConnectorLeaf(noInitialHold).failures[0]).toContain("rollback incomplete");
     expect(compensateConnectorLeaf({
-      ...noInitialHold, initialHoldOperationPath: initialPath,
-    })[0]).toContain("rollback incomplete");
+      ...noInitialHold, evidence: [{ kind: "initial", operationPath: initialPath, displayPath: initialPath, status: "retained", certificate: current.certificate }],
+    }).failures[0]).toContain("rollback incomplete");
     expect(compensateConnectorLeaf({
       displayPath: hooksPath, operationPath: currentPath, parentOperationPath: dir,
       initial: current, current: absent, transactionDisplayPath: tx, transactionOperationPath: tx,
       mutationCommitted: true, recoveryRequired: false,
-    })[0]).toContain("rollback incomplete");
+    }).failures[0]).toContain("rollback incomplete");
     const absentWithHold = {
       displayPath: hooksPath, operationPath: hooksPath, parentOperationPath: dir,
       initial: current, current: absent, transactionDisplayPath: tx, transactionOperationPath: tx,
-      initialHoldOperationPath: initialPath, mutationCommitted: true, recoveryRequired: false,
+      evidence: [{ kind: "initial", operationPath: initialPath, displayPath: initialPath, status: "retained", certificate: current.certificate }], mutationCommitted: true, recoveryRequired: false,
     };
-    expect(compensateConnectorLeaf(absentWithHold)[0]).toContain("rollback incomplete");
+    expect(compensateConnectorLeaf(absentWithHold).failures[0]).toContain("rollback incomplete");
     rmSync(hooksPath, { force: true });
-    expect(compensateConnectorLeaf({ ...absentWithHold, operationPath: hooksPath })[0]).toContain("rollback incomplete");
+    expect(compensateConnectorLeaf({ ...absentWithHold, operationPath: hooksPath }).failures[0]).toContain("rollback incomplete");
     const absentInitial = {
       displayPath: hooksPath, operationPath: hooksPath, parentOperationPath: dir,
       initial: absent, current: absent, transactionDisplayPath: tx, transactionOperationPath: tx,
       mutationCommitted: true, recoveryRequired: false,
     };
     writeFileSync(hooksPath, "unexpected\n");
-    expect(compensateConnectorLeaf(absentInitial)[0]).toContain("rollback incomplete");
+    expect(compensateConnectorLeaf(absentInitial).failures[0]).toContain("rollback incomplete");
     rmSync(hooksPath);
-    expect(compensateConnectorLeaf(absentInitial)).toEqual([]);
+    expect(compensateConnectorLeaf(absentInitial).failures).toEqual([]);
 
     const finalTx = join(dir, "final-tx");
     mkdirSync(finalTx);
@@ -955,9 +1023,9 @@ describe("Codex hook configuration boundaries", () => {
     const cleanup = finalizeConnectorLeaf({
       displayPath: hooksPath, operationPath: hooksPath, parentOperationPath: dir,
       initial: absent, current: absent, transactionDisplayPath: finalTx, transactionOperationPath: finalTx,
-      currentHoldOperationPath: holdDirectory, mutationCommitted: true, recoveryRequired: false,
+      evidence: [{ kind: "recovery", operationPath: holdDirectory, displayPath: holdDirectory, status: "retain-only" }], mutationCommitted: true, recoveryRequired: false,
     });
-    expect(cleanup.join(";")).toContain("cleanup incomplete");
+    expect(cleanup.failures.join(";")).toContain("cleanup incomplete");
   });
 
   it("finalizes legacy receipts by deriving missing retained states", () => {
@@ -977,11 +1045,13 @@ describe("Codex hook configuration boundaries", () => {
       current,
       transactionDisplayPath: tx,
       transactionOperationPath: tx,
-      initialHoldOperationPath: initialHold,
-      currentHoldOperationPath: currentHold,
       mutationCommitted: true,
       recoveryRequired: false,
-    })).toEqual([]);
+      evidence: [
+        { kind: "initial", operationPath: initialHold, displayPath: initialHold, status: "retained", certificate: initial.certificate },
+        { kind: "current-private", operationPath: currentHold, displayPath: currentHold, status: "retained", certificate: current.certificate },
+      ],
+    }).failures).toEqual([]);
     expect(existsSync(tx)).toBe(false);
 
     const malformedTx = join(dir, "malformed-receipt-tx");
@@ -996,10 +1066,10 @@ describe("Codex hook configuration boundaries", () => {
       current: { state: "absent" },
       transactionDisplayPath: malformedTx,
       transactionOperationPath: malformedTx,
-      initialHoldOperationPath: unexpectedInitial,
+      evidence: [{ kind: "recovery", operationPath: unexpectedInitial, displayPath: unexpectedInitial, status: "retain-only" }],
       mutationCommitted: true,
       recoveryRequired: false,
-    }).join(";")).toMatch(/cleanup incomplete.*recovery artifact/iu);
+    }).failures.join(";")).toMatch(/cleanup incomplete.*recovery artifact/iu);
     expect(readFileSync(unexpectedInitial, "utf-8")).toBe("preserve\n");
   });
 
@@ -1096,7 +1166,7 @@ describe("Codex hook configuration boundaries", () => {
       });
       faults.unlinkAsAlreadyAbsent = true;
       faults.rmdirAsAlreadyAbsent = true;
-      expect(module.finalizeConnectorLeaf(seeded.receipt)).toEqual([]);
+      expect(module.finalizeConnectorLeaf(seeded.receipt).failures).toEqual([]);
 
       faults.removeParentWithoutCode = true;
       expect(() => module.removeCodexHooks(hooksPath)).toThrow(/Unable to inspect connector hooks parent/iu);
@@ -1117,7 +1187,7 @@ describe("Codex hook configuration boundaries", () => {
     const faults = {
       publicationIdentityCaptures: 0,
       remainingIdentityCaptures: 0,
-      primitiveRollback: false,
+      primitiveRollback: "" as "" | "string" | "object",
       failCandidateCleanup: false,
     };
     const descriptors = new Map<number, { path: string; fakeIdentity: boolean }>();
@@ -1210,9 +1280,10 @@ describe("Codex hook configuration boundaries", () => {
       }, first.receipt);
       expect(second.receipt.initial).toEqual({ state: "absent" });
       expect(readFileSync(absentPath, "utf-8")).toBe("two\n");
-      expect(module.compensateConnectorLeaf(second.receipt)).toEqual([]);
+      const compensated = module.compensateConnectorLeaf(second.receipt);
+      expect(compensated.failures).toEqual([]);
       expect(existsSync(absentPath)).toBe(false);
-      expect(module.finalizeConnectorLeaf(second.receipt)).toEqual([]);
+      expect(module.finalizeConnectorLeaf(compensated.receipt).failures).toEqual([]);
 
       const redundantAbsentPath = join(dir, "redundant-absent.json");
       const redundantAbsent = module.mutateConnectorLeaf({
@@ -1225,7 +1296,7 @@ describe("Codex hook configuration boundaries", () => {
       expect(redundantAbsent.changed).toBe(false);
       expect(redundantAbsent.receipt.current).toEqual({ state: "absent" });
       expect(redundantAbsent.receipt.mutationCommitted).toBe(false);
-      expect(module.finalizeConnectorLeaf(redundantAbsent.receipt)).toEqual([]);
+      expect(module.finalizeConnectorLeaf(redundantAbsent.receipt).failures).toEqual([]);
 
       const rollbackPath = join(dir, "rollback.json");
       writeFileSync(rollbackPath, "initial\n");
@@ -1237,7 +1308,7 @@ describe("Codex hook configuration boundaries", () => {
         decide: () => ({ state: "regular" as const, content: Buffer.from("current\n"), mode: 0o600 }),
       });
       faults.primitiveRollback = true;
-      expect(module.compensateConnectorLeaf(rollbackSeed.receipt)).toEqual([
+      expect(module.compensateConnectorLeaf(rollbackSeed.receipt).failures).toEqual([
         expect.stringMatching(/primitive rollback failure/iu),
       ]);
       faults.primitiveRollback = false;
@@ -1369,7 +1440,7 @@ describe("Codex hook configuration boundaries", () => {
               });
               race = { path, phase, kind, occupied };
               const failures = module.compensateConnectorLeaf(seeded.receipt);
-              expect(failures.join(";")).toMatch(/rollback incomplete.*recovery/iu);
+      expect(failures.failures.join(";")).toMatch(/rollback incomplete.*recovery/iu);
             }
             race = undefined;
             if (occupied) expect(readFileSync(path, "utf-8")).toBe("public peer\n");
@@ -1452,7 +1523,7 @@ describe("Codex hook configuration boundaries", () => {
         decide: () => ({ state: "regular" as const, content: Buffer.from("current\n"), mode: 0o600 }),
       });
       failInitialRestoration = true;
-      expect(module.compensateConnectorLeaf(seeded.receipt).join(";")).toMatch(/recovery republished.*without replacement/iu);
+      expect(module.compensateConnectorLeaf(seeded.receipt).failures.join(";")).toMatch(/recovery republished.*without replacement/iu);
       expect(readFileSync(compensationPath, "utf-8")).toBe("current\n");
     } finally {
       vi.doUnmock("node:fs");
@@ -1582,9 +1653,9 @@ describe("Codex hook configuration boundaries", () => {
         expected: module.captureConnectorLeaf(restorationPath, restorationPath),
         decide: () => ({ state: "regular" as const, content: Buffer.from("current!"), mode: 0o600 }),
       });
-      const initialWriter = openSync(restoration.receipt.initialHoldOperationPath!, "r+");
+      const initialWriter = openSync(restoration.receipt.evidence.find((entry) => entry.kind === "initial")!.operationPath, "r+");
       editAfterInitialPublish = () => actualWrite(initialWriter, "peeredit");
-      expect(module.compensateConnectorLeaf(restoration.receipt)).toEqual([]);
+      expect(module.compensateConnectorLeaf(restoration.receipt).failures).toEqual([]);
       closeSync(initialWriter);
       expect(readFileSync(restorationPath, "utf-8")).toBe("initial!");
 
@@ -1599,7 +1670,7 @@ describe("Codex hook configuration boundaries", () => {
       });
       const currentWriter = openSync(cleanupPath, "r+");
       editAfterInitialPublish = () => actualWrite(currentWriter, "peeredit");
-      expect(module.compensateConnectorLeaf(cleanup.receipt).join(";")).toMatch(/cleanup incomplete/iu);
+      expect(module.compensateConnectorLeaf(cleanup.receipt).failures.join(";")).toMatch(/cleanup incomplete/iu);
       closeSync(currentWriter);
       expect(readFileSync(cleanupPath, "utf-8")).toBe("initial!");
 
@@ -1613,7 +1684,7 @@ describe("Codex hook configuration boundaries", () => {
         decide: () => ({ state: "absent" as const }),
       });
       writeFileSync(occupiedPath, "peerstate");
-      expect(module.compensateConnectorLeaf(occupied.receipt).join(";")).toMatch(/current receipt changed/iu);
+      expect(module.compensateConnectorLeaf(occupied.receipt).failures.join(";")).toMatch(/current receipt changed/iu);
       expect(readFileSync(occupiedPath, "utf-8")).toBe("peerstate");
 
       const absentRestorePath = join(dir, "absent-restoration-race");
@@ -1625,11 +1696,307 @@ describe("Codex hook configuration boundaries", () => {
         expected: module.captureConnectorLeaf(absentRestorePath, absentRestorePath),
         decide: () => ({ state: "absent" as const }),
       });
-      const absentInitialWriter = openSync(absentRestore.receipt.initialHoldOperationPath!, "r+");
+      const absentInitialWriter = openSync(absentRestore.receipt.evidence.find((entry) => entry.kind === "initial")!.operationPath, "r+");
       editAfterInitialPublish = () => actualWrite(absentInitialWriter, "peeredit");
-      expect(module.compensateConnectorLeaf(absentRestore.receipt)).toEqual([]);
+      expect(module.compensateConnectorLeaf(absentRestore.receipt).failures).toEqual([]);
       closeSync(absentInitialWriter);
       expect(readFileSync(absentRestorePath, "utf-8")).toBe("initial!");
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("covers immutable-certificate defensive seams and primitive diagnostics", async () => {
+    const faults = {
+      zeroWrite: false,
+      mismatchCleanup: false,
+      driftCandidate: false,
+      candidateVerify: false,
+      dropInitialAfterCapture: false,
+      stageOpenError: "" as "" | "string" | "object",
+      transactionError: "" as "" | "string" | "object",
+      restorePublicMismatch: false,
+      restoreCleanupFailure: false,
+      aliasCleanupFailure: false,
+      primitiveRollback: false,
+      standaloneRead: "" as "" | "string" | "object",
+      standalonePostLinkRead: false,
+      inspectModeMismatch: false,
+      inspectReadFailure: false,
+      inspectStatFailure: false,
+    };
+    const descriptors = new Map<number, string>();
+    let candidateVerifySeen = 0;
+    let standalonePublished = false;
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        openSync: ((path: fs.PathLike, flags: fs.OpenMode, mode?: number) => {
+          const shown = String(path);
+          if (shown.includes("candidate-") && faults.stageOpenError) {
+            const kind = faults.stageOpenError;
+            faults.stageOpenError = "";
+            if (kind === "string") throw "primitive candidate open";
+            throw { message: "object candidate open" };
+          }
+          const effectiveMode = mode;
+          const fd = effectiveMode === undefined ? actual.openSync(path, flags) : actual.openSync(path, flags, effectiveMode);
+          let resolved = shown;
+          const match = /^\/proc\/self\/fd\/(\d+)(\/.*)$/u.exec(shown);
+          if (match) {
+            try { resolved = join(actual.readlinkSync(`/proc/self/fd/${match[1]}`), match[2]); } catch { /* retain proc path */ }
+          }
+          descriptors.set(fd, resolved);
+          if (faults.dropInitialAfterCapture && shown.includes("/initial")) {
+            faults.dropInitialAfterCapture = false;
+            actual.unlinkSync(path);
+          }
+          return fd;
+        }) as typeof actual.openSync,
+        closeSync: ((fd: number) => {
+          const path = descriptors.get(fd) ?? "";
+          descriptors.delete(fd);
+          const result = actual.closeSync(fd);
+          if (faults.driftCandidate && path.includes("candidate-")) {
+            faults.driftCandidate = false;
+            actual.writeFileSync(path, "candidate drift\n");
+          }
+          return result;
+        }) as typeof actual.closeSync,
+        writeSync: ((fd: number, data: Uint8Array, offset: number, length: number, position: number | null) => {
+          const path = descriptors.get(fd) ?? "";
+          if (faults.zeroWrite && path.includes("candidate-")) return 0;
+          if (faults.standaloneRead && path.endsWith("standalone-primitive.json")) {
+            const kind = faults.standaloneRead;
+            faults.standaloneRead = "";
+            if (kind === "string") throw "primitive standalone write";
+            throw { message: "object standalone write" };
+          }
+          return actual.writeSync(fd, data, offset, length, position);
+        }) as typeof actual.writeSync,
+        readSync: ((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+          const path = descriptors.get(fd) ?? "";
+          if (faults.standaloneRead && path.endsWith("standalone-primitive.json")) {
+            const kind = faults.standaloneRead;
+            faults.standaloneRead = "";
+            if (kind === "string") throw "primitive standalone read";
+            throw { message: "object standalone read" };
+          }
+          if (faults.standalonePostLinkRead && standalonePublished && path.endsWith("standalone-committed.json")) {
+            faults.standalonePostLinkRead = false;
+            throw Object.assign(new Error("post-link observation failed"), { code: "EIO" });
+          }
+          if (faults.inspectReadFailure && path === hooksPath) {
+            faults.inspectReadFailure = false;
+            throw new Error("inspection read failed");
+          }
+          return actual.readSync(fd, buffer, offset, length, position);
+        }) as typeof actual.readSync,
+        fstatSync: ((fd: number, options?: fs.StatOptions) => {
+          const path = descriptors.get(fd) ?? "";
+          const stats = actual.fstatSync(fd, options as never);
+          if (faults.candidateVerify && path.includes("candidate-")) {
+            candidateVerifySeen += 1;
+            if (candidateVerifySeen < 2) return stats;
+            faults.candidateVerify = false;
+            candidateVerifySeen = 0;
+            return new Proxy(stats, { get: (target, prop) => prop === "isFile" ? (() => false) : Reflect.get(target, prop, target) });
+          }
+          if (faults.inspectModeMismatch && path === hooksPath) {
+            faults.inspectModeMismatch = false;
+            return new Proxy(stats, { get: (target, prop) => prop === "mode" ? Number(target.mode) ^ 0o1 : Reflect.get(target, prop, target) });
+          }
+          return stats;
+        }) as typeof actual.fstatSync,
+        lstatSync: ((path: fs.PathLike, options?: fs.StatOptions) => {
+          if (faults.inspectStatFailure && String(path) === hooksPath) {
+            faults.inspectStatFailure = false;
+            throw Object.assign(new Error("inspection stat failed"), { code: "EIO" });
+          }
+          if (faults.mismatchCleanup && String(path).includes("candidate-")) {
+            const stats = actual.lstatSync(path, options as never);
+            faults.mismatchCleanup = false;
+            return new Proxy(stats, { get: (target, prop) => prop === "ino" ? BigInt(target.ino) + 1n : Reflect.get(target, prop, target) });
+          }
+          return actual.lstatSync(path, options as never);
+        }) as typeof actual.lstatSync,
+        mkdirSync: ((path: fs.PathLike, options?: fs.MakeDirectoryOptions | number) => {
+          if (String(path).includes(".lcm-connector-txn-") && faults.transactionError) {
+            const kind = faults.transactionError;
+            faults.transactionError = "";
+            if (kind === "string") throw "primitive transaction failure";
+            throw { message: "object transaction failure" };
+          }
+          return actual.mkdirSync(path, options as never);
+        }) as typeof actual.mkdirSync,
+        renameSync: ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+          if (faults.primitiveRollback && String(newPath).includes("rollback-")) {
+            const kind = faults.primitiveRollback;
+            faults.primitiveRollback = "";
+            if (kind === "string") throw "primitive rollback failure";
+            throw { message: "object rollback failure" };
+          }
+          return actual.renameSync(oldPath, newPath);
+        }) as typeof actual.renameSync,
+        linkSync: ((existing: fs.PathLike, target: fs.PathLike) => {
+          const result = actual.linkSync(existing, target);
+          if (String(existing).includes("candidate-") && String(target).endsWith("standalone-committed.json")) standalonePublished = true;
+          if (faults.restorePublicMismatch && String(existing).includes("restore-")) {
+            faults.restorePublicMismatch = false;
+            actual.writeFileSync(target, "peer restore\n");
+          }
+          if (faults.standalonePostLinkRead && String(existing).includes("candidate-")) {
+            // The next public verification read fails, while compensation can
+            // still authenticate and restore the committed receipt.
+          }
+          return result;
+        }) as typeof actual.linkSync,
+        unlinkSync: ((path: fs.PathLike) => {
+          const shown = String(path);
+          if (faults.restoreCleanupFailure && shown.includes("restore-")) {
+            faults.restoreCleanupFailure = false;
+            throw Object.assign(new Error("restore cleanup denied"), { code: "EIO" });
+          }
+          if (faults.aliasCleanupFailure && shown.includes("candidate-")) {
+            faults.aliasCleanupFailure = false;
+            throw Object.assign(new Error("alias cleanup denied"), { code: "EIO" });
+          }
+          return actual.unlinkSync(path);
+        }) as typeof actual.unlinkSync,
+      };
+    });
+    try {
+      const module = await import("../../src/connectors/codex-hooks.js");
+      const operation = (path: string, expected: import("../../src/connectors/codex-hooks.js").ConnectorLeafCertificate, decision: import("../../src/connectors/codex-hooks.js").ConnectorLeafDecision) => ({
+        displayPath: path,
+        operationPath: path,
+        parentOperationPath: dir,
+        expected,
+        decide: () => decision,
+      });
+
+      writeFileSync(hooksPath, "base\n", { mode: 0o600 });
+      const expected = module.captureConnectorLeaf(hooksPath, hooksPath).certificate;
+      faults.zeroWrite = true;
+      faults.mismatchCleanup = true;
+      expect(() => module.mutateConnectorLeaf(operation(hooksPath, expected, { state: "regular", content: Buffer.from("candidate\n"), mode: 0o600 }))).toThrow(/no progress/iu);
+      faults.zeroWrite = false;
+      faults.driftCandidate = true;
+      expect(() => module.mutateConnectorLeaf(operation(hooksPath, expected, { state: "regular", content: Buffer.from("candidate\n"), mode: 0o600 }))).toThrow(/changed before publication/iu);
+      faults.transactionError = "string";
+      expect(() => module.mutateConnectorLeaf(operation(hooksPath, expected, { state: "regular", content: Buffer.from("candidate\n"), mode: 0o600 }))).toThrow(/primitive transaction failure/iu);
+      faults.transactionError = "object";
+      expect(() => module.mutateConnectorLeaf(operation(hooksPath, expected, { state: "regular", content: Buffer.from("candidate\n"), mode: 0o600 }))).toThrow(/object transaction failure/iu);
+      faults.stageOpenError = "string";
+      expect(() => module.mutateConnectorLeaf(operation(hooksPath, expected, { state: "regular", content: Buffer.from("candidate\n"), mode: 0o600 }))).toThrow(/primitive candidate open/iu);
+      faults.stageOpenError = "object";
+      expect(() => module.mutateConnectorLeaf(operation(hooksPath, expected, { state: "regular", content: Buffer.from("candidate\n"), mode: 0o600 }))).toThrow(/connector mutation failed/iu);
+      faults.candidateVerify = true;
+      candidateVerifySeen = 0;
+      expect(() => module.mutateConnectorLeaf(operation(hooksPath, expected, { state: "regular", content: Buffer.from("candidate\n"), mode: 0o600 }))).toThrow(/verification failed/iu);
+
+      const seed = (name: string, absent: boolean) => {
+        const path = join(dir, name);
+        writeFileSync(path, "initial\n", { mode: 0o600 });
+        const first = module.mutateConnectorLeaf(operation(path, module.captureConnectorLeaf(path, path).certificate, absent ? { state: "absent" } : { state: "regular", content: Buffer.from("current\n"), mode: 0o600 }));
+        return first;
+      };
+      const noEvidenceSeed = seed("absence-no-evidence", false);
+      const noEvidenceReceipt = {
+        displayPath: noEvidenceSeed.receipt.displayPath,
+        operationPath: noEvidenceSeed.receipt.operationPath,
+        parentOperationPath: noEvidenceSeed.receipt.parentOperationPath,
+        initial: noEvidenceSeed.receipt.initial,
+        current: noEvidenceSeed.receipt.current,
+        transactionDisplayPath: noEvidenceSeed.receipt.transactionDisplayPath,
+        transactionOperationPath: noEvidenceSeed.receipt.transactionOperationPath,
+        evidence: undefined,
+        mutationCommitted: noEvidenceSeed.receipt.mutationCommitted,
+        recoveryRequired: noEvidenceSeed.receipt.recoveryRequired,
+      } as never;
+      expect(module.mutateConnectorLeaf(
+        operation(join(dir, "absence-no-evidence"), noEvidenceSeed.receipt.current, { state: "absent" }),
+        noEvidenceReceipt,
+      ).changed).toBe(true);
+      const missingInitial = seed("missing-initial", false);
+      faults.dropInitialAfterCapture = true;
+      expect(module.compensateConnectorLeaf(missingInitial.receipt).failures.join(";")).toMatch(/rollback incomplete/iu);
+
+      const publicMismatch = seed("restore-public-mismatch", false);
+      faults.restorePublicMismatch = true;
+      expect(module.compensateConnectorLeaf(publicMismatch.receipt).failures.join(";")).toMatch(/rollback incomplete/iu);
+
+      const restoreCleanup = seed("restore-cleanup-failure", false);
+      faults.restoreCleanupFailure = true;
+      expect(module.compensateConnectorLeaf(restoreCleanup.receipt).failures.join(";")).toMatch(/rollback incomplete/iu);
+
+      const aliasCleanup = seed("alias-cleanup-failure", false);
+      faults.aliasCleanupFailure = true;
+      expect(module.compensateConnectorLeaf(aliasCleanup.receipt).failures.join(";")).toMatch(/rollback incomplete/iu);
+
+      const absentInitial = seed("absent-initial-hold", true);
+      faults.dropInitialAfterCapture = true;
+      expect(module.compensateConnectorLeaf(absentInitial.receipt).failures.join(";")).toMatch(/rollback incomplete/iu);
+
+      const absentPublicMismatch = seed("absent-public-mismatch", true);
+      faults.restorePublicMismatch = true;
+      expect(module.compensateConnectorLeaf(absentPublicMismatch.receipt).failures.join(";")).toMatch(/rollback incomplete/iu);
+
+      const absentRestoreCleanup = seed("absent-restore-cleanup", true);
+      faults.restoreCleanupFailure = true;
+      expect(module.compensateConnectorLeaf(absentRestoreCleanup.receipt).failures.join(";")).toMatch(/rollback incomplete/iu);
+
+      const primitiveRollback = seed("primitive-rollback", false);
+      faults.primitiveRollback = "string";
+      expect(module.compensateConnectorLeaf(primitiveRollback.receipt).failures.join(";")).toMatch(/rollback incomplete/iu);
+      const objectRollback = seed("object-rollback", false);
+      faults.primitiveRollback = "object";
+      expect(module.compensateConnectorLeaf(objectRollback.receipt).failures.join(";")).toMatch(/connector mutation failed|rollback incomplete/iu);
+
+      const tx = join(dir, "finalize-evidence");
+      mkdirSync(tx);
+      const retained = join(tx, "retained");
+      writeFileSync(retained, "retained\n");
+      const noCertificate = {
+        displayPath: hooksPath,
+        operationPath: hooksPath,
+        parentOperationPath: dir,
+        initial: { state: "absent" as const },
+        current: { state: "absent" as const },
+        transactionDisplayPath: tx,
+        transactionOperationPath: tx,
+        evidence: [{ kind: "staging" as const, operationPath: retained, displayPath: retained, status: "retained" as const }],
+        mutationCommitted: true,
+        recoveryRequired: false,
+      };
+      expect(module.finalizeConnectorLeaf(noCertificate).failures).toHaveLength(1);
+      unlinkSync(retained);
+      expect(module.finalizeConnectorLeaf({ ...noCertificate, evidence: undefined } as never).failures).toEqual([]);
+
+      const standalone = join(dir, "standalone-primitive.json");
+      writeFileSync(standalone, JSON.stringify({ hooks: { PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "lcm post-tool --client codex" }] }] }, custom: true }));
+      faults.standaloneRead = "string";
+      expect(() => module.removeCodexHooks(standalone)).toThrow(/primitive standalone read/iu);
+      writeFileSync(standalone, JSON.stringify({ hooks: { PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "lcm post-tool --client codex" }] }] }, custom: true }));
+      faults.standaloneRead = "object";
+      expect(() => module.removeCodexHooks(standalone)).toThrow(/connector hooks mutation failed/iu);
+
+      const committed = join(dir, "standalone-committed.json");
+      writeFileSync(committed, JSON.stringify({ hooks: { PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "lcm post-tool --client codex" }] }] }, custom: true }));
+      faults.standalonePostLinkRead = true;
+      expect(() => module.removeCodexHooks(committed)).toThrow(/standalone committed mutation compensated/iu);
+
+      writeFileSync(hooksPath, JSON.stringify({ hooks: { PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: "lcm post-tool --client codex" }] }] } }));
+      faults.inspectModeMismatch = true;
+      expect(module.hasCodexHooks(hooksPath)).toBe(false);
+      faults.inspectReadFailure = true;
+      expect(module.hasCodexHooks(hooksPath)).toBe(false);
+      unlinkSync(hooksPath);
+      faults.inspectStatFailure = true;
+      expect(module.inspectCodexPostToolHook(hooksPath)).toMatchObject({ state: "incomplete" });
     } finally {
       vi.doUnmock("node:fs");
       vi.resetModules();
