@@ -25,7 +25,29 @@ runs:
       uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
       with:
         node-version: "22.20.0"
-        cache: npm
+
+    - name: Bootstrap verified pnpm
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        bootstrap_root="$(mktemp -d "$RUNNER_TEMP/lcm-pnpm.XXXXXX")"
+        pnpm_bin="$(node scripts/bootstrap-pnpm.mjs --destination "$bootstrap_root/pnpm")"
+        printf '%s\n' "$pnpm_bin" >> "$GITHUB_PATH"
+        printf 'npm_config_store_dir=%s\n' "$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"
+
+    - name: Locate pnpm store
+      id: pnpm-store
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        store_path="$(pnpm store path)"
+        printf 'path=%s\n' "$store_path" >> "$GITHUB_OUTPUT"
+
+    - name: Cache pnpm store
+      uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        path: ${{ steps.pnpm-store.outputs.path }}
+        key: pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-22.20.0-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}
 
     - name: Derive exact cache keys
       id: cache-metadata
@@ -48,11 +70,9 @@ runs:
         if [[ "$NODE_MODULES_CACHE_HIT" == "true" ]]; then
           node scripts/ci-environment.mjs validate-node-modules node_modules
         else
-          npm ci
-          npm ls --all --json >/dev/null
+          pnpm install --frozen-lockfile
           node scripts/ci-environment.mjs write-node-modules-stamp node_modules
         fi
-        npm ls --all --json >/dev/null
 
     - name: Save installed Node dependencies
       if: ${{ steps.restore-node-modules.outputs.cache-hit != 'true' }}

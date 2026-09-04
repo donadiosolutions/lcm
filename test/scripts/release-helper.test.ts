@@ -19,6 +19,7 @@ const tagObjectSha = "c".repeat(40);
 const otherTagObjectSha = "d".repeat(40);
 
 interface HarnessOptions {
+  fromStep?: 3 | 4 | 8;
   changelogContent?: string;
   localTagState?: string;
   mergeSha?: string;
@@ -42,6 +43,9 @@ interface HarnessOptions {
 }
 
 interface HarnessResult {
+  packageContent: string;
+  lockContent: string;
+  changelogContent: string;
   calls: string[];
   localTagState: string | null;
   remoteTagState: string | null;
@@ -67,7 +71,9 @@ function runRelease(options: HarnessOptions = {}): HarnessResult {
   const releaseTag = `v${releaseVersion}`;
   const releaseMergeSha = options.mergeSha ?? mergeSha;
   mkdirSync(binDir);
-  writeFileSync(join(root, "package.json"), JSON.stringify({ name: "@donadiosolutions/lcm" }));
+  writeFileSync(join(root, "package.json"), JSON.stringify({ name: "@donadiosolutions/lcm", version: "1.0.0", description: "Preserved fixture metadata" }));
+  writeFileSync(join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\nimporters:\n  .: {}\n");
+  writeFileSync(join(root, "CHANGELOG.md"), "# Changelog\n\n## 1.0.0\n\n- Existing release\n");
   const scriptsDir = join(root, ".github", "scripts");
   mkdirSync(scriptsDir, { recursive: true });
   for (const scriptName of [
@@ -107,6 +113,12 @@ fi
 if [[ "$1" == "remote" && "$2" == "get-url" && "$3" == "--push" && "$4" == "--all" && "$5" == "origin" ]]; then
   printf '%s' "$FAKE_ORIGIN_PUSH_URLS"
   exit 0
+fi
+if [[ "$FAKE_EARLY_RELEASE" == "true" ]]; then
+  if [[ "$1" == "checkout" || "$1" == "add" || "$1" == "commit" ]]; then exit 0; fi
+  if [[ "$1" == "diff" && "$2" == "--cached" ]]; then exit 1; fi
+  # Stop at the fake push boundary; never reach real PR creation or publication.
+  if [[ "$1" == "push" && "$2" == "-u" ]]; then exit 71; fi
 fi
 if [[ "$1" == "fetch" ]]; then
   for arg in "$@"; do
@@ -265,11 +277,12 @@ exit 0
 `);
 
   try {
-    const result = spawnSync("bash", [releaseScript, releaseVersion, "--from-step", "8"], {
+    const result = spawnSync("bash", [releaseScript, releaseVersion, "--from-step", String(options.fromStep ?? 8)], {
       cwd: root,
       encoding: "utf8",
       env: {
         ...process.env,
+        FAKE_EARLY_RELEASE: String(options.fromStep === 3 || options.fromStep === 4),
         FAKE_CALL_LOG: callLog,
         FAKE_CHANGELOG_CONTENT: options.changelogContent ?? `## ${releaseVersion}\n\n- Release notes\n`,
         FAKE_LOCAL_TAG_STATE: localTagState,
@@ -300,6 +313,9 @@ exit 0
       },
     });
     return {
+      packageContent: readFileSync(join(root, "package.json"), "utf8"),
+      lockContent: readFileSync(join(root, "pnpm-lock.yaml"), "utf8"),
+      changelogContent: readFileSync(join(root, "CHANGELOG.md"), "utf8"),
       calls: existsSync(callLog) ? readFileSync(callLog, "utf8").trim().split("\n") : [],
       localTagState: existsSync(localTagState) ? readFileSync(localTagState, "utf8").trim() : null,
       remoteTagState: existsSync(remoteTagState) ? readFileSync(remoteTagState, "utf8").trim() : null,
@@ -722,5 +738,34 @@ describe("manual release helper step 8", () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(`GitHub draft release tag is v9.9.8, expected ${tag}`);
+  });
+});
+
+
+describe("manual release helper versioning and staging", () => {
+  it.each(["9.9.9", "10.0.0-beta.0"])("writes %s with Node and stages only versioned release files", (releaseVersion) => {
+    const result = runRelease({ fromStep: 3, version: releaseVersion });
+    expect(result.status).toBe(71); // Deliberate stop in the fake push tool.
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.packageContent)).toEqual({
+      name: "@donadiosolutions/lcm",
+      version: releaseVersion,
+      description: "Preserved fixture metadata",
+    });
+    expect(result.changelogContent).toContain(`## ${releaseVersion}\n`);
+    expect(result.lockContent).toBe("lockfileVersion: '9.0'\nimporters:\n  .: {}\n");
+    expect(result.calls).toContain("git|add|package.json|CHANGELOG.md");
+    expect(result.calls.some((call) => call.startsWith("npm|version"))).toBe(false);
+    expect(result.calls.some((call) => call.includes("package-lock.json"))).toBe(false);
+    expect(result.calls.some((call) => call.startsWith("git|tag|") || call.startsWith("gh|"))).toBe(false);
+  });
+
+  it("resumes step 4 without rewriting version, lockfile, or changelog", () => {
+    const result = runRelease({ fromStep: 4 });
+    expect(result.status).toBe(71);
+    expect(JSON.parse(result.packageContent).version).toBe("1.0.0");
+    expect(result.lockContent).toBe("lockfileVersion: '9.0'\nimporters:\n  .: {}\n");
+    expect(result.changelogContent).toBe("# Changelog\n\n## 1.0.0\n\n- Existing release\n");
+    expect(result.calls).toContain("git|add|package.json|CHANGELOG.md");
   });
 });

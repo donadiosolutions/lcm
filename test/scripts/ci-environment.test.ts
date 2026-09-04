@@ -1,4 +1,5 @@
 import {
+  cpSync,
   linkSync,
   mkdtempSync,
   mkdirSync,
@@ -8,10 +9,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   CI_CACHE_FORMAT,
+  NODE_DEPENDENCY_CACHE_FORMAT,
   MAX_ARCHIVE_CHECKSUM_BYTES,
   MAX_CAPTURED_OUTPUT_BYTES,
   MAX_NODE_MODULES_STAMP_BYTES,
@@ -49,6 +51,30 @@ function temporaryDirectory(): string {
   return directory;
 }
 
+const repositoryManifest = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+const managerPin = repositoryManifest.packageManager;
+
+function pnpmFixture(): string {
+  const nodeModules = join(temporaryDirectory(), "node_modules");
+  mkdirSync(join(nodeModules, ".pnpm"), { recursive: true });
+  writeFileSync(join(nodeModules, ".modules.yaml"), JSON.stringify({
+    packageManager: managerPin.split("+")[0],
+    nodeLinker: "isolated",
+    virtualStoreDir: ".pnpm",
+    storeDir: "/a/previous/runner/store",
+  }));
+  writeFileSync(join(nodeModules, ".pnpm", "lock.yaml"), readFileSync(new URL("../../pnpm-lock.yaml", import.meta.url)));
+  for (const name of [...Object.keys(repositoryManifest.dependencies), ...Object.keys(repositoryManifest.devDependencies), "example"]) {
+    const packagePath = join(".pnpm", name.replaceAll("/", "+") + "@1.0.0", "node_modules", name);
+    mkdirSync(join(nodeModules, packagePath), { recursive: true });
+    writeFileSync(join(nodeModules, packagePath, "package.json"), JSON.stringify({ name, version: "1.0.0" }));
+    const scope = name.startsWith("@") ? name.split("/")[0] : "";
+    mkdirSync(join(nodeModules, scope), { recursive: true });
+    symlinkSync((scope ? "../" : "") + packagePath, join(nodeModules, name));
+  }
+  return nodeModules;
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
@@ -75,7 +101,7 @@ describe("CI environment cache metadata", () => {
     const metadata = cacheMetadata({ RUNNER_OS: "Linux", RUNNER_ARCH: "X64" });
 
     expect(metadata.nodeModulesKey).toMatch(
-      new RegExp(`^lcm-node-modules-${CI_CACHE_FORMAT}-linux-x64-node-${NODE_VERSION}-[0-9a-f]{64}$`, "u"),
+      new RegExp(`^lcm-node-modules-${NODE_DEPENDENCY_CACHE_FORMAT}-linux-x64-node-${NODE_VERSION}-[0-9a-f]{64}$`, "u"),
     );
     expect(metadata.imagesKey).toMatch(
       new RegExp(`^lcm-postgresql-images-${CI_CACHE_FORMAT}-linux-x64-[0-9a-f]{64}$`, "u"),
@@ -84,7 +110,11 @@ describe("CI environment cache metadata", () => {
       new RegExp(`^lcm-postgresql-template-${CI_CACHE_FORMAT}-linux-x64-[0-9a-f]{64}$`, "u"),
     );
     expect(metadata.dependencyDigest).toHaveLength(64);
-    expect(NODE_DEPENDENCY_INPUT_PATHS.some((path) => path.endsWith("/.npmrc"))).toBe(true);
+    expect(NODE_DEPENDENCY_INPUT_PATHS.map((path) => path.split("/").at(-1))).toEqual([
+      "package.json", "pnpm-lock.yaml", ".npmrc", "pnpm-workspace.yaml", "bootstrap-pnpm.mjs",
+    ]);
+    expect(NODE_DEPENDENCY_CACHE_FORMAT).toBe("v2");
+    expect(CI_CACHE_FORMAT).toBe("v1");
     expect(metadata.dependencyDigest).toBe(sha256Files(NODE_DEPENDENCY_INPUT_PATHS));
     expect(metadata.imageDigest).not.toBe(metadata.templateDigest);
     expect(POSTGRES_TEMPLATE_INPUT_PATHS.some((path) => path.endsWith(
@@ -93,12 +123,30 @@ describe("CI environment cache metadata", () => {
     expect(metadata.templateDigest).toBe(sha256Files(POSTGRES_TEMPLATE_INPUT_PATHS));
   });
 
-  it.runIf(process.platform === "linux")("writes and validates an installed dependency inventory stamp", () => {
+  it("derives keys before installation and invalidates every dependency input", async () => {
     const root = temporaryDirectory();
-    const nodeModules = join(root, "node_modules");
+    const sourceRoot = new URL("../../", import.meta.url).pathname;
+    for (const source of new Set([...NODE_DEPENDENCY_INPUT_PATHS, ...POSTGRES_TEMPLATE_INPUT_PATHS])) {
+      const target = join(root, relative(sourceRoot, source));
+      mkdirSync(dirname(target), { recursive: true });
+      cpSync(source, target);
+    }
+    const script = join(root, "scripts/ci-environment.mjs");
+    const before = (await runProcess(process.execPath, [script, "cache-metadata"])).stdout;
+    for (const source of NODE_DEPENDENCY_INPUT_PATHS) {
+      const target = join(root, relative(sourceRoot, source));
+      const original = readFileSync(target);
+      writeFileSync(target, Buffer.concat([original, Buffer.from("\n")]));
+      const changed = (await runProcess(process.execPath, [script, "cache-metadata"])).stdout;
+      expect(changed.split("\n")[0]).not.toBe(before.split("\n")[0]);
+      expect(changed.split("\n").slice(1)).toEqual(before.split("\n").slice(1));
+      writeFileSync(target, original);
+    }
+  });
+
+  it.runIf(process.platform === "linux")("writes and validates an installed dependency inventory stamp", () => {
+    const nodeModules = pnpmFixture();
     const packageDirectory = join(nodeModules, "example");
-    mkdirSync(packageDirectory, { recursive: true });
-    writeFileSync(join(packageDirectory, "package.json"), '{"name":"example","version":"1.0.0"}\n');
 
     const before = nodeModulesInventoryDigest(nodeModules);
     const stamp = writeNodeModulesStamp(nodeModules, { RUNNER_OS: "Linux", RUNNER_ARCH: "X64" });
@@ -114,21 +162,69 @@ describe("CI environment cache metadata", () => {
     })).toThrow("inventoryDigest");
   });
 
-  it.runIf(process.platform === "linux")("does not follow dependency inventory symlinks", () => {
-    const root = temporaryDirectory();
-    const nodeModules = join(root, "node_modules");
-    const outside = join(root, "outside");
-    mkdirSync(nodeModules);
-    mkdirSync(outside);
-    writeFileSync(join(outside, "package.json"), '{"name":"outside","version":"1.0.0"}\n');
-    symlinkSync("../outside/package.json", join(nodeModules, "package.json"));
+  it.runIf(process.platform === "linux")("rejects escaping and dangling links without following them", () => {
+    for (const target of ["../outside", "/outside", ".pnpm/missing"]) {
+      const nodeModules = pnpmFixture();
+      symlinkSync(target, join(nodeModules, "bad-link"));
+      expect(() => nodeModulesInventoryDigest(nodeModules)).toThrow(/link/u);
+    }
+    const nodeModules = pnpmFixture();
+    symlinkSync(nodeModules, join(temporaryDirectory(), "linked-node-modules"));
+    expect(() => nodeModulesInventoryDigest(join(temporaryDirectories.at(-1)!, "linked-node-modules"))).toThrow();
+  });
 
-    const before = nodeModulesInventoryDigest(nodeModules);
-    writeFileSync(join(outside, "package.json"), '{"name":"outside","version":"2.0.0"}\n');
+  it.runIf(process.platform === "linux")("validates contained link chains and rejects cycles and non-directory traversal", () => {
+    const nodeModules = pnpmFixture();
+    mkdirSync(join(nodeModules, ".links"));
+    symlinkSync("../example", join(nodeModules, ".links/alias"));
+    expect(() => nodeModulesInventoryDigest(nodeModules)).not.toThrow();
+    symlinkSync("cycle", join(nodeModules, ".links/cycle"));
+    expect(() => nodeModulesInventoryDigest(nodeModules)).toThrow("cycle");
+    rmSync(join(nodeModules, ".links/cycle"));
+    symlinkSync("../example/package.json/../package.json", join(nodeModules, ".links/broken"));
+    expect(() => nodeModulesInventoryDigest(nodeModules)).toThrow(/non-directory/u);
+  });
 
-    expect(nodeModulesInventoryDigest(nodeModules)).toBe(before);
-    symlinkSync(nodeModules, join(root, "linked-node-modules"), "dir");
-    expect(() => nodeModulesInventoryDigest(join(root, "linked-node-modules"))).toThrow();
+  it.runIf(process.platform === "linux")("restores isolated dependencies in a different directory without the original store", () => {
+    const nodeModules = pnpmFixture();
+    const stamp = writeNodeModulesStamp(nodeModules);
+    const restored = join(temporaryDirectory(), "node_modules");
+    cpSync(nodeModules, restored, { recursive: true, verbatimSymlinks: true });
+    rmSync(nodeModules, { recursive: true });
+    expect(validateNodeModulesStamp(restored)).toEqual(stamp);
+  });
+
+  it.runIf(process.platform === "linux")("requires pnpm metadata, the installed lock and every package manifest", () => {
+    for (const missing of [".modules.yaml", ".pnpm/lock.yaml", "example/package.json", Object.keys(repositoryManifest.dependencies)[0]]) {
+      const nodeModules = pnpmFixture();
+      rmSync(join(nodeModules, missing), { recursive: true, force: true });
+      expect(() => writeNodeModulesStamp(nodeModules)).toThrow();
+    }
+  });
+
+  it.runIf(process.platform === "linux")("rejects incompatible pnpm metadata and changed installed lock before stamping", () => {
+    for (const change of [{ packageManager: "pnpm@0.0.0" }, { nodeLinker: "hoisted" }, { virtualStoreDir: "../outside" }]) {
+      const nodeModules = pnpmFixture();
+      const path = join(nodeModules, ".modules.yaml");
+      writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), ...change }));
+      expect(() => writeNodeModulesStamp(nodeModules)).toThrow(/pnpm/u);
+    }
+    const nodeModules = pnpmFixture();
+    writeFileSync(join(nodeModules, ".pnpm/lock.yaml"), "lockfileVersion: invalid");
+    expect(() => writeNodeModulesStamp(nodeModules)).toThrow(/lock/u);
+  });
+
+  it.runIf(process.platform === "linux")("detects pnpm metadata and stamp tampering on restore", () => {
+    const nodeModules = pnpmFixture();
+    writeNodeModulesStamp(nodeModules);
+    const path = join(nodeModules, ".modules.yaml");
+    writeFileSync(path, readFileSync(path, "utf8") + " ");
+    expect(() => validateNodeModulesStamp(nodeModules)).toThrow("inventoryDigest");
+    writeNodeModulesStamp(nodeModules);
+    const stampPath = join(nodeModules, ".lcm-ci-cache.json");
+    const stamp = JSON.parse(readFileSync(stampPath, "utf8"));
+    writeFileSync(stampPath, JSON.stringify({ ...stamp, dependencyDigest: "tampered" }));
+    expect(() => validateNodeModulesStamp(nodeModules)).toThrow("dependencyDigest");
   });
 
   it.runIf(process.platform === "linux")("rejects unsafe node_modules stamp metadata", () => {

@@ -8,7 +8,7 @@
 ## Test Coverage Approval Gate
 
 - Maintain 100% line, branch, function, and statement coverage for every executable production TypeScript file matched by `bin/**/*.ts`, `installer/**/*.ts`, and `src/**/*.ts`.
-- A change must not be approved, merged, or released unless a fresh `npm run test:ci` reports 100% lines, 100% branches, 100% functions, and 100% statements and passes the per-file threshold for the complete collected scope.
+- A change must not be approved, merged, or released unless a fresh `pnpm run test:ci` reports 100% lines, 100% branches, 100% functions, and 100% statements and passes the per-file threshold for the complete collected scope.
 - For local development and pre-push verification, run only the tests relevant to the code being changed and its direct integration boundaries. If the impact is uncertain, err on the side of caution and widen the local test scope before pushing. Do not run unrelated local suites solely to duplicate the complete CI run; rely on CI to exercise the complete collected scope and enforce the 100% coverage gate.
 - Do not use coverage exclusions, `v8 ignore` directives, skipped tests, or untested production wrappers to satisfy the gate. Cover behavior through observable public seams and deterministic failure injection.
 
@@ -18,7 +18,7 @@
 - Require complete exclusive ownership and accurate stable IDs/names/paths: every covered production TypeScript file belongs to exactly one component.
 - Do not freeze the taxonomy at its current count; intentional additions/removals must update the literal map and count atomically.
 - Forbid Codecov flags, statuses, ignore/coverage exclusions, report-only runs, or reporting-topology changes without an explicit design change.
-- Preserve the existing 100% line, branch, function, and statement gate enforced by a fresh `npm run test:ci` over the complete collected scope.
+- Preserve the existing 100% line, branch, function, and statement gate enforced by a fresh `pnpm run test:ci` over the complete collected scope.
 
 ## PR Review And Merge
 
@@ -33,17 +33,34 @@
 
 ## Local Environment Stability
 
-After merging a feature PR, follow exactly one of the workflows below before moving on. Choose the workflow for the agent you are currently running in. Do not run both paths unless the user explicitly asks you to verify both integrations.
+After merging a feature PR, serialize global environment changes with the
+Environment Coordinator. That owner alone performs the following workflow;
+implementation agents must not mutate the globally installed LCM. Choose the
+native connector for the active agent and do not run both integrations unless
+explicitly requested.
 
-Rebuild and verify the package:
+In the primary worktree, preserve unrelated changes, fetch `origin/main`, and
+fast-forward clean `main` to the verified merged commit. Bootstrap pnpm as
+shown in [docs/development.md](docs/development.md), then rebuild and install
+the exact package artifact:
 
 ```bash
-git checkout main && git fetch origin main && git reset --hard origin/main
-npm run build && npm link
+pnpm install --frozen-lockfile
+pnpm run build
+mkdir -p .superpowers/packages
+lcm_package_dir="$(mktemp -d "$PWD/.superpowers/packages/run.XXXXXXXX")"
+npm pack --ignore-scripts --pack-destination "$lcm_package_dir"
+lcm_package_name="$(node -p 'require("./package.json").name.replace(/^@/, "").replace("/", "-") + "-" + require("./package.json").version + ".tgz"')"
+lcm_tarball="$lcm_package_dir/$lcm_package_name"
+npm install -g "$lcm_tarball" --ignore-scripts
+# Verify the installed package version and contents against this exact tarball.
 lcm install
 lcm doctor # must show 0 failures
-npm test   # must pass
+pnpm run test # must pass
 ```
+
+Do not use `npm link` or `pnpm link --global`: installed LCM must be an
+independent copy of the reviewed package artifact.
 
 Then sync the agent native hook connector, where `<agent>` is one of `claude` or `codex`:
 

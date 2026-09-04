@@ -20,8 +20,12 @@ fi
 # Build
 echo "  ▸ Building"
 cd "$INSTALL_DIR"
-npm install --silent
-npm run build
+PNPM_BOOTSTRAP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/lcm-pnpm.XXXXXXXX")"
+trap 'rm -rf -- "$PNPM_BOOTSTRAP_ROOT"' EXIT
+PNPM_BIN="$(node scripts/bootstrap-pnpm.mjs --destination "$PNPM_BOOTSTRAP_ROOT/verified")"
+export PATH="${PNPM_BIN}:${PATH}"
+pnpm install --frozen-lockfile
+pnpm run build
 if [ ! -f "${INSTALL_DIR}/dist/bin/lcm.js" ]; then
   echo "  ✘ Build failed — dist/bin/lcm.js not found" >&2
   exit 1

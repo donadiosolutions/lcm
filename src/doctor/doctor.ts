@@ -1673,7 +1673,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       name: "secret-detection",
       category: "Security",
       status: "fail",
-      message: "No gitleaks patterns were loaded (GITLEAKS_PATTERNS is empty) — run: npx tsx scripts/update-gitleaks-patterns.ts",
+      message: "No gitleaks patterns were loaded (GITLEAKS_PATTERNS is empty) — run pnpm run update:patterns from an LCM source checkout",
     });
   } else {
     const syncNote = syncDate ? ` (synced ${syncDate})` : "";

@@ -152,7 +152,7 @@ export function createVitestConfiguration(root: string): UserConfig {
             sequence: {
               groupOrder: 1,
             },
-            // Package inventory tests run npm build and mutate dist. Keep them
+            // Package inventory tests run pnpm build and mutate dist. Keep them
             // out of the parallel unit pool so they cannot race other tests.
             fileParallelism: false,
           },

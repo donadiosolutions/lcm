@@ -123,6 +123,9 @@ describe("update-patterns workflow", () => {
       "Checkout main",
       "Require pattern bot token",
       "Setup Node",
+      "Bootstrap verified pnpm",
+      "Locate pnpm store",
+      "Cache pnpm store",
       "Install dependencies",
       "Run update-gitleaks-patterns",
       "Check for changes",
@@ -147,8 +150,30 @@ describe("update-patterns workflow", () => {
     });
     expect(step("Setup Node")).toMatchObject({
       uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
-      with: { "node-version": "22.20.0", cache: "npm" },
+      with: { "node-version": "22.20.0" },
     });
+  });
+
+  it("bootstraps pnpm before resolving the exact store cache and frozen install", () => {
+    expect(runStep("Bootstrap verified pnpm")).toContain('mktemp -d "$RUNNER_TEMP/lcm-pnpm.XXXXXX"');
+    expect(runStep("Bootstrap verified pnpm")).toContain(
+      'node scripts/bootstrap-pnpm.mjs --destination "$bootstrap_root/pnpm"',
+    );
+    expect(runStep("Bootstrap verified pnpm")).toContain('"$pnpm_bin" >> "$GITHUB_PATH"');
+    expect(runStep("Bootstrap verified pnpm")).toContain("npm_config_store_dir=%s");
+    expect(runStep("Bootstrap verified pnpm")).toContain('"$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"');
+    expect(runStep("Locate pnpm store")).toContain('store_path="$(pnpm store path)"');
+    expect(step("Cache pnpm store")).toMatchObject({
+      uses: "actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306",
+      with: {
+        path: "${{ steps.pnpm-store.outputs.path }}",
+        key: "pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-22.20.0-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}",
+      },
+    });
+    expect(step("Cache pnpm store").with).not.toHaveProperty("restore-keys");
+    expect(runStep("Install dependencies")).toBe("pnpm install --frozen-lockfile");
+    expect(step("Install dependencies").if).toBeUndefined();
+    expect(workflowSource).not.toMatch(/\bnpm (?:ci|run)|\bnpx\b/u);
   });
 
   it("runs the token preflight before setup/install/generator and fails clearly when PAT is absent", () => {
@@ -158,6 +183,9 @@ describe("update-patterns workflow", () => {
     expect(preflightIndex).toBe(checkoutIndex + 1);
     for (const later of [
       "Setup Node",
+      "Bootstrap verified pnpm",
+      "Locate pnpm store",
+      "Cache pnpm store",
       "Install dependencies",
       "Run update-gitleaks-patterns",
       "Check for changes",
@@ -270,7 +298,7 @@ describe("update-patterns workflow", () => {
     const names = steps.map(({ name }) => name);
     expect(names.indexOf("Run update-gitleaks-patterns")).toBeLessThan(names.indexOf("Check for changes"));
     expect(runStep("Run update-gitleaks-patterns")).toBe(
-      "node --experimental-strip-types scripts/update-gitleaks-patterns.ts",
+      "pnpm run update:patterns",
     );
     const commit = runStep("Commit and open PR");
     expect(commit).toContain("git commit -s");

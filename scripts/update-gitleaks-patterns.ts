@@ -1,4 +1,4 @@
-#!/usr/bin/env tsx
+#!/usr/bin/env -S node --experimental-strip-types
 /**
  * update-gitleaks-patterns.ts
  *
@@ -6,7 +6,7 @@
  * validates each pattern (compiles + smoke tests), and writes src/generated-patterns.ts.
  *
  * Usage:
- *   npx tsx scripts/update-gitleaks-patterns.ts
+ *   pnpm run update:patterns (from a source checkout)
  *
  * The script aborts (exit 1) if:
  *   - Fetch fails

@@ -9,6 +9,25 @@ version forms are:
 Alpha, release-candidate, custom prerelease, build-metadata, and leading-zero
 versions are rejected.
 
+## Build toolchain and historical tags
+
+Release builds use the verified pnpm `packageManager` pin from `package.json`.
+Follow [Development](development.md) to bootstrap it into a fresh local directory,
+then use `pnpm install --frozen-lockfile` and `pnpm run` for build, test, and
+Changesets scripts. No global pnpm installation is required. Version-only
+Changesets updates leave the pnpm dependency graph unchanged.
+
+npm still owns `npm pack`, registry ordering, and `npm publish`. Publishing jobs
+with OIDC authority consume the verified tarball without installing or executing
+package code.
+
+An unpublished tag must contain the pnpm lockfile, configuration, bootstrap,
+and valid manifest pin. Historical unpublished tags without these inputs are
+rejected; prepare a new reviewed release from a commit containing the migration
+instead of moving an existing tag or attempting an npm fallback. If the exact
+version is already published, recovery remains verification-only and bypasses
+pnpm prerequisites, bootstrap, installation, tests, build, and pack.
+
 ## Preparing versions
 
 Changesets remains the source of package versions and changelog entries. Normal

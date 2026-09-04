@@ -29,6 +29,14 @@ maintenance fix branches        → maintenance/<major>.<minor>.x
 - CI dependency/image/database caches are initialization state, not reusable test state. Preserve exact dependency-cache validation, digest validation for cached images, a secret-free PostgreSQL template, and fresh run-scoped credentials/resources for each conformance leg.
 - npm publishing remains on GitHub-hosted runners because trusted provenance does not accept self-hosted runners.
 
+## Development toolchain
+
+- Follow [Development](docs/development.md) to bootstrap the exact `packageManager` version and SHA-512 archive pin with `node scripts/bootstrap-pnpm.mjs`. Use a fresh private destination and prepend the returned absolute bin directory to `PATH`; do not install pnpm globally.
+- Use `pnpm install --frozen-lockfile` for clean development and CI installs, `pnpm run` for scripts, and `pnpm exec` for installed development tools. Keep `pnpm-lock.yaml` authoritative and dependencies exact.
+- Keep `.npmrc` and `pnpm-workspace.yaml` with the lockfile. Dependency build scripts are allowed only for `esbuild` and optional macOS `fsevents`; manager mismatches must fail without automatic manager downloads.
+- npm owns consumer topology installs, package tarballs, registry ordering, and publication. Public installation remains `npm install -g`.
+- After merge, coordinate with the Environment Coordinator before any global installed-LCM mutation. That owner alone builds through pnpm, packs and installs the exact npm tarball, verifies installed artifact identity, and runs installation/doctor/connector checks. Do not use global links to the development tree.
+
 ## Release flow
 
 1. User-facing changes targeting `main` include the appropriate `.changeset/*.md` entry.

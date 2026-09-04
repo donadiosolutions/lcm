@@ -1,4 +1,7 @@
-import { readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import { load as loadYaml } from "js-yaml";
 import { describe, expect, it } from "vitest";
 
@@ -144,7 +147,7 @@ describe("release workflows", () => {
     expect(changesets?.with).toMatchObject({
       branch: "main",
       commitMode: "github-api",
-      version: "npm run version-packages",
+      version: "pnpm run version-packages",
       createGithubReleases: false,
     });
     expect(changesets?.env?.LCM_RELEASE_CHANNEL).toBe("${{ steps.channel.outputs.channel }}");
@@ -169,6 +172,37 @@ describe("release workflows", () => {
     expect(releasePolicyLabels?.with?.script).toContain('if (error.status !== 404) throw error');
     expect(releasePolicyLabels?.with?.script).not.toContain('"chore"');
     expect(releasePolicyLabels?.with?.script).not.toContain('"release-workflow"');
+  });
+
+  it("bootstraps exact pnpm before a separate store cache and frozen install", () => {
+    for (const job of [versionWorkflow.jobs.version, publishWorkflow.jobs.draft, publishWorkflow.jobs.preflight, publishWorkflow.jobs["recover-preflight"]]) {
+      const index = (name: string) => job.steps.findIndex((step) => step.name === name);
+      const bootstrap = job.steps[index("Bootstrap verified pnpm")];
+      expect(index("Setup Node")).toBeLessThan(index("Bootstrap verified pnpm"));
+      expect(bootstrap.run).toContain('mktemp -d "$RUNNER_TEMP/pnpm-bootstrap.XXXXXX"');
+      expect(bootstrap.run).toContain('node scripts/bootstrap-pnpm.mjs --destination "$parent/verified" >> "$GITHUB_PATH"');
+      expect(index("Bootstrap verified pnpm")).toBeLessThan(index("Locate pnpm store"));
+      expect(index("Locate pnpm store")).toBeLessThan(index("Cache pnpm store"));
+      expect(index("Cache pnpm store")).toBeLessThan(index("Install dependencies"));
+      const cache = job.steps[index("Cache pnpm store")];
+      expect(cache.uses).toBe("actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306");
+      expect(cache.with?.path).toBe("${{ steps.pnpm-store.outputs.path }}");
+      const prefix = job.defaults?.run["working-directory"] === "release" ? "release/" : "";
+      for (const name of ["package.json", "pnpm-lock.yaml", ".npmrc", "pnpm-workspace.yaml", "scripts/bootstrap-pnpm.mjs"]) {
+        expect(cache.with?.key).toContain(`'${prefix}${name}'`);
+      }
+      expect(job.steps[index("Install dependencies")].run).toBe("pnpm install --frozen-lockfile");
+    }
+    for (const job of [publishWorkflow.jobs.draft, publishWorkflow.jobs.preflight, publishWorkflow.jobs["recover-preflight"]]) {
+      const validationIndex = job.steps.findIndex((step) => step.name === "Validate tagged pnpm inputs");
+      expect(validationIndex).toBeLessThan(job.steps.findIndex((step) => step.name === "Bootstrap verified pnpm"));
+      expect(job.steps[validationIndex].run).toContain("trusted/.github/scripts/check-pnpm-release-inputs.mjs .");
+    }
+    for (const job of [publishWorkflow.jobs.publish, publishWorkflow.jobs["recover-publish"]]) {
+      expect(JSON.stringify(job.steps)).not.toMatch(/pnpm|bootstrap|npm (ci|install|run)/u);
+      expect(job.steps.filter((step) => step.uses?.startsWith("actions/checkout"))).toHaveLength(1);
+      expect(job.steps.find((step) => step.uses?.startsWith("actions/checkout"))?.with?.["sparse-checkout"]).toBe(".github/scripts");
+    }
   });
 
   it("separates tag-driven drafts from manually published npm releases", () => {
@@ -342,7 +376,7 @@ describe("release workflows", () => {
     expect(publishTarballSource).toContain('"public"');
     expect(publishTarballSource).toContain('"--tag"');
     expect(publishSource).toContain("assertActionCreatedReleaseBody");
-    expect(publishSource.match(/npm run test:ci/gu)).toHaveLength(3);
+    expect(publishSource.match(/pnpm run test:ci/gu)).toHaveLength(3);
     const draftNpmState = publishWorkflow.jobs.draft.steps.find(
       (step: WorkflowStep): boolean => step.name === "Check npm release ordering",
     );
@@ -577,6 +611,10 @@ describe("release workflows", () => {
     expect(recoveryNpmState?.id).toBe("npm");
     expect(recoveryNpmState?.run).toContain('>> "$GITHUB_OUTPUT"');
     const recoveryBuildSteps = [
+      "Validate tagged pnpm inputs",
+      "Bootstrap verified pnpm",
+      "Locate pnpm store",
+      "Cache pnpm store",
       "Install dependencies",
       "Verify trusted publishing prerequisites",
       "Type-check",
@@ -590,6 +628,9 @@ describe("release workflows", () => {
     for (const name of recoveryBuildSteps) {
       expect(recoveryPreflight.steps.find((step) => step.name === name)?.if).toBe(
         "${{ steps.npm.outputs.already_published != 'true' }}",
+      );
+      expect(recoveryPreflight.steps.indexOf(recoveryNpmState!)).toBeLessThan(
+        recoveryPreflight.steps.findIndex((step) => step.name === name),
       );
     }
     const existingNpmVerification = recoveryPreflight.steps.find(
@@ -658,5 +699,108 @@ describe("release workflows", () => {
 
   it("records prerelease support as a minor package change", () => {
     expect(changesetSource).toMatch(/^---\n"@donadiosolutions\/lcm": minor\n---\n/u);
+  });
+});
+
+
+const metadataValidationSteps = [
+  publishWorkflow.jobs.draft.steps.find((step) => step.name === "Validate release tag")!,
+  publishWorkflow.jobs.preflight.steps.find((step) => step.name === "Validate published release")!,
+  publishWorkflow.jobs["recover-preflight"].steps.find((step) => step.name === "Validate tagged package")!,
+];
+
+function runMetadataValidation(step: WorkflowStep, {
+  version = "1.2.3",
+  metadata = JSON.stringify({ version }),
+  ancestor = true,
+}: { version?: string; metadata?: string; ancestor?: boolean } = {}) {
+  const root = mkdtempSync(join(tmpdir(), "lcm-release-metadata-"));
+  try {
+    const bin = join(root, "bin");
+    const calls = join(root, "calls");
+    const output = join(root, "output");
+    mkdirSync(bin);
+    writeFileSync(join(root, "package.json"), metadata);
+    writeFileSync(join(root, "CHANGELOG.md"), `## ${version}\n\n- Fixture release.\n`);
+    writeFileSync(join(bin, "git"), `#!/bin/bash
+printf 'git %s\\n' "$*" >> "$FIXTURE_CALLS"
+if [[ "$*" == "fetch --no-tags origin main" ]]; then exit 0; fi
+if [[ "$*" == "merge-base --is-ancestor HEAD origin/main" ]]; then
+  [[ "$FIXTURE_ANCESTOR" == "true" ]]
+  exit
+fi
+exit 99
+`);
+    writeFileSync(join(bin, "node"), `#!/bin/bash
+printf 'node\\n' >> "$FIXTURE_CALLS"
+exec "$FIXTURE_NODE" "$@"
+`);
+    chmodSync(join(bin, "git"), 0o755);
+    chmodSync(join(bin, "node"), 0o755);
+    const result = spawnSync("/bin/bash", ["-c", step.run!], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
+        HOME: root,
+        TMPDIR: root,
+        FIXTURE_CALLS: calls,
+        FIXTURE_NODE: process.execPath,
+        FIXTURE_ANCESTOR: String(ancestor),
+        GITHUB_OUTPUT: output,
+        RELEASE_TAG: `v${version}`,
+        RELEASE_DRAFT: "false",
+        RELEASE_PRERELEASE: String(version.includes("-beta.")),
+      },
+    });
+    return {
+      ...result,
+      calls: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [],
+      output: existsSync(output) ? readFileSync(output, "utf8") : "",
+    };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+describe.each(metadataValidationSteps)("$name metadata admission", (step) => {
+  it("establishes main ancestry before data-only package parsing", () => {
+    const script = step.run!;
+    expect(script.indexOf("git merge-base --is-ancestor HEAD origin/main")).toBeLessThan(script.indexOf("readFileSync"));
+    expect(script).toContain("JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version");
+    expect(script.match(/require\([^)]*\)/gu)).toEqual(["require('node:fs')"]);
+  });
+
+  it.each(["1.2.3", "1.3.0-beta.0"])("accepts inert %s metadata after ancestry", (version) => {
+    const result = runMetadataValidation(step, { version });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.calls).toEqual(["git fetch --no-tags origin main", "git merge-base --is-ancestor HEAD origin/main", "node"]);
+    if (step.id === "release") {
+      expect(result.output).toContain(`version=${version}\n`);
+      expect(result.output).toContain(`is_beta=${version.includes("-beta.")}\n`);
+    }
+  });
+
+  it("rejects non-ancestor input before attempting malformed metadata", () => {
+    const result = runMetadataValidation(step, { ancestor: false, metadata: "{" });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("reachable from origin/main");
+    expect(result.calls).toEqual(["git fetch --no-tags origin main", "git merge-base --is-ancestor HEAD origin/main"]);
+    expect(result.output).toBe("");
+  });
+
+  it("fails closed on malformed JSON after ancestry", () => {
+    const result = runMetadataValidation(step, { metadata: "{" });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("SyntaxError");
+    expect(result.calls).toEqual(["git fetch --no-tags origin main", "git merge-base --is-ancestor HEAD origin/main", "node"]);
+    expect(result.output).toBe("");
+  });
+
+  it("retains the package-version mismatch guard", () => {
+    const result = runMetadataValidation(step, { metadata: JSON.stringify({ version: "0.0.1" }) });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("does not match release tag");
+    expect(result.output).toBe("");
   });
 });
