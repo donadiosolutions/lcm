@@ -205,7 +205,7 @@ export async function withProjectStorage<T>(
           && !sameStorageIdentity(request.expectedIdentity, identity)) {
         throw new BackendPublicationJournalError(
           "unexpected-state",
-          "project identity changed during publication admission",
+          "project storage identity changed during publication admission",
         );
       }
       state.openPending = true;

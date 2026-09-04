@@ -403,7 +403,7 @@ describe("route storage cleanup", () => {
       }, operation)).rejects.toMatchObject({
         name: "BackendPublicationJournalError",
         reason: "unexpected-state",
-        message: "project identity changed during publication admission",
+        message: "project storage identity changed during publication admission",
       } satisfies Partial<BackendPublicationJournalError>);
 
       expect(openProject).not.toHaveBeenCalled();
