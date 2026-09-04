@@ -937,11 +937,18 @@ describe("daemon server", () => {
       JSON.stringify({ message: { role: "assistant", content: [{ type: "text", text: "Alias scan answer" }] } }),
     ].join("\n") + "\n");
 
-    const observedTokens: Array<object | undefined> = [];
+    const identityTokens: Array<object | undefined> = [];
     const admissionTokens: object[] = [];
+    const originalProjectIdentity = projectModule.projectIdentity as (...args: unknown[]) => unknown;
+    vi.spyOn(projectModule, "projectIdentity").mockImplementation(((...args: unknown[]) => {
+      const publicationLockToken = args[2] as object | undefined;
+      if (identityTokens.at(-1) !== publicationLockToken) {
+        identityTokens.push(publicationLockToken);
+      }
+      return originalProjectIdentity(...args);
+    }) as typeof projectModule.projectIdentity);
     const originalProjectPaths = projectModule.projectPaths;
     vi.spyOn(projectModule, "projectPaths").mockImplementation((cwd, publicationLockToken) => {
-      if (observedTokens.at(-1) !== publicationLockToken) observedTokens.push(publicationLockToken);
       if (publicationLockToken !== undefined && admissionTokens.at(-1) !== publicationLockToken) {
         admissionTokens.push(publicationLockToken);
       }
@@ -957,7 +964,7 @@ describe("daemon server", () => {
     const transactionSpy = vi.spyOn(SqliteProjectStorage.prototype, "transaction").mockImplementation(async function (callback) {
       const index = transactionIndex++;
       transactionStarted[index]?.resolve({
-        discoveryToken: observedTokens.at(-2),
+        discoveryToken: identityTokens.at(-2),
         admissionToken: admissionTokens.at(-1),
       });
       await releaseTransaction[index]?.promise;
