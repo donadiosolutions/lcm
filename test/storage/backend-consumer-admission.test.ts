@@ -1,10 +1,12 @@
 import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
   assertBackendPublicationConfigAccess,
+  backendPublicationDirectory,
   backendPublicationHomeForConfigPath,
   withBackendPublicationConfigLock,
   withBackendPublicationConsumerLock,
@@ -20,7 +22,7 @@ import { BackendPublicationJournalError } from "../../src/storage/backend-public
 
 const homes: string[] = [];
 
-function makeHome(publicationDirectory = true): string {
+function makeHome(publicationDirectory = false): string {
   const home = mkdtempSync(join(tmpdir(), "lcm-backend-consumer-"));
   homes.push(home);
   mkdirSync(join(home, ".lcm"), { mode: 0o700 });
@@ -39,6 +41,36 @@ function expectReason(action: () => unknown, reason: BackendPublicationJournalEr
   }));
 }
 
+async function interruptPublicationDirectoryValidation(
+  home: string,
+  action: () => unknown | Promise<unknown>,
+): Promise<Readonly<{ injected: boolean; error: unknown }>> {
+  const publicationDirectory = backendPublicationDirectory(home);
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const originalRealpath = nodeFs.realpathSync as (...args: unknown[]) => unknown;
+  let injected = false;
+  let error: unknown;
+  try {
+    nodeFs.realpathSync = ((path: string, ...args: unknown[]) => {
+      if (path === publicationDirectory && !injected) {
+        injected = true;
+        rmSync(publicationDirectory, { recursive: true });
+      }
+      return originalRealpath(path, ...args);
+    }) as never;
+    syncBuiltinESMExports();
+    try {
+      await action();
+    } catch (caught) {
+      error = caught;
+    }
+  } finally {
+    nodeFs.realpathSync = originalRealpath;
+    syncBuiltinESMExports();
+  }
+  return { injected, error };
+}
+
 afterEach(() => {
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
 });
@@ -54,13 +86,13 @@ describe("backend publication consumer admission", () => {
       .toThrowError(expect.objectContaining({ reason: "unsafe-storage" }));
   });
 
-  it("admits SQLite with and without a publication directory", () => {
-    const withDirectory = makeHome();
-    const withoutDirectory = makeHome(false);
-    expect(withStorageBackendConsumerLock(withDirectory, lockToken => {
+  it("admits SQLite only when the publication directory is genuinely absent", () => {
+    const withDirectory = makeHome(true);
+    const withoutDirectory = makeHome();
+    expectReason(() => withStorageBackendConsumerLock(withDirectory, lockToken => {
       assertStorageBackendPublication({ backend: "sqlite", homeDir: withDirectory }, lockToken);
       return "locked";
-    })).toBe("locked");
+    }), "publication-evidence-missing");
     expect(withStorageBackendConsumerLock(withoutDirectory, lockToken => {
       assertStorageBackendPublication({ backend: "sqlite", homeDir: withoutDirectory }, lockToken);
       return "unlocked";
@@ -68,16 +100,68 @@ describe("backend publication consumer admission", () => {
   });
 
   it("supports asynchronous admission on both lock paths", async () => {
-    const withDirectory = makeHome();
-    const withoutDirectory = makeHome(false);
+    const withDirectory = makeHome(true);
+    const withoutDirectory = makeHome();
     await expect(withStorageBackendConsumerLockAsync(withDirectory, async lockToken => {
       assertStorageBackendPublication({ backend: "sqlite", homeDir: withDirectory }, lockToken);
       return "locked";
-    })).resolves.toBe("locked");
+    })).rejects.toMatchObject({ reason: "publication-evidence-missing" });
     await expect(withStorageBackendConsumerLockAsync(withoutDirectory, async lockToken => {
       assertStorageBackendPublication({ backend: "sqlite", homeDir: withoutDirectory }, lockToken);
       return "unlocked";
     })).resolves.toBe("unlocked");
+  });
+
+  it("rejects interrupted synchronous publication-directory authentication", async () => {
+    const home = makeHome(true);
+    let callbackRan = false;
+
+    const observed = await interruptPublicationDirectoryValidation(home, () => {
+      withStorageBackendConsumerLock(home, lockToken => {
+        callbackRan = true;
+        assertStorageBackendPublication({ backend: "sqlite", homeDir: home }, lockToken);
+      });
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(callbackRan).toBe(false);
+    expect(observed.error).toBeInstanceOf(BackendPublicationJournalError);
+    expect(observed.error).toMatchObject({ reason: "unsafe-storage" });
+  });
+
+  it("rejects interrupted asynchronous publication-directory authentication", async () => {
+    const home = makeHome(true);
+    let callbackRan = false;
+
+    const observed = await interruptPublicationDirectoryValidation(home, async () => {
+      await withStorageBackendConsumerLockAsync(home, async lockToken => {
+        callbackRan = true;
+        assertStorageBackendPublication({ backend: "sqlite", homeDir: home }, lockToken);
+      });
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(callbackRan).toBe(false);
+    expect(observed.error).toBeInstanceOf(BackendPublicationJournalError);
+    expect(observed.error).toMatchObject({ reason: "unsafe-storage" });
+  });
+
+  it("rejects interrupted publication authentication beneath a non-private root", async () => {
+    const home = makeHome(true);
+    chmodSync(join(home, ".lcm"), 0o755);
+    let callbackRan = false;
+
+    const observed = await interruptPublicationDirectoryValidation(home, () => {
+      withStorageBackendConsumerLock(home, lockToken => {
+        callbackRan = true;
+        assertStorageBackendPublication({ backend: "sqlite", homeDir: home }, lockToken);
+      });
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(callbackRan).toBe(false);
+    expect(observed.error).toBeInstanceOf(BackendPublicationJournalError);
+    expect(observed.error).toMatchObject({ reason: "unsafe-storage" });
   });
 
   it("reuses the exact live token for the same canonical home and revokes retained continuations", async () => {
@@ -142,11 +226,11 @@ describe("backend publication consumer admission", () => {
   });
 
   it("fails closed for unsafe publication directories", async () => {
-    const syncHome = makeHome();
+    const syncHome = makeHome(true);
     chmodSync(join(syncHome, ".lcm", "backend-publication"), 0o755);
     expectReason(() => withStorageBackendConsumerLock(syncHome, () => "never"), "unsafe-storage");
 
-    const asyncHome = makeHome();
+    const asyncHome = makeHome(true);
     chmodSync(join(asyncHome, ".lcm", "backend-publication"), 0o755);
     await expect(withStorageBackendConsumerLockAsync(asyncHome, () => "never"))
       .rejects.toMatchObject({ reason: "unsafe-storage" });

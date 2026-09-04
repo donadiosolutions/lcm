@@ -21,6 +21,7 @@ import {
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
   isOwnerOnlyFileMode,
+  openPrivateDirectoryIfExists,
 } from "../security-files.js";
 import type { StorageBackendName } from "./contracts.js";
 import {
@@ -948,26 +949,55 @@ function parseJournal(content: string): BackendPublicationJournal {
   return journal;
 }
 
-function readJournal(homeDir?: string): BackendPublicationJournal | null {
+type BackendPublicationDirectoryHandle = ReturnType<typeof openPrivateDirectory>;
+
+function openBackendPublicationDirectoryForRead(
+  homeDir?: string,
+): BackendPublicationDirectoryHandle | undefined {
   const directory = backendPublicationDirectory(homeDir);
-  let directoryHandle;
   try {
-    directoryHandle = openPrivateDirectory(directory);
+    return openPrivateDirectoryIfExists(directory);
   } catch (error) {
-    if (isMissing(error)) return null;
     return fail("unsafe-storage", `backend publication directory cannot be opened: ${(error as Error).message}`);
   }
+}
+
+function withBackendPublicationDirectoryRead<T>(
+  homeDir: string | undefined,
+  callback: (handle: BackendPublicationDirectoryHandle | undefined) => T,
+): T {
+  const handle = openBackendPublicationDirectoryForRead(homeDir);
   try {
+    return callback(handle);
+  } finally {
+    handle?.close();
+  }
+}
+
+function readJournalFromDirectory(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle | undefined,
+): BackendPublicationJournal | null {
+  if (directoryHandle === undefined) return null;
+  const directory = backendPublicationDirectory(homeDir);
+  try {
+    assertPrivateDirectory(directoryHandle, directory, directoryHandle.witness);
     let journal: BackendPublicationJournal | null;
     try {
-      const content = readBoundedRegularFileWithStat(backendPublicationJournalPath(homeDir), {
+      const observed = readBoundedRegularFileWithStat(backendPublicationJournalPath(homeDir), {
         allowedRoot: directory,
         maxBytes: MAX_JOURNAL_BYTES,
         expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
         allowedModes: [0o600],
         requireSingleLink: true,
-      }).content;
-      journal = parseJournal(content);
+      });
+      if (
+        observed.parentDev !== directoryHandle.witness.dev
+        || observed.parentIno !== directoryHandle.witness.ino
+      ) {
+        return fail("unsafe-storage", "backend publication journal parent does not match the authenticated directory");
+      }
+      journal = parseJournal(observed.content);
     } catch (error) {
       if (isMissing(error)) journal = null;
       else if (error instanceof BackendPublicationJournalError) throw error;
@@ -975,27 +1005,31 @@ function readJournal(homeDir?: string): BackendPublicationJournal | null {
     }
     assertPrivateDirectory(directoryHandle, directory, directoryHandle.witness);
     return journal;
-  } finally {
-    directoryHandle.close();
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError) throw error;
+    return fail(
+      "unsafe-storage",
+      `backend publication directory changed during journal read: ${(error as Error).message}`,
+    );
   }
+}
+
+function readJournal(homeDir?: string): BackendPublicationJournal | null {
+  return withBackendPublicationDirectoryRead(
+    homeDir,
+    (handle) => readJournalFromDirectory(homeDir, handle),
+  );
 }
 
 export function readBackendPublicationJournal(homeDir?: string): BackendPublicationJournal | null {
   return readJournal(homeDir);
 }
 
-function backendPublicationEvidenceExists(
-  homeDir?: string,
-  emptyDirectoryIsEvidence = false,
-): boolean {
+function assertBackendPublicationEvidenceDirectory(
+  homeDir: string | undefined,
+  handle: BackendPublicationDirectoryHandle,
+): void {
   const directory = backendPublicationDirectory(homeDir);
-  let handle;
-  try {
-    handle = openPrivateDirectory(directory);
-  } catch (error) {
-    if (isMissing(error)) return false;
-    return fail("unsafe-storage", `backend publication directory cannot be opened: ${(error as Error).message}`);
-  }
   try {
     assertPrivateDirectory(handle, directory, handle.witness);
     const entries = readdirSync(directory);
@@ -1009,14 +1043,58 @@ function backendPublicationEvidenceExists(
       }
     }
     assertPrivateDirectory(handle, directory, handle.witness);
-    return entries.length > 0 || emptyDirectoryIsEvidence;
-  } finally {
-    handle.close();
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError) throw error;
+    return fail(
+      "unsafe-storage",
+      `backend publication directory changed during evidence enumeration: ${(error as Error).message}`,
+    );
   }
+}
+
+function withPublicationJournalForConsumer<T>(
+  homeDir: string | undefined,
+  callback: (
+    journal: BackendPublicationJournal | null,
+    handle: BackendPublicationDirectoryHandle | undefined,
+  ) => T,
+): T {
+  const inspect = (
+    handle: BackendPublicationDirectoryHandle | undefined,
+  ): T => {
+    const journal = readJournalFromDirectory(homeDir, handle);
+    if (journal === null && handle !== undefined) {
+      assertBackendPublicationEvidenceDirectory(homeDir, handle);
+      return fail("publication-evidence-missing", "backend publication evidence is incomplete");
+    }
+    return callback(journal, handle);
+  };
+  return withBackendPublicationDirectoryRead(homeDir, (initialHandle) => {
+    if (initialHandle !== undefined) return inspect(initialHandle);
+    return withBackendPublicationDirectoryRead(homeDir, inspect);
+  });
+}
+
+function readPublicationJournalForConsumer(homeDir?: string): BackendPublicationJournal | null {
+  return withPublicationJournalForConsumer(homeDir, (journal) => journal);
+}
+
+function readPublicationJournalForAccess(
+  homeDir: string | undefined,
+  permit: PrivateMutationPermit | undefined,
+): BackendPublicationJournal | null {
+  const journal = permit === undefined
+    ? readPublicationJournalForConsumer(homeDir)
+    : readJournal(homeDir);
+  if (journal === null && permit !== undefined) {
+    return fail("permit-mismatch", "backend publication permit has no durable journal");
+  }
+  return journal;
 }
 
 function assertTerminalPublicationEvidence(
   journal: BackendPublicationJournal,
+  directoryHandle: BackendPublicationDirectoryHandle,
   homeDir?: string,
 ): void {
   if (journal.phase !== "completed" && journal.phase !== "aborted") {
@@ -1031,7 +1109,7 @@ function assertTerminalPublicationEvidence(
     }
   }
   try {
-    authenticateMaterial(homeDir, journal);
+    authenticateMaterial(homeDir, journal, directoryHandle);
   } catch (error) {
     // Aborted publications remove their recovery material after the journal
     // reaches its terminal state. The journal checksum and state witnesses
@@ -1052,19 +1130,19 @@ function assertTerminalPublicationEvidence(
   }
 }
 
-function readConsumerPublicationJournal(
-  homeDir?: string,
-  emptyDirectoryIsEvidence = false,
-): BackendPublicationJournal | null {
-  const journal = readJournal(homeDir);
-  if (journal === null) {
-    if (backendPublicationEvidenceExists(homeDir, emptyDirectoryIsEvidence)) {
-      return fail("publication-evidence-missing", "backend publication evidence is incomplete");
-    }
-    return null;
-  }
-  assertTerminalPublicationEvidence(journal, homeDir);
-  return journal;
+function withConsumerPublicationJournal<T>(
+  homeDir: string | undefined,
+  callback: (journal: BackendPublicationJournal | null) => T,
+): T {
+  return withPublicationJournalForConsumer(homeDir, (journal, handle) => {
+    if (journal === null) return callback(journal);
+    assertTerminalPublicationEvidence(journal, handle!, homeDir);
+    return callback(journal);
+  });
+}
+
+function readConsumerPublicationJournal(homeDir?: string): BackendPublicationJournal | null {
+  return withConsumerPublicationJournal(homeDir, (journal) => journal);
 }
 
 function permitMetadata(
@@ -1107,28 +1185,22 @@ function assertBackendPublicationConsumerAccessUnlocked(options: {
   readonly permit?: PrivateMutationPermit;
   readonly lockToken?: BackendPublicationLockToken;
 } = {}): void {
-  const journal = readJournal(options.homeDir);
-  if (journal === null) {
-    if (backendPublicationEvidenceExists(options.homeDir)) {
-      return fail("publication-evidence-missing", "backend publication evidence is incomplete");
-    }
-    if (options.backend === "postgresql") {
-      return fail("publication-evidence-missing", "PostgreSQL selection has no completed backend publication evidence");
-    }
-    if (options.permit !== undefined) {
-      return fail("permit-mismatch", "backend publication permit has no durable journal");
-    }
-    return;
+  if (options.permit === undefined) {
+    return withConsumerPublicationJournal(options.homeDir, (journal) => {
+      if (journal === null) {
+        if (options.backend === "postgresql") {
+          return fail("publication-evidence-missing", "PostgreSQL selection has no completed backend publication evidence");
+        }
+        return;
+      }
+      const expected = journal.phase === "completed" ? journal.targetBackend : journal.sourceBackend;
+      if (options.backend !== undefined && options.backend !== expected) {
+        return fail("backend-mismatch", "stored backend does not match the completed publication journal");
+      }
+    });
   }
-  if (options.permit !== undefined) {
-    permitMetadata(options.permit, options.homeDir, journal);
-    return;
-  }
-  assertTerminalPublicationEvidence(journal, options.homeDir);
-  const expected = journal.phase === "completed" ? journal.targetBackend : journal.sourceBackend;
-  if (options.backend !== undefined && options.backend !== expected) {
-    return fail("backend-mismatch", "stored backend does not match the completed publication journal");
-  }
+  const journal = readPublicationJournalForAccess(options.homeDir, options.permit);
+  permitMetadata(options.permit, options.homeDir, journal!);
 }
 
 type ConsumerLockOptions = Readonly<{
@@ -1194,9 +1266,8 @@ function checkRetainedConsumerDirectories(
 
 function openOptionalPublicationDirectory(homeDir?: string): ReturnType<typeof openPrivateDirectory> | undefined {
   try {
-    return openPrivateDirectory(backendPublicationDirectory(homeDir));
+    return openPrivateDirectoryIfExists(backendPublicationDirectory(homeDir));
   } catch (error) {
-    if (isMissing(error)) return undefined;
     return fail("unsafe-storage", `backend publication directory cannot be opened: ${(error as Error).message}`);
   }
 }
@@ -1212,11 +1283,11 @@ function openOptionalRootDirectory(homeDir?: string): ReturnType<typeof openPriv
     // of the evidence and the unsafe mode must fail closed.
     if ((error as Error).message.includes("private directory mode is not trusted")) {
       try {
-        const publication = openPrivateDirectory(backendPublicationDirectory(homeDir));
+        const publication = openPrivateDirectoryIfExists(backendPublicationDirectory(homeDir));
+        if (publication === undefined) return undefined;
         publication.close();
         return fail("unsafe-storage", "backend publication root is not private");
       } catch (publicationError) {
-        if (isMissing(publicationError)) return undefined;
         return fail(
           "unsafe-storage",
           "backend publication directory cannot be opened: " + (publicationError as Error).message,
@@ -1603,7 +1674,7 @@ function assertBackendPublicationConfigAccessUnlocked(
 ): void {
   const journal = permit === undefined
     ? readConsumerPublicationJournal(homeDir)
-    : readJournal(homeDir);
+    : readPublicationJournalForAccess(homeDir, permit);
   if (journal === null) {
     if (backend === "postgresql") {
       return fail("publication-evidence-missing", "PostgreSQL selection has no completed backend publication evidence");
@@ -1654,7 +1725,7 @@ export function assertBackendPublicationConfigReadAccess(
 ): Readonly<{ journalChecksumSha256: string | null }> {
   const homeDir = backendPublicationHomeForConfigPath(configPath);
   if (homeDir === undefined) return Object.freeze({ journalChecksumSha256: null });
-  const journal = readConsumerPublicationJournal(homeDir, true);
+  const journal = readConsumerPublicationJournal(homeDir);
   if (journal === null) {
     if (backend === "postgresql") {
       return fail("publication-evidence-missing", "PostgreSQL selection has no completed backend publication evidence");
@@ -1678,12 +1749,9 @@ function assertBackendPublicationConfigMutationUnlocked(
   currentContent: string | null | undefined,
   permit?: PrivateMutationPermit,
 ): void {
-  const journal = readJournal(homeDir);
+  const journal = readPublicationJournalForAccess(homeDir, permit);
   if (currentContent !== undefined) currentConfigWitness(homeDir, currentContent);
   if (journal === null) {
-    if (backendPublicationEvidenceExists(homeDir)) {
-      return fail("publication-evidence-missing", "backend publication evidence is incomplete");
-    }
     if (currentBackend !== candidateBackend && candidateBackend === "postgresql") {
       return fail("publication-evidence-missing", "PostgreSQL backend selection requires publication control");
     }
@@ -1766,11 +1834,8 @@ function assertBackendPublicationProjectMapMutationUnlocked(
   candidateContent: string | null | undefined,
   permit?: PrivateMutationPermit,
 ): void {
-  const journal = readJournal(homeDir);
-  if (journal === null) {
-    if (backendPublicationEvidenceExists(homeDir)) return fail("publication-evidence-missing", "backend publication evidence is incomplete");
-    return;
-  }
+  const journal = readPublicationJournalForAccess(homeDir, permit);
+  if (journal === null) return;
   if (journal.phase === "completed" || journal.phase === "aborted") return;
   const access = ["guarded", "map-publishing"].includes(journal.phase)
     ? "publish-project-map"
@@ -1821,7 +1886,7 @@ function assertBackendPublicationProjectMapAccessUnlocked(input: {
   }
   const journal = input.permit === undefined
     ? readConsumerPublicationJournal(input.homeDir)
-    : readJournal(input.homeDir);
+    : readPublicationJournalForAccess(input.homeDir, input.permit);
   if (journal === null) return;
   if (input.content === null) {
     assertLogicalWitness(captureBackendPublicationState(input.homeDir).projectMap, ABSENT_WITNESS, "current project map");
@@ -2138,9 +2203,28 @@ function sealMaterial(
   };
 }
 
+function assertBackendPublicationMaterialDirectory(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+): void {
+  try {
+    assertPrivateDirectory(
+      directoryHandle,
+      backendPublicationDirectory(homeDir),
+      directoryHandle.witness,
+    );
+  } catch (error) {
+    return fail(
+      "unsafe-storage",
+      `backend publication directory changed during material authentication: ${(error as Error).message}`,
+    );
+  }
+}
+
 function authenticateMaterial(
   homeDir: string | undefined,
   journal: BackendPublicationJournal,
+  directoryHandle?: BackendPublicationDirectoryHandle,
 ): { reference: BackendPublicationRecoveryReference; material: BackendPublicationRecoveryMaterial } {
   const reference = journal.recoveryReference ?? {
     relativePath: `${journal.publicationId}.material`,
@@ -2150,32 +2234,53 @@ function authenticateMaterial(
   if (reference.relativePath !== `${journal.publicationId}.material`) {
     return fail("malformed-journal", "backend publication recovery material path is not deterministic");
   }
-  const path = join(backendPublicationDirectory(homeDir), reference.relativePath);
-  const content = readBoundedRegularFileWithStat(path, {
-    allowedRoot: backendPublicationDirectory(homeDir),
-    maxBytes: MAX_MATERIAL_BYTES,
-    expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
-    allowedModes: [0o600],
-    requireSingleLink: true,
-  }).content;
-  const digest = sha256(content);
-  if (
-    (reference.sealSha256 !== "" && digest !== reference.sealSha256)
-    || (reference.byteLength !== 0 && content.length !== reference.byteLength)
-  ) {
-    return fail("checksum-mismatch", "backend publication recovery material checksum does not match");
+  const directory = backendPublicationDirectory(homeDir);
+  if (directoryHandle !== undefined) {
+    assertBackendPublicationMaterialDirectory(homeDir, directoryHandle);
   }
-  const material = parseMaterial(content, journal.publicationId);
-  assertContentState(backendPublicationMaterialWitness(material), journal.sourceState, "material source");
-  assertContentState(materialTargetWitness(material), journal.targetState, "material target");
-  return {
-    reference: {
-      relativePath: reference.relativePath,
-      sealSha256: digest,
-      byteLength: content.length,
-    },
-    material,
-  };
+  try {
+    const path = join(directory, reference.relativePath);
+    const observed = readBoundedRegularFileWithStat(path, {
+      allowedRoot: directory,
+      maxBytes: MAX_MATERIAL_BYTES,
+      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      allowedModes: [0o600],
+      requireSingleLink: true,
+    });
+    if (directoryHandle !== undefined) {
+      const observedParent = `${observed.parentDev}:${observed.parentIno}`;
+      const expectedParent = `${directoryHandle.witness.dev}:${directoryHandle.witness.ino}`;
+      if (observedParent !== expectedParent) {
+        return fail(
+          "unsafe-storage",
+          "backend publication recovery material parent does not match the authenticated directory",
+        );
+      }
+    }
+    const content = observed.content;
+    const digest = sha256(content);
+    if (
+      (reference.sealSha256 !== "" && digest !== reference.sealSha256)
+      || (reference.byteLength !== 0 && content.length !== reference.byteLength)
+    ) {
+      return fail("checksum-mismatch", "backend publication recovery material checksum does not match");
+    }
+    const material = parseMaterial(content, journal.publicationId);
+    assertContentState(backendPublicationMaterialWitness(material), journal.sourceState, "material source");
+    assertContentState(materialTargetWitness(material), journal.targetState, "material target");
+    return {
+      reference: {
+        relativePath: reference.relativePath,
+        sealSha256: digest,
+        byteLength: content.length,
+      },
+      material,
+    };
+  } finally {
+    if (directoryHandle !== undefined) {
+      assertBackendPublicationMaterialDirectory(homeDir, directoryHandle);
+    }
+  }
 }
 
 function prospectiveJournal(

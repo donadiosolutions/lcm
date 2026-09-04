@@ -186,7 +186,7 @@ describe("daemon server", () => {
     const defaultConfigPath = join(defaultLcmDir, "config.json");
     const alternateConfigPath = join(alternateLcmDir, "config.json");
     mkdirSync(defaultLcmDir, { recursive: true, mode: 0o700 });
-    mkdirSync(join(alternateLcmDir, "backend-publication"), { recursive: true, mode: 0o700 });
+    mkdirSync(alternateLcmDir, { recursive: true, mode: 0o700 });
     writeFileSync(defaultConfigPath, "{}\n", { mode: 0o600 });
     writeFileSync(alternateConfigPath, "{}\n", { mode: 0o600 });
     const caPath = join(tempHome!, "alternate-postgres-ca.pem");

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
@@ -154,6 +154,60 @@ async function withPatchedFsAsync<T>(
     nodeFs[name] = original;
     syncBuiltinESMExports();
   }
+}
+
+async function withTemporaryReboundPublicationMaterial(
+  home: string,
+  callback: () => unknown | Promise<unknown>,
+): Promise<Readonly<{ injected: boolean; restored: boolean; error: unknown }>> {
+  const publicationDirectory = backendPublicationDirectory(home);
+  const originalDirectory = `${publicationDirectory}.original`;
+  const materialPath = join(publicationDirectory, "publication-1.material");
+  const materialContent = readFileSync(materialPath);
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+  const originalClose = nodeFs.closeSync as (fd: number) => void;
+  let materialFd: number | undefined;
+  let injected = false;
+  let restored = false;
+  let error: unknown;
+  const restore = (): void => {
+    if (!injected || restored) return;
+    rmSync(publicationDirectory, { recursive: true, force: true });
+    renameSync(originalDirectory, publicationDirectory);
+    restored = true;
+  };
+
+  try {
+    nodeFs.openSync = ((path: string, ...args: unknown[]) => {
+      if (path !== materialPath || injected) return originalOpen(path, ...args);
+      injected = true;
+      renameSync(publicationDirectory, originalDirectory);
+      mkdirSync(publicationDirectory, { mode: 0o700 });
+      writeFileSync(materialPath, materialContent, { mode: 0o600 });
+      materialFd = originalOpen(path, ...args);
+      return materialFd;
+    }) as never;
+    nodeFs.closeSync = ((fd: number) => {
+      originalClose(fd);
+      if (fd === materialFd) {
+        materialFd = undefined;
+        restore();
+      }
+    }) as never;
+    syncBuiltinESMExports();
+    try {
+      await callback();
+    } catch (caught) {
+      error = caught;
+    }
+  } finally {
+    nodeFs.openSync = originalOpen;
+    nodeFs.closeSync = originalClose;
+    syncBuiltinESMExports();
+    restore();
+  }
+  return { injected, restored, error };
 }
 
 function inputFor(materialInput: BackendPublicationRecoveryMaterial) {
@@ -2335,6 +2389,214 @@ describe("BackendPublicationCoordinator", () => {
       "sqlite",
       configReadWitness(configPath),
     )).toThrowError(expect.objectContaining({ reason: "publication-evidence-missing" }));
+  });
+
+  it("rejects SQLite admission when publication directory authentication is interrupted", async () => {
+    const home = makeHome();
+    const configPath = join(home, ".lcm", "config.json");
+    const publicationDirectory = backendPublicationDirectory(home);
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    mkdirSync(publicationDirectory, { mode: 0o700 });
+    const witness = configReadWitness(configPath);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalRealpath = nodeFs.realpathSync as (...args: unknown[]) => unknown;
+    let injected = false;
+    let admissionError: unknown;
+
+    await withPatchedFsAsync("realpathSync", ((path: string, ...args: unknown[]) => {
+      if (path === publicationDirectory && !injected) {
+        injected = true;
+        rmSync(publicationDirectory, { recursive: true });
+      }
+      return originalRealpath(path, ...args);
+    }) as never, async () => {
+      try {
+        assertBackendPublicationConfigReadAccess(configPath, "sqlite", witness);
+      } catch (error) {
+        admissionError = error;
+      }
+    });
+
+    expect(injected).toBe(true);
+    expect(admissionError).toBeInstanceOf(BackendPublicationJournalError);
+    expect(admissionError).toMatchObject({ reason: "unsafe-storage" });
+  });
+
+  it.each(["removed", "rebound"] as const)(
+    "retains the authenticated publication directory when it is %s between journal read and evidence enumeration",
+    (replacement) => {
+      const home = makeHome();
+      const configPath = join(home, ".lcm", "config.json");
+      const publicationDirectory = backendPublicationDirectory(home);
+      writeFileSync(configPath, "{}", { mode: 0o600 });
+      mkdirSync(publicationDirectory, { mode: 0o700 });
+      const witness = configReadWitness(configPath);
+      const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+      const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+      const originalReaddir = nodeFs.readdirSync as (...args: unknown[]) => unknown;
+      let publicationDirectoryOpens = 0;
+      let injected = false;
+      const replacePublicationDirectory = (): void => {
+        if (injected) return;
+        injected = true;
+        rmSync(publicationDirectory, { recursive: true });
+        if (replacement === "rebound") mkdirSync(publicationDirectory, { mode: 0o700 });
+      };
+
+      try {
+        // The current implementation reopens before enumeration; a corrected
+        // implementation may enumerate through the retained handle instead.
+        // Inject at whichever of those stable boundaries it reaches first.
+        nodeFs.openSync = ((path: string, ...args: unknown[]) => {
+          if (path === publicationDirectory) {
+            publicationDirectoryOpens += 1;
+            if (publicationDirectoryOpens > 1) replacePublicationDirectory();
+          }
+          return originalOpen(path, ...args);
+        }) as never;
+        nodeFs.readdirSync = ((...args: unknown[]) => {
+          replacePublicationDirectory();
+          return originalReaddir(...args);
+        }) as never;
+        syncBuiltinESMExports();
+
+        expect(() => assertBackendPublicationConfigReadAccess(
+          configPath,
+          "sqlite",
+          witness,
+        )).toThrowError(expect.objectContaining({
+          name: "BackendPublicationJournalError",
+          reason: "unsafe-storage",
+        }));
+        expect(injected).toBe(true);
+      } finally {
+        nodeFs.openSync = originalOpen;
+        nodeFs.readdirSync = originalReaddir;
+        syncBuiltinESMExports();
+      }
+    },
+  );
+
+  it("binds a present journal to the retained publication directory identity", async () => {
+    const { home } = await preparedFixture();
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; ino: bigint; [key: string]: unknown };
+    let publicationDirectoryStats = 0;
+
+    await withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+      const observed = originalStat(path, options);
+      if (path === publicationDirectory && options?.bigint === true) {
+        publicationDirectoryStats += 1;
+        if (publicationDirectoryStats === 3) return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      expect(() => readBackendPublicationJournal(home)).toThrowError(expect.objectContaining({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+      }));
+    });
+  });
+
+  it("normalizes retained directory revalidation failures after a journal read", async () => {
+    const { home } = await preparedFixture();
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; ino: bigint; [key: string]: unknown };
+    let publicationDirectoryStats = 0;
+
+    await withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+      const observed = originalStat(path, options);
+      if (path === publicationDirectory && options?.bigint === true) {
+        publicationDirectoryStats += 1;
+        if (publicationDirectoryStats === 4) return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      expect(() => readBackendPublicationJournal(home)).toThrowError(expect.objectContaining({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: expect.stringContaining("backend publication directory changed during journal read"),
+      }));
+    });
+  });
+
+  it("binds terminal material to the journal directory for lock-free config reads", async () => {
+    const { home, fake } = await preparedFixture();
+    await coordinator(home, fake.driver).resume();
+    const configPath = join(home, ".lcm", "config.json");
+    const witness = configReadWitness(configPath);
+    let admitted = false;
+
+    const observed = await withTemporaryReboundPublicationMaterial(home, () => {
+      assertBackendPublicationConfigReadAccess(configPath, "postgresql", witness);
+      admitted = true;
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(observed.restored).toBe(true);
+    expect(admitted).toBe(false);
+    expect(observed.error).toBeInstanceOf(BackendPublicationJournalError);
+    expect(observed.error).toMatchObject({ reason: "unsafe-storage" });
+  });
+
+  it("binds terminal material to the journal directory for locked consumers", async () => {
+    const { home, fake } = await preparedFixture();
+    await coordinator(home, fake.driver).resume();
+    let callbackRan = false;
+
+    const observed = await withTemporaryReboundPublicationMaterial(home, () => {
+      withBackendPublicationConsumerLock(home, () => {
+        callbackRan = true;
+      });
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(observed.restored).toBe(true);
+    expect(callbackRan).toBe(false);
+    expect(observed.error).toBeInstanceOf(BackendPublicationJournalError);
+    expect(observed.error).toMatchObject({ reason: "unsafe-storage" });
+  });
+
+  it("normalizes retained directory drift during terminal material authentication", async () => {
+    const { home, fake } = await preparedFixture();
+    await coordinator(home, fake.driver).resume();
+    const configPath = join(home, ".lcm", "config.json");
+    const witness = configReadWitness(configPath);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; ino: bigint; [key: string]: unknown };
+    let publicationDirectoryStats = 0;
+
+    await withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+      const observed = originalStat(path, options);
+      if (path === publicationDirectory && options?.bigint === true) {
+        publicationDirectoryStats += 1;
+        if (publicationDirectoryStats === 5) return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      expect(() => assertBackendPublicationConfigReadAccess(
+        configPath,
+        "postgresql",
+        witness,
+      )).toThrowError(expect.objectContaining({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: expect.stringContaining("changed during material authentication"),
+      }));
+    });
+    expect(publicationDirectoryStats).toBeGreaterThanOrEqual(5);
   });
 
   it("validates lock-free reads against terminal evidence and the exact config witness", async () => {

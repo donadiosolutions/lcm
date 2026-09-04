@@ -98,24 +98,24 @@ function currentUid(): number | undefined {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
 }
 
-/**
- * Open and retain a private directory without following a symlink at the
- * final component.  The descriptor is checked before the pathname is used
- * again, and the pathname is required to still identify that same inode.
- */
-export function openPrivateDirectory(
+type PrivateDirectoryOpenOptions = Readonly<{
+  expectedUid?: number;
+}>;
+
+const PRIVATE_DIRECTORY_OPEN_FLAGS = constants.O_RDONLY
+  | constants.O_DIRECTORY
+  | constants.O_NOFOLLOW
+  | constants.O_NONBLOCK;
+
+function openPrivateDirectoryDescriptor(path: string): number {
+  return openSync(path, PRIVATE_DIRECTORY_OPEN_FLAGS);
+}
+
+function authenticateOpenPrivateDirectory(
   path: string,
-  options: {
-    readonly expectedUid?: number;
-  } = {},
+  fd: number,
+  options: PrivateDirectoryOpenOptions,
 ): PrivateDirectoryHandle {
-  const fd = openSync(
-    path,
-    constants.O_RDONLY
-      | constants.O_DIRECTORY
-      | constants.O_NOFOLLOW
-      | constants.O_NONBLOCK,
-  );
   let closed = false;
   try {
     const stat = directoryStat(fd);
@@ -141,6 +141,36 @@ export function openPrivateDirectory(
     closeSync(fd);
     throw error;
   }
+}
+
+/**
+ * Open and retain a private directory without following a symlink at the
+ * final component.  The descriptor is checked before the pathname is used
+ * again, and the pathname is required to still identify that same inode.
+ */
+export function openPrivateDirectory(
+  path: string,
+  options: PrivateDirectoryOpenOptions = {},
+): PrivateDirectoryHandle {
+  return authenticateOpenPrivateDirectory(path, openPrivateDirectoryDescriptor(path), options);
+}
+
+/**
+ * Open an optional private directory while distinguishing initial absence
+ * from interruption after its descriptor has been acquired.
+ */
+export function openPrivateDirectoryIfExists(
+  path: string,
+  options: PrivateDirectoryOpenOptions = {},
+): PrivateDirectoryHandle | undefined {
+  let fd: number;
+  try {
+    fd = openPrivateDirectoryDescriptor(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  return authenticateOpenPrivateDirectory(path, fd, options);
 }
 
 /** Revalidate a retained private directory descriptor and its pathname. */
