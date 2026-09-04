@@ -34,6 +34,8 @@ const mocks = vi.hoisted(() => ({
   projectExists: vi.fn(async () => true),
   createFactory: vi.fn(),
   dedupObserver: vi.fn(),
+  ensureProjectDir: vi.fn(() => "/private/project"),
+  scrubForProject: vi.fn(async () => ({ scrub: (text: string) => mocks.scrub(text) })),
 }));
 
 vi.mock("node:fs", async (importOriginal) => ({
@@ -46,6 +48,7 @@ vi.mock("node:fs", async (importOriginal) => ({
 vi.mock("../../../src/daemon/project.js", () => ({
   projectPaths: (cwd: string) => ({ id: "pid", dbPath: `${cwd}/lcm.db`, metaPath: `${cwd}/meta.json`, canonical: cwd }),
   projectIdentity: (cwd: string) => ({ id: "pid", canonical: cwd }),
+  ensureProjectDirForIdentity: mocks.ensureProjectDir,
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/db/connection.js", () => ({ getLcmConnection: mocks.getConnection, closeLcmConnection: mocks.closeConnection }));
@@ -57,7 +60,7 @@ vi.mock("../../../src/promotion/detector.js", () => ({ shouldPromote: mocks.shou
 vi.mock("../../../src/promotion/dedup.js", () => ({ deduplicateAndInsert: mocks.dedup }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
 vi.mock("../../../src/scrub.js", () => ({
-  ScrubEngine: { forProject: async () => ({ scrub: mocks.scrub }) },
+  ScrubEngine: { forProject: mocks.scrubForProject },
 }));
 vi.mock("../../../src/storage/index.js", () => ({ createStorageBackendFactory: mocks.createFactory }));
 
@@ -79,6 +82,8 @@ describe("promote persistence boundaries", () => {
     mocks.shouldPromote.mockReturnValue({ promote: false, tags: [], confidence: 0 });
     mocks.dedup.mockResolvedValue(undefined);
     mocks.dedupObserver.mockReset();
+    mocks.ensureProjectDir.mockReturnValue("/private/project");
+    mocks.scrubForProject.mockResolvedValue({ scrub: (text: string) => mocks.scrub(text) });
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
     mocks.createFactory.mockImplementation(async () => makeMockStorageFactory({
@@ -94,6 +99,37 @@ describe("promote persistence boundaries", () => {
       transaction: mocks.transaction,
       close: mocks.projectClose,
     });
+  });
+
+  it("authenticates the sidecar directory before scrubber setup", async () => {
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
+
+    expect(mocks.ensureProjectDir).toHaveBeenCalledOnce();
+    expect(mocks.ensureProjectDir).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "pid", canonical: "/ok" }),
+      { writeMetadata: false },
+    );
+    expect(mocks.scrubForProject).toHaveBeenCalledWith(
+      config.security.sensitivePatterns,
+      "/private/project",
+    );
+    expect(mocks.ensureProjectDir.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.scrubForProject.mock.invocationCallOrder[0]!);
+    expect(mocks.mkdir).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the private sidecar directory is untrusted", async () => {
+    mocks.ensureProjectDir.mockImplementationOnce(() => {
+      throw new Error("private directory mode is not trusted");
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "private directory mode is not trusted",
+    });
+    expect(mocks.scrubForProject).not.toHaveBeenCalled();
+    expect(mocks.openProject).not.toHaveBeenCalled();
   });
 
   it("compares stored prefixes with the same scrubbed content used for insertion", async () => {

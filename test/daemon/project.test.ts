@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -112,6 +112,26 @@ describe("secure project-root handoff", () => {
     expect(existsSync(join(home, ".lcm"))).toBe(false);
   });
 
+  it("creates a private project directory without metadata when requested", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "c".repeat(64), canonical: "/project" };
+    const previousUmask = process.umask(0o022);
+    try {
+      const dir = ensureProjectDirForIdentity(identity, { writeMetadata: false });
+
+      expect(existsSync(dir)).toBe(true);
+      expect(statSync(dir).isDirectory()).toBe(true);
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+      expect(existsSync(join(dir, "meta.json"))).toBe(false);
+
+      expect(ensureProjectDirForIdentity(identity)).toBe(dir);
+      expect(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"))).toEqual({ cwd: "/project" });
+      expect(statSync(join(dir, "meta.json")).mode & 0o777).toBe(0o600);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
   it("falls back to the normalized path for malformed compatibility entries", () => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });
     writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({
@@ -148,7 +168,10 @@ describe("secure project-root handoff", () => {
     expect(localProjectDir("/project", home)).toContain(join("projects", identity.id));
   });
 
-  it("fails closed when the retained root witness changes during metadata publication", () => {
+  it.each([
+    ["metadata publication", undefined],
+    ["directory-only creation", { writeMetadata: false }],
+  ] as const)("fails closed when the retained root witness changes during %s", (_label, options) => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });
     const originalAssert = securityFiles.assertPrivateDirectory;
     let calls = 0;
@@ -158,7 +181,7 @@ describe("secure project-root handoff", () => {
       return calls === 2 ? { ...actual, ino: `${actual.ino}-changed` } : actual;
     });
     try {
-      expect(() => ensureProjectDirForIdentity({ id: "b".repeat(64), canonical: "/project" }))
+      expect(() => ensureProjectDirForIdentity({ id: "b".repeat(64), canonical: "/project" }, options))
         .toThrow("private directory witness changed");
     } finally {
       assert.mockRestore();

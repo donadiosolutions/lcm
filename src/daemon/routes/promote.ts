@@ -1,7 +1,6 @@
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
 import type { DaemonConfig } from "../config.js";
-import { projectIdentity, projectPaths } from "../project.js";
+import { ensureProjectDirForIdentity, projectIdentity, projectPaths } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { shouldPromote } from "../../promotion/detector.js";
@@ -148,11 +147,11 @@ export function createPromoteHandler(
       throwIfAborted(signal);
       const paths = projectPaths(cwd, context?.publicationLockToken);
       projectIdentity(cwd, config.storage, context?.publicationLockToken);
-      mkdirSync(dirname(paths.metaPath), { recursive: true });
+      const projectDir = ensureProjectDirForIdentity(paths, { writeMetadata: false });
       throwIfAborted(signal);
       const scrubber = await ScrubEngine.forProject(
         config.security.sensitivePatterns,
-        dirname(paths.metaPath),
+        projectDir,
       );
       throwIfAborted(signal);
 

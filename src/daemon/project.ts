@@ -272,8 +272,15 @@ export function isSafeTranscriptPath(transcriptPath: string, cwd: string): strin
   return false;
 }
 
-/** Ensures the snapshotted project dir exists and writes its canonical cwd to meta.json. */
-export const ensureProjectDirForIdentity = (identity: ProjectIdentity): string => {
+type EnsureProjectDirOptions = Readonly<{
+  writeMetadata?: boolean;
+}>;
+
+/** Ensures the snapshotted project dir exists and optionally writes its canonical cwd to meta.json. */
+export const ensureProjectDirForIdentity = (
+  identity: ProjectIdentity,
+  options: EnsureProjectDirOptions = {},
+): string => {
   const rootPath = lcmHomeDir();
   const rootHandle = openPrivateDirectory(rootPath);
   const rootWitness = rootHandle.witness;
@@ -282,6 +289,11 @@ export const ensureProjectDirForIdentity = (identity: ProjectIdentity): string =
     const dir = join(rootPath, "projects", identity.id);
     ensurePrivateDirectory(join(rootPath, "projects"));
     ensurePrivateDirectory(dir);
+    // /promote alone defers metadata to its existing dry-run-aware post-operation write.
+    if (options.writeMetadata === false) {
+      assertStablePrivateRoot(rootHandle, rootPath, rootWitness);
+      return dir;
+    }
     const metaPath = join(dir, "meta.json");
     let meta: Record<string, unknown> = { cwd: identity.canonical };
     try {

@@ -831,6 +831,11 @@ Hook error fallback logs write to `~/.lcm/logs/events.log`.
 
 LCM keeps `~/.lcm` and its project, event, and temporary directories accessible only to the current user (`0700`). Configuration, metadata, database, token, map, backup, and lock files use private file permissions (`0600`). Existing LCM roots are tightened during startup and installation.
 
+Before `/promote` reads project scrub patterns or opens project storage, it
+authenticates the private LCM root and project directory. Promotion refuses a
+directory with the wrong owner or exact mode, a symlink, or topology that
+changes during validation.
+
 Session restore locks use a SHA-256 digest of the agent session ID under `~/.lcm/tmp`; session IDs are never used as path components. LCM reads restored `AGENTS.md` and `CLAUDE.md` instructions only from regular, non-symlink files inside their expected roots, with a combined 1 MiB limit. Unsafe instruction files are skipped.
 Cached instructions are isolated by local project, machine, client, agent
 session, verified worktree, and exact working directory. A compact/resume
