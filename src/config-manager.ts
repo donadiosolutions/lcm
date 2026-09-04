@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstatSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import {
   normalizeLlmProvider,
   daemonConfigSnapshotWitnessEqual,
