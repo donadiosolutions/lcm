@@ -23,6 +23,8 @@ component_management:
         # #824 keeps connector snapshots and process-owner authentication in
         # the same configuration-security component.
         # #681 keeps durable configuration writes in this existing component.
+        # #722 distinguishes initial absence from interrupted validation in
+        # the shared authenticated-directory open seam.
         - "^src/config-manager\\.ts$"
         - "^src/config-projection\\.ts$"
         - "^src/generated-patterns\\.ts$"

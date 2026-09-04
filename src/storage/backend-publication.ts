@@ -21,6 +21,7 @@ import {
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
   isOwnerOnlyFileMode,
+  openPrivateDirectoryIfExists,
 } from "../security-files.js";
 import type { StorageBackendName } from "./contracts.js";
 import {
@@ -955,9 +956,8 @@ function openBackendPublicationDirectoryForRead(
 ): BackendPublicationDirectoryHandle | undefined {
   const directory = backendPublicationDirectory(homeDir);
   try {
-    return openPrivateDirectory(directory);
+    return openPrivateDirectoryIfExists(directory);
   } catch (error) {
-    if (isMissing(error)) return undefined;
     return fail("unsafe-storage", `backend publication directory cannot be opened: ${(error as Error).message}`);
   }
 }

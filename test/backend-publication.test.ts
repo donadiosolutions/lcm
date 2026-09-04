@@ -2337,6 +2337,37 @@ describe("BackendPublicationCoordinator", () => {
     )).toThrowError(expect.objectContaining({ reason: "publication-evidence-missing" }));
   });
 
+  it("rejects SQLite admission when publication directory authentication is interrupted", async () => {
+    const home = makeHome();
+    const configPath = join(home, ".lcm", "config.json");
+    const publicationDirectory = backendPublicationDirectory(home);
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    mkdirSync(publicationDirectory, { mode: 0o700 });
+    const witness = configReadWitness(configPath);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalRealpath = nodeFs.realpathSync as (...args: unknown[]) => unknown;
+    let injected = false;
+    let admissionError: unknown;
+
+    await withPatchedFsAsync("realpathSync", ((path: string, ...args: unknown[]) => {
+      if (path === publicationDirectory && !injected) {
+        injected = true;
+        rmSync(publicationDirectory, { recursive: true });
+      }
+      return originalRealpath(path, ...args);
+    }) as never, async () => {
+      try {
+        assertBackendPublicationConfigReadAccess(configPath, "sqlite", witness);
+      } catch (error) {
+        admissionError = error;
+      }
+    });
+
+    expect(injected).toBe(true);
+    expect(admissionError).toBeInstanceOf(BackendPublicationJournalError);
+    expect(admissionError).toMatchObject({ reason: "unsafe-storage" });
+  });
+
   it.each(["removed", "rebound"] as const)(
     "retains the authenticated publication directory when it is %s between journal read and evidence enumeration",
     (replacement) => {
