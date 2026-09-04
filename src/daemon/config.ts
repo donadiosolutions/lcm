@@ -1705,13 +1705,21 @@ function makeSnapshotWitness(
   });
 }
 
-/** Read and validate one bounded config snapshot without acquiring a mutation lock. */
-export function readDaemonConfigSnapshot(
+export type DaemonConfigRawSnapshot = Readonly<{
+  content: string;
+  witness: DaemonConfigSnapshotWitness;
+}>;
+
+/**
+ * Read one bounded, descriptor-bound config snapshot without acquiring a
+ * mutation lock and without validating it. Callers that need raw bytes for
+ * diagnostics (for example, recovering a configured port from an otherwise
+ * invalid file) parse the content themselves.
+ */
+export function readDaemonConfigRawSnapshot(
   configPath: string,
-  env: Record<string, string | undefined> = process.env,
   options: DaemonConfigSnapshotOptions = {},
-): DaemonConfigSnapshot {
-  const resolvedEnv = resolveDaemonConfigEnv(env);
+): DaemonConfigRawSnapshot {
   let initiallyPresent = false;
   try {
     lstatSync(configPath);
@@ -1744,9 +1752,20 @@ export function readDaemonConfigSnapshot(
       mtimeMs: null,
     });
   }
+  return Object.freeze({ content, witness });
+}
+
+/** Read and validate one bounded config snapshot without acquiring a mutation lock. */
+export function readDaemonConfigSnapshot(
+  configPath: string,
+  env: Record<string, string | undefined> = process.env,
+  options: DaemonConfigSnapshotOptions = {},
+): DaemonConfigSnapshot {
+  const resolvedEnv = resolveDaemonConfigEnv(env);
+  const raw = readDaemonConfigRawSnapshot(configPath, options);
   return Object.freeze({
-    config: parseDaemonConfig(content, undefined, resolvedEnv),
-    witness,
+    config: parseDaemonConfig(raw.content, undefined, resolvedEnv),
+    witness: raw.witness,
   });
 }
 

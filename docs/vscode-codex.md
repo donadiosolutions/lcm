@@ -108,6 +108,14 @@ bundle. The MCP bundle does not retain or install the CLI-only managed
 `~/.codex/AGENTS.md` entry. Explicit or stored CLI convergence may remove only
 the exact LCM-owned MCP registration.
 
+On Linux, LCM forwards the user-session bus to those nested commands only as
+the exact validated pair `XDG_RUNTIME_DIR=/run/user/<uid>` and
+`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus`. The runtime directory
+must be canonical, user-owned, and mode `0700`; the matching endpoint must be
+a canonical user-owned socket. LCM omits both values if either side is missing,
+malformed, oversized, redirected, foreign-owned, non-socket, or mismatched,
+and it does not inherit unrelated process environment variables.
+
 The hook connector installs these Codex events:
 
 | Event | Command | Behavior |

@@ -1487,7 +1487,86 @@ function removeLegacyDefault(agent: Agent, cwd: string): boolean {
   return removed;
 }
 
-function nativeCodexMcpEnvironment(cwd: string): NodeJS.ProcessEnv {
+type NativeCodexMcpPathStats = {
+  readonly uid: number;
+  readonly mode: number;
+  isDirectory(): boolean;
+  isSocket(): boolean;
+  isSymbolicLink(): boolean;
+};
+
+export interface NativeCodexMcpEnvironmentDependencies {
+  readonly environment?: Readonly<Record<string, string | undefined>>;
+  readonly getUid?: () => number | undefined;
+  readonly lstat?: (path: string) => NativeCodexMcpPathStats;
+  readonly realpath?: (path: string) => string;
+}
+
+const NATIVE_CODEX_ENV_VALUE_MAX_BYTES = 4096;
+
+function isBoundedNativeCodexEnvironmentValue(value: string | undefined): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= NATIVE_CODEX_ENV_VALUE_MAX_BYTES
+    && !/[\u0000-\u001F\u007F]/u.test(value);
+}
+
+function authenticatedNativeCodexBusEnvironment(
+  dependencies: NativeCodexMcpEnvironmentDependencies,
+): NodeJS.ProcessEnv {
+  const environment = dependencies.environment ?? process.env;
+  const getUid = dependencies.getUid
+    ?? (() => typeof process.getuid === "function" ? process.getuid() : undefined);
+  const lstat = dependencies.lstat ?? lstatSync;
+  const realpath = dependencies.realpath ?? realpathSync;
+  let uid: number | undefined;
+  try {
+    uid = getUid();
+  } catch {
+    return {};
+  }
+  if (uid === undefined || !Number.isSafeInteger(uid) || uid < 0 || uid > 0xffff_ffff) return {};
+
+  const runtimeDir = environment.XDG_RUNTIME_DIR;
+  const busAddress = environment.DBUS_SESSION_BUS_ADDRESS;
+  const expectedRuntimeDir = `/run/user/${uid}`;
+  const expectedBusPath = `${expectedRuntimeDir}/bus`;
+  if (
+    !isBoundedNativeCodexEnvironmentValue(runtimeDir)
+    || !isBoundedNativeCodexEnvironmentValue(busAddress)
+    || runtimeDir !== expectedRuntimeDir
+    || busAddress !== `unix:path=${expectedBusPath}`
+  ) return {};
+
+  try {
+    const runtimeStats = lstat(runtimeDir);
+    const busStats = lstat(expectedBusPath);
+    if (
+      runtimeStats.isSymbolicLink()
+      || !runtimeStats.isDirectory()
+      || runtimeStats.uid !== uid
+      || (runtimeStats.mode & 0o7777) !== 0o700
+      || realpath(runtimeDir) !== runtimeDir
+      || busStats.isSymbolicLink()
+      || !busStats.isSocket()
+      || busStats.uid !== uid
+      || realpath(expectedBusPath) !== expectedBusPath
+    ) return {};
+  } catch {
+    return {};
+  }
+
+  return {
+    XDG_RUNTIME_DIR: runtimeDir,
+    DBUS_SESSION_BUS_ADDRESS: busAddress,
+  };
+}
+
+export function nativeCodexMcpEnvironment(
+  cwd: string,
+  dependencies: NativeCodexMcpEnvironmentDependencies = {},
+): NodeJS.ProcessEnv {
+  const source = dependencies.environment ?? process.env;
   const environment: NodeJS.ProcessEnv = {};
   for (const name of [
     "PATH",
@@ -1503,13 +1582,14 @@ function nativeCodexMcpEnvironment(cwd: string): NodeJS.ProcessEnv {
     "LC_TIME",
     "TZ",
   ]) {
-    const value = process.env[name];
+    const value = source[name];
     if (typeof value !== "string" || value.length === 0 || value.length > 4096) continue;
     if (/[\u0000\r\n]/u.test(value)) continue;
     environment[name] = value;
   }
   if (!environment.PATH) environment.PATH = "/usr/bin:/bin";
   environment.CODEX_HOME = resolveConfigPath("~/.codex", cwd);
+  Object.assign(environment, authenticatedNativeCodexBusEnvironment(dependencies));
   return environment;
 }
 

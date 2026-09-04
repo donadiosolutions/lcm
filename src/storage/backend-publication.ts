@@ -1234,6 +1234,48 @@ export function openBackendPublicationReadRoot(
   return openOptionalRootDirectory(homeDir);
 }
 
+/**
+ * Retain the canonical LCM root across one lock-free publication read.
+ * Legacy installations without an admissible root receive a refreshable
+ * no-op assertion until a private root or publication evidence appears.
+ */
+export function withBackendPublicationReadRoot<T>(
+  homeDir: string | undefined,
+  callback: (assertReadRoot: () => void) => T,
+): T {
+  const root = rootPath(homeDir);
+  let rootHandle: ReturnType<typeof openPrivateDirectory> | undefined;
+  const assertReadRoot = (): void => {
+    try {
+      if (rootHandle === undefined) {
+        rootHandle = openBackendPublicationReadRoot(homeDir);
+        return;
+      }
+      assertPrivateDirectory(rootHandle, root);
+      // Reopen with O_NOFOLLOW so a symlink to the retained inode is not
+      // accepted merely because path-based realpath identity still matches.
+      const currentRoot = openPrivateDirectory(root);
+      try {
+        assertPrivateDirectory(rootHandle, root);
+        assertPrivateDirectory(currentRoot, root);
+      } finally {
+        currentRoot.close();
+      }
+    } catch (error) {
+      if (error instanceof BackendPublicationJournalError) throw error;
+      return fail(
+        "unsafe-storage",
+        `private LCM root changed during validation: ${(error as Error).message}`,
+      );
+    }
+  };
+  try {
+    return callback(assertReadRoot);
+  } finally {
+    rootHandle?.close();
+  }
+}
+
 function consumerLockCallback<T>(
   homeDir: string | undefined,
   callback: (token: BackendPublicationLockToken) => T,

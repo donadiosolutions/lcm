@@ -10,10 +10,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   PrivateMutationLockContentionError,
   PrivateMutationPermitRevokedError,
+  processStartTime,
+  readPrivateMutationLockOwner,
   trustedProcessBirthExecutableForTesting,
   withPrivateMutationLock,
   withPrivateMutationLocksAsync,
@@ -87,6 +89,18 @@ function strandOwnedLock(
 }
 
 describe("private mutation lock release recovery", () => {
+  it("reads only an authenticated owner record and treats absence as no owner", () => {
+    const { lockPath } = makeLock();
+    expect(readPrivateMutationLockOwner(lockPath)).toBeNull();
+    writeFileSync(lockPath, ownerContent("a".repeat(32)), { mode: 0o600 });
+    expect(readPrivateMutationLockOwner(lockPath)).toMatchObject({
+      pid: process.pid,
+      processStartTime: "0",
+    });
+    writeFileSync(lockPath, "{", { mode: 0o600 });
+    expect(() => readPrivateMutationLockOwner(lockPath)).toThrow("lock is malformed");
+  });
+
   it("recovers an owned lock when cleanup fails after a successful mutation", () => {
     const { lockPath } = makeLock();
     const releaseFailure = new Error("release observer failed");
@@ -621,6 +635,77 @@ describe("private mutation lock process-birth helpers", () => {
     }
     expect(trustedProcessBirthExecutableForTesting("linux", "/")).toBeNull();
   });
+
+  it.each([
+    ["darwin", undefined, "/bin/ps", ["-o", "lstart=", "-p", "42"], 7],
+    [
+      "win32",
+      "C:\\Windows",
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "(Get-CimInstance Win32_Process -Filter 'ProcessId = 42').CreationDate.ToUniversalTime().ToString('O')",
+      ],
+      9,
+    ],
+  ] as const)("passes the bounded %s birth-probe timeout to the trusted helper", (
+    currentPlatform,
+    systemRoot,
+    expectedCommand,
+    expectedArgs,
+    timeoutMs,
+  ) => {
+    const previousSystemRoot = process.env.SystemRoot;
+    if (systemRoot === undefined) delete process.env.SystemRoot;
+    else process.env.SystemRoot = systemRoot;
+    const execute = vi.fn(() => "birth-time\n");
+    try {
+      expect(processStartTime(42, (event, _path, mutable) => {
+        if (event === "platform" && mutable) mutable.value = currentPlatform;
+      }, { timeoutMs, _execFileSyncForTesting: execute })).toBe("birth-time");
+    } finally {
+      if (previousSystemRoot === undefined) delete process.env.SystemRoot;
+      else process.env.SystemRoot = previousSystemRoot;
+    }
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledWith(expectedCommand, expectedArgs, expect.objectContaining({
+      timeout: timeoutMs,
+    }));
+  });
+
+  it("keeps the process-birth helper bounded by the default two-second maximum", () => {
+    const execute = vi.fn(() => "birth-time");
+    const observer: Parameters<typeof processStartTime>[1] = (event, _path, mutable) => {
+      if (event === "platform" && mutable) mutable.value = "darwin";
+    };
+
+    expect(processStartTime(42, observer, {
+      timeoutMs: 20_000,
+      _execFileSyncForTesting: execute,
+    })).toBe("birth-time");
+    expect(execute).toHaveBeenLastCalledWith("/bin/ps", ["-o", "lstart=", "-p", "42"], expect.objectContaining({
+      timeout: 2_000,
+    }));
+    expect(processStartTime(42, observer, {
+      _execFileSyncForTesting: execute,
+    })).toBe("birth-time");
+    expect(execute).toHaveBeenLastCalledWith("/bin/ps", ["-o", "lstart=", "-p", "42"], expect.objectContaining({
+      timeout: 2_000,
+    }));
+  });
+
+  it.each([0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "refuses an unusable process-birth timeout %s without invoking the helper",
+    (timeoutMs) => {
+      const execute = vi.fn(() => "birth-time");
+      expect(processStartTime(42, (event, _path, mutable) => {
+        if (event === "platform" && mutable) mutable.value = "darwin";
+      }, { timeoutMs, _execFileSyncForTesting: execute })).toBeNull();
+      expect(execute).not.toHaveBeenCalled();
+    },
+  );
 
   it("never executes PATH or current-directory ps impostors", () => {
     const { lockPath } = makeLock();

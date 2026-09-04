@@ -20,6 +20,7 @@ vi.mock("../../src/daemon/config.js", async importOriginal => {
 });
 
 import { runDoctor } from "../../src/doctor/doctor.js";
+import { doctorConfigSeams } from "./config-seams.js";
 
 describe("doctor publication admission defensive coverage", () => {
   let home: string | undefined;
@@ -47,7 +48,7 @@ describe("doctor publication admission defensive coverage", () => {
       homedir: home,
       cwd: home,
       platform: "darwin",
-      _assertBackendPublication: vi.fn(),
+      ...doctorConfigSeams("{}"),
     });
 
     expect(results.find((result) => result.name === "backend-publication")).toBeUndefined();
