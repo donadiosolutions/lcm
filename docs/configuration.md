@@ -174,6 +174,16 @@ default CLI bundle with `lcm connectors install codex --transport cli`. The
 explicit MCP bundle does not retain or install the CLI-only managed
 `~/.codex/AGENTS.md` entry.
 
+On Linux, the nested native `codex mcp` commands receive the current user's
+session bus only when both values form one authenticated canonical pair:
+`XDG_RUNTIME_DIR=/run/user/<uid>` and
+`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus`. LCM verifies the
+runtime directory is canonical, owned by that user, and mode `0700`, and that
+the exact bus endpoint is a canonical user-owned socket. Missing, malformed,
+oversized, control-character-bearing, foreign-user, redirected, non-socket,
+or mismatched values are omitted together. Other process environment values
+remain outside the native-command allowlist.
+
 Connector install and removal protect filesystem-backed project and home
 targets with Linux proc-descriptor-anchored traversal. Existing parent
 directories are authenticated without following intermediate symlinks; missing
