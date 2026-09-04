@@ -1249,9 +1249,8 @@ function checkRetainedConsumerDirectories(
 
 function openOptionalPublicationDirectory(homeDir?: string): ReturnType<typeof openPrivateDirectory> | undefined {
   try {
-    return openPrivateDirectory(backendPublicationDirectory(homeDir));
+    return openPrivateDirectoryIfExists(backendPublicationDirectory(homeDir));
   } catch (error) {
-    if (isMissing(error)) return undefined;
     return fail("unsafe-storage", `backend publication directory cannot be opened: ${(error as Error).message}`);
   }
 }
@@ -1267,11 +1266,11 @@ function openOptionalRootDirectory(homeDir?: string): ReturnType<typeof openPriv
     // of the evidence and the unsafe mode must fail closed.
     if ((error as Error).message.includes("private directory mode is not trusted")) {
       try {
-        const publication = openPrivateDirectory(backendPublicationDirectory(homeDir));
+        const publication = openPrivateDirectoryIfExists(backendPublicationDirectory(homeDir));
+        if (publication === undefined) return undefined;
         publication.close();
         return fail("unsafe-storage", "backend publication root is not private");
       } catch (publicationError) {
-        if (isMissing(publicationError)) return undefined;
         return fail(
           "unsafe-storage",
           "backend publication directory cannot be opened: " + (publicationError as Error).message,

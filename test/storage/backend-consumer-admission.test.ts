@@ -1,10 +1,12 @@
 import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
   assertBackendPublicationConfigAccess,
+  backendPublicationDirectory,
   backendPublicationHomeForConfigPath,
   withBackendPublicationConfigLock,
   withBackendPublicationConsumerLock,
@@ -37,6 +39,36 @@ function expectReason(action: () => unknown, reason: BackendPublicationJournalEr
     name: "BackendPublicationJournalError",
     reason,
   }));
+}
+
+async function interruptPublicationDirectoryValidation(
+  home: string,
+  action: () => unknown | Promise<unknown>,
+): Promise<Readonly<{ injected: boolean; error: unknown }>> {
+  const publicationDirectory = backendPublicationDirectory(home);
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const originalRealpath = nodeFs.realpathSync as (...args: unknown[]) => unknown;
+  let injected = false;
+  let error: unknown;
+  try {
+    nodeFs.realpathSync = ((path: string, ...args: unknown[]) => {
+      if (path === publicationDirectory && !injected) {
+        injected = true;
+        rmSync(publicationDirectory, { recursive: true });
+      }
+      return originalRealpath(path, ...args);
+    }) as never;
+    syncBuiltinESMExports();
+    try {
+      await action();
+    } catch (caught) {
+      error = caught;
+    }
+  } finally {
+    nodeFs.realpathSync = originalRealpath;
+    syncBuiltinESMExports();
+  }
+  return { injected, error };
 }
 
 afterEach(() => {
@@ -78,6 +110,58 @@ describe("backend publication consumer admission", () => {
       assertStorageBackendPublication({ backend: "sqlite", homeDir: withoutDirectory }, lockToken);
       return "unlocked";
     })).resolves.toBe("unlocked");
+  });
+
+  it("rejects interrupted synchronous publication-directory authentication", async () => {
+    const home = makeHome(true);
+    let callbackRan = false;
+
+    const observed = await interruptPublicationDirectoryValidation(home, () => {
+      withStorageBackendConsumerLock(home, lockToken => {
+        callbackRan = true;
+        assertStorageBackendPublication({ backend: "sqlite", homeDir: home }, lockToken);
+      });
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(callbackRan).toBe(false);
+    expect(observed.error).toBeInstanceOf(BackendPublicationJournalError);
+    expect(observed.error).toMatchObject({ reason: "unsafe-storage" });
+  });
+
+  it("rejects interrupted asynchronous publication-directory authentication", async () => {
+    const home = makeHome(true);
+    let callbackRan = false;
+
+    const observed = await interruptPublicationDirectoryValidation(home, async () => {
+      await withStorageBackendConsumerLockAsync(home, async lockToken => {
+        callbackRan = true;
+        assertStorageBackendPublication({ backend: "sqlite", homeDir: home }, lockToken);
+      });
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(callbackRan).toBe(false);
+    expect(observed.error).toBeInstanceOf(BackendPublicationJournalError);
+    expect(observed.error).toMatchObject({ reason: "unsafe-storage" });
+  });
+
+  it("rejects interrupted publication authentication beneath a non-private root", async () => {
+    const home = makeHome(true);
+    chmodSync(join(home, ".lcm"), 0o755);
+    let callbackRan = false;
+
+    const observed = await interruptPublicationDirectoryValidation(home, () => {
+      withStorageBackendConsumerLock(home, lockToken => {
+        callbackRan = true;
+        assertStorageBackendPublication({ backend: "sqlite", homeDir: home }, lockToken);
+      });
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(callbackRan).toBe(false);
+    expect(observed.error).toBeInstanceOf(BackendPublicationJournalError);
+    expect(observed.error).toMatchObject({ reason: "unsafe-storage" });
   });
 
   it("reuses the exact live token for the same canonical home and revokes retained continuations", async () => {
