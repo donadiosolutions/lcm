@@ -91,6 +91,7 @@ import { LCM_MD_CONTENT } from "../src/daemon/orientation.js";
 import { ScrubEngine } from "../src/scrub.js";
 import { mergeClaudeSettings, REQUIRED_HOOKS } from "../installer/install.js";
 import type { CheckResult, DoctorDeps } from "../src/doctor/types.js";
+import { doctorConfigReadFailureSeams, doctorConfigSeams } from "./doctor/config-seams.js";
 
 function isolatedPath(name: string): string {
   const runtimeHome = process.env.HOME;
@@ -122,6 +123,10 @@ function makeDeps(options: {
   writes?: string[];
 } = {}): DoctorDeps {
   const health = [...(options.health ?? [{ ok: false }])];
+  const configReadError = options.readError?.(join(DOCTOR_HOME, ".lcm", "config.json"));
+  const configSeams = configReadError
+    ? doctorConfigReadFailureSeams(configReadError)
+    : doctorConfigSeams(options.configText ?? JSON.stringify(options.config ?? {}));
   return {
     existsSync: options.exists ?? (() => true),
     readFileSync: (path: string) => {
@@ -150,7 +155,7 @@ function makeDeps(options: {
     platform: "linux",
     cwd: DOCTOR_CWD,
     managedDaemonPath: options.managedDaemonPath,
-    _assertBackendPublication: () => undefined,
+    ...configSeams,
   };
 }
 
@@ -742,7 +747,6 @@ describe("doctor service coverage", () => {
         homedir: home,
         cwd: join(home, "project"),
         fetch: vi.fn().mockResolvedValue({ ok: false }) as typeof fetch,
-        _assertBackendPublication: () => undefined,
       });
       expect(results.find((result) => result.name === "claude-process")?.status).toBe("fail");
       expect(results.find((result) => result.name === "codex-process")?.status).toBe("fail");

@@ -11,9 +11,10 @@ import {
 
 const MAX_PRIVATE_MUTATION_LOCK_BYTES = 1024;
 const MAX_DISAPPEARED_OWNER_READ_RETRIES = 1;
+const MAX_PROCESS_BIRTH_COMMAND_MS = 2_000;
 const abandonedMutationLocks = new Map<string, string>();
 
-type PrivateMutationLockOwner = {
+export type PrivateMutationLockOwner = {
   readonly version: 1;
   readonly pid: number;
   readonly processStartTime: string | null;
@@ -30,6 +31,24 @@ export type PrivateMutationLockObserver = (
 ) => void;
 
 const NOOP_PRIVATE_MUTATION_LOCK_OBSERVER: PrivateMutationLockObserver = () => undefined;
+
+type ProcessBirthCommand = (
+  command: string,
+  args: readonly string[],
+  options: Readonly<{
+    encoding: "utf8";
+    maxBuffer: number;
+    timeout: number;
+    windowsHide: boolean;
+  }>,
+) => string;
+
+export type ProcessStartTimeOptions = Readonly<{
+  /** Maximum wall-clock duration for a non-Linux helper invocation. */
+  timeoutMs?: number;
+  /** @internal Deterministic trusted-helper seam used by tests. */
+  _execFileSyncForTesting?: ProcessBirthCommand;
+}>;
 
 /** @internal Deterministic filesystem seam used by lock recovery tests. */
 export type PrivateMutationLockOperations = {
@@ -88,6 +107,7 @@ export function trustedProcessBirthExecutableForTesting(
 export function processStartTime(
   pid: number,
   observer: PrivateMutationLockObserver = NOOP_PRIVATE_MUTATION_LOCK_OBSERVER,
+  options: ProcessStartTimeOptions = {},
 ): string | null {
   const currentPlatform = { value: platform() };
   observer("platform", "", currentPlatform);
@@ -120,13 +140,25 @@ export function processStartTime(
       `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}').CreationDate.ToUniversalTime().ToString('O')`,
     ]
     : ["-o", "lstart=", "-p", String(pid)];
+  const requestedTimeoutMs = options.timeoutMs ?? MAX_PROCESS_BIRTH_COMMAND_MS;
+  const timeoutMs = Math.min(
+    MAX_PROCESS_BIRTH_COMMAND_MS,
+    Math.floor(requestedTimeoutMs),
+  );
+  if (!Number.isFinite(requestedTimeoutMs) || timeoutMs <= 0) return null;
+  const execute: ProcessBirthCommand = options._execFileSyncForTesting
+    ?? ((executable, commandArgs, commandOptions) => execFileSync(
+      executable,
+      [...commandArgs],
+      commandOptions,
+    ));
   const observed = { value: "" };
   try {
     observer("before-process-birth-command", command);
-    observed.value = execFileSync(command, args, {
+    observed.value = execute(command, args, {
       encoding: "utf8",
       maxBuffer: 16 * 1024,
-      timeout: 2_000,
+      timeout: timeoutMs,
       windowsHide: true,
     }).trim();
   } catch {
@@ -196,6 +228,19 @@ function readLockOwner(
     content,
     owner: owner as PrivateMutationLockOwner,
   };
+}
+
+/** @internal Read one authenticated lock owner for bounded convergence callers. */
+export function readPrivateMutationLockOwner(
+  lockPath: string,
+  label = "private mutation",
+): PrivateMutationLockOwner | null {
+  try {
+    return readLockOwner(lockPath, label).owner;
+  } catch (error) {
+    if (isMissingFileError(error)) return null;
+    throw error;
+  }
 }
 
 function createReclaimClaim(

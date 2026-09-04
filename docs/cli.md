@@ -117,6 +117,45 @@ exempt according to the command-routing policy. When connector inspection is
 unavailable, `connectors doctor` reads its stored transport hint through the
 same bounded, stable, lock-free configuration admission.
 
+The configuration read used by `lcm doctor` and by connector transport
+resolution is also lock-free and authenticated: two descriptor-bound snapshots
+of `config.json` and two reads of the terminal publication journal must agree
+before the bytes are trusted. When a private canonical `.lcm` root is present,
+both readers open it without following a symlink and retain that directory
+descriptor across both snapshots and both publication admissions, rejecting a
+root replacement or unsafe publication root. A legacy SQLite installation with
+an absent root, or a non-private root without publication evidence, remains
+read-compatible without a retained descriptor; every boundary rechecks for a
+new admissible root or publication evidence and fails closed if either becomes
+unsafe. Any subsequent configuration write, including an explicit transport
+preference, still takes the normal authenticated mutation lock and remains fail
+closed if that lock is held by another operation.
+
+The remaining doctor stages that take the exclusive publication lock (the
+project-map validation and repair, the worktree reconciliation listing, and
+the daemon lifecycle admission on both the healthy and the auto-start paths)
+keep their locks. When one of them is refused because the lock is held, doctor
+retries that stage only if the lock owner is the exact managed daemon it
+already observed: the lock record's PID and process start time must match a
+live process, and a fresh token-authenticated health exchange must return the
+same PID, version, storage backend, entrypoint, and packaged runtime digest.
+A foreign, ambiguous, malformed, stale, missing, or unreadable owner, an
+identity mismatch, a failed authenticated probe, or any error other than lock
+contention propagates unchanged and doctor reports the stage as failed.
+
+The retry budget is a single two-second wall-clock window shared by every
+stage of one doctor run, polled at most every 50 milliseconds. Time spent
+inside a refused attempt, the platform process-birth probe, and the
+authenticated health probe counts against that window. On platforms that need
+an external trusted process-birth helper, its timeout is shortened to the
+remaining shared budget; doctor recomputes the budget again before reading the
+daemon token or starting the health exchange. The final wait is likewise
+shortened to whatever remains. Once the window is spent no further retries
+occur in that run. This is what prevents a healthy managed daemon's short
+background publication reconciliation immediately after `lcm install` from
+failing the next `lcm doctor` or `lcm connectors install codex`; it does not
+wait for a stuck or foreign lock holder.
+
 ## Daemon-dependent resilience
 
 `lcm doctor` limits the complete daemon health exchange to two seconds. The
