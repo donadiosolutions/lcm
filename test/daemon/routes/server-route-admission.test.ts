@@ -880,7 +880,7 @@ describe("daemon route publication admission", () => {
     process.env.USERPROFILE = tempHome;
     const lcmDir = join(tempHome, ".lcm");
     const publicationDir = join(lcmDir, "backend-publication");
-    mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
     const configPath = join(lcmDir, "config.json");
     writeFileSync(configPath, "{}\n", { mode: 0o600 });
     const unhandledRejections: unknown[] = [];
@@ -921,6 +921,7 @@ describe("daemon route publication admission", () => {
       daemon.registerRoute("POST", "/ingest", async (_req, res) => {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
+        mkdirSync(publicationDir, { mode: 0o700 });
         chmodSync(publicationDir, 0o777);
       }, "read");
 
@@ -930,10 +931,13 @@ describe("daemon route publication admission", () => {
         body: "{}",
       });
       const blockedBody = await blockedResponse.json();
-      expect(blockedResponse.status).toBe(500);
-      expect(blockedBody).toMatchObject({ error: expect.any(String) });
+      expect(blockedResponse.status).toBe(503);
+      expect(blockedBody).toEqual({
+        status: "blocked",
+        error: "backend publication admission blocked",
+      });
       expect(JSON.stringify(blockedBody)).not.toContain("ok");
-      chmodSync(publicationDir, 0o700);
+      rmSync(publicationDir, { recursive: true, force: true });
       await expect(withBackendPublicationConsumerLockAsync(tempHome, async () => undefined))
         .resolves.toBeUndefined();
       await new Promise<void>((resolve) => setImmediate(resolve));

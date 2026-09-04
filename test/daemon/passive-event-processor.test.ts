@@ -39,7 +39,7 @@ function makeConfig() {
 function publicationFixture(): { home: string; configPath: string } {
   const home = mkdtempSync(join(tmpdir(), "lcm-passive-publication-"));
   const lcmDir = join(home, ".lcm");
-  mkdirSync(join(lcmDir, "backend-publication"), { recursive: true, mode: 0o700 });
+  mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
   const configPath = join(lcmDir, "config.json");
   writeFileSync(configPath, "{}\n", { mode: 0o600 });
   return { home, configPath };

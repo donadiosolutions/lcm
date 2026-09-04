@@ -212,7 +212,6 @@ describe("periodic transcript scan boundaries", () => {
       message: { role: "user", content: "blocked publication admission" },
     })}\n`);
     const publicationDir = join(home, ".lcm", "backend-publication");
-    mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
     const journalPath = join(publicationDir, "journal.json");
     let publicationAvailableDuringPreparation = false;
     const prepareScrubber = vi.spyOn(ScrubEngine, "forProject").mockImplementation(async () => {
@@ -222,6 +221,7 @@ describe("periodic transcript scan boundaries", () => {
       } catch {
         // The pre-remediation outer admission wrapper keeps this lock held.
       }
+      mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
       writeFileSync(journalPath, "{", { mode: 0o600 });
       return { scrubWithCounts: vi.fn() } as never;
     });

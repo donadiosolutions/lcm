@@ -98,7 +98,12 @@ root:
 
 The exact path is derived from the configured home for isolated installations;
 the default is under `~/.lcm`. Files are bounded, private, checksum-protected,
-and opened through descriptor- and ownership-aware filesystem seams.
+and opened through descriptor- and ownership-aware filesystem seams. Consumer
+admission retains one authenticated device/inode witness for the publication
+directory across the journal read and any evidence enumeration. A present
+journal is accepted only when its exact parent device/inode matches that
+retained directory witness. Removing the directory or rebinding its pathname
+to another inode during admission is unsafe storage, not absent evidence.
 
 The implementation persists exactly these 16 phase literals:
 
@@ -206,7 +211,13 @@ repaired.
 Consumers accept only an authenticated terminal journal with matching
 configuration, project-map, target-backend, recovery-material, and remote-fence
 witnesses. Missing evidence, unknown residue, checksum drift, active remote
-fences in a terminal record, and backend mismatch all remain blocked.
+fences in a terminal record, and backend mismatch all remain blocked. An
+existing private publication directory is evidence even when it is empty; an
+empty directory or one with recognized residue but no journal is incomplete
+evidence. Legacy SQLite compatibility applies only when the directory is
+confirmed absent at both the initial journal probe and the admission decision
+boundary. Preserve an empty or incomplete directory for diagnosis instead of
+deleting it to regain SQLite compatibility.
 
 ## Hard limits and rejection behavior
 

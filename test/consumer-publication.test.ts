@@ -1172,6 +1172,44 @@ describe("local backend-publication consumer seam", () => {
     )).resolves.toBe("missing-root-async");
   });
 
+  it("rejects every SQLite compatibility surface when an empty publication directory exists", () => {
+    const values = fixture();
+    mkdirSync(backendPublicationDirectory(values.home), { mode: 0o700 });
+    const configPath = join(values.home, ".lcm", "config.json");
+    const expectedError = expect.objectContaining({
+      name: "BackendPublicationJournalError",
+      reason: "publication-evidence-missing",
+    });
+
+    expect(() => assertBackendPublicationConsumerAccess({
+      homeDir: values.home,
+      backend: "sqlite",
+    })).toThrowError(expectedError);
+    expect(() => assertBackendPublicationConfigAccess(
+      configPath,
+      "sqlite",
+      values.sourceConfig,
+    )).toThrowError(expectedError);
+    expect(() => assertBackendPublicationConfigMutation(
+      configPath,
+      "sqlite",
+      "sqlite",
+      values.sourceConfig,
+      values.sourceConfig,
+    )).toThrowError(expectedError);
+    expect(() => assertBackendPublicationProjectMapMutation(
+      {},
+      values.home,
+      values.sourceMap,
+    )).toThrowError(expectedError);
+    expect(() => assertBackendPublicationProjectMapAccess({
+      homeDir: values.home,
+      content: values.sourceMap,
+      map: {},
+      present: true,
+    })).toThrowError(expectedError);
+  });
+
   it("fails closed for publication residue without a journal and for mismatched map witnesses", async () => {
     const values = fixture();
     const publicationDir = backendPublicationDirectory(values.home);
@@ -1356,22 +1394,7 @@ describe("local backend-publication consumer seam", () => {
     )).not.toThrow();
   });
 
-  it("distinguishes empty, orphaned, and unsafe publication directories", () => {
-    const empty = fixture();
-    mkdirSync(backendPublicationDirectory(empty.home), { mode: 0o700 });
-    expect(() => assertBackendPublicationConfigMutation(
-      join(empty.home, ".lcm", "config.json"),
-      "sqlite",
-      "sqlite",
-      empty.sourceConfig,
-      empty.sourceConfig,
-    )).not.toThrow();
-    expect(() => assertBackendPublicationProjectMapMutation(
-      {},
-      empty.home,
-      empty.sourceMap,
-    )).not.toThrow();
-
+  it("distinguishes orphaned and unsafe publication directories", () => {
     const orphaned = fixture();
     mkdirSync(backendPublicationDirectory(orphaned.home), { mode: 0o700 });
     writeFileSync(join(backendPublicationDirectory(orphaned.home), "orphan.material"), "orphan", { mode: 0o600 });
@@ -1464,7 +1487,7 @@ describe("local backend-publication consumer seam", () => {
           nodeFs.openSync = ((path: string, ...args: unknown[]) => {
             if (path === directory) {
               directoryOpens += 1;
-              if (directoryOpens === 2) throw openError;
+              if (directoryOpens === 1) throw openError;
             }
             return (originalOpen as (...input: unknown[]) => unknown)(path, ...args);
           });
@@ -1480,7 +1503,7 @@ describe("local backend-publication consumer seam", () => {
           nodeFs.openSync = originalOpen;
           syncBuiltinESMExports();
         }
-      })).not.toThrow();
+      }, { allowUnresolved: true })).not.toThrow();
     } finally {
       nodeFs.openSync = originalOpen;
       syncBuiltinESMExports();

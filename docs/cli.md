@@ -90,9 +90,10 @@ witness and terminal publication-journal checksum before releasing up to 10 MiB
 of buffered output. If publication begins, completes, aborts, or changes
 evidence during the handler, the buffered result is discarded and the request
 returns a blocked response instead of leaking a stale or mixed-backend result.
-An existing publication directory without a journal is incomplete evidence,
-not the legacy SQLite no-evidence case. This response buffering applies to
-read routes; `lcm store` remains a mutation.
+An existing publication directory without a journal, including an empty
+directory, is incomplete evidence, not the legacy SQLite no-evidence case.
+Removal or inode rebinding during admission is unsafe storage. This response
+buffering applies to read routes; `lcm store` remains a mutation.
 
 `lcm store <text>` first completes legacy-home bootstrap admission through the
 same locked migration gate, then reuses the authenticated healthy daemon client
@@ -120,14 +121,17 @@ same bounded, stable, lock-free configuration admission.
 The configuration read used by `lcm doctor` and by connector transport
 resolution is also lock-free and authenticated: two descriptor-bound snapshots
 of `config.json` and two reads of the terminal publication journal must agree
-before the bytes are trusted. When a private canonical `.lcm` root is present,
-both readers open it without following a symlink and retain that directory
-descriptor across both snapshots and both publication admissions, rejecting a
-root replacement or unsafe publication root. A legacy SQLite installation with
-an absent root, or a non-private root without publication evidence, remains
-read-compatible without a retained descriptor; every boundary rechecks for a
-new admissible root or publication evidence and fails closed if either becomes
-unsafe. Any subsequent configuration write, including an explicit transport
+before the bytes are trusted. Each journal admission retains the authenticated
+publication-directory identity through journal reading and evidence
+enumeration, and rejects removal or rebinding. When a private canonical `.lcm`
+root is present, both readers open it without following a symlink and retain
+that directory descriptor across both snapshots and both publication
+admissions, rejecting a root replacement or unsafe publication root. A legacy
+SQLite installation with an absent root, or a non-private root without
+publication evidence, remains read-compatible without a retained descriptor;
+every boundary rechecks for a new admissible root or publication evidence and
+fails closed if either becomes unsafe. Any subsequent configuration write,
+including an explicit transport
 preference, still takes the normal authenticated mutation lock and remains fail
 closed if that lock is held by another operation.
 
