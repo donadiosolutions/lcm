@@ -109,7 +109,8 @@ component_management:
       paths:
         # Keep the #691 journal witness and incomplete-evidence admission seam, plus the #700 optional abort-signal project-open contract, here.
         # #681 retains backend-publication durable-write ownership here.
-        # #722 retains one authenticated backend-publication directory identity across journal and evidence reads.
+        # #722 retains one authenticated backend-publication directory identity
+        # across journal, evidence, and terminal recovery-material reads.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
         - "^src/storage/capabilities\\.ts$"

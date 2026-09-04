@@ -100,10 +100,11 @@ The exact path is derived from the configured home for isolated installations;
 the default is under `~/.lcm`. Files are bounded, private, checksum-protected,
 and opened through descriptor- and ownership-aware filesystem seams. Consumer
 admission retains one authenticated device/inode witness for the publication
-directory across the journal read and any evidence enumeration. A present
-journal is accepted only when its exact parent device/inode matches that
-retained directory witness. Removing the directory or rebinding its pathname
-to another inode during admission is unsafe storage, not absent evidence.
+directory across the journal read, any evidence enumeration, and terminal
+recovery-material authentication. A present journal and its recovery material
+are accepted only when each exact parent device/inode matches that retained
+directory witness. Removing the directory or rebinding its pathname to another
+inode during admission is unsafe storage, not absent evidence.
 
 The implementation persists exactly these 16 phase literals:
 
