@@ -4,6 +4,9 @@ import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
+import type { DoctorDeps } from "../../src/doctor/types.js";
+import { doctorConfigReadFailureSeams, doctorConfigSeams } from "./config-seams.js";
+import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-publication-journal.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { renderGuidance } from "../../src/connectors/template-service.js";
 import { mergeClaudeSettings, REQUIRED_HOOKS } from "../../installer/install.js";
@@ -19,8 +22,10 @@ import {
   normalizeProjectPath,
 } from "../../src/project-map.js";
 import * as projectMapModule from "../../src/project-map.js";
+import * as worktreeReconciliationModule from "../../src/worktree-reconciliation.js";
 import {
   BackendPublicationJournalError,
+  assertBackendPublicationConfigReadAccess,
   backendPublicationCanonicalSha256,
   withBackendPublicationConfigLockAsync,
 } from "../../src/storage/backend-publication.js";
@@ -74,8 +79,21 @@ function buildCleanSettingsJson(): string {
   return JSON.stringify({ mcpServers: { "lcm": {} } });
 }
 
-function minimalDeps(overrides: Partial<Parameters<typeof runDoctor>[0]> = {}) {
-  return {
+type DoctorOverrides = Partial<DoctorDeps> & {
+  /** Legacy publication seam adapter kept for the remaining deterministic refusal tests. */
+  _assertBackendPublication?: (homeDir: string, backend: "sqlite" | "postgresql") => void;
+};
+
+/**
+ * Build doctor dependencies. Configuration bytes come from the injected
+ * readFileSync/existsSync pair through the internal snapshot seam so the
+ * single production admission path is exercised. Pass
+ * `_readDaemonConfigRawSnapshot: undefined` explicitly to use the real
+ * filesystem snapshot reader against `homedir`.
+ */
+function minimalDeps(overrides: DoctorOverrides = {}): DoctorDeps {
+  const { _assertBackendPublication, ...rest } = overrides;
+  const base = {
     existsSync: () => true,
     readFileSync: (path: string) => {
       if (path.endsWith("config.json")) return "{}";
@@ -98,9 +116,24 @@ function minimalDeps(overrides: Partial<Parameters<typeof runDoctor>[0]> = {}) {
     }),
     homedir: defaultDoctorHome,
     platform: "darwin",
-    _assertBackendPublication: () => undefined,
-    ...overrides,
+    ...rest,
   };
+  if (Object.hasOwn(rest, "_readDaemonConfigRawSnapshot")) return base;
+  const path = join(base.homedir, ".lcm", "config.json");
+  const assertReadAccess: DoctorDeps["_assertPublicationReadAccess"] = _assertBackendPublication === undefined
+    ? () => Object.freeze({ journalChecksumSha256: null })
+    : (_configPath, backend) => {
+      _assertBackendPublication(base.homedir, backend);
+      return Object.freeze({ journalChecksumSha256: null });
+    };
+  if (!base.existsSync(path)) return { ...base, ...doctorConfigSeams(null, assertReadAccess) };
+  let content: string;
+  try {
+    content = base.readFileSync(path, "utf-8");
+  } catch (error) {
+    return { ...base, ...doctorConfigReadFailureSeams(error) };
+  }
+  return { ...base, ...doctorConfigSeams(content, assertReadAccess) };
 }
 
 function writeLivePublicationOwner(home: string): void {
@@ -158,14 +191,18 @@ function publicationFileWitness(content: string | null): Record<string, unknown>
   };
 }
 
-function writeCompletedPublicationJournal(home: string, targetConfig: string | null): void {
+function writeCompletedPublicationJournal(
+  home: string,
+  targetConfig: string | null,
+  publicationId = "doctor-sentinel-test",
+): void {
   const publicationDir = join(home, ".lcm", "backend-publication");
   mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
   const sourceConfig = "{}";
   const absentProjectMap = publicationFileWitness(null);
   const payload = {
     version: 2,
-    publicationId: "doctor-sentinel-test",
+    publicationId,
     sourceBackend: "postgresql",
     targetBackend: "sqlite",
     phase: "completed",
@@ -337,7 +374,7 @@ describe("runDoctor project map checks", () => {
     writeFileSync(join(home, ".lcm", "config.json"), "{}\n", { mode: 0o600 });
     try {
       await withBackendPublicationConfigLockAsync(join(home, ".lcm", "config.json"), async () => {
-        const results = await runDoctor(minimalDeps({ homedir: home, _assertBackendPublication: undefined }));
+        const results = await runDoctor(minimalDeps({ homedir: home, _readDaemonConfigRawSnapshot: undefined }));
         expect(results.find((result) => result.name === "config")).toMatchObject({ status: "pass" });
       });
     } finally {
@@ -345,159 +382,524 @@ describe("runDoctor project map checks", () => {
     }
   });
 
-  it("converges lifecycle admission only after authenticated daemon contention releases", async () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-lifecycle-contention-"));
+  function contentionHome(prefix: string): { home: string; configPath: string } {
+    const home = mkdtempSync(join(tmpdir(), prefix));
     const configPath = join(home, ".lcm", "config.json");
     mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
     writeFileSync(configPath, "{}\n", { mode: 0o600 });
-    let signalLifecycleAttempt!: () => void;
-    const lifecycleAttempted = new Promise<void>(resolve => { signalLifecycleAttempt = resolve; });
-    const contention = new PrivateMutationLockContentionError("publication lock is busy");
-    vi.mocked(ensureDaemon)
-      .mockImplementationOnce(async () => {
-        signalLifecycleAttempt();
-        throw contention;
-      })
-      .mockResolvedValueOnce({ connected: false });
+    return { home, configPath };
+  }
+
+  function authenticatedHealth(overrides: Record<string, unknown> = {}) {
+    return {
+      ok: true,
+      json: async () => ({
+        status: "ok",
+        version: "0.5.0",
+        storageBackend: "sqlite",
+        pid: process.pid,
+        entrypoint: TEST_RUNTIME_ENTRYPOINT,
+        ...overrides,
+      }),
+    };
+  }
+
+  function passingProjectMapValidation(home: string) {
+    return { ok: true, path: join(home, ".lcm", "map.json"), map: {}, errors: [], warnings: [], fixApplied: false };
+  }
+
+  /**
+   * Build convergence-focused deps. The live owner record written by
+   * `writeLivePublicationOwner` makes every real lock-taking stage contend, so
+   * stages a test does not exercise are quiesced through spies to keep the
+   * shared budget for the stage under test.
+   */
+  function convergenceDeps(
+    home: string,
+    overrides: DoctorOverrides = {},
+    quiesce: { projectMap?: boolean; worktrees?: boolean } = {},
+  ): {
+    deps: DoctorDeps;
+    sleeps: number[];
+    fetch: ReturnType<typeof vi.fn>;
+    clock: { now: number };
+    restore: () => void;
+  } {
+    const sleeps: number[] = [];
+    const clock = { now: 0 };
+    const spies: Array<{ mockRestore: () => void }> = [];
+    if (quiesce.projectMap !== false) {
+      spies.push(vi.spyOn(projectMapModule, "validateProjectMap")
+        .mockImplementation(() => passingProjectMapValidation(home)));
+    }
+    if (quiesce.worktrees !== false) {
+      spies.push(vi.spyOn(worktreeReconciliationModule, "listWorktreeReconciliationJournals")
+        .mockImplementation(() => []));
+    }
+    const fetch = overrides.fetch === undefined
+      ? vi.fn().mockImplementation(async () => authenticatedHealth())
+      : vi.mocked(overrides.fetch);
     const deps = minimalDeps({
       homedir: home,
-      _assertBackendPublication: undefined,
-      fetch: vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: process.pid, entrypoint: TEST_RUNTIME_ENTRYPOINT }),
-      }),
+      _readDaemonConfigRawSnapshot: undefined,
+      _publicationConvergenceNow: () => clock.now,
+      _publicationConvergenceSleep: async (delayMs) => { sleeps.push(delayMs); clock.now += delayMs; },
       readFileSync: (path: string) => path.endsWith("daemon.token")
         ? "doctor-token"
         : minimalDeps().readFileSync(path),
+      ...overrides,
+      fetch,
     });
-    let pending!: Promise<Awaited<ReturnType<typeof runDoctor>>>;
-    const holder = withBackendPublicationConfigLockAsync(configPath, async () => {
-      pending = runDoctor(deps);
-      await lifecycleAttempted;
+    return { deps, sleeps, fetch, clock, restore: () => { for (const spy of spies) spy.mockRestore(); } };
+  }
+
+  it("converges project-map validation through authenticated daemon contention", async () => {
+    const { home } = contentionHome("lcm-doctor-map-contention-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const { deps, sleeps, fetch, restore } = convergenceDeps(home, {}, { projectMap: false });
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap")
+      .mockImplementationOnce(() => { throw contention; })
+      .mockImplementationOnce(() => { throw contention; })
+      .mockImplementationOnce(() => passingProjectMapValidation(home));
+    const releases: number[] = [];
+    deps._betweenConvergenceAttemptsForTesting = () => {
+      releases.push(validateProjectMap.mock.calls.length);
+      // The owner releases the lock only after the second refusal.
+      if (validateProjectMap.mock.calls.length === 2) rmSync(join(home, ".lcm.backend-publication.lock"));
+    };
+    try {
+      const results = await runDoctor(deps);
+      expect(validateProjectMap).toHaveBeenCalledTimes(3);
+      expect(releases).toEqual([1, 2]);
+      expect(sleeps).toEqual([50, 50]);
+      // One recognized probe plus one authenticated probe per retried refusal.
+      expect(fetch).toHaveBeenCalledTimes(3);
+      expect(fetch.mock.calls[1]?.[1]).toMatchObject({ headers: { Authorization: "Bearer doctor-token" } });
+      expect(results.find((result) => result.name === "project-map")).toMatchObject({
+        status: "pass",
+        message: "map.json not created yet",
+      });
+    } finally {
+      validateProjectMap.mockRestore();
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("converges worktree reconciliation listing through authenticated daemon contention", async () => {
+    const { home } = contentionHome("lcm-doctor-worktree-contention-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const { deps, sleeps, restore } = convergenceDeps(home, {}, { worktrees: false });
+    const listJournals = vi.spyOn(worktreeReconciliationModule, "listWorktreeReconciliationJournals")
+      .mockImplementationOnce(() => { throw contention; })
+      .mockImplementationOnce(() => []);
+    try {
+      const results = await runDoctor(deps);
+      expect(listJournals).toHaveBeenCalledTimes(2);
+      expect(sleeps).toEqual([50]);
+      expect(results.find((result) => result.name === "worktree-reconciliation")).toMatchObject({
+        status: "pass",
+        message: "no pending worktree reconciliations",
+      });
+    } finally {
+      listJournals.mockRestore();
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("converges lifecycle admission after authenticated daemon contention releases", async () => {
+    const { home } = contentionHome("lcm-doctor-lifecycle-contention-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    vi.mocked(ensureDaemon)
+      .mockRejectedValueOnce(contention)
+      .mockResolvedValueOnce({ connected: true, port: 3737, spawned: false, pid: process.pid });
+    const { deps, sleeps, fetch, restore } = convergenceDeps(home);
+    try {
+      const results = await runDoctor(deps);
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(restartDaemon)).not.toHaveBeenCalled();
+      expect(sleeps).toEqual([50]);
+      // Recognized probe, authenticated retry probe, post-lifecycle probe.
+      expect(fetch).toHaveBeenCalledTimes(3);
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "pass",
+        message: "localhost:3737 (up)",
+      });
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the auto-start lifecycle path fail closed without a daemon identity", async () => {
+    const { home } = contentionHome("lcm-doctor-autostart-contention-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(contention);
+    // The daemon is not yet answering when doctor starts, so no identity is
+    // available: the auto-start path must fail closed on contention.
+    const { deps, sleeps, restore } = convergenceDeps(home, {
+      fetch: vi.fn().mockResolvedValueOnce({ ok: false }).mockImplementation(async () => authenticatedHealth()),
     });
-    // The holder callback returns after the first contention, releasing the
-    // lock while doctor remains in its bounded convergence helper.
-    await holder;
-    const results = await pending;
-    expect(results.find((result) => result.name === "daemon")).toBeDefined();
-    rmSync(home, { recursive: true, force: true });
+    try {
+      const results = await runDoctor(deps);
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledTimes(1);
+      expect(sleeps).toEqual([]);
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("localhost:3737 not responding"),
+      });
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("keeps lifecycle contention fail closed for a foreign daemon owner", async () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-foreign-contention-"));
-    const configPath = join(home, ".lcm", "config.json");
-    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
-    writeFileSync(configPath, "{}\n", { mode: 0o600 });
-    let signalLifecycleAttempt!: () => void;
-    const lifecycleAttempted = new Promise<void>(resolve => { signalLifecycleAttempt = resolve; });
+    const { home } = contentionHome("lcm-doctor-foreign-contention-");
+    writeLivePublicationOwner(home);
     const contention = new PrivateMutationLockContentionError("publication lock is busy");
-    vi.mocked(ensureDaemon).mockImplementationOnce(async () => {
-      signalLifecycleAttempt();
-      throw contention;
-    });
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(contention);
     const foreignPid = process.pid + 1;
-    const deps = minimalDeps({
-      homedir: home,
-      _assertBackendPublication: undefined,
-      fetch: vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: foreignPid, entrypoint: TEST_RUNTIME_ENTRYPOINT }),
-      }),
+    const { deps, sleeps, fetch, restore } = convergenceDeps(home, {
+      fetch: vi.fn().mockImplementation(async () => authenticatedHealth({ pid: foreignPid })),
     });
-    let pending!: Promise<Awaited<ReturnType<typeof runDoctor>>>;
-    const holder = withBackendPublicationConfigLockAsync(configPath, async () => {
-      pending = runDoctor(deps);
-      await lifecycleAttempted;
-    });
-    await holder;
-    const results = await pending;
-    expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
-    expect(results.find((result) => result.name === "daemon")?.status).toBe("warn");
-    rmSync(home, { recursive: true, force: true });
+    try {
+      const results = await runDoctor(deps);
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+      expect(sleeps).toEqual([]);
+      // Only the recognized probe: the owner PID mismatch refuses before any
+      // authenticated health exchange.
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "warn",
+        message: expect.stringContaining("daemon validation failed"),
+      });
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("does not retry version-mismatch repair through daemon-owned contention", async () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-version-contention-"));
-    const configPath = join(home, ".lcm", "config.json");
-    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
-    writeFileSync(configPath, "{}\n", { mode: 0o600 });
-    let signalLifecycleAttempt!: () => void;
-    const lifecycleAttempted = new Promise<void>(resolve => { signalLifecycleAttempt = resolve; });
+    const { home } = contentionHome("lcm-doctor-version-contention-");
+    writeLivePublicationOwner(home);
     const contention = new PrivateMutationLockContentionError("publication lock is busy");
-    vi.mocked(restartDaemon).mockImplementationOnce(async () => {
-      signalLifecycleAttempt();
-      throw contention;
+    vi.mocked(restartDaemon).mockRejectedValueOnce(contention);
+    const { deps, sleeps, restore } = convergenceDeps(home, {
+      fetch: vi.fn().mockImplementation(async () => authenticatedHealth({ version: "0.4.0" })),
     });
-    const deps = minimalDeps({
-      homedir: home,
-      _assertBackendPublication: undefined,
-      fetch: vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({ status: "ok", version: "0.4.0", storageBackend: "sqlite", pid: process.pid, entrypoint: TEST_RUNTIME_ENTRYPOINT }),
-      }),
-    });
-    let pending!: Promise<Awaited<ReturnType<typeof runDoctor>>>;
-    const holder = withBackendPublicationConfigLockAsync(configPath, async () => {
-      pending = runDoctor(deps);
-      await lifecycleAttempted;
-    });
-    await holder;
-    await pending;
-    expect(vi.mocked(restartDaemon)).toHaveBeenCalledOnce();
-    rmSync(home, { recursive: true, force: true });
+    try {
+      const results = await runDoctor(deps);
+      expect(vi.mocked(restartDaemon)).toHaveBeenCalledOnce();
+      expect(vi.mocked(ensureDaemon)).not.toHaveBeenCalled();
+      expect(sleeps).toEqual([]);
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "warn",
+        message: expect.stringContaining("version mismatch (v0.4.0 running, v0.5.0 installed)"),
+      });
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it.each([
     ["entrypoint", { entrypoint: "/foreign/lcm.mjs" }, {}],
-    ["runtime digest", { entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: "b".repeat(64) }, { _expectedRuntimeDigestForTesting: "a".repeat(64) }],
-  ] as const)("does not converge when authenticated daemon %s identity changes", async (_label, healthIdentity, seam) => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-identity-contention-"));
-    const configPath = join(home, ".lcm", "config.json");
-    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
-    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    ["runtime digest", { runtimeDigest: "b".repeat(64) }, { _expectedRuntimeDigestForTesting: "a".repeat(64) }],
+    ["storage backend", { storageBackend: "postgresql" }, {}],
+    ["version", { version: "0.4.9" }, {}],
+  ] as const)("does not converge when authenticated daemon %s identity differs", async (_label, healthIdentity, seam) => {
+    const { home } = contentionHome("lcm-doctor-identity-contention-");
     writeLivePublicationOwner(home);
     const contention = new PrivateMutationLockContentionError("publication lock is busy");
-    vi.mocked(ensureDaemon).mockImplementationOnce(async () => { throw contention; });
-    const deps = minimalDeps({
-      homedir: home,
-      _assertBackendPublication: undefined,
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(contention);
+    const { deps, sleeps, fetch, restore } = convergenceDeps(home, {
       ...seam,
-      fetch: vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: process.pid, ...healthIdentity }),
-      }),
+      fetch: vi.fn()
+        .mockResolvedValueOnce(authenticatedHealth())
+        .mockImplementation(async () => authenticatedHealth(healthIdentity)),
     });
-    const results = await runDoctor(deps);
-    expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
-    expect(results.find((result) => result.name === "daemon")).toBeDefined();
-    rmSync(home, { recursive: true, force: true });
+    try {
+      const results = await runDoctor(deps);
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+      expect(sleeps).toEqual([]);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "warn",
+        message: expect.stringContaining("daemon validation failed"),
+      });
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
-  it("preserves typed contention at the convergence deadline", async () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-deadline-contention-"));
-    const configPath = join(home, ".lcm", "config.json");
-    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
-    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+  it.each([
+    ["absent", (home: string) => { rmSync(join(home, ".lcm.backend-publication.lock")); }],
+    ["malformed", (home: string) => { writeFileSync(join(home, ".lcm.backend-publication.lock"), "{", { mode: 0o600 }); }],
+    ["birth-less", (home: string) => {
+      writeFileSync(join(home, ".lcm.backend-publication.lock"), `${JSON.stringify({
+        version: 1, pid: process.pid, processStartTime: null, nonce: "a".repeat(32),
+      })}\n`, { mode: 0o600 });
+    }],
+    ["stale birth", (home: string) => {
+      writeFileSync(join(home, ".lcm.backend-publication.lock"), `${JSON.stringify({
+        version: 1, pid: process.pid, processStartTime: "1", nonce: "a".repeat(32),
+      })}\n`, { mode: 0o600 });
+    }],
+  ] as const)("does not converge on an %s lock owner", async (_label, mutateOwner) => {
+    const { home } = contentionHome("lcm-doctor-owner-contention-");
+    writeLivePublicationOwner(home);
+    mutateOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(contention);
+    const { deps, sleeps, fetch, restore } = convergenceDeps(home);
+    try {
+      const results = await runDoctor(deps);
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+      expect(sleeps).toEqual([]);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "warn",
+        message: expect.stringContaining("daemon validation failed"),
+      });
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("does not converge when the authenticated health probe fails during contention", async () => {
+    const { home } = contentionHome("lcm-doctor-probe-contention-");
     writeLivePublicationOwner(home);
     const contention = new PrivateMutationLockContentionError("publication lock is busy");
-    vi.mocked(ensureDaemon).mockRejectedValue(contention);
-    let now = 0;
-    const sleeps: number[] = [];
-    const deps = minimalDeps({
-      homedir: home,
-      _assertBackendPublication: undefined,
-      _publicationConvergenceNow: () => now,
-      _publicationConvergenceSleep: async (delayMs) => { sleeps.push(delayMs); now += delayMs; },
-      fetch: vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: process.pid, entrypoint: TEST_RUNTIME_ENTRYPOINT }),
-      }),
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(contention);
+    const { deps, sleeps, restore } = convergenceDeps(home, {
+      fetch: vi.fn()
+        .mockResolvedValueOnce(authenticatedHealth())
+        .mockRejectedValueOnce(new Error("connection reset"))
+        .mockImplementation(async () => authenticatedHealth()),
     });
-    const results = await runDoctor(deps);
-    expect(vi.mocked(ensureDaemon).mock.calls.length).toBeGreaterThan(1);
-    expect(sleeps.every(delay => delay <= 50)).toBe(true);
-    expect(results.find((result) => result.name === "daemon")).toBeDefined();
-    rmSync(home, { recursive: true, force: true });
+    try {
+      const results = await runDoctor(deps);
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+      expect(sleeps).toEqual([]);
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("warn");
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retry non-contention lifecycle failures", async () => {
+    const { home } = contentionHome("lcm-doctor-other-failure-");
+    writeLivePublicationOwner(home);
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(new Error("spawn refused"));
+    const { deps, sleeps, restore } = convergenceDeps(home);
+    try {
+      const results = await runDoctor(deps);
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+      expect(sleeps).toEqual([]);
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("warn");
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves typed contention once the shared convergence deadline is spent", async () => {
+    const { home } = contentionHome("lcm-doctor-deadline-contention-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const { deps, sleeps, clock, restore } = convergenceDeps(home, {}, { projectMap: false });
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap")
+      .mockImplementation(() => { throw contention; });
+    vi.mocked(ensureDaemon).mockRejectedValue(contention);
+    try {
+      const results = await runDoctor(deps);
+      // 2000 ms budget at 50 ms polls: 40 retries, then the 41st refusal
+      // observes the deadline and propagates the original typed error.
+      expect(validateProjectMap).toHaveBeenCalledTimes(41);
+      expect(sleeps).toHaveLength(40);
+      expect(sleeps.every(delay => delay === 50)).toBe(true);
+      expect(clock.now).toBe(2000);
+      expect(results.find((result) => result.name === "project-map")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("publication lock is busy"),
+      });
+      // The budget is shared: the lifecycle stage gets no additional waits.
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("warn");
+    } finally {
+      validateProjectMap.mockRestore();
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds the final wait to the remaining budget", async () => {
+    const { home } = contentionHome("lcm-doctor-remaining-budget-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const { deps, sleeps, clock, restore } = convergenceDeps(home);
+    // Spend most of the budget before the stage runs.
+    vi.mocked(ensureDaemon).mockReset();
+    vi.mocked(ensureDaemon)
+      .mockImplementationOnce(async () => { clock.now = 1_990; throw contention; })
+      .mockResolvedValueOnce({ connected: true, port: 3737, spawned: false, pid: process.pid });
+    try {
+      await runDoctor(deps);
+      expect(sleeps).toEqual([10]);
+      expect(clock.now).toBe(2_000);
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("uses a real timer wait for synchronous stages without a sleep seam", async () => {
+    const { home } = contentionHome("lcm-doctor-sync-wait-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const { deps, restore } = convergenceDeps(home, {
+      _publicationConvergenceNow: undefined,
+      _publicationConvergenceSleep: undefined,
+    }, { projectMap: false });
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap")
+      .mockImplementationOnce(() => { throw contention; })
+      .mockImplementationOnce(() => passingProjectMapValidation(home));
+    try {
+      const started = Date.now();
+      const results = await runDoctor(deps);
+      expect(validateProjectMap).toHaveBeenCalledTimes(2);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(45);
+      expect(results.find((result) => result.name === "project-map")?.status).toBe("pass");
+    } finally {
+      validateProjectMap.mockRestore();
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("uses a real timer wait for asynchronous stages without a sleep seam", async () => {
+    const { home } = contentionHome("lcm-doctor-async-wait-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    vi.mocked(ensureDaemon)
+      .mockRejectedValueOnce(contention)
+      .mockResolvedValueOnce({ connected: true, port: 3737, spawned: false, pid: process.pid });
+    const { deps, restore } = convergenceDeps(home, {
+      _publicationConvergenceNow: undefined,
+      _publicationConvergenceSleep: undefined,
+    });
+    try {
+      const started = Date.now();
+      const results = await runDoctor(deps);
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledTimes(2);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(45);
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("pass");
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks admission when the LCM root cannot be inspected", async () => {
+    const results = await runDoctor(minimalDeps({
+      _lstatLcmRootForTesting: (() => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); }) as never,
+    }));
+    expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+      status: "fail",
+      message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+    });
+    expect(results.find((result) => result.name === "project-map")?.status).toBe("skip");
+  });
+
+  it("blocks admission when the LCM root is a symlink", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-root-symlink-"));
+    const realRoot = join(home, "real-lcm");
+    mkdirSync(realRoot, { mode: 0o700 });
+    symlinkSync(realRoot, join(home, ".lcm"));
+    try {
+      // No lstat seam: the production filesystem inspection is exercised.
+      const results = await runDoctor(minimalDeps({ homedir: home, _readDaemonConfigRawSnapshot: undefined }));
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+      });
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("skip");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks admission when config bytes drift between lock-free snapshots", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-config-drift-"));
+    const configFile = join(home, ".lcm", "config.json");
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(configFile, "{}\n", { mode: 0o600 });
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap");
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        _readDaemonConfigRawSnapshot: undefined,
+        _betweenConfigSnapshotsForTesting: () => {
+          writeFileSync(configFile, JSON.stringify({ daemon: { port: 4545 } }), { mode: 0o600 });
+        },
+      }));
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+      });
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("skip");
+      expect(validateProjectMap).not.toHaveBeenCalled();
+    } finally {
+      validateProjectMap.mockRestore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks admission when publication evidence changes between lock-free snapshots", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-journal-drift-"));
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(home, ".lcm", "config.json"), "{}", { mode: 0o600 });
+    const firstChecksum = writeAbortedTerminalPublicationJournal(home, "terminal-publication-a");
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap");
+    const admissions: Array<string | null> = [];
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        _readDaemonConfigRawSnapshot: undefined,
+        _assertPublicationReadAccess: (...args) => {
+          const admission = assertBackendPublicationConfigReadAccess(...args);
+          admissions.push(admission.journalChecksumSha256);
+          return admission;
+        },
+        _betweenConfigSnapshotsForTesting: () => {
+          // A second valid terminal journal with a different checksum: the
+          // config bytes and descriptor are unchanged, so only the evidence
+          // differs and the checksum inequality is the guard that fires.
+          writeAbortedTerminalPublicationJournal(home, "terminal-publication-b");
+        },
+      }));
+      expect(admissions).toHaveLength(2);
+      expect(admissions[0]).toBe(firstChecksum);
+      expect(admissions[1]).not.toBe(firstChecksum);
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+      });
+      expect(results.find((result) => result.name === "config")?.status).toBe("pass");
+      expect(validateProjectMap).not.toHaveBeenCalled();
+    } finally {
+      validateProjectMap.mockRestore();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("reports blocked publication admission without attempting repair", async () => {
@@ -508,7 +910,7 @@ describe("runDoctor project map checks", () => {
       writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
       const results = await runDoctor(minimalDeps({
         homedir: home,
-        _assertBackendPublication: undefined,
+        _readDaemonConfigRawSnapshot: undefined,
       }));
 
       expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
@@ -530,7 +932,7 @@ describe("runDoctor project map checks", () => {
       const results = await runDoctor(minimalDeps({
         homedir: home,
         existsSync: (path: string) => !path.endsWith("config.json"),
-        _assertBackendPublication: undefined,
+        _readDaemonConfigRawSnapshot: undefined,
       }));
       expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
         status: "fail",
@@ -551,7 +953,7 @@ describe("runDoctor project map checks", () => {
       const results = await runDoctor(minimalDeps({
         homedir: home,
         existsSync: (path: string) => !path.endsWith("config.json"),
-        _assertBackendPublication: undefined,
+        _readDaemonConfigRawSnapshot: undefined,
       }));
       expect(results.find((result) => result.name === "backend-publication")).toBeUndefined();
       expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
@@ -564,19 +966,26 @@ describe("runDoctor project map checks", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-untrusted-config-"));
     const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap");
     writeCompletedPublicationJournal(home, null);
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    const configFile = join(home, ".lcm", "config.json");
+    if (_label === "oversized") {
+      // One byte over the bounded snapshot limit: the real reader refuses it
+      // before any bytes are trusted.
+      writeFileSync(configFile, "x".repeat(4 * 1024 * 1024 + 1), { mode: 0o600 });
+    } else {
+      // A directory in place of the config file fails the regular-file check.
+      mkdirSync(configFile, { mode: 0o700 });
+    }
     try {
-      const boundedRead: (path: string, maxBytes: number) => string = _label === "oversized"
-        ? () => { throw new Error("file exceeds the configured size limit"); }
-        : () => { throw new Error("config read refused"); };
       const results = await runDoctor(minimalDeps({
         homedir: home,
-        _assertBackendPublication: undefined,
-        _readBoundedConfig: boundedRead,
+        _readDaemonConfigRawSnapshot: undefined,
       }));
       expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
         status: "fail",
         message: expect.stringContaining("Backend publication admission is blocked"),
       });
+      expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
       expect(results.find((result) => result.name === "project-map")).toMatchObject({ status: "skip" });
       expect(results.find((result) => result.name === "events-capture")).toMatchObject({ status: "skip" });
       expect(validateProjectMap).not.toHaveBeenCalled();
@@ -594,15 +1003,15 @@ describe("runDoctor project map checks", () => {
     const assertPublication = vi.fn(() => {
       throw new BackendPublicationJournalError("unresolved-publication", "publication remains unresolved");
     });
-    const base = minimalDeps();
+    const base = minimalDeps({
+      readFileSync: (path: string) => path.endsWith("config.json") ? content : minimalDeps().readFileSync(path),
+      _assertBackendPublication: assertPublication,
+    });
     try {
-      const results = await runDoctor({
-        ...base,
-        readFileSync: (path: string) => path.endsWith("config.json") ? content : base.readFileSync(path),
-        _assertBackendPublication: assertPublication,
-      });
-      if (_label === "malformed config") expect(assertPublication).toHaveBeenCalledOnce();
-      else expect(assertPublication).not.toHaveBeenCalled();
+      const results = await runDoctor(base);
+      // Both variants observe bytes safely through the seam, so the candidate
+      // backend is authenticated exactly once after validation fails.
+      expect(assertPublication).toHaveBeenCalledOnce();
       expect(validateProjectMap).not.toHaveBeenCalled();
       expect(results.find((result) => result.name === "backend-publication")).toMatchObject({ status: "fail" });
       expect(results.find((result) => result.name === "project-map")).toMatchObject({ status: "skip" });
@@ -1649,7 +2058,7 @@ describe("runDoctor daemon version mismatch", () => {
 
 describe("runDoctor summarizer modes", () => {
   it("reports auto mode as Claude and Codex process defaults", async () => {
-    const results = await runDoctor({
+    const results = await runDoctor(minimalDeps({
       existsSync: () => true,
       readFileSync: (path: string) => {
         if (path.endsWith("config.json")) return JSON.stringify({ llm: { provider: "auto" } });
@@ -1671,7 +2080,7 @@ describe("runDoctor summarizer modes", () => {
       fetch: vi.fn().mockResolvedValue({ ok: false }),
       homedir: defaultDoctorHome,
       platform: "darwin",
-    });
+    }));
 
     expect(results.find((result) => result.name === "stack")?.message).toContain("Summarizer: auto");
     expect(results.find((result) => result.name === "stack")?.message).toContain("Storage: sqlite");

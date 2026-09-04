@@ -2,7 +2,11 @@
 "@donadiosolutions/lcm": patch
 ---
 
-Keep doctor configuration reads and connector transport resolution available
-during a managed daemon's short backend-publication reconciliation by using
-authenticated, descriptor-bound lock-free snapshots. Configuration mutations
-continue to require the exclusive publication lock.
+Let `lcm doctor` and connector transport resolution converge through a managed
+daemon's short backend-publication reconciliation immediately after
+`lcm install`. Configuration reads use authenticated, descriptor-bound
+lock-free snapshots, and the lock-taking doctor stages (project map, worktree
+reconciliation, daemon lifecycle) retry within one shared two-second budget
+only while the lock owner is the exact token-authenticated managed daemon.
+All configuration and project-map mutations still require the exclusive
+publication lock, and any other owner remains fail closed.

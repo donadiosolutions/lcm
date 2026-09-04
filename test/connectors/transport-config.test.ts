@@ -21,6 +21,7 @@ import {
 } from "../../src/config-manager.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { withBackendPublicationConfigLockAsync } from "../../src/storage/backend-publication.js";
+import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-publication-journal.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -110,7 +111,7 @@ describe("persisted connector transport configuration", () => {
     })).toThrow("Configuration changed during lock-free connector transport inspection");
   });
 
-  it("rejects publication evidence that changes between snapshots", () => {
+  it("rejects malformed publication evidence introduced between snapshots", () => {
     const { home, configPath } = makeHome({
       version: 1,
       connectors: { transports: { codex: "mcp" } },
@@ -123,6 +124,28 @@ describe("persisted connector transport configuration", () => {
         writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
       },
     })).toThrow("backend publication evidence is incomplete");
+  });
+
+  it("rejects valid terminal publication evidence that changes between snapshots", () => {
+    const content = JSON.stringify({ version: 1, connectors: { transports: { codex: "mcp" } } });
+    const { home, configPath } = makeHome();
+    writeFileSync(configPath, content, { mode: 0o600 });
+    const firstChecksum = writeAbortedTerminalPublicationJournal(home, "terminal-publication-a", content);
+
+    // Both journals are complete, authenticated terminal evidence for the
+    // same config bytes; only their checksums differ. The config witness
+    // therefore matches on both reads and the checksum inequality is the
+    // guard that refuses the snapshot.
+    expect(readConnectorTransportSnapshot(configPath, "codex")).toBe("mcp");
+    let secondChecksum: string | undefined;
+    expect(() => readConnectorTransportSnapshot(configPath, "codex", {
+      _afterFirstSnapshotForTesting: () => {
+        secondChecksum = writeAbortedTerminalPublicationJournal(home, "terminal-publication-b", content);
+      },
+    })).toThrow("Backend publication changed during lock-free connector transport inspection.");
+    expect(secondChecksum).toBeDefined();
+    expect(secondChecksum).not.toBe(firstChecksum);
+    expect(readConnectorTransportSnapshot(configPath, "codex")).toBe("mcp");
   });
 
   it("propagates non-absence failures from the initial connector snapshot probe", () => {

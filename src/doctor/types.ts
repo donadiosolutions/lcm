@@ -22,10 +22,23 @@ export interface DoctorDeps {
   managedDaemonPath?: string;
   /** Internal deterministic seam for exercising MCP handshake failures. */
   _testMcpHandshake?: () => Promise<CheckResult>;
-  /** Internal seam for testing backend-publication admission independently. */
-  _assertBackendPublication?: (homeDir: string, backend: "sqlite" | "postgresql") => void;
-  /** Internal bounded config-read seam used by deterministic doctor tests. */
-  _readBoundedConfig?: (path: string, maxBytes: number) => string;
+  /**
+   * Internal seam replacing the lock-free raw config snapshot reader inside
+   * the single production admission path. Tests use it to inject config bytes
+   * and deterministic descriptor witnesses.
+   */
+  _readDaemonConfigRawSnapshot?: typeof import("../daemon/config.js").readDaemonConfigRawSnapshot;
+  /**
+   * Internal seam replacing the lock-free publication read admission inside
+   * the single production admission path.
+   */
+  _assertPublicationReadAccess?: typeof import("../storage/backend-publication.js").assertBackendPublicationConfigReadAccess;
+  /** Internal seam invoked between the two lock-free config snapshots. */
+  _betweenConfigSnapshotsForTesting?: () => void;
+  /** Internal seam for the LCM root shape inspection used by deterministic tests. */
+  _lstatLcmRootForTesting?: typeof import("node:fs").lstatSync;
+  /** Internal seam invoked between the two convergence stage attempts. */
+  _betweenConvergenceAttemptsForTesting?: () => void;
   /** Internal convergence clock seam used by deterministic publication tests. */
   _publicationConvergenceNow?: () => number;
   /** Internal convergence wait seam used by deterministic publication tests. */
