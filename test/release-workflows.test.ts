@@ -1,4 +1,7 @@
-import { readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import { load as loadYaml } from "js-yaml";
 import { describe, expect, it } from "vitest";
 
@@ -696,5 +699,108 @@ describe("release workflows", () => {
 
   it("records prerelease support as a minor package change", () => {
     expect(changesetSource).toMatch(/^---\n"@donadiosolutions\/lcm": minor\n---\n/u);
+  });
+});
+
+
+const metadataValidationSteps = [
+  publishWorkflow.jobs.draft.steps.find((step) => step.name === "Validate release tag")!,
+  publishWorkflow.jobs.preflight.steps.find((step) => step.name === "Validate published release")!,
+  publishWorkflow.jobs["recover-preflight"].steps.find((step) => step.name === "Validate tagged package")!,
+];
+
+function runMetadataValidation(step: WorkflowStep, {
+  version = "1.2.3",
+  metadata = JSON.stringify({ version }),
+  ancestor = true,
+}: { version?: string; metadata?: string; ancestor?: boolean } = {}) {
+  const root = mkdtempSync(join(tmpdir(), "lcm-release-metadata-"));
+  try {
+    const bin = join(root, "bin");
+    const calls = join(root, "calls");
+    const output = join(root, "output");
+    mkdirSync(bin);
+    writeFileSync(join(root, "package.json"), metadata);
+    writeFileSync(join(root, "CHANGELOG.md"), `## ${version}\n\n- Fixture release.\n`);
+    writeFileSync(join(bin, "git"), `#!/bin/bash
+printf 'git %s\\n' "$*" >> "$FIXTURE_CALLS"
+if [[ "$*" == "fetch --no-tags origin main" ]]; then exit 0; fi
+if [[ "$*" == "merge-base --is-ancestor HEAD origin/main" ]]; then
+  [[ "$FIXTURE_ANCESTOR" == "true" ]]
+  exit
+fi
+exit 99
+`);
+    writeFileSync(join(bin, "node"), `#!/bin/bash
+printf 'node\\n' >> "$FIXTURE_CALLS"
+exec "$FIXTURE_NODE" "$@"
+`);
+    chmodSync(join(bin, "git"), 0o755);
+    chmodSync(join(bin, "node"), 0o755);
+    const result = spawnSync("/bin/bash", ["-c", step.run!], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
+        HOME: root,
+        TMPDIR: root,
+        FIXTURE_CALLS: calls,
+        FIXTURE_NODE: process.execPath,
+        FIXTURE_ANCESTOR: String(ancestor),
+        GITHUB_OUTPUT: output,
+        RELEASE_TAG: `v${version}`,
+        RELEASE_DRAFT: "false",
+        RELEASE_PRERELEASE: String(version.includes("-beta.")),
+      },
+    });
+    return {
+      ...result,
+      calls: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [],
+      output: existsSync(output) ? readFileSync(output, "utf8") : "",
+    };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+describe.each(metadataValidationSteps)("$name metadata admission", (step) => {
+  it("establishes main ancestry before data-only package parsing", () => {
+    const script = step.run!;
+    expect(script.indexOf("git merge-base --is-ancestor HEAD origin/main")).toBeLessThan(script.indexOf("readFileSync"));
+    expect(script).toContain("JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version");
+    expect(script.match(/require\([^)]*\)/gu)).toEqual(["require('node:fs')"]);
+  });
+
+  it.each(["1.2.3", "1.3.0-beta.0"])("accepts inert %s metadata after ancestry", (version) => {
+    const result = runMetadataValidation(step, { version });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.calls).toEqual(["git fetch --no-tags origin main", "git merge-base --is-ancestor HEAD origin/main", "node"]);
+    if (step.id === "release") {
+      expect(result.output).toContain(`version=${version}\n`);
+      expect(result.output).toContain(`is_beta=${version.includes("-beta.")}\n`);
+    }
+  });
+
+  it("rejects non-ancestor input before attempting malformed metadata", () => {
+    const result = runMetadataValidation(step, { ancestor: false, metadata: "{" });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("reachable from origin/main");
+    expect(result.calls).toEqual(["git fetch --no-tags origin main", "git merge-base --is-ancestor HEAD origin/main"]);
+    expect(result.output).toBe("");
+  });
+
+  it("fails closed on malformed JSON after ancestry", () => {
+    const result = runMetadataValidation(step, { metadata: "{" });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("SyntaxError");
+    expect(result.calls).toEqual(["git fetch --no-tags origin main", "git merge-base --is-ancestor HEAD origin/main", "node"]);
+    expect(result.output).toBe("");
+  });
+
+  it("retains the package-version mismatch guard", () => {
+    const result = runMetadataValidation(step, { metadata: JSON.stringify({ version: "0.0.1" }) });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("does not match release tag");
+    expect(result.output).toBe("");
   });
 });

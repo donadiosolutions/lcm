@@ -87,7 +87,13 @@ jobs:
         run: |
           set -Eeuo pipefail
           tag="$RELEASE_TAG"
-          version="$(node -p "require('./package.json').version")"
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::release tag $tag must point to a commit reachable from origin/main"
+            exit 1
+          fi
+
+          version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
 
           if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.(0|[1-9][0-9]*))?$ ]]; then
             echo "::error::Unsupported release tag '$tag'; expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-beta.N"
@@ -95,12 +101,6 @@ jobs:
           fi
           if [[ "$version" != "${tag#v}" ]]; then
             echo "::error::package.json version $version does not match release tag $tag"
-            exit 1
-          fi
-
-          git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor HEAD origin/main; then
-            echo "::error::release tag $tag must point to a commit reachable from origin/main"
             exit 1
           fi
 
@@ -462,7 +462,13 @@ jobs:
         run: |
           set -Eeuo pipefail
           tag="$RELEASE_TAG"
-          version="$(node -p "require('./package.json').version")"
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::release tag $tag must point to a commit reachable from origin/main"
+            exit 1
+          fi
+
+          version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
 
           if [[ "$RELEASE_DRAFT" != "false" ]]; then
             echo "::error::release published event unexpectedly refers to a draft"
@@ -481,12 +487,6 @@ jobs:
           [[ "$version" == *-beta.* ]] && is_beta=true
           if [[ "$RELEASE_PRERELEASE" != "$is_beta" ]]; then
             echo "::error::GitHub prerelease flag $RELEASE_PRERELEASE does not match $tag"
-            exit 1
-          fi
-
-          git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor HEAD origin/main; then
-            echo "::error::release tag $tag must point to a commit reachable from origin/main"
             exit 1
           fi
 
@@ -830,14 +830,15 @@ jobs:
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -Eeuo pipefail
-          version="$(node -p "require('./package.json').version")"
-          if [[ "$version" != "${RELEASE_TAG#v}" ]]; then
-            echo "::error::package.json version $version does not match release tag $RELEASE_TAG"
-            exit 1
-          fi
           git fetch --no-tags origin main
           if ! git merge-base --is-ancestor HEAD origin/main; then
             echo "::error::release tag $RELEASE_TAG must be reachable from origin/main"
+            exit 1
+          fi
+
+          version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+          if [[ "$version" != "${RELEASE_TAG#v}" ]]; then
+            echo "::error::package.json version $version does not match release tag $RELEASE_TAG"
             exit 1
           fi
           changelog_block="$(awk -v version="$version" '
