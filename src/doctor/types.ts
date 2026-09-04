@@ -45,6 +45,8 @@ export interface DoctorDeps {
   _publicationConvergenceSleep?: (delayMs: number) => Promise<void>;
   /** Internal lock-owner reader seam used by deterministic convergence tests. */
   _readPrivateMutationLockOwnerForTesting?: typeof import("../private-mutation-lock.js").readPrivateMutationLockOwner;
+  /** Internal process-birth reader seam used by deterministic convergence tests. */
+  _processStartTimeForTesting?: typeof import("../private-mutation-lock.js").processStartTime;
   /** Internal packaged runtime digest seam used by deterministic tests. */
   _expectedRuntimeDigestForTesting?: string;
   /** Test seam for transport-aware Claude guidance repair. */

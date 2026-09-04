@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   statSync,
@@ -85,6 +86,52 @@ describe("persisted connector transport configuration", () => {
     await withBackendPublicationConfigLockAsync(configPath, async () => {
       expect(readConnectorTransport(configPath, "codex")).toBe("mcp");
     });
+  });
+
+  it("rejects a symlinked canonical LCM root before reading connector transport", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-transport-symlink-root-"));
+    temporaryDirectories.push(home);
+    const targetRoot = join(home, "target-lcm");
+    mkdirSync(targetRoot, { mode: 0o700 });
+    writeFileSync(join(targetRoot, "config.json"), JSON.stringify({
+      version: 1,
+      connectors: { transports: { codex: "mcp" } },
+    }), { mode: 0o600 });
+    symlinkSync(targetRoot, join(home, ".lcm"));
+
+    expect(() => readConnectorTransport(join(home, ".lcm", "config.json"), "codex"))
+      .toThrow();
+  });
+
+  it("rejects canonical LCM root identity drift between connector snapshots", () => {
+    const { home, configPath } = makeHome({
+      version: 1,
+      connectors: { transports: { codex: "mcp" } },
+    });
+    const root = join(home, ".lcm");
+    const retainedRoot = join(home, "retained-lcm");
+    const replacementRoot = join(home, "replacement-lcm");
+    mkdirSync(replacementRoot, { mode: 0o700 });
+    writeFileSync(join(replacementRoot, "config.json"), readFileSync(configPath), { mode: 0o600 });
+
+    expect(() => readConnectorTransportSnapshot(configPath, "codex", {
+      _afterFirstSnapshotForTesting: () => {
+        renameSync(root, retainedRoot);
+        renameSync(replacementRoot, root);
+      },
+    })).toThrow("private directory changed during validation");
+  });
+
+  it("rejects an unsafe canonical LCM root with publication state", () => {
+    const { home, configPath } = makeHome({
+      version: 1,
+      connectors: { transports: { codex: "mcp" } },
+    });
+    mkdirSync(join(home, ".lcm", "backend-publication"), { mode: 0o700 });
+    chmodSync(join(home, ".lcm"), 0o755);
+
+    expect(() => readConnectorTransportSnapshot(configPath, "codex"))
+      .toThrow("backend publication root is not private");
   });
 
   it("keeps transport mutations serialized while the publication lock is held", async () => {

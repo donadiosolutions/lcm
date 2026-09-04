@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstatSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
   normalizeLlmProvider,
   daemonConfigSnapshotWitnessEqual,
@@ -23,7 +23,9 @@ import {
   assertBackendPublicationConfigReadAccess,
   assertBackendPublicationConfigMutation,
   assertBackendPublicationPermit,
+  backendPublicationHomeForConfigPath,
   captureBackendPublicationState,
+  openBackendPublicationReadRoot,
   withBackendPublicationConfigLockAsync,
   withBackendPublicationConfigLock,
   type BackendPublicationFileMutationContext,
@@ -32,6 +34,7 @@ import {
 } from "./storage/backend-publication.js";
 import {
   atomicWritePrivateFileDurable,
+  assertPrivateDirectory,
   consumeBoundedRegularFile,
   ensurePrivateDirectory,
   readBoundedRegularFile,
@@ -519,25 +522,52 @@ function readConnectorConfigSnapshot(configPath: string): ConnectorConfigSnapsho
   }
 }
 
+function withConnectorTransportReadRoot<T>(
+  configPath: string,
+  callback: (assertReadRoot: () => void) => T,
+): T {
+  const homeDir = backendPublicationHomeForConfigPath(configPath);
+  if (homeDir === undefined) return callback(() => undefined);
+  const rootPath = dirname(resolve(configPath));
+  let rootHandle = openBackendPublicationReadRoot(homeDir);
+  const assertReadRoot = (): void => {
+    rootHandle ??= openBackendPublicationReadRoot(homeDir);
+    if (rootHandle !== undefined) assertPrivateDirectory(rootHandle, rootPath);
+  };
+  try {
+    return callback(assertReadRoot);
+  } finally {
+    rootHandle?.close();
+  }
+}
+
 /** Read one validated stored connector transport without taking the publication lock. */
 export function readConnectorTransportSnapshot(
   configPath: string,
   agentId: string,
   options: ConnectorTransportSnapshotOptions = {},
 ): ConnectorTransport | undefined {
-  const first = readConnectorConfigSnapshot(configPath);
-  const backend = configBackend(first.content);
-  const firstAdmission = assertBackendPublicationConfigReadAccess(configPath, backend, first.witness);
-  options._afterFirstSnapshotForTesting?.();
-  const second = readConnectorConfigSnapshot(configPath);
-  if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
-    throw new ConfigManagerError("Configuration changed during lock-free connector transport inspection.");
-  }
-  const secondAdmission = assertBackendPublicationConfigReadAccess(configPath, backend, second.witness);
-  if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
-    throw new ConfigManagerError("Backend publication changed during lock-free connector transport inspection.");
-  }
-  return readConnectorTransportFromStored(parseStoredConfig(second.content), agentId);
+  return withConnectorTransportReadRoot(configPath, (assertReadRoot) => {
+    assertReadRoot();
+    const first = readConnectorConfigSnapshot(configPath);
+    assertReadRoot();
+    const backend = configBackend(first.content);
+    const firstAdmission = assertBackendPublicationConfigReadAccess(configPath, backend, first.witness);
+    assertReadRoot();
+    options._afterFirstSnapshotForTesting?.();
+    assertReadRoot();
+    const second = readConnectorConfigSnapshot(configPath);
+    assertReadRoot();
+    if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
+      throw new ConfigManagerError("Configuration changed during lock-free connector transport inspection.");
+    }
+    const secondAdmission = assertBackendPublicationConfigReadAccess(configPath, backend, second.witness);
+    assertReadRoot();
+    if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
+      throw new ConfigManagerError("Backend publication changed during lock-free connector transport inspection.");
+    }
+    return readConnectorTransportFromStored(parseStoredConfig(second.content), agentId);
+  });
 }
 
 /** Persist one validated connector transport while retaining all other settings. */

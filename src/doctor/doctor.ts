@@ -368,18 +368,23 @@ async function convergenceRetryDelay(
     owner === null
     || owner.pid !== convergence.identity.pid
     || owner.processStartTime === null
-    || processStartTime(owner.pid) !== owner.processStartTime
   ) return undefined;
+  const remainingBirthBudgetMs = convergence.deadline - convergence.now();
+  if (remainingBirthBudgetMs <= 0) return undefined;
+  const observedProcessStartTime = (
+    deps._processStartTimeForTesting ?? processStartTime
+  )(owner.pid, undefined, { timeoutMs: remainingBirthBudgetMs });
+  if (observedProcessStartTime !== owner.processStartTime) return undefined;
   const token = readDoctorDaemonToken(deps);
-  const remainingBudgetMs = convergence.deadline - convergence.now();
-  if (remainingBudgetMs <= 0) return undefined;
+  const remainingHealthBudgetMs = convergence.deadline - convergence.now();
+  if (remainingHealthBudgetMs <= 0) return undefined;
   let health: DoctorDaemonHealth | null;
   try {
     health = await readRecognizedDaemonHealth(
       deps.fetch,
       port,
       token,
-      Math.min(DAEMON_HEALTH_DEADLINE_MS, remainingBudgetMs),
+      Math.min(DAEMON_HEALTH_DEADLINE_MS, remainingHealthBudgetMs),
     );
   } catch {
     return undefined;

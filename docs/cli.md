@@ -120,10 +120,13 @@ same bounded, stable, lock-free configuration admission.
 The configuration read used by `lcm doctor` and by connector transport
 resolution is also lock-free and authenticated: two descriptor-bound snapshots
 of `config.json` and two reads of the terminal publication journal must agree
-before the bytes are trusted. Any subsequent configuration write, including
-an explicit transport preference, still takes the normal authenticated
-mutation lock and remains fail closed if that lock is held by another
-operation.
+before the bytes are trusted. Connector transport resolution also opens the
+canonical `.lcm` root without following a symlink and retains that directory
+descriptor across both snapshots and both publication admissions, rejecting a
+root replacement or unsafe publication root. Any subsequent configuration
+write, including an explicit transport preference, still takes the normal
+authenticated mutation lock and remains fail closed if that lock is held by
+another operation.
 
 The remaining doctor stages that take the exclusive publication lock (the
 project-map validation and repair, the worktree reconciliation listing, and
@@ -139,13 +142,16 @@ contention propagates unchanged and doctor reports the stage as failed.
 
 The retry budget is a single two-second wall-clock window shared by every
 stage of one doctor run, polled at most every 50 milliseconds. Time spent
-inside a refused attempt and inside the authenticated health probe counts
-against that window; the final wait is shortened to whatever remains. Once the
-window is spent no further retries occur in that run. This is what prevents a
-healthy managed daemon's short background publication reconciliation
-immediately after `lcm install` from failing the next `lcm doctor` or
-`lcm connectors install codex`; it does not wait for a stuck or foreign
-lock holder.
+inside a refused attempt, the platform process-birth probe, and the
+authenticated health probe counts against that window. On platforms that need
+an external trusted process-birth helper, its timeout is shortened to the
+remaining shared budget; doctor recomputes the budget again before reading the
+daemon token or starting the health exchange. The final wait is likewise
+shortened to whatever remains. Once the window is spent no further retries
+occur in that run. This is what prevents a healthy managed daemon's short
+background publication reconciliation immediately after `lcm install` from
+failing the next `lcm doctor` or `lcm connectors install codex`; it does not
+wait for a stuck or foreign lock holder.
 
 ## Daemon-dependent resilience
 

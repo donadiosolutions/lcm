@@ -9,6 +9,7 @@ import { doctorConfigReadFailureSeams, doctorConfigSeams } from "./config-seams.
 import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-publication-journal.js";
 import {
   PrivateMutationLockContentionError,
+  processStartTime as observedProcessStartTime,
   readPrivateMutationLockOwner,
 } from "../../src/private-mutation-lock.js";
 import { renderGuidance } from "../../src/connectors/template-service.js";
@@ -140,8 +141,8 @@ function minimalDeps(overrides: DoctorOverrides = {}): DoctorDeps {
 }
 
 function writeLivePublicationOwner(home: string): void {
-  const stat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
-  const processStartTime = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? "";
+  const processStartTime = observedProcessStartTime(process.pid);
+  if (processStartTime === null) throw new Error("current process birth time is unavailable");
   writeFileSync(join(home, ".lcm.backend-publication.lock"), `${JSON.stringify({
     version: 1,
     pid: process.pid,
@@ -813,6 +814,70 @@ describe("runDoctor project map checks", () => {
     try {
       const results = await runDoctor(deps);
       expect(readOwner).toHaveBeenCalledOnce();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(sleeps).toEqual([]);
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("fail");
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds owner birth verification to the remaining budget and recomputes before health", async () => {
+    const { home } = contentionHome("lcm-doctor-owner-birth-budget-");
+    writeLivePublicationOwner(home);
+    const owner = readPrivateMutationLockOwner(join(home, ".lcm.backend-publication.lock"));
+    if (owner === null || owner.processStartTime === null) throw new Error("live owner fixture is unavailable");
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const { deps, sleeps, clock, fetch, restore } = convergenceDeps(home);
+    const processBirth = vi.fn((
+      _pid: number,
+      _observer: Parameters<typeof observedProcessStartTime>[1],
+      options?: { timeoutMs?: number },
+    ) => {
+      expect(options?.timeoutMs).toBe(10);
+      clock.now = 2_000;
+      return owner.processStartTime;
+    });
+    deps._processStartTimeForTesting = processBirth;
+    vi.mocked(ensureDaemon).mockImplementationOnce(async () => {
+      clock.now = 1_990;
+      throw contention;
+    });
+    try {
+      const results = await runDoctor(deps);
+      expect(processBirth).toHaveBeenCalledOnce();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(sleeps).toEqual([]);
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("fail");
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("recomputes the remaining budget after reading the daemon token", async () => {
+    const { home } = contentionHome("lcm-doctor-token-budget-");
+    writeLivePublicationOwner(home);
+    const owner = readPrivateMutationLockOwner(join(home, ".lcm.backend-publication.lock"));
+    if (owner === null || owner.processStartTime === null) throw new Error("live owner fixture is unavailable");
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const { deps, sleeps, clock, fetch, restore } = convergenceDeps(home);
+    deps._processStartTimeForTesting = () => owner.processStartTime;
+    const readFile = deps.readFileSync;
+    deps.readFileSync = (path, encoding) => {
+      if (path.endsWith("daemon.token")) {
+        clock.now = 2_000;
+        return "doctor-token";
+      }
+      return readFile(path, encoding);
+    };
+    vi.mocked(ensureDaemon).mockImplementationOnce(async () => {
+      clock.now = 1_990;
+      throw contention;
+    });
+    try {
+      const results = await runDoctor(deps);
       expect(fetch).toHaveBeenCalledOnce();
       expect(sleeps).toEqual([]);
       expect(results.find((result) => result.name === "daemon")?.status).toBe("fail");
