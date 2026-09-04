@@ -4,20 +4,21 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 
-function runNpm(args, cwd, ignoreScripts = true) {
-  const result = spawnSync(npmCommand, args, {
+function runPackageManager(manager, args, cwd, spawn, ignoreScripts = true) {
+  const command = process.platform === "win32" ? `${manager}.cmd` : manager;
+  const result = spawn(command, args, {
     cwd,
     encoding: "utf8",
     env: {
@@ -29,7 +30,7 @@ function runNpm(args, cwd, ignoreScripts = true) {
   });
   if (result.status !== 0) {
     throw new Error(
-      `npm ${args.join(" ")} failed in ${cwd}\n${result.stdout}\n${result.stderr}`,
+      `${manager} ${args.join(" ")} failed in ${cwd}\n${result.stdout}\n${result.stderr}`,
     );
   }
   return result.stdout;
@@ -128,13 +129,13 @@ export function verifyCli(directory, scratchRoot, {
   return result.stdout.trim();
 }
 
-function verifyPostgreSqlApi(directory) {
+function verifyPostgreSqlApi(directory, spawn) {
   const source = `
     const api = await import("@donadiosolutions/lcm/storage/postgresql");
     if (typeof api.createPostgreSqlStorageBackendFactory !== "function") process.exit(2);
     if ("createPostgreSqlStorageBackendFactoryForTesting" in api) process.exit(3);
   `;
-  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+  const result = spawn(process.execPath, ["--input-type=module", "--eval", source], {
     cwd: directory,
     encoding: "utf8",
   });
@@ -145,7 +146,8 @@ function verifyPostgreSqlApi(directory) {
   }
 }
 
-function executeConsumerTopology(scratch) {
+export function executeConsumerTopology(scratch, { spawn = spawnSync } = {}) {
+  const runNpm = (args, cwd) => runPackageManager("npm", args, cwd, spawn);
   const rootRequire = createRequire(join(root, "package.json"));
   const sdkServer = rootRequire.resolve("@modelcontextprotocol/sdk/server/index.js");
   const expressManifest = createRequire(sdkServer).resolve("express/package.json");
@@ -161,7 +163,7 @@ function executeConsumerTopology(scratch) {
     + `sdk-ajv-fast-uri=3.1.5 @ ${fastUriManifest}`,
   );
 
-  runNpm(["run", "build"], root, false);
+  runPackageManager("pnpm", ["run", "build"], root, spawn, false);
   const packOutput = runNpm([
     "pack",
     "--json",
@@ -196,9 +198,9 @@ function executeConsumerTopology(scratch) {
       throw new Error(`${label} packed package changed the independently pinned Hono dependency`);
     }
     verifyNoPublishedBuildDependencies(directory, label);
-    verifyPostgreSqlApi(directory);
+    verifyPostgreSqlApi(directory, spawn);
     console.log(
-      `${label}: lcm=${pkg.version} external-sdk=absent cli=${verifyCli(directory, scratch)}`,
+      `${label}: lcm=${pkg.version} external-sdk=absent cli=${verifyCli(directory, scratch, { spawn })}`,
     );
   }
 
@@ -218,10 +220,16 @@ function defaultCleanupFailureReporter(scratchPath, cleanupError) {
 
 export function runConsumerTopology({
   execute = executeConsumerTopology,
+  temporaryRoot = tmpdir(),
   cleanup = (path) => rmSync(path, { recursive: true, force: true }),
   reportCleanupFailure = defaultCleanupFailureReporter,
 } = {}) {
-  const scratch = mkdtempSync(join(tmpdir(), "lcm-consumer-topology-"));
+  const relativeRoot = relative(realpathSync(root), realpathSync(temporaryRoot));
+  if (relativeRoot !== ".." && !relativeRoot.startsWith(`..${sep}`)
+      && !isAbsolute(relativeRoot)) {
+    throw new Error("Consumer temporary root must be outside the repository");
+  }
+  const scratch = mkdtempSync(join(temporaryRoot, "lcm-consumer-topology-"));
   let verificationError;
   let verificationFailed = false;
   let result;

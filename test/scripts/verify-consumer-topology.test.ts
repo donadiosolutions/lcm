@@ -488,3 +488,76 @@ describe("verify-consumer-topology", () => {
     }
   });
 });
+
+describe("consumer package manager boundary", () => {
+  it("builds with pnpm and packs and installs both consumers with npm", async () => {
+    const module = await import(scriptPath);
+    const scratch = isolatedRoot("verify-managers-");
+    const commands: Array<{ command: string; args: string[]; cwd: string; env?: NodeJS.ProcessEnv }> = [];
+    try {
+      module.executeConsumerTopology(scratch, {
+        spawn: (command: string, args: string[], options: { cwd: string; env?: NodeJS.ProcessEnv }) => {
+          commands.push({ command, args, ...options });
+          if (args[0] === "pack") {
+            return { status: 0, stdout: JSON.stringify([{ filename: "lcm.tgz" }]), stderr: "" };
+          }
+          if (args[0] === "install") {
+            const packageRoot = join(options.cwd, "node_modules", "@donadiosolutions", "lcm");
+            mkdirSync(packageRoot, { recursive: true });
+            writeFileSync(join(packageRoot, "package.json"), JSON.stringify({
+              version: "1.0.0", dependencies: { "@hono/node-server": "2.0.12" },
+            }));
+            if (args.includes("body-parser@2.2.2")) {
+              for (const [name, version] of [["body-parser", "2.2.2"], ["fast-uri", "3.1.0"]]) {
+                const dependency = join(options.cwd, "node_modules", name!);
+                mkdirSync(dependency, { recursive: true });
+                writeFileSync(join(dependency, "package.json"), JSON.stringify({ version }));
+              }
+            }
+          }
+          return { status: 0, stdout: "1.0.0\n", stderr: "" };
+        },
+      });
+      const packageCommands = commands.filter(({ command }) => command !== process.execPath);
+      expect(packageCommands.map(({ command, args }) => [command, args[0]])).toEqual([
+        [process.platform === "win32" ? "pnpm.cmd" : "pnpm", "run"],
+        [process.platform === "win32" ? "npm.cmd" : "npm", "pack"],
+        [process.platform === "win32" ? "npm.cmd" : "npm", "install"],
+        [process.platform === "win32" ? "npm.cmd" : "npm", "install"],
+      ]);
+      expect(packageCommands[0]!.args).toEqual(["run", "build"]);
+      expect(packageCommands[0]!.env?.npm_config_ignore_scripts).toBe("false");
+      expect(packageCommands.slice(1).every(({ env }) => env?.npm_config_ignore_scripts === "true"))
+        .toBe(true);
+      expect(packageCommands.slice(2).every(({ cwd }) => isStrictDescendant(scratch, cwd))).toBe(true);
+      expect(commands.filter(({ command }) => command === process.execPath)).toHaveLength(4);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("stops before npm packing when the pnpm build fails", async () => {
+    const module = await import(scriptPath);
+    const scratch = isolatedRoot("verify-build-failure-");
+    const calls: string[] = [];
+    try {
+      expect(() => module.executeConsumerTopology(scratch, {
+        spawn: (command: string) => {
+          calls.push(command);
+          return { status: 1, stdout: "build output", stderr: "compiler failure" };
+        },
+      })).toThrow(/pnpm run build failed.*[\s\S]*compiler failure/u);
+      expect(calls).toEqual([process.platform === "win32" ? "pnpm.cmd" : "pnpm"]);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a consumer temporary directory within the repository configuration tree", async () => {
+    const module = await import(scriptPath);
+    const execute = vi.fn();
+    expect(() => module.runConsumerTopology({ temporaryRoot: repositoryRoot, execute }))
+      .toThrow("Consumer temporary root must be outside the repository");
+    expect(execute).not.toHaveBeenCalled();
+  });
+});
