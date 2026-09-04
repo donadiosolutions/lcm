@@ -25,8 +25,22 @@ const mocks = vi.hoisted(() => ({
   normalize: vi.fn((client: unknown) => client ?? "claude"),
   scrubCounts: vi.fn((content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 })),
   forProject: vi.fn(async () => ({ scrubWithCounts: mocks.scrubCounts })),
-  identity: vi.fn((cwd: string) => ({ id: "pid", canonical: cwd })),
+  identity: vi.fn((cwd: string) => ({
+    id: "pid",
+    localProjectId: "pid",
+    canonical: cwd,
+    machineId: "machine-id",
+    selectedPath: cwd,
+  })),
   ensureProject: vi.fn(),
+  ensureProjectForIdentity: vi.fn((identity: { id: string }) => `/lcm/projects/${identity.id}`),
+  pathsForIdentity: vi.fn((identity: { id: string; canonical: string; remoteProjectId?: string }) => ({
+    ...identity,
+    dir: `/lcm/projects/${identity.id}`,
+    dbPath: `/lcm/projects/${identity.id}/db.sqlite`,
+    metaPath: `/lcm/projects/${identity.id}/meta.json`,
+  })),
+  openProject: vi.fn(),
   send: vi.fn(),
   logError: vi.fn(),
 }));
@@ -49,8 +63,10 @@ vi.mock("../../../src/db/connection.js", () => ({
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
   projectPaths: (cwd: string) => ({ id: "pid", dir: `${cwd}/project`, dbPath: `${cwd}/lcm.db`, metaPath: `${cwd}/meta.json`, canonical: cwd }),
+  projectPathsForIdentity: mocks.pathsForIdentity,
   projectIdentity: mocks.identity,
   ensureProjectDir: mocks.ensureProject,
+  ensureProjectDirForIdentity: mocks.ensureProjectForIdentity,
   isSafeTranscriptPath: mocks.safeTranscript,
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
@@ -69,7 +85,8 @@ vi.mock("../../../src/store/summary-store.js", () => ({
 }));
 vi.mock("../../../src/storage/index.js", () => ({
   createStorageBackendFactory: async () => ({
-    openProject: async () => {
+    openProject: async (...args: unknown[]) => {
+      mocks.openProject(...args);
       mocks.getConnection();
       const repositories = {
         conversations: {
@@ -141,7 +158,20 @@ describe("ingest persistence boundaries", () => {
     mocks.normalize.mockImplementation((client: unknown) => client ?? "claude");
     mocks.scrubCounts.mockImplementation((content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }));
     mocks.forProject.mockImplementation(async () => ({ scrubWithCounts: mocks.scrubCounts }));
-    mocks.identity.mockImplementation((cwd: string) => ({ id: "pid", canonical: cwd }));
+    mocks.identity.mockImplementation((cwd: string) => ({
+      id: "pid",
+      localProjectId: "pid",
+      canonical: cwd,
+      machineId: "machine-id",
+      selectedPath: cwd,
+    }));
+    mocks.ensureProjectForIdentity.mockImplementation(identity => `/lcm/projects/${identity.id}`);
+    mocks.pathsForIdentity.mockImplementation(identity => ({
+      ...identity,
+      dir: `/lcm/projects/${identity.id}`,
+      dbPath: `/lcm/projects/${identity.id}/db.sqlite`,
+      metaPath: `/lcm/projects/${identity.id}/meta.json`,
+    }));
   });
 
   it("validates required fields and typed cwd failures", async () => {
@@ -302,7 +332,7 @@ describe("ingest persistence boundaries", () => {
       totalTokens: 7,
     });
     expect(mocks.getConnection).toHaveBeenCalledOnce();
-    expect(mocks.ensureProject.mock.invocationCallOrder[0])
+    expect(mocks.ensureProjectForIdentity.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.getConnection.mock.invocationCallOrder[0]);
   });
 
@@ -315,8 +345,8 @@ describe("ingest persistence boundaries", () => {
     }));
 
     expect(mocks.identity.mock.invocationCallOrder[0])
-      .toBeLessThan(mocks.ensureProject.mock.invocationCallOrder[0]);
-    expect(mocks.ensureProject.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.ensureProjectForIdentity.mock.invocationCallOrder[0]);
+    expect(mocks.ensureProjectForIdentity.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.forProject.mock.invocationCallOrder[0]);
     expect(mocks.forProject.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.getConnection.mock.invocationCallOrder[0]);
@@ -336,5 +366,112 @@ describe("ingest persistence boundaries", () => {
     expect(admission).toHaveBeenCalledOnce();
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 0, totalTokens: 0 });
     expect(mocks.getConnection).toHaveBeenCalledOnce();
+  });
+
+  it("blocks live identity drift after selecting scrubber patterns from the preflight identity", async () => {
+    const preflight = {
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      localProjectId: "local-hash-a",
+      canonical: "/work/project",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      machineId: "machine-id",
+      selectedPath: "/work/project",
+    };
+    const live = {
+      ...preflight,
+      canonical: "/work/different",
+    };
+    mocks.identity.mockReturnValueOnce(preflight).mockReturnValueOnce(live);
+    const order: string[] = [];
+    mocks.forProject.mockImplementationOnce(async () => {
+      order.push("scrubber");
+      return { scrubWithCounts: mocks.scrubCounts };
+    });
+    const admission = vi.fn(async (operation: (token: object) => Promise<unknown>) => {
+      order.push("admission");
+      return operation({});
+    });
+
+    await createIngestHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "drift", cwd: preflight.canonical, messages: [validMessage] }),
+      { withPublicationAdmission: admission, signal: new AbortController().signal },
+    );
+
+    const localIdentity = {
+      id: preflight.localProjectId,
+      canonical: preflight.canonical,
+      remoteProjectId: preflight.remoteProjectId,
+    };
+    expect(mocks.pathsForIdentity).toHaveBeenCalledWith(localIdentity);
+    expect(mocks.ensureProjectForIdentity).toHaveBeenCalledWith(localIdentity);
+    expect(mocks.forProject).toHaveBeenCalledWith(
+      config.security.sensitivePatterns,
+      `/lcm/projects/${preflight.localProjectId}`,
+    );
+    expect(order).toEqual(["scrubber", "admission"]);
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    expect(mocks.openProject).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.createBulk).not.toHaveBeenCalled();
+    expect(mocks.logError).not.toHaveBeenCalled();
+  });
+
+  it("blocks PostgreSQL remote-only drift even when there are no messages", async () => {
+    const preflight = {
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      localProjectId: "local-hash-empty",
+      canonical: "/work/empty",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      machineId: "machine-id",
+      selectedPath: "/work/empty",
+    };
+    const live = {
+      ...preflight,
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
+    };
+    mocks.identity.mockReturnValueOnce(preflight).mockReturnValueOnce(live);
+
+    await createIngestHandler(postgresqlConfig)(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "remote-drift-empty", cwd: preflight.canonical, messages: [] }),
+      { withPublicationAdmission: operation => operation({}) },
+    );
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    expect(mocks.openProject).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.logError).not.toHaveBeenCalled();
+  });
+
+  it("passes the matching preflight identity through the live storage open", async () => {
+    const identity = {
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      localProjectId: "local-hash-same",
+      canonical: "/work/same",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      machineId: "machine-id",
+      selectedPath: "/work/same",
+    };
+    mocks.identity.mockReturnValue(identity);
+
+    await createIngestHandler(postgresqlConfig)(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "same", cwd: identity.canonical, messages: [validMessage] }),
+      { withPublicationAdmission: operation => operation({}) },
+    );
+
+    expect(mocks.openProject).toHaveBeenCalledWith(identity, expect.any(Object), expect.any(AbortSignal));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
   });
 });

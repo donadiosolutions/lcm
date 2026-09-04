@@ -55,6 +55,7 @@ import {
 import {
   closeRouteStorage,
   createCommitCloseBarrier,
+  sameStorageIdentity,
   stagedPostgreSqlFactoryUnavailableResponse,
   storageRouteFailureResponse,
 } from "./storage-lifecycle.js";
@@ -251,16 +252,6 @@ function admittedProjectStorage(
     // Cleanup must remain possible after an admission failure.
     close: () => project.close(),
   };
-}
-
-function sameStorageIdentity(
-  expected: StorageIdentityContext & { readonly localProjectId: string },
-  actual: StorageIdentityContext & { readonly localProjectId: string },
-): boolean {
-  return expected.id === actual.id
-    && expected.localProjectId === actual.localProjectId
-    && expected.canonical === actual.canonical
-    && expected.remoteProjectId === actual.remoteProjectId;
 }
 
 function routeInvocationTarget(

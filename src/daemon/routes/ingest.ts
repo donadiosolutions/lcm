@@ -1,8 +1,8 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { DaemonConfig } from "../config.js";
 import {
-  projectPaths,
-  ensureProjectDir,
+  projectPathsForIdentity,
+  ensureProjectDirForIdentity,
   isSafeTranscriptPath,
   projectIdentity,
 } from "../project.js";
@@ -15,6 +15,7 @@ import { validateCwd } from "../validate-cwd.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
 import { storageRouteFailureResponse, withProjectStorage } from "./storage-lifecycle.js";
+import { BackendPublicationJournalError } from "../../storage/backend-publication.js";
 
 function isParsedMessage(value: unknown): value is ParsedMessage {
   if (!value || typeof value !== "object") return false;
@@ -64,8 +65,19 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
     try {
       // Preserve the route's early identity/configuration rejection while the
       // lifecycle helper re-resolves the identity with its live admission token.
-      projectIdentity(cwd, config.storage, context?.publicationLockToken);
-      const paths = projectPaths(cwd, context?.publicationLockToken);
+      const storageIdentity = projectIdentity(
+        cwd,
+        config.storage,
+        context?.publicationLockToken,
+      );
+      const localIdentity = {
+        id: storageIdentity.localProjectId,
+        canonical: storageIdentity.canonical,
+        ...(storageIdentity.remoteProjectId === undefined
+          ? {}
+          : { remoteProjectId: storageIdentity.remoteProjectId }),
+      };
+      const paths = projectPathsForIdentity(localIdentity);
       const resolvedMessages = resolveMessages(input, cwd);
       if (config.storage.backend === "sqlite" && resolvedMessages.length === 0) {
         sendJson(res, 200, { ingested: 0, totalTokens: 0 });
@@ -73,7 +85,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       }
       const scrubber = resolvedMessages.length > 0
         ? await (async () => {
-            ensureProjectDir(cwd, context?.publicationLockToken);
+            ensureProjectDirForIdentity(localIdentity);
             return ScrubEngine.forProject(
               config.security?.sensitivePatterns ?? [],
               paths.dir,
@@ -82,7 +94,14 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         : undefined;
 
       const ingest = await withProjectStorage(
-        { config, cwd, factory: storageFactory, context, mode: "create" },
+        {
+          config,
+          cwd,
+          factory: storageFactory,
+          context,
+          mode: "create",
+          expectedIdentity: storageIdentity,
+        },
         async (project) => {
           if (resolvedMessages.length === 0) return null;
 
@@ -161,6 +180,13 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         ...(totalRedacted > 0 ? { redacted: totalRedacted, redactedCategories: redactionCategories } : {}),
       });
     } catch (err) {
+      if (err instanceof BackendPublicationJournalError) {
+        sendJson(res, 503, {
+          status: "blocked",
+          error: "backend publication admission blocked",
+        });
+        return;
+      }
       await safeLogError("ingest", err, { cwd, sessionId: session_id });
       const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "ingest", storageFactory);
       if (storageFailure) {

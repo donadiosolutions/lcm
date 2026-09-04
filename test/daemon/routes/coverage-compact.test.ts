@@ -303,6 +303,7 @@ import { BackendPublicationJournalError } from "../../../src/storage/backend-pub
 import {
   createAbortError,
 } from "../../../src/daemon/cancellation.js";
+import { sameStorageIdentity } from "../../../src/daemon/routes/storage-lifecycle.js";
 import {
   createInvocationCoordinator,
   InvocationCoordinatorError,
@@ -418,6 +419,30 @@ describe("compact route coverage", () => {
       .toContain("1.0M");
     expect(buildCompactionMessage({ tokensBefore: 0, tokensAfter: 0, messageCount: 0, summaryCount: 0, maxDepth: 0, promotedCount: 0 }))
       .toContain("0.0% saved");
+  });
+
+  it("uses the shared full storage identity comparison contract", () => {
+    const expected = {
+      id: "remote-a",
+      localProjectId: "local-a",
+      canonical: "/work/project",
+      remoteProjectId: "remote-a",
+      machineId: "machine-a",
+      selectedPath: "/work/project",
+    };
+    expect(sameStorageIdentity(expected, {
+      ...expected,
+      machineId: "machine-b",
+      selectedPath: "/work/alias",
+    })).toBe(true);
+    for (const actual of [
+      { ...expected, id: "remote-b" },
+      { ...expected, localProjectId: "local-b" },
+      { ...expected, canonical: "/work/other" },
+      { ...expected, remoteProjectId: "remote-b" },
+    ]) {
+      expect(sameStorageIdentity(expected, actual)).toBe(false);
+    }
   });
 
   it("fails PostgreSQL identity before local directory, scrubber, or storage effects", async () => {
@@ -626,7 +651,7 @@ describe("compact route coverage", () => {
     expect(closeFactory).not.toHaveBeenCalled();
   });
 
-  it("revalidates local and remote identity before queued storage setup", async () => {
+  it("revalidates the shared full identity before queued storage setup", async () => {
     const first = {
       id: "local-hash-a",
       canonical: "/work/project",

@@ -17,7 +17,19 @@ const mocks = vi.hoisted(() => ({
   openProject: vi.fn(),
   projectClose: vi.fn(async () => undefined),
   factoryClose: vi.fn(async () => undefined),
-  identity: vi.fn((cwd: string) => ({ id: "pid", canonical: cwd })),
+  identity: vi.fn((cwd: string) => ({
+    id: `pid-${cwd}`,
+    localProjectId: `pid-${cwd}`,
+    canonical: cwd,
+    machineId: "machine-id",
+    selectedPath: cwd,
+  })),
+  pathsForIdentity: vi.fn((identity: { id: string; canonical: string; remoteProjectId?: string }) => ({
+    ...identity,
+    dir: `/lcm/projects/${identity.id}`,
+    dbPath: `/lcm/projects/${identity.id}/db.sqlite`,
+    metaPath: `/lcm/projects/${identity.id}/meta.json`,
+  })),
 }));
 
 vi.mock("node:fs", async (importOriginal) => ({
@@ -31,6 +43,7 @@ vi.mock("../../../src/db/connection.js", () => ({
 vi.mock("../../../src/daemon/project.js", () => ({
   projectDir: (cwd: string) => `${cwd}/project`,
   projectIdentity: mocks.identity,
+  projectPathsForIdentity: mocks.pathsForIdentity,
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/db/migration.js", () => ({ runLcmMigrations: mocks.migrate }));
@@ -58,7 +71,19 @@ describe("store persistence boundaries", () => {
     mocks.scrub.mockImplementation((text: string) => `scrubbed:${text}`);
     mocks.forProject.mockImplementation(async () => ({ scrub: mocks.scrub }));
     mocks.validate.mockImplementation((cwd: string) => cwd);
-    mocks.identity.mockImplementation((cwd: string) => ({ id: "pid", canonical: cwd }));
+    mocks.identity.mockImplementation((cwd: string) => ({
+      id: `pid-${cwd}`,
+      localProjectId: `pid-${cwd}`,
+      canonical: cwd,
+      machineId: "machine-id",
+      selectedPath: cwd,
+    }));
+    mocks.pathsForIdentity.mockImplementation(identity => ({
+      ...identity,
+      dir: `/lcm/projects/${identity.id}`,
+      dbPath: `/lcm/projects/${identity.id}/db.sqlite`,
+      metaPath: `/lcm/projects/${identity.id}/meta.json`,
+    }));
     mocks.getConnection.mockReturnValue({});
     mocks.openProject.mockResolvedValue({
       promotedMemory: { insert: mocks.insert },
@@ -286,5 +311,77 @@ describe("store persistence boundaries", () => {
 
     expect(order).toEqual(["scrubber", "scrub", "admission", "insert"]);
     expect(admission).toHaveBeenCalledOnce();
+  });
+
+  it("blocks live identity drift after selecting scrubber patterns from the preflight identity", async () => {
+    const preflight = {
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      localProjectId: "local-hash-a",
+      canonical: "/work/project",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      machineId: "machine-id",
+      selectedPath: "/work/project",
+    };
+    const live = {
+      ...preflight,
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
+    };
+    mocks.identity.mockReturnValueOnce(preflight).mockReturnValueOnce(live);
+    const order: string[] = [];
+    mocks.forProject.mockImplementationOnce(async () => {
+      order.push("scrubber");
+      return { scrub: mocks.scrub };
+    });
+    const admission = vi.fn(async (operation: (token: object) => Promise<unknown>) => {
+      order.push("admission");
+      return operation({});
+    });
+
+    await createStoreHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ text: "value", cwd: preflight.canonical }),
+      { withPublicationAdmission: admission, signal: new AbortController().signal },
+    );
+
+    expect(mocks.pathsForIdentity).toHaveBeenCalledWith({
+      id: preflight.localProjectId,
+      canonical: preflight.canonical,
+      remoteProjectId: preflight.remoteProjectId,
+    });
+    expect(mocks.forProject).toHaveBeenCalledWith(
+      config.security.sensitivePatterns,
+      `/lcm/projects/${preflight.localProjectId}`,
+    );
+    expect(order).toEqual(["scrubber", "admission"]);
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    expect(mocks.openProject).not.toHaveBeenCalled();
+    expect(mocks.insert).not.toHaveBeenCalled();
+  });
+
+  it("passes the matching preflight identity through the live storage open", async () => {
+    const identity = {
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      localProjectId: "local-hash-same",
+      canonical: "/work/same",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      machineId: "machine-id",
+      selectedPath: "/work/same",
+    };
+    mocks.identity.mockReturnValue(identity);
+
+    await createStoreHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ text: "value", cwd: identity.canonical }),
+      { withPublicationAdmission: operation => operation({}) },
+    );
+
+    expect(mocks.openProject).toHaveBeenCalledWith(identity, expect.any(Object), expect.any(AbortSignal));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { stored: true, id: "stored-id" });
   });
 });

@@ -36,6 +36,19 @@ const mocks = vi.hoisted(() => ({
   dedupObserver: vi.fn(),
   ensureProjectDir: vi.fn(() => "/private/project"),
   scrubForProject: vi.fn(async () => ({ scrub: (text: string) => mocks.scrub(text) })),
+  identity: vi.fn((cwd: string) => ({
+    id: "pid",
+    localProjectId: "pid",
+    canonical: cwd,
+    machineId: "machine-id",
+    selectedPath: cwd,
+  })),
+  pathsForIdentity: vi.fn((identity: { id: string; canonical: string; remoteProjectId?: string }) => ({
+    ...identity,
+    dir: `/lcm/projects/${identity.id}`,
+    dbPath: `/lcm/projects/${identity.id}/db.sqlite`,
+    metaPath: `/lcm/projects/${identity.id}/meta.json`,
+  })),
 }));
 
 vi.mock("node:fs", async (importOriginal) => ({
@@ -47,7 +60,8 @@ vi.mock("node:fs", async (importOriginal) => ({
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
   projectPaths: (cwd: string) => ({ id: "pid", dbPath: `${cwd}/lcm.db`, metaPath: `${cwd}/meta.json`, canonical: cwd }),
-  projectIdentity: (cwd: string) => ({ id: "pid", canonical: cwd }),
+  projectPathsForIdentity: mocks.pathsForIdentity,
+  projectIdentity: mocks.identity,
   ensureProjectDirForIdentity: mocks.ensureProjectDir,
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
@@ -84,6 +98,19 @@ describe("promote persistence boundaries", () => {
     mocks.dedupObserver.mockReset();
     mocks.ensureProjectDir.mockReturnValue("/private/project");
     mocks.scrubForProject.mockResolvedValue({ scrub: (text: string) => mocks.scrub(text) });
+    mocks.identity.mockImplementation((cwd: string) => ({
+      id: "pid",
+      localProjectId: "pid",
+      canonical: cwd,
+      machineId: "machine-id",
+      selectedPath: cwd,
+    }));
+    mocks.pathsForIdentity.mockImplementation(identity => ({
+      ...identity,
+      dir: `/lcm/projects/${identity.id}`,
+      dbPath: `/lcm/projects/${identity.id}/db.sqlite`,
+      metaPath: `/lcm/projects/${identity.id}/meta.json`,
+    }));
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
     mocks.createFactory.mockImplementation(async () => makeMockStorageFactory({
@@ -766,6 +793,84 @@ describe("promote persistence boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
       status: "blocked",
       error: "backend publication admission blocked",
+    });
+  });
+
+  it("blocks live identity drift after selecting scrubber patterns from the preflight identity", async () => {
+    const preflight = {
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      localProjectId: "local-hash-a",
+      canonical: "/work/project",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      machineId: "machine-id",
+      selectedPath: "/work/project",
+    };
+    const live = {
+      ...preflight,
+      localProjectId: "local-hash-b",
+    };
+    mocks.identity.mockReturnValueOnce(preflight).mockReturnValueOnce(live);
+    const order: string[] = [];
+    mocks.scrubForProject.mockImplementationOnce(async () => {
+      order.push("scrubber");
+      return { scrub: mocks.scrub };
+    });
+    const admission = vi.fn(async (operation: (token: object) => Promise<unknown>) => {
+      order.push("admission");
+      return operation({});
+    });
+
+    await createPromoteHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ cwd: preflight.canonical }),
+      { withPublicationAdmission: admission, signal: new AbortController().signal },
+    );
+
+    const localIdentity = {
+      id: preflight.localProjectId,
+      canonical: preflight.canonical,
+      remoteProjectId: preflight.remoteProjectId,
+    };
+    expect(mocks.pathsForIdentity).toHaveBeenCalledWith(localIdentity);
+    expect(mocks.ensureProjectDir).toHaveBeenCalledWith(localIdentity, { writeMetadata: false });
+    expect(mocks.scrubForProject).toHaveBeenCalledWith(
+      config.security.sensitivePatterns,
+      "/private/project",
+    );
+    expect(order).toEqual(["scrubber", "admission"]);
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    expect(mocks.openProject).not.toHaveBeenCalled();
+    expect(mocks.dedup).not.toHaveBeenCalled();
+    expect(mocks.write).not.toHaveBeenCalled();
+  });
+
+  it("passes the matching preflight identity through the live storage open", async () => {
+    const identity = {
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      localProjectId: "local-hash-same",
+      canonical: "/work/same",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      machineId: "machine-id",
+      selectedPath: "/work/same",
+    };
+    mocks.identity.mockReturnValue(identity);
+
+    await createPromoteHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ cwd: identity.canonical, dry_run: true }),
+      { withPublicationAdmission: operation => operation({}) },
+    );
+
+    expect(mocks.openProject).toHaveBeenCalledWith(identity, expect.any(Object), expect.any(AbortSignal));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
     });
   });
 
