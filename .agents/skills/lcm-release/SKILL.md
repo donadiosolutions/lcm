@@ -46,6 +46,9 @@ to npm.
 
 ## Prerequisites
 
+- Use the verified pnpm bootstrap described in [development guidance](../../../../docs/development.md) for development installs and commands. Install dependencies with `pnpm install --frozen-lockfile`; do not install pnpm globally.
+- New unpublished release tags must contain `pnpm-lock.yaml`, `.npmrc`, `pnpm-workspace.yaml`, the integrity-pinned `packageManager`, and the bootstrap script. npm-only historical tags cannot be rebuilt; already published versions retain verification-only recovery before pnpm prerequisites.
+
 - All feature PRs for this release are merged into `main`
 - `gh` CLI is authenticated
 - Git tag signing is configured with an available signing key and agent, and
@@ -62,6 +65,8 @@ to npm.
 - **Step 8 is idempotent** for a valid one-sided tag by pushing the local copy or fetching the remote copy; when both copies exist, their signed tag object and expected commit must match exactly
 - **Release PRs target `main`**
 - **Use `--merge`** (not squash) so the version bump SHA is preserved on main
+- **Version-only changes leave `pnpm-lock.yaml` unchanged**. Step 3 writes the validated version with Node; step 4 stages `package.json` and `CHANGELOG.md`.
+- **npm owns distribution**: builds and checks use `pnpm run`, while packing stays `npm pack --ignore-scripts` and trusted publishing stays npm.
 - **`package.json` is the package version source of truth**; generated runtime
   and native connector resources carry no independent release version
 - **CHANGELOG.md must include the release version block** before `publish.yml` creates the draft

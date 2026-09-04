@@ -72,10 +72,11 @@ fingerprint preflight is the failed contract, then rerun readiness.
 ## Run the conformance harness
 
 Docker and the runner-provided OpenSSL must be available. From a clean checkout
-with dependencies installed, run:
+with the [verified pnpm toolchain](../../../../docs/development.md) bootstrapped
+and dependencies installed using `pnpm install --frozen-lockfile`, run:
 
 ```bash
-npm run test:postgresql
+pnpm run test:postgresql
 ```
 
 The same command runs locally and in CI. Locally it publishes a cryptographically
@@ -98,7 +99,7 @@ PostgreSQL instance, the default Unix socket, `localhost:5432`,
 `LCM_POSTGRES_URL`, and every `PG*` environment variable are invalid harness
 inputs and are never test targets.
 
-Run PostgreSQL integration files only through `npm run test:postgresql`.
+Run PostgreSQL integration files only through `pnpm run test:postgresql`.
 Invoking Vitest directly is intentionally unsupported: without the
 harness-generated run identity, database names, roles, connection URLs, and
 certificate fixtures, readiness fails before migration or test-database
@@ -232,7 +233,7 @@ recognized adapter without adding its manifest registration and contract is a
 type-check failure; registering a contract for a domain without an exposed
 adapter is also rejected. The dedicated
 `tsconfig.postgresql-conformance.json` project keeps this test-only manifest in
-the existing `npm run typecheck` and CI gate without adding it to the production
+the existing `pnpm run typecheck` and CI gate without adding it to the production
 build or public runtime API.
 
 The staged manifest currently registers conversations; summaries, context, and
@@ -261,7 +262,7 @@ The manifest is an enforcement gate, not daemon/CLI activation.
 ## Add or change a migration
 
 Migration files live in `src/storage/postgresql/migrations/`, use an ordered
-four-digit prefix, and are copied to `dist` by `npm run build`. After changing a
+four-digit prefix, and are copied to `dist` by `pnpm run build`. After changing a
 file, calculate its SHA-256 digest and update the explicit manifest in
 `src/storage/postgresql/migrations.ts`. Never edit an already released
 migration: checksum drift is rejected. Add a new migration instead.
@@ -590,7 +591,7 @@ The PostgreSQL and CI-only Node references in
    provides the expected entrypoint, OpenSSL compatibility, extensions, and
    Debian base.
 4. Replace both tag and full digest in the harness, update the image assertions,
-   and run `npm run test:postgresql` locally and through both CI matrix jobs.
+   and run `pnpm run test:postgresql` locally and through both CI matrix jobs.
    The stable required `ci` check depends on the complete matrix, so any
    PostgreSQL conformance failure blocks admission even when core CI passes.
 5. Confirm the reports and failure output contain no connection URL, password,

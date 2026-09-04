@@ -42,4 +42,6 @@ A major package Changeset also selects Breaking changes.
 - [ ] New routes have tests in `test/daemon/routes/`
 - [ ] Multi-step writes use transactions
 - [ ] Schema migrations are additive only
-- [ ] Test suite passes: `npm test`
+- [ ] Relevant local tests pass: `pnpm exec vitest run <test-files>`
+- [ ] Fresh exact-head CI passes `pnpm run test:ci` with 100% line, branch, function, and statement coverage
+- [ ] Dependency changes use exact versions and update `pnpm-lock.yaml`; `pnpm install --frozen-lockfile` succeeds

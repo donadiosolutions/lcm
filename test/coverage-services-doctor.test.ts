@@ -1401,7 +1401,10 @@ describe("doctor service coverage", () => {
     validation = { ok: true, fixApplied: false, warnings: [], errors: [], path: mapPath, map: { one: {}, two: {} } };
     const finalResults = await isolated.runDoctor(makeDeps({ settings: { mcpServers: { lcm: {} } } }));
     expect(finalResults.find((result) => result.name === "project-map")?.message).toContain("2 mapped projects");
-    expect(finalResults.find((result) => result.name === "secret-detection")?.status).toBe("fail");
+    expect(finalResults.find((result) => result.name === "secret-detection")).toMatchObject({
+      status: "fail",
+      message: "No gitleaks patterns were loaded (GITLEAKS_PATTERNS is empty) — run pnpm run update:patterns from an LCM source checkout",
+    });
     expect(finalResults.find((result) => result.name === "mcp-lcm")?.status).toBe("warn");
 
     vi.resetModules();

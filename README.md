@@ -587,13 +587,24 @@ the daemon's publication, identity, cancellation, shutdown, or privacy gates.
 
 ## Development
 
+Repository development uses the exact pnpm version and SHA-512 integrity pin in
+`package.json`. Node remains the runtime; published packages are installed with
+npm. Bootstrap the verified manager locally rather than installing pnpm globally:
+
 ```bash
-npm install
-npm run build
-npx vitest
-npx tsc --noEmit
-npm run test:postgresql
+mkdir -p .superpowers/pnpm
+pnpm_bootstrap_root="$(mktemp -d "$PWD/.superpowers/pnpm/run.XXXXXXXX")"
+pnpm_bin="$(node scripts/bootstrap-pnpm.mjs --destination "$pnpm_bootstrap_root/verified")"
+export PATH="$pnpm_bin:$PATH"
+pnpm install --frozen-lockfile
+pnpm run build
+pnpm exec vitest
+pnpm run typecheck
+pnpm run test:postgresql
 ```
+
+See [Development](docs/development.md) for dependency changes, focused tests,
+source installation, and `pnpm run update:patterns`.
 
 The PostgreSQL command owns an exact PostgreSQL 18 container and all temporary
 TLS, network, volume, credential, and database resources. See

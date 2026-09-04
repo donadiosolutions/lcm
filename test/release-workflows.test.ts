@@ -144,7 +144,7 @@ describe("release workflows", () => {
     expect(changesets?.with).toMatchObject({
       branch: "main",
       commitMode: "github-api",
-      version: "npm run version-packages",
+      version: "pnpm run version-packages",
       createGithubReleases: false,
     });
     expect(changesets?.env?.LCM_RELEASE_CHANNEL).toBe("${{ steps.channel.outputs.channel }}");
@@ -169,6 +169,37 @@ describe("release workflows", () => {
     expect(releasePolicyLabels?.with?.script).toContain('if (error.status !== 404) throw error');
     expect(releasePolicyLabels?.with?.script).not.toContain('"chore"');
     expect(releasePolicyLabels?.with?.script).not.toContain('"release-workflow"');
+  });
+
+  it("bootstraps exact pnpm before a separate store cache and frozen install", () => {
+    for (const job of [versionWorkflow.jobs.version, publishWorkflow.jobs.draft, publishWorkflow.jobs.preflight, publishWorkflow.jobs["recover-preflight"]]) {
+      const index = (name: string) => job.steps.findIndex((step) => step.name === name);
+      const bootstrap = job.steps[index("Bootstrap verified pnpm")];
+      expect(index("Setup Node")).toBeLessThan(index("Bootstrap verified pnpm"));
+      expect(bootstrap.run).toContain('mktemp -d "$RUNNER_TEMP/pnpm-bootstrap.XXXXXX"');
+      expect(bootstrap.run).toContain('node scripts/bootstrap-pnpm.mjs --destination "$parent/verified" >> "$GITHUB_PATH"');
+      expect(index("Bootstrap verified pnpm")).toBeLessThan(index("Locate pnpm store"));
+      expect(index("Locate pnpm store")).toBeLessThan(index("Cache pnpm store"));
+      expect(index("Cache pnpm store")).toBeLessThan(index("Install dependencies"));
+      const cache = job.steps[index("Cache pnpm store")];
+      expect(cache.uses).toBe("actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306");
+      expect(cache.with?.path).toBe("${{ steps.pnpm-store.outputs.path }}");
+      const prefix = job.defaults?.run["working-directory"] === "release" ? "release/" : "";
+      for (const name of ["package.json", "pnpm-lock.yaml", ".npmrc", "pnpm-workspace.yaml", "scripts/bootstrap-pnpm.mjs"]) {
+        expect(cache.with?.key).toContain(`'${prefix}${name}'`);
+      }
+      expect(job.steps[index("Install dependencies")].run).toBe("pnpm install --frozen-lockfile");
+    }
+    for (const job of [publishWorkflow.jobs.draft, publishWorkflow.jobs.preflight, publishWorkflow.jobs["recover-preflight"]]) {
+      const validationIndex = job.steps.findIndex((step) => step.name === "Validate tagged pnpm inputs");
+      expect(validationIndex).toBeLessThan(job.steps.findIndex((step) => step.name === "Bootstrap verified pnpm"));
+      expect(job.steps[validationIndex].run).toContain("trusted/.github/scripts/check-pnpm-release-inputs.mjs .");
+    }
+    for (const job of [publishWorkflow.jobs.publish, publishWorkflow.jobs["recover-publish"]]) {
+      expect(JSON.stringify(job.steps)).not.toMatch(/pnpm|bootstrap|npm (ci|install|run)/u);
+      expect(job.steps.filter((step) => step.uses?.startsWith("actions/checkout"))).toHaveLength(1);
+      expect(job.steps.find((step) => step.uses?.startsWith("actions/checkout"))?.with?.["sparse-checkout"]).toBe(".github/scripts");
+    }
   });
 
   it("separates tag-driven drafts from manually published npm releases", () => {
@@ -342,7 +373,7 @@ describe("release workflows", () => {
     expect(publishTarballSource).toContain('"public"');
     expect(publishTarballSource).toContain('"--tag"');
     expect(publishSource).toContain("assertActionCreatedReleaseBody");
-    expect(publishSource.match(/npm run test:ci/gu)).toHaveLength(3);
+    expect(publishSource.match(/pnpm run test:ci/gu)).toHaveLength(3);
     const draftNpmState = publishWorkflow.jobs.draft.steps.find(
       (step: WorkflowStep): boolean => step.name === "Check npm release ordering",
     );
@@ -577,6 +608,10 @@ describe("release workflows", () => {
     expect(recoveryNpmState?.id).toBe("npm");
     expect(recoveryNpmState?.run).toContain('>> "$GITHUB_OUTPUT"');
     const recoveryBuildSteps = [
+      "Validate tagged pnpm inputs",
+      "Bootstrap verified pnpm",
+      "Locate pnpm store",
+      "Cache pnpm store",
       "Install dependencies",
       "Verify trusted publishing prerequisites",
       "Type-check",
@@ -590,6 +625,9 @@ describe("release workflows", () => {
     for (const name of recoveryBuildSteps) {
       expect(recoveryPreflight.steps.find((step) => step.name === name)?.if).toBe(
         "${{ steps.npm.outputs.already_published != 'true' }}",
+      );
+      expect(recoveryPreflight.steps.indexOf(recoveryNpmState!)).toBeLessThan(
+        recoveryPreflight.steps.findIndex((step) => step.name === name),
       );
     }
     const existingNpmVerification = recoveryPreflight.steps.find(

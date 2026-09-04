@@ -118,10 +118,24 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22.20.0"
-          cache: npm
+
+      - name: Bootstrap verified pnpm
+        run: |
+          parent="$(mktemp -d "$RUNNER_TEMP/pnpm-bootstrap.XXXXXX")"
+          node scripts/bootstrap-pnpm.mjs --destination "$parent/verified" >> "$GITHUB_PATH"
+
+      - name: Locate pnpm store
+        id: pnpm-store
+        run: printf 'path=%s\n' "$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('pnpm-lock.yaml', 'package.json', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}
 
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Open or update release PR
         id: changesets
@@ -131,7 +145,7 @@ jobs:
           commit: "chore: version packages"
           commitMode: github-api
           title: "chore: version packages"
-          version: npm run version-packages
+          version: pnpm run version-packages
           createGithubReleases: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

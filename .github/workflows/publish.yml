@@ -67,6 +67,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Checkout trusted pnpm release policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -120,8 +128,26 @@ jobs:
             fi
           } >> "$GITHUB_OUTPUT"
 
+      - name: Validate tagged pnpm inputs
+        run: node trusted/.github/scripts/check-pnpm-release-inputs.mjs .
+
+      - name: Bootstrap verified pnpm
+        run: |
+          parent="$(mktemp -d "$RUNNER_TEMP/pnpm-bootstrap.XXXXXX")"
+          node scripts/bootstrap-pnpm.mjs --destination "$parent/verified" >> "$GITHUB_PATH"
+
+      - name: Locate pnpm store
+        id: pnpm-store
+        run: printf 'path=%s\n' "$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('pnpm-lock.yaml', 'package.json', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}
+
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Check npm release ordering
         env:
@@ -129,13 +155,13 @@ jobs:
         run: node .github/scripts/check-npm-release-state.mjs "$RELEASE_VERSION"
 
       - name: Type-check
-        run: npm run typecheck
+        run: pnpm run typecheck
 
       - name: Run complete coverage suite
-        run: npm run test:ci
+        run: pnpm run test:ci
 
       - name: Build
-        run: npm run build
+        run: pnpm run build
 
       - name: Verify build leaves tracked sources unchanged
         run: git diff --exit-code
@@ -484,8 +510,26 @@ jobs:
             printf 'is_beta=%s\n' "$is_beta"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Validate tagged pnpm inputs
+        run: node ../trusted/.github/scripts/check-pnpm-release-inputs.mjs .
+
+      - name: Bootstrap verified pnpm
+        run: |
+          parent="$(mktemp -d "$RUNNER_TEMP/pnpm-bootstrap.XXXXXX")"
+          node scripts/bootstrap-pnpm.mjs --destination "$parent/verified" >> "$GITHUB_PATH"
+
+      - name: Locate pnpm store
+        id: pnpm-store
+        run: printf 'path=%s\n' "$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('release/pnpm-lock.yaml', 'release/package.json', 'release/.npmrc', 'release/pnpm-workspace.yaml', 'release/scripts/bootstrap-pnpm.mjs') }}
+
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Verify trusted publishing prerequisites
         run: |
@@ -510,13 +554,13 @@ jobs:
           NODE
 
       - name: Type-check
-        run: npm run typecheck
+        run: pnpm run typecheck
 
       - name: Run complete coverage suite
-        run: npm run test:ci
+        run: pnpm run test:ci
 
       - name: Build
-        run: npm run build
+        run: pnpm run build
 
       - name: Verify build leaves tracked sources unchanged
         run: git diff --exit-code
@@ -810,9 +854,31 @@ jobs:
             exit 1
           fi
 
+      - name: Validate tagged pnpm inputs
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
+        run: node ../trusted/.github/scripts/check-pnpm-release-inputs.mjs .
+
+      - name: Bootstrap verified pnpm
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
+        run: |
+          parent="$(mktemp -d "$RUNNER_TEMP/pnpm-bootstrap.XXXXXX")"
+          node scripts/bootstrap-pnpm.mjs --destination "$parent/verified" >> "$GITHUB_PATH"
+
+      - name: Locate pnpm store
+        id: pnpm-store
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
+        run: printf 'path=%s\n' "$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        if: ${{ steps.npm.outputs.already_published != 'true' }}
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('release/pnpm-lock.yaml', 'release/package.json', 'release/.npmrc', 'release/pnpm-workspace.yaml', 'release/scripts/bootstrap-pnpm.mjs') }}
+
       - name: Install dependencies
         if: ${{ steps.npm.outputs.already_published != 'true' }}
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Verify trusted publishing prerequisites
         if: ${{ steps.npm.outputs.already_published != 'true' }}
@@ -837,15 +903,15 @@ jobs:
 
       - name: Type-check
         if: ${{ steps.npm.outputs.already_published != 'true' }}
-        run: npm run typecheck
+        run: pnpm run typecheck
 
       - name: Run complete coverage suite
         if: ${{ steps.npm.outputs.already_published != 'true' }}
-        run: npm run test:ci
+        run: pnpm run test:ci
 
       - name: Build
         if: ${{ steps.npm.outputs.already_published != 'true' }}
-        run: npm run build
+        run: pnpm run build
 
       - name: Verify build leaves tracked sources unchanged
         if: ${{ steps.npm.outputs.already_published != 'true' }}

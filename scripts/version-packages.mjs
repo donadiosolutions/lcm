@@ -1,9 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
-const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const SUPPORTED_CHANNELS = new Set(["auto", "beta", "stable"]);
 
 export function validateReleaseChannel(value) {
@@ -102,7 +101,6 @@ export function runVersionPackages({
     execute(process.execPath, [changesetCli, ...transition], { cwd });
   }
   execute(process.execPath, [changesetCli, "version"], { cwd });
-  execute(process.execPath, [resolve(SCRIPT_DIR, "sync-package-version.mjs")], { cwd });
 }
 
 const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : undefined;
