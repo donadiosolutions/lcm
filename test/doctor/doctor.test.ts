@@ -1,13 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, symlinkSync, lstatSync, readdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, lstatSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
 import type { DoctorDeps } from "../../src/doctor/types.js";
 import { doctorConfigReadFailureSeams, doctorConfigSeams } from "./config-seams.js";
 import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-publication-journal.js";
-import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
+import {
+  PrivateMutationLockContentionError,
+  readPrivateMutationLockOwner,
+} from "../../src/private-mutation-lock.js";
 import { renderGuidance } from "../../src/connectors/template-service.js";
 import { mergeClaudeSettings, REQUIRED_HOOKS } from "../../installer/install.js";
 import { legacyLcmMcpServerName } from "../../src/legacy-names.js";
@@ -576,8 +579,8 @@ describe("runDoctor project map checks", () => {
       // authenticated health exchange.
       expect(fetch).toHaveBeenCalledTimes(1);
       expect(results.find((result) => result.name === "daemon")).toMatchObject({
-        status: "warn",
-        message: expect.stringContaining("daemon validation failed"),
+        status: "fail",
+        message: expect.stringContaining("publication lock is busy"),
       });
     } finally {
       restore();
@@ -599,8 +602,8 @@ describe("runDoctor project map checks", () => {
       expect(vi.mocked(ensureDaemon)).not.toHaveBeenCalled();
       expect(sleeps).toEqual([]);
       expect(results.find((result) => result.name === "daemon")).toMatchObject({
-        status: "warn",
-        message: expect.stringContaining("version mismatch (v0.4.0 running, v0.5.0 installed)"),
+        status: "fail",
+        message: expect.stringContaining("publication lock is busy"),
       });
     } finally {
       restore();
@@ -630,8 +633,8 @@ describe("runDoctor project map checks", () => {
       expect(sleeps).toEqual([]);
       expect(fetch).toHaveBeenCalledTimes(2);
       expect(results.find((result) => result.name === "daemon")).toMatchObject({
-        status: "warn",
-        message: expect.stringContaining("daemon validation failed"),
+        status: "fail",
+        message: expect.stringContaining("publication lock is busy"),
       });
     } finally {
       restore();
@@ -665,8 +668,8 @@ describe("runDoctor project map checks", () => {
       expect(sleeps).toEqual([]);
       expect(fetch).toHaveBeenCalledTimes(1);
       expect(results.find((result) => result.name === "daemon")).toMatchObject({
-        status: "warn",
-        message: expect.stringContaining("daemon validation failed"),
+        status: "fail",
+        message: expect.stringContaining("publication lock is busy"),
       });
     } finally {
       restore();
@@ -689,7 +692,10 @@ describe("runDoctor project map checks", () => {
       const results = await runDoctor(deps);
       expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
       expect(sleeps).toEqual([]);
-      expect(results.find((result) => result.name === "daemon")?.status).toBe("warn");
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("publication lock is busy"),
+      });
     } finally {
       restore();
       rmSync(home, { recursive: true, force: true });
@@ -734,7 +740,10 @@ describe("runDoctor project map checks", () => {
       });
       // The budget is shared: the lifecycle stage gets no additional waits.
       expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
-      expect(results.find((result) => result.name === "daemon")?.status).toBe("warn");
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("publication lock is busy"),
+      });
     } finally {
       validateProjectMap.mockRestore();
       restore();
@@ -756,6 +765,116 @@ describe("runDoctor project map checks", () => {
       await runDoctor(deps);
       expect(sleeps).toEqual([10]);
       expect(clock.now).toBe(2_000);
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("does not inspect the owner or probe health after the shared deadline is spent", async () => {
+    const { home } = contentionHome("lcm-doctor-spent-budget-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const readOwner = vi.fn();
+    const { deps, sleeps, clock, fetch, restore } = convergenceDeps(home, {
+      _readPrivateMutationLockOwnerForTesting: readOwner,
+    });
+    vi.mocked(ensureDaemon).mockImplementationOnce(async () => {
+      clock.now = 2_000;
+      throw contention;
+    });
+    try {
+      const results = await runDoctor(deps);
+      expect(readOwner).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(sleeps).toEqual([]);
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("publication lock is busy"),
+      });
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("does not probe health when owner inspection consumes the remaining budget", async () => {
+    const { home } = contentionHome("lcm-doctor-owner-budget-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const { deps, sleeps, clock, fetch, restore } = convergenceDeps(home);
+    const readOwner = vi.fn((...args: Parameters<typeof readPrivateMutationLockOwner>) => {
+      const owner = readPrivateMutationLockOwner(...args);
+      clock.now = 2_000;
+      return owner;
+    });
+    deps._readPrivateMutationLockOwnerForTesting = readOwner;
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(contention);
+    try {
+      const results = await runDoctor(deps);
+      expect(readOwner).toHaveBeenCalledOnce();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(sleeps).toEqual([]);
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("fail");
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds the authenticated retry probe to the remaining shared budget", async () => {
+    vi.useFakeTimers();
+    const { home } = contentionHome("lcm-doctor-probe-budget-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    let retrySignal: AbortSignal | undefined;
+    let abortElapsed: number | undefined;
+    const started = Date.now();
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(authenticatedHealth())
+      .mockImplementationOnce(async (_url: string | URL | Request, init?: RequestInit) => {
+        retrySignal = init?.signal ?? undefined;
+        retrySignal?.addEventListener("abort", () => { abortElapsed = Date.now() - started; });
+        return await new Promise<Response>(() => undefined);
+      });
+    const { deps, sleeps, clock, restore } = convergenceDeps(home, { fetch });
+    vi.mocked(ensureDaemon).mockImplementationOnce(async () => {
+      clock.now = 1_990;
+      throw contention;
+    });
+    try {
+      const pending = runDoctor(deps);
+      await vi.advanceTimersByTimeAsync(2_000);
+      const results = await pending;
+      expect(retrySignal?.aborted).toBe(true);
+      expect(abortElapsed).toBe(10);
+      expect(sleeps).toEqual([]);
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("fail");
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the injected platform for authenticated entrypoint matching", async () => {
+    const { home } = contentionHome("lcm-doctor-platform-seam-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const windowsEntrypoint = TEST_RUNTIME_ENTRYPOINT.replaceAll("/", "\\").toUpperCase();
+    vi.mocked(ensureDaemon)
+      .mockRejectedValueOnce(contention)
+      .mockResolvedValueOnce({ connected: true, port: 3737, spawned: false, pid: process.pid });
+    const { deps, sleeps, restore } = convergenceDeps(home, {
+      platform: "win32",
+      fetch: vi.fn()
+        .mockResolvedValueOnce(authenticatedHealth())
+        .mockImplementation(async () => authenticatedHealth({ entrypoint: windowsEntrypoint })),
+    });
+    try {
+      const results = await runDoctor(deps);
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledTimes(2);
+      expect(sleeps).toEqual([50]);
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("pass");
     } finally {
       restore();
       rmSync(home, { recursive: true, force: true });
@@ -862,6 +981,45 @@ describe("runDoctor project map checks", () => {
       validateProjectMap.mockRestore();
       rmSync(home, { recursive: true, force: true });
     }
+  });
+
+  it("blocks admission when invalid config bytes drift between lock-free snapshots", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-invalid-config-drift-"));
+    const lcmRoot = join(home, ".lcm");
+    const configFile = join(lcmRoot, "config.json");
+    const replacement = join(lcmRoot, "config.next.json");
+    mkdirSync(lcmRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(configFile, JSON.stringify({ daemon: { port: 4545 }, storage: { backend: "invalid" } }), { mode: 0o600 });
+    writeFileSync(replacement, JSON.stringify({ daemon: { port: 5656 }, storage: { backend: "invalid" } }), { mode: 0o600 });
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        _readDaemonConfigRawSnapshot: undefined,
+        _betweenConfigSnapshotsForTesting: () => renameSync(replacement, configFile),
+      }));
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+      });
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("skip");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks invalid config when publication evidence changes between snapshots", async () => {
+    const invalidConfig = JSON.stringify({ storage: { backend: "invalid" } });
+    const admissions = vi.fn()
+      .mockReturnValueOnce(Object.freeze({ journalChecksumSha256: "a".repeat(64) }))
+      .mockReturnValueOnce(Object.freeze({ journalChecksumSha256: "b".repeat(64) }));
+    const results = await runDoctor(minimalDeps({
+      ...doctorConfigSeams(invalidConfig, admissions),
+    }));
+    expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+      status: "fail",
+      message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+    });
+    expect(results.find((result) => result.name === "daemon")?.status).toBe("skip");
   });
 
   it("blocks admission when publication evidence changes between lock-free snapshots", async () => {

@@ -16,7 +16,7 @@ export interface DoctorDeps {
   spawnSync: (cmd: string, args: string[], opts?: object) => { status: number | null; stdout: string; stderr: string };
   fetch: typeof globalThis.fetch;
   homedir: string;
-  platform: string;
+  platform: NodeJS.Platform;
   cwd?: string;
   /** Internal deterministic seam for the Linux managed-daemon executable path. */
   managedDaemonPath?: string;
@@ -43,6 +43,8 @@ export interface DoctorDeps {
   _publicationConvergenceNow?: () => number;
   /** Internal convergence wait seam used by deterministic publication tests. */
   _publicationConvergenceSleep?: (delayMs: number) => Promise<void>;
+  /** Internal lock-owner reader seam used by deterministic convergence tests. */
+  _readPrivateMutationLockOwnerForTesting?: typeof import("../private-mutation-lock.js").readPrivateMutationLockOwner;
   /** Internal packaged runtime digest seam used by deterministic tests. */
   _expectedRuntimeDigestForTesting?: string;
   /** Test seam for transport-aware Claude guidance repair. */

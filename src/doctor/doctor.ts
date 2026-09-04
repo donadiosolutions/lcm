@@ -204,6 +204,7 @@ async function readRecognizedDaemonHealth(
   fetchFn: typeof globalThis.fetch,
   port: number,
   token?: string | null,
+  timeoutMs = DAEMON_HEALTH_DEADLINE_MS,
 ): Promise<DoctorDaemonHealth | null> {
   if (token === null) return null;
   const controller = new AbortController();
@@ -212,7 +213,7 @@ async function readRecognizedDaemonHealth(
     timeout = setTimeout(() => {
       controller.abort();
       reject(new Error("Daemon health check timed out"));
-    }, DAEMON_HEALTH_DEADLINE_MS);
+    }, timeoutMs);
   });
   try {
     return await Promise.race([
@@ -285,12 +286,13 @@ function daemonHealthMatchesIdentity(
   health: DoctorDaemonHealth | null,
   identity: ConvergenceDaemonIdentity,
   expectedRuntimeDigest: string | undefined,
+  platform: NodeJS.Platform,
 ): boolean {
   return health !== null
     && health.pid === identity.pid
     && health.version === identity.version
     && (health.storageBackend ?? "sqlite") === identity.storageBackend
-    && daemonEntrypointMatches(health.entrypoint, identity.entrypoint, process.platform)
+    && daemonEntrypointMatches(health.entrypoint, identity.entrypoint, platform)
     && (expectedRuntimeDigest === undefined || health.runtimeDigest === expectedRuntimeDigest);
 }
 
@@ -352,9 +354,10 @@ async function convergenceRetryDelay(
   if (!(error instanceof PrivateMutationLockContentionError) || convergence.identity === undefined) {
     return undefined;
   }
+  if (convergence.now() >= convergence.deadline) return undefined;
   let owner;
   try {
-    owner = readPrivateMutationLockOwner(
+    owner = (deps._readPrivateMutationLockOwnerForTesting ?? readPrivateMutationLockOwner)(
       join(deps.homedir, ".lcm.backend-publication.lock"),
       "backend publication",
     );
@@ -367,14 +370,27 @@ async function convergenceRetryDelay(
     || owner.processStartTime === null
     || processStartTime(owner.pid) !== owner.processStartTime
   ) return undefined;
+  const token = readDoctorDaemonToken(deps);
+  const remainingBudgetMs = convergence.deadline - convergence.now();
+  if (remainingBudgetMs <= 0) return undefined;
   let health: DoctorDaemonHealth | null;
   try {
-    health = await readDoctorAuthenticatedHealth(deps, port);
+    health = await readRecognizedDaemonHealth(
+      deps.fetch,
+      port,
+      token,
+      Math.min(DAEMON_HEALTH_DEADLINE_MS, remainingBudgetMs),
+    );
   } catch {
     return undefined;
   }
   if (
-    !daemonHealthMatchesIdentity(health, convergence.identity, convergence.identity.runtimeDigest)
+    !daemonHealthMatchesIdentity(
+      health,
+      convergence.identity,
+      convergence.identity.runtimeDigest,
+      deps.platform,
+    )
     || convergence.now() >= convergence.deadline
   ) return undefined;
   return Math.min(
@@ -576,7 +592,31 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
       // still diagnoses the daemon on a recoverable port.
       let publicationError: BackendPublicationJournalError | undefined;
       try {
-        assertReadAccess(resolvedConfigPath, backendCandidate(first.content), first.witness);
+        const candidateBackend = backendCandidate(first.content);
+        const firstAdmission = assertReadAccess(
+          resolvedConfigPath,
+          candidateBackend,
+          first.witness,
+        );
+        deps._betweenConfigSnapshotsForTesting?.();
+        const second = readSnapshot(resolvedConfigPath);
+        if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
+          throw new BackendPublicationJournalError(
+            "unexpected-state",
+            "doctor config changed during lock-free read admission",
+          );
+        }
+        const secondAdmission = assertReadAccess(
+          resolvedConfigPath,
+          candidateBackend,
+          second.witness,
+        );
+        if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
+          throw new BackendPublicationJournalError(
+            "unexpected-state",
+            "doctor backend publication changed during lock-free read admission",
+          );
+        }
       } catch (admissionError) {
         if (!(admissionError instanceof BackendPublicationJournalError)) throw admissionError;
         publicationError = admissionError;
@@ -1352,10 +1392,18 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         });
         daemonHealthy = true;
       }
-    } catch {
+    } catch (error) {
       daemonHealthy = false;
       daemonStorageReadiness = "unverified";
-      if (versionMismatch) {
+      if (error instanceof PrivateMutationLockContentionError) {
+        results.push({
+          name: "daemon",
+          category: "Daemon",
+          status: "fail",
+          message: `localhost:${config.port} — backend publication admission failed: ${sanitizeTerminalText(error.message)}`,
+          fixApplied: false,
+        });
+      } else if (versionMismatch) {
         results.push({ name: "daemon", category: "Daemon", status: "warn",
           message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed)\n     Fix: ${remediationGuidance("not-running")}` });
       } else {
