@@ -16,7 +16,10 @@ import {
   type StagedPostgreSqlUnavailableResponse,
 } from "../staged-postgresql.js";
 import { sanitizeError } from "../safe-error.js";
-import type { BackendPublicationLockToken } from "../../storage/backend-publication.js";
+import {
+  BackendPublicationJournalError,
+  type BackendPublicationLockToken,
+} from "../../storage/backend-publication.js";
 import { createAbortError } from "../cancellation.js";
 
 interface AsyncClosable {
@@ -47,6 +50,7 @@ export type ProjectStorageRequest = Readonly<{
   readonly factory?: StorageBackendFactory;
   readonly context?: RouteExecutionContext;
   readonly mode: "create" | "existing";
+  readonly expectedIdentity?: StorageIdentityContext & { readonly localProjectId: string };
   /** Optional non-revocable work that must settle before storage closes. */
   readonly beforeClose?: () => Promise<void>;
 }>;
@@ -109,6 +113,19 @@ export type ProjectStorageOperation<T> = (
   storage: ProjectStorage,
   signal: AbortSignal,
 ) => Promise<T> | T;
+
+export function sameStorageIdentity(
+  expected: StorageIdentityContext & { readonly localProjectId: string },
+  actual: StorageIdentityContext & { readonly localProjectId: string },
+): boolean {
+  // selectedPath may name a different verified alias for the same project.
+  // machineId authenticates the caller rather than selecting project storage;
+  // backend identity resolution validates it independently.
+  return expected.id === actual.id
+    && expected.localProjectId === actual.localProjectId
+    && expected.canonical === actual.canonical
+    && expected.remoteProjectId === actual.remoteProjectId;
+}
 
 async function settleClose(resource: AsyncClosable | undefined): Promise<void> {
   if (!resource) return;
@@ -184,6 +201,13 @@ export async function withProjectStorage<T>(
     };
 
     try {
+      if (request.expectedIdentity !== undefined
+          && !sameStorageIdentity(request.expectedIdentity, identity)) {
+        throw new BackendPublicationJournalError(
+          "unexpected-state",
+          "project identity changed during publication admission",
+        );
+      }
       state.openPending = true;
       try {
         project = request.mode === "existing"

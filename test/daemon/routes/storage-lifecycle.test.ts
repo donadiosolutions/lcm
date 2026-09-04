@@ -16,10 +16,14 @@ import { MachineIdentityFileError } from "../../../src/machine-identity.js";
 import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 import { StorageOperationError } from "../../../src/storage/errors.js";
 import type { ProjectStorage, StorageBackendFactory } from "../../../src/storage/index.js";
-import { withBackendPublicationConsumerLockAsync } from "../../../src/storage/backend-publication.js";
+import {
+  BackendPublicationJournalError,
+  withBackendPublicationConsumerLockAsync,
+} from "../../../src/storage/backend-publication.js";
 import { clearProjectMapCache } from "../../../src/project-map.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 import { isAbortError } from "../../../src/daemon/cancellation.js";
+import { projectIdentity } from "../../../src/daemon/project.js";
 
 const storageFactorySeam = vi.hoisted(() => ({ create: vi.fn() }));
 
@@ -328,6 +332,111 @@ describe("route storage cleanup", () => {
     });
   });
 
+  it.each([
+    ["id", "create"],
+    ["id", "existing"],
+    ["localProjectId", "create"],
+    ["localProjectId", "existing"],
+    ["canonical", "create"],
+    ["canonical", "existing"],
+    ["remoteProjectId", "create"],
+    ["remoteProjectId", "existing"],
+  ] as const)("rejects %s drift before a %s open and preserves cleanup ordering", async (field, mode) => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const liveIdentity = projectIdentity(cwd, config.storage);
+      const expectedIdentity = {
+        id: liveIdentity.id,
+        localProjectId: liveIdentity.localProjectId,
+        canonical: liveIdentity.canonical,
+        remoteProjectId: liveIdentity.remoteProjectId,
+        [field]: field === "canonical" ? "/different/project" : `${field}-drift`,
+      };
+      const openProject = vi.fn(async () => fakeProject(async () => undefined));
+      const openExistingProject = vi.fn(async () => null);
+      const factoryClose = vi.fn(async () => undefined);
+      const factory = fakeFactory({ openProject, openExistingProject, close: factoryClose });
+      storageFactorySeam.create.mockResolvedValueOnce(factory);
+      const beforeClose = vi.fn(async () => undefined);
+      const operation = vi.fn(async () => "must not run");
+      let admissionReleases = 0;
+      const listeners = new Set<EventListenerOrEventListenerObject>();
+      const controller = new AbortController();
+      const signal = {
+        get aborted(): boolean { return controller.signal.aborted; },
+        get reason(): unknown { return controller.signal.reason; },
+        addEventListener: (
+          type: string,
+          listener: EventListenerOrEventListenerObject | null,
+          options?: AddEventListenerOptions | boolean,
+        ): void => {
+          if (listener !== null) listeners.add(listener);
+          controller.signal.addEventListener(type, listener, options);
+        },
+        removeEventListener: (
+          type: string,
+          listener: EventListenerOrEventListenerObject | null,
+          options?: EventListenerOptions | boolean,
+        ): void => {
+          if (listener !== null) listeners.delete(listener);
+          controller.signal.removeEventListener(type, listener, options);
+        },
+        dispatchEvent: controller.signal.dispatchEvent.bind(controller.signal),
+      } as unknown as AbortSignal;
+
+      await expect(withProjectStorage({
+        config,
+        cwd,
+        context: {
+          signal,
+          withPublicationAdmission: operation =>
+            withBackendPublicationConsumerLockAsync(home, async token => {
+              try {
+                return await operation(token);
+              } finally {
+                admissionReleases += 1;
+              }
+            }),
+        },
+        mode,
+        expectedIdentity,
+        beforeClose,
+      }, operation)).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "unexpected-state",
+        message: "project identity changed during publication admission",
+      } satisfies Partial<BackendPublicationJournalError>);
+
+      expect(openProject).not.toHaveBeenCalled();
+      expect(openExistingProject).not.toHaveBeenCalled();
+      expect(operation).not.toHaveBeenCalled();
+      expect(beforeClose).toHaveBeenCalledOnce();
+      expect(admissionReleases).toBe(1);
+      expect(factoryClose).toHaveBeenCalledOnce();
+      expect(listeners.size).toBe(0);
+    });
+  });
+
+  it.each(["create", "existing"] as const)("opens the selected %s backend when every identity field is equal", async mode => {
+    await withTemporaryProject(async ({ cwd, config }) => {
+      const expectedIdentity = projectIdentity(cwd, config.storage);
+      const project = fakeProject(async () => undefined);
+      const openProject = vi.fn(async () => project);
+      const openExistingProject = vi.fn(async () => project);
+      const factory = fakeFactory({ openProject, openExistingProject });
+
+      await expect(withProjectStorage({
+        config,
+        cwd,
+        factory,
+        mode,
+        expectedIdentity,
+      }, async storage => storage.projectId)).resolves.toBe("project-id");
+
+      expect(mode === "create" ? openProject : openExistingProject).toHaveBeenCalledOnce();
+      expect(mode === "create" ? openExistingProject : openProject).not.toHaveBeenCalled();
+    });
+  });
+
   it("closes an owned factory after admission release and preserves a primary operation failure over cleanup failures", async () => {
     await withTemporaryProject(async ({ home, cwd, config }) => {
       const events: string[] = [];
@@ -536,6 +645,50 @@ describe("route storage cleanup", () => {
       resolveOpen(project);
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(events).toEqual(["admission-enter", "project-close", "admission-release", "factory-close"]);
+    });
+  });
+
+  it("observes cancellation latched while the public pending-open listener is attached", async () => {
+    await withTemporaryProject(async ({ cwd, config }) => {
+      const controller = new AbortController();
+      let abortOnAdd = true;
+      const signal = {
+        get aborted(): boolean { return controller.signal.aborted; },
+        get reason(): unknown { return controller.signal.reason; },
+        addEventListener: (
+          type: string,
+          listener: EventListenerOrEventListenerObject | null,
+          options?: AddEventListenerOptions | boolean,
+        ): void => {
+          controller.signal.addEventListener(type, listener, options);
+          if (abortOnAdd) {
+            abortOnAdd = false;
+            controller.abort();
+          }
+        },
+        removeEventListener: controller.signal.removeEventListener.bind(controller.signal),
+        dispatchEvent: controller.signal.dispatchEvent.bind(controller.signal),
+      } as unknown as AbortSignal;
+      let resolveOpen!: (project: ProjectStorage) => void;
+      const project = fakeProject(async () => undefined);
+      const factory = fakeFactory({
+        openProject: vi.fn(async () => new Promise<ProjectStorage>(resolve => { resolveOpen = resolve; })),
+      });
+      const operation = vi.fn(async () => "must not run");
+
+      const result = withProjectStorage({
+        config,
+        cwd,
+        factory,
+        context: { signal },
+        mode: "create",
+      }, operation);
+
+      await expect(result).rejects.toSatisfy(isAbortError);
+      resolveOpen(project);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(operation).not.toHaveBeenCalled();
+      expect(project.close).toHaveBeenCalledOnce();
     });
   });
 
