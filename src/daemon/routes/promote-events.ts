@@ -711,12 +711,9 @@ async function promoteEventsForCwdUnlocked(
 
 type PreparedPromotionBatch = Readonly<{
   events: EventRow[];
-  reinforcementCache: Map<string, PreparedPatternReinforcement>;
+  reinforcementCache: Map<string, PatternReinforcementStats>;
+  reinforcementErrors: Map<EventRow["event_id"], unknown>;
 }>;
-
-type PreparedPatternReinforcement =
-  | { kind: "value"; value: PatternReinforcementStats }
-  | { kind: "error"; error: unknown };
 
 async function preparePromotionBatch(
   config: DaemonConfig,
@@ -724,33 +721,35 @@ async function preparePromotionBatch(
 ): Promise<PreparedPromotionBatch> {
   const events = await edb.getUnprocessed();
   if (events.length === 0) {
-    return { events, reinforcementCache: new Map() };
+    return {
+      events,
+      reinforcementCache: new Map(),
+      reinforcementErrors: new Map(),
+    };
   }
 
   correlateErrors(events);
   const thresholds = config.compaction.promotionThresholds;
-  const reinforcementCache = new Map<string, PreparedPatternReinforcement>();
+  const reinforcementCache = new Map<string, PatternReinforcementStats>();
+  const reinforcementErrors = new Map<EventRow["event_id"], unknown>();
   for (const event of events) {
     if (event.priority !== 3 || !AUTO_PROMOTABLE_PATTERN_CATEGORIES.has(event.category)) continue;
     const key = `${event.type}\u0000${event.category}\u0000${event.data}`;
     if (reinforcementCache.has(key)) continue;
     try {
-      reinforcementCache.set(key, {
-        kind: "value",
-        value: await edb.getPatternReinforcement(
-          event.type,
-          event.category,
-          event.data,
-          thresholds.insightsMaxAgeDays ?? 90,
-        ),
-      });
+      reinforcementCache.set(key, await edb.getPatternReinforcement(
+        event.type,
+        event.category,
+        event.data,
+        thresholds.insightsMaxAgeDays ?? 90,
+      ));
     } catch (error) {
       // Keep the local sidecar read outside selected storage admission while
       // preserving the prior per-event best-effort behavior.
-      reinforcementCache.set(key, { kind: "error", error });
+      reinforcementErrors.set(event.event_id, error);
     }
   }
-  return { events, reinforcementCache };
+  return { events, reinforcementCache, reinforcementErrors };
 }
 
 function cancelledPromotionResult(): PromoteResult {
@@ -808,6 +807,7 @@ async function runSelectedPromotionBatch(
           new Map(),
           prepared.events,
           prepared.reinforcementCache,
+          prepared.reinforcementErrors,
         );
       },
     );
@@ -828,7 +828,8 @@ async function promoteEventsBatch(
   scrubber: ScrubEngine,
   scrubCache: Map<string, string>,
   events: EventRow[],
-  reinforcementCache: Map<string, PreparedPatternReinforcement>,
+  reinforcementCache: Map<string, PatternReinforcementStats>,
+  reinforcementErrors: Map<EventRow["event_id"], unknown>,
 ): Promise<PromoteResult> {
   const result: PromoteResult = { promoted: 0, skipped: 0, correlated: 0, errors: 0 };
 
@@ -841,10 +842,11 @@ async function promoteEventsBatch(
           return EMPTY_REINFORCEMENT;
         }
 
+        if (reinforcementErrors.has(event.event_id)) {
+          throw reinforcementErrors.get(event.event_id);
+        }
         const key = `${event.type}\u0000${event.category}\u0000${event.data}`;
-        const prepared = reinforcementCache.get(key)!;
-        if (prepared.kind === "error") throw prepared.error;
-        return prepared.value;
+        return reinforcementCache.get(key)!;
       };
 
       const processedIds: number[] = [];
