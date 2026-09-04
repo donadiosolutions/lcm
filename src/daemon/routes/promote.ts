@@ -1,6 +1,10 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import type { DaemonConfig } from "../config.js";
-import { ensureProjectDirForIdentity, projectIdentity, projectPaths } from "../project.js";
+import {
+  ensureProjectDirForIdentity,
+  projectIdentity,
+  projectPathsForIdentity,
+} from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { shouldPromote } from "../../promotion/detector.js";
@@ -145,9 +149,20 @@ export function createPromoteHandler(
       }
 
       throwIfAborted(signal);
-      const paths = projectPaths(cwd, context?.publicationLockToken);
-      projectIdentity(cwd, config.storage, context?.publicationLockToken);
-      const projectDir = ensureProjectDirForIdentity(paths, { writeMetadata: false });
+      const storageIdentity = projectIdentity(
+        cwd,
+        config.storage,
+        context?.publicationLockToken,
+      );
+      const localIdentity = {
+        id: storageIdentity.localProjectId,
+        canonical: storageIdentity.canonical,
+        ...(storageIdentity.remoteProjectId === undefined
+          ? {}
+          : { remoteProjectId: storageIdentity.remoteProjectId }),
+      };
+      const paths = projectPathsForIdentity(localIdentity);
+      const projectDir = ensureProjectDirForIdentity(localIdentity, { writeMetadata: false });
       throwIfAborted(signal);
       const scrubber = await ScrubEngine.forProject(
         config.security.sensitivePatterns,
@@ -182,6 +197,7 @@ export function createPromoteHandler(
           factory: storageFactory,
           context: storageContext,
           mode: "existing",
+          expectedIdentity: storageIdentity,
           beforeClose: commitCloseBarrier.waitForZero,
         },
         async (project) => {

@@ -164,6 +164,18 @@ export const projectId = (cwd: string): string =>
 export const projectCanonicalPath = (cwd: string): string =>
   projectIdentity(cwd).canonical;
 
+export function projectPathsForIdentity(
+  identity: ProjectIdentity,
+): ProjectIdentity & { dir: string; dbPath: string; metaPath: string } {
+  const dir = join(lcmHomeDir(), "projects", identity.id);
+  return {
+    ...identity,
+    dir,
+    dbPath: join(dir, "db.sqlite"),
+    metaPath: join(dir, "meta.json"),
+  };
+}
+
 export function projectPaths(
   cwd: string,
   publicationLockToken?: BackendPublicationLockToken,
@@ -177,13 +189,7 @@ export function projectPaths(
   const identity = resolveProjectIdentity(cwd, {
     _publicationLockToken: publicationLockToken,
   });
-  const dir = join(lcmHomeDir(), "projects", identity.id);
-  return {
-    ...identity,
-    dir,
-    dbPath: join(dir, "db.sqlite"),
-    metaPath: join(dir, "meta.json"),
-  };
+  return projectPathsForIdentity(identity);
 }
 
 export const projectDir = (cwd: string, publicationLockToken?: BackendPublicationLockToken): string =>

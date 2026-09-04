@@ -340,6 +340,15 @@ sanitized `503`; URLs, credentials, filesystem paths, SQL causes, and stack
 traces are not returned. PostgreSQL never causes a project SQLite database to
 be opened as a fallback.
 
+The store, ingest, and promote routes select project-sensitive scrubber
+patterns from one preflight storage-identity snapshot. Before opening the live
+backend under publication admission, they compare its complete project
+identity—backend project ID, local project ID, canonical path, and remote
+project ID—with that snapshot. Any drift returns the bounded `503` publication
+blocked response before a backend open or repository write. A change only to
+the remote project binding is rejected conservatively even when the local path
+and hash remain unchanged.
+
 Request cancellation closes the active project, and daemon shutdown aborts and
 drains foreground and passive consumers before closing the shared PostgreSQL
 factory. Hook capture is intentionally independent: it commits to the local
