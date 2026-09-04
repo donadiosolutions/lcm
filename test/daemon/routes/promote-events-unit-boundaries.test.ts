@@ -675,21 +675,88 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.mark).toHaveBeenCalledWith(expect.arrayContaining([1, 2, 3, 4, 5, 6, 8, 9]));
   });
 
-  it("keeps local reinforcement read failures in SQLite per-event best-effort handling", async () => {
+  it("retries reinforcement for a same-pattern sibling after a per-event SQLite failure", async () => {
     const failure = new Error("reinforcement read failed");
     mocks.events.mockReturnValueOnce([
-      event({ event_id: 1, category: "file", type: "file", data: "reinforcement failure", priority: 3 }),
+      event({
+        event_id: 1,
+        session_id: "first-session",
+        category: "file",
+        type: "file",
+        data: "reinforcement failure",
+        priority: 3,
+      }),
+      event({
+        event_id: 2,
+        session_id: "second-session",
+        category: "file",
+        type: "file",
+        data: "reinforcement failure",
+        priority: 3,
+      }),
     ]);
-    mocks.reinforcement.mockImplementationOnce(() => { throw failure; });
+    mocks.reinforcement
+      .mockImplementationOnce(() => { throw failure; })
+      .mockReturnValueOnce({ totalCount: 3, distinctSessions: 2 });
 
     await expect(promoteEventsForCwd(config, "/cwd", "/events.db"))
-      .resolves.toMatchObject({ promoted: 0, skipped: 0, errors: 1 });
+      .resolves.toEqual({ promoted: 1, skipped: 0, correlated: 0, errors: 1 });
+    expect(mocks.reinforcement).toHaveBeenCalledTimes(2);
+    expect(mocks.log).toHaveBeenCalledOnce();
     expect(mocks.log).toHaveBeenCalledWith(
       "promote-events",
       failure,
-      { cwd: "/cwd", sessionId: "session" },
+      { cwd: "/cwd", sessionId: "first-session" },
+    );
+    expect(mocks.dedup).toHaveBeenCalledOnce();
+    expect(mocks.mark).toHaveBeenCalledOnce();
+    expect(mocks.mark).toHaveBeenLastCalledWith([2]);
+  });
+
+  it("retries every same-pattern sibling when reinforcement lookups keep failing", async () => {
+    const firstFailure = new Error("first reinforcement read failed");
+    const secondFailure = new Error("second reinforcement read failed");
+    mocks.events.mockReturnValueOnce([
+      event({
+        event_id: 1,
+        session_id: "first-session",
+        category: "file",
+        type: "file",
+        data: "reinforcement failure",
+        priority: 3,
+      }),
+      event({
+        event_id: 2,
+        session_id: "second-session",
+        category: "file",
+        type: "file",
+        data: "reinforcement failure",
+        priority: 3,
+      }),
+    ]);
+    mocks.reinforcement
+      .mockImplementationOnce(() => { throw firstFailure; })
+      .mockImplementationOnce(() => { throw secondFailure; });
+
+    await expect(promoteEventsForCwd(config, "/cwd", "/events.db"))
+      .resolves.toEqual({ promoted: 0, skipped: 0, correlated: 0, errors: 2 });
+    expect(mocks.reinforcement).toHaveBeenCalledTimes(2);
+    expect(mocks.log).toHaveBeenCalledTimes(2);
+    expect(mocks.log).toHaveBeenNthCalledWith(
+      1,
+      "promote-events",
+      firstFailure,
+      { cwd: "/cwd", sessionId: "first-session" },
+    );
+    expect(mocks.log).toHaveBeenNthCalledWith(
+      2,
+      "promote-events",
+      secondFailure,
+      { cwd: "/cwd", sessionId: "second-session" },
     );
     expect(mocks.dedup).not.toHaveBeenCalled();
+    expect(mocks.mark).toHaveBeenCalledOnce();
+    expect(mocks.mark).toHaveBeenLastCalledWith([]);
   });
 
   it("scopes tier 3 eligibility to the current project attribution", async () => {
