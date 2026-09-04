@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { installConnector, listConnectorInventory, removeConnector } from "../../src/connectors/installer.js";
+import {
+  installConnector,
+  listConnectorInventory,
+  nativeCodexMcpEnvironment,
+  removeConnector,
+} from "../../src/connectors/installer.js";
 
 type CodexRunRequest = {
   readonly executable: string;
@@ -59,6 +64,176 @@ function withTempHome<T>(fn: (cwd: string, home: string) => T): T {
 }
 
 describe("native Codex MCP runner", () => {
+  const uid = 1000;
+  const runtimeDir = `/run/user/${uid}`;
+  const busPath = `${runtimeDir}/bus`;
+  const busAddress = `unix:path=${busPath}`;
+  const trustedPathStats = (path: string) => ({
+    uid,
+    mode: path === runtimeDir ? 0o40700 : 0o140600,
+    isDirectory: () => path === runtimeDir,
+    isSocket: () => path === busPath,
+    isSymbolicLink: () => false,
+  });
+
+  it("projects only the authenticated canonical current-user bus pair", () => {
+    withTempHome((cwd, home) => {
+      const environment = nativeCodexMcpEnvironment(cwd, {
+        environment: {
+          HOME: home,
+          PATH: "/usr/bin:/bin",
+          XDG_RUNTIME_DIR: runtimeDir,
+          DBUS_SESSION_BUS_ADDRESS: busAddress,
+          LD_PRELOAD: "/tmp/attacker.so",
+          LCM_UNRELATED_SECRET: "must-not-cross",
+        },
+        getUid: () => uid,
+        lstat: trustedPathStats,
+        realpath: (path) => path,
+      });
+
+      expect(environment).toEqual({
+        PATH: "/usr/bin:/bin",
+        HOME: home,
+        XDG_RUNTIME_DIR: runtimeDir,
+        DBUS_SESSION_BUS_ADDRESS: busAddress,
+        CODEX_HOME: join(home, ".codex"),
+      });
+    });
+  });
+
+  it.each([
+    ["missing runtime directory", undefined, busAddress],
+    ["empty runtime directory", "", busAddress],
+    ["relative runtime directory", "relative", busAddress],
+    ["foreign-user runtime directory", `/run/user/${uid + 1}`, `unix:path=/run/user/${uid + 1}/bus`],
+    ["runtime directory newline", `${runtimeDir}\n`, busAddress],
+    ["runtime directory NUL", `${runtimeDir}\0`, busAddress],
+    ["oversized runtime directory", `/run/user/${"1".repeat(4097)}`, busAddress],
+    ["missing bus address", runtimeDir, undefined],
+    ["empty bus address", runtimeDir, ""],
+    ["non-unix bus address", runtimeDir, "tcp:host=localhost"],
+    ["mismatched bus path", runtimeDir, `unix:path=${runtimeDir}/other`],
+    ["foreign-user bus path", runtimeDir, `unix:path=/run/user/${uid + 1}/bus`],
+    ["bus address newline", runtimeDir, `${busAddress}\n`],
+    ["bus address NUL", runtimeDir, `${busAddress}\0`],
+    ["oversized bus address", runtimeDir, `unix:path=/${"x".repeat(4097)}`],
+  ] as const)("rejects a %s instead of forwarding partial bus authority", (_label, candidateRuntime, candidateBus) => {
+    const environment = nativeCodexMcpEnvironment("/workspace", {
+      environment: {
+        XDG_RUNTIME_DIR: candidateRuntime,
+        DBUS_SESSION_BUS_ADDRESS: candidateBus,
+      },
+      getUid: () => uid,
+      lstat: trustedPathStats,
+      realpath: (path) => path,
+    });
+
+    expect(environment.XDG_RUNTIME_DIR).toBeUndefined();
+    expect(environment.DBUS_SESSION_BUS_ADDRESS).toBeUndefined();
+  });
+
+  it.each([
+    ["runtime directory is unavailable", runtimeDir, undefined],
+    ["runtime directory is a symlink", runtimeDir, { isSymbolicLink: () => true }],
+    ["runtime directory is not a directory", runtimeDir, { isDirectory: () => false }],
+    ["runtime directory has a foreign owner", runtimeDir, { uid: uid + 1 }],
+    ["runtime directory has unsafe permissions", runtimeDir, { mode: 0o40755 }],
+    ["runtime directory has special permission bits", runtimeDir, { mode: 0o41700 }],
+    ["bus endpoint is unavailable", busPath, undefined],
+    ["bus endpoint is a symlink", busPath, { isSymbolicLink: () => true }],
+    ["bus endpoint is not a socket", busPath, { isSocket: () => false }],
+    ["bus endpoint has a foreign owner", busPath, { uid: uid + 1 }],
+  ] as const)("rejects the bus pair when the %s", (_label, rejectedPath, statsOverride) => {
+    const environment = nativeCodexMcpEnvironment("/workspace", {
+      environment: {
+        XDG_RUNTIME_DIR: runtimeDir,
+        DBUS_SESSION_BUS_ADDRESS: busAddress,
+      },
+      getUid: () => uid,
+      lstat: (path) => {
+        if (path === rejectedPath) {
+          if (statsOverride === undefined) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+          return { ...trustedPathStats(path), ...statsOverride };
+        }
+        return trustedPathStats(path);
+      },
+      realpath: (path) => path,
+    });
+
+    expect(environment.XDG_RUNTIME_DIR).toBeUndefined();
+    expect(environment.DBUS_SESSION_BUS_ADDRESS).toBeUndefined();
+  });
+
+  it.each([
+    ["runtime directory", runtimeDir, `${runtimeDir}/redirected`],
+    ["bus endpoint", busPath, `${runtimeDir}/redirected-bus`],
+  ] as const)("rejects a non-canonical %s", (_label, rejectedPath, canonicalPath) => {
+    const environment = nativeCodexMcpEnvironment("/workspace", {
+      environment: {
+        XDG_RUNTIME_DIR: runtimeDir,
+        DBUS_SESSION_BUS_ADDRESS: busAddress,
+      },
+      getUid: () => uid,
+      lstat: trustedPathStats,
+      realpath: (path) => path === rejectedPath ? canonicalPath : path,
+    });
+
+    expect(environment.XDG_RUNTIME_DIR).toBeUndefined();
+    expect(environment.DBUS_SESSION_BUS_ADDRESS).toBeUndefined();
+  });
+
+  it.each([undefined, -1, 1.5, Number.NaN, 0x1_0000_0000])("rejects an unavailable or invalid current UID (%s)", (candidateUid) => {
+    const environment = nativeCodexMcpEnvironment("/workspace", {
+      environment: {
+        XDG_RUNTIME_DIR: runtimeDir,
+        DBUS_SESSION_BUS_ADDRESS: busAddress,
+      },
+      getUid: () => candidateUid,
+      lstat: trustedPathStats,
+      realpath: (path) => path,
+    });
+
+    expect(environment.XDG_RUNTIME_DIR).toBeUndefined();
+    expect(environment.DBUS_SESSION_BUS_ADDRESS).toBeUndefined();
+  });
+
+  it("rejects the bus pair when current UID lookup fails", () => {
+    const environment = nativeCodexMcpEnvironment("/workspace", {
+      environment: {
+        XDG_RUNTIME_DIR: runtimeDir,
+        DBUS_SESSION_BUS_ADDRESS: busAddress,
+      },
+      getUid: () => { throw new Error("UID lookup failed"); },
+      lstat: trustedPathStats,
+      realpath: (path) => path,
+    });
+
+    expect(environment.XDG_RUNTIME_DIR).toBeUndefined();
+    expect(environment.DBUS_SESSION_BUS_ADDRESS).toBeUndefined();
+  });
+
+  it("omits the bus pair when the platform does not expose process.getuid", () => {
+    const getuidDescriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+    try {
+      const environment = nativeCodexMcpEnvironment("/workspace", {
+        environment: {
+          XDG_RUNTIME_DIR: runtimeDir,
+          DBUS_SESSION_BUS_ADDRESS: busAddress,
+        },
+        lstat: trustedPathStats,
+        realpath: (path) => path,
+      });
+
+      expect(environment.XDG_RUNTIME_DIR).toBeUndefined();
+      expect(environment.DBUS_SESSION_BUS_ADDRESS).toBeUndefined();
+    } finally {
+      if (getuidDescriptor === undefined) Reflect.deleteProperty(process, "getuid");
+      else Object.defineProperty(process, "getuid", getuidDescriptor);
+    }
+  });
+
   it("refuses an injected runner without add after preflight", () => {
     withTempHome((cwd) => {
       const runner = { get: () => [], remove: () => undefined };

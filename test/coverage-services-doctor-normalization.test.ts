@@ -17,6 +17,7 @@ vi.mock("../src/db/events-stats.js", () => ({
 }));
 
 import { runDoctor } from "../src/doctor/doctor.js";
+import { doctorConfigSeams } from "./doctor/config-seams.js";
 import { LCM_MD_CONTENT } from "../src/daemon/orientation.js";
 import type { DoctorDeps } from "../src/doctor/types.js";
 
@@ -65,7 +66,7 @@ it("normalizes a merge result without an MCP servers object", async () => {
     homedir: NORMALIZATION_HOME,
     platform: "linux",
     cwd: NORMALIZATION_CWD,
-    _assertBackendPublication: () => undefined,
+    ...doctorConfigSeams("{}"),
   };
 
   mergeClaudeSettingsMock.mockReturnValueOnce({});

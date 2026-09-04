@@ -57,6 +57,7 @@ const expectedComponents = [
       "^src/generated-patterns\\.ts$",
       "^src/home-parent-auth\\.ts$",
       "^src/legacy-names\\.ts$",
+      "^src/private-mutation-lock\\.ts$",
       "^src/runtime-paths\\.ts$",
       "^src/runtime-root\\.ts$",
       "^src/scrub\\.ts$",
@@ -206,7 +207,6 @@ const expectedComponents = [
       "^src/git-project\\.ts$",
       "^src/machine-identity\\.ts$",
       "^src/portable-knowledge\\.ts$",
-      "^src/private-mutation-lock\\.ts$",
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
       "^src/worktree-reconciliation\\.ts$",
@@ -483,7 +483,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(206);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#824 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -494,6 +494,7 @@ describe("Codecov configuration", () => {
     const expectedOwners = [
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
+      ["src/private-mutation-lock.ts", "unit-configuration-security"],
       ["src/home-parent-auth.ts", "unit-configuration-security"],
       ["src/runtime-paths.ts", "unit-configuration-security"],
       ["src/security-files.ts", "unit-configuration-security"],
@@ -512,6 +513,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/grep.ts", "unit-daemon-routes"],
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
+      ["src/doctor/doctor.ts", "unit-diagnostics"],
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],

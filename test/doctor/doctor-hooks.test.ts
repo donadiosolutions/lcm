@@ -1,6 +1,7 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { mkdirSync, rmSync } from "node:fs";
 import { runDoctor as runDoctorProduction } from "../../src/doctor/doctor.js";
+import { doctorConfigSeams } from "./config-seams.js";
 import { mergeClaudeSettings, REQUIRED_HOOKS } from "../../installer/install.js";
 import { join } from "node:path";
 import type { DoctorDeps } from "../../src/doctor/types.js";
@@ -24,8 +25,11 @@ function doctorHome(): string {
   return home;
 }
 
-function runDoctor(deps: Omit<DoctorDeps, "_assertBackendPublication">): ReturnType<typeof runDoctorProduction> {
-  return runDoctorProduction({ ...deps, _assertBackendPublication: () => undefined });
+function runDoctor(deps: DoctorDeps): ReturnType<typeof runDoctorProduction> {
+  return runDoctorProduction({
+    ...deps,
+    ...doctorConfigSeams(deps.readFileSync(join(deps.homedir, ".lcm", "config.json"), "utf-8")),
+  });
 }
 
 afterEach(() => {

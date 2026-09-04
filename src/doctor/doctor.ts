@@ -38,11 +38,17 @@ import {
 import { packageExecutable, packageRootFor } from "../runtime-root.js";
 import { sanitizeTerminalText } from "../terminal-sanitize.js";
 import { managedDaemonPath } from "../daemon/managed-path.js";
+import { daemonEntrypointMatches } from "../daemon/lifecycle-scope.js";
+import { RUNTIME_DIGEST } from "../daemon/version.js";
 import {
   ConfigValidationError,
   DEFAULT_DAEMON_PORT,
+  daemonConfigSnapshotWitnessEqual,
   parseDaemonConfig,
+  readDaemonConfigRawSnapshot,
   resolveDaemonConfigEnv,
+  type DaemonConfig,
+  type DaemonConfigRawSnapshot,
   type LlmRetryPolicy,
   type ResolvedStorageConfig,
 } from "../daemon/config.js";
@@ -61,11 +67,15 @@ import {
   type DaemonRefusalReason,
 } from "../daemon/remediation.js";
 import {
-  assertBackendPublicationConfigAccess,
-  withBackendPublicationConfigLock,
+  assertBackendPublicationConfigReadAccess,
   BackendPublicationJournalError,
+  withBackendPublicationReadRoot,
 } from "../storage/backend-publication.js";
-import { readBoundedRegularFile } from "../security-files.js";
+import {
+  PrivateMutationLockContentionError,
+  processStartTime,
+  readPrivateMutationLockOwner,
+} from "../private-mutation-lock.js";
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -92,10 +102,6 @@ function defaultDeps(): DoctorDeps {
     fetch: globalThis.fetch,
     homedir: homedir(),
     platform: platform(),
-    _readBoundedConfig: (path, maxBytes) => readBoundedRegularFile(path, {
-      allowedRoot: dirname(path),
-      maxBytes,
-    }),
   };
 }
 
@@ -115,7 +121,6 @@ interface DoctorConfig {
 
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
 const DAEMON_HEALTH_DEADLINE_MS = 2000;
-const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 
 function publicationAdmissionMessage(
   reason: BackendPublicationJournalError["reason"],
@@ -157,6 +162,10 @@ type DaemonStorageReadiness = "ready" | "unavailable" | "unverified";
 
 type DoctorDaemonHealth = StagedPostgreSqlHealthResponse & {
   readonly status?: string;
+  /** Authenticated health only: the daemon's resolved runtime entrypoint. */
+  readonly entrypoint?: string;
+  /** Authenticated health only: the packaged runtime digest. */
+  readonly runtimeDigest?: string;
 };
 
 type LifecycleResultWithRefusal = Readonly<{
@@ -196,6 +205,7 @@ async function readRecognizedDaemonHealth(
   fetchFn: typeof globalThis.fetch,
   port: number,
   token?: string | null,
+  timeoutMs = DAEMON_HEALTH_DEADLINE_MS,
 ): Promise<DoctorDaemonHealth | null> {
   if (token === null) return null;
   const controller = new AbortController();
@@ -204,7 +214,7 @@ async function readRecognizedDaemonHealth(
     timeout = setTimeout(() => {
       controller.abort();
       reject(new Error("Daemon health check timed out"));
-    }, DAEMON_HEALTH_DEADLINE_MS);
+    }, timeoutMs);
   });
   try {
     return await Promise.race([
@@ -243,6 +253,185 @@ async function readDoctorAuthenticatedHealth(
     port,
     readDoctorDaemonToken(deps),
   );
+}
+
+const PUBLICATION_CONVERGENCE_MS = 2_000;
+const PUBLICATION_CONVERGENCE_POLL_MS = 50;
+
+/**
+ * The exact managed daemon that doctor is willing to wait for. Every field is
+ * taken from token-authenticated health so that only the daemon holding the
+ * daemon token can be treated as the convergence owner.
+ */
+type ConvergenceDaemonIdentity = Readonly<{
+  pid: number;
+  version: string | undefined;
+  storageBackend: "sqlite" | "postgresql";
+  entrypoint: string | undefined;
+  runtimeDigest: string | undefined;
+}>;
+
+/**
+ * Doctor stages that must remain eligible for convergence share one wall-clock
+ * budget so the total time spent waiting on the daemon's publication work is
+ * bounded across the entire doctor run, not per stage.
+ */
+type PublicationConvergence = Readonly<{
+  identity: ConvergenceDaemonIdentity | undefined;
+  deadline: number;
+  now: () => number;
+  sleep: (delayMs: number) => Promise<void>;
+}>;
+
+function daemonHealthMatchesIdentity(
+  health: DoctorDaemonHealth | null,
+  identity: ConvergenceDaemonIdentity,
+  expectedRuntimeDigest: string | undefined,
+  platform: NodeJS.Platform,
+): boolean {
+  return health !== null
+    && health.pid === identity.pid
+    && health.version === identity.version
+    && (health.storageBackend ?? "sqlite") === identity.storageBackend
+    && daemonEntrypointMatches(health.entrypoint, identity.entrypoint, platform)
+    && (expectedRuntimeDigest === undefined || health.runtimeDigest === expectedRuntimeDigest);
+}
+
+/**
+ * Build the identity doctor will require from token-authenticated health
+ * before any retry. The PID comes from the initial recognized health probe;
+ * every remaining field is the identity this installation expects, so a
+ * daemon must prove all of them through authenticated health at retry time.
+ */
+function expectedConvergenceIdentity(
+  initialHealthPid: number | undefined,
+  config: DoctorConfig,
+  expectedVersion: string | undefined,
+  expectedEntrypoint: string,
+  expectedRuntimeDigest: string | undefined,
+): ConvergenceDaemonIdentity | undefined {
+  if (
+    initialHealthPid === undefined
+    || (config.storageBackend !== "sqlite" && config.storageBackend !== "postgresql")
+  ) return undefined;
+  return {
+    pid: initialHealthPid,
+    version: expectedVersion,
+    storageBackend: config.storageBackend,
+    entrypoint: expectedEntrypoint,
+    runtimeDigest: expectedRuntimeDigest,
+  };
+}
+
+function createPublicationConvergence(
+  deps: DoctorDeps,
+  identity: ConvergenceDaemonIdentity | undefined,
+): PublicationConvergence {
+  const now = deps._publicationConvergenceNow ?? Date.now;
+  const sleep = deps._publicationConvergenceSleep
+    ?? ((delayMs: number) => new Promise<void>(resolve => setTimeout(resolve, delayMs)));
+  return {
+    identity,
+    deadline: now() + PUBLICATION_CONVERGENCE_MS,
+    now,
+    sleep,
+  };
+}
+
+/**
+ * Decide whether one lock-contention failure may be retried. Only the exact
+ * authenticated daemon identity captured at the start of doctor qualifies: the
+ * lock owner PID and process birth must match, the owner must still be live,
+ * and a fresh token-authenticated health exchange must confirm the same
+ * daemon. Foreign, ambiguous, malformed, stale, or unresolved owners and any
+ * identity drift are refused so the original typed error propagates unchanged.
+ */
+async function convergenceRetryDelay(
+  deps: DoctorDeps,
+  port: number,
+  convergence: PublicationConvergence,
+  error: unknown,
+): Promise<number | undefined> {
+  if (!(error instanceof PrivateMutationLockContentionError) || convergence.identity === undefined) {
+    return undefined;
+  }
+  if (convergence.now() >= convergence.deadline) return undefined;
+  let owner;
+  try {
+    owner = (deps._readPrivateMutationLockOwnerForTesting ?? readPrivateMutationLockOwner)(
+      join(deps.homedir, ".lcm.backend-publication.lock"),
+      "backend publication",
+    );
+  } catch {
+    return undefined;
+  }
+  if (
+    owner === null
+    || owner.pid !== convergence.identity.pid
+    || owner.processStartTime === null
+  ) return undefined;
+  const remainingBirthBudgetMs = convergence.deadline - convergence.now();
+  if (remainingBirthBudgetMs <= 0) return undefined;
+  const observedProcessStartTime = (
+    deps._processStartTimeForTesting ?? processStartTime
+  )(owner.pid, undefined, { timeoutMs: remainingBirthBudgetMs });
+  if (observedProcessStartTime !== owner.processStartTime) return undefined;
+  const token = readDoctorDaemonToken(deps);
+  const remainingHealthBudgetMs = convergence.deadline - convergence.now();
+  if (remainingHealthBudgetMs <= 0) return undefined;
+  let health: DoctorDaemonHealth | null;
+  try {
+    health = await readRecognizedDaemonHealth(
+      deps.fetch,
+      port,
+      token,
+      Math.min(DAEMON_HEALTH_DEADLINE_MS, remainingHealthBudgetMs),
+    );
+  } catch {
+    return undefined;
+  }
+  if (
+    !daemonHealthMatchesIdentity(
+      health,
+      convergence.identity,
+      convergence.identity.runtimeDigest,
+      deps.platform,
+    )
+    || convergence.now() >= convergence.deadline
+  ) return undefined;
+  return Math.min(
+    PUBLICATION_CONVERGENCE_POLL_MS,
+    Math.max(1, convergence.deadline - convergence.now()),
+  );
+}
+
+/**
+ * Retry one lock-taking doctor stage within the shared budget. Synchronous
+ * stages (project map, worktree journals) and asynchronous stages (daemon
+ * lifecycle) share this helper; the identity check is asynchronous because it
+ * performs an authenticated health exchange, so every stage is awaited here.
+ */
+async function withPublicationConvergence<T>(
+  run: () => T | Promise<T>,
+  deps: DoctorDeps,
+  port: number,
+  convergence: PublicationConvergence,
+): Promise<T> {
+  let firstContention: PrivateMutationLockContentionError | undefined;
+  while (true) {
+    if (firstContention !== undefined && convergence.now() >= convergence.deadline) {
+      throw firstContention;
+    }
+    try {
+      return await run();
+    } catch (error) {
+      const delay = await convergenceRetryDelay(deps, port, convergence, error);
+      if (delay === undefined) throw error;
+      firstContention ??= error as PrivateMutationLockContentionError;
+      deps._betweenConvergenceAttemptsForTesting?.();
+      await convergence.sleep(delay);
+    }
+  }
 }
 
 function storageReadinessFromHealth(
@@ -291,6 +480,30 @@ function recoverConfiguredPort(content: string): number {
   }
 }
 
+/**
+ * Every locked publication consumer opens the LCM root with O_NOFOLLOW, so a
+ * symlinked or non-directory root is never admitted. Mirror that rule for the
+ * lock-free doctor read so an unsafe root blocks admission before any repair.
+ * The inspection is a real filesystem lstat: injected file readers are byte
+ * sources only and cannot vouch for the root's shape.
+ */
+function assertLcmRootShape(homeDir: string, inspect: typeof lstatSync): void {
+  const root = join(homeDir, ".lcm");
+  let stat;
+  try {
+    stat = inspect(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw new BackendPublicationJournalError(
+      "unsafe-storage",
+      `LCM root cannot be inspected: ${(error as Error).message}`,
+    );
+  }
+  if (!stat.isDirectory()) {
+    throw new BackendPublicationJournalError("unsafe-storage", "LCM root is not a directory");
+  }
+}
+
 function backendCandidate(content: string): "sqlite" | "postgresql" {
   try {
     const parsed = JSON.parse(content) as { storage?: { backend?: unknown } };
@@ -300,116 +513,166 @@ function backendCandidate(content: string): "sqlite" | "postgresql" {
   }
 }
 
-function authenticateConfigPublication(
-  configPathValue: string,
-  deps: DoctorDeps,
-  backend: "sqlite" | "postgresql",
-  observedContent: string | null,
-  lockToken: object,
-): BackendPublicationJournalError | undefined {
-  try {
-    if (deps._assertBackendPublication !== undefined) {
-      deps._assertBackendPublication(deps.homedir, backend);
-    } else {
-      assertBackendPublicationConfigAccess(
-        configPathValue,
-        backend,
-        observedContent,
-        undefined,
-        lockToken,
-      );
-    }
-    return undefined;
-  } catch (error) {
-    if (!(error instanceof BackendPublicationJournalError)) throw error;
-    return error;
-  }
+function doctorConfigFromDaemonConfig(config: DaemonConfig): DoctorConfig {
+  return {
+    port: config.daemon.port,
+    storageBackend: config.storage.backend,
+    storage: config.storage,
+    summarizer: config.llm.provider,
+    apiMode: config.llm.apiMode,
+    reasoningEffort: config.llm.reasoningEffort,
+    fastMode: config.llm.fastMode,
+    requestTimeoutMs: config.llm.provider === "openai" ? config.llm.requestTimeoutMs : undefined,
+    retry: config.llm.provider === "openai" ? config.llm.retry : undefined,
+    publicationError: undefined,
+  };
 }
 
+/**
+ * Read a valid daemon configuration without taking the publication mutation
+ * lock. Doctor only needs a stable, authenticated snapshot for its admission
+ * decision; repairs and other writes retain their own exclusive locks. Two
+ * descriptor-bound snapshots and two journal admissions must agree, otherwise
+ * the read is refused as unexpected state rather than trusted.
+ */
 function loadConfig(deps: DoctorDeps): DoctorConfig {
   const resolvedConfigPath = configPath(deps.homedir);
-  try {
-    return withBackendPublicationConfigLock(resolvedConfigPath, (lockToken) => {
-      let content: string | undefined;
-      let publicationError: BackendPublicationJournalError | undefined;
-      try {
-        if (!deps.existsSync(resolvedConfigPath)) {
-          publicationError = authenticateConfigPublication(
-            resolvedConfigPath,
-            deps,
-            "sqlite",
-            null,
-            lockToken,
-          );
-          return {
-            port: DEFAULT_DAEMON_PORT,
-            storageBackend: "sqlite",
-            storage: { backend: "sqlite" },
-            summarizer: "disabled",
-            publicationError,
-          };
-        }
-        content = deps._readBoundedConfig!(resolvedConfigPath, MAX_CONFIG_BYTES);
-        const config = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
-        publicationError = authenticateConfigPublication(
-          resolvedConfigPath,
-          deps,
-          config.storage.backend,
-          content,
-          lockToken,
+  const readSnapshot = deps._readDaemonConfigRawSnapshot ?? readDaemonConfigRawSnapshot;
+  const assertReadAccess = deps._assertPublicationReadAccess ?? assertBackendPublicationConfigReadAccess;
+  return withBackendPublicationReadRoot(deps.homedir, (assertReadRoot) => {
+    const readVerifiedSnapshot = (): DaemonConfigRawSnapshot => {
+      assertReadRoot();
+      const snapshot = readSnapshot(resolvedConfigPath);
+      assertReadRoot();
+      return snapshot;
+    };
+    const assertVerifiedReadAccess = (
+      backend: "sqlite" | "postgresql",
+      snapshot: DaemonConfigRawSnapshot,
+    ): Readonly<{ journalChecksumSha256: string | null }> => {
+      assertReadRoot();
+      const admission = assertReadAccess(resolvedConfigPath, backend, snapshot.witness);
+      assertReadRoot();
+      return admission;
+    };
+    const runInterleavingSeam = (): void => {
+      assertReadRoot();
+      deps._betweenConfigSnapshotsForTesting?.();
+      assertReadRoot();
+    };
+    let first: DaemonConfigRawSnapshot | undefined;
+    let parsed: DaemonConfig | undefined;
+    try {
+      assertLcmRootShape(deps.homedir, deps._lstatLcmRootForTesting ?? lstatSync);
+      first = readVerifiedSnapshot();
+      parsed = parseDaemonConfig(first.content, undefined, resolveDaemonConfigEnv(process.env));
+      const firstAdmission = assertVerifiedReadAccess(parsed.storage.backend, first);
+      runInterleavingSeam();
+      const second = readVerifiedSnapshot();
+      if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
+        throw new BackendPublicationJournalError(
+          "unexpected-state",
+          "doctor config changed during lock-free read admission",
         );
+      }
+      const secondAdmission = assertVerifiedReadAccess(parsed.storage.backend, second);
+      if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
+        throw new BackendPublicationJournalError(
+          "unexpected-state",
+          "doctor backend publication changed during lock-free read admission",
+        );
+      }
+      if (first.witness.presence === "absent") {
+        // No configuration yet: the daemon would run on defaults, but doctor
+        // reports the summarizer as disabled until `lcm install` writes one.
         return {
-          port: config.daemon.port,
-          storageBackend: config.storage.backend,
-          storage: config.storage,
-          summarizer: config.llm.provider,
-          apiMode: config.llm.apiMode,
-          reasoningEffort: config.llm.reasoningEffort,
-          fastMode: config.llm.fastMode,
-          requestTimeoutMs: config.llm.provider === "openai" ? config.llm.requestTimeoutMs : undefined,
-          retry: config.llm.provider === "openai" ? config.llm.retry : undefined,
-          publicationError,
+          port: DEFAULT_DAEMON_PORT,
+          storageBackend: "sqlite",
+          storage: { backend: "sqlite" },
+          summarizer: "disabled",
+          publicationError: undefined,
         };
-      } catch (error) {
-        const validationError = error instanceof ConfigValidationError
-          ? error
-          : new ConfigValidationError("$", error instanceof Error ? error.message : String(error));
-        publicationError = content === undefined
-          ? new BackendPublicationJournalError(
-              "unsafe-storage",
-              "backend publication admission is blocked because config bytes could not be observed safely",
-            )
-          : authenticateConfigPublication(
-              resolvedConfigPath,
-              deps,
-              backendCandidate(content),
-              content,
-              lockToken,
-            );
+      }
+      return doctorConfigFromDaemonConfig(parsed);
+    } catch (error) {
+      if (error instanceof BackendPublicationJournalError) {
         return {
-          port: typeof content === "string" ? recoverConfiguredPort(content) : DEFAULT_DAEMON_PORT,
+          port: parsed?.daemon.port ?? DEFAULT_DAEMON_PORT,
+          storageBackend: "unavailable",
+          summarizer: "disabled",
+          publicationError: error,
+        };
+      }
+      const validationError = error instanceof ConfigValidationError
+        ? error
+        : new ConfigValidationError(
+          "$",
+          error instanceof Error ? error.message : String(error),
+        );
+      if (first !== undefined) {
+        // The bytes were observed safely; only validation failed. Doctor still
+        // authenticates publication evidence against the candidate backend so a
+        // blocked publication is reported even when the config is invalid, and
+        // still diagnoses the daemon on a recoverable port.
+        let publicationError: BackendPublicationJournalError | undefined;
+        try {
+          const candidateBackend = backendCandidate(first.content);
+          const firstAdmission = assertVerifiedReadAccess(candidateBackend, first);
+          runInterleavingSeam();
+          const second = readVerifiedSnapshot();
+          if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
+            throw new BackendPublicationJournalError(
+              "unexpected-state",
+              "doctor config changed during lock-free read admission",
+            );
+          }
+          const secondAdmission = assertVerifiedReadAccess(candidateBackend, second);
+          if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
+            throw new BackendPublicationJournalError(
+              "unexpected-state",
+              "doctor backend publication changed during lock-free read admission",
+            );
+          }
+        } catch (admissionError) {
+          if (!(admissionError instanceof BackendPublicationJournalError)) throw admissionError;
+          publicationError = admissionError;
+        }
+        return {
+          port: recoverConfiguredPort(first.content),
           storageBackend: "unavailable",
           summarizer: "disabled",
           validationError,
           publicationError,
         };
       }
-    });
-  } catch (error) {
-    if (!(error instanceof BackendPublicationJournalError)) throw error;
-    return {
-      port: DEFAULT_DAEMON_PORT,
-      storageBackend: "unavailable",
-      summarizer: "disabled",
-      publicationError: error,
-    };
-  }
+      return {
+        port: DEFAULT_DAEMON_PORT,
+        storageBackend: "unavailable",
+        summarizer: "disabled",
+        validationError,
+        publicationError: new BackendPublicationJournalError(
+          "unsafe-storage",
+          "backend publication admission is blocked because config bytes could not be observed safely",
+        ),
+      };
+    }
+  });
 }
 
-function checkProjectMap(results: CheckResult[], deps: DoctorDeps): void {
+async function checkProjectMap(
+  results: CheckResult[],
+  deps: DoctorDeps,
+  port: number,
+  convergence: PublicationConvergence,
+): Promise<void> {
   let validation: ProjectMapValidation;
   try {
-    validation = validateProjectMap({ homeDir: deps.homedir, fix: true });
+    validation = await withPublicationConvergence(
+      () => validateProjectMap({ homeDir: deps.homedir, fix: true }),
+      deps,
+      port,
+      convergence,
+    );
   } catch (err) {
     results.push({
       name: "project-map",
@@ -457,9 +720,19 @@ function checkProjectMap(results: CheckResult[], deps: DoctorDeps): void {
   });
 }
 
-function checkWorktreeReconciliations(results: CheckResult[], deps: DoctorDeps): void {
+async function checkWorktreeReconciliations(
+  results: CheckResult[],
+  deps: DoctorDeps,
+  port: number,
+  convergence: PublicationConvergence,
+): Promise<void> {
   try {
-    const journals = listWorktreeReconciliationJournals(deps.homedir);
+    const journals = await withPublicationConvergence(
+      () => listWorktreeReconciliationJournals(deps.homedir),
+      deps,
+      port,
+      convergence,
+    );
     const blocked = journals.filter((journal) => journal.phase === "blocked");
     const partial = journals.filter((journal) =>
       journal.phase !== "blocked" && journal.phase !== "completed");
@@ -888,20 +1161,7 @@ async function checkPassiveLearning(
 }
 
 export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: boolean | DoctorRunOptions = false): Promise<CheckResult[]> {
-  const mergedDeps = { ...defaultDeps(), ...overrides };
-  const deps = {
-    ...mergedDeps,
-    _readBoundedConfig: overrides?._readBoundedConfig
-      ?? (overrides?.readFileSync === undefined
-        ? mergedDeps._readBoundedConfig
-        : (path: string, maxBytes: number) => {
-          const content = mergedDeps.readFileSync(path, "utf-8");
-          if (Buffer.byteLength(content, "utf8") > maxBytes) {
-            throw new Error("file exceeds the configured size limit");
-          }
-          return content;
-        }),
-  };
+  const deps: DoctorDeps = { ...defaultDeps(), ...overrides };
   const options = normalizeDoctorOptions(doctorOptions);
   const results: CheckResult[] = [];
   const config = loadConfig(deps);
@@ -949,25 +1209,15 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     results.push({ name: "config", category: "Stack", status: "fail", message: `Missing — run: lcm install` });
   }
 
-  // ── Project path aliases ──
-  if (repairBlocked) {
-    results.push({ name: "project-map", category: "Project Map", status: "skip", message: repairSkipMessage });
-    results.push({ name: "worktree-reconciliation", category: "Project Map", status: "skip", message: repairSkipMessage });
-  } else {
-    checkProjectMap(results, deps);
-    checkWorktreeReconciliations(results, deps);
-  }
-
-  // ── Daemon ──
-  let daemonHealthy = false;
-  let daemonStorageReadiness: DaemonStorageReadiness = "unverified";
-  let daemonVersion: string | undefined;
-  let daemonPid: number | undefined;
+  // ── Convergence identity ──
+  // Observe the daemon before any lock-taking stage so that project-map,
+  // worktree, and lifecycle admission can all wait for the same daemon's
+  // short publication work under one shared deadline. Retries additionally
+  // require token-authenticated health to match this identity every time.
   const runtimePath = packagedRuntimePath();
-  const daemonSpawnArgs = [runtimePath, "daemon", "start", "--foreground"];
-  const clearRemediationMarker = (): void => {
-    clearDaemonNotice(remediationScope);
-  };
+  const expectedRuntimeDigest = deps._expectedRuntimeDigestForTesting ?? RUNTIME_DIGEST;
+  let daemonHealthy = false;
+  let daemonVersion: string | undefined;
   let initialHealthPid: number | undefined;
   if (!publicationBlocked) {
     try {
@@ -979,6 +1229,29 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       }
     } catch {}
   }
+  const convergence = createPublicationConvergence(
+    deps,
+    repairBlocked
+      ? undefined
+      : expectedConvergenceIdentity(initialHealthPid, config, pkgVersion, runtimePath, expectedRuntimeDigest),
+  );
+
+  // ── Project path aliases ──
+  if (repairBlocked) {
+    results.push({ name: "project-map", category: "Project Map", status: "skip", message: repairSkipMessage });
+    results.push({ name: "worktree-reconciliation", category: "Project Map", status: "skip", message: repairSkipMessage });
+  } else {
+    await checkProjectMap(results, deps, config.port, convergence);
+    await checkWorktreeReconciliations(results, deps, config.port, convergence);
+  }
+
+  // ── Daemon ──
+  let daemonStorageReadiness: DaemonStorageReadiness = "unverified";
+  let daemonPid: number | undefined;
+  const daemonSpawnArgs = [runtimePath, "daemon", "start", "--foreground"];
+  const clearRemediationMarker = (): void => {
+    clearDaemonNotice(remediationScope);
+  };
 
   if (publicationBlocked) {
     results.push({
@@ -1017,14 +1290,21 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         expectedEntrypoint: runtimePath,
         enforceUserManagerParent: true,
       };
+      const invokeLifecycle = (restart: boolean): Promise<Awaited<ReturnType<typeof ensureDaemon>>> =>
+        withPublicationConvergence(
+          () => restart ? restartDaemon(lifecycleOptions) : ensureDaemon(lifecycleOptions),
+          deps,
+          config.port,
+          convergence,
+        );
       let lifecycleResult = versionMismatch
-        ? await restartDaemon(lifecycleOptions)
-        : await ensureDaemon(lifecycleOptions);
+        ? await invokeLifecycle(true)
+        : await invokeLifecycle(false);
       const repairedStaleConfiguration = !versionMismatch
         && !lifecycleResult.connected
         && lifecycleResult.refusalReason === "stale-config";
       if (repairedStaleConfiguration) {
-        lifecycleResult = await restartDaemon(lifecycleOptions);
+        lifecycleResult = await invokeLifecycle(true);
       }
       if (lifecycleResult.connected) daemonPid = lifecycleResult.pid ?? initialHealthPid;
 
@@ -1129,10 +1409,18 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         });
         daemonHealthy = true;
       }
-    } catch {
+    } catch (error) {
       daemonHealthy = false;
       daemonStorageReadiness = "unverified";
-      if (versionMismatch) {
+      if (error instanceof PrivateMutationLockContentionError) {
+        results.push({
+          name: "daemon",
+          category: "Daemon",
+          status: "fail",
+          message: `localhost:${config.port} — backend publication admission failed: ${sanitizeTerminalText(error.message)}`,
+          fixApplied: false,
+        });
+      } else if (versionMismatch) {
         results.push({ name: "daemon", category: "Daemon", status: "warn",
           message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed)\n     Fix: ${remediationGuidance("not-running")}` });
       } else {
@@ -1144,17 +1432,18 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     // Auto-fix: try ensureDaemon
     try {
       const { ensureDaemon } = await import("../daemon/lifecycle.js");
-      const ensureResult = await ensureDaemon({
+      const expectedStorageBackend = config.storageBackend;
+      const ensureResult = await withPublicationConvergence(() => ensureDaemon({
         port: config.port,
         pidFilePath: daemonPidPath(deps.homedir),
         spawnTimeoutMs: 10000,
         expectedVersion: pkgVersion,
-        expectedStorageBackend: config.storageBackend,
+        expectedStorageBackend,
         spawnCommand: process.execPath,
         spawnArgs: daemonSpawnArgs,
         expectedEntrypoint: runtimePath,
         enforceUserManagerParent: true,
-      });
+      }), deps, config.port, convergence);
       if (ensureResult.connected) {
         clearRemediationMarker();
         daemonPid = ensureResult.pid;
