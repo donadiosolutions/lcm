@@ -678,6 +678,12 @@ describe("native transcript scrub and JSONL reader", () => {
       }),
     ]);
 
+    const progressEntries: Array<{
+      readonly startByteOffset: number;
+      readonly endByteOffset: number;
+      readonly rangeSha256: string;
+      readonly prefixSha256: string;
+    }> = [];
     const rejected = await Array.fromAsync(readNativeTranscriptJsonl({
       bytes: byteChunks(`${rawLine}\n`),
       format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
@@ -690,16 +696,18 @@ describe("native transcript scrub and JSONL reader", () => {
       clock: () => new Date("2026-07-25T12:00:00.000Z"),
       maxRecordBytes: 21,
       onProgress: (progress) => {
-        expect(progress).toEqual({
-          startByteOffset: 0,
-          endByteOffset: 14,
-          rangeSha256:
-            "2439ae967c1b8c05520633077a1988e5335764f134365a50bd53c7eff285f8fe",
-          prefixSha256:
-            "2439ae967c1b8c05520633077a1988e5335764f134365a50bd53c7eff285f8fe",
-        });
+        progressEntries.push(progress);
       },
     }));
+    expect(progressEntries).toHaveLength(1);
+    expect(progressEntries[0]).toEqual({
+      startByteOffset: 0,
+      endByteOffset: 14,
+      rangeSha256:
+        "2439ae967c1b8c05520633077a1988e5335764f134365a50bd53c7eff285f8fe",
+      prefixSha256:
+        "2439ae967c1b8c05520633077a1988e5335764f134365a50bd53c7eff285f8fe",
+    });
     expect(rejected).toEqual([
       {
         kind: "quarantine",
