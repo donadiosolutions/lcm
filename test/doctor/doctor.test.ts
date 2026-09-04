@@ -719,26 +719,34 @@ describe("runDoctor project map checks", () => {
     }
   });
 
-  it("preserves typed contention once the shared convergence deadline is spent", async () => {
+  it("preserves typed contention without starting a retry at the shared deadline", async () => {
     const { home } = contentionHome("lcm-doctor-deadline-contention-");
     writeLivePublicationOwner(home);
-    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const contention = new PrivateMutationLockContentionError("original publication lock is busy");
+    let attempts = 0;
     const { deps, sleeps, clock, restore } = convergenceDeps(home, {}, { projectMap: false });
     const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap")
-      .mockImplementation(() => { throw contention; });
+      .mockImplementation(() => {
+        attempts += 1;
+        throw attempts === 1
+          ? contention
+          : new PrivateMutationLockContentionError(`retry ${attempts} publication lock is busy`);
+      });
     vi.mocked(ensureDaemon).mockRejectedValue(contention);
     try {
       const results = await runDoctor(deps);
-      // 2000 ms budget at 50 ms polls: 40 retries, then the 41st refusal
-      // observes the deadline and propagates the original typed error.
-      expect(validateProjectMap).toHaveBeenCalledTimes(41);
+      // The initial attempt plus 39 retries begin before the deadline. The
+      // final wait reaches 2000 ms, so a 41st stage call is never started.
+      expect(validateProjectMap).toHaveBeenCalledTimes(40);
       expect(sleeps).toHaveLength(40);
       expect(sleeps.every(delay => delay === 50)).toBe(true);
       expect(clock.now).toBe(2000);
       expect(results.find((result) => result.name === "project-map")).toMatchObject({
         status: "fail",
-        message: expect.stringContaining("publication lock is busy"),
+        message: expect.stringContaining("original publication lock is busy"),
       });
+      expect(results.find((result) => result.name === "project-map")?.message)
+        .not.toContain("retry 40 publication lock is busy");
       // The budget is shared: the lifecycle stage gets no additional waits.
       expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
       expect(results.find((result) => result.name === "daemon")).toMatchObject({
@@ -763,9 +771,47 @@ describe("runDoctor project map checks", () => {
       .mockImplementationOnce(async () => { clock.now = 1_990; throw contention; })
       .mockResolvedValueOnce({ connected: true, port: 3737, spawned: false, pid: process.pid });
     try {
-      await runDoctor(deps);
+      const results = await runDoctor(deps);
       expect(sleeps).toEqual([10]);
       expect(clock.now).toBe(2_000);
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("publication lock is busy"),
+      });
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("does not start a retry when a timer resumes after the deadline", async () => {
+    vi.useFakeTimers();
+    const { home } = contentionHome("lcm-doctor-late-timer-contention-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("late timer publication lock is busy");
+    const { deps, sleeps, clock, restore } = convergenceDeps(home, {
+      _publicationConvergenceSleep: async (delayMs) => {
+        sleeps.push(delayMs);
+        await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+        clock.now = 2_001;
+      },
+    });
+    vi.mocked(ensureDaemon).mockImplementationOnce(async () => {
+      clock.now = 1_990;
+      throw contention;
+    });
+    try {
+      const pending = runDoctor(deps);
+      await vi.advanceTimersByTimeAsync(10);
+      const results = await pending;
+      expect(sleeps).toEqual([10]);
+      expect(clock.now).toBe(2_001);
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("late timer publication lock is busy"),
+      });
     } finally {
       restore();
       rmSync(home, { recursive: true, force: true });
@@ -1021,6 +1067,88 @@ describe("runDoctor project map checks", () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  it("blocks a symlink swap during the first publication admission", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-root-first-admission-swap-"));
+    const root = join(home, ".lcm");
+    const retainedRoot = join(home, "retained-lcm");
+    const configFile = join(root, "config.json");
+    mkdirSync(root, { mode: 0o700 });
+    writeFileSync(configFile, "{}\n", { mode: 0o600 });
+    let admissions = 0;
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        _readDaemonConfigRawSnapshot: undefined,
+        _assertPublicationReadAccess: (...args) => {
+          admissions += 1;
+          if (admissions === 1) {
+            renameSync(root, retainedRoot);
+            symlinkSync(retainedRoot, root);
+          }
+          return assertBackendPublicationConfigReadAccess(...args);
+        },
+      }));
+      expect(admissions).toBe(1);
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+      });
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("skip");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks an LCM root replacement on the invalid-config second snapshot path", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-invalid-root-second-snapshot-swap-"));
+    const root = join(home, ".lcm");
+    const retainedRoot = join(home, "retained-lcm");
+    const replacementRoot = join(home, "replacement-lcm");
+    const configFile = join(root, "config.json");
+    mkdirSync(root, { mode: 0o700 });
+    mkdirSync(replacementRoot, { mode: 0o700 });
+    writeFileSync(configFile, JSON.stringify({ storage: { backend: "invalid" } }), { mode: 0o600 });
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        _readDaemonConfigRawSnapshot: undefined,
+        _betweenConfigSnapshotsForTesting: () => {
+          renameSync(root, retainedRoot);
+          renameSync(join(retainedRoot, "config.json"), join(replacementRoot, "config.json"));
+          renameSync(replacementRoot, root);
+        },
+      }));
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+      });
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("skip");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["absent", "non-private"] as const)(
+    "preserves the legacy %s LCM-root read without publication evidence",
+    async (rootShape) => {
+      const home = mkdtempSync(join(tmpdir(), `lcm-doctor-legacy-${rootShape}-root-`));
+      if (rootShape === "non-private") {
+        mkdirSync(join(home, ".lcm"), { mode: 0o755 });
+        writeFileSync(join(home, ".lcm", "config.json"), "{}\n", { mode: 0o600 });
+      }
+      try {
+        const results = await runDoctor(minimalDeps({
+          homedir: home,
+          _readDaemonConfigRawSnapshot: undefined,
+        }));
+        expect(results.find((result) => result.name === "backend-publication")).toBeUndefined();
+        expect(results.find((result) => result.name === "config")).toMatchObject({ status: "pass" });
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("blocks admission when config bytes drift between lock-free snapshots", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-config-drift-"));

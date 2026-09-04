@@ -120,13 +120,16 @@ same bounded, stable, lock-free configuration admission.
 The configuration read used by `lcm doctor` and by connector transport
 resolution is also lock-free and authenticated: two descriptor-bound snapshots
 of `config.json` and two reads of the terminal publication journal must agree
-before the bytes are trusted. Connector transport resolution also opens the
-canonical `.lcm` root without following a symlink and retains that directory
+before the bytes are trusted. When a private canonical `.lcm` root is present,
+both readers open it without following a symlink and retain that directory
 descriptor across both snapshots and both publication admissions, rejecting a
-root replacement or unsafe publication root. Any subsequent configuration
-write, including an explicit transport preference, still takes the normal
-authenticated mutation lock and remains fail closed if that lock is held by
-another operation.
+root replacement or unsafe publication root. A legacy SQLite installation with
+an absent root, or a non-private root without publication evidence, remains
+read-compatible without a retained descriptor; every boundary rechecks for a
+new admissible root or publication evidence and fails closed if either becomes
+unsafe. Any subsequent configuration write, including an explicit transport
+preference, still takes the normal authenticated mutation lock and remains fail
+closed if that lock is held by another operation.
 
 The remaining doctor stages that take the exclusive publication lock (the
 project-map validation and repair, the worktree reconciliation listing, and

@@ -25,7 +25,7 @@ import {
   assertBackendPublicationPermit,
   backendPublicationHomeForConfigPath,
   captureBackendPublicationState,
-  openBackendPublicationReadRoot,
+  withBackendPublicationReadRoot,
   withBackendPublicationConfigLockAsync,
   withBackendPublicationConfigLock,
   type BackendPublicationFileMutationContext,
@@ -34,7 +34,6 @@ import {
 } from "./storage/backend-publication.js";
 import {
   atomicWritePrivateFileDurable,
-  assertPrivateDirectory,
   consumeBoundedRegularFile,
   ensurePrivateDirectory,
   readBoundedRegularFile,
@@ -528,17 +527,7 @@ function withConnectorTransportReadRoot<T>(
 ): T {
   const homeDir = backendPublicationHomeForConfigPath(configPath);
   if (homeDir === undefined) return callback(() => undefined);
-  const rootPath = dirname(resolve(configPath));
-  let rootHandle = openBackendPublicationReadRoot(homeDir);
-  const assertReadRoot = (): void => {
-    rootHandle ??= openBackendPublicationReadRoot(homeDir);
-    if (rootHandle !== undefined) assertPrivateDirectory(rootHandle, rootPath);
-  };
-  try {
-    return callback(assertReadRoot);
-  } finally {
-    rootHandle?.close();
-  }
+  return withBackendPublicationReadRoot(homeDir, callback);
 }
 
 /** Read one validated stored connector transport without taking the publication lock. */

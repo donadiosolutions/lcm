@@ -69,6 +69,7 @@ import {
 import {
   assertBackendPublicationConfigReadAccess,
   BackendPublicationJournalError,
+  withBackendPublicationReadRoot,
 } from "../storage/backend-publication.js";
 import {
   PrivateMutationLockContentionError,
@@ -416,12 +417,17 @@ async function withPublicationConvergence<T>(
   port: number,
   convergence: PublicationConvergence,
 ): Promise<T> {
+  let firstContention: PrivateMutationLockContentionError | undefined;
   while (true) {
+    if (firstContention !== undefined && convergence.now() >= convergence.deadline) {
+      throw firstContention;
+    }
     try {
       return await run();
     } catch (error) {
       const delay = await convergenceRetryDelay(deps, port, convergence, error);
       if (delay === undefined) throw error;
+      firstContention ??= error as PrivateMutationLockContentionError;
       deps._betweenConvergenceAttemptsForTesting?.();
       await convergence.sleep(delay);
     }
@@ -533,118 +539,124 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
   const resolvedConfigPath = configPath(deps.homedir);
   const readSnapshot = deps._readDaemonConfigRawSnapshot ?? readDaemonConfigRawSnapshot;
   const assertReadAccess = deps._assertPublicationReadAccess ?? assertBackendPublicationConfigReadAccess;
-  let first: DaemonConfigRawSnapshot | undefined;
-  let parsed: DaemonConfig | undefined;
-  try {
-    assertLcmRootShape(deps.homedir, deps._lstatLcmRootForTesting ?? lstatSync);
-    first = readSnapshot(resolvedConfigPath);
-    parsed = parseDaemonConfig(first.content, undefined, resolveDaemonConfigEnv(process.env));
-    const firstAdmission = assertReadAccess(
-      resolvedConfigPath,
-      parsed.storage.backend,
-      first.witness,
-    );
-    deps._betweenConfigSnapshotsForTesting?.();
-    const second = readSnapshot(resolvedConfigPath);
-    if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
-      throw new BackendPublicationJournalError(
-        "unexpected-state",
-        "doctor config changed during lock-free read admission",
-      );
-    }
-    const secondAdmission = assertReadAccess(
-      resolvedConfigPath,
-      parsed.storage.backend,
-      second.witness,
-    );
-    if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
-      throw new BackendPublicationJournalError(
-        "unexpected-state",
-        "doctor backend publication changed during lock-free read admission",
-      );
-    }
-    if (first.witness.presence === "absent") {
-      // No configuration yet: the daemon would run on defaults, but doctor
-      // reports the summarizer as disabled until `lcm install` writes one.
-      return {
-        port: DEFAULT_DAEMON_PORT,
-        storageBackend: "sqlite",
-        storage: { backend: "sqlite" },
-        summarizer: "disabled",
-        publicationError: undefined,
-      };
-    }
-    return doctorConfigFromDaemonConfig(parsed);
-  } catch (error) {
-    if (error instanceof BackendPublicationJournalError) {
-      return {
-        port: parsed?.daemon.port ?? DEFAULT_DAEMON_PORT,
-        storageBackend: "unavailable",
-        summarizer: "disabled",
-        publicationError: error,
-      };
-    }
-    const validationError = error instanceof ConfigValidationError
-      ? error
-      : new ConfigValidationError(
-        "$",
-        error instanceof Error ? error.message : String(error),
-      );
-    if (first !== undefined) {
-      // The bytes were observed safely; only validation failed. Doctor still
-      // authenticates publication evidence against the candidate backend so a
-      // blocked publication is reported even when the config is invalid, and
-      // still diagnoses the daemon on a recoverable port.
-      let publicationError: BackendPublicationJournalError | undefined;
-      try {
-        const candidateBackend = backendCandidate(first.content);
-        const firstAdmission = assertReadAccess(
-          resolvedConfigPath,
-          candidateBackend,
-          first.witness,
+  return withBackendPublicationReadRoot(deps.homedir, (assertReadRoot) => {
+    const readVerifiedSnapshot = (): DaemonConfigRawSnapshot => {
+      assertReadRoot();
+      const snapshot = readSnapshot(resolvedConfigPath);
+      assertReadRoot();
+      return snapshot;
+    };
+    const assertVerifiedReadAccess = (
+      backend: "sqlite" | "postgresql",
+      snapshot: DaemonConfigRawSnapshot,
+    ): Readonly<{ journalChecksumSha256: string | null }> => {
+      assertReadRoot();
+      const admission = assertReadAccess(resolvedConfigPath, backend, snapshot.witness);
+      assertReadRoot();
+      return admission;
+    };
+    const runInterleavingSeam = (): void => {
+      assertReadRoot();
+      deps._betweenConfigSnapshotsForTesting?.();
+      assertReadRoot();
+    };
+    let first: DaemonConfigRawSnapshot | undefined;
+    let parsed: DaemonConfig | undefined;
+    try {
+      assertLcmRootShape(deps.homedir, deps._lstatLcmRootForTesting ?? lstatSync);
+      first = readVerifiedSnapshot();
+      parsed = parseDaemonConfig(first.content, undefined, resolveDaemonConfigEnv(process.env));
+      const firstAdmission = assertVerifiedReadAccess(parsed.storage.backend, first);
+      runInterleavingSeam();
+      const second = readVerifiedSnapshot();
+      if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
+        throw new BackendPublicationJournalError(
+          "unexpected-state",
+          "doctor config changed during lock-free read admission",
         );
-        deps._betweenConfigSnapshotsForTesting?.();
-        const second = readSnapshot(resolvedConfigPath);
-        if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
-          throw new BackendPublicationJournalError(
-            "unexpected-state",
-            "doctor config changed during lock-free read admission",
-          );
-        }
-        const secondAdmission = assertReadAccess(
-          resolvedConfigPath,
-          candidateBackend,
-          second.witness,
+      }
+      const secondAdmission = assertVerifiedReadAccess(parsed.storage.backend, second);
+      if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
+        throw new BackendPublicationJournalError(
+          "unexpected-state",
+          "doctor backend publication changed during lock-free read admission",
         );
-        if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
-          throw new BackendPublicationJournalError(
-            "unexpected-state",
-            "doctor backend publication changed during lock-free read admission",
-          );
+      }
+      if (first.witness.presence === "absent") {
+        // No configuration yet: the daemon would run on defaults, but doctor
+        // reports the summarizer as disabled until `lcm install` writes one.
+        return {
+          port: DEFAULT_DAEMON_PORT,
+          storageBackend: "sqlite",
+          storage: { backend: "sqlite" },
+          summarizer: "disabled",
+          publicationError: undefined,
+        };
+      }
+      return doctorConfigFromDaemonConfig(parsed);
+    } catch (error) {
+      if (error instanceof BackendPublicationJournalError) {
+        return {
+          port: parsed?.daemon.port ?? DEFAULT_DAEMON_PORT,
+          storageBackend: "unavailable",
+          summarizer: "disabled",
+          publicationError: error,
+        };
+      }
+      const validationError = error instanceof ConfigValidationError
+        ? error
+        : new ConfigValidationError(
+          "$",
+          error instanceof Error ? error.message : String(error),
+        );
+      if (first !== undefined) {
+        // The bytes were observed safely; only validation failed. Doctor still
+        // authenticates publication evidence against the candidate backend so a
+        // blocked publication is reported even when the config is invalid, and
+        // still diagnoses the daemon on a recoverable port.
+        let publicationError: BackendPublicationJournalError | undefined;
+        try {
+          const candidateBackend = backendCandidate(first.content);
+          const firstAdmission = assertVerifiedReadAccess(candidateBackend, first);
+          runInterleavingSeam();
+          const second = readVerifiedSnapshot();
+          if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
+            throw new BackendPublicationJournalError(
+              "unexpected-state",
+              "doctor config changed during lock-free read admission",
+            );
+          }
+          const secondAdmission = assertVerifiedReadAccess(candidateBackend, second);
+          if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
+            throw new BackendPublicationJournalError(
+              "unexpected-state",
+              "doctor backend publication changed during lock-free read admission",
+            );
+          }
+        } catch (admissionError) {
+          if (!(admissionError instanceof BackendPublicationJournalError)) throw admissionError;
+          publicationError = admissionError;
         }
-      } catch (admissionError) {
-        if (!(admissionError instanceof BackendPublicationJournalError)) throw admissionError;
-        publicationError = admissionError;
+        return {
+          port: recoverConfiguredPort(first.content),
+          storageBackend: "unavailable",
+          summarizer: "disabled",
+          validationError,
+          publicationError,
+        };
       }
       return {
-        port: recoverConfiguredPort(first.content),
+        port: DEFAULT_DAEMON_PORT,
         storageBackend: "unavailable",
         summarizer: "disabled",
         validationError,
-        publicationError,
+        publicationError: new BackendPublicationJournalError(
+          "unsafe-storage",
+          "backend publication admission is blocked because config bytes could not be observed safely",
+        ),
       };
     }
-    return {
-      port: DEFAULT_DAEMON_PORT,
-      storageBackend: "unavailable",
-      summarizer: "disabled",
-      validationError,
-      publicationError: new BackendPublicationJournalError(
-        "unsafe-storage",
-        "backend publication admission is blocked because config bytes could not be observed safely",
-      ),
-    };
-  }
+  });
 }
 
 async function checkProjectMap(
