@@ -121,6 +121,8 @@ component_management:
         # #681 retains backend-publication durable-write ownership here.
         # #722 retains one authenticated backend-publication directory identity
         # across journal, evidence, and terminal recovery-material reads.
+        # #844 extends the coordinator's locked evidence/material reads with
+        # one operation-scoped directory witness and a fail-closed return check.
         # #837 retains consumer-admission descriptor cleanup in this owner.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
@@ -202,6 +204,7 @@ component_management:
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"
         - "^src/daemon/managed-path\\.ts$"
+        # #786/#952 creation-only daemon-tmp rollback remains service-manager owned.
         - "^src/daemon/supervisor\\.ts$"
     - component_id: "integration-postgresql-runtime"
       name: "Integration - PostgreSQL Runtime"

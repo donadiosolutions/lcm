@@ -765,7 +765,7 @@ describe("systemd-user supervisor", () => {
     const movedRoot = `${root}-moved`;
     roots.push(movedRoot);
     let redirected = false;
-    const race = (path: string, phase: "before-open" | "before-manager"): void => {
+    const race = (path: string, phase: "before-open" | "before-rollback" | "before-manager"): void => {
       if (phase !== "before-open" || redirected) return;
       redirected = true;
       renameSync(root, movedRoot);
@@ -789,7 +789,7 @@ describe("systemd-user supervisor", () => {
     const daemonTemp = join(root, "daemon-tmp");
     const redirect = makeRoot();
     let raced = false;
-    const race = (path: string, phase: "before-open" | "before-manager"): void => {
+    const race = (path: string, phase: "before-open" | "before-rollback" | "before-manager"): void => {
       if (phase !== "before-manager" || raced) return;
       raced = true;
       rmSync(path, { recursive: true, force: true });
