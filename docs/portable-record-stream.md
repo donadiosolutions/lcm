@@ -189,9 +189,13 @@ Manifest `recordCount` values are nonnegative safe integers, with `-0`
 explicitly rejected as `malformed-manifest` before checksum canonicalization.
 This classification applies consistently to manifest construction,
 serialization, negotiation, batch creation, and canonical wire parsing. A
-negative-zero count encountered while verifying a checkpoint retains the
-compatibility classification `checkpoint-mismatch`; a negative-zero value in a
-canonical record payload remains `malformed-record`.
+checkpoint's `nextOrdinal` and `recordCount` values are also nonnegative safe
+integers, with `-0` rejected as `checkpoint-mismatch` by direct checkpoint
+serialization and verification and by canonical wire parsing before checksum
+canonicalization. A negative-zero count encountered while verifying a
+checkpoint therefore retains the compatibility classification
+`checkpoint-mismatch`; a negative-zero value in a canonical record payload
+remains `malformed-record`.
 
 ### Checkpoints and batches
 
