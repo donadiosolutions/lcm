@@ -26,6 +26,10 @@ vi.mock("../../src/llm/codex-responses-gateway.js", () => ({
   })),
 }));
 
+vi.mock("../../src/llm/codex-config.js", () => ({
+  resolveCodexOpenAIBaseUrl: vi.fn(() => undefined),
+}));
+
 type SpawnFn = typeof import("node:child_process").spawn;
 type MkdtempSyncFn = typeof import("node:fs").mkdtempSync;
 type ReadFileSyncFn = typeof import("node:fs").readFileSync;
@@ -81,6 +85,7 @@ function baseDeps(child: FakeChild, overrides: Record<string, unknown> = {}) {
     mkdtempSync: vi.fn(() => mkdtempSync(join(tmpdir(), "lcm-codex-"))) as unknown as MkdtempSyncFn,
     readFileSync: vi.fn(() => "summary") as unknown as ReadFileSyncFn,
     rmSync: vi.fn() as unknown as RmSyncFn,
+    _resolveConfig: vi.fn(() => undefined),
     ...overrides,
   };
 }
@@ -108,7 +113,7 @@ describe("createCodexProcessSummarizer", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
-  it("awaits a late gateway close before abort rejection and temp cleanup", async () => {
+  it("closes a late gateway after abort without retaining temp state", async () => {
     const controller = new AbortController();
     const child = makeHangingChild();
     let resolveGateway: ((gateway: ReturnType<typeof makeGateway>) => void) | undefined;
@@ -135,11 +140,11 @@ describe("createCodexProcessSummarizer", () => {
     void pending.then(() => { settled = true; }, () => { settled = true; });
     await Promise.resolve();
     expect(settled).toBe(false);
-    expect(rmSyncMock).not.toHaveBeenCalled();
+    expect(rmSyncMock).toHaveBeenCalledOnce();
 
     resolveGateway?.(gateway);
     await vi.waitFor(() => expect(gateway.close).toHaveBeenCalledOnce());
-    expect(rmSyncMock).not.toHaveBeenCalled();
+    expect(rmSyncMock).toHaveBeenCalledOnce();
     releaseClose?.();
     expect(isAbortError((await observed).error)).toBe(true);
     expect(rmSyncMock).toHaveBeenCalledOnce();
@@ -530,6 +535,58 @@ describe("createCodexProcessSummarizer", () => {
     expect(gateway.close).toHaveBeenCalledOnce();
   });
 
+  it("passes a resolved Codex endpoint to the gateway", async () => {
+    const child = makeChild(0);
+    const createGateway = vi.fn().mockResolvedValue(makeGateway());
+    const resolveConfig = vi.fn(async () => "https://proxy.example/v1/responses");
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child, { _createGateway: createGateway, _resolveConfig: resolveConfig }),
+    } as never);
+
+    await expect(summarizer("configured endpoint", false)).resolves.toBe("summary");
+    expect(resolveConfig).toHaveBeenCalledOnce();
+    expect(createGateway.mock.calls[0]?.[0]).toMatchObject({
+      upstreamResponsesUrl: "https://proxy.example/v1/responses",
+    });
+  });
+
+  it("cleans up when gateway startup fails or reaches the shared deadline", async () => {
+    const failed = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), {
+        _createGateway: vi.fn().mockRejectedValue(new Error("gateway startup failed")),
+      }),
+    } as never);
+    await expect(failed("startup failure", false)).rejects.toThrow("gateway startup failed");
+
+    let deadlineCallback: (() => void) | undefined;
+    const hanging = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), {
+        _createGateway: vi.fn(() => new Promise<never>(() => undefined)),
+        setTimeout: vi.fn((callback: () => void) => { deadlineCallback = callback; return 1 as never; }),
+        clearTimeout: vi.fn(),
+      }),
+    } as never);
+    const pending = hanging("gateway deadline", false);
+    await vi.waitFor(() => expect(deadlineCallback).toBeTypeOf("function"));
+    deadlineCallback?.();
+    await expect(pending).rejects.toThrow("codex process timed out");
+  });
+
+  it("closes a gateway when the absolute deadline expires before exec spawn", async () => {
+    const gateway = makeGateway();
+    let nowCalls = 0;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), {
+        timeoutMs: 10,
+        _now: () => (nowCalls++ < 3 ? 0 : 20),
+        _createGateway: vi.fn().mockResolvedValue(gateway),
+        _resolveConfig: vi.fn(async () => "https://proxy.example/v1/responses"),
+      }),
+    } as never);
+    await expect(summarizer("expired deadline", false)).rejects.toThrow("codex process timed out");
+    expect(gateway.close).toHaveBeenCalledOnce();
+  });
+
   it("rejects an exit-0 child when no authenticated gateway request was accepted", async () => {
     const child = makeChild(0);
     const gateway = makeGateway({ requestAccepted: false, requestCompleted: false });
@@ -710,7 +767,7 @@ describe("createCodexProcessSummarizer", () => {
       const processChild = makeHangingChild();
       processChild.kill.mockImplementation(() => { processChild.emit("close", null); });
       const summarizer = createCodexProcessSummarizer({
-        ...baseDeps(processChild), timeoutMs: 1,
+        ...baseDeps(processChild), timeoutMs: 1, _now: () => 0,
       } as never);
       const pending = summarizer("text", false, { signal: controller.signal });
       const observed = pending.then(() => undefined, error => error);
@@ -840,7 +897,7 @@ describe("createCodexProcessSummarizer", () => {
       const child = makeHangingChild();
       const gateway = makeGateway();
       const summarizer = createCodexProcessSummarizer({
-        ...baseDeps(child), _createGateway: vi.fn().mockResolvedValue(gateway), timeoutMs: 1,
+        ...baseDeps(child), _createGateway: vi.fn().mockResolvedValue(gateway), timeoutMs: 1, _now: () => 0,
       } as never);
       const pending = summarizer("text", false, { signal: controller.signal });
       const observed = pending.then(() => undefined, error => error);
@@ -1327,6 +1384,7 @@ describe("createCodexProcessSummarizer", () => {
       const pending = createCodexProcessSummarizer({
         ...baseDeps(child),
         timeoutMs: 1,
+        _now: () => 0,
         _createGateway: vi.fn().mockResolvedValue(gateway),
       })("text", false);
       const observed = pending.then(() => undefined, error => error);
@@ -1469,6 +1527,7 @@ describe("createCodexProcessSummarizer", () => {
     const summarizer = createCodexProcessSummarizer({
       ...baseDeps(child),
       timeoutMs: 1,
+      _now: () => 0,
     });
     await expect(summarizer("text", false)).rejects.toThrow("codex process timed out after 0s");
     child.emit("close", 0);

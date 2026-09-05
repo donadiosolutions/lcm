@@ -25,6 +25,7 @@ import {
   type CodexResponsesGatewayFailureCategory,
   type CodexResponsesGatewayOptions,
 } from "./codex-responses-gateway.js";
+import { resolveCodexOpenAIBaseUrl } from "./codex-config.js";
 import {
   LCM_SUMMARIZER_SYSTEM_PROMPT,
   buildLeafSummaryPrompt,
@@ -43,6 +44,10 @@ export type CodexProcessDeps = {
   tmpdir?: typeof tmpdir;
   timeoutMs?: number;
   _createGateway?: (options: CodexResponsesGatewayOptions) => Promise<CodexResponsesGateway>;
+  /** @internal deterministic endpoint resolver seam. */
+  _resolveConfig?: (signal?: AbortSignal, timeoutMs?: number, invocationId?: string) => Promise<string | undefined> | string | undefined;
+  /** @internal monotonic clock seam for overall timeout accounting. */
+  _now?: () => number;
   /** @internal deterministic process lifecycle seams. */
   platform?: NodeJS.Platform;
   detachedProcessGroup?: boolean;
@@ -59,7 +64,6 @@ export type CodexProcessDeps = {
 };
 
 const CODEX_BOOTSTRAP = "LCM compaction bootstrap.\n";
-const MAX_CODEX_STDERR_BYTES = 16 * 1024;
 
 const CODEX_FAILURE_MESSAGES: Readonly<Record<"usage" | "authentication" | "model" | "invalid-request", string>> = {
   usage: "Codex compaction reached a usage limit. Wait and retry, or choose another available model.",
@@ -82,18 +86,10 @@ function containsCodexPhrase(text: string, phrase: string): boolean {
 function classifyCodexStderr(stderr: string): CodexStderrFailureCategory | undefined {
   const normalized = normalizeCodexStderr(stderr);
   const matches = (phrases: readonly string[]): boolean => phrases.some(phrase => containsCodexPhrase(normalized, phrase));
-  if (matches(["you've hit your usage limit", "usage limit", "usage-limit", "rate limit", "rate-limit"])) {
-    return "usage";
-  }
-  if (matches(["not logged in", "authentication required", "authentication failed", "invalid api key"])) {
-    return "authentication";
-  }
-  if (matches(["unsupported model", "unknown model", "model is not available"])) {
-    return "model";
-  }
-  if (matches(["invalid request", "unexpected argument", "unknown flag"])) {
-    return "invalid-request";
-  }
+  if (matches(["you've hit your usage limit", "usage limit", "usage-limit", "rate limit", "rate-limit"])) return "usage";
+  if (matches(["not logged in", "authentication required", "authentication failed", "invalid api key"])) return "authentication";
+  if (matches(["unsupported model", "unknown model", "model is not available"])) return "model";
+  if (matches(["invalid request", "unexpected argument", "unknown flag"])) return "invalid-request";
   return undefined;
 }
 
@@ -195,6 +191,14 @@ function cleanupTempDir(rmSync: typeof defaultRmSync, tempDir: string): void {
   }
 }
 
+async function closeGatewaySuppressingFailure(gateway: CodexResponsesGateway): Promise<void> {
+  try {
+    await gateway.close();
+  } catch {
+    // Preserve the original resolver or cancellation failure.
+  }
+}
+
 async function runCodexSummarizer(
   prompt: string,
   deps: Required<Pick<CodexProcessDeps, "spawn" | "mkdtempSync" | "readFileSync" | "rmSync" | "tmpdir" | "timeoutMs">> & {
@@ -202,6 +206,8 @@ async function runCodexSummarizer(
     reasoningEffort?: CodexProcessReasoningEffort;
     fastMode?: boolean;
     createGateway: (options: CodexResponsesGatewayOptions) => Promise<CodexResponsesGateway>;
+    resolveConfig: (signal?: AbortSignal, timeoutMs?: number, invocationId?: string) => Promise<string | undefined> | string | undefined;
+    now: () => number;
     platform?: NodeJS.Platform;
     detachedProcessGroup?: boolean;
     killProcess?: (pid: number, signal?: NodeJS.Signals | number) => void;
@@ -219,35 +225,55 @@ async function runCodexSummarizer(
   invocationId?: string,
 ): Promise<string> {
   throwIfAborted(signal);
+  const startedAt = deps.now();
   const tempDir = deps.mkdtempSync(join(deps.tmpdir(), "lcm-codex-"));
   const outputPath = join(tempDir, "last-message.txt");
   let gateway: CodexResponsesGateway | undefined;
   let gatewayPromise: Promise<CodexResponsesGateway> | undefined;
+  let gatewayDeadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  let upstreamResponsesUrl: string | undefined;
 
   try {
-    gatewayPromise = Promise.resolve(deps.createGateway({ prompt }));
-    gateway = await waitForAbortable(gatewayPromise, signal);
+    const remainingBudget = (): number => deps.timeoutMs - Math.max(0, deps.now() - startedAt);
+    const resolverRemaining = remainingBudget();
+    if (resolverRemaining <= 0) throw new Error("codex process timed out");
+    upstreamResponsesUrl = await waitForAbortable(Promise.resolve(deps.resolveConfig(signal, resolverRemaining, invocationId)), signal);
+    const gatewayRemaining = remainingBudget();
+    if (gatewayRemaining <= 0) throw new Error("codex process timed out");
+    gatewayPromise = Promise.resolve(deps.createGateway({ prompt, upstreamResponsesUrl }));
+    const gatewayDeadline = new Promise<never>((_resolve, reject) => {
+      gatewayDeadlineTimer = (deps.setTimeout ?? setTimeout)(() => reject(new Error("codex process timed out")), gatewayRemaining);
+    });
+    gateway = await waitForAbortable(Promise.race([gatewayPromise, gatewayDeadline]), signal);
     throwIfAborted(signal);
   } catch (error) {
-    if (gateway !== undefined) {
-      await gateway.close().catch(() => undefined);
-    } else if (signal?.aborted && gatewayPromise !== undefined) {
-      // waitForAbortable rejects immediately, but the gateway promise remains
-      // owned by this call. Await it before cleanup so a late gateway cannot
-      // outlive the temp directory or leak its listener/socket handles.
-      try {
-        const lateGateway = await gatewayPromise;
-        try { await lateGateway.close(); } catch { /* preserve cancellation */ }
-      } catch {
-        // A failed late gateway has no owned close handle.
-      }
+    if (gatewayPromise !== undefined) {
+      // Gateway startup may never settle, so cancellation and the absolute
+      // deadline must not await it. Retain a rejection handler and close any
+      // gateway immediately if startup eventually materializes one.
+      void gatewayPromise.then(
+        lateGateway => { void closeGatewaySuppressingFailure(lateGateway); },
+        () => undefined,
+      );
     }
     cleanupTempDir(deps.rmSync, tempDir);
+    if (gatewayDeadlineTimer !== undefined) {
+      (deps.clearTimeout ?? clearTimeout)(gatewayDeadlineTimer);
+      gatewayDeadlineTimer = undefined;
+    }
     if (signal?.aborted) throw createAbortError(signal.reason);
     throw error instanceof Error ? error : new Error(String(error));
   }
 
   const activeGateway = gateway;
+  (deps.clearTimeout ?? clearTimeout)(gatewayDeadlineTimer as ReturnType<typeof setTimeout>);
+  gatewayDeadlineTimer = undefined;
+  const processTimeoutMs = deps.timeoutMs - Math.max(0, deps.now() - startedAt);
+  if (processTimeoutMs <= 0) {
+    await activeGateway.close().catch(() => undefined);
+    cleanupTempDir(deps.rmSync, tempDir);
+    throw new Error("codex process timed out");
+  }
 
   return new Promise((resolve, reject) => {
     let child: ChildProcessWithoutNullStreams;
@@ -266,27 +292,14 @@ async function runCodexSummarizer(
 
     const onStderrData = (chunk: Buffer | string): void => {
       try {
-        let bytes: Buffer;
-        if (Buffer.isBuffer(chunk)) {
-          bytes = chunk;
-        } else if (typeof chunk === "string") {
-          const bounded = chunk.length > MAX_CODEX_STDERR_BYTES
-            ? chunk.slice(-MAX_CODEX_STDERR_BYTES)
-            : chunk;
-          bytes = Buffer.from(bounded, "utf8");
-        } else {
-          return;
-        }
-        if (bytes.length > MAX_CODEX_STDERR_BYTES) {
-          bytes = bytes.subarray(bytes.length - MAX_CODEX_STDERR_BYTES);
-        }
-        if (bytes.length === 0) return;
-        const retained = Buffer.from(bytes);
-        stderrWindow.push(retained);
-        stderrWindowBytes += retained.length;
-        while (stderrWindowBytes > MAX_CODEX_STDERR_BYTES) {
+        let bytes = Buffer.isBuffer(chunk) ? chunk : typeof chunk === "string" ? Buffer.from(chunk, "utf8") : undefined;
+        if (bytes === undefined) return;
+        if (bytes.length > 16 * 1024) bytes = bytes.subarray(bytes.length - 16 * 1024);
+        stderrWindow.push(Buffer.from(bytes));
+        stderrWindowBytes += bytes.length;
+        while (stderrWindowBytes > 16 * 1024) {
           const first = stderrWindow[0]!;
-          const excess = stderrWindowBytes - MAX_CODEX_STDERR_BYTES;
+          const excess = stderrWindowBytes - 16 * 1024;
           if (first.length <= excess) {
             stderrWindow.shift();
             stderrWindowBytes -= first.length;
@@ -295,20 +308,16 @@ async function runCodexSummarizer(
             stderrWindowBytes -= excess;
           }
         }
-      } catch {
-        // Diagnostics are best-effort and must never affect process settlement.
-      }
+      } catch { /* diagnostics are best effort */ }
     };
+
     const cleanupStreams = (): void => {
       if (child === undefined) return;
       try { child.stdin.removeAllListeners("error"); } catch { /* already closed */ }
       try { child.stdin.on("error", () => undefined); } catch { /* already closed */ }
       try { child.stdin.destroy(); } catch { /* already closed */ }
       try { child.stdout.removeAllListeners("data"); } catch { /* already closed */ }
-      try {
-        child.stderr.removeListener("data", onStderrData);
-        child.stderr.removeAllListeners("data");
-      } catch { /* already closed */ }
+      try { child.stderr.removeListener("data", onStderrData); child.stderr.removeAllListeners("data"); } catch { /* already closed */ }
       stderrWindow = [];
       stderrWindowBytes = 0;
     };
@@ -454,7 +463,7 @@ async function runCodexSummarizer(
 
     const setTimer = deps.setTimeout ?? setTimeout;
     timer = setTimer(() => {
-      const timeoutError = new Error(`codex process timed out after ${Math.round(deps.timeoutMs / 1000)}s`);
+      const timeoutError = new Error(`codex process timed out after ${Math.round(processTimeoutMs / 1000)}s`);
       if (finishPromise !== undefined) {
         terminalReason = "timeout";
         abortCompletionWait?.(timeoutError);
@@ -462,7 +471,7 @@ async function runCodexSummarizer(
       }
       terminalReason = "timeout";
       void finishRun(timeoutError, undefined, "timeout");
-    }, deps.timeoutMs);
+    }, processTimeoutMs);
 
     try {
       child.stderr.on("data", onStderrData);
@@ -549,6 +558,24 @@ export function createCodexProcessSummarizer(opts: CodexProcessDeps = {}): LcmSu
     tmpdir: opts.tmpdir ?? tmpdir,
     timeoutMs: opts.timeoutMs ?? DEFAULT_LLM_REQUEST_TIMEOUT_MS,
     createGateway: opts._createGateway ?? createCodexResponsesGateway,
+    resolveConfig: opts._resolveConfig
+      ?? ((signal?: AbortSignal, timeoutMs?: number, invocationId?: string) => resolveCodexOpenAIBaseUrl({
+        timeoutMs,
+        platform: opts.platform,
+        detachedProcessGroup: opts.detachedProcessGroup,
+        killProcess: opts.killProcess,
+        processGroupId: opts.processGroupId,
+        daemonProcessGroupId: opts.daemonProcessGroupId,
+        isProcessGroupAlive: opts.isProcessGroupAlive,
+        processGroupIdProbe: opts.processGroupIdProbe,
+        daemonInstanceId: opts.daemonInstanceId,
+        invocationId,
+        witnessStore: opts.witnessStore,
+        processBirthTime: opts.processBirthTime ?? processStartTime,
+        setTimeout: opts.setTimeout,
+        clearTimeout: opts.clearTimeout,
+      }, signal)),
+    now: opts._now ?? Date.now,
     platform: opts.platform,
     detachedProcessGroup: opts.detachedProcessGroup,
     killProcess: opts.killProcess,
@@ -569,3 +596,5 @@ export function createCodexProcessSummarizer(opts: CodexProcessDeps = {}): LcmSu
     return runCodexSummarizer(prompt, deps, ctx.signal, ctx.invocationId);
   };
 }
+
+export const __codexProcessTestUtils = { closeGatewaySuppressingFailure };
