@@ -21,10 +21,44 @@ function childWithProtocol(lines: string[]): FakeChild {
   child.stderr = new PassThrough();
   child.kill = vi.fn(() => { child.emit("close", 0); return true; });
   child.pid = 8123;
-  child.stdin.on("data", () => {
-    for (const line of lines) child.stdout.write(`${line}\n`);
-    child.stdout.end();
-    child.emit("close", 0);
+  let requestBuffer = "";
+  let responseIndex = 0;
+  child.stdin.on("data", (chunk) => {
+    requestBuffer += chunk.toString();
+    let newline = requestBuffer.indexOf("\n");
+    while (newline >= 0) {
+      const request = requestBuffer.slice(0, newline);
+      requestBuffer = requestBuffer.slice(newline + 1);
+      newline = requestBuffer.indexOf("\n");
+      let parsed: unknown;
+      try { parsed = JSON.parse(request) as unknown; } catch { continue; }
+      const method = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as { method?: unknown }).method
+        : undefined;
+      if (method === "initialize" && responseIndex === 0) {
+        child.stdout.write(`${lines[0]}\n`);
+        if (lines[0]?.includes('"id":2') && lines[2] !== undefined) {
+          child.stdout.write(`${lines[1]}\n`);
+          responseIndex = 2;
+        } else {
+          responseIndex = 1;
+        }
+      } else if (method === "config/read" && responseIndex === 1) {
+        setImmediate(() => {
+          child.stdout.write(`${lines[1]}\n`);
+          child.stdout.end();
+          child.emit("close", 0);
+        });
+        responseIndex = 2;
+      } else if (method === "config/read" && responseIndex === 2) {
+        setImmediate(() => {
+          child.stdout.write(`${lines[2]}\n`);
+          child.stdout.end();
+          child.emit("close", 0);
+        });
+        responseIndex = 3;
+      }
+    }
   });
   return child;
 }
@@ -120,6 +154,15 @@ describe("resolveCodexOpenAIBaseUrl", () => {
     const child = childWithProtocol([
       JSON.stringify({ id: 1, result: {} }),
       JSON.stringify({ id: 2, result: { config: {} } }),
+    ]);
+    await expect(resolveCodexOpenAIBaseUrl({ spawn: spawnFor(child), processBirthTime: () => "birth" }))
+      .resolves.toBeUndefined();
+  });
+
+  it("treats an explicit null openai_base_url as the token-class default", async () => {
+    const child = childWithProtocol([
+      JSON.stringify({ id: 1, result: {} }),
+      JSON.stringify({ id: 2, result: { config: { openai_base_url: null } } }),
     ]);
     await expect(resolveCodexOpenAIBaseUrl({ spawn: spawnFor(child), processBirthTime: () => "birth" }))
       .resolves.toBeUndefined();
@@ -353,7 +396,7 @@ describe("resolveCodexOpenAIBaseUrl", () => {
       const observed = pending.then(() => undefined, error => error);
       await vi.waitFor(() => expect(killProcess).toHaveBeenCalledWith(-8124, "SIGTERM"));
       await vi.advanceTimersByTimeAsync(4_000);
-      await expect(observed).resolves.toMatchObject({ message: "codex endpoint resolution failed" });
+      await expect(observed).resolves.toMatchObject({ message: expect.stringContaining("codex endpoint resolution failed") });
       expect(killProcess).toHaveBeenCalledWith(-8124, "SIGKILL");
     } finally {
       vi.useRealTimers();

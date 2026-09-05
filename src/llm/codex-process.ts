@@ -237,7 +237,9 @@ async function runCodexSummarizer(
     const remainingBudget = (): number => deps.timeoutMs - Math.max(0, deps.now() - startedAt);
     const resolverRemaining = remainingBudget();
     if (resolverRemaining <= 0) throw new Error("codex process timed out");
-    upstreamResponsesUrl = await waitForAbortable(Promise.resolve(deps.resolveConfig(signal, resolverRemaining, invocationId)), signal);
+    // The resolver owns a provider process and must settle that teardown before
+    // cancellation reaches the caller. Do not race it with waitForAbortable.
+    upstreamResponsesUrl = await Promise.resolve(deps.resolveConfig(signal, resolverRemaining, invocationId));
     const gatewayRemaining = remainingBudget();
     if (gatewayRemaining <= 0) throw new Error("codex process timed out");
     gatewayPromise = Promise.resolve(deps.createGateway({ prompt, upstreamResponsesUrl }));

@@ -10,7 +10,7 @@ import {
 } from "./process-utils.js";
 import { processStartTime } from "../private-mutation-lock.js";
 
-const RESOLUTION_ERROR = "codex endpoint resolution failed";
+const RESOLUTION_ERROR = "codex endpoint resolution failed: config/read capability unavailable";
 const MAX_PROTOCOL_LINE_CHARS = 4 * 1024 * 1024;
 const MAX_PROTOCOL_STDOUT_BYTES = 8 * 1024 * 1024;
 const CODEX_APP_SERVER_ARGS = ["app-server", "--listen", "stdio://"] as const;

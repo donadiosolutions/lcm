@@ -573,7 +573,7 @@ describe("createCodexProcessSummarizer", () => {
   });
 
   it("closes a gateway when the absolute deadline expires before exec spawn", async () => {
-    const gateway = makeGateway();
+    const gateway = makeGateway({ close: vi.fn().mockRejectedValue(new Error("late close")) });
     let nowCalls = 0;
     const summarizer = createCodexProcessSummarizer({
       ...baseDeps(makeHangingChild(), {
@@ -585,6 +585,64 @@ describe("createCodexProcessSummarizer", () => {
     } as never);
     await expect(summarizer("expired deadline", false)).rejects.toThrow("codex process timed out");
     expect(gateway.close).toHaveBeenCalledOnce();
+  });
+
+  it("awaits resolver-owned cancellation before rejecting and never starts a gateway", async () => {
+    const controller = new AbortController();
+    let releaseResolver!: () => void;
+    const resolver = new Promise<undefined>((_resolve, reject) => {
+      releaseResolver = () => reject(createAbortError(controller.signal.reason));
+    });
+    const createGateway = vi.fn();
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), {
+        _resolveConfig: vi.fn(() => resolver),
+        _createGateway: createGateway,
+      }),
+    } as never);
+    const pending = summarizer("cancel during discovery", false, { signal: controller.signal });
+    controller.abort();
+    let settled = false;
+    void pending.then(() => { settled = true; }, () => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(createGateway).not.toHaveBeenCalled();
+    releaseResolver();
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+  });
+
+  it("fails before discovery or gateway creation when the absolute deadline is exhausted", async () => {
+    let nowCalls = 0;
+    const resolveConfig = vi.fn(() => undefined);
+    const createGateway = vi.fn();
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), {
+        timeoutMs: 10,
+        _now: () => (nowCalls++ === 0 ? 0 : 100),
+        _resolveConfig: resolveConfig,
+        _createGateway: createGateway,
+      }),
+    } as never);
+    await expect(summarizer("expired before discovery", false)).rejects.toThrow("codex process timed out");
+    expect(resolveConfig).not.toHaveBeenCalled();
+    expect(createGateway).not.toHaveBeenCalled();
+  });
+
+  it("fails after discovery when the remaining budget is exhausted before gateway creation", async () => {
+    let nowCalls = 0;
+    const resolveConfig = vi.fn(() => undefined);
+    const createGateway = vi.fn();
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), {
+        timeoutMs: 10,
+        _now: () => (nowCalls++ < 2 ? 0 : 20),
+        _resolveConfig: resolveConfig,
+        _createGateway: createGateway,
+      }),
+    } as never);
+    await expect(summarizer("expired after discovery", false)).rejects.toThrow("codex process timed out");
+    expect(resolveConfig).toHaveBeenCalledOnce();
+    expect(createGateway).not.toHaveBeenCalled();
   });
 
   it("rejects an exit-0 child when no authenticated gateway request was accepted", async () => {
