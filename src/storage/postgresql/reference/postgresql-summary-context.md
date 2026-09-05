@@ -171,6 +171,14 @@ conversation, owner, operation, expired lease, released lease, or predecessor
 owner fails the whole mutation. The cycle trigger is defense in depth and is
 not a substitute for this final-write fence.
 
+The bound fence `machineId` must be a canonical UUIDv7. Construction accepts
+case-insensitive UUIDv7 text and stores the machine ID in lowercase so query,
+transaction, and cancellation diagnostics use one identity. Invalid machine
+IDs are rejected synchronously with a sanitized `machine_id` data error; the
+supplied value is never serialized. Callers that do not bind a fence remain
+machine-less, while valid canonical machine IDs remain present in sanitized
+cancellation JSON for attribution.
+
 Do not hold these transactions while calling a model, provider, filesystem, or
 remote service. Perform expensive work before the final fenced mutation, and
 discard its result if fence validation fails.
