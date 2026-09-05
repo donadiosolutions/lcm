@@ -892,6 +892,27 @@ describe("issue 400 managed ensure admission matrix", () => {
     expect(publicationAssertions).toBe(2);
   });
 
+  it("preserves ordinary admission when the birth probe throws", async () => {
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({ totalConnections: 0 }),
+      ]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _skipSpawn: false,
+      _processStartTimeForTesting: () => { throw new Error("birth unavailable"); },
+    }))).resolves.toMatchObject({ connected: true, spawned: true, pid: 4242 });
+  });
+
   it("rethrows the exact contention when abort interrupts convergence sleep", async () => {
     let publicationAssertions = 0;
     const contention = new PrivateMutationLockContentionError("aborted convergence");
