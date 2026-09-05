@@ -1182,7 +1182,7 @@ export async function discoverHarnessRuns(dependencies = {}) {
       run.classification = "ambiguous";
     }
     const harnessDirectory = ownership.kind === "database"
-      ? (dependencies.resolveHarnessDirectory?.(record) ?? harnessDirectoryFromRecord(record))
+      ? (dependencies.resolveHarnessDirectory?.(record) ?? harnessDirectoryFromRecord(record, dependencies))
       : undefined;
     const resourceEntry = {
       ...resource,

@@ -43,6 +43,9 @@ export function createRuntimeHomeRun(
   });
   try {
     project.provide(RUNTIME_HOME_ROOT_CONTEXT, allocation.root);
+    if (environment.LCM_TEST_HARNESS_TMPDIR === undefined) {
+      environment.LCM_TEST_HARNESS_TMPDIR = allocation.parent;
+    }
   } catch (error) {
     removeDirectory(allocation.root);
     throw error;

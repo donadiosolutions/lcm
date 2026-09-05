@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import {
   lstatSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -16,6 +17,20 @@ import {
   createRuntimeHomeRun,
 } from "./runtime-home-global.js";
 
+export function createChildAcceptanceEnvironment(
+  parentEnvironment: NodeJS.ProcessEnv,
+  fixture: string,
+): NodeJS.ProcessEnv {
+  const childEnvironment = { ...parentEnvironment };
+  delete childEnvironment.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT;
+  delete childEnvironment.LCM_TEST_HARNESS_TMPDIR;
+  delete childEnvironment.LCM_TEST_ARTIFACT_ROOT;
+  childEnvironment.TMPDIR = fixture;
+  childEnvironment.TMP = fixture;
+  childEnvironment.TEMP = fixture;
+  return childEnvironment;
+}
+
 describe("Vitest runtime-home global lifecycle", () => {
   it("places each worker home beneath the run root", () => {
     const root = inject(RUNTIME_HOME_ROOT_CONTEXT);
@@ -23,6 +38,7 @@ describe("Vitest runtime-home global lifecycle", () => {
 
     expect(home).toBeDefined();
     expect(dirname(home!)).toBe(root);
+    expect(process.env.LCM_TEST_HARNESS_TMPDIR).toBe(dirname(root));
     expect(basename(home!)).toMatch(/^worker-[0-9]+-[A-Za-z0-9_-]+$/u);
     expect(process.env.TMPDIR).toBe(process.env.TMP);
     expect(process.env.TMP).toBe(process.env.TEMP);
@@ -36,13 +52,16 @@ describe("Vitest runtime-home global lifecycle", () => {
     const createDirectory = vi.fn(() => "/tmp/lcm-vitest-run-unique");
     const secureDirectory = vi.fn();
     const removeDirectory = vi.fn();
+    const environment: NodeJS.ProcessEnv = {};
 
     const teardown = createRuntimeHomeRun({ provide }, {
       createDirectory,
       secureDirectory,
       removeDirectory,
-      environment: {},
+      environment,
       temporaryRoot: () => "/tmp",
+      realpath: (path) => path,
+      markerProbe: () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
     });
 
     expect(createDirectory).toHaveBeenCalledWith(
@@ -53,6 +72,7 @@ describe("Vitest runtime-home global lifecycle", () => {
       RUNTIME_HOME_ROOT_CONTEXT,
       "/tmp/lcm-vitest-run-unique",
     );
+    expect(environment.LCM_TEST_HARNESS_TMPDIR).toBe("/tmp");
     expect(removeDirectory).not.toHaveBeenCalled();
 
     teardown();
@@ -150,12 +170,43 @@ describe("Vitest runtime-home global lifecycle", () => {
     expect(teardown).toBeTypeOf("function");
   });
 
+  it("preserves an existing stable harness parent", () => {
+    const environment: NodeJS.ProcessEnv = {
+      LCM_TEST_HARNESS_TMPDIR: "/stable-parent",
+      LCM_TEST_VITEST_RUNTIME_ROOT_PARENT: "/private/harness",
+    };
+    const teardown = createRuntimeHomeRun({ provide: vi.fn() }, {
+      createDirectory: vi.fn(() => "/private/harness/lcm-vitest-run-stable"),
+      secureDirectory: vi.fn(),
+      removeDirectory: vi.fn(),
+      environment,
+      realpath: (path) => path,
+      markerProbe: () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
+    });
+    expect(environment.LCM_TEST_HARNESS_TMPDIR).toBe("/stable-parent");
+    teardown();
+  });
+
   it("fails clearly for an explicit contaminated parent without fallback", () => {
     expect(() => createRuntimeHomeRun({ provide: vi.fn() }, {
       environment: { LCM_TEST_VITEST_RUNTIME_ROOT_PARENT: "/private/harness" },
       realpath: (path) => path,
       markerProbe: () => ({}),
     })).toThrow(/LCM_TEST_VITEST_RUNTIME_ROOT_PARENT/iu);
+  });
+
+  it("clears inherited child-only overrides while redirecting all temp names", () => {
+    const child = createChildAcceptanceEnvironment({
+      LCM_TEST_ARTIFACT_ROOT: "/parent/report-root",
+      LCM_TEST_VITEST_RUNTIME_ROOT_PARENT: "/parent/runtime",
+      LCM_TEST_HARNESS_TMPDIR: "/parent/harness",
+    }, "/private/fixture");
+    expect(child.LCM_TEST_ARTIFACT_ROOT).toBeUndefined();
+    expect(child.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT).toBeUndefined();
+    expect(child.LCM_TEST_HARNESS_TMPDIR).toBeUndefined();
+    expect(child.TMPDIR).toBe("/private/fixture");
+    expect(child.TMP).toBe("/private/fixture");
+    expect(child.TEMP).toBe("/private/fixture");
   });
 
   it("proves a child Vitest run relocates all runtime scratch below a clean parent", () => {
@@ -166,42 +217,68 @@ describe("Vitest runtime-home global lifecycle", () => {
     writeFileSync(join(marker, "sentinel"), markerBytes, { mode: 0o600 });
     const childSpec = join(process.cwd(), "test", `.bug840-acceptance-${process.pid}.test.ts`);
     const resultPath = join(fixture, "result.json");
+    const artifactRoot = mkdtempSync(join(tmpdir(), "lcm-bug-840-artifact-"));
     writeFileSync(childSpec, `
 import { existsSync, writeFileSync } from "node:fs";
-import { relative, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createHarness } from ${JSON.stringify(join(process.cwd(), "test/e2e/harness.ts"))};
+import { readFileSync } from "node:fs";
 const resultPath = ${JSON.stringify(resultPath)};
 describe("Bug840 child acceptance", () => {
   let handle;
   afterEach(async () => { await handle?.cleanup(); });
   it("keeps the harness outside the malformed fixture", async () => {
     handle = await createHarness("mock");
-    const rel = relative(resolve(${JSON.stringify(fixture)}), resolve(handle.tmpDir));
+    const tmpPath = handle.tmpDir;
+    const rel = relative(resolve(${JSON.stringify(fixture)}), resolve(tmpPath));
     const health = await handle.client.health();
-    writeFileSync(resultPath, JSON.stringify({ health, outside: !rel || rel.startsWith("..") }));
+    const config = readFileSync(join(tmpPath, "config.json"), "utf8");
+    await handle.cleanup();
+    handle = undefined;
+    writeFileSync(resultPath, JSON.stringify({
+      health,
+      config,
+      tmpPath,
+      outside: rel.startsWith(".."),
+      cleaned: !existsSync(tmpPath),
+    }));
     expect(health.status).toBe("ok");
-    expect(rel === "" || rel.startsWith("..")).toBe(true);
+    expect(config).toBe("{}\\n");
+    expect(rel.startsWith("..")).toBe(true);
+    expect(existsSync(tmpPath)).toBe(false);
   });
 });
 `, { mode: 0o600 });
-    const childEnvironment = { ...process.env };
-    delete childEnvironment.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT;
-    delete childEnvironment.LCM_TEST_HARNESS_TMPDIR;
-    childEnvironment.TMPDIR = fixture;
-    childEnvironment.TMP = fixture;
-    childEnvironment.TEMP = fixture;
+    const parentEnvironment = { ...process.env, LCM_TEST_ARTIFACT_ROOT: artifactRoot };
+    const childEnvironment = createChildAcceptanceEnvironment(parentEnvironment, fixture);
+    expect(childEnvironment.LCM_TEST_ARTIFACT_ROOT).toBeUndefined();
     try {
-      execFileSync(process.execPath, [
-        "node_modules/vitest/vitest.mjs", "run", "--config", "vitest.config.ts", childSpec,
-      ], { cwd: process.cwd(), env: childEnvironment, stdio: "pipe" });
-      expect(JSON.parse(readFileSync(resultPath, "utf8"))).toMatchObject({ health: { status: "ok" }, outside: true });
-      expect(lstatSync(marker).isDirectory()).toBe(true);
+      try {
+        execFileSync(process.execPath, [
+          "node_modules/vitest/vitest.mjs", "run", "--config", "vitest.config.ts", childSpec,
+        ], { cwd: process.cwd(), env: childEnvironment, stdio: "pipe", timeout: 30_000 });
+      } catch (error) {
+        const stdout = String(error?.stdout ?? "");
+        const stderr = String(error?.stderr ?? "");
+        throw new Error(`Bug840 child Vitest failed\nstdout:\n${stdout}\nstderr:\n${stderr}`, { cause: error });
+      }
+      const result = JSON.parse(readFileSync(resultPath, "utf8"));
+      expect(result).toMatchObject({ health: { status: "ok" }, outside: true });
+      expect(result.config).toBe("{}\n");
+      expect(result.cleaned).toBe(true);
+      expect(existsSync(result.tmpPath)).toBe(false);
+      expect(existsSync(artifactRoot)).toBe(true);
+      const markerBefore = lstatSync(marker);
+      expect(markerBefore.isDirectory()).toBe(true);
       expect(readFileSync(join(marker, "sentinel"), "utf8")).toBe(markerBytes);
       expect([...readdirSync(fixture)].filter((entry) => entry.startsWith("lcm-") && entry !== ".git")).toEqual([]);
+      const markerAfter = lstatSync(marker);
+      expect(markerAfter.mode & 0o777).toBe(markerBefore.mode & 0o777);
     } finally {
       rmSync(childSpec, { force: true });
       rmSync(fixture, { recursive: true, force: true });
+      rmSync(artifactRoot, { recursive: true, force: true });
     }
   });
 });

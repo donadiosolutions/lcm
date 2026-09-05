@@ -83,9 +83,10 @@ Vitest setup selects a private temporary parent whose canonical ancestor chain
 has no `.git` marker. It checks the caller's temporary directory first, then
 the platform fallbacks (`/var/tmp` and `/tmp` on POSIX; the configured Windows
 temporary locations). A marker of any type, including an empty or malformed
-`.git` directory, excludes that parent. Probe errors and realpath failures are
-treated as unverifiable, so setup reports the explicit
-`LCM_TEST_VITEST_RUNTIME_ROOT_PARENT` error instead of silently falling back.
+`.git` directory, excludes that parent. For automatic candidates, probe,
+realpath, and creation failures advance to the next finite candidate. An
+explicit `LCM_TEST_VITEST_RUNTIME_ROOT_PARENT` failure is reported clearly and
+never falls back.
 
 Each run owns one mode-0700 root. Forked workers create a home directory and a
 sibling temporary directory below that root before test modules load, and set

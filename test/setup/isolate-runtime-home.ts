@@ -1,5 +1,5 @@
 import { chmodSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { inject } from "vitest";
 import { RUNTIME_HOME_ROOT_CONTEXT } from "./runtime-home-global.js";
 
@@ -41,6 +41,7 @@ process.env.LCM_TEST_REAL_USERPROFILE = state.realUserProfile ?? "";
 process.env.LCM_TEST_HOME = state.testHome;
 process.env.HOME = state.testHome;
 process.env.USERPROFILE = state.testHome;
+process.env.LCM_TEST_HARNESS_TMPDIR ??= dirname(state.runtimeHomeRoot);
 process.env.TMPDIR = state.workerTemp;
 process.env.TMP = state.workerTemp;
 process.env.TEMP = state.workerTemp;

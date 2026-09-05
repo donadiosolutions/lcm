@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -110,6 +111,108 @@ describe("PostgreSQL harness utilities", () => {
       environment,
       realpath,
     })).toBeUndefined();
+  });
+
+  it("classifies and reclaims an owned alternate-parent harness directory", async () => {
+    const parent = mkdtempSync("/var/tmp/lcm-bug-840-auth-parent-");
+    const directory = mkdtempSync(join(parent, "lcm-postgresql-harness-"));
+    const runId = "e".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 987654,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:987654",
+      scope: testOwnerScope,
+    };
+    const records = new Map([
+      [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+      [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
+    ]);
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        return {
+          stdout: [...records.keys()]
+            .filter((key) => key.startsWith(`${type}:`))
+            .map((key) => key.slice(type.length + 1)).join("\n"),
+          stderr: "",
+        };
+      }
+      if (args[1] === "inspect") {
+        const type = args[0];
+        const name = args[2];
+        const labels = records.get(`${type}:${name}`);
+        if (!labels) throw missingContainerError(name);
+        return {
+          stdout: JSON.stringify([type === "container"
+            ? {
+              Config: { Labels: labels },
+              State: { Running: false },
+              Mounts: [{
+                Destination: "/run/lcm-harness",
+                Type: "bind",
+                RW: false,
+                Source: directory,
+              }],
+            }
+            : { Labels: labels }]),
+          stderr: "",
+        };
+      }
+      const type = args[0] === "container" ? "container" : args[0];
+      records.delete(`${type}:${args.at(-1)}`);
+      return { stdout: "", stderr: "" };
+    });
+    const environment = {
+      LCM_TEST_HARNESS_TMPDIR: parent,
+      TMPDIR: join(parent, "worker-scratch"),
+    };
+    try {
+      const discovered = await discoverHarnessRuns({
+        dockerRunner,
+        environment,
+        realpath: (path: string) => path,
+        processProbe: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+        readScope: () => testOwnerScope,
+        delay: vi.fn(),
+      });
+      expect(discovered).toMatchObject([{ runId, classification: "stale" }]);
+      expect(discovered[0].resources.find((resource) => resource.kind === "database")?.harnessDirectory)
+        .toBe(directory);
+
+      const reclaimed = await reclaimProvenOrphans({
+        dockerRunner,
+        environment,
+        realpath: (path: string) => path,
+        processProbe: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+        readScope: () => testOwnerScope,
+        delay: vi.fn(),
+        removeDirectory: (path: string) => rmSync(path, { recursive: true, force: true }),
+      });
+      expect(reclaimed).toMatchObject([{ runId, classification: "stale" }]);
+      expect(() => lstatSync(directory)).toThrow();
+
+      const unrelated = await discoverHarnessRuns({
+        dockerRunner: vi.fn(async (args: string[]) => {
+          if (args[1] === "ls") return { stdout: args[0] === "container" ? names.container : "", stderr: "" };
+          return {
+            stdout: JSON.stringify([{
+              Config: { Labels: ownershipLabels(runId, "database", owner) },
+              State: { Running: false },
+              Mounts: [{ Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: "/unrelated/lcm-postgresql-harness-foreign" }],
+            }]),
+            stderr: "",
+          };
+        }),
+        environment,
+        realpath: (path: string) => path,
+        processProbe: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+        readScope: () => testOwnerScope,
+      });
+      expect(unrelated[0].resources[0].harnessDirectory).toBeUndefined();
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
   });
 
   it("resolves a bounded signal-probe readiness timeout", () => {
