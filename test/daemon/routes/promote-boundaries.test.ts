@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { StorageOperationError } from "../../../src/storage/errors.js";
 import { BackendPublicationJournalError } from "../../../src/storage/backend-publication.js";
+import { PrivateDirectoryTopologyError } from "../../../src/security-files.js";
 import { makeMockStorageFactory } from "./mock-storage-factory.js";
 import {
   createInvocationCoordinator,
@@ -17,6 +18,11 @@ const mocks = vi.hoisted(() => ({
   write: vi.fn(),
   readMetadata: vi.fn(() => "{}"),
   writeMetadata: vi.fn(),
+  openDirectory: vi.fn(() => ({
+    fd: 1,
+    witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+    close: vi.fn(),
+  })),
   mkdir: vi.fn(),
   getConnection: vi.fn(() => ({})),
   closeConnection: vi.fn(),
@@ -71,6 +77,7 @@ vi.mock("../../../src/security-files.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../../src/security-files.js")>(),
   readBoundedRegularFile: mocks.readMetadata,
   atomicWritePrivateFile: mocks.writeMetadata,
+  openPrivateDirectory: mocks.openDirectory,
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/db/connection.js", () => ({ getLcmConnection: mocks.getConnection, closeLcmConnection: mocks.closeConnection }));
@@ -274,6 +281,18 @@ describe("promote persistence boundaries", () => {
       promoted: 0,
       conversations: 0,
     });
+
+    mocks.openDirectory.mockImplementationOnce(() => ({
+      fd: 1,
+      witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+      close: () => { throw closeError; },
+    }));
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/cleanup-only" }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
   });
 
   it.each([
@@ -336,6 +355,37 @@ describe("promote persistence boundaries", () => {
   it("keeps a writer rejection best-effort", async () => {
     mocks.writeMetadata.mockImplementationOnce(() => { throw new Error("publish failed"); });
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/writer-error" }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it("does not swallow a topology failure while reopening metadata parent", async () => {
+    mocks.openDirectory.mockImplementationOnce(() => {
+      throw new PrivateDirectoryTopologyError("project directory topology changed");
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/topology" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+  });
+
+  it("keeps metadata cleanup failures best-effort while preserving writer errors", async () => {
+    const closeError = new Error("metadata parent close failed");
+    mocks.openDirectory.mockImplementationOnce(() => ({
+      fd: 1,
+      witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+      close: () => { throw closeError; },
+    }));
+    mocks.writeMetadata.mockImplementationOnce(() => { throw new Error("metadata writer failed"); });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/cleanup" }));
+
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
       processed: 0,
       promoted: 0,

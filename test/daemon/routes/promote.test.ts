@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -48,6 +48,9 @@ function mockRes() {
 function setupDb(tempDir: string) {
   const dbPath = projectDbPath(tempDir);
   mkdirSync(dirname(dbPath), { recursive: true });
+  chmodSync(join(process.env.HOME ?? "/tmp", ".lcm"), 0o700);
+  chmodSync(dirname(dirname(dbPath)), 0o700);
+  chmodSync(dirname(dbPath), 0o700);
   const db = new DatabaseSync(dbPath);
   runLcmMigrations(db);
   return db;

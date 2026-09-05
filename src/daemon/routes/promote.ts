@@ -5,7 +5,13 @@ import {
   projectIdentity,
   projectPathsForIdentity,
 } from "../project.js";
-import { atomicWritePrivateFile, readBoundedRegularFile } from "../../security-files.js";
+import {
+  atomicWritePrivateFile,
+  openPrivateDirectory,
+  PrivateDirectoryTopologyError,
+  readBoundedRegularFile,
+  type PrivateDirectoryHandle,
+} from "../../security-files.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { shouldPromote } from "../../promotion/detector.js";
@@ -314,7 +320,37 @@ export function createPromoteHandler(
               if (Buffer.byteLength(serialized, "utf8") > MAX_PROJECT_METADATA_BYTES) {
                 throw new Error("project metadata exceeds size limit");
               }
-              atomicWritePrivateFile(paths.metaPath, serialized);
+              let parent: PrivateDirectoryHandle;
+              try {
+                parent = openPrivateDirectory(paths.dir, { expectedUid });
+              } catch (error) {
+                throw new PrivateDirectoryTopologyError(
+                  "project directory topology changed before metadata publication",
+                  { cause: error },
+                );
+              }
+              let primaryError: unknown;
+              let hasPrimaryError = false;
+              try {
+                atomicWritePrivateFile(paths.metaPath, serialized, {}, parent);
+              } catch (error) {
+                hasPrimaryError = true;
+                primaryError = error;
+              } finally {
+                try {
+                  parent.close();
+                } catch (error) {
+                  if (hasPrimaryError) {
+                    throw new AggregateError(
+                      [primaryError, error],
+                      "project metadata publication and directory cleanup failed",
+                      { cause: primaryError },
+                    );
+                  }
+                  throw error;
+                }
+              }
+              if (hasPrimaryError) throw primaryError;
             };
             if (context?.withPublicationAdmission !== undefined) {
               await context.withPublicationAdmission(() => writeMetadata());
@@ -323,7 +359,12 @@ export function createPromoteHandler(
             }
           });
         } catch (error) {
-          if (isAbortError(error) || isInvocationCancellation(error) || error instanceof BackendPublicationJournalError) {
+          if (
+            isAbortError(error)
+            || isInvocationCancellation(error)
+            || error instanceof BackendPublicationJournalError
+            || error instanceof PrivateDirectoryTopologyError
+          ) {
             throw error;
           }
           // Meta persistence remains best-effort for ordinary filesystem failures.

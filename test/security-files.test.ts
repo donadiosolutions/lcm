@@ -35,12 +35,14 @@ import {
   atomicWritePrivateFileDurable,
   atomicWritePrivateFileExclusive,
   assertPrivateDirectory,
+  assertPrivateDirectoryEntry,
   copyRegularFilePrivateExclusive,
   consumeAuthenticatedWriterAlias,
   consumeBoundedRegularFile,
   deleteRegularFile,
   ensurePrivateDirectory,
   openPrivateDirectory,
+  openPrivateDirectoryForCreation,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
@@ -89,6 +91,129 @@ function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T)
 }
 
 describe("private filesystem primitives", () => {
+  it("publishes through a borrowed parent without repairing or closing it", () => {
+    const root = makeRoot();
+    chmodSync(root, 0o700);
+    const parent = openPrivateDirectory(root);
+    let closed = false;
+    const borrowed = { ...parent, close: () => { closed = true; } };
+    try {
+      const target = join(root, "metadata.json");
+      atomicWritePrivateFile(target, "content", {}, borrowed);
+      expect(readFileSync(target, "utf8")).toBe("content");
+      expect(statSync(root).mode & 0o777).toBe(0o700);
+      expect(closed).toBe(false);
+      expect(assertPrivateDirectoryEntry(parent, root, parent.witness.uid).dev).toBe(parent.witness.dev);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("rejects borrowed publication when the parent entry is replaced by a symlink", () => {
+    const root = makeRoot();
+    const replacement = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    rmSync(root, { recursive: true, force: true });
+    symlinkSync(replacement, root);
+    try {
+      expect(() => atomicWritePrivateFile(target, "content", {}, parent)).toThrow();
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("classifies borrowed temp-open and rename topology failures", () => {
+    const root = makeRoot();
+    const replacement = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const replaceParent = (): void => {
+      rmSync(root, { recursive: true, force: true });
+      symlinkSync(replacement, root);
+    };
+    try {
+      expect(() => atomicWritePrivateFile(target, "content", {
+        open: () => {
+          replaceParent();
+          throw new Error("open failed");
+        },
+      }, parent)).toThrow(/topology/i);
+      replaceParent();
+      parent.close();
+      const secondParent = openPrivateDirectory(replacement);
+      const secondTarget = join(replacement, "metadata.json");
+      expect(() => atomicWritePrivateFile(secondTarget, "content", {
+        rename: (from, to) => {
+          renameSync(from, to);
+          rmSync(replacement, { recursive: true, force: true });
+          symlinkSync(root, replacement);
+          throw new Error("rename failed");
+        },
+      }, secondParent)).toThrow(/topology/i);
+      secondParent.close();
+    } finally {
+      try { parent.close(); } catch { /* already closed */ }
+    }
+  });
+
+  it("preserves ordinary borrowed rename failures when the parent is still valid", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    try {
+      expect(() => atomicWritePrivateFile(join(root, "metadata.json"), "content", {
+        rename: () => { throw new Error("ordinary rename failure"); },
+      }, parent)).toThrow("ordinary rename failure");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("rejects borrowed entries whose mode, owner, or inode no longer matches", () => {
+    const root = makeRoot();
+    const other = makeRoot();
+    const parent = openPrivateDirectory(root);
+    try {
+      chmodSync(root, 0o755);
+      expect(() => assertPrivateDirectoryEntry(parent, root)).toThrow(/topology/i);
+      chmodSync(root, 0o700);
+      expect(() => assertPrivateDirectoryEntry(parent, root, parent.witness.uid + 1)).toThrow(/topology/i);
+      expect(() => assertPrivateDirectoryEntry(parent, other)).toThrow(/topology/i);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("fails creation admission on an invalid type or owner", () => {
+    const root = makeRoot();
+    const originalFstat = fstatSync;
+    try {
+      expect(() => withPatchedFs(
+        "fstatSync",
+        ((fd: number, options?: unknown) => {
+          if ((options as { bigint?: boolean } | undefined)?.bigint === true) {
+            return { isDirectory: () => false };
+          }
+          return originalFstat(fd, options as never);
+        }) as typeof fstatSync,
+        () => openPrivateDirectoryForCreation(root),
+      )).toThrow("path is not a directory");
+      expect(() => withPatchedFs(
+        "fstatSync",
+        ((fd: number, options?: unknown) => {
+          if ((options as { bigint?: boolean } | undefined)?.bigint === true) {
+            return { isDirectory: () => true, uid: 999999n, mode: 0o40700n };
+          }
+          return originalFstat(fd, options as never);
+        }) as typeof fstatSync,
+        () => openPrivateDirectoryForCreation(root),
+      )).toThrow("private directory owner is not trusted");
+    } finally {
+      chmodSync(root, 0o700);
+    }
+  });
+
   it("consumes an authenticated writer alias while retaining the final inode", () => {
     const { aliasPath, finalPath } = writerAliasFixture();
 

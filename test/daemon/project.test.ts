@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -130,6 +130,171 @@ describe("secure project-root handoff", () => {
     } finally {
       process.umask(previousUmask);
     }
+  });
+
+  it("rejects a pre-existing project symlink without changing its target", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const outside = join(home, "outside");
+    mkdirSync(outside, { mode: 0o755 });
+    const projects = join(home, ".lcm", "projects");
+    mkdirSync(projects, { mode: 0o700 });
+    symlinkSync(outside, join(projects, "e".repeat(64)));
+
+    expect(() => ensureProjectDirForIdentity({ id: "e".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+      .toThrow();
+    expect(statSync(outside).mode & 0o777).toBe(0o755);
+  });
+
+  it("rejects an existing project directory with a non-private mode", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const projects = join(home, ".lcm", "projects");
+    const leaf = join(projects, "f".repeat(64));
+    mkdirSync(leaf, { recursive: true, mode: 0o700 });
+    chmodSync(leaf, 0o755);
+
+    expect(() => ensureProjectDirForIdentity({ id: "f".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+      .toThrow();
+    expect(statSync(leaf).mode & 0o777).toBe(0o755);
+  });
+
+  it("rejects an invalid project identity before opening the LCM root", () => {
+    expect(() => ensureProjectDirForIdentity({ id: "bad", canonical: "/project" })).toThrow(/valid hash/);
+    expect(existsSync(join(home, ".lcm"))).toBe(false);
+  });
+
+  it("preserves metadata keys while replacing a stale canonical cwd", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "1".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, "meta.json"), JSON.stringify({ cwd: "/old", extra: true }));
+
+    ensureProjectDirForIdentity(identity);
+
+    expect(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"))).toMatchObject({
+      cwd: "/project",
+      extra: true,
+    });
+  });
+
+  it("uses the default metadata for a syntax-error snapshot", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "2".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, "meta.json"), "{");
+
+    ensureProjectDirForIdentity(identity);
+
+    expect(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"))).toEqual({ cwd: "/project" });
+  });
+
+  it("returns early when metadata already has the canonical cwd", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "4".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, "meta.json"), JSON.stringify({ cwd: "/project", extra: true }));
+
+    expect(ensureProjectDirForIdentity(identity)).toBe(dir);
+    expect(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"))).toEqual({ cwd: "/project", extra: true });
+  });
+
+  it("rejects a parsed non-object metadata value", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "5".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, "meta.json"), "null");
+
+    expect(() => ensureProjectDirForIdentity(identity)).toThrow("invalid project metadata");
+  });
+
+  it("propagates non-syntax parser failures", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "6".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, "meta.json"), "{}");
+    const parseSpy = vi.spyOn(JSON, "parse").mockImplementationOnce(() => {
+      throw new Error("parser failed");
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity(identity)).toThrow("parser failed");
+    } finally {
+      parseSpy.mockRestore();
+    }
+  });
+
+  it("reports a descriptor close failure after a successful admission", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const closeError = new Error("root close failed");
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) => {
+      const handle = originalOpen(path, options);
+      return path === rootPath ? { ...handle, close: () => { throw closeError; } } : handle;
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity({ id: "7".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow(closeError);
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
+  it("aggregates multiple descriptor close failures after admission", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    mkdirSync(join(rootPath, "projects"), { mode: 0o700 });
+    const closeError = new Error("directory close failed");
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalOpenIfExists = securityFiles.openPrivateDirectoryIfExists;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) => {
+      const handle = originalOpen(path, options);
+      return path === rootPath ? { ...handle, close: () => { throw closeError; } } : handle;
+    });
+    const optionalSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      const handle = originalOpenIfExists(path, options);
+      return handle === undefined ? handle : { ...handle, close: () => { throw closeError; } };
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity({ id: "9".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow(AggregateError);
+    } finally {
+      optionalSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("preserves an admission error when descriptor cleanup also fails", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const projects = join(rootPath, "projects");
+    const leaf = join(projects, "8".repeat(64));
+    mkdirSync(leaf, { recursive: true, mode: 0o755 });
+    const closeError = new Error("root close failed");
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) => {
+      const handle = originalOpen(path, options);
+      return path === rootPath ? { ...handle, close: () => { throw closeError; } } : handle;
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity({ id: "8".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow(AggregateError);
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
+  it("propagates bounded metadata policy failures instead of overwriting them", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "3".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    symlinkSync(join(home, "outside-meta"), join(dir, "meta.json"));
+
+    expect(() => ensureProjectDirForIdentity(identity)).toThrow();
   });
 
   it("falls back to the normalized path for malformed compatibility entries", () => {

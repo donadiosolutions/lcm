@@ -1,4 +1,4 @@
-import { lstatSync, realpathSync } from "node:fs";
+import { fchmodSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, normalize, join as pathJoin, dirname, basename, parse } from "node:path";
 import { lcmHomeDir } from "../runtime-paths.js";
@@ -12,8 +12,10 @@ import {
 import {
   atomicWritePrivateFile,
   assertPrivateDirectory,
-  ensurePrivateDirectory,
+  assertPrivateDirectoryEntry,
   openPrivateDirectory,
+  openPrivateDirectoryIfExists,
+  openPrivateDirectoryForCreation,
   readBoundedRegularFile,
   type PrivateDirectoryHandle,
   type PrivateDirectoryWitness,
@@ -34,6 +36,7 @@ function assertStablePrivateRoot(
   expected: PrivateDirectoryWitness,
 ): void {
   const actual = assertPrivateDirectory(handle, path);
+  assertPrivateDirectoryEntry(handle, path, expected.uid);
   if (
     actual.mode !== expected.mode
     || actual.uid !== expected.uid
@@ -42,6 +45,61 @@ function assertStablePrivateRoot(
     || actual.ino !== expected.ino
   ) {
     throw new Error("private directory witness changed");
+  }
+}
+
+function assertProjectTopology(
+  root: PrivateDirectoryHandle,
+  rootPath: string,
+  projects: PrivateDirectoryHandle,
+  projectsPath: string,
+  leaf: PrivateDirectoryHandle,
+  leafPath: string,
+): void {
+  assertPrivateDirectoryEntry(root, rootPath, root.witness.uid);
+  assertPrivateDirectoryEntry(projects, projectsPath, projects.witness.uid);
+  assertPrivateDirectoryEntry(leaf, leafPath, leaf.witness.uid);
+}
+
+function acquireProjectChild(
+  parent: PrivateDirectoryHandle,
+  parentPath: string,
+  childPath: string,
+  expectedUid: number | undefined,
+): PrivateDirectoryHandle {
+  assertPrivateDirectoryEntry(parent, parentPath, expectedUid);
+  const existing = openPrivateDirectoryIfExists(childPath, { expectedUid });
+  if (existing !== undefined) {
+    try {
+      assertPrivateDirectoryEntry(existing, childPath, expectedUid);
+      return existing;
+    } catch (error) {
+      existing.close();
+      throw error;
+    }
+  }
+
+  let created = false;
+  try {
+    mkdirSync(childPath, { recursive: false, mode: 0o700 });
+    created = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+
+  let child: PrivateDirectoryHandle | undefined;
+  try {
+    child = created
+      ? openPrivateDirectoryForCreation(childPath, { expectedUid })
+      : openPrivateDirectory(childPath, { expectedUid });
+    if (created) {
+      fchmodSync(child.fd, 0o700);
+    }
+    assertPrivateDirectoryEntry(child, childPath, expectedUid);
+    return child;
+  } catch (error) {
+    child?.close();
+    throw error;
   }
 }
 
@@ -287,42 +345,99 @@ export const ensureProjectDirForIdentity = (
   identity: ProjectIdentity,
   options: EnsureProjectDirOptions = {},
 ): string => {
+  if (!PROJECT_HASH_PATTERN.test(identity.id)) {
+    throw new Error("project identity id is not a valid hash");
+  }
   const rootPath = lcmHomeDir();
   const rootHandle = openPrivateDirectory(rootPath);
   const rootWitness = rootHandle.witness;
+  const expectedUid = rootWitness.uid;
+  let projectsHandle: PrivateDirectoryHandle | undefined;
+  let leafHandle: PrivateDirectoryHandle | undefined;
+  let result: string | undefined;
+  let primaryError: unknown;
+  let hasPrimaryError = false;
   try {
     assertStablePrivateRoot(rootHandle, rootPath, rootWitness);
     const dir = join(rootPath, "projects", identity.id);
-    ensurePrivateDirectory(join(rootPath, "projects"));
-    ensurePrivateDirectory(dir);
+    const projectsPath = join(rootPath, "projects");
+    projectsHandle = acquireProjectChild(rootHandle, rootPath, projectsPath, expectedUid);
+    leafHandle = acquireProjectChild(projectsHandle, projectsPath, dir, expectedUid);
+    assertProjectTopology(rootHandle, rootPath, projectsHandle, projectsPath, leafHandle, dir);
     // /promote alone defers metadata to its existing dry-run-aware post-operation write.
     if (options.writeMetadata === false) {
       assertStablePrivateRoot(rootHandle, rootPath, rootWitness);
-      return dir;
-    }
-    const metaPath = join(dir, "meta.json");
-    let meta: Record<string, unknown> = { cwd: identity.canonical };
-    try {
-      const existing = JSON.parse(readBoundedRegularFile(metaPath, {
-        allowedRoot: dir,
-        maxBytes: MAX_PROJECT_METADATA_BYTES,
-      })) as Record<string, unknown>;
-      if (existing.cwd === identity.canonical) {
-        assertStablePrivateRoot(rootHandle, rootPath, rootWitness);
-        return dir;
+      assertProjectTopology(rootHandle, rootPath, projectsHandle, projectsPath, leafHandle, dir);
+      result = dir;
+    } else {
+      const metaPath = join(dir, "meta.json");
+      let meta: Record<string, unknown> = { cwd: identity.canonical };
+      let content: string | undefined;
+      try {
+        content = readBoundedRegularFile(metaPath, {
+          allowedRoot: dir,
+          maxBytes: MAX_PROJECT_METADATA_BYTES,
+        });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
-      meta = { ...existing, cwd: identity.canonical };
-    } catch { /* keep default */ }
-    atomicWritePrivateFile(metaPath, JSON.stringify(meta, null, 2) + "\n");
-    assertStablePrivateRoot(rootHandle, rootPath, rootWitness);
-    return dir;
-  } finally {
-    try {
+      if (content !== undefined) {
+        let existing: unknown;
+        try {
+          existing = JSON.parse(content);
+        } catch (error) {
+          if (!(error instanceof SyntaxError)) throw error;
+        }
+        if (existing !== undefined) {
+          if (existing === null || typeof existing !== "object" || Array.isArray(existing)) {
+            throw new Error("invalid project metadata");
+          }
+          const existingRecord = existing as Record<string, unknown>;
+          if (existingRecord.cwd === identity.canonical) {
+            assertProjectTopology(rootHandle, rootPath, projectsHandle, projectsPath, leafHandle, dir);
+            result = dir;
+          } else {
+            meta = { ...existingRecord, cwd: identity.canonical };
+          }
+        }
+      }
+      if (result === undefined) {
+        assertProjectTopology(rootHandle, rootPath, projectsHandle, projectsPath, leafHandle, dir);
+        atomicWritePrivateFile(metaPath, JSON.stringify(meta, null, 2) + "\n", {}, leafHandle);
+        assertProjectTopology(rootHandle, rootPath, projectsHandle, projectsPath, leafHandle, dir);
+        result = dir;
+      }
       assertStablePrivateRoot(rootHandle, rootPath, rootWitness);
-    } finally {
-      rootHandle.close();
+    }
+  } catch (error) {
+    hasPrimaryError = true;
+    primaryError = error;
+  } finally {
+    const cleanupErrors: unknown[] = [];
+    for (const handle of [leafHandle, projectsHandle, rootHandle]) {
+      if (handle === undefined) continue;
+      try {
+        handle.close();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    if (!hasPrimaryError && cleanupErrors.length === 1) {
+      hasPrimaryError = true;
+      primaryError = cleanupErrors[0];
+    } else if (!hasPrimaryError && cleanupErrors.length > 1) {
+      hasPrimaryError = true;
+      primaryError = new AggregateError(cleanupErrors, "project directory cleanup failed");
+    } else if (hasPrimaryError && cleanupErrors.length > 0) {
+      primaryError = new AggregateError(
+        [primaryError, ...cleanupErrors],
+        "project directory operation and cleanup failed",
+        { cause: primaryError },
+      );
     }
   }
+  if (hasPrimaryError) throw primaryError;
+  return result!;
 };
 
 /** Ensures the current project dir exists and writes cwd to meta.json. */
