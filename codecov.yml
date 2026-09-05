@@ -25,6 +25,8 @@ component_management:
         # #681 keeps durable configuration writes in this existing component.
         # #722 distinguishes initial absence from interrupted validation in
         # the shared authenticated-directory open seam.
+        # #814 retains the fresh-root descriptor and authenticates its
+        # pre-handoff content within this configuration-security boundary.
         - "^src/config-manager\\.ts$"
         - "^src/config-projection\\.ts$"
         - "^src/generated-patterns\\.ts$"

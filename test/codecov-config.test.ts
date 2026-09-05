@@ -484,7 +484,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(208);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#722 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#722/#814 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -496,6 +496,8 @@ describe("Codecov configuration", () => {
     // existing route component. #862 keeps recent limit validation and #863
     // keeps expand depth validation in the same daemon-routes component.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
+    // #814 fresh-root descriptor and pre-handoff content checks remain
+    // configuration-security-owned.
     const expectedOwners = [
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
