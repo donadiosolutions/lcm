@@ -68,6 +68,7 @@ describe("FTS fallback", () => {
       query: "database migration",
       mode: "full_text",
       conversationId: conversation.conversationId,
+      since: new Date("0001-01-01T00:00:00.000Z"),
       limit: 10,
     });
     expect(messageResults).toHaveLength(1);
@@ -77,6 +78,7 @@ describe("FTS fallback", () => {
       query: "search usable",
       mode: "full_text",
       conversationId: conversation.conversationId,
+      since: new Date("0001-01-01T00:00:00.000Z"),
       limit: 10,
     });
     expect(summaryResults).toHaveLength(1);

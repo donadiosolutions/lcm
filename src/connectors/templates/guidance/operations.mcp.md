@@ -10,7 +10,7 @@
   - `query` is the exact term or phrase [required]
   - `mode` optionally selects `full_text` or `regex`; it defaults to `full_text`. `full_text` performs literal/full-text matching, while `regex` interprets the query as a regex pattern
   - `sessionId` optionally limits the search to one session
-  - `since` optionally sets an inclusive ISO datetime lower bound. Use `YYYY-MM-DDTHH:mm:ss` with optional 1-3 fractional digits and `Z` or `+/-HH:mm`; omit it to include all history. Malformed values return `{ "error": "invalid since" }` before project or storage access.
+  - `since` optionally sets an inclusive ISO datetime lower bound. Use `YYYY-MM-DDTHH:mm:ss` with optional 1-3 fractional digits and `Z` or `+/-HH:mm`; after offset normalization, UTC years must be 0001-9999. Omit it to include all history. Malformed or out-of-range values return `{ "error": "invalid since" }` (HTTP 400) before project or storage access.
 - `lcm_describe`
   Inspect a recalled node before retrieving more detail.
   - `nodeId` identifies the recalled node [required]

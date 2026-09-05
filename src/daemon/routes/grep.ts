@@ -63,6 +63,10 @@ function normalizeGrepSince(value: unknown): Date | null {
   }
 
   const parsed = new Date(value);
+  const normalizedYear = parsed.getUTCFullYear();
+  if (normalizedYear < 1 || normalizedYear > 9999) {
+    return null;
+  }
   return parsed;
 }
 
