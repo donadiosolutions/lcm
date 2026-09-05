@@ -77,6 +77,15 @@ integration files run only through `pnpm run test:postgresql`; see
 [PostgreSQL development](../src/storage/postgresql/reference/postgresql-development.md)
 for the isolated container prerequisites and lifecycle.
 
+## Codex Responses gateway fixtures
+
+Gateway tests may provide the internal `_upstreamUrl` option to target a
+private loopback fixture. That fixture URL takes precedence over the validated
+`upstreamResponsesUrl`; when neither is present, route-specific `_upstreamUrls`
+then provider defaults apply. This keeps tests isolated when normal config
+resolution also supplies a provider endpoint. These options are internal test
+seams and are not part of the public package configuration.
+
 ## Test scratch isolation
 
 Vitest setup selects a private temporary parent whose canonical ancestor chain
