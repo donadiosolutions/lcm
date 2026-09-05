@@ -218,8 +218,13 @@ The `Security` section of the doctor output shows:
   intact. In unquoted file URLs, whitespace and the existing path
   delimiters, including later colons, `?`, and `#`, end the redacted span, so
   text after those delimiters can remain visible. Ordinary HTTP and HTTPS URLs
-  retain their authorities, slashes, and paths.
-  There are no configuration options for this defense-in-depth behavior.
+  retain their authorities, slashes, and paths. When an exact case-insensitive
+  `file://` literal begins immediately after `?`, `#`, `&`, or `=` inside any
+  URL, LCM also redacts that nested file URL path while preserving the outer URL
+  text. This bounded rule does not parse general query values, decode escaped
+  schemes, recognize prefixed or mid-value schemes, or treat those delimiters
+  as URL termination points. There are no configuration options for this
+  defense-in-depth behavior.
 - Hook project paths retain leading and trailing whitespace. Directories whose names differ only by that whitespace remain separate LCM projects.
 - Hook errors are attached to a project sidecar only when the reported working directory is an existing directory. Invalid paths are recorded in the bounded fallback log without creating project metadata.
 - `lcm stats` and verbose `lcm doctor` remove terminal control sequences and line breaks from persisted text before displaying it. SQLite content is not modified by display sanitization.

@@ -134,6 +134,7 @@ const expectedComponents = [
     paths: [
       "^src/storage/backend\\.ts$",
       "^src/storage/backend-publication\\.ts$",
+      "^src/storage/publication-convergence\\.ts$",
       "^src/storage/capabilities\\.ts$",
       "^src/storage/contracts\\.ts$",
       "^src/storage/errors\\.ts$",
@@ -450,7 +451,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(207);
+    expect(productionFiles).toHaveLength(208);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -480,10 +481,10 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(207);
+    expect(ownershipCounts.size).toBe(208);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#722 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#722 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -514,6 +515,8 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/expand.ts", "unit-daemon-routes"],
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
+      // #833 passive-event identity admission remains route-owned.
+      ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"],
       // #793 search-limit validation and #864 search candidate recall remain
       // owned by daemon routes.
       ["src/daemon/routes/search.ts", "unit-daemon-routes"],
@@ -530,6 +533,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],
+      // #837 consumer-admission descriptor cleanup remains storage-owned.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],

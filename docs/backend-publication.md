@@ -286,6 +286,15 @@ into `~/.lcm/` and then creates the retained copy; the cross-device fallback
 keeps its authenticated staging copy. Source, staging, and target identities,
 hashes, ownership, and modes are rechecked at each non-terminal boundary.
 
+During `lcm install`, publication-lock admission is bounded and authenticated
+against the managed daemon already serving the configured home. The preflight
+migration, root preparation, absent-config creation, backend selection, and
+lifecycle publication assertions share one lazily armed two-second window.
+Only lock-acquisition callbacks are retried; writes, prompts, skill changes,
+and daemon startup remain outside those callbacks and therefore run once. A
+foreign, malformed, stale, or unverifiable owner, or any identity drift,
+preserves the original typed contention failure and fails closed.
+
 The terminal journal deliberately does not rehash mutable `~/.lcm/` content on
 later startups. Normal database, daemon, transcript, and configuration writes
 therefore cannot freeze startup against the publication-time hash. Startup
@@ -364,6 +373,11 @@ Publication admission is checked at startup and again at consumer boundaries.
 The check is deliberately short-lived around each operation; it is not held
 across network calls, request bodies, model work, daemon spawning, or unrelated
 health waits.
+
+When directory authentication rejects a consumer admission, LCM releases the
+temporary root and publication descriptors acquired for that check before
+returning the original refusal. The rejection remains fail-closed; releasing
+those resources does not repair or change the publication state.
 
 - **Daemon and health:** an unresolved or inconsistent publication returns a
   sanitized HTTP `503` with `status: "blocked"` and no filesystem, SQL, URL,

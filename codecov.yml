@@ -83,8 +83,8 @@ component_management:
         # #705 prompt-search surfacing-log failures, #709 search and grep routes,
         # #710 grep mode, #792 session filtering, #793 search-limit validation,
         # #794 grep-since validation, #825 bounded atomic promotion metadata,
-        # #862 recent limit validation and #864 episodic search candidate recall
-        # remain route-owned.
+        # #862 recent limit validation and #864 episodic search candidate recall,
+        # and #833 passive-event identity admission remain route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -117,8 +117,10 @@ component_management:
         # #681 retains backend-publication durable-write ownership here.
         # #722 retains one authenticated backend-publication directory identity
         # across journal, evidence, and terminal recovery-material reads.
+        # #837 retains consumer-admission descriptor cleanup in this owner.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
+        - "^src/storage/publication-convergence\\.ts$"
         - "^src/storage/capabilities\\.ts$"
         - "^src/storage/contracts\\.ts$"
         - "^src/storage/errors\\.ts$"

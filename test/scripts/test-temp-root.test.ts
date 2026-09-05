@@ -3,10 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
+  LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS,
   candidateTemporaryParents,
   canonicalCandidateParents,
+  captureOriginalTemporaryParents,
   createTestTempDirectory,
   inspectGitFreeParent,
+  nonLivePlatformFallbackParents,
+  parseOriginalTemporaryParents,
+  serializeOriginalTemporaryParents,
   selectTestTempParent,
 } from "../../scripts/test-temp-root.mjs";
 
@@ -209,6 +214,58 @@ describe("test temporary parent selector", () => {
     ]);
   });
 
+  it("uses only the first configured Windows system root for non-live fallbacks", () => {
+    expect(nonLivePlatformFallbackParents({
+      SystemRoot: "C:\\Windows",
+      WINDIR: "D:\\Windows",
+    }, "win32")).toEqual(["C:\\Windows\\Temp"]);
+    expect(nonLivePlatformFallbackParents({
+      WINDIR: "D:\\Windows",
+    }, "win32")).toEqual(["D:\\Windows\\Temp"]);
+  });
+
+  it("captures a bounded original parent snapshot and preserves existing bytes", () => {
+    const environment: NodeJS.ProcessEnv = {
+      TEMP: "/original-temp",
+      TMP: "/original-tmp",
+    };
+    captureOriginalTemporaryParents(environment, "linux", () => "/original-root");
+    expect(environment[LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS]).toBe(
+      JSON.stringify({
+        version: 1,
+        parents: ["/original-root", "/var/tmp", "/tmp"],
+      }),
+    );
+    const snapshot = environment[LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS];
+    captureOriginalTemporaryParents(environment, "linux", () => {
+      throw new Error("an existing snapshot must not be recaptured");
+    });
+    expect(environment[LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS]).toBe(snapshot);
+  });
+
+  it.each([
+    "",
+    "not-json",
+    JSON.stringify({ version: 2, parents: ["/tmp"] }),
+    JSON.stringify({ version: 1, parents: ["relative"] }),
+    JSON.stringify({ version: 1, parents: ["/tmp", "\0bad"] }),
+    JSON.stringify({ version: 1, parents: ["/tmp"], extra: true }),
+    JSON.stringify({ version: 1, parents: Array.from({ length: 9 }, (_, i) => `/p${i}`) }),
+    `{"version":1,"parents":["/${"x".repeat(8_200)}"]}`,
+  ])("treats malformed original parent snapshot %j as missing", (value) => {
+    expect(parseOriginalTemporaryParents(value, "linux")).toBeUndefined();
+  });
+
+  it("allows a valid empty snapshot and rejects unsafe serialization entries", () => {
+    const empty = JSON.stringify({ version: 1, parents: [] });
+    expect(parseOriginalTemporaryParents(empty, "linux")).toEqual([]);
+    expect(serializeOriginalTemporaryParents([], "linux")).toBe(empty);
+    expect(serializeOriginalTemporaryParents(["relative"], "linux")).toBeUndefined();
+    expect(serializeOriginalTemporaryParents(["C:\\Temp"], "linux")).toBeUndefined();
+    expect(parseOriginalTemporaryParents(JSON.stringify({ version: 1, parents: ["C:\\Temp"] }), "win32"))
+      .toEqual(["C:\\Temp"]);
+  });
+
   it("reports exhausted Windows candidates with marker reasons", () => {
     const environment = {
       TEMP: "C:\\Temp",
@@ -236,5 +293,18 @@ describe("test temporary parent selector", () => {
         return path === "/alias" ? "/tmp" : path;
       },
     })).toEqual(["/tmp"]);
+  });
+
+  it("skips empty, relative, and NUL candidate parents before realpath", () => {
+    const resolved: string[] = [];
+    expect(canonicalCandidateParents({
+      platformName: "linux",
+      candidateParents: ["", "relative", "/valid", "/bad\0path"],
+      realpath: (path: string) => {
+        resolved.push(path);
+        return path;
+      },
+    })).toEqual(["/valid"]);
+    expect(resolved).toEqual(["/valid"]);
   });
 });

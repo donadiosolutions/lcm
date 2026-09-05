@@ -1357,9 +1357,7 @@ function consumerLockCallback<T>(
     return requireSynchronousResult(callback({}), undefined, options.permit);
   }
   let rootHandle = openOptionalRootDirectory(homeDir);
-  let publicationHandle = rootHandle === undefined
-    ? undefined
-    : openOptionalPublicationDirectory(homeDir);
+  let publicationHandle: ReturnType<typeof openPrivateDirectory> | undefined;
   const refreshDirectories = (): void => {
     rootHandle ??= openOptionalRootDirectory(homeDir);
     if (rootHandle !== undefined && publicationHandle === undefined) {
@@ -1382,6 +1380,9 @@ function consumerLockCallback<T>(
     }
   };
   try {
+    publicationHandle = rootHandle === undefined
+      ? undefined
+      : openOptionalPublicationDirectory(homeDir);
     return withBackendPublicationLock(homeDir, run);
   } finally {
     publicationHandle?.close();
@@ -1417,9 +1418,7 @@ export async function withBackendPublicationConsumerLockAsync<T>(
     return callback({});
   }
   let rootHandle = openOptionalRootDirectory(homeDir);
-  let publicationHandle = rootHandle === undefined
-    ? undefined
-    : openOptionalPublicationDirectory(homeDir);
+  let publicationHandle: ReturnType<typeof openPrivateDirectory> | undefined;
   const refreshDirectories = (): void => {
     rootHandle ??= openOptionalRootDirectory(homeDir);
     if (rootHandle !== undefined && publicationHandle === undefined) {
@@ -1442,6 +1441,9 @@ export async function withBackendPublicationConsumerLockAsync<T>(
     }
   };
   try {
+    publicationHandle = rootHandle === undefined
+      ? undefined
+      : openOptionalPublicationDirectory(homeDir);
     return await withBackendPublicationLockAsync(homeDir, run);
   } finally {
     publicationHandle?.close();

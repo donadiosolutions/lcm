@@ -3,7 +3,7 @@ import { eventsDbPath, existingEventsDbPath } from "../../db/events-path.js";
 import { deduplicateAndInsert } from "../../promotion/dedup.js";
 import { sendJson, type RouteExecutionContext, type RouteHandler } from "../server.js";
 import { isMissingCwdError, validateCwd } from "../validate-cwd.js";
-import { projectDir, projectIdentity } from "../project.js";
+import { projectIdentity, projectPathsForIdentity } from "../project.js";
 import type { DaemonConfig } from "../config.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
 import { collectEventSidecars } from "../../db/event-sidecars.js";
@@ -15,9 +15,13 @@ import {
 import {
   createStorageBackendFactory,
   type ProjectStorage,
+  type StorageIdentityContext,
   type StorageBackendFactory,
 } from "../../storage/index.js";
-import type { BackendPublicationLockToken } from "../../storage/backend-publication.js";
+import {
+  BackendPublicationJournalError,
+  type BackendPublicationLockToken,
+} from "../../storage/backend-publication.js";
 import {
   closeRouteStorage,
   storageRouteFailureResponse,
@@ -363,6 +367,13 @@ export function createPromoteEventsHandler(
           );
       sendJson(res, 200, result);
     } catch (error) {
+      if (error instanceof BackendPublicationJournalError) {
+        sendJson(res, 503, {
+          status: "blocked",
+          error: "backend publication admission blocked",
+        });
+        return;
+      }
       // Log detailed failure but avoid exposing internal error/stack info to the client
       await safeLogError("promote-events", error, { cwd });
       const storageFailure = storageRouteFailureResponse(
@@ -490,6 +501,7 @@ export function createPromoteAllEventsHandler(
             unprocessedBefore: sidecar.unprocessed,
           });
         } catch (error) {
+          if (error instanceof BackendPublicationJournalError) throw error;
           if (storageRouteFailureResponse(config.storage.backend, error, "promote-events-all", activeFactory)) {
             throw error;
           }
@@ -512,6 +524,13 @@ export function createPromoteAllEventsHandler(
 
       sendJson(res, 200, result);
     } catch (error) {
+      if (error instanceof BackendPublicationJournalError) {
+        sendJson(res, 503, {
+          status: "blocked",
+          error: "backend publication admission blocked",
+        });
+        return;
+      }
       await safeLogError("promote-events", error, {});
       const storageFailure = storageRouteFailureResponse(
         config.storage.backend,
@@ -593,6 +612,9 @@ async function drainEventsForCwdUnlocked(
     ));
     for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
       const prepared = await preparePromotionBatch(config, edb);
+      const expectedIdentity = prepared.events.length === 0
+        ? undefined
+        : projectIdentity(cwd, config.storage, effectiveToken);
       const batchResult = await runSelectedPromotionBatch(
         config,
         cwd,
@@ -600,7 +622,7 @@ async function drainEventsForCwdUnlocked(
         factory,
         executionContext,
         prepared,
-        effectiveToken,
+        expectedIdentity,
       );
       if (batchResult.message === "no unprocessed events") {
         result.message = result.batches === 0
@@ -678,22 +700,9 @@ async function promoteEventsForCwdUnlocked(
       undefined,
       effectiveToken,
     ));
-    if (prepared.events.length === 0) {
-      const empty = await runSelectedPromotionBatch(
-        config,
-        cwd,
-        edb,
-        factory,
-        executionContext,
-        prepared,
-        effectiveToken,
-      );
-      return empty;
-    }
-    const scrubber = await ScrubEngine.forProject(
-      config.security.sensitivePatterns,
-      projectDir(cwd, effectiveToken),
-    );
+    const expectedIdentity = prepared.events.length === 0
+      ? undefined
+      : projectIdentity(cwd, config.storage, effectiveToken);
     return await runSelectedPromotionBatch(
       config,
       cwd,
@@ -701,8 +710,7 @@ async function promoteEventsForCwdUnlocked(
       factory,
       executionContext,
       prepared,
-      effectiveToken,
-      scrubber,
+      expectedIdentity,
     );
   } finally {
     await closeRouteStorage(outboxFactory, ownedFactory);
@@ -769,25 +777,32 @@ async function runSelectedPromotionBatch(
   factory: StorageBackendFactory,
   context: PromotionExecutionContext | undefined,
   prepared: PreparedPromotionBatch,
-  publicationLockToken: BackendPublicationLockToken | undefined,
-  scrubber?: ScrubEngine,
+  expectedIdentity?: StorageIdentityContext & { readonly localProjectId: string },
 ): Promise<PromoteResult> {
   const activeScrubber = prepared.events.length === 0
     ? undefined
-    : scrubber ?? await ScrubEngine.forProject(
+    : await ScrubEngine.forProject(
       config.security.sensitivePatterns,
-      projectDir(cwd, publicationLockToken),
+      projectPathsForIdentity({
+        id: expectedIdentity!.localProjectId,
+        canonical: expectedIdentity!.canonical,
+        ...(expectedIdentity!.remoteProjectId === undefined
+          ? {}
+          : { remoteProjectId: expectedIdentity!.remoteProjectId }),
+      }).dir,
     );
+  const storageRequest = {
+    config,
+    cwd,
+    factory,
+    context,
+    mode: "create" as const,
+    ...(expectedIdentity === undefined ? {} : { expectedIdentity }),
+  };
   let result: PromoteResult | null;
   try {
     result = await withProjectStorage(
-      {
-        config,
-        cwd,
-        factory,
-        context,
-        mode: "create",
-      },
+      storageRequest,
       async project => {
         if (prepared.events.length === 0) {
           return {

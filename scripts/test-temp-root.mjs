@@ -1,8 +1,12 @@
 import { lstatSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
-import { dirname, join, parse, win32 } from "node:path";
+import { dirname, isAbsolute, join, parse, win32 } from "node:path";
 
 const POSIX_FALLBACK_PARENTS = ["/var/tmp", "/tmp"];
+export const LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS =
+  "LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS";
+export const MAX_ORIGINAL_TEMP_PARENTS = 8;
+export const MAX_ORIGINAL_TEMP_PARENTS_SERIALIZED_LENGTH = 8192;
 
 function deduplicate(values) {
   const seen = new Set();
@@ -11,6 +15,83 @@ function deduplicate(values) {
     seen.add(value);
     return true;
   });
+}
+
+function isAbsolutePlatformPath(value, platformName) {
+  return platformName === "win32" ? win32.isAbsolute(value) : isAbsolute(value);
+}
+
+/** Return only platform fallbacks that do not inspect live temp variables. */
+export function nonLivePlatformFallbackParents(
+  environment = process.env,
+  platformName = platform(),
+) {
+  if (platformName !== "win32") return [...POSIX_FALLBACK_PARENTS];
+  const systemRoot = [environment.SystemRoot, environment.WINDIR]
+    .find((value) => typeof value === "string" && value.length > 0);
+  return systemRoot === undefined ? [] : [win32.join(systemRoot, "Temp")];
+}
+
+/** Parse the bounded original-temp handoff. Invalid input is treated as absent. */
+export function parseOriginalTemporaryParents(
+  value,
+  platformName = platform(),
+) {
+  if (typeof value !== "string"
+    || value.length === 0
+    || value.length > MAX_ORIGINAL_TEMP_PARENTS_SERIALIZED_LENGTH) return undefined;
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null
+    || typeof parsed !== "object"
+    || Array.isArray(parsed)
+    || parsed.version !== 1
+    || !Array.isArray(parsed.parents)
+    || Object.keys(parsed).some((key) => key !== "version" && key !== "parents")
+    || parsed.parents.length > MAX_ORIGINAL_TEMP_PARENTS) return undefined;
+  if (parsed.parents.some((parent) => typeof parent !== "string"
+    || parent.length === 0
+    || parent.includes("\0")
+    || !isAbsolutePlatformPath(parent, platformName))) return undefined;
+  return [...parsed.parents];
+}
+
+/** Serialize a finite, platform-absolute original-temp parent set. */
+export function serializeOriginalTemporaryParents(
+  parents,
+  platformName = platform(),
+) {
+  if (!Array.isArray(parents) || parents.length > MAX_ORIGINAL_TEMP_PARENTS) return undefined;
+  if (parents.some((parent) => typeof parent !== "string"
+    || parent.length === 0
+    || parent.includes("\0")
+    || !isAbsolutePlatformPath(parent, platformName))) return undefined;
+  const serialized = JSON.stringify({ version: 1, parents: deduplicate(parents) });
+  return serialized.length <= MAX_ORIGINAL_TEMP_PARENTS_SERIALIZED_LENGTH
+    ? serialized
+    : undefined;
+}
+
+/** Capture the pre-handoff candidate set when the snapshot variable is absent. */
+export function captureOriginalTemporaryParents(
+  environment = process.env,
+  platformName = platform(),
+  temporaryRoot = tmpdir,
+) {
+  if (environment[LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS] !== undefined) return undefined;
+  const candidates = candidateTemporaryParents(environment, platformName, null, temporaryRoot);
+  const usable = candidates.filter((candidate) => typeof candidate === "string"
+    && candidate.length > 0
+    && !candidate.includes("\0")
+    && isAbsolutePlatformPath(candidate, platformName));
+  const serialized = serializeOriginalTemporaryParents(usable, platformName);
+  if (serialized === undefined) return undefined;
+  environment[LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS] = serialized;
+  return usable;
 }
 
 /**
@@ -40,11 +121,9 @@ export function candidateTemporaryParents(
       temporaryRoot(),
       environment.TEMP,
       environment.TMP,
-      (environment.SystemRoot ?? environment.WINDIR)
-        ? win32.join(environment.SystemRoot ?? environment.WINDIR, "Temp")
-        : undefined,
+      ...nonLivePlatformFallbackParents(environment, platformName),
     ].filter((value) => typeof value === "string" && value.length > 0)
-    : [temporaryRoot(), ...POSIX_FALLBACK_PARENTS];
+    : [temporaryRoot(), ...nonLivePlatformFallbackParents(environment, platformName)];
   return deduplicate(defaults);
 }
 
@@ -104,6 +183,10 @@ export function canonicalCandidateParents(options = {}) {
   const result = [];
   const seen = new Set();
   for (const candidate of candidates) {
+    if (typeof candidate !== "string"
+      || candidate.length === 0
+      || candidate.includes("\0")
+      || !isAbsolutePlatformPath(candidate, options.platformName ?? platform())) continue;
     try {
       const resolved = resolvePath(candidate);
       if (!seen.has(resolved)) {

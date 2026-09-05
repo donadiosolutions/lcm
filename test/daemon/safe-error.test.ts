@@ -220,6 +220,137 @@ describe("sanitizeError", () => {
   });
 
   it.each([
+    [
+      "https://outer.test/x?next=file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x?next=file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x#next=file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x#next=file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x&next=file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x&next=file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x=next=file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x=next=file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?next=FiLe://host.invalid/Users/canary/private.db",
+      "https://outer.test/x?next=FiLe://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?next=file:///Users/canary/private.db",
+      "https://outer.test/x?next=file://<path>",
+    ],
+    [
+      "https://outer.test/x?next=file://localhost/Users/canary/private.db",
+      "https://outer.test/x?next=file://localhost<path>",
+    ],
+    [
+      "https://outer.test/x?next=file://host.invalid/C:/Users/canary/private.db",
+      "https://outer.test/x?next=file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?next=file://host.invalid/C:\\Users\\canary\\private.db",
+      "https://outer.test/x?next=file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?next=file://[fe80::1%25eth0]/Users/canary/private.db",
+      "https://outer.test/x?next=file://[fe80::1%25eth0]<path>",
+    ],
+    [
+      "https://outer.test/x?next=file://remote.invalid[/Users/canary/private.db",
+      "https://outer.test/x?next=file://remote.invalid[<path>",
+    ],
+    [
+      "https://outer.test/[unterminated?next=file://host.invalid/Users/canary/private.db",
+      "https://outer.test/[unterminated?next=file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?a=file://one.invalid/Users/canary/one.db&b=file://two.invalid/Users/canary/two.db",
+      "https://outer.test/x?a=file://one.invalid<path>&b=file://two.invalid<path>",
+    ],
+    [
+      "file://outer.invalid/Users/canary/outer.db?next=file://inner.invalid/Users/canary/inner.db",
+      "file://outer.invalid<path>?next=file://inner.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?next='file://host.invalid/Users/canary/My Files/private.db'",
+      "https://outer.test/x?next='file://host.invalid<path>'",
+    ],
+    [
+      'https://outer.test/x?next="file://host.invalid/Users/canary/My Files/private.db"',
+      'https://outer.test/x?next="file://host.invalid<path>"',
+    ],
+  ] as const)("redacts nested file URL paths: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    [
+      "https://outer.test/x?next=/Users/canary/private.db",
+      "https://outer.test/x?next=/Users/canary/private.db",
+    ],
+    [
+      "https://outer.test/x&next=/Users/canary/private.db",
+      "https://outer.test/x&next=/Users/canary/private.db",
+    ],
+    [
+      "https://outer.test/x?next=https://other.invalid/Users/canary/private.db",
+      "https://outer.test/x?next=https://other.invalid/Users/canary/private.db",
+    ],
+    [
+      "https://outer.test/x?next=profile://remote.invalid/Users/canary/private.db",
+      "https://outer.test/x?next=profile://remote.invalid/Users/canary/private.db",
+    ],
+    [
+      "https://outer.test/x?next=xfile://remote.invalid/Users/canary/private.db",
+      "https://outer.test/x?next=xfile://remote.invalid/Users/canary/private.db",
+    ],
+    [
+      "https://outer.test/x?next=prefix-file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x?next=prefix-file://host.invalid/Users/canary/private.db",
+    ],
+    [
+      "https://outer.test/x?next=file%3A%2F%2Fhost.invalid%2FUsers%2Fcanary%2Fprivate.db",
+      "https://outer.test/x?next=file%3A%2F%2Fhost.invalid%2FUsers%2Fcanary%2Fprivate.db",
+    ],
+    ["https://outer.test/a/b/c?d=e#f", "https://outer.test/a/b/c?d=e#f"],
+    [
+      "https://outer.test/x?q=[a=b]file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x?q=[a=b]file://host.invalid/Users/canary/private.db",
+    ],
+    [
+      "https://outer.test/x?q=(file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x?q=(file://host.invalid/Users/canary/private.db",
+    ],
+    [
+      "https://outer.test/x?q=1file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x?q=1file://host.invalid/Users/canary/private.db",
+    ],
+    [
+      "https://outer.test/x/file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x/file://host.invalid/Users/canary/private.db",
+    ],
+    ["file://host.invalid?x=https://y.test/p", "file://host.invalid?x=https:<path>"],
+    [
+      "https://outer.test/x?next=file://host.invalid",
+      "https://outer.test/x?next=file://host.invalid",
+    ],
+    [
+      "https://outer.test/x?next=file://host.invalid/",
+      "https://outer.test/x?next=file://host.invalid/",
+    ],
+  ] as const)("preserves nested URL controls and residuals: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
+  });
+
+  it.each([
     ["xfile:///Users/canary/private.db", "xfile://<path>"],
     ["profile://localhost/Users/canary/private.db", "profile://localhost<path>"],
     ["xfile://remote.invalid/Users/canary/private.db", "xfile://remote.invalid/Users/canary/private.db"],

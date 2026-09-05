@@ -24,7 +24,16 @@ const mocks = vi.hoisted(() => ({
   log: vi.fn(),
   send: vi.fn(),
   scrub: vi.fn((text: string) => text),
-  identity: vi.fn(() => ({ id: "pid", canonical: "/cwd" })),
+  identity: vi.fn((cwd: string) => ({
+    id: "pid",
+    localProjectId: "pid",
+    canonical: cwd,
+    remoteProjectId: "pid",
+    machineId: "machine",
+  })),
+  projectPaths: vi.fn((identity: { id: string; canonical?: string; remoteProjectId?: string }) => ({
+    dir: `/projects/${identity.id}`,
+  })),
   openOutbox: vi.fn(),
   scrubberFactory: vi.fn(),
   eventsPath: vi.fn(() => "/events.db"),
@@ -61,6 +70,7 @@ vi.mock("../../../src/daemon/validate-cwd.js", () => ({
 vi.mock("../../../src/daemon/project.js", () => ({
   projectDir: () => "/project",
   projectIdentity: mocks.identity,
+  projectPathsForIdentity: mocks.projectPaths,
 }));
 vi.mock("../../../src/storage/index.js", () => ({
   createStorageBackendFactory: async () => ({ openProject: mocks.openProject, close: mocks.closeFactory }),
@@ -145,7 +155,13 @@ describe("promote-events unit boundaries", () => {
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
     mocks.scrubberFactory.mockResolvedValue({ scrub: mocks.scrub });
-    mocks.identity.mockReturnValue({ id: "pid", canonical: "/cwd" });
+    mocks.identity.mockImplementation((cwd: string) => ({
+      id: "pid",
+      localProjectId: "pid",
+      canonical: cwd,
+      remoteProjectId: "pid",
+      machineId: "machine",
+    }));
     mocks.eventsPath.mockReturnValue("/events.db");
     mocks.existingEventsPath.mockReturnValue(undefined);
     mocks.closeProject.mockResolvedValue(undefined);
@@ -255,6 +271,7 @@ describe("promote-events unit boundaries", () => {
       storageBackend: "postgresql",
     });
     expect(mocks.openOutbox).toHaveBeenCalledOnce();
+    expect(mocks.scrubberFactory).not.toHaveBeenCalled();
   });
 
   it("prepares the local outbox before selected PostgreSQL admission", async () => {
@@ -338,6 +355,133 @@ describe("promote-events unit boundaries", () => {
     expect(sequence.indexOf("scrubber")).toBeLessThan(sequence.indexOf("admission"));
     expect(sequence.indexOf("admission")).toBeLessThan(sequence.indexOf("project-open"));
     expect(sequence.indexOf("project-open")).toBeLessThan(sequence.indexOf("repository-batch"));
+  });
+
+  it("pairs a PostgreSQL-shaped preflight identity with scrubber paths and admission", async () => {
+    const preflight = {
+      id: "remote-1",
+      localProjectId: "local-1",
+      canonical: "/cwd",
+      remoteProjectId: "remote-1",
+      machineId: "machine-1",
+    };
+    const admitted = { ...preflight, selectedPath: "/alias", machineId: "other-machine" };
+    mocks.identity.mockReturnValueOnce(preflight).mockReturnValueOnce(admitted);
+    mocks.events.mockReturnValueOnce([event({ data: "paired identity" })]);
+
+    await expect(promoteEventsForCwd(
+      postgresqlConfig,
+      "/cwd",
+      "/events.db",
+      { openProject: mocks.openProject, close: mocks.closeFactory } as never,
+    )).resolves.toMatchObject({ promoted: 1, errors: 0 });
+
+    expect(mocks.projectPaths).toHaveBeenCalledWith({
+      id: "local-1",
+      canonical: "/cwd",
+      remoteProjectId: "remote-1",
+    });
+    expect(mocks.scrubberFactory).toHaveBeenCalledWith(
+      postgresqlConfig.security.sensitivePatterns,
+      "/projects/local-1",
+    );
+    expect(mocks.openProject).toHaveBeenCalledWith(
+      admitted,
+      undefined,
+      expect.any(AbortSignal),
+    );
+  });
+
+  it.each(["id", "localProjectId", "canonical", "remoteProjectId"] as const)(
+    "maps direct journal admission %s drift to an unlogged 503 response",
+    async (field) => {
+      const preflight = {
+        id: "remote-1",
+        localProjectId: "local-1",
+        canonical: "/cwd",
+        remoteProjectId: "remote-1",
+        machineId: "machine-1",
+      };
+      mocks.identity.mockReturnValueOnce(preflight).mockReturnValueOnce({
+        ...preflight,
+        [field]: `${preflight[field]}-drift`,
+      });
+      mocks.events.mockReturnValueOnce([event({ data: "drift" })]);
+      const response = {} as never;
+
+      await createPromoteEventsHandler(postgresqlConfig, {
+        backend: "postgresql",
+        openProject: mocks.openProject,
+        close: mocks.closeFactory,
+      } as never)(
+        {} as never,
+        response,
+        JSON.stringify({ cwd: "/cwd" }),
+      );
+
+      expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+        status: "blocked",
+        error: "backend publication admission blocked",
+      });
+      expect(mocks.log).not.toHaveBeenCalled();
+      expect(mocks.openProject).not.toHaveBeenCalled();
+      expect(mocks.mark).not.toHaveBeenCalled();
+    },
+  );
+
+  it("stops an all-project drain on journal admission drift and leaves later projects untouched", async () => {
+    const a = {
+      id: "a",
+      localProjectId: "a",
+      canonical: "/a",
+      remoteProjectId: "a",
+      machineId: "machine",
+    };
+    const b = {
+      id: "b",
+      localProjectId: "b",
+      canonical: "/b",
+      remoteProjectId: "b",
+      machineId: "machine",
+    };
+    const c = {
+      id: "c",
+      localProjectId: "c",
+      canonical: "/c",
+      remoteProjectId: "c",
+      machineId: "machine",
+    };
+    mocks.collect.mockReturnValueOnce([
+      { projectId: "a", cwd: "/a", path: "/a.db", metadataMissing: false, captured: 1, unprocessed: 1, errors: 0, lastCapture: "2026", file: "a.db" },
+      { projectId: "b", cwd: "/b", path: "/b.db", metadataMissing: false, captured: 1, unprocessed: 1, errors: 0, lastCapture: "2026", file: "b.db" },
+      { projectId: "c", cwd: "/c", path: "/c.db", metadataMissing: false, captured: 1, unprocessed: 1, errors: 0, lastCapture: "2026", file: "c.db" },
+    ]);
+    let eventsCalls = 0;
+    mocks.events.mockImplementation(() => {
+      eventsCalls++;
+      return eventsCalls === 1 || eventsCalls === 3
+        ? [event({ event_id: eventsCalls === 1 ? 1 : 2, data: eventsCalls === 1 ? "a" : "b" })]
+        : [];
+    });
+    mocks.identity.mockImplementation((cwd: string) => {
+      if (cwd === "/a") return a;
+      if (cwd === "/b" && mocks.identity.mock.calls.filter(([path]) => path === "/b").length === 1) return b;
+      if (cwd === "/b") return { ...b, canonical: "/b-drift" };
+      return c;
+    });
+
+    const response = {} as never;
+    await createPromoteAllEventsHandler(postgresqlConfig)({} as never, response, "");
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    expect(mocks.closeFactory).toHaveBeenCalledOnce();
+    expect(mocks.mark).toHaveBeenCalledWith([1]);
+    expect(mocks.openProject).toHaveBeenCalledTimes(2);
+    expect(mocks.identity.mock.calls.some(([cwd]) => cwd === "/c")).toBe(false);
+    expect(mocks.log).not.toHaveBeenCalled();
   });
 
   it("escapes typed PostgreSQL event failures as sanitized route storage responses", async () => {
@@ -449,7 +593,13 @@ describe("promote-events unit boundaries", () => {
     );
 
     expect(mocks.openProject).toHaveBeenCalledWith(
-      { id: "pid", canonical: "/cwd" },
+      expect.objectContaining({
+        id: "pid",
+        localProjectId: "pid",
+        canonical: "/cwd",
+        remoteProjectId: "pid",
+        machineId: "machine",
+      }),
       undefined,
       expect.any(AbortSignal),
     );
@@ -477,7 +627,13 @@ describe("promote-events unit boundaries", () => {
       { publicationLockToken },
     );
     expect(mocks.openProject).toHaveBeenCalledWith(
-      { id: "pid", canonical: "/cwd" },
+      expect.objectContaining({
+        id: "pid",
+        localProjectId: "pid",
+        canonical: "/cwd",
+        remoteProjectId: "pid",
+        machineId: "machine",
+      }),
       publicationLockToken,
       expect.any(AbortSignal),
     );
@@ -499,7 +655,13 @@ describe("promote-events unit boundaries", () => {
     )).resolves.toMatchObject({ message: "no unprocessed events" });
 
     expect(mocks.openProject).toHaveBeenCalledWith(
-      { id: "pid", canonical: "/cwd" },
+      expect.objectContaining({
+        id: "pid",
+        localProjectId: "pid",
+        canonical: "/cwd",
+        remoteProjectId: "pid",
+        machineId: "machine",
+      }),
       publicationLockToken,
       expect.any(AbortSignal),
     );
