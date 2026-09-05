@@ -18,9 +18,9 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createMigrationManifestHead,
@@ -668,7 +668,8 @@ describe("migration manifest nested publication-writer scratch recovery", () => 
 });
 
 function makeHome(mode = 0o700): string {
-  const home = mkdtempSync(join("/tmp", "lcm-manifest-store-"));
+  const home = mkdtempSync(join(tmpdir(), "lcm-manifest-store-"));
+  expect(dirname(home)).toBe(tmpdir());
   roots.push(home);
   chmodSync(home, mode);
   mkdirSync(join(home, ".lcm"), { mode: 0o700 });

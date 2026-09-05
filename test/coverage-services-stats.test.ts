@@ -1,5 +1,7 @@
 import { afterAll, beforeEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname } from "node:path";
 import type { RecallStats } from "../src/stats.js";
 
 interface FakeDatabaseState {
@@ -33,21 +35,29 @@ interface FakeStatement {
   all(): FakeAllRow[];
 }
 
-const mocks = vi.hoisted(() => ({
-  baseExists: true,
-  configFails: false,
-  eventsFail: false,
-  publicationBlocked: false,
-  storageUnavailable: false,
-  entries: [] as Array<{ name: string; directory: boolean; dbExists: boolean }>,
-  close: vi.fn<(project: string) => void>(),
-  migrate: vi.fn<(db: FakeDatabaseState) => void>(),
-  collectEvents: vi.fn<(maxDbs: number) => void>(),
-  loadConfig: vi.fn<(path: string) => void>(),
-  findStale: vi.fn<(args: FakeStaleQuery) => unknown[]>(),
-  getRecallStats: vi.fn<() => RecallStats>(),
-  publicationHome: `/tmp/lcm-stats-services-${process.pid}`,
-}));
+const mocks = vi.hoisted(() => {
+  const getBuiltinModule = (process as NodeJS.Process & {
+    getBuiltinModule: (specifier: string) => unknown;
+  }).getBuiltinModule;
+  const fs = getBuiltinModule("node:fs") as typeof import("node:fs");
+  const os = getBuiltinModule("node:os") as typeof import("node:os");
+  const path = getBuiltinModule("node:path") as typeof import("node:path");
+  return {
+    baseExists: true,
+    configFails: false,
+    eventsFail: false,
+    publicationBlocked: false,
+    storageUnavailable: false,
+    entries: [] as Array<{ name: string; directory: boolean; dbExists: boolean }>,
+    close: vi.fn<(project: string) => void>(),
+    migrate: vi.fn<(db: FakeDatabaseState) => void>(),
+    collectEvents: vi.fn<(maxDbs: number) => void>(),
+    loadConfig: vi.fn<(path: string) => void>(),
+    findStale: vi.fn<(args: FakeStaleQuery) => unknown[]>(),
+    getRecallStats: vi.fn<() => RecallStats>(),
+    publicationHome: fs.mkdtempSync(path.join(os.tmpdir(), "lcm-stats-services-")),
+  };
+});
 
 const projects = new Map<string, {
   messages: number; messageTokens: number; summaries: number; summaryTokens: number; maxDepth: number;
@@ -149,6 +159,7 @@ type Stats = Parameters<typeof printStats>[0];
 
 describe("stats service coverage", () => {
   beforeAll(() => {
+    expect(dirname(mocks.publicationHome)).toBe(tmpdir());
     mkdirSync(mocks.publicationHome, { recursive: true, mode: 0o700 });
     mkdirSync(`${mocks.publicationHome}/.lcm`, { mode: 0o700 });
   });

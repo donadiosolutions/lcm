@@ -886,6 +886,7 @@ describe("runtime home rename failures", () => {
   });
 
   it("rejects a nonterminal journal injected at witness refresh", () => {
+    // POSIX-only fixture: hooks below intentionally match the shared /tmp parent.
     const paths = legacyHome("/tmp");
     processControl.procFiles.set("/proc/self/uid_map", "0 0 1\n");
     fsControl.fstatHook = (path, stat) => path === "/tmp"
@@ -1077,6 +1078,7 @@ describe("runtime home rename failures", () => {
   });
 
   it("accepts a root-owned sticky parent as an authenticated home parent", () => {
+    // POSIX-only fixture: authenticate the real root-owned sticky /tmp parent.
     const home = mkdtempSync("/tmp/lcm-runtime-sticky-parent-");
     homes.push(home);
     processControl.procFiles.set("/proc/self/uid_map", "0 0 1\n");
@@ -1091,6 +1093,7 @@ describe("runtime home rename failures", () => {
   });
 
   it("propagates a non-missing parent witness read failure", () => {
+    // POSIX-only fixture: the witness-error hook is keyed to the shared /tmp parent.
     const home = mkdtempSync("/tmp/lcm-runtime-parent-witness-error-");
     homes.push(home);
     processControl.procFiles.set("/proc/self/uid_map", "0 0 1\n");

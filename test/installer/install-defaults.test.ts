@@ -1,15 +1,17 @@
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 
 const mocks = vi.hoisted(() => {
   const getBuiltinModule = (process as NodeJS.Process & {
     getBuiltinModule: (specifier: string) => unknown;
   }).getBuiltinModule;
   const fs = getBuiltinModule("node:fs") as typeof import("node:fs");
+  const os = getBuiltinModule("node:os") as typeof import("node:os");
   const path = getBuiltinModule("node:path") as typeof import("node:path");
   return {
-    homeDir: fs.mkdtempSync(path.join("/tmp", "lcm-installer-defaults-")),
+    homeDir: fs.mkdtempSync(path.join(os.tmpdir(), "lcm-installer-defaults-")),
     ensureCore: vi.fn(),
     ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
     runDoctor: vi.fn().mockResolvedValue([]),
@@ -35,6 +37,10 @@ vi.mock("node:readline/promises", () => ({
 }));
 
 import { install, type ServiceDeps } from "../../installer/install.js";
+
+beforeAll(() => {
+  expect(dirname(mocks.homeDir)).toBe(tmpdir());
+});
 
 afterAll(() => {
   rmSync(mocks.homeDir, { recursive: true, force: true });

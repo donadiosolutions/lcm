@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { ConfigValidationError } from "../../src/daemon/config.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
@@ -755,7 +755,8 @@ describe("runCli daemon-backed and utility actions", () => {
     });
     const migrate = vi.fn();
     const sleep = vi.fn(async (_delayMs: number) => undefined);
-    const root = actualFs.mkdtempSync("/tmp/lcm-cli-concurrent-");
+    const root = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-concurrent-"));
+    expect(dirname(root)).toBe(tmpdir());
     actualFs.mkdirSync(join(root, ".lcm"), { recursive: true });
     const previousRuntime = {
       home: state.runtimeHome,
@@ -2090,7 +2091,8 @@ describe("runCli failure and alternate presentation branches", () => {
       runtime: process.env.XDG_RUNTIME_DIR,
       owner: process.env.LCM_DAEMON_OWNER_ID,
     };
-    const homeDir = actualFs.mkdtempSync("/tmp/lcm-cli-owned-home-");
+    const homeDir = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-owned-home-"));
+    expect(dirname(homeDir)).toBe(tmpdir());
     const runtimeDir = `${homeDir}/runtime`;
     const entrypoint = `${runtimeDir}/owned-lcm.mjs`;
     actualFs.mkdirSync(runtimeDir, { recursive: true });
@@ -2141,7 +2143,8 @@ describe("runCli failure and alternate presentation branches", () => {
       runtime: process.env.XDG_RUNTIME_DIR,
       owner: process.env.LCM_DAEMON_OWNER_ID,
     };
-    const root = actualFs.mkdtempSync("/tmp/lcm-cli-symlink-");
+    const root = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-symlink-"));
+    expect(dirname(root)).toBe(tmpdir());
     const homeDir = `${root}/home`;
     const runtimeDir = `${homeDir}/runtime`;
     const stateTarget = `${root}/canonical-target-state`;
