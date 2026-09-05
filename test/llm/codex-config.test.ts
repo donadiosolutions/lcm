@@ -312,8 +312,18 @@ describe("resolveCodexOpenAIBaseUrl", () => {
 
   it("rejects a nonzero close before a valid config response", async () => {
     const child = hangingChild();
+    const killProcess = vi.fn();
     child.stdin.on("data", () => { child.stdout.end(); child.emit("close", 2); });
-    await expect(resolveCodexOpenAIBaseUrl({ spawn: spawnFor(child), processBirthTime: () => "birth" }))
+    await expect(resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "linux",
+      processBirthTime: () => "birth",
+      processGroupId: 8124,
+      daemonProcessGroupId: 8122,
+      processGroupIdProbe: () => 8124,
+      isProcessGroupAlive: () => false,
+      killProcess,
+    }))
       .rejects.toThrow("codex endpoint resolution failed");
   });
 
@@ -450,7 +460,16 @@ describe("resolveCodexOpenAIBaseUrl", () => {
       nonzero.stdout.end();
       nonzero.emit("close", 2);
     });
-    await expect(resolveCodexOpenAIBaseUrl({ spawn: spawnFor(nonzero), processBirthTime: () => "birth" }))
+    await expect(resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(nonzero),
+      platform: "linux",
+      processBirthTime: () => "birth",
+      processGroupId: 8123,
+      daemonProcessGroupId: 8122,
+      processGroupIdProbe: () => 8123,
+      isProcessGroupAlive: () => false,
+      killProcess: vi.fn(),
+    }))
       .resolves.toBeUndefined();
   });
 
@@ -500,10 +519,13 @@ describe("resolveCodexOpenAIBaseUrl", () => {
         child.emit("close", null, "SIGTERM");
       });
       const killProcess = vi.fn();
+      const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
       const pending = resolveCodexOpenAIBaseUrl({
         spawn: spawnFor(child),
         platform: "linux",
         processBirthTime: () => "birth",
+        daemonInstanceId: "daemon",
+        witnessStore,
         processGroupIdProbe: () => 8124,
         isProcessGroupAlive: () => true,
         killProcess,
@@ -513,6 +535,8 @@ describe("resolveCodexOpenAIBaseUrl", () => {
       await vi.advanceTimersByTimeAsync(4_000);
       await expect(observed).resolves.toMatchObject({ message: expect.stringContaining("codex endpoint resolution failed") });
       expect(killProcess).toHaveBeenCalledWith(-8124, "SIGKILL");
+      expect(witnessStore.add).toHaveBeenCalledOnce();
+      expect(witnessStore.remove).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
