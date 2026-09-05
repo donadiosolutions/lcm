@@ -106,6 +106,13 @@ function currentUid(): number | undefined {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
 }
 
+function errorCode(error: unknown): string | undefined {
+  return error !== null && typeof error === "object" && "code" in error
+    && typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
+
 type PrivateDirectoryOpenOptions = Readonly<{
   expectedUid?: number;
 }>;
@@ -205,7 +212,7 @@ export function openPrivateDirectoryIfExists(
   try {
     fd = openPrivateDirectoryDescriptor(path);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if (errorCode(error) === "ENOENT") return undefined;
     throw error;
   }
   return authenticateOpenPrivateDirectory(path, fd, options);

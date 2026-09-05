@@ -74,6 +74,13 @@ function isInvocationCancellation(error: unknown): boolean {
   return error instanceof InvocationCoordinatorError && error.code === "cancelled";
 }
 
+function errorCode(error: unknown): string | undefined {
+  return error !== null && typeof error === "object" && "code" in error
+    && typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
+
 export function createPromoteHandler(
   config: DaemonConfig,
   storageFactory?: StorageBackendFactory,
@@ -312,7 +319,7 @@ export function createPromoteHandler(
                 }
                 meta = parsed as Record<string, unknown>;
               } catch (error) {
-                if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+                if (errorCode(error) !== "ENOENT") throw error;
               }
               meta.cwd = paths.canonical;
               meta.lastPromote = new Date().toISOString();

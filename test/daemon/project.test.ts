@@ -297,6 +297,28 @@ describe("secure project-root handoff", () => {
     expect(() => ensureProjectDirForIdentity(identity)).toThrow();
   });
 
+  it("preserves an explicitly thrown undefined metadata-read failure", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "a".repeat(64), canonical: "/project" };
+    const readSpy = vi.spyOn(securityFiles, "readBoundedRegularFile").mockImplementationOnce(() => {
+      throw undefined;
+    });
+    try {
+      let didThrow = false;
+      let caught: unknown = "sentinel";
+      try {
+        ensureProjectDirForIdentity(identity);
+      } catch (error) {
+        didThrow = true;
+        caught = error;
+      }
+      expect(didThrow).toBe(true);
+      expect(caught).toBeUndefined();
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
   it("falls back to the normalized path for malformed compatibility entries", () => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });
     writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({

@@ -30,6 +30,13 @@ export const MAX_PROJECT_METADATA_BYTES = 1024 * 1024;
 const MAX_PROJECT_MAP_COMPATIBILITY_BYTES = 4 * 1024 * 1024;
 const PROJECT_HASH_PATTERN = /^[a-f0-9]{64}$/u;
 
+function errorCode(error: unknown): string | undefined {
+  return error !== null && typeof error === "object" && "code" in error
+    && typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
+
 function assertStablePrivateRoot(
   handle: PrivateDirectoryHandle,
   path: string,
@@ -84,7 +91,7 @@ function acquireProjectChild(
     mkdirSync(childPath, { recursive: false, mode: 0o700 });
     created = true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    if (errorCode(error) !== "EEXIST") throw error;
   }
 
   let child: PrivateDirectoryHandle | undefined;
@@ -379,7 +386,7 @@ export const ensureProjectDirForIdentity = (
           maxBytes: MAX_PROJECT_METADATA_BYTES,
         });
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if (errorCode(error) !== "ENOENT") throw error;
       }
       if (content !== undefined) {
         let existing: unknown;
