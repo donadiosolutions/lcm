@@ -1101,6 +1101,7 @@ describe("issue 400 managed ensure admission matrix", () => {
 
   it("blocks the next assertion when abort lands after convergence sleep", async () => {
     let publicationAssertions = 0;
+    let nowCalls = 0;
     const contention = new PrivateMutationLockContentionError("abort between retries");
     const controller = new AbortController();
     const fixture = createFixture({
@@ -1125,6 +1126,11 @@ describe("issue 400 managed ensure admission matrix", () => {
       expectedRuntimeDigest: "a".repeat(64),
       _skipSpawn: false,
       _abortSignal: controller.signal,
+      _monotonicNowOverride: () => {
+        nowCalls += 1;
+        if (nowCalls >= 20) controller.abort();
+        return 0;
+      },
       _processStartTimeForTesting: () => "birth",
       _readPrivateMutationLockOwnerForTesting: () => ({
         version: 1,
