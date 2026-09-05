@@ -205,8 +205,15 @@ The `Security` section of the doctor output shows:
   HTTP `200` status and null-result response shape. SQLite details become a
   `database constraint error`. Host-local POSIX, Windows, and UNC paths become
   `<path>`; quoted paths may contain spaces, while unquoted paths stop at
-  whitespace so arbitrary trailing prose remains intact. URL authorities and
-  slashes remain unchanged.
+  whitespace so arbitrary trailing prose remains intact. File URLs preserve
+  their scheme and authority spelling while replacing a non-root path after
+  the authority with `<path>`, including an initial Windows drive. A quote
+  immediately before the `file` scheme lets the redacted path contain spaces
+  until the matching quote or a newline. Empty and root-only file URLs remain
+  unchanged. In unquoted file URLs, whitespace and the existing path
+  delimiters, including later colons, `?`, and `#`, end the redacted span, so
+  text after those delimiters can remain visible. Ordinary HTTP and HTTPS URLs
+  retain their authorities, slashes, and paths.
   There are no configuration options for this defense-in-depth behavior.
 - Hook project paths retain leading and trailing whitespace. Directories whose names differ only by that whitespace remain separate LCM projects.
 - Hook errors are attached to a project sidecar only when the reported working directory is an existing directory. Invalid paths are recorded in the bounded fallback log without creating project metadata.
