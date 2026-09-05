@@ -80,8 +80,8 @@ component_management:
         # The #700 cancellation-aware open lifecycle and compact/restore response
         # handling remain route-owned; #703 describe/expand compatibility errors,
         # #705 prompt-search surfacing-log failures, #709 search and grep routes,
-        # #710 grep mode, #792 session filtering, and #793 search-limit
-        # validation remain route-owned.
+        # #710 grep mode, #792 session filtering, #793 search-limit validation,
+        # and #794 grep-since validation remain route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -90,8 +90,8 @@ component_management:
     - component_id: "unit-mcp"
       name: "Unit - MCP"
       paths:
-        # The #709 canonical search and grep MCP tools, #710 grep mode, and #793
-        # search-limit schema remain MCP-owned.
+        # The #709 canonical search and grep MCP tools, #710 grep mode, #793
+        # search-limit schema, and #794 grep-since schema remain MCP-owned.
         - "src/mcp/"
     - component_id: "unit-llm-prompts"
       name: "Unit - LLM, Responses, and Prompts"

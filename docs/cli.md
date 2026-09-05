@@ -62,7 +62,7 @@ daemon client for each read:
 | Command | Operation performed by the daemon |
 |---|---|
 | `lcm search <query>` | Search episodic and promoted memory |
-| `lcm grep <query>` | Search messages and summaries by exact text or regular expression |
+| `lcm grep <query>` | Search messages and summaries by exact text or regular expression; optional inclusive `--since` accepts `YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm)` and malformed values return HTTP 400 |
 | `lcm describe <nodeId>` | Read summary or stored-memory metadata |
 | `lcm expand <nodeId>` | Expand a summary into source detail |
 | `lcm status` | Read daemon and project status |

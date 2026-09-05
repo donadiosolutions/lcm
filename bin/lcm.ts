@@ -1241,7 +1241,7 @@ export function registerMemoryCommands(
     .description("Search raw messages and summaries by keyword or regex")
     .option("--mode <mode>", "Search mode: full_text or regex", "full_text")
     .option("--scope <scope>", "Scope: messages, summaries, or both", "both")
-    .option("--since <iso>", "Only include matches on or after this ISO timestamp")
+    .option("--since <iso>", "Inclusive lower bound: YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm); invalid values return HTTP 400")
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (query: string, opts) => {

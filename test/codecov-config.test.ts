@@ -491,7 +491,8 @@ describe("Codecov configuration", () => {
     }
 
     const components = validateComponents(configuredComponents(config));
-    // #792 keeps grep session filtering in the existing route component.
+    // #792 keeps grep session filtering and #794 grep-since validation in the
+    // existing route component.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     const expectedOwners = [
       ["bin/lcm.ts", "unit-cli"],
