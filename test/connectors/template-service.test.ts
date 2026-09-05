@@ -163,6 +163,8 @@ describe("transport-pure guidance", () => {
     expect(operations).toContain("regex pattern");
     expect(operations).toContain("inclusive ISO datetime lower bound");
     expect(operations).toContain("1-3 fractional digits");
+    expect(operations).toContain("UTC years must be 0001-9999");
+    expect(operations).toContain("Malformed or out-of-range values return");
     expect(operations).toContain("invalid since");
   });
 

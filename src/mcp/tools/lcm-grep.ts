@@ -25,7 +25,7 @@ export const lcmGrepTool = {
       sessionId: { type: "string", description: "Filter to a specific session" },
       since: {
         type: "string",
-        description: "inclusive ISO datetime lower bound: YYYY-MM-DDTHH:mm:ss with optional 1-3 fractional digits and Z or +/-HH:mm timezone; omitted to include all history",
+        description: "inclusive ISO datetime lower bound: YYYY-MM-DDTHH:mm:ss with optional 1-3 fractional digits and Z or +/-HH:mm timezone; after offset normalization, UTC years must be 0001-9999; malformed or out-of-range values return HTTP 400 with invalid since; omitted to include all history",
       },
     },
     required: ["query"],

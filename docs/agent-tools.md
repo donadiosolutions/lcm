@@ -84,7 +84,7 @@ Search conversation history by keyword or regex across raw messages and summarie
 | `mode` | string | | `full_text` | `full_text` for literal/full-text matching or `regex` for regular-expression matching |
 | `scope` | string | | `"both"` | `"messages"`, `"summaries"`, or `"both"` |
 | `sessionId` | string | | — | Filter to a specific session |
-| `since` | string | | — | Inclusive ISO datetime lower bound. Use `YYYY-MM-DDTHH:mm:ss` with optional 1-3 fractional digits and `Z` or `+/-HH:mm`; omit to include all history. Invalid values return `{ "error": "invalid since" }`. |
+| `since` | string | | — | Inclusive ISO datetime lower bound. Use `YYYY-MM-DDTHH:mm:ss` with optional 1-3 fractional digits and `Z` or `+/-HH:mm`; after offset normalization, UTC years must be 0001-9999. Omit it to include all history. Malformed or out-of-range values return `{ "error": "invalid since" }` (HTTP 400). |
 
 Omit `sessionId` to search the whole project. When supplied, it selects the
 project's canonical newest conversation for that session identifier; an
@@ -110,9 +110,11 @@ lcm_grep(query: 'config\\.(threshold|limit)', mode: 'regex')
 
 `since` is an inclusive lower bound. For example, `since: '2025-01-01T00:00:00Z'` includes matches created exactly at that instant and
 later. The accepted form is `YYYY-MM-DDTHH:mm:ss` with an optional 1-3 digit
-fraction and a required `Z` or numeric `+/-HH:mm` timezone. Omit `since` to
-search all history; malformed values return `{ "error": "invalid since" }`
-before project validation or storage access.
+fraction and a required `Z` or numeric `+/-HH:mm` timezone. After offset
+normalization, the UTC year must be 0001 through 9999 inclusive. Omit `since`
+to search all history; malformed or out-of-range values return
+`{ "error": "invalid since" }` (HTTP 400) before project validation or storage
+access.
 
 The deprecated `all` scope remains accepted as a compatibility input and is
 normalized to `both`, but it is not advertised. The package

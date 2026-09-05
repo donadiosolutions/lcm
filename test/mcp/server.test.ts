@@ -88,6 +88,8 @@ describe("MCP tool definitions", () => {
     expect(grep.inputSchema.properties.mode.description).toContain("full-text");
     expect(grep.inputSchema.properties.mode.description).toContain("regex");
     expect(grep.inputSchema.properties.since.description).toContain("inclusive");
+    expect(grep.inputSchema.properties.since.description).toContain("UTC years must be 0001-9999");
+    expect(grep.inputSchema.properties.since.description).toContain("HTTP 400");
     expect(grep.inputSchema.properties.since.description).toContain("1-3 fractional digits");
     expect(grep.inputSchema.properties.since.description).toContain("+/-HH:mm");
     expect(grep.inputSchema.properties.query.description).toBe(

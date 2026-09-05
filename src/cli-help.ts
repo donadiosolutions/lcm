@@ -172,14 +172,14 @@ const HELP: Record<string, CommandHelp> = {
     options: [
       ["--mode <mode>", "Search mode: full_text (default) or regex"],
       ["--scope <scope>", "Scope: messages, summaries, or both (default: both)"],
-      ["--since <iso>", "Inclusive lower bound: YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm); invalid values return HTTP 400"],
+      ["--since <iso>", "Inclusive lower bound: YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm), normalized UTC year 0001-9999; malformed or out-of-range values return HTTP 400"],
     ],
     examples: [
       ["lcm grep \"ECONNREFUSED\"", "Search for an exact error string"],
       ["lcm grep \"createDaemon|startMcpServer\" --mode regex", "Regex search across history"],
       ["lcm grep \"migration\" --scope summaries", "Search only summaries"],
     ],
-    notes: "The optional --since value is inclusive and must use YYYY-MM-DDTHH:mm:ss with optional 1-3 fractional digits and a Z or +/-HH:mm timezone. Omit it to include all history; malformed values return HTTP 400 with invalid since.",
+    notes: "The optional --since value is inclusive and must use YYYY-MM-DDTHH:mm:ss with optional 1-3 fractional digits and a Z or +/-HH:mm timezone. After offset normalization, the UTC year must be 0001-9999. Omit it to include all history; malformed or out-of-range values return HTTP 400 with invalid since.",
   },
 
   describe: {

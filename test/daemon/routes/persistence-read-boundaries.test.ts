@@ -471,14 +471,20 @@ describe("persistence read route boundaries", () => {
     });
   });
 
-  it("normalizes valid since timestamps and rejects malformed values before storage", async () => {
+  it("normalizes supported UTC years and rejects invalid since values before storage", async () => {
     const handler = createGrepHandler(config);
     const valid = [
+      ["0001-01-01T00:00:00Z", "0001-01-01T00:00:00.000Z"],
+      ["0000-12-31T23:00:00-01:00", "0001-01-01T00:00:00.000Z"],
+      ["0001-01-01T00:01:00+00:01", "0001-01-01T00:00:00.000Z"],
       ["2024-02-29T23:59:59Z", "2024-02-29T23:59:59.000Z"],
       ["2000-02-29T00:00:00Z", "2000-02-29T00:00:00.000Z"],
       ["2025-01-01T00:00:00+23:59", "2024-12-31T00:01:00.000Z"],
       ["2025-12-31T23:59:59.1-02:30", "2026-01-01T02:29:59.100Z"],
       ["2025-06-15T12:34:56.999Z", "2025-06-15T12:34:56.999Z"],
+      ["9999-12-31T23:59:59.999Z", "9999-12-31T23:59:59.999Z"],
+      ["9999-12-31T23:58:59.999-00:01", "9999-12-31T23:59:59.999Z"],
+      ["9999-12-31T22:59:59.999-01:00", "9999-12-31T23:59:59.999Z"],
     ] as const;
 
     for (const [input, expected] of valid) {
@@ -535,14 +541,29 @@ describe("persistence read route boundaries", () => {
       "2025-01-01T00:00:60Z",
       "2025-01-01T00:00:00+24:00",
       "2025-01-01T00:00:00+00:60",
+      "0000-12-31T23:59:59.999Z",
+      "0001-01-01T00:00:00+00:01",
+      "0000-01-01T00:00:00Z",
+      "0000-02-29T00:00:00Z",
+      "0000-01-01T00:00:00+00:01",
+      "9999-12-31T23:59:00.000-00:01",
+      "9999-12-31T23:59:59.999-00:01",
     ];
-    for (const since of malformed) {
-      mocks.validate.mockClear();
-      const openCalls = mocks.openProject.mock.calls.length;
-      await invoke(handler, { query: "q", cwd: "/bad", since });
-      expectLast(400, { error: "invalid since" });
-      expect(mocks.validate).not.toHaveBeenCalled();
-      expect(mocks.openProject.mock.calls.length).toBe(openCalls);
+    const handlers = [
+      handler,
+      createGrepHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())),
+    ];
+    for (const candidate of handlers) {
+      for (const since of malformed) {
+        mocks.validate.mockClear();
+        const openCalls = mocks.openProject.mock.calls.length;
+        const grepCalls = mocks.grep.mock.calls.length;
+        await invoke(candidate, { query: "q", cwd: "/bad", since });
+        expectLast(400, { error: "invalid since" });
+        expect(mocks.validate).not.toHaveBeenCalled();
+        expect(mocks.openProject.mock.calls.length).toBe(openCalls);
+        expect(mocks.grep.mock.calls.length).toBe(grepCalls);
+      }
     }
 
     await invoke(handler, {
