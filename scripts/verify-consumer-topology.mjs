@@ -259,7 +259,7 @@ export function runConsumerTopology({
     }
     throw verificationError;
   }
-  if (cleanupError !== undefined) throw cleanupError;
+  if (cleanupFailed) throw cleanupError;
   return result;
 }
 
