@@ -715,6 +715,7 @@ describe("createCodexProcessSummarizer", () => {
       const pending = summarizer("text", false, { signal: controller.signal });
       const observed = pending.then(() => undefined, error => error);
       await vi.waitFor(() => expect(processChild.stdin.listenerCount("error")).toBeGreaterThan(0));
+      processChild.stderr.emit("data", "usage limit");
       await vi.advanceTimersByTimeAsync(1);
       controller.abort();
       await expect(observed).resolves.toMatchObject({ message: expect.stringMatching(/timed out/) });
@@ -1142,6 +1143,8 @@ describe("createCodexProcessSummarizer", () => {
     expect(error.cause).toBeUndefined();
     expect(JSON.stringify(error)).not.toContain(canary);
     expect(sanitizeError(error.message)).toBe(error.message);
+    expect(error.message).toContain('reasoning effort "default/omitted"');
+    expect(error.message).toContain("fast mode default/omitted");
     if (category === "usage") expect(error.message).toMatch(/usage limit|rate/i);
     if (category === "authentication") expect(error.message).toMatch(/authentication|sign in/i);
     if (category === "model") expect(error.message).toMatch(/model|supported/i);
@@ -1166,9 +1169,6 @@ describe("createCodexProcessSummarizer", () => {
 
   it("classifies split multibyte and same-tick stderr while retaining only the terminal byte window", async () => {
     const child = makeHangingChild();
-    child.stderr.write(Buffer.from("usage lim"));
-    child.stderr.write(Buffer.from("it — ", "utf8"));
-    child.stderr.write("GPT-5.3-Codex-Spark");
     const spawn = vi.fn().mockReturnValue(child);
     const summarizer = createCodexProcessSummarizer({
       ...baseDeps(child),
@@ -1176,6 +1176,10 @@ describe("createCodexProcessSummarizer", () => {
     });
     const pending = summarizer("text", false);
     await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    const diagnostic = Buffer.from("usage limit — GPT-5.3-Codex-Spark");
+    const splitAt = diagnostic.indexOf(0xE2) + 1;
+    child.stderr.emit("data", diagnostic.subarray(0, splitAt));
+    child.stderr.emit("data", diagnostic.subarray(splitAt));
     child.emit("close", 1);
     const error = await pending.catch((caught: unknown) => caught as Error);
     expect(error.message).toMatch(/usage limit/i);
@@ -1226,7 +1230,7 @@ describe("createCodexProcessSummarizer", () => {
     ["usage", 429],
     ["authentication", 401],
   ] as const)("prefers the gateway %s category over generic stderr", async (category) => {
-    const child = makeChild(1, "codex responses gateway request failed");
+    const child = makeChild(1, category === "usage" ? "authentication required" : "usage limit");
     const gateway = makeGateway({ upstreamFailureCategory: category });
     const error = await createCodexProcessSummarizer({
       ...baseDeps(child),
@@ -1234,6 +1238,41 @@ describe("createCodexProcessSummarizer", () => {
     } as never)("text", false).catch((caught: unknown) => caught as Error);
     expect(error.message).not.toContain("Upgrade the Codex CLI");
     expect(error.message).toMatch(category === "usage" ? /usage limit/i : /authentication|sign in/i);
+  });
+
+  it("keeps classified controls and known evidence for a null exit", async () => {
+    const child = makeHangingChild();
+    const spawn = vi.fn().mockReturnValue(child);
+    const pending = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    })("text", false);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.stderr.emit("data", "usage limit");
+    child.emit("close", null);
+    const error = await pending.catch((caught: unknown) => caught as Error);
+    expect(error.message).toMatch(/usage limit/i);
+    expect(error.message).toContain('reasoning effort "default/omitted"');
+  });
+
+  it("lets abort win after quota stderr has been received", async () => {
+    const controller = new AbortController();
+    const child = makeHangingChild();
+    child.kill.mockImplementation(() => { child.emit("close", null); });
+    const spawn = vi.fn().mockReturnValue(child);
+    const pending = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    })("text", false, { signal: controller.signal });
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.stderr.emit("data", "usage limit");
+    controller.abort();
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+  });
+
+  it("ignores quota stderr on a successful exit", async () => {
+    const child = makeChild(0, "usage limit");
+    await expect(createCodexProcessSummarizer(baseDeps(child))("text", false)).resolves.toBe("summary");
   });
 
   it("reports bounded controls without exposing CLI diagnostics", async () => {

@@ -6,6 +6,7 @@ import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, type CodexProcessReasoningEffort } from "../daemon/config.js";
 import {
   createOwnedProcessTeardown,
+  boundedModelForDisplay,
   normalizeProcessBirthTime,
   createProcessCompatibilityError,
   type ProviderProcessWitness,
@@ -94,6 +95,20 @@ function classifyCodexStderr(stderr: string): CodexStderrFailureCategory | undef
     return "invalid-request";
   }
   return undefined;
+}
+
+function createCodexFailureError(
+  category: CodexStderrFailureCategory,
+  deps: { model?: string; reasoningEffort?: CodexProcessReasoningEffort; fastMode?: boolean },
+): Error {
+  const model = boundedModelForDisplay(deps.model ?? "default");
+  const reasoningEffort = deps.reasoningEffort ?? "default/omitted";
+  const fastMode = deps.fastMode === undefined ? "default/omitted" : String(deps.fastMode);
+  return new Error(
+    `${CODEX_FAILURE_MESSAGES[category]} ` +
+      `(provider codex-process, model ${JSON.stringify(model)}, ` +
+      `reasoning effort ${JSON.stringify(reasoningEffort)}, fast mode ${fastMode}; diagnostic output omitted)`,
+  );
 }
 
 function buildPrompt(text: string, aggressive: boolean | undefined, ctx: SummarizeContext): string {
@@ -474,7 +489,7 @@ async function runCodexSummarizer(
           const gatewayCategory: CodexResponsesGatewayFailureCategory | undefined = activeGateway.upstreamFailureCategory;
           const stderrCategory = classifyCodexStderr(Buffer.concat(stderrWindow, stderrWindowBytes).toString("utf8"));
           const category = gatewayCategory ?? stderrCategory;
-          if (category !== undefined) throw new Error(CODEX_FAILURE_MESSAGES[category]);
+          if (category !== undefined) throw createCodexFailureError(category, deps);
           throw createProcessCompatibilityError({
             cliName: "Codex",
             providerId: "codex-process",
