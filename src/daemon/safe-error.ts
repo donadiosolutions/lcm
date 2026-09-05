@@ -9,6 +9,7 @@ const FILE_SCHEME = "file";
 const WHITESPACE_PATTERN = /\s/u;
 const PATH_DELIMITERS = new Set(["#", "&", "=", "|", ",", ";", ":", "!", "?", ")", "]", "}", "'", '"', "<", ">"]);
 const URL_END_DELIMITERS = new Set(["|", ",", ";", ")", "]", "}", "'", '"', "<", ">"]);
+const FILE_URL_AUTHORITY_DELIMITERS = new Set([",", ";", ")", "}", "'"]);
 const NESTED_FILE_URL_DELIMITERS = new Set(["?", "#", "&", "="]);
 
 function isPathWord(char: string | undefined): boolean {
@@ -95,7 +96,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       authority[index + 7] = 1;
       continue;
     }
-    if (separator >= 0 && brackets === 0 && URL_END_DELIMITERS.has(char)) {
+    // These characters are valid in a file URL authority. Keep classifying
+    // until the first path separator, except when one closes a quote that
+    // immediately preceded the scheme. Once a path starts, all URL-ending
+    // delimiters retain their existing termination behavior below.
+    const fileAuthorityDelimiter =
+      exactFileScheme &&
+      !foundFilePath &&
+      FILE_URL_AUTHORITY_DELIMITERS.has(char) &&
+      !(schemeQuote !== 0 && quoteCode(char) === schemeQuote);
+    if (separator >= 0 && brackets === 0 && URL_END_DELIMITERS.has(char) && !fileAuthorityDelimiter) {
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;
