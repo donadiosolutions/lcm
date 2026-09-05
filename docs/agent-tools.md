@@ -43,7 +43,7 @@ Hybrid search across episodic memory (SQLite FTS5) and promoted memory. Returns 
 | Param | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `query` | string | ✅ | — | Natural language search query |
-| `limit` | number | | `5` | Max results per layer |
+| `limit` | integer | | `5` | Maximum results per layer, from 1 through 1000 |
 | `layers` | string[] | | `["episodic", "promoted"]` | `"episodic"`, `"promoted"`, or both |
 | `tags` | string[] | | — | Filter to entries that include all specified tags |
 
@@ -60,6 +60,11 @@ lcm_search(query: "database migration", layers: ["promoted"], tags: ["type:decis
 The deprecated `semantic` layer name remains accepted as a compatibility input
 and is normalized to `promoted`, but it is not advertised.
 
+`limit` must be a positive integer from 1 through 1000. When omitted, it
+defaults to 5. The value is a maximum applied independently to each selected
+layer; the episodic layer may return fewer matches when its history pool is
+smaller. Invalid values return HTTP 400 with `{ "error": "invalid limit" }`.
+
 ### lcm_grep
 
 Search conversation history by keyword or regex across raw messages and summaries.
@@ -72,7 +77,7 @@ Search conversation history by keyword or regex across raw messages and summarie
 | `mode` | string | | `full_text` | `full_text` for literal/full-text matching or `regex` for regular-expression matching |
 | `scope` | string | | `"both"` | `"messages"`, `"summaries"`, or `"both"` |
 | `sessionId` | string | | — | Filter to a specific session |
-| `since` | string | | — | ISO datetime lower bound |
+| `since` | string | | — | Inclusive ISO datetime lower bound. Use `YYYY-MM-DDTHH:mm:ss` with optional 1-3 fractional digits and `Z` or `+/-HH:mm`; omit to include all history. Invalid values return `{ "error": "invalid since" }`. |
 
 Omit `sessionId` to search the whole project. When supplied, it selects the
 project's canonical newest conversation for that session identifier; an
@@ -95,6 +100,12 @@ lcm_grep(query: 'config\\.threshold', scope: 'summaries')
 # Interpret the query as a regular expression
 lcm_grep(query: 'config\\.(threshold|limit)', mode: 'regex')
 ```
+
+`since` is an inclusive lower bound. For example, `since: '2025-01-01T00:00:00Z'` includes matches created exactly at that instant and
+later. The accepted form is `YYYY-MM-DDTHH:mm:ss` with an optional 1-3 digit
+fraction and a required `Z` or numeric `+/-HH:mm` timezone. Omit `since` to
+search all history; malformed values return `{ "error": "invalid since" }`
+before project validation or storage access.
 
 The deprecated `all` scope remains accepted as a compatibility input and is
 normalized to `both`, but it is not advertised. The package

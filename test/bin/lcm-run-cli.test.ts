@@ -1084,7 +1084,7 @@ describe("runCli daemon-backed and utility actions", () => {
 
   it.each([
     ["search", "needle", "--limit", "2", "--layer", "episodic", "--tag", "decision"],
-    ["grep", "needle", "--mode", "regex", "--scope", "messages", "--since", "2026-01-01"],
+    ["grep", "needle", "--mode", "regex", "--scope", "messages", "--since", "2026-01-01T00:00:00Z"],
     ["describe", "node"], ["expand", "node", "--depth", "2"], ["store", "memory", "--tag", "one"],
   ])("dispatches memory action %#", async (...args) => {
     expect(await invoke(args)).toBeUndefined();

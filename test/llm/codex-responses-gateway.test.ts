@@ -239,6 +239,8 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(utils.upstreamUrlFor(chatAuthorization, { prompt: "x", _upstreamUrl: "http://test/one" })).toBe("http://test/one");
     expect(utils.upstreamUrlFor(chatAuthorization, { prompt: "x", _upstreamUrls: { chatgpt: "http://test/chat" } })).toBe("http://test/chat");
     expect(utils.upstreamUrlFor(apiAuthorization, { prompt: "x", _upstreamUrls: { api: "http://test/api" } })).toBe("http://test/api");
+    expect(utils.upstreamUrlFor(chatAuthorization, { prompt: "x", upstreamResponsesUrl: "http://proxy.test/v1/responses" })).toBe("http://proxy.test/v1/responses");
+    expect(utils.upstreamUrlFor(apiAuthorization, { prompt: "x", upstreamResponsesUrl: "http://proxy.test/v1/responses", _upstreamUrl: "http://test/one" })).toBe("http://proxy.test/v1/responses");
     expect(utils.upstreamUrlFor(chatAuthorization, { prompt: "x" })).toBe("https://chatgpt.com/backend-api/codex/responses");
     expect(utils.upstreamUrlFor(apiAuthorization, { prompt: "x" })).toBe("https://api.openai.com/v1/responses");
     expect(utils.safeResponseHeader(null)).toBeUndefined();

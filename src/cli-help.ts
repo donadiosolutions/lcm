@@ -172,13 +172,14 @@ const HELP: Record<string, CommandHelp> = {
     options: [
       ["--mode <mode>", "Search mode: full_text (default) or regex"],
       ["--scope <scope>", "Scope: messages, summaries, or both (default: both)"],
-      ["--since <iso>", "Only include matches on or after this ISO timestamp"],
+      ["--since <iso>", "Inclusive lower bound: YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm); invalid values return HTTP 400"],
     ],
     examples: [
       ["lcm grep \"ECONNREFUSED\"", "Search for an exact error string"],
       ["lcm grep \"createDaemon|startMcpServer\" --mode regex", "Regex search across history"],
       ["lcm grep \"migration\" --scope summaries", "Search only summaries"],
     ],
+    notes: "The optional --since value is inclusive and must use YYYY-MM-DDTHH:mm:ss with optional 1-3 fractional digits and a Z or +/-HH:mm timezone. Omit it to include all history; malformed values return HTTP 400 with invalid since.",
   },
 
   describe: {

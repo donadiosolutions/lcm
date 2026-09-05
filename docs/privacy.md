@@ -32,7 +32,7 @@ that you configure explicitly:
 |-----------------------------|----------------------|
 | `disabled` (default) | Nothing |
 | `claude-process` | Messages sent to Anthropic via the `claude` CLI (your Claude subscription) |
-| `codex-process` | Messages sent to OpenAI through the `codex` CLI and its per-call loopback Responses gateway (your OpenAI subscription) |
+| `codex-process` | Messages sent through the Codex CLI and its per-call loopback Responses gateway to the effective Codex `openai_base_url` (or the existing token-class default when absent or `null`) |
 | `anthropic` | Messages sent to Anthropic API (your API key) |
 | `openai` | Messages sent to OpenAI API (your API key) |
 
@@ -48,13 +48,16 @@ prompt-cache key. The payload explicitly uses `tools: []`,
 `stream: true` in the standard Responses dialect. Responses Lite instead uses
 an explicit empty `additional_tools` inventory and omits top-level `tools`.
 Both dialects discard inherited prompt/input/tools state; `include` and
-`stream_options` are omitted. Managed
-authentication is forwarded only through an explicit header allowlist, and the
-gateway selects the exact endpoint described in [configuration](configuration.md):
-`sk-`-prefixed bearer credentials use the public OpenAI route, while other
-managed bearers use the ChatGPT route even when account ID is absent. A supplied
-account ID is forwarded but is not the sole route classifier. It never persists
-or logs credentials,
+`stream_options` are omitted. Managed authentication is forwarded only through
+an explicit header allowlist, and a configured Codex `openai_base_url` is
+authoritative for both bearer classes. When that value is absent or `null`,
+`sk-`-prefixed bearer credentials use the public OpenAI route while other
+managed bearers use the ChatGPT route, even when account ID is absent. A
+configured endpoint may receive the managed bearer, account identifier, and
+allowlisted Codex metadata, including over cleartext HTTP; use HTTPS when the
+endpoint supports it. Resolution reads the on-disk Codex configuration from
+the LCM process's inherited environment and working directory, rather than
+from a live parent session profile. It never persists or logs credentials,
 raw request bodies, prompts, or upstream response bodies. If authentication,
 request shape, routing, streaming, or gateway shutdown is ambiguous, the
 compaction fails closed. The selected provider's retention policy still
@@ -210,7 +213,9 @@ The `Security` section of the doctor output shows:
   the authority with `<path>`, including an initial Windows drive. A quote
   immediately before the `file` scheme lets the redacted path contain spaces
   until the matching quote or a newline. Empty and root-only file URLs remain
-  unchanged. In unquoted file URLs, whitespace and the existing path
+  unchanged. Unmatched or path-wrapping brackets in file URLs do not stop path
+  redaction; valid bracketed IPv6 authorities, including zone IDs, remain
+  intact. In unquoted file URLs, whitespace and the existing path
   delimiters, including later colons, `?`, and `#`, end the redacted span, so
   text after those delimiters can remain visible. Ordinary HTTP and HTTPS URLs
   retain their authorities, slashes, and paths.

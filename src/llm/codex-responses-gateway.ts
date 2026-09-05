@@ -70,6 +70,8 @@ type CreateServerFn = typeof defaultCreateServer;
 export type CodexResponsesGatewayOptions = {
   /** The complete immutable LCM summarizer prompt for this compaction call. */
   prompt: string;
+  /** Validated Codex config endpoint, ending in `/responses`. */
+  upstreamResponsesUrl?: string;
   /** @internal fixed local upstream used only by real HTTP tests. */
   _upstreamUrl?: string;
   /** @internal per-route fixed local upstreams used only by real HTTP tests. */
@@ -366,6 +368,7 @@ function upstreamUrlFor(
   authorization: ManagedAuthorization,
   options: CodexResponsesGatewayOptions,
 ): string {
+  if (options.upstreamResponsesUrl !== undefined) return options.upstreamResponsesUrl;
   if (options._upstreamUrl !== undefined) return options._upstreamUrl;
   if (authorization.route === "chatgpt") return options._upstreamUrls?.chatgpt ?? CHATGPT_RESPONSES_URL;
   return options._upstreamUrls?.api ?? OPENAI_RESPONSES_URL;

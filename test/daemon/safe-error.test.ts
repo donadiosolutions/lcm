@@ -74,6 +74,51 @@ describe("sanitizeError", () => {
 
   const hostedFileUrlCases = [
     {
+      input: "file://remote.invalid[/Users/canary/private.db",
+      expected: "file://remote.invalid[<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://remote.invalid[/Users/canary/private.db]",
+      expected: "file://remote.invalid[<path>]",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://[/Users/canary/private.db",
+      expected: "file://[<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://remote.invalid[[/Users/canary/private.db",
+      expected: "file://remote.invalid[[<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://remote.invalid[/C:/Users/canary/private.db",
+      expected: "file://remote.invalid[<path>",
+      absent: ["C:", "Users", "canary", "private.db"],
+    },
+    {
+      input: "file://remote.invalid[\\C:\\Users\\canary\\private.db",
+      expected: "file://remote.invalid[<path>",
+      absent: ["C:", "Users", "canary", "private.db"],
+    },
+    {
+      input: "'file://remote.invalid[/Users/canary/My Files/private.db",
+      expected: "'file://remote.invalid[<path>",
+      absent: ["Users", "canary", "My Files", "private.db"],
+    },
+    {
+      input: "'file://remote.invalid[/Users/canary/My Files/private.db]'",
+      expected: "'file://remote.invalid[<path>'",
+      absent: ["Users", "canary", "My Files", "private.db"],
+    },
+    {
+      input: "see file://remote.invalid[/Users/canary/private.db later",
+      expected: "see file://remote.invalid[<path> later",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
       input: "file://remote.invalid/Users/canary/private.db",
       expected: "file://remote.invalid<path>",
       absent: ["Users", "canary", "private.db"],

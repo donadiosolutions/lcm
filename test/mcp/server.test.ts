@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { __lcmMcpTestHooks, getMcpToolDefinitions, handleDaemonRequest } from "../../src/mcp/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import * as storageBackend from "../../src/storage/backend.js";
+import { DEFAULT_SEARCH_RESULT_LIMIT, MAX_SEARCH_RESULT_LIMIT } from "../../src/retrieval.js";
 
 const ensureDaemonMcpMock = vi.hoisted(() => vi.fn().mockResolvedValue({ connected: true, port: 9999, spawned: false }));
 
@@ -73,12 +74,21 @@ describe("MCP tool definitions", () => {
     const grep = getMcpToolDefinitions().find((t: any) => t.name === "lcm_grep") as any;
     expect(search.inputSchema.properties.layers.items.enum).toEqual(["episodic", "promoted"]);
     expect(search.inputSchema.properties.layers.default).toEqual(["episodic", "promoted"]);
+    expect(search.inputSchema.properties.limit).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      maximum: MAX_SEARCH_RESULT_LIMIT,
+      default: DEFAULT_SEARCH_RESULT_LIMIT,
+    });
     expect(grep.inputSchema.properties.scope.enum).toEqual(["messages", "summaries", "both"]);
     expect(grep.inputSchema.properties.scope.default).toBe("both");
     expect(grep.inputSchema.properties.mode.enum).toEqual(["full_text", "regex"]);
     expect(grep.inputSchema.properties.mode.default).toBe("full_text");
     expect(grep.inputSchema.properties.mode.description).toContain("full-text");
     expect(grep.inputSchema.properties.mode.description).toContain("regex");
+    expect(grep.inputSchema.properties.since.description).toContain("inclusive");
+    expect(grep.inputSchema.properties.since.description).toContain("1-3 fractional digits");
+    expect(grep.inputSchema.properties.since.description).toContain("+/-HH:mm");
     expect(grep.inputSchema.properties.query.description).toBe(
       "Keyword, phrase, or pattern to search; interpretation follows mode (full_text by default, regex when selected)",
     );

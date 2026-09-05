@@ -56,7 +56,8 @@ component_management:
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
-        # Keep the #691/#700 response fences, #701 terminal factory-close retry, and runtime identity here.
+        # Keep the #691/#700 response fences, #701 terminal factory-close retry,
+        # runtime identity, and #825 bounded project metadata limit here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
@@ -80,7 +81,9 @@ component_management:
         # The #700 cancellation-aware open lifecycle and compact/restore response
         # handling remain route-owned; #703 describe/expand compatibility errors,
         # #705 prompt-search surfacing-log failures, #709 search and grep routes,
-        # and #710 grep mode, plus #792 session filtering, remain here.
+        # #710 grep mode, #792 session filtering, #793 search-limit validation,
+        # #794 grep-since validation, and #825 bounded atomic promotion metadata
+        # remain route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -89,13 +92,14 @@ component_management:
     - component_id: "unit-mcp"
       name: "Unit - MCP"
       paths:
-        # The #709 canonical search and grep MCP tools and #710 grep mode remain MCP-owned.
+        # The #709 canonical search and grep MCP tools, #710 grep mode, #793
+        # search-limit schema, and #794 grep-since schema remain MCP-owned.
         - "src/mcp/"
     - component_id: "unit-llm-prompts"
       name: "Unit - LLM, Responses, and Prompts"
       paths:
-        # The #779 authenticated Responses terminal gateway and #780 bounded
-        # Codex failure classification remain LLM-owned.
+        # The #779 authenticated Responses terminal gateway, #780 bounded
+        # Codex failure classification, and #790 endpoint resolver remain LLM-owned.
         - "src/llm/"
         - "src/prompts/"
     - component_id: "unit-local-persistence"
@@ -151,7 +155,8 @@ component_management:
     - component_id: "unit-memory-retrieval"
       name: "Unit - Memory and Retrieval"
       paths:
-        # The #709 SearchResult compatibility bridge and retrieval contract remain memory/retrieval-owned.
+        # The #709 SearchResult compatibility bridge, #793 search-limit contract,
+        # and retrieval contract remain memory/retrieval-owned.
         - "src/memory/"
         - "^src/expansion\\.ts$"
         - "^src/retrieval\\.ts$"
@@ -228,7 +233,7 @@ component_management:
     - component_id: "integration-postgresql-memory"
       name: "Integration - PostgreSQL Memory"
       paths:
-        # The #760 repository cancellation machine-identity context remains memory-owned.
+        # The #760/#805 repository machine-identity context remains memory-owned.
         - "^src/storage/postgresql/memory-repositories\\.ts$"
         - "^src/storage/postgresql/summary-context-repositories\\.ts$"
     - component_id: "integration-postgresql-search"

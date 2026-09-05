@@ -15,6 +15,8 @@ const mocks = vi.hoisted(() => ({
   exists: vi.fn(() => true),
   read: vi.fn(() => "{}"),
   write: vi.fn(),
+  readMetadata: vi.fn(() => "{}"),
+  writeMetadata: vi.fn(),
   mkdir: vi.fn(),
   getConnection: vi.fn(() => ({})),
   closeConnection: vi.fn(),
@@ -63,6 +65,12 @@ vi.mock("../../../src/daemon/project.js", () => ({
   projectPathsForIdentity: mocks.pathsForIdentity,
   projectIdentity: mocks.identity,
   ensureProjectDirForIdentity: mocks.ensureProjectDir,
+  MAX_PROJECT_METADATA_BYTES: 1024 * 1024,
+}));
+vi.mock("../../../src/security-files.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/security-files.js")>(),
+  readBoundedRegularFile: mocks.readMetadata,
+  atomicWritePrivateFile: mocks.writeMetadata,
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/db/connection.js", () => ({ getLcmConnection: mocks.getConnection, closeLcmConnection: mocks.closeConnection }));
@@ -89,6 +97,7 @@ describe("promote persistence boundaries", () => {
     mocks.exists.mockReturnValue(true);
     mocks.projectExists.mockResolvedValue(true);
     mocks.read.mockReturnValue("{}");
+    mocks.readMetadata.mockReturnValue("{}");
     mocks.getConnection.mockReturnValue({});
     mocks.conversations.mockResolvedValue([]);
     mocks.summaries.mockResolvedValue([]);
@@ -209,7 +218,7 @@ describe("promote persistence boundaries", () => {
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok", dry_run: true }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { processed: 2, promoted: 1, conversations: 1 });
     expect(mocks.dedup).not.toHaveBeenCalled();
-    expect(mocks.write).not.toHaveBeenCalled();
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
   });
 
   it("inserts promoted summaries, ignores individual failures, and updates metadata", async () => {
@@ -220,15 +229,26 @@ describe("promote persistence boundaries", () => {
     ]);
     mocks.shouldPromote.mockReturnValue({ promote: true, tags: ["depth"], confidence: 0.25 });
     mocks.dedup.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("duplicate failed"));
-    mocks.read.mockReturnValueOnce(JSON.stringify({ existing: true }));
+    mocks.readMetadata.mockReturnValueOnce(JSON.stringify({ existing: true }));
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { processed: 2, promoted: 1, conversations: 1 });
-    expect(mocks.write).toHaveBeenCalledOnce();
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    expect(mocks.readMetadata).toHaveBeenCalledWith("/lcm/projects/pid/meta.json", {
+      allowedRoot: "/lcm/projects/pid",
+      maxBytes: 1024 * 1024,
+      expectedUid: process.getuid?.(),
+      requireSingleLink: true,
+    });
+    const [metadataPath, serialized] = mocks.writeMetadata.mock.calls[0] as [string, string];
+    expect(metadataPath).toBe("/lcm/projects/pid/meta.json");
+    expect(JSON.parse(serialized)).toMatchObject({ existing: true, cwd: "/ok" });
+    expect(JSON.parse(serialized).lastPromote).toEqual(expect.any(String));
+    expect(serialized.endsWith("\n")).toBe(true);
 
     mocks.exists.mockReturnValueOnce(true);
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
-    expect(mocks.write).toHaveBeenCalledTimes(2);
-    mocks.read.mockImplementationOnce(() => { throw new Error("meta failed"); });
+    expect(mocks.writeMetadata).toHaveBeenCalledTimes(2);
+    mocks.readMetadata.mockImplementationOnce(() => { throw new Error("meta failed"); });
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { processed: 0, promoted: 0, conversations: 0 });
   });
@@ -246,9 +266,76 @@ describe("promote persistence boundaries", () => {
   });
 
   it("creates metadata when the file is absent", async () => {
-    mocks.read.mockImplementationOnce(() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); });
+    mocks.readMetadata.mockImplementationOnce(() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); });
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
-    expect(mocks.write).toHaveBeenCalledOnce();
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it.each([
+    ["malformed JSON", "{"],
+    ["null metadata", "null"],
+    ["array metadata", "[]"],
+    ["primitive metadata", "42"],
+  ])("leaves %s unchanged and keeps promotion successful", async (_label, content) => {
+    mocks.readMetadata.mockReturnValueOnce(content);
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/invalid" }));
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it("skips metadata publication when the bounded reader rejects an existing file", async () => {
+    mocks.readMetadata.mockImplementationOnce(() => {
+      throw new Error("metadata owner or topology is not trusted");
+    });
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/invalid" }));
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it("covers platforms without process.getuid while preserving bounded read options", async () => {
+    const originalGetuid = process.getuid;
+    Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+    try {
+      await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/no-uid" }));
+    } finally {
+      Object.defineProperty(process, "getuid", { configurable: true, value: originalGetuid });
+    }
+    expect(mocks.readMetadata).toHaveBeenCalledWith("/lcm/projects/pid/meta.json", {
+      allowedRoot: "/lcm/projects/pid",
+      maxBytes: 1024 * 1024,
+      expectedUid: undefined,
+      requireSingleLink: true,
+    });
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+  });
+
+  it("bounds serialized metadata by bytes and keeps the promotion result", async () => {
+    mocks.readMetadata.mockReturnValueOnce(JSON.stringify({ existing: "é".repeat(524_288) }));
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/oversized" }));
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it("keeps a writer rejection best-effort", async () => {
+    mocks.writeMetadata.mockImplementationOnce(() => { throw new Error("publish failed"); });
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/writer-error" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
       processed: 0,
       promoted: 0,
@@ -720,7 +807,7 @@ describe("promote persistence boundaries", () => {
       } satisfies RouteExecutionContext,
     );
 
-    expect(mocks.write).toHaveBeenCalledOnce();
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
     expect(mocks.send).toHaveBeenLastCalledWith(response, 499, {
       status: "cancelled",
       error: "promote cancelled",
@@ -745,7 +832,7 @@ describe("promote persistence boundaries", () => {
       { withPublicationAdmission } satisfies RouteExecutionContext,
     );
     expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
-    expect(mocks.write).toHaveBeenCalledOnce();
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
   });
 
   it("returns the coordinator cancellation response when a commit permit is refused", async () => {
@@ -845,7 +932,7 @@ describe("promote persistence boundaries", () => {
     });
     expect(mocks.openProject).not.toHaveBeenCalled();
     expect(mocks.dedup).not.toHaveBeenCalled();
-    expect(mocks.write).not.toHaveBeenCalled();
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
   });
 
   it("passes the matching preflight identity through the live storage open", async () => {

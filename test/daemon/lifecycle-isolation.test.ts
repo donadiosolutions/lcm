@@ -1239,6 +1239,7 @@ describe("daemon lifecycle test-scope validation", () => {
         _platform: "darwin",
         _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as never,
         _spawnOverride: vi.fn(() => child) as never,
+        _monotonicNowOverride: () => 0,
         _skipHealthWait: true,
       })).resolves.toMatchObject({
         connected: false,

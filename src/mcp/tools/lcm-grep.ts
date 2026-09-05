@@ -23,7 +23,10 @@ export const lcmGrepTool = {
       },
       scope: { type: "string", enum: [...CANONICAL_GREP_SCOPES], default: DEFAULT_GREP_SCOPE },
       sessionId: { type: "string", description: "Filter to a specific session" },
-      since: { type: "string", description: "ISO datetime lower bound" },
+      since: {
+        type: "string",
+        description: "inclusive ISO datetime lower bound: YYYY-MM-DDTHH:mm:ss with optional 1-3 fractional digits and Z or +/-HH:mm timezone; omitted to include all history",
+      },
     },
     required: ["query"],
   },

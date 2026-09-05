@@ -62,11 +62,16 @@ daemon client for each read:
 | Command | Operation performed by the daemon |
 |---|---|
 | `lcm search <query>` | Search episodic and promoted memory |
-| `lcm grep <query>` | Search messages and summaries by exact text or regular expression |
+| `lcm grep <query>` | Search messages and summaries by exact text or regular expression; optional inclusive `--since` accepts `YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm)` and malformed values return HTTP 400 |
 | `lcm describe <nodeId>` | Read summary or stored-memory metadata |
 | `lcm expand <nodeId>` | Expand a summary into source detail |
 | `lcm status` | Read daemon and project status |
 | `lcm stats --pool` | Read daemon connection-pool statistics |
+
+`lcm search <query> --limit <n>` accepts a positive integer from 1 through
+1000 and defaults to 5. The limit is a maximum applied independently to each
+selected layer. Values outside this range or that are not integers are rejected
+by the daemon with HTTP 400 (`invalid limit`).
 
 Before using this route, LCM reads a bounded, no-follow configuration snapshot
 without taking the private mutation/publication lock. If `config.json` is
@@ -194,6 +199,15 @@ layer, LCM runs the managed-daemon recovery check, creates a fresh client, and
 retries promotion for that project once. It does not rerun compaction.
 Application-level promotion errors are not retried, and each later project gets
 its own independent recovery opportunity.
+
+Automatic promotion records its most recent timestamp in project metadata on a
+best-effort basis. Metadata is bounded to 1 MiB and published atomically with
+0600 permissions, including when tightening a legacy file that was more
+permissive. Invalid, unreadable, or untrusted metadata is left unchanged and
+does not undo promoted memories; promotion counts and results are independent
+of this metadata update. `--dry-run` never writes metadata. On platforms with a
+POSIX UID, the existing metadata file must be owned by the current UID; where
+UIDs are unavailable, that ownership check is skipped.
 
 `lcm compact --all` reports each SQLite project that it cannot open, migrate, or
 scan as a failure in the Compact phase while continuing with readable projects.

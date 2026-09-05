@@ -308,8 +308,19 @@ describe("persistence read route boundaries", () => {
     expect(mocks.getConversationBySessionId).not.toHaveBeenCalled();
     await invoke(handler, { query: "q", cwd: "/ok", mode: "full_text", scope: "messages" });
     expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "messages", since: undefined });
-    await invoke(handler, { query: "q", cwd: "/ok", mode: "regex", scope: "messages", since: "2025" });
-    expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "regex", scope: "messages", since: "2025" });
+    await invoke(handler, {
+      query: "q",
+      cwd: "/ok",
+      mode: "regex",
+      scope: "messages",
+      since: "2025-01-02T03:04:05.006+05:30",
+    });
+    expect(mocks.grep).toHaveBeenLastCalledWith({
+      query: "q",
+      mode: "regex",
+      scope: "messages",
+      since: new Date("2025-01-01T21:34:05.006Z"),
+    });
     await invoke(handler, { query: "q", cwd: "/ok", scope: "summaries" });
     expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "summaries", since: undefined });
     await invoke(handler, { query: "q", cwd: "/ok", scope: "all" });
@@ -363,6 +374,90 @@ describe("persistence read route boundaries", () => {
     expectLast(503, {
       ...failure.toJSON(),
     });
+  });
+
+  it("normalizes valid since timestamps and rejects malformed values before storage", async () => {
+    const handler = createGrepHandler(config);
+    const valid = [
+      ["2024-02-29T23:59:59Z", "2024-02-29T23:59:59.000Z"],
+      ["2000-02-29T00:00:00Z", "2000-02-29T00:00:00.000Z"],
+      ["2025-01-01T00:00:00+23:59", "2024-12-31T00:01:00.000Z"],
+      ["2025-12-31T23:59:59.1-02:30", "2026-01-01T02:29:59.100Z"],
+      ["2025-06-15T12:34:56.999Z", "2025-06-15T12:34:56.999Z"],
+    ] as const;
+
+    for (const [input, expected] of valid) {
+      await invoke(handler, { query: "q", cwd: "/ok", since: input });
+      const since = mocks.grep.mock.calls.at(-1)?.[0].since;
+      expect(since).toBeInstanceOf(Date);
+      expect((since as Date).toISOString()).toBe(expected);
+    }
+
+    mocks.getConversationBySessionId.mockResolvedValueOnce({ conversationId: 42 } as never);
+    await invoke(handler, {
+      query: "q",
+      cwd: "/ok",
+      sessionId: "session",
+      since: "2025-01-01T00:00:00Z",
+    });
+    const sessionSince = mocks.grep.mock.calls.at(-1)?.[0].since;
+    expect(sessionSince).toBeInstanceOf(Date);
+    expect((sessionSince as Date).toISOString()).toBe("2025-01-01T00:00:00.000Z");
+
+    await invoke(
+      createGrepHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())),
+      { query: "q", cwd: "/ok", since: "2025-01-01T00:00:00Z" },
+    );
+    const postgresqlSince = mocks.grep.mock.calls.at(-1)?.[0].since;
+    expect(postgresqlSince).toBeInstanceOf(Date);
+    expect((postgresqlSince as Date).toISOString()).toBe("2025-01-01T00:00:00.000Z");
+
+    const canonical = (postgresqlSince as Date).toISOString();
+    await invoke(handler, { query: "q", cwd: "/ok", since: canonical });
+    expect((mocks.grep.mock.calls.at(-1)?.[0].since as Date).toISOString()).toBe(canonical);
+
+    const malformed: unknown[] = [
+      null,
+      1,
+      [],
+      {},
+      "",
+      "   ",
+      "2025",
+      "2025-01-01",
+      "2025-01-01T00:00:00",
+      "2025-01-00T00:00:00Z",
+      "2025-01-01T00:00:00.1234Z",
+      "2025-01-01T00:00:00Zjunk",
+      "2025-00-01T00:00:00Z",
+      "2025-13-01T00:00:00Z",
+      "2025-02-29T00:00:00Z",
+      "1900-02-29T00:00:00Z",
+      "2024-02-30T00:00:00Z",
+      "2025-04-31T00:00:00Z",
+      "2025-01-01T24:00:00Z",
+      "2025-01-01T00:60:00Z",
+      "2025-01-01T00:00:60Z",
+      "2025-01-01T00:00:00+24:00",
+      "2025-01-01T00:00:00+00:60",
+    ];
+    for (const since of malformed) {
+      mocks.validate.mockClear();
+      const openCalls = mocks.openProject.mock.calls.length;
+      await invoke(handler, { query: "q", cwd: "/bad", since });
+      expectLast(400, { error: "invalid since" });
+      expect(mocks.validate).not.toHaveBeenCalled();
+      expect(mocks.openProject.mock.calls.length).toBe(openCalls);
+    }
+
+    await invoke(handler, {
+      query: "q",
+      cwd: "/bad",
+      sessionId: null,
+      since: "not-a-date",
+    });
+    expectLast(400, { error: "invalid sessionId" });
+    expect(mocks.validate).not.toHaveBeenCalled();
   });
 
   it("covers recent validation, missing projects, defaults, success, and failure", async () => {
