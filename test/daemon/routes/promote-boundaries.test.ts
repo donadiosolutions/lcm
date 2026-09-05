@@ -282,6 +282,7 @@ describe("promote persistence boundaries", () => {
       conversations: 0,
     });
 
+    const closeError = new Error("metadata parent close failed");
     mocks.openDirectory.mockImplementationOnce(() => ({
       fd: 1,
       witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
@@ -373,6 +374,36 @@ describe("promote persistence boundaries", () => {
       error: "project directory topology changed before metadata publication",
     });
     expect(mocks.writeMetadata).not.toHaveBeenCalled();
+  });
+
+  it("preserves a topology primary when metadata-parent cleanup also fails", async () => {
+    const topologyError = new PrivateDirectoryTopologyError("topology primary");
+    const closeError = new Error("metadata parent close failed");
+    mocks.openDirectory.mockImplementationOnce(() => ({
+      fd: 1,
+      witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+      close: () => { throw closeError; },
+    }));
+    mocks.writeMetadata.mockImplementationOnce(() => { throw topologyError; });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/topology-close" }));
+
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "topology primary" });
+
+    mocks.openDirectory.mockImplementationOnce(() => ({
+      fd: 1,
+      witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+      close: () => { throw closeError; },
+    }));
+    mocks.writeMetadata.mockImplementationOnce(() => { throw topologyError; });
+    const withPublicationAdmission = vi.fn(async <T>(operation: (token: object) => Promise<T> | T): Promise<T> => operation({}));
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/topology-close-admission" }), {
+      withPublicationAdmission,
+    });
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "topology primary" });
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
   });
 
   it("keeps metadata cleanup failures best-effort while preserving writer errors", async () => {

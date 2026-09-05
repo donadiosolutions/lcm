@@ -395,10 +395,11 @@ export const ensureProjectDirForIdentity = (
         } catch (error) {
           if (!(error instanceof SyntaxError)) throw error;
         }
-        if (existing !== undefined) {
-          if (existing === null || typeof existing !== "object" || Array.isArray(existing)) {
-            throw new Error("invalid project metadata");
-          }
+        if (
+          existing !== null
+          && typeof existing === "object"
+          && !Array.isArray(existing)
+        ) {
           const existingRecord = existing as Record<string, unknown>;
           if (existingRecord.cwd === identity.canonical) {
             assertProjectTopology(rootHandle, rootPath, projectsHandle, projectsPath, leafHandle, dir);

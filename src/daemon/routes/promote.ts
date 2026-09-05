@@ -74,6 +74,19 @@ function isInvocationCancellation(error: unknown): boolean {
   return error instanceof InvocationCoordinatorError && error.code === "cancelled";
 }
 
+function isCriticalMetadataError(error: unknown): boolean {
+  return error instanceof PrivateDirectoryTopologyError
+    || (
+      error !== null
+      && typeof error === "object"
+      && "name" in error
+      && error.name === "PrivateDirectoryTopologyError"
+    )
+    || isAbortError(error)
+    || isInvocationCancellation(error)
+    || error instanceof BackendPublicationJournalError;
+}
+
 function errorCode(error: unknown): string | undefined {
   return error !== null && typeof error === "object" && "code" in error
     && typeof error.code === "string"
@@ -348,13 +361,16 @@ export function createPromoteHandler(
                   parent.close();
                 } catch (error) {
                   if (hasPrimaryError) {
-                    throw new AggregateError(
-                      [primaryError, error],
-                      "project metadata publication and directory cleanup failed",
-                      { cause: primaryError },
-                    );
+                    if (!isCriticalMetadataError(primaryError)) {
+                      throw new AggregateError(
+                        [primaryError, error],
+                        "project metadata publication and directory cleanup failed",
+                        { cause: primaryError },
+                      );
+                    }
+                  } else {
+                    throw error;
                   }
-                  throw error;
                 }
               }
               if (hasPrimaryError) throw primaryError;
@@ -366,14 +382,7 @@ export function createPromoteHandler(
             }
           });
         } catch (error) {
-          if (
-            isAbortError(error)
-            || isInvocationCancellation(error)
-            || error instanceof BackendPublicationJournalError
-            || error instanceof PrivateDirectoryTopologyError
-          ) {
-            throw error;
-          }
+          if (isCriticalMetadataError(error)) throw error;
           // Meta persistence remains best-effort for ordinary filesystem failures.
         }
         throwIfAborted(signal);

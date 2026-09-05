@@ -200,14 +200,15 @@ describe("secure project-root handoff", () => {
     expect(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"))).toEqual({ cwd: "/project", extra: true });
   });
 
-  it("rejects a parsed non-object metadata value", () => {
+  it.each(["null", "[]", "42"])("falls back for a parsed non-object metadata value %s", (content) => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });
     const identity = { id: "5".repeat(64), canonical: "/project" };
     const dir = join(home, ".lcm", "projects", identity.id);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    writeFileSync(join(dir, "meta.json"), "null");
+    writeFileSync(join(dir, "meta.json"), content);
 
-    expect(() => ensureProjectDirForIdentity(identity)).toThrow("invalid project metadata");
+    expect(() => ensureProjectDirForIdentity(identity)).not.toThrow();
+    expect(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"))).toEqual({ cwd: "/project" });
   });
 
   it("propagates non-syntax parser failures", () => {
