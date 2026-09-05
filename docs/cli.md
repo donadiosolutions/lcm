@@ -160,6 +160,17 @@ background publication reconciliation immediately after `lcm install` from
 failing the next `lcm doctor` or `lcm connectors install codex`; it does not
 wait for a stuck or foreign lock holder.
 
+`lcm install` uses the same bounded publication admission for its preflight
+migration and each installer lock-taking stage, including daemon lifecycle
+publication assertions. A retry re-attempts only a lock-acquisition callback;
+the callback body has not run when contention is raised, so prompts, settings
+writes, skill installation, and daemon startup are not repeated. The shared
+window is armed at the first qualifying contention, lasts up to two seconds,
+and polls every 50 milliseconds. Bootstrap-lock retries remain unchanged and
+may add a bounded overshoot of up to one second when both locks contend.
+Identity, token, process-birth, health, entrypoint, version, backend, or
+runtime-digest mismatches fail closed with the original typed contention error.
+
 ## Daemon-dependent resilience
 
 `lcm doctor` limits the complete daemon health exchange to two seconds. The

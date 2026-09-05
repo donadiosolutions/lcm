@@ -39,6 +39,24 @@ function makeDeps(overrides: Partial<EnsureCoreDeps> = {}): EnsureCoreDeps {
 }
 
 describe("ensureCore", () => {
+  it("threads one publication admission wrapper through every core edge", async () => {
+    const admission = vi.fn(async <T>(step: () => T | Promise<T>) => await step());
+    const ensureRuntimeHome = vi.fn();
+    const ensureDaemon = vi.fn().mockResolvedValue({ connected: true });
+    const deps = makeDeps({
+      ensureRuntimeHome,
+      _withPublicationAdmissionRetry: admission,
+      ensureDaemon,
+    });
+    const { ensureCoreEndpoint } = await import("../src/bootstrap.js");
+    await expect(ensureCoreEndpoint(deps)).resolves.toMatchObject({ connected: true });
+    expect(admission).toHaveBeenCalledTimes(3);
+    expect(ensureRuntimeHome).toHaveBeenCalledOnce();
+    expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+      _withPublicationAdmissionRetry: admission,
+    }));
+  });
+
   it("uses the default secure-root, durable writer, and daemon seams", async () => {
     const runtimeRoot = join(homedir(), ".lcm");
     const configPath = join(runtimeRoot, "config.json");

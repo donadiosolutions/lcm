@@ -114,6 +114,7 @@ component_management:
         # across journal, evidence, and terminal recovery-material reads.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
+        - "^src/storage/publication-convergence\\.ts$"
         - "^src/storage/capabilities\\.ts$"
         - "^src/storage/contracts\\.ts$"
         - "^src/storage/errors\\.ts$"

@@ -144,6 +144,16 @@ function ensureDaemon(options: EnsureDaemonOptions): ReturnType<typeof ensureDae
 
 describe("mocked lifecycle identity boundaries", () => {
 
+  it("wraps lifecycle publication assertions without replaying startup", async () => {
+    const admission = vi.fn(async <T>(step: () => T | Promise<T>) => await step());
+    const result = await ensureDaemon({
+      ...base(),
+      _withPublicationAdmissionRetry: admission,
+    });
+    expect(admission).toHaveBeenCalledTimes(2);
+    expect(result.spawned).toBe(false);
+  });
+
   it("does not terminate when a verified retry PID changes identity before signaling", async () => {
     let daemonCommandReads = 0;
     writePidLeaf(20);

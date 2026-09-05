@@ -3,6 +3,7 @@ import {
   mergeClaudeSettings,
   resolveBinaryPath,
   install,
+  prepareInstallConfig,
   ensureLcmMd,
   REQUIRED_HOOKS,
   parseInstalledClaudePlugins,
@@ -33,6 +34,9 @@ import { legacyLcmCommand, legacyLcmMcpServerName } from "../../src/legacy-names
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../../src/daemon/config.js";
 import { removeManagedClaudeHooks } from "../../src/installer/settings.js";
 import { OWNER_ONLY_FILE_MODES } from "../../src/security-files.js";
+import { readBoundedRegularFile } from "../../src/security-files.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
+import { createPublicationConvergence } from "../../src/storage/publication-convergence.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -2040,5 +2044,96 @@ describe("ensureLcmMd", () => {
       mkdirSync: vi.fn(),
     }, CONTENT, "/home");
     expect(result.lcmMdWritten).toBe(false);
+  });
+});
+
+describe("installer publication admission integration", () => {
+  it("reads an existing canonical config through the production bounded reader", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-publication-existing-"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    fsMkdirSync(root, { recursive: true, mode: 0o700 });
+    fsWriteFileSync(configPath, JSON.stringify({ version: 1 }), { mode: 0o600 });
+    try {
+      const result = prepareInstallConfig({
+        ...makeDeps({
+          ensureLcmHome: vi.fn(),
+          readBoundedRegularFile,
+          existsSync: fsExistsSync,
+        }),
+      }, configPath);
+      expect(result).toEqual({ exists: true, content: JSON.stringify({ version: 1 }) });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("retries ensureLcmHome contention and uses the lock-free config reader", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-publication-"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    fsMkdirSync(join(home, ".claude"), { recursive: true, mode: 0o700 });
+    chmodSync(join(home, ".claude"), 0o700);
+    let now = 0;
+    const sleeps: number[] = [];
+    const firstContention = new PrivateMutationLockContentionError("publication busy");
+    let homeCalls = 0;
+    const ensureLcmHome = vi.fn((homeDir: string) => {
+      homeCalls += 1;
+      if (homeCalls === 1) throw firstContention;
+      fsMkdirSync(join(homeDir, ".lcm"), { recursive: true, mode: 0o700 });
+    });
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: {
+        pid: process.pid,
+        version: "1.4.2",
+        storageBackend: "sqlite",
+        entrypoint: "/opt/lcm.mjs",
+        runtimeDigest: "a".repeat(64),
+      },
+      expectedEntrypoint: "/opt/lcm.mjs",
+      expectedRuntimeDigest: "a".repeat(64),
+      deps: {
+        now: () => now,
+        sleep: async (ms) => { sleeps.push(ms); now += ms; },
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth",
+        fetch: vi.fn(async () => ({
+          ok: true,
+          json: async () => ({ status: "ok", pid: process.pid, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/opt/lcm.mjs", runtimeDigest: "a".repeat(64) }),
+        })) as unknown as typeof globalThis.fetch,
+        lockPath: join(home, ".lcm.backend-publication.lock"),
+        platform: "linux",
+      },
+    });
+    const deps = makeDeps({
+      ensureLcmHome,
+      publicationConvergence: convergence,
+      readBoundedRegularFile,
+      existsSync: fsExistsSync,
+      readFileSync: fsReadFileSync,
+      writeFileSync: fsWriteFileSync,
+      mkdirSync: fsMkdirSync,
+      chmodSync,
+      ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
+      commandsSourceDir: join(home, "missing-commands"),
+      skillSourceDir: join(home, "missing-skills"),
+    });
+    try {
+      await expect(install(deps, convergence)).resolves.toBeUndefined();
+      expect(ensureLcmHome).toHaveBeenCalledTimes(3);
+      expect(sleeps).toEqual([50]);
+      expect(fsExistsSync(join(home, ".lcm", "config.json"))).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      fsRmSync(home, { recursive: true, force: true });
+    }
   });
 });

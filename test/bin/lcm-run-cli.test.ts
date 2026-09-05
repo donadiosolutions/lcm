@@ -5,6 +5,7 @@ import { ConfigValidationError } from "../../src/daemon/config.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import { createPublicationConvergence } from "../../src/storage/publication-convergence.js";
 
 const FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC =
   "lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.";
@@ -106,6 +107,8 @@ const state = vi.hoisted(() => ({
   runtimePidPath: "/lcm/daemon.pid",
   runtimeTokenPath: "/lcm/daemon.token",
   migrateLegacyHome: vi.fn(),
+  install: vi.fn(async () => undefined),
+  createInstallerPublicationConvergence: vi.fn(),
   ensureAuthToken: vi.fn(),
   createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }) })),
 }));
@@ -263,7 +266,10 @@ vi.mock("../../src/config-manager.js", () => ({
   readConnectorTransport: vi.fn(() => state.storedCodexTransport),
   readConnectorTransportSnapshot: vi.fn(() => state.storedCodexTransport),
 }));
-vi.mock("../../installer/install.js", () => ({ install: vi.fn(async () => undefined) }));
+vi.mock("../../installer/install.js", () => ({
+  install: state.install,
+  createInstallerPublicationConvergence: state.createInstallerPublicationConvergence,
+}));
 vi.mock("../../installer/uninstall.js", () => ({ uninstall: vi.fn(async () => undefined) }));
 vi.mock("../../installer/dry-run-deps.js", () => ({ DryRunServiceDeps: class {} }));
 vi.mock("../../src/import.js", () => ({
@@ -321,6 +327,8 @@ async function invoke(args: string[], seams?: RootBootstrapTestSeams): Promise<E
 
 beforeEach(() => {
   vi.clearAllMocks();
+  state.createInstallerPublicationConvergence.mockResolvedValue(undefined);
+  state.install.mockResolvedValue(undefined);
   fakeStdin.on.mockReset();
   fakeStdin.destroy.mockReset();
   fakeStdin.isTTY = true;
@@ -380,6 +388,54 @@ afterEach(() => {
 });
 
 describe("runCli registration and help dispatch", () => {
+  it("creates one convergence and passes it to top-level install", async () => {
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      expectedEntrypoint: "/daemon",
+      expectedRuntimeDigest: "runtime",
+      deps: {
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth",
+        lockPath: "/tmp/publication.lock",
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({ status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+
+    await invoke(["install"]);
+
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+    expect(state.install).toHaveBeenCalledWith(undefined, convergence);
+  });
+
+  it("retries top-level doctor migration through the shared convergence", async () => {
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      expectedEntrypoint: "/daemon",
+      expectedRuntimeDigest: "runtime",
+      deps: {
+        now: (() => { let value = 0; return () => value; })(),
+        sleep: async () => undefined,
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth",
+        lockPath: "/tmp/publication.lock",
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({ status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.migrateLegacyHome.mockImplementationOnce(() => { throw contention; }).mockImplementationOnce(() => undefined);
+
+    await invoke(["doctor"]);
+
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+    expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
+  });
+
   it("retries transient root bootstrap contention for an ordinary command", async () => {
     vi.useFakeTimers();
     const contention = new actualRuntimePaths.BootstrapLockContentionError(
@@ -487,6 +543,10 @@ describe("runCli registration and help dispatch", () => {
     expect(consoleError).toHaveBeenNthCalledWith(2, configError.message);
     expect(consoleError).toHaveBeenNthCalledWith(3, backendError.message);
     expect(consoleError).toHaveBeenNthCalledWith(4, contentionError.message);
+    const publicationContention = new PrivateMutationLockContentionError("publication contention");
+    expect(() => handleCliError(publicationContention)).toThrow("exit:1");
+    expect(consoleError).toHaveBeenNthCalledWith(5, publicationContention.message);
+    expect(consoleError).toHaveBeenCalledTimes(5);
     expect(stdout).toHaveBeenCalledWith("out");
     expect(stderr).toHaveBeenCalledWith("err");
     const runner = vi.fn(async () => undefined);
