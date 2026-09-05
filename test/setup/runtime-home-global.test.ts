@@ -24,6 +24,7 @@ export function createChildAcceptanceEnvironment(
   const childEnvironment = { ...parentEnvironment };
   delete childEnvironment.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT;
   delete childEnvironment.LCM_TEST_HARNESS_TMPDIR;
+  delete childEnvironment.LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS;
   delete childEnvironment.LCM_TEST_ARTIFACT_ROOT;
   childEnvironment.TMPDIR = fixture;
   childEnvironment.TMP = fixture;
@@ -77,6 +78,44 @@ describe("Vitest runtime-home global lifecycle", () => {
 
     teardown();
     expect(removeDirectory).toHaveBeenCalledWith("/tmp/lcm-vitest-run-unique");
+  });
+
+  it("captures original temporary parents before installing the harness handoff", () => {
+    const environment: NodeJS.ProcessEnv = {};
+    const teardown = createRuntimeHomeRun({ provide: vi.fn() }, {
+      createDirectory: vi.fn(() => "/tmp/lcm-vitest-run-captured"),
+      secureDirectory: vi.fn(),
+      removeDirectory: vi.fn(),
+      environment,
+      temporaryRoot: () => "/tmp",
+      realpath: (path) => path,
+      markerProbe: () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
+    });
+    expect(environment.LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS).toBe(
+      JSON.stringify({ version: 1, parents: ["/tmp", "/var/tmp"] }),
+    );
+    expect(environment.LCM_TEST_HARNESS_TMPDIR).toBe("/tmp");
+    teardown();
+  });
+
+  it("does not recapture when a nested harness handoff already exists", () => {
+    const environment: NodeJS.ProcessEnv = {
+      LCM_TEST_HARNESS_TMPDIR: "/stable",
+      TMPDIR: "/worker-scratch",
+    };
+    const teardown = createRuntimeHomeRun({ provide: vi.fn() }, {
+      createDirectory: vi.fn(() => "/stable/lcm-vitest-run-nested"),
+      secureDirectory: vi.fn(),
+      removeDirectory: vi.fn(),
+      environment,
+      temporaryRoot: () => {
+        throw new Error("nested setup must not inspect the ambient root");
+      },
+      realpath: (path) => path,
+      markerProbe: () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
+    });
+    expect(environment.LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS).toBeUndefined();
+    teardown();
   });
 
   it("removes the owned root and rethrows a provide failure", () => {
@@ -177,6 +216,8 @@ describe("Vitest runtime-home global lifecycle", () => {
       removeDirectory: vi.fn(),
       environment: {
         LCM_TEST_VITEST_RUNTIME_ROOT_PARENT: "/private/harness",
+        LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS:
+          JSON.stringify({ version: 1, parents: ["/private/original-temp"] }),
       },
       realpath: (path) => path,
       markerProbe: () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
