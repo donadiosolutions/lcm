@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -255,8 +255,37 @@ describe("verify-consumer-topology", () => {
     const run = vi.fn();
     expect(module.runIfDirect({ invokedPath: undefined, moduleUrl: "file:///script.mjs", run })).toBe(false);
     expect(module.runIfDirect({ invokedPath: "/other.mjs", moduleUrl: "file:///script.mjs", run })).toBe(false);
-    expect(module.runIfDirect({ invokedPath: scriptPath, moduleUrl: `file://${scriptPath}`, run })).toBe(true);
+    expect(module.runIfDirect({ invokedPath: scriptPath, moduleUrl: pathToFileURL(scriptPath).href, run })).toBe(true);
     expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires canonical file URLs for encoded native paths", async () => {
+    const module = await import(scriptPath);
+    const run = vi.fn();
+    const nativePath = resolve(repositoryRoot, "lcm checkout # %", "verify-consumer-topology.mjs");
+    const canonicalHref = pathToFileURL(nativePath).href;
+    const differentPath = resolve(repositoryRoot, "different checkout", "verify-consumer-topology.mjs");
+
+    expect(canonicalHref).toContain("%20");
+    expect(canonicalHref).toContain("%23");
+    expect(canonicalHref).toContain("%25");
+    expect(module.runIfDirect({ invokedPath: nativePath, moduleUrl: canonicalHref, run })).toBe(true);
+    expect(module.runIfDirect({ invokedPath: differentPath, moduleUrl: canonicalHref, run })).toBe(false);
+    expect(module.runIfDirect({ invokedPath: nativePath, moduleUrl: `file://${nativePath}`, run })).toBe(false);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("constructs canonical file URLs for Windows paths", () => {
+    const windowsPath = String.raw`C:\Users\a\dir with space\file#%.mjs`;
+    const expectedHref = "file:///C:/Users/a/dir%20with%20space/file%23%25.mjs";
+    const windowsHref = pathToFileURL(windowsPath, { windows: true }).href;
+
+    expect(windowsHref).toBe(expectedHref);
+    expect(windowsHref.startsWith("file:///C:/")).toBe(true);
+    expect(windowsHref).not.toContain("\\");
+    expect(windowsHref).toContain("%20");
+    expect(windowsHref).toContain("%23");
+    expect(windowsHref).toContain("%25");
   });
 
   it("isolates every packed CLI home and preserves unrelated environment", async () => {
