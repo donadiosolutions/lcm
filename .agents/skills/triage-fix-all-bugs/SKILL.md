@@ -89,6 +89,14 @@ using an expected-head merge guard when supported. On a mismatch, return to the
 owner for review of the new candidate; do not merge. Return `pr-merged` with the
 verified merge SHA after confirming GitHub reports `MERGED`.
 
+Publication requests include the originating Bug and a closing reference when
+the fix fully resolves it. After merge, verify the source Bug is closed and the
+fix is present on the default branch. If GitHub did not close it automatically,
+the owner supplies the resolution evidence and the root closes it explicitly,
+then reads back the state before recording `merged-resolved`. A merged PR with
+an unresolved or still-open source Bug is not terminal; return incomplete fixes
+to the owner instead of closing them for accounting purposes.
+
 For P2 deferrals made before a PR exists, create the native Bug with the originating
 Bug, candidate SHA, review context, evidence, and reproduction details first.
 Record its PR link as pending; creating the follow-up satisfies the pre-publication
