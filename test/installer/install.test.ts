@@ -16,6 +16,7 @@ import {
   removeClaudeLegacyAssets,
   readlinePrompt,
   resolveClaudeTransport,
+  createInstallerPublicationConvergence,
   type ServiceDeps,
 } from "../../installer/install.js";
 import { homedir } from "node:os";
@@ -37,6 +38,8 @@ import { OWNER_ONLY_FILE_MODES } from "../../src/security-files.js";
 import { readBoundedRegularFile } from "../../src/security-files.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { createPublicationConvergence } from "../../src/storage/publication-convergence.js";
+import { PACKAGED_RUNTIME_ENTRYPOINT, PKG_VERSION, RUNTIME_DIGEST } from "../../src/daemon/version.js";
+import * as backendPublication from "../../src/storage/backend-publication.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -2048,6 +2051,129 @@ describe("ensureLcmMd", () => {
 });
 
 describe("installer publication admission integration", () => {
+  function rawSnapshot(content: string, rawSha256: string, ino = "2") {
+    return {
+      content,
+      witness: {
+        presence: "present" as const,
+        rawSha256,
+        byteLength: Buffer.byteLength(content),
+        dev: "1",
+        ino,
+        mtimeMs: 0,
+      },
+    };
+  }
+
+  it("captures configured and default daemon ports through the real factory", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-factory-port-"));
+    try {
+      const configuredPath = join(home, "config.json");
+      fsWriteFileSync(configuredPath, '{"daemon":{"port":4123}}', { mode: 0o600 });
+      await expect(createInstallerPublicationConvergence(configuredPath)).resolves.toMatchObject({ port: 4123 });
+
+      const defaultPath = join(home, "default.json");
+      fsWriteFileSync(defaultPath, '{"daemon":{}}', { mode: 0o600 });
+      await expect(createInstallerPublicationConvergence(defaultPath)).resolves.toMatchObject({ port: 3737 });
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when the factory snapshots drift or publication journal changes", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-factory-drift-"));
+    const configPath = join(home, "config.json");
+    const content = '{"daemon":{}}';
+    fsWriteFileSync(configPath, content, { mode: 0o600 });
+    try {
+      const witnessDrift = [rawSnapshot(content, "a"), rawSnapshot(content, "b")];
+      await expect(createInstallerPublicationConvergence(configPath, {
+        _readDaemonConfigRawSnapshot: () => witnessDrift.shift()!,
+      })).resolves.toMatchObject({ identity: undefined });
+
+      const journalDrift = ["journal-a", "journal-b"];
+      await expect(createInstallerPublicationConvergence(configPath, {
+        _assertBackendPublicationConfigReadAccess: () => ({
+          journalChecksumSha256: journalDrift.shift() ?? "journal-b",
+        }),
+      })).resolves.toMatchObject({ identity: undefined });
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("executes both default capture and retry token readers", async () => {
+    const canonicalHome = mkdtempSync(join(tmpdir(), "lcm-installer-factory-token-"));
+    const canonicalRoot = join(canonicalHome, ".lcm");
+    const canonicalConfig = join(canonicalRoot, "config.json");
+    fsMkdirSync(canonicalRoot, { mode: 0o700 });
+    fsWriteFileSync(canonicalConfig, '{"daemon":{"port":3737}}', { mode: 0o600 });
+    fsWriteFileSync(join(canonicalRoot, "daemon.token"), "token\n", { mode: 0o600 });
+    const expectedVersion = PKG_VERSION ?? "test-version";
+    const expectedEntrypoint = PACKAGED_RUNTIME_ENTRYPOINT ?? "/opt/lcm.mjs";
+    const expectedRuntimeDigest = RUNTIME_DIGEST ?? "a".repeat(64);
+    const health = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        status: "ok", pid: process.pid, version: expectedVersion,
+        storageBackend: "sqlite", entrypoint: expectedEntrypoint,
+        runtimeDigest: expectedRuntimeDigest,
+      }),
+    })) as unknown as typeof globalThis.fetch;
+    const nonCanonicalHome = mkdtempSync(join(tmpdir(), "lcm-installer-factory-token-alt-"));
+    const nonCanonical = join(nonCanonicalHome, "config.json");
+    fsWriteFileSync(nonCanonical, '{"daemon":{}}', { mode: 0o600 });
+    try {
+      const canonical = await createInstallerPublicationConvergence(canonicalConfig, {
+        fetch: health,
+        _expectedVersionForTesting: expectedVersion,
+        _expectedEntrypointForTesting: expectedEntrypoint,
+        _expectedRuntimeDigestForTesting: expectedRuntimeDigest,
+      });
+      expect(canonical.identity).toBeDefined();
+      expect(canonical.deps.readToken?.()).toBe("token");
+      const alternate = await createInstallerPublicationConvergence(nonCanonical);
+      expect(alternate.deps.readToken?.()).toBeNull();
+    } finally {
+      fsRmSync(canonicalHome, { recursive: true, force: true });
+      fsRmSync(nonCanonicalHome, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects lock-free existing-config witness drift and admits PostgreSQL via its read seam", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-lockfree-drift-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    fsMkdirSync(root, { mode: 0o700 });
+    const sqliteContent = '{"daemon":{}}';
+    fsWriteFileSync(configPath, sqliteContent, { mode: 0o600 });
+    const baseDeps = {
+      ...makeDeps(),
+      ensureLcmHome: vi.fn(),
+      readBoundedRegularFile,
+      _forceLockFreePublicationReadForTesting: true,
+      existsSync: fsExistsSync,
+      _readDaemonConfigRawSnapshot: vi.fn()
+        .mockReturnValueOnce(rawSnapshot(sqliteContent, "a"))
+        .mockReturnValueOnce(rawSnapshot(sqliteContent, "b")),
+    } satisfies ServiceDeps;
+    try {
+      expect(() => prepareInstallConfig(baseDeps, configPath))
+        .toThrow("configuration changed during lock-free publication admission");
+
+      const postgresContent = '{"storage":{"backend":"postgresql"}}';
+      fsWriteFileSync(configPath, postgresContent, { mode: 0o600 });
+      const postgresDeps = {
+        ...baseDeps,
+        _readDaemonConfigRawSnapshot: vi.fn().mockReturnValue(rawSnapshot(postgresContent, "postgres")),
+        _assertBackendPublicationConfigReadAccess: vi.fn(() => ({ journalChecksumSha256: "journal" })),
+      } satisfies ServiceDeps;
+      expect(prepareInstallConfig(postgresDeps, configPath)).toEqual({ exists: true, content: postgresContent });
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("reads an existing canonical config through the production bounded reader", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-installer-publication-existing-"));
     const previousHome = process.env.HOME;
@@ -2081,7 +2207,26 @@ describe("installer publication admission integration", () => {
     let now = 0;
     const sleeps: number[] = [];
     const firstContention = new PrivateMutationLockContentionError("publication busy");
+    const configLockContention = new PrivateMutationLockContentionError("config publication busy");
     let homeCalls = 0;
+    let configLockCalls = 0;
+    let actualConfigLockCalls = 0;
+    let configCreationCallbackCalls = 0;
+    let contendedCallbackInvoked = false;
+    const originalConfigLock = backendPublication.withBackendPublicationConfigLock;
+    const configLock = vi.spyOn(backendPublication, "withBackendPublicationConfigLock")
+      .mockImplementation((configFile, callback, permit) => {
+        configLockCalls += 1;
+        if (configFile === join(home, ".lcm", "config.json")) {
+          actualConfigLockCalls += 1;
+          if (actualConfigLockCalls === 1) throw configLockContention;
+        }
+        return originalConfigLock(configFile, (token) => {
+          configCreationCallbackCalls += 1;
+          if (actualConfigLockCalls === 1) contendedCallbackInvoked = true;
+          return callback(token);
+        }, permit);
+      });
     const ensureLcmHome = vi.fn((homeDir: string) => {
       homeCalls += 1;
       if (homeCalls === 1) throw firstContention;
@@ -2116,9 +2261,10 @@ describe("installer publication admission integration", () => {
       ensureLcmHome,
       publicationConvergence: convergence,
       readBoundedRegularFile,
+      _forceLockFreePublicationReadForTesting: true,
       existsSync: fsExistsSync,
       readFileSync: fsReadFileSync,
-      writeFileSync: fsWriteFileSync,
+      writeFileSync: vi.fn((path: string, content: string) => fsWriteFileSync(path, content)),
       mkdirSync: fsMkdirSync,
       chmodSync,
       ensureDaemon: vi.fn().mockResolvedValue({ connected: true }),
@@ -2128,9 +2274,18 @@ describe("installer publication admission integration", () => {
     try {
       await expect(install(deps, convergence)).resolves.toBeUndefined();
       expect(ensureLcmHome).toHaveBeenCalledTimes(3);
-      expect(sleeps).toEqual([50]);
+      expect(sleeps).toEqual([50, 50]);
+      expect(configLockCalls).toBeGreaterThanOrEqual(2);
+      expect(contendedCallbackInvoked).toBe(false);
+      expect(configCreationCallbackCalls).toBeGreaterThanOrEqual(1);
+      expect((deps.writeFileSync as ReturnType<typeof vi.fn>).mock.calls
+        .filter(([path]) => path === join(home, ".lcm", "config.json"))).toHaveLength(1);
+      expect(deps.promptUser).not.toHaveBeenCalled();
+      expect((deps.writeFileSync as ReturnType<typeof vi.fn>).mock.calls
+        .filter(([path]) => path === join(home, ".claude", "skills", "lcm-memory", "SKILL.md"))).toHaveLength(1);
       expect(fsExistsSync(join(home, ".lcm", "config.json"))).toBe(true);
     } finally {
+      configLock.mockRestore();
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
       fsRmSync(home, { recursive: true, force: true });

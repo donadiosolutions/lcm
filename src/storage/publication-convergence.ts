@@ -33,6 +33,32 @@ export type PublicationConvergenceDeps = Readonly<{
   platform?: NodeJS.Platform;
   lockPath?: string;
   homeDir?: string;
+  /** @internal deterministic installer admission seams. */
+  _readDaemonConfigRawSnapshot?: (configPath: string) => {
+    content: string;
+    witness: Readonly<{
+      presence: "present" | "absent";
+      rawSha256: string | null;
+      byteLength: number;
+      dev: string | null;
+      ino: string | null;
+      mtimeMs: number | null;
+    }>;
+  };
+  _assertBackendPublicationConfigReadAccess?: (
+    configPath: string,
+    backend: "sqlite" | "postgresql",
+    witness: Readonly<{
+      presence: "present" | "absent";
+      rawSha256: string | null;
+      byteLength: number;
+      dev: string | null;
+      ino: string | null;
+    }>,
+  ) => Readonly<{ journalChecksumSha256: string | null }>;
+  _expectedVersionForTesting?: string;
+  _expectedEntrypointForTesting?: string;
+  _expectedRuntimeDigestForTesting?: string;
 }>;
 
 export type PublicationConvergence = Readonly<{
@@ -155,11 +181,11 @@ function currentDeadline(convergence: PublicationConvergence): number | undefine
 async function retryDelay(
   convergence: PublicationConvergence,
   error: unknown,
-): Promise<number | undefined> {
+): Promise<number | { expired: true } | undefined> {
   if (!(error instanceof PrivateMutationLockContentionError) || convergence.identity === undefined) return undefined;
   const now = convergence.deps.now ?? Date.now;
   const existingDeadline = currentDeadline(convergence);
-  if (existingDeadline !== undefined && now() >= existingDeadline) return undefined;
+  if (existingDeadline !== undefined && now() >= existingDeadline) return { expired: true };
   const ownerReader = convergence.deps.readOwner ?? readPrivateMutationLockOwner;
   const lockPath = convergence.deps.lockPath
     ?? (convergence.deps.homeDir === undefined ? undefined : join(convergence.deps.homeDir, ".lcm.backend-publication.lock"));
@@ -169,7 +195,7 @@ async function retryDelay(
   if (owner === null || owner.pid !== convergence.identity.pid || owner.processStartTime === null) return undefined;
   const deadline = existingDeadline ?? now() + PUBLICATION_CONVERGENCE_MS;
   const remainingBirth = deadline - now();
-  if (remainingBirth <= 0) return undefined;
+  if (remainingBirth <= 0) return { expired: true };
   let birth: string | null;
   try {
     birth = (convergence.deps.processBirth ?? processStartTime)(owner.pid, undefined, { timeoutMs: remainingBirth });
@@ -178,10 +204,10 @@ async function retryDelay(
   }
   if (birth !== owner.processStartTime) return undefined;
   const remainingHealth = deadline - now();
-  if (remainingHealth <= 0) return undefined;
+  if (remainingHealth <= 0) return { expired: true };
   const health = await authenticatedHealth(convergence.deps, convergence.port, Math.min(2_000, remainingHealth));
   if (!healthMatches(health, convergence.identity, convergence.expectedRuntimeDigest, convergence.expectedEntrypoint, convergence.deps.platform ?? process.platform)) return undefined;
-  if (now() >= deadline) return undefined;
+  if (now() >= deadline) return { expired: true };
   convergence.deadline = deadline;
   const delay = Math.min(PUBLICATION_CONVERGENCE_POLL_MS, Math.max(1, deadline - now()));
   return delay;
@@ -200,11 +226,8 @@ export async function withPublicationAdmissionRetry<T>(
       return await run();
     } catch (error) {
       const delay = await retryDelay(convergence, error);
-      if (delay === undefined) {
-        throw firstContention !== undefined && error instanceof PrivateMutationLockContentionError
-          ? firstContention
-          : error;
-      }
+      if (delay === undefined) throw error;
+      if (typeof delay !== "number") throw firstContention ?? error;
       firstContention ??= error as PrivateMutationLockContentionError;
       await (convergence.deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))))(delay);
     }

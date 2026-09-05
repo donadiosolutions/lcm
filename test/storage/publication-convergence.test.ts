@@ -163,7 +163,8 @@ describe("publication convergence", () => {
       exhaustedAttempts += 1;
       throw error;
     }, exhausted)).rejects.toBe(exhaustedFirst);
-    expect(exhaustedAttempts).toBeGreaterThan(1);
+    expect(exhaustedAttempts).toBe(40);
+    expect(exhaustedNow).toBe(2_000);
   });
 
   it("fails closed for foreign owners, missing evidence, and noncontention errors", async () => {
@@ -307,6 +308,32 @@ describe("publication convergence", () => {
       throw attempts === 1 ? first : second;
     }, convergence)).rejects.toBe(first);
     expect(attempts).toBe(2);
+  });
+
+  it("preserves a later identity-mismatch contention after a granted retry", async () => {
+    let now = 0;
+    const first = new PrivateMutationLockContentionError("first");
+    const second = new PrivateMutationLockContentionError("second");
+    let ownerReads = 0;
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity,
+      expectedEntrypoint: identity.entrypoint,
+      expectedRuntimeDigest: identity.runtimeDigest,
+      deps: deps({
+        now: () => now,
+        sleep: async (ms) => { now += ms; },
+        readOwner: () => ({ version: 1, pid: ownerReads++ === 0 ? identity.pid : 99, processStartTime: "birth", nonce: "a".repeat(32) }),
+      }),
+    });
+    let attempts = 0;
+    await expect(withPublicationAdmissionRetry(() => {
+      attempts += 1;
+      if (attempts === 1) throw first;
+      throw second;
+    }, convergence)).rejects.toBe(second);
+    expect(attempts).toBe(2);
+    expect(now).toBe(50);
   });
 
   it("keeps a later ordinary error unchanged after contention", async () => {

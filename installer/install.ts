@@ -12,7 +12,12 @@ import {
   readBoundedRegularFile,
 } from "../src/security-files.js";
 import { parseStoredConfig } from "../src/daemon/config.js";
-import { DEFAULT_DAEMON_PORT, daemonConfigSnapshotWitnessEqual, readDaemonConfigRawSnapshot } from "../src/daemon/config.js";
+import {
+  DEFAULT_DAEMON_PORT,
+  daemonConfigSnapshotWitnessEqual,
+  readDaemonConfigRawSnapshot,
+  type DaemonConfigRawSnapshot,
+} from "../src/daemon/config.js";
 import { daemonTokenPath } from "../src/runtime-paths.js";
 import { readAuthToken } from "../src/daemon/auth.js";
 import { resolveAgentTransport } from "../src/connectors/registry.js";
@@ -100,6 +105,9 @@ export interface ServiceDeps {
   _publicationConvergenceFetch?: typeof globalThis.fetch;
   _readPrivateMutationLockOwnerForTesting?: PublicationConvergenceDeps["readOwner"];
   _processStartTimeForTesting?: PublicationConvergenceDeps["processBirth"];
+  _readDaemonConfigRawSnapshot?: (configPath: string) => DaemonConfigRawSnapshot;
+  _assertBackendPublicationConfigReadAccess?: typeof assertBackendPublicationConfigReadAccess;
+  _forceLockFreePublicationReadForTesting?: boolean;
 }
 
 const CLAUDE_PLUGIN_REPOSITORIES = new Set([
@@ -307,8 +315,11 @@ export async function createInstallerPublicationConvergence(
   let port = DEFAULT_DAEMON_PORT;
   let backend: "sqlite" | "postgresql" = "sqlite";
   let configAuthenticated = false;
+  const readSnapshot = seams._readDaemonConfigRawSnapshot ?? readDaemonConfigRawSnapshot;
+  const assertReadAccess = seams._assertBackendPublicationConfigReadAccess
+    ?? assertBackendPublicationConfigReadAccess;
   try {
-    const snapshot = readDaemonConfigRawSnapshot(configPath);
+    const snapshot = readSnapshot(configPath);
     if (snapshot.witness.presence === "absent") throw new Error("configuration is absent");
     const stored = parseStoredConfig(snapshot.content);
     const daemon = stored.daemon as { port?: unknown } | undefined;
@@ -322,10 +333,10 @@ export async function createInstallerPublicationConvergence(
       dev: snapshot.witness.dev,
       ino: snapshot.witness.ino,
     } as const;
-    const firstJournal = assertBackendPublicationConfigReadAccess(configPath, backend, witness);
-    const second = readDaemonConfigRawSnapshot(configPath);
+    const firstJournal = assertReadAccess(configPath, backend, witness);
+    const second = readSnapshot(configPath);
     if (!daemonConfigSnapshotWitnessEqual(snapshot.witness, second.witness)) throw new Error("configuration changed");
-    const secondJournal = assertBackendPublicationConfigReadAccess(configPath, backend, {
+    const secondJournal = assertReadAccess(configPath, backend, {
       presence: second.witness.presence,
       rawSha256: second.witness.rawSha256,
       byteLength: second.witness.byteLength,
@@ -338,12 +349,15 @@ export async function createInstallerPublicationConvergence(
     // Missing, malformed, or unstable config cannot authenticate a daemon.
   }
   const homeDir = backendPublicationHomeForConfigPath(configPath);
+  const expectedVersion = seams._expectedVersionForTesting ?? PKG_VERSION;
+  const expectedEntrypoint = seams._expectedEntrypointForTesting ?? PACKAGED_RUNTIME_ENTRYPOINT;
+  const expectedRuntimeDigest = seams._expectedRuntimeDigestForTesting ?? RUNTIME_DIGEST;
   const identity = homeDir === undefined || !configAuthenticated ? undefined : await capturePublicationIdentity({
     port,
-    expectedVersion: PKG_VERSION,
+    expectedVersion,
     expectedStorageBackend: backend,
-    expectedEntrypoint: PACKAGED_RUNTIME_ENTRYPOINT,
-    expectedRuntimeDigest: RUNTIME_DIGEST,
+    expectedEntrypoint,
+    expectedRuntimeDigest,
     deps: {
       ...seams,
       homeDir,
@@ -355,8 +369,8 @@ export async function createInstallerPublicationConvergence(
   return createPublicationConvergence({
     port,
     identity,
-    expectedEntrypoint: PACKAGED_RUNTIME_ENTRYPOINT,
-    expectedRuntimeDigest: RUNTIME_DIGEST,
+    expectedEntrypoint,
+    expectedRuntimeDigest,
     deps: {
       ...seams,
       homeDir,
@@ -440,7 +454,8 @@ export function prepareInstallConfig(deps: ServiceDeps, path: string): InstallCo
   }
   // Explicit unit fixtures retain the historical lock seam; production
   // dependencies expose the descriptor reader used by the lock-free path.
-  if (deps.readBoundedRegularFile === undefined || deps.readBoundedRegularFile !== readBoundedRegularFile) {
+  if (deps._forceLockFreePublicationReadForTesting !== true
+    && (deps.readBoundedRegularFile === undefined || deps.readBoundedRegularFile !== readBoundedRegularFile)) {
     return withBackendPublicationConfigLock(path, (lockToken) => {
       if (!safeConfigExists(deps, path)) {
         assertBackendPublicationConsumerAccess({ homeDir, lockToken });
@@ -457,11 +472,14 @@ export function prepareInstallConfig(deps: ServiceDeps, path: string): InstallCo
   // Lock-free authenticated double snapshot. This keeps install's existence
   // decision readable while a daemon is publishing, without permitting a
   // mutation or accepting a mixed config/journal view.
+  const readSnapshot = deps._readDaemonConfigRawSnapshot ?? readDaemonConfigRawSnapshot;
+  const assertReadAccess = deps._assertBackendPublicationConfigReadAccess
+    ?? assertBackendPublicationConfigReadAccess;
   return withBackendPublicationReadRoot(homeDir, (assertReadRoot) => {
     const read = (): InstallConfigState & { journalChecksum: string | null; witness: ReturnType<typeof readDaemonConfigRawSnapshot>["witness"] } => {
-      const snapshot = readDaemonConfigRawSnapshot(path);
+      const snapshot = readSnapshot(path);
       if (snapshot.witness.presence === "absent") {
-        assertBackendPublicationConfigReadAccess(path, "sqlite", {
+        assertReadAccess(path, "sqlite", {
           presence: "absent",
           rawSha256: null,
           byteLength: 0,
@@ -482,7 +500,7 @@ export function prepareInstallConfig(deps: ServiceDeps, path: string): InstallCo
         dev: snapshot.witness.dev,
         ino: snapshot.witness.ino,
       } as const;
-      const journal = assertBackendPublicationConfigReadAccess(path, backend, witness);
+      const journal = assertReadAccess(path, backend, witness);
       assertReadRoot();
       return { exists: true, content: snapshot.content, journalChecksum: journal.journalChecksumSha256, witness: snapshot.witness };
     };
