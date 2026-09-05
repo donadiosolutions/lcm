@@ -12,7 +12,7 @@ import {
 export function createGrepHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
-    const { query, scope, mode, since } = input;
+    const { query, scope, mode, since, sessionId } = input;
 
     if (!query) {
       sendJson(res, 400, { error: "query is required" });
@@ -28,6 +28,12 @@ export function createGrepHandler(config: DaemonConfig, storageFactory?: Storage
     const normalizedScope = normalizeGrepScope(scope);
     if (!normalizedScope) {
       sendJson(res, 400, { error: "invalid scope" });
+      return;
+    }
+
+    if (sessionId !== undefined
+        && (typeof sessionId !== "string" || sessionId.trim().length === 0 || sessionId.includes("\0"))) {
+      sendJson(res, 400, { error: "invalid sessionId" });
       return;
     }
 
@@ -47,12 +53,27 @@ export function createGrepHandler(config: DaemonConfig, storageFactory?: Storage
     try {
       const result = await withProjectStorage(
         { config, cwd, factory: storageFactory, context, mode: "existing" },
-        async (project) => createRetrievalEngine(project).grep({
-          query,
-          mode: normalizedMode,
-          scope: normalizedScope,
-          since,
-        }),
+        async (project) => {
+          if (sessionId !== undefined) {
+            const conversation = await project.conversations.getConversationBySessionId(sessionId);
+            if (conversation === null) {
+              return { messages: [], summaries: [], totalMatches: 0 };
+            }
+            return createRetrievalEngine(project).grep({
+              query,
+              mode: normalizedMode,
+              scope: normalizedScope,
+              since,
+              conversationId: conversation.conversationId,
+            });
+          }
+          return createRetrievalEngine(project).grep({
+            query,
+            mode: normalizedMode,
+            scope: normalizedScope,
+            since,
+          });
+        },
       );
       sendJson(res, 200, result ?? { matches: [] });
     } catch (error) {

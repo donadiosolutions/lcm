@@ -491,6 +491,7 @@ describe("Codecov configuration", () => {
     }
 
     const components = validateComponents(configuredComponents(config));
+    // #792 keeps grep session filtering in the existing route component.
     const expectedOwners = [
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
