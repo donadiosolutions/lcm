@@ -1784,10 +1784,12 @@ describe("BackendPublicationCoordinator", () => {
     await expect(coordinator(home, fake.driver).resume()).rejects.toMatchObject({ reason: "malformed-journal" });
   });
 
-  it("rejects malformed journal fields, witnesses, references, fences, and projects", async () => {
-    const explicit = await preparedFixture();
-    rewriteJournal(explicit.home, (journal) => ({ ...journal, sourceState: null }));
-    expect(() => readBackendPublicationJournal(explicit.home)).toThrow("source state is malformed");
+  describe("rejects malformed journal fields, witnesses, references, fences, and projects", () => {
+    it("reports malformed source state", async () => {
+      const explicit = await preparedFixture();
+      rewriteJournal(explicit.home, (journal) => ({ ...journal, sourceState: null }));
+      expect(() => readBackendPublicationJournal(explicit.home)).toThrow("source state is malformed");
+    });
 
     const malformedCases: readonly [string, (journal: Record<string, unknown>) => Record<string, unknown>][] = [
       ["invalid fields", (journal) => ({ ...journal, version: 1 })],
@@ -1978,11 +1980,9 @@ describe("BackendPublicationCoordinator", () => {
         }],
       })],
     ];
-    for (const [label, mutate] of malformedCases) {
-      await expectJournalReadFailure(mutate).catch((error) => {
-        throw new Error(`${label}: ${String(error)}`);
-      });
-    }
+    it.each(malformedCases)("%s", async (_label, mutate) => {
+      await expectJournalReadFailure(mutate);
+    });
   });
 
   it("rejects every malformed persisted fence field", async () => {

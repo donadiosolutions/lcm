@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import packageJson from "../package.json";
+import postgresqlConfig from "../vitest.postgresql.config";
 import {
   createVitestConfiguration,
   createVitestConfigurationResolver,
@@ -564,6 +565,9 @@ describe("Vitest artifact-root configuration", () => {
     expect(packageProject?.test?.fileParallelism).toBe(false);
     expect(configured.test?.setupFiles).toEqual(["test/setup/isolate-runtime-home.ts"]);
     expect(configured.test?.globalSetup).toEqual(["test/setup/runtime-home-global.ts"]);
+    expect(configured.test?.pool).toBe("forks");
+    expect(projects.every((project) => project.test?.pool === "forks")).toBe(true);
+    expect(postgresqlConfig.test?.pool).toBe("forks");
     expect(configured.test?.coverage?.thresholds).toMatchObject({
       lines: 100,
       functions: 100,

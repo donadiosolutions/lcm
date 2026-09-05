@@ -195,6 +195,15 @@ retries promotion for that project once. It does not rerun compaction.
 Application-level promotion errors are not retried, and each later project gets
 its own independent recovery opportunity.
 
+Automatic promotion records its most recent timestamp in project metadata on a
+best-effort basis. Metadata is bounded to 1 MiB and published atomically with
+0600 permissions, including when tightening a legacy file that was more
+permissive. Invalid, unreadable, or untrusted metadata is left unchanged and
+does not undo promoted memories; promotion counts and results are independent
+of this metadata update. `--dry-run` never writes metadata. On platforms with a
+POSIX UID, the existing metadata file must be owned by the current UID; where
+UIDs are unavailable, that ownership check is skipped.
+
 `lcm compact --all` reports each SQLite project that it cannot open, migrate, or
 scan as a failure in the Compact phase while continuing with readable projects.
 These failures produce a nonzero exit status and are not reported as “Nothing to

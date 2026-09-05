@@ -213,7 +213,9 @@ The `Security` section of the doctor output shows:
   the authority with `<path>`, including an initial Windows drive. A quote
   immediately before the `file` scheme lets the redacted path contain spaces
   until the matching quote or a newline. Empty and root-only file URLs remain
-  unchanged. In unquoted file URLs, whitespace and the existing path
+  unchanged. Unmatched or path-wrapping brackets in file URLs do not stop path
+  redaction; valid bracketed IPv6 authorities, including zone IDs, remain
+  intact. In unquoted file URLs, whitespace and the existing path
   delimiters, including later colons, `?`, and `#`, end the redacted span, so
   text after those delimiters can remain visible. Ordinary HTTP and HTTPS URLs
   retain their authorities, slashes, and paths.
