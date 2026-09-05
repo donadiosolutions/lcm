@@ -1,13 +1,124 @@
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import packageJson from "../package.json";
 import {
   createVitestConfiguration,
   createVitestConfigurationResolver,
   createVitestRunRoot,
+  drainVitestRunRootCleanups,
 } from "../vitest.config";
+
+interface ChildDefaultRootResult {
+  readonly before: number;
+  readonly after: number;
+  readonly count: number;
+  readonly roots: string[];
+  readonly warningNames: string[];
+  readonly allRootsExist: boolean;
+}
+
+function runDefaultRootChild(
+  parent: string,
+  configPath: string,
+): ChildDefaultRootResult {
+  const scriptPath = join(parent, "default-root-child.mts");
+  const resultPath = join(parent, "default-root-result.json");
+  writeFileSync(scriptPath, `
+import { EventEmitter } from "node:events";
+import { existsSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const configPath = process.argv[2];
+const resultPath = process.argv[3];
+const count = Math.max(12, EventEmitter.defaultMaxListeners + 2);
+const warnings = [];
+const before = process.listenerCount("exit");
+process.on("warning", (warning) => {
+  warnings.push(warning.name + "|" + warning.message);
+});
+const roots = [];
+for (let index = 0; index < count; index += 1) {
+  const moduleUrl = pathToFileURL(configPath).href + "?fresh=" + index;
+  const module = await import(moduleUrl);
+  if (typeof module.default !== "function") {
+    throw new Error("default export must be a resolver function");
+  }
+  const configuration = module.default();
+  if (typeof configuration?.cacheDir !== "string") {
+    throw new Error("resolver must return a config with a cache directory");
+  }
+  roots.push(dirname(configuration.cacheDir));
+}
+const after = process.listenerCount("exit");
+await new Promise((resolve) => setImmediate(resolve));
+writeFileSync(resultPath, JSON.stringify({
+  before,
+  after,
+  count,
+  roots,
+  warningNames: warnings,
+  allRootsExist: roots.every((root) => existsSync(root)),
+}));
+`, { mode: 0o600 });
+
+  const childEnvironment = { ...process.env };
+  delete childEnvironment.LCM_TEST_ARTIFACT_ROOT;
+  childEnvironment.TMPDIR = parent;
+  execFileSync(process.execPath, ["--experimental-strip-types", scriptPath, configPath, resultPath], {
+    cwd: dirname(configPath),
+    env: childEnvironment,
+    stdio: "ignore",
+  });
+  return JSON.parse(readFileSync(resultPath, "utf8")) as ChildDefaultRootResult;
+}
+
+interface ChildExplicitRootResult {
+  readonly before: number;
+  readonly after: number;
+  readonly root: string;
+}
+
+function runExplicitRootChild(
+  parent: string,
+  configPath: string,
+  root: string,
+): ChildExplicitRootResult {
+  const scriptPath = join(parent, "explicit-root-child.mts");
+  const resultPath = join(parent, "explicit-root-result.json");
+  writeFileSync(scriptPath, `
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const configPath = process.argv[2];
+const resultPath = process.argv[3];
+const root = process.argv[4];
+const before = process.listenerCount("exit");
+const module = await import(pathToFileURL(configPath).href + "?fresh=explicit");
+if (typeof module.default !== "function") {
+  throw new Error("default export must be a resolver function");
+}
+const resolved = module.default();
+if (resolved.test?.outputFile?.junit !== root + "/test-report.junit.xml") {
+  throw new Error("resolver did not use the explicit root");
+}
+writeFileSync(root + "/sentinel", "keep");
+const after = process.listenerCount("exit");
+writeFileSync(resultPath, JSON.stringify({ before, after, root }));
+`, { mode: 0o600 });
+
+  const childEnvironment = { ...process.env, LCM_TEST_ARTIFACT_ROOT: root, TMPDIR: parent };
+  execFileSync(process.execPath, ["--experimental-strip-types", scriptPath, configPath, resultPath, root], {
+    cwd: dirname(configPath),
+    env: childEnvironment,
+    stdio: "ignore",
+  });
+  return JSON.parse(readFileSync(resultPath, "utf8")) as ChildExplicitRootResult;
+}
 
 describe("Vitest artifact-root configuration", () => {
   it("constructs a lazy resolver that creates one root and returns one config", () => {
@@ -472,5 +583,65 @@ describe("Vitest artifact-root configuration", () => {
     expect(testCi).toMatch(/--coverage\.reporter(?:=|\s+)lcov/u);
     expect(testCi).toMatch(/--coverage\.reporter(?:=|\s+)text/u);
     expect(testCi).not.toContain("--outputFile=test-report.junit.xml");
+  });
+
+  it("drains an isolated cleanup registry once while preserving failure isolation", () => {
+    const registry = new Set<() => void>();
+    const calls: string[] = [];
+    registry.add(() => {
+      calls.push("first");
+      throw new Error("first cleanup failed");
+    });
+    registry.add(() => {
+      calls.push("second");
+    });
+
+    expect(() => drainVitestRunRootCleanups(registry)).not.toThrow();
+    expect(calls).toEqual(["first", "second"]);
+    expect(registry).toHaveLength(0);
+
+    drainVitestRunRootCleanups(registry);
+    expect(calls).toEqual(["first", "second"]);
+  });
+
+  it("shares one exit listener across fresh default configuration evaluations", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-vitest-config-reload-"));
+    const parentOwnedRoot = join(parent, "parent-owned");
+    const configPath = resolve(dirname(fileURLToPath(import.meta.url)), "../vitest.config.ts");
+    mkdirSync(parentOwnedRoot, { mode: 0o700 });
+
+    try {
+      const result = runDefaultRootChild(parent, configPath);
+      expect(result.after - result.before).toBe(1);
+      expect(result.count).toBeGreaterThanOrEqual(12);
+      expect(result.roots).toHaveLength(result.count);
+      expect(new Set(result.roots)).toHaveLength(result.count);
+      expect(result.allRootsExist).toBe(true);
+      expect(result.warningNames.some(
+        (warning) => warning.startsWith("MaxListenersExceededWarning|")
+          && warning.includes("exit listeners"),
+      )).toBe(false);
+      for (const root of result.roots) {
+        expect(existsSync(root)).toBe(false);
+      }
+      expect(existsSync(parentOwnedRoot)).toBe(true);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("retains a fresh explicit root after an isolated child exits", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-vitest-config-reload-explicit-"));
+    const root = join(parent, "explicit-root");
+    const configPath = resolve(dirname(fileURLToPath(import.meta.url)), "../vitest.config.ts");
+
+    try {
+      const result = runExplicitRootChild(parent, configPath, root);
+      expect(result.after - result.before).toBe(0);
+      expect(result.root).toBe(root);
+      expect(existsSync(join(root, "sentinel"))).toBe(true);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
   });
 });
