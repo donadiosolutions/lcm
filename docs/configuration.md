@@ -1068,6 +1068,10 @@ configuration, endpoint contents, or authentication data.
 Once the endpoint has been validated and the one-shot app-server has provably
 settled, that endpoint remains authoritative regardless of its exit status or
 signal.
+When resolution fails, is aborted, or times out, LCM removes the published
+process witness after the child and its owned process group are proven settled.
+If settlement cannot be proven, LCM retains the witness for reconciliation and
+fails closed.
 
 Codex-process compaction then uses a private, one-use loopback Responses gateway for
 each summarize call. The gateway binds only to `127.0.0.1` on an ephemeral port

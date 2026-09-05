@@ -504,6 +504,171 @@ describe("resolveCodexOpenAIBaseUrl", () => {
     expect(killProcess).toHaveBeenCalled();
   });
 
+  it("removes the witness once after a proven protocol failure", async () => {
+    const child = hangingChild();
+    child.stdin.on("data", () => {
+      child.stdout.write(`${JSON.stringify({ id: 1, error: { code: "bad" } })}\n`);
+    });
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+    await expect(resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+    })).rejects.toThrow("codex endpoint resolution failed");
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+  });
+
+  it("removes the witness once after a proven child error", async () => {
+    const child = hangingChild();
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+    });
+    child.emit("error", new Error("child failed"));
+    await expect(pending).rejects.toThrow("codex endpoint resolution failed");
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+  });
+
+  it("removes the witness once after a proven stdin error", async () => {
+    const child = hangingChild();
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+    });
+    child.stdin.emit("error", new Error("stdin failed"));
+    await expect(pending).rejects.toThrow("codex endpoint resolution failed");
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+  });
+
+  it("removes the witness once after a proven abort", async () => {
+    const child = hangingChild();
+    const controller = new AbortController();
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+    }, controller.signal);
+    controller.abort("cancelled");
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+  });
+
+  it("removes the witness once after a proven timeout", async () => {
+    const child = hangingChild();
+    let timeout: (() => void) | undefined;
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+      timeoutMs: 10,
+      setTimeout: vi.fn((callback: () => void) => {
+        timeout = callback;
+        return 1 as never;
+      }) as never,
+      clearTimeout: vi.fn(),
+    });
+    await vi.waitFor(() => expect(timeout).toBeTypeOf("function"));
+    timeout?.();
+    await expect(pending).rejects.toThrow("codex endpoint resolution failed");
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+  });
+
+  it("retains the witness when failure teardown cannot prove settlement", async () => {
+    const child = hangingChild();
+    child.kill = vi.fn(() => true);
+    const timers: Array<{ callback: () => void; delay: number }> = [];
+    const setTimeoutMock = vi.fn((callback: () => void, delay: number) => {
+      timers.push({ callback, delay });
+      return timers.length as unknown as ReturnType<typeof setTimeout>;
+    }) as unknown as typeof setTimeout;
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+      timeoutMs: 10_000,
+      setTimeout: setTimeoutMock,
+      clearTimeout: vi.fn(),
+    });
+    const observed = pending.then(() => undefined, error => error);
+    child.emit("error", new Error("child failed"));
+    await vi.waitFor(() => expect(timers.filter(timer => timer.delay === 2_000)).toHaveLength(1));
+    timers.find(timer => timer.delay === 2_000)?.callback();
+    await vi.waitFor(() => expect(timers.filter(timer => timer.delay === 2_000)).toHaveLength(2));
+    timers.filter(timer => timer.delay === 2_000)[1]?.callback();
+    await expect(observed).resolves.toMatchObject({ message: expect.stringContaining("codex endpoint resolution failed") });
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).not.toHaveBeenCalled();
+  });
+
+  it("preserves the original failure when witness removal throws", async () => {
+    const child = hangingChild();
+    child.stdin.on("data", () => {
+      child.stdout.write(`${JSON.stringify({ id: 1, error: { code: "secret" } })}\n`);
+    });
+    const witnessStore = {
+      add: vi.fn(),
+      remove: vi.fn(() => { throw new Error("remove failed"); }),
+      path: "/tmp/witness",
+    };
+    await expect(resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+    })).rejects.toThrow("codex endpoint resolution failed");
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+  });
+
+  it("preserves AbortError when witness removal throws", async () => {
+    const child = hangingChild();
+    const controller = new AbortController();
+    const witnessStore = {
+      add: vi.fn(),
+      remove: vi.fn(() => { throw new Error("remove failed"); }),
+      path: "/tmp/witness",
+    };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+    }, controller.signal);
+    controller.abort("cancelled");
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+  });
+
   it("fails closed when a detached group survives intentional TERM and KILL", async () => {
     vi.useFakeTimers();
     try {
