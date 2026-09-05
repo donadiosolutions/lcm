@@ -36,6 +36,7 @@ import {
   createSingleFlightOperation,
   discoverHarnessRuns,
   harnessErrorDetails,
+  harnessDirectoryFromRecord,
   isValidProcessBirthFingerprint,
   isMissingDockerObjectError,
   ownershipLabels,
@@ -70,6 +71,47 @@ function missingContainerError(name: string) {
 }
 
 describe("PostgreSQL harness utilities", () => {
+  it("authenticates owned harness directories under finite fallback parents", () => {
+    const record = {
+      Mounts: [{
+        Destination: "/run/lcm-harness",
+        Type: "bind",
+        RW: false,
+        Source: "/var/tmp/lcm-postgresql-harness-owned",
+      }],
+    };
+    const realpath = (path: string) => path;
+    expect(harnessDirectoryFromRecord(record, {
+      environment: {},
+      candidateParents: ["/var/tmp", "/unrelated"],
+      realpath,
+    })).toBe("/var/tmp/lcm-postgresql-harness-owned");
+    expect(harnessDirectoryFromRecord(record, {
+      environment: {},
+      candidateParents: ["/unrelated"],
+      realpath,
+    })).toBeUndefined();
+  });
+
+  it("uses the explicit nested harness parent and rejects outer worker scratch", () => {
+    const realpath = (path: string) => path;
+    const mount = (source: string) => ({ Mounts: [{
+      Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+    }] });
+    const environment = {
+      LCM_TEST_HARNESS_TMPDIR: "/original",
+      TMPDIR: "/worker-scratch",
+    };
+    expect(harnessDirectoryFromRecord(mount("/original/lcm-postgresql-harness-owned"), {
+      environment,
+      realpath,
+    })).toBe("/original/lcm-postgresql-harness-owned");
+    expect(harnessDirectoryFromRecord(mount("/worker-scratch/lcm-postgresql-harness-owned"), {
+      environment,
+      realpath,
+    })).toBeUndefined();
+  });
+
   it("resolves a bounded signal-probe readiness timeout", () => {
     expect(resolveSignalProbeReadinessTimeout({})).toBe(
       DEFAULT_SIGNAL_PROBE_READINESS_TIMEOUT_MS,

@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { inject } from "vitest";
 import { RUNTIME_HOME_ROOT_CONTEXT } from "./runtime-home-global.js";
@@ -10,6 +10,7 @@ type RuntimeHomeState = {
   realUserProfile: string | undefined;
   runtimeHomeRoot: string;
   testHome: string;
+  workerTemp: string;
 };
 
 const globals = globalThis as typeof globalThis & {
@@ -23,12 +24,14 @@ if (!globals[stateKey] || globals[stateKey].runtimeHomeRoot !== runtimeHomeRoot)
   const workerId = (process.env.VITEST_POOL_ID ?? process.env.VITEST_WORKER_ID ?? "main")
     .replace(/[^A-Za-z0-9_-]/gu, "_");
   const testHome = join(runtimeHomeRoot, `worker-${process.pid}-${workerId}`);
+  const workerTemp = join(runtimeHomeRoot, `worker-tmp-${process.pid}-${workerId}`);
 
   globals[stateKey] = {
     realHome,
     realUserProfile,
     runtimeHomeRoot,
     testHome,
+    workerTemp,
   };
 }
 
@@ -38,7 +41,12 @@ process.env.LCM_TEST_REAL_USERPROFILE = state.realUserProfile ?? "";
 process.env.LCM_TEST_HOME = state.testHome;
 process.env.HOME = state.testHome;
 process.env.USERPROFILE = state.testHome;
+process.env.TMPDIR = state.workerTemp;
+process.env.TMP = state.workerTemp;
+process.env.TEMP = state.workerTemp;
 
 mkdirSync(join(state.testHome, ".lcm"), { recursive: true });
 mkdirSync(join(state.testHome, ".claude"), { recursive: true });
 mkdirSync(join(state.testHome, ".codex"), { recursive: true });
+mkdirSync(state.workerTemp, { recursive: true, mode: 0o700 });
+chmodSync(state.workerTemp, 0o700);

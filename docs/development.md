@@ -77,6 +77,33 @@ integration files run only through `pnpm run test:postgresql`; see
 [PostgreSQL development](../src/storage/postgresql/reference/postgresql-development.md)
 for the isolated container prerequisites and lifecycle.
 
+## Test scratch isolation
+
+Vitest setup selects a private temporary parent whose canonical ancestor chain
+has no `.git` marker. It checks the caller's temporary directory first, then
+the platform fallbacks (`/var/tmp` and `/tmp` on POSIX; the configured Windows
+temporary locations). A marker of any type, including an empty or malformed
+`.git` directory, excludes that parent. Probe errors and realpath failures are
+treated as unverifiable, so setup reports the explicit
+`LCM_TEST_VITEST_RUNTIME_ROOT_PARENT` error instead of silently falling back.
+
+Each run owns one mode-0700 root. Forked workers create a home directory and a
+sibling temporary directory below that root before test modules load, and set
+`TMPDIR`, `TMP`, and `TEMP` to the sibling. The PostgreSQL harness uses the
+same selector and passes its selected parent to nested children through the
+development-only `LCM_TEST_HARNESS_TMPDIR` handoff. Cleanup removes only roots
+created by the current run.
+
+Vitest config-time roots (`createVitestRunRoot` in `vitest.config.ts` and
+`postgresqlVitestCacheDir` in `vitest.postgresql.config.ts`) are resolved before
+setup files run, so cache, coverage, and JUnit output may remain below the
+caller's temporary directory. They are never passed to
+`resolveGitProjectAnchor`; `LCM_TEST_ARTIFACT_ROOT` retains its existing fresh
+leaf rules. `cleanupOrphanedProjects` is scoped to the redirected temporary
+directory and therefore does not sweep pre-existing orphans in the ambient
+temporary root. On a host with a valid ambient `.git`, tests no longer share
+that repository identity.
+
 The consumer verifier builds through pnpm, then uses npm to pack and install
 ordinary and conflicting consumers outside the repository configuration tree.
 It verifies the package that npm users receive, including the Node CLI and

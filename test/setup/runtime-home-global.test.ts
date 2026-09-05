@@ -1,4 +1,15 @@
-import { basename, dirname } from "node:path";
+import { execFileSync } from "node:child_process";
+import {
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { describe, expect, inject, it, vi } from "vitest";
 import {
   RUNTIME_HOME_ROOT_CONTEXT,
@@ -13,6 +24,11 @@ describe("Vitest runtime-home global lifecycle", () => {
     expect(home).toBeDefined();
     expect(dirname(home!)).toBe(root);
     expect(basename(home!)).toMatch(/^worker-[0-9]+-[A-Za-z0-9_-]+$/u);
+    expect(process.env.TMPDIR).toBe(process.env.TMP);
+    expect(process.env.TMP).toBe(process.env.TEMP);
+    expect(dirname(process.env.TMPDIR!)).toBe(root);
+    expect(basename(process.env.TMPDIR!)).toMatch(/^worker-tmp-[0-9]+-[A-Za-z0-9_-]+$/u);
+    expect(lstatSync(process.env.TMPDIR!).mode & 0o777).toBe(0o700);
   });
 
   it("provides one secure run root and removes it during global teardown", () => {
@@ -57,6 +73,8 @@ describe("Vitest runtime-home global lifecycle", () => {
       secureDirectory,
       removeDirectory,
       environment: { LCM_TEST_VITEST_RUNTIME_ROOT_PARENT: "/private/harness" },
+      realpath: (path) => path,
+      markerProbe: () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
     };
 
     const firstTeardown = createRuntimeHomeRun({ provide }, dependencies);
@@ -117,6 +135,8 @@ describe("Vitest runtime-home global lifecycle", () => {
       environment: {
         LCM_TEST_VITEST_RUNTIME_ROOT_PARENT: "/private/harness",
       },
+      realpath: (path) => path,
+      markerProbe: () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
       temporaryRoot: () => {
         throw new Error("the ambient temporary root must not be used");
       },
@@ -128,5 +148,60 @@ describe("Vitest runtime-home global lifecycle", () => {
       "/private/harness/lcm-vitest-run-unique",
     );
     expect(teardown).toBeTypeOf("function");
+  });
+
+  it("fails clearly for an explicit contaminated parent without fallback", () => {
+    expect(() => createRuntimeHomeRun({ provide: vi.fn() }, {
+      environment: { LCM_TEST_VITEST_RUNTIME_ROOT_PARENT: "/private/harness" },
+      realpath: (path) => path,
+      markerProbe: () => ({}),
+    })).toThrow(/LCM_TEST_VITEST_RUNTIME_ROOT_PARENT/iu);
+  });
+
+  it("proves a child Vitest run relocates all runtime scratch below a clean parent", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "lcm-bug-840-fixture-"));
+    const marker = join(fixture, ".git");
+    const markerBytes = "synthetic malformed marker\n";
+    mkdirSync(marker, { mode: 0o755 });
+    writeFileSync(join(marker, "sentinel"), markerBytes, { mode: 0o600 });
+    const childSpec = join(process.cwd(), "test", `.bug840-acceptance-${process.pid}.test.ts`);
+    const resultPath = join(fixture, "result.json");
+    writeFileSync(childSpec, `
+import { existsSync, writeFileSync } from "node:fs";
+import { relative, resolve } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { createHarness } from ${JSON.stringify(join(process.cwd(), "test/e2e/harness.ts"))};
+const resultPath = ${JSON.stringify(resultPath)};
+describe("Bug840 child acceptance", () => {
+  let handle;
+  afterEach(async () => { await handle?.cleanup(); });
+  it("keeps the harness outside the malformed fixture", async () => {
+    handle = await createHarness("mock");
+    const rel = relative(resolve(${JSON.stringify(fixture)}), resolve(handle.tmpDir));
+    const health = await handle.client.health();
+    writeFileSync(resultPath, JSON.stringify({ health, outside: !rel || rel.startsWith("..") }));
+    expect(health.status).toBe("ok");
+    expect(rel === "" || rel.startsWith("..")).toBe(true);
+  });
+});
+`, { mode: 0o600 });
+    const childEnvironment = { ...process.env };
+    delete childEnvironment.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT;
+    delete childEnvironment.LCM_TEST_HARNESS_TMPDIR;
+    childEnvironment.TMPDIR = fixture;
+    childEnvironment.TMP = fixture;
+    childEnvironment.TEMP = fixture;
+    try {
+      execFileSync(process.execPath, [
+        "node_modules/vitest/vitest.mjs", "run", "--config", "vitest.config.ts", childSpec,
+      ], { cwd: process.cwd(), env: childEnvironment, stdio: "pipe" });
+      expect(JSON.parse(readFileSync(resultPath, "utf8"))).toMatchObject({ health: { status: "ok" }, outside: true });
+      expect(lstatSync(marker).isDirectory()).toBe(true);
+      expect(readFileSync(join(marker, "sentinel"), "utf8")).toBe(markerBytes);
+      expect([...readdirSync(fixture)].filter((entry) => entry.startsWith("lcm-") && entry !== ".git")).toEqual([]);
+    } finally {
+      rmSync(childSpec, { force: true });
+      rmSync(fixture, { recursive: true, force: true });
+    }
   });
 });
