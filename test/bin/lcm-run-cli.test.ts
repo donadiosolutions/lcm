@@ -589,6 +589,18 @@ describe("runCli registration and help dispatch", () => {
     expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
   });
 
+  it("does not write stdout when a sensitive read has an empty result", async () => {
+    state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+    state.sensitiveStdout = "";
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      expect((await invoke(["sensitive", "list"]))?.message).toBe("exit:0");
+      expect(output).not.toHaveBeenCalled();
+    } finally {
+      state.sensitiveStdout = "sensitive";
+    }
+  });
+
   it("retries project list and show preparation while preserving one result", async () => {
     state.createInstallerPublicationConvergence.mockImplementation(async () => makeTestConvergence());
     state.listProjects.mockImplementationOnce(() => { throw new PrivateMutationLockContentionError("busy"); })

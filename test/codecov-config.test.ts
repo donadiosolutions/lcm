@@ -484,7 +484,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(208);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#722 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#866/#722 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -503,7 +503,10 @@ describe("Codecov configuration", () => {
       ["src/home-parent-auth.ts", "unit-configuration-security"],
       ["src/runtime-paths.ts", "unit-configuration-security"],
       ["src/security-files.ts", "unit-configuration-security"],
+      ["src/sensitive.ts", "unit-configuration-security"],
       ["src/project-map.ts", "unit-project-worktrees"],
+      ["src/portable-knowledge.ts", "unit-project-worktrees"],
+      ["src/stats.ts", "unit-memory-retrieval"],
       ["src/connectors/codex-hooks.ts", "unit-connectors"],
       ["src/connectors/installer.ts", "unit-connectors"],
       ["installer/install.ts", "unit-installation"],
