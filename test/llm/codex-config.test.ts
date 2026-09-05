@@ -80,6 +80,35 @@ function hangingChild(): FakeChild {
   return child;
 }
 
+function childWithForcedGroupCleanup(configValue: unknown): {
+  child: FakeChild;
+  isGroupAlive: () => boolean;
+  killProcess: ReturnType<typeof vi.fn>;
+} {
+  const child = hangingChild();
+  child.stdin.removeAllListeners("data");
+  let groupAlive = true;
+  child.stdin.on("data", (chunk) => {
+    const requests = chunk.toString().trim().split("\n").map(line => JSON.parse(line) as { method?: string });
+    for (const request of requests) {
+      if (request.method === "initialize") {
+        child.stdout.write(`${JSON.stringify({ id: 1, result: {} })}\n`);
+      } else if (request.method === "config/read") {
+        const config = configValue === undefined ? {} : { openai_base_url: configValue };
+        child.stdout.write(`${JSON.stringify({ id: 2, result: { config } })}\n`);
+        child.stdout.end();
+      }
+    }
+  });
+  const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+    if (signal === "SIGKILL") {
+      groupAlive = false;
+      child.emit("close", null, "SIGKILL");
+    }
+  });
+  return { child, isGroupAlive: () => groupAlive, killProcess };
+}
+
 describe("resolveCodexOpenAIBaseUrl", () => {
   it("covers strict framing and URL normalization edges", () => {
     const utils = __codexConfigTestUtils;
@@ -199,6 +228,69 @@ describe("resolveCodexOpenAIBaseUrl", () => {
       .resolves.toBeUndefined();
   });
 
+  it("preserves a validated endpoint after TERM is ignored and KILL settles the owned group", async () => {
+    vi.useFakeTimers();
+    try {
+      const forced = childWithForcedGroupCleanup("https://forced.example/v1/");
+      const { child, isGroupAlive, killProcess } = forced;
+      const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+      let outcome: string | undefined;
+      const pending = resolveCodexOpenAIBaseUrl({
+        spawn: spawnFor(child),
+        platform: "linux",
+        processBirthTime: () => "birth",
+        processGroupId: 8124,
+        daemonProcessGroupId: 8122,
+        processGroupIdProbe: () => 8124,
+        isProcessGroupAlive: isGroupAlive,
+        killProcess,
+        timeoutMs: 20_000,
+        daemonInstanceId: "daemon",
+        witnessStore,
+      }).then(value => { outcome = value; return value; });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(killProcess).toHaveBeenCalledWith(-8124, "SIGTERM");
+      expect(outcome).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(killProcess).not.toHaveBeenCalledWith(-8124, "SIGKILL");
+      expect(outcome).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(pending).resolves.toBe("https://forced.example/v1/responses");
+      expect(killProcess).toHaveBeenCalledWith(-8124, "SIGKILL");
+      expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves absent and null defaults after forced cleanup", async () => {
+    vi.useFakeTimers();
+    try {
+      for (const configValue of [undefined, null]) {
+        const { child, isGroupAlive, killProcess } = childWithForcedGroupCleanup(configValue);
+        const pending = resolveCodexOpenAIBaseUrl({
+          spawn: spawnFor(child),
+          platform: "linux",
+          processBirthTime: () => "birth",
+          processGroupId: 8124,
+          daemonProcessGroupId: 8122,
+          processGroupIdProbe: () => 8124,
+          isProcessGroupAlive: isGroupAlive,
+          killProcess,
+          timeoutMs: 20_000,
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(killProcess).toHaveBeenCalledWith(-8124, "SIGTERM");
+        await vi.advanceTimersByTimeAsync(2_000);
+        await expect(pending).resolves.toBeUndefined();
+        expect(killProcess).toHaveBeenCalledWith(-8124, "SIGKILL");
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("fails closed for malformed, sensitive, and non-http URLs", async () => {
     for (const value of ["not a url", "https://[", "file:///tmp/x", "https://user:pass@example.test", "https://example.test/x?q=1"]) {
       const child = childWithProtocol([
@@ -214,6 +306,13 @@ describe("resolveCodexOpenAIBaseUrl", () => {
     const child = childWithProtocol([]);
     child.stdin.removeAllListeners("data");
     child.stdin.on("data", () => { child.stdout.end(); child.emit("close", 0); });
+    await expect(resolveCodexOpenAIBaseUrl({ spawn: spawnFor(child), processBirthTime: () => "birth" }))
+      .rejects.toThrow("codex endpoint resolution failed");
+  });
+
+  it("rejects a nonzero close before a valid config response", async () => {
+    const child = hangingChild();
+    child.stdin.on("data", () => { child.stdout.end(); child.emit("close", 2); });
     await expect(resolveCodexOpenAIBaseUrl({ spawn: spawnFor(child), processBirthTime: () => "birth" }))
       .rejects.toThrow("codex endpoint resolution failed");
   });
@@ -352,7 +451,7 @@ describe("resolveCodexOpenAIBaseUrl", () => {
       nonzero.emit("close", 2);
     });
     await expect(resolveCodexOpenAIBaseUrl({ spawn: spawnFor(nonzero), processBirthTime: () => "birth" }))
-      .rejects.toThrow("codex endpoint resolution failed");
+      .resolves.toBeUndefined();
   });
 
   it("fails closed when the app-server stdin or teardown setup fails", async () => {
