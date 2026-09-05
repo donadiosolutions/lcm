@@ -33,6 +33,18 @@ export type SearchLayer = (typeof CANONICAL_SEARCH_LAYERS)[number];
 export type SearchLayerInput = SearchLayer | "semantic";
 export const DEFAULT_SEARCH_LAYERS = CANONICAL_SEARCH_LAYERS;
 
+/** Default maximum number of results returned by each search layer. */
+export const DEFAULT_SEARCH_RESULT_LIMIT = 5;
+/** Maximum result limit accepted at the search operation boundary. */
+export const MAX_SEARCH_RESULT_LIMIT = 1000;
+
+/** Normalize a search result limit, rejecting malformed values before storage access. */
+export function normalizeSearchLimit(input: unknown): number | null {
+  if (input === undefined) return DEFAULT_SEARCH_RESULT_LIMIT;
+  if (typeof input !== "number" || !Number.isInteger(input)) return null;
+  return input >= 1 && input <= MAX_SEARCH_RESULT_LIMIT ? input : null;
+}
+
 /** Canonical conversation-history scopes exposed by grep operations. */
 export const CANONICAL_GREP_SCOPES = Object.freeze(["messages", "summaries", "both"] as const);
 export type GrepScope = (typeof CANONICAL_GREP_SCOPES)[number];

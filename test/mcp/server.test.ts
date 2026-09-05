@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { __lcmMcpTestHooks, getMcpToolDefinitions, handleDaemonRequest } from "../../src/mcp/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import * as storageBackend from "../../src/storage/backend.js";
+import { DEFAULT_SEARCH_RESULT_LIMIT, MAX_SEARCH_RESULT_LIMIT } from "../../src/retrieval.js";
 
 const ensureDaemonMcpMock = vi.hoisted(() => vi.fn().mockResolvedValue({ connected: true, port: 9999, spawned: false }));
 
@@ -73,6 +74,12 @@ describe("MCP tool definitions", () => {
     const grep = getMcpToolDefinitions().find((t: any) => t.name === "lcm_grep") as any;
     expect(search.inputSchema.properties.layers.items.enum).toEqual(["episodic", "promoted"]);
     expect(search.inputSchema.properties.layers.default).toEqual(["episodic", "promoted"]);
+    expect(search.inputSchema.properties.limit).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      maximum: MAX_SEARCH_RESULT_LIMIT,
+      default: DEFAULT_SEARCH_RESULT_LIMIT,
+    });
     expect(grep.inputSchema.properties.scope.enum).toEqual(["messages", "summaries", "both"]);
     expect(grep.inputSchema.properties.scope.default).toBe("both");
     expect(grep.inputSchema.properties.mode.enum).toEqual(["full_text", "regex"]);
