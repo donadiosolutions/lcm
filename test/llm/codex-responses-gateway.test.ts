@@ -752,11 +752,12 @@ describe("Codex Responses zero-tools gateway", () => {
     gateways.push(gateway);
 
     const response = await fetchGateway(gateway);
+    const responseBody = await response.text();
     expect(response.status).toBe(502);
-    expect(await response.text()).toBe("codex responses gateway request failed\n");
+    expect(responseBody).toBe("codex responses gateway request failed\n");
     expect(gateway.upstreamFailureCategory).toBe(category);
-    expect(JSON.stringify({ status: response.status, body: "codex responses gateway request failed\n" }))
-      .not.toContain("upstream-secret");
+    expect(responseBody).not.toContain("upstream-secret");
+    expect(responseBody).not.toContain("GPT-5.3-Codex-Spark");
   });
 
   it("does not classify a network-level upstream failure", async () => {

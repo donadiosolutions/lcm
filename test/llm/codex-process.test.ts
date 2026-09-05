@@ -1124,6 +1124,9 @@ describe("createCodexProcessSummarizer", () => {
   it.each([
     ["usage", "You've hit your usage limit for GPT-5.3-Codex-Spark. Try again at 4:27 AM."],
     ["usage", "rate-limit reached"],
+    ["usage", "rate limit reached"],
+    ["usage", "usage-limit reached"],
+    ["authentication", "not logged in"],
     ["authentication", "authentication required"],
     ["authentication", "invalid API key"],
     ["model", "unsupported model"],
@@ -1149,6 +1152,32 @@ describe("createCodexProcessSummarizer", () => {
     if (category === "authentication") expect(error.message).toMatch(/authentication|sign in/i);
     if (category === "model") expect(error.message).toMatch(/model|supported/i);
     if (category === "invalid-request") expect(error.message).toMatch(/invalid|compatibility/i);
+  });
+
+  it.each([
+    ["true", true],
+    ["false", false],
+  ] as const)("keeps defined %s controls in classified guidance", async (_label, fastMode) => {
+    const child = makeChild(1, "usage limit");
+    const error = await createCodexProcessSummarizer({
+      ...baseDeps(child),
+      model: "gpt-5.4",
+      reasoningEffort: "high",
+      fastMode,
+    })("text", false).catch((caught: unknown) => caught as Error);
+    expect(error.message).toMatch(/^Codex compaction reached a usage limit\./);
+    expect(error.message).toContain('model "gpt-5.4"');
+    expect(error.message).toContain('reasoning effort "high"');
+    expect(error.message).toContain(`fast mode ${fastMode}`);
+  });
+
+  it.each([
+    "limit", "token", "error", "model", "limitation", "rate limiting", "rate limited",
+    "usage limits", "unknown flags", "model is not availables", "not logged into",
+  ])("keeps lookalike diagnostic %s on the compatibility fallback", async (diagnostic) => {
+    const child = makeChild(1, diagnostic);
+    await expect(createCodexProcessSummarizer(baseDeps(child))("text", false))
+      .rejects.toThrow("Upgrade the Codex CLI");
   });
 
   it("uses fixed precedence across the complete stderr window", async () => {
@@ -1219,6 +1248,34 @@ describe("createCodexProcessSummarizer", () => {
     expect(error.message).toContain("Upgrade the Codex CLI");
   });
 
+  it("classifies a trailing phrase in an oversized Buffer chunk", async () => {
+    const child = makeHangingChild();
+    const spawn = vi.fn().mockReturnValue(child);
+    const pending = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    })("text", false);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.stderr.emit("data", Buffer.concat([Buffer.alloc(20_000, "x"), Buffer.from(" usage limit")]));
+    child.emit("close", 1);
+    const error = await pending.catch((caught: unknown) => caught as Error);
+    expect(error.message).toMatch(/^Codex compaction reached a usage limit\./);
+  });
+
+  it("drains a paused same-tick stderr write after attaching the listener", async () => {
+    const child = makeHangingChild();
+    child.stderr.write("usage limit");
+    const spawn = vi.fn().mockReturnValue(child);
+    const pending = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    })("text", false);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.emit("close", 1);
+    const error = await pending.catch((caught: unknown) => caught as Error);
+    expect(error.message).toMatch(/^Codex compaction reached a usage limit\./);
+  });
+
   it("falls back when a known diagnostic is pushed out of the 16 KiB terminal window", async () => {
     const child = makeChild(1, `usage limit${"x".repeat(16 * 1024)}`);
     const error = await createCodexProcessSummarizer(baseDeps(child))("text", false)
@@ -1238,6 +1295,47 @@ describe("createCodexProcessSummarizer", () => {
     } as never)("text", false).catch((caught: unknown) => caught as Error);
     expect(error.message).not.toContain("Upgrade the Codex CLI");
     expect(error.message).toMatch(category === "usage" ? /usage limit/i : /authentication|sign in/i);
+  });
+
+  it("preserves gateway category precedence across abort, timeout, and success", async () => {
+    const successGateway = makeGateway({ upstreamFailureCategory: "usage" });
+    await expect(createCodexProcessSummarizer({
+      ...baseDeps(makeChild(0)),
+      _createGateway: vi.fn().mockResolvedValue(successGateway),
+    })("text", false)).resolves.toBe("summary");
+
+    const controller = new AbortController();
+    const abortChild = makeHangingChild();
+    abortChild.kill.mockImplementation(() => { abortChild.emit("close", null); });
+    const abortSpawn = vi.fn().mockReturnValue(abortChild);
+    const abortPending = createCodexProcessSummarizer({
+      ...baseDeps(abortChild),
+      spawn: abortSpawn as unknown as SpawnFn,
+      _createGateway: vi.fn().mockResolvedValue(makeGateway({ upstreamFailureCategory: "usage" })),
+    })("text", false, { signal: controller.signal });
+    await vi.waitFor(() => expect(abortSpawn).toHaveBeenCalledOnce());
+    controller.abort();
+    await expect(abortPending).rejects.toSatisfy(error => isAbortError(error));
+  });
+
+  it("preserves gateway category precedence on timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeHangingChild();
+      child.kill.mockImplementation(() => { child.emit("close", null); });
+      const gateway = makeGateway({ upstreamFailureCategory: "authentication" });
+      const pending = createCodexProcessSummarizer({
+        ...baseDeps(child),
+        timeoutMs: 1,
+        _createGateway: vi.fn().mockResolvedValue(gateway),
+      })("text", false);
+      const observed = pending.then(() => undefined, error => error);
+      await vi.waitFor(() => expect(child.stdin.listenerCount("error")).toBeGreaterThan(0));
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(observed).resolves.toMatchObject({ message: expect.stringMatching(/timed out/) });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps classified controls and known evidence for a null exit", async () => {
