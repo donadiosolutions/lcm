@@ -72,9 +72,168 @@ describe("sanitizeError", () => {
     expect(sanitizeError(input)).toBe(expected);
   });
 
+  const hostedFileUrlCases = [
+    {
+      input: "file://remote.invalid/Users/canary/private.db",
+      expected: "file://remote.invalid<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://remote.invalid//Users/canary/private.db",
+      expected: "file://remote.invalid<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://remote.invalid/C:/Users/canary/private.db",
+      expected: "file://remote.invalid<path>",
+      absent: ["C:", "Users", "canary", "private.db"],
+    },
+    {
+      input: "file://remote.invalid/C:\\Users\\canary\\private.db",
+      expected: "file://remote.invalid<path>",
+      absent: ["C:", "Users", "canary", "private.db"],
+    },
+    {
+      input: "file://localhost/C:/Users/canary/private.db",
+      expected: "file://localhost<path>",
+      absent: ["C:", "Users", "canary", "private.db"],
+    },
+    {
+      input: "file:///C:/Users/canary/private.db",
+      expected: "file://<path>",
+      absent: ["C:", "Users", "canary", "private.db"],
+    },
+    {
+      input: "file:///C:/",
+      expected: "file://<path>",
+      absent: ["C:"],
+    },
+    {
+      input: "FILE://REMOTE.INVALID/Users/canary/private.db",
+      expected: "FILE://REMOTE.INVALID<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: `file://${"authority".repeat(24)}.invalid/Users/canary/private.db`,
+      expected: `file://${"authority".repeat(24)}.invalid<path>`,
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://[fe80::1%25eth0]/Users/canary/private.db",
+      expected: "file://[fe80::1%25eth0]<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://remote.invalid\\Users\\canary\\private.db",
+      expected: "file://remote.invalid<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://remote.invalid\\\\C:\\Users\\canary\\private.db",
+      expected: "file://remote.invalid<path>",
+      absent: ["C:", "Users", "canary", "private.db"],
+    },
+    {
+      input: "'file://remote.invalid/Users/canary/My Files/private.db'",
+      expected: "'file://remote.invalid<path>'",
+      absent: ["Users", "canary", "My Files", "private.db"],
+    },
+    {
+      input: '\"file://remote.invalid/C:/Users/canary/My Files/private.db\"',
+      expected: '\"file://remote.invalid<path>\"',
+      absent: ["C:", "Users", "canary", "My Files", "private.db"],
+    },
+    {
+      input: "'file://remote.invalid/Users/canary/My Files/private.db",
+      expected: "'file://remote.invalid<path>",
+      absent: ["Users", "canary", "My Files", "private.db"],
+    },
+    {
+      input: "'file://remote.invalid/Users/canary/My Files\ncontinued",
+      expected: "'file://remote.invalid<path>\ncontinued",
+      absent: ["Users", "canary", "My Files"],
+    },
+    {
+      input:
+        '\"file://one.invalid/Users/canary/One File\"\"file://two.invalid/Users/canary/Two File\"',
+      expected: '\"file://one.invalid<path>\"\"file://two.invalid<path>\"',
+      absent: ["Users", "canary", "One File", "Two File"],
+    },
+    {
+      input: "file://C:/Users/canary/private.db",
+      expected: "file://C:<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+  ] as const;
+
+  it.each(hostedFileUrlCases)("redacts hosted file URL paths: $input", ({ input, expected, absent }) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    for (const component of absent) expect(result).not.toContain(component);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["xfile:///Users/canary/private.db", "xfile://<path>"],
+    ["profile://localhost/Users/canary/private.db", "profile://localhost<path>"],
+    ["xfile://remote.invalid/Users/canary/private.db", "xfile://remote.invalid/Users/canary/private.db"],
+    [
+      "profile://remote.invalid/Users/canary/private.db",
+      "profile://remote.invalid/Users/canary/private.db",
+    ],
+    ["file://", "file://"],
+    ["file://localhost", "file://localhost"],
+    ["file:///", "file:///"],
+    ["file://remote.invalid/", "file://remote.invalid/"],
+    ["file://remote.invalid//", "file://remote.invalid//"],
+    ["https://example.test/Users/canary/private.db", "https://example.test/Users/canary/private.db"],
+    ["https://[fe80::1%25eth0]/Users/canary/private.db", "https://[fe80::1%25eth0]/Users/canary/private.db"],
+    ["prefix=https://example.test/x", "prefix=https://example.test/x"],
+    [
+      "https://one.invalid/x,https://two.invalid/y,/Users/canary/private.db",
+      "https://one.invalid/x,https://two.invalid/y,<path>",
+    ],
+    [
+      "file://remote.invalid/Users/canary/private.db: retry https://example.test/x",
+      "file://remote.invalid<path>: retry https://example.test/x",
+    ],
+    [
+      "file://remote.invalid/Users/canary/My Files/private.db",
+      "file://remote.invalid<path> Files/private.db",
+    ],
+    [
+      "file://remote.invalid/Reports:2024/private.db",
+      "file://remote.invalid<path>:2024/private.db",
+    ],
+  ] as const)("preserves file URL compatibility boundary %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    [
+      "file://remote.invalid/Users/canary/private.db?next=/etc/private.db",
+      "file://remote.invalid<path>?next=/etc/private.db",
+      "file://remote.invalid<path>?next=<path>",
+    ],
+    [
+      "file://remote.invalid/Users/canary/private.db#next=/etc/private.db",
+      "file://remote.invalid<path>#next=/etc/private.db",
+      "file://remote.invalid<path>#next=<path>",
+    ],
+  ] as const)("redacts file URL delimiter residuals monotonically %#", (input, firstPass, secondPass) => {
+    expect(sanitizeError(input)).toBe(firstPass);
+    expect(sanitizeError(firstPass)).toBe(secondPass);
+    expect(sanitizeError(secondPass)).toBe(secondPass);
+  });
+
   it("bounds URL authority classification work by input length", () => {
-    const path = Array.from({ length: 128 }, (_, index) => `segment-${index}`).join("/");
-    const input = `request failed for https://example.test/${path}`;
+    const authority = `${"host-segment".repeat(64)}.invalid`;
+    const path = Array.from({ length: 256 }, (_, index) => `segment-${index}`).join("/");
+    const input = `request failed for file://${authority}/${path}`;
     const originalTest = RegExp.prototype.test;
     let whitespaceChecks = 0;
     const testSpy = vi.spyOn(RegExp.prototype, "test").mockImplementation(function (value: string): boolean {
@@ -89,7 +248,8 @@ describe("sanitizeError", () => {
       testSpy.mockRestore();
     }
 
-    expect(result).toBe(input);
+    expect(result).toBe(`request failed for file://${authority}<path>`);
+    expect(result).not.toContain("segment-0");
     expect(whitespaceChecks).toBeLessThanOrEqual(Array.from(input).length);
   });
 
