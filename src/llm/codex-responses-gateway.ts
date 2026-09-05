@@ -82,6 +82,8 @@ export type CodexResponsesGatewayOptions = {
   _randomBytes?: RandomBytesFn;
 };
 
+export type CodexResponsesGatewayFailureCategory = "usage" | "authentication";
+
 export type CodexResponsesGateway = {
   /** Base URL ending at the private capability path; append `/responses`. */
   readonly baseUrl: string;
@@ -91,6 +93,8 @@ export type CodexResponsesGateway = {
   readonly requestAccepted: boolean;
   /** True only after the complete successful upstream SSE stream was relayed. */
   readonly requestCompleted: boolean;
+  /** Optional provider failure category latched from an upstream HTTP status. */
+  readonly upstreamFailureCategory?: CodexResponsesGatewayFailureCategory;
   /** Wait for the one accepted request and complete upstream stream. */
   waitForCompletion(): Promise<void>;
   /** Stop listening, abort active upstream requests, and await closure. */
@@ -632,6 +636,7 @@ export async function createCodexResponsesGateway(
   let requestSeen = false;
   let requestAccepted = false;
   let requestCompleted = false;
+  let upstreamFailureCategory: CodexResponsesGatewayFailureCategory | undefined;
   let closed = false;
   let completionSettled = false;
   let closePromise: Promise<void> | undefined;
@@ -724,6 +729,8 @@ export async function createCodexResponsesGateway(
       }
       upstreamBody = upstream.body;
       if (!upstream.ok) {
+        if (upstream.status === 429) upstreamFailureCategory = "usage";
+        else if (upstream.status === 401) upstreamFailureCategory = "authentication";
         throw new GatewayInputError(502);
       }
       if (upstream.body === null) {
@@ -801,6 +808,9 @@ export async function createCodexResponsesGateway(
     },
     get requestCompleted() {
       return requestCompleted;
+    },
+    get upstreamFailureCategory() {
+      return upstreamFailureCategory;
     },
     waitForCompletion: () => completion,
     close: () => {

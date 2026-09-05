@@ -6,6 +6,7 @@ import type { LcmSummarizeFn, SummarizeContext } from "./types.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, type CodexProcessReasoningEffort } from "../daemon/config.js";
 import {
   createOwnedProcessTeardown,
+  boundedModelForDisplay,
   normalizeProcessBirthTime,
   createProcessCompatibilityError,
   type ProviderProcessWitness,
@@ -21,6 +22,7 @@ import { processStartTime } from "../private-mutation-lock.js";
 import {
   createCodexResponsesGateway,
   type CodexResponsesGateway,
+  type CodexResponsesGatewayFailureCategory,
   type CodexResponsesGatewayOptions,
 } from "./codex-responses-gateway.js";
 import {
@@ -57,6 +59,57 @@ export type CodexProcessDeps = {
 };
 
 const CODEX_BOOTSTRAP = "LCM compaction bootstrap.\n";
+const MAX_CODEX_STDERR_BYTES = 16 * 1024;
+
+const CODEX_FAILURE_MESSAGES: Readonly<Record<"usage" | "authentication" | "model" | "invalid-request", string>> = {
+  usage: "Codex compaction reached a usage limit. Wait and retry, or choose another available model.",
+  authentication: "Codex compaction authentication failed. Sign in again or check your authentication.",
+  model: "Codex compaction model is unavailable. Select an accessible supported model.",
+  "invalid-request": "Codex compaction request is invalid. Check the model, controls, or CLI compatibility.",
+};
+
+type CodexStderrFailureCategory = keyof typeof CODEX_FAILURE_MESSAGES;
+
+function normalizeCodexStderr(text: string): string {
+  return text.toLowerCase().replace(/\s+/gu, " ").trim();
+}
+
+function containsCodexPhrase(text: string, phrase: string): boolean {
+  const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&").replace(/ /gu, "\\s+");
+  return new RegExp(`(?:^|[^a-z0-9])${escaped}(?:$|[^a-z0-9])`, "u").test(text);
+}
+
+function classifyCodexStderr(stderr: string): CodexStderrFailureCategory | undefined {
+  const normalized = normalizeCodexStderr(stderr);
+  const matches = (phrases: readonly string[]): boolean => phrases.some(phrase => containsCodexPhrase(normalized, phrase));
+  if (matches(["you've hit your usage limit", "usage limit", "usage-limit", "rate limit", "rate-limit"])) {
+    return "usage";
+  }
+  if (matches(["not logged in", "authentication required", "authentication failed", "invalid api key"])) {
+    return "authentication";
+  }
+  if (matches(["unsupported model", "unknown model", "model is not available"])) {
+    return "model";
+  }
+  if (matches(["invalid request", "unexpected argument", "unknown flag"])) {
+    return "invalid-request";
+  }
+  return undefined;
+}
+
+function createCodexFailureError(
+  category: CodexStderrFailureCategory,
+  deps: { model?: string; reasoningEffort?: CodexProcessReasoningEffort; fastMode?: boolean },
+): Error {
+  const model = boundedModelForDisplay(deps.model ?? "default");
+  const reasoningEffort = deps.reasoningEffort ?? "default/omitted";
+  const fastMode = deps.fastMode === undefined ? "default/omitted" : String(deps.fastMode);
+  return new Error(
+    `${CODEX_FAILURE_MESSAGES[category]} ` +
+      `(provider codex-process, model ${JSON.stringify(model)}, ` +
+      `reasoning effort ${JSON.stringify(reasoningEffort)}, fast mode ${fastMode}; diagnostic output omitted)`,
+  );
+}
 
 function buildPrompt(text: string, aggressive: boolean | undefined, ctx: SummarizeContext): string {
   const estimatedInputTokens = Math.ceil(text.length / 4);
@@ -208,14 +261,56 @@ async function runCodexSummarizer(
     let terminalReason: "abort" | "timeout" | undefined;
     let witness: ProviderProcessWitness | undefined;
     let witnessRemoved = false;
+    let stderrWindow: Buffer[] = [];
+    let stderrWindowBytes = 0;
 
+    const onStderrData = (chunk: Buffer | string): void => {
+      try {
+        let bytes: Buffer;
+        if (Buffer.isBuffer(chunk)) {
+          bytes = chunk;
+        } else if (typeof chunk === "string") {
+          const bounded = chunk.length > MAX_CODEX_STDERR_BYTES
+            ? chunk.slice(-MAX_CODEX_STDERR_BYTES)
+            : chunk;
+          bytes = Buffer.from(bounded, "utf8");
+        } else {
+          return;
+        }
+        if (bytes.length > MAX_CODEX_STDERR_BYTES) {
+          bytes = bytes.subarray(bytes.length - MAX_CODEX_STDERR_BYTES);
+        }
+        if (bytes.length === 0) return;
+        const retained = Buffer.from(bytes);
+        stderrWindow.push(retained);
+        stderrWindowBytes += retained.length;
+        while (stderrWindowBytes > MAX_CODEX_STDERR_BYTES) {
+          const first = stderrWindow[0]!;
+          const excess = stderrWindowBytes - MAX_CODEX_STDERR_BYTES;
+          if (first.length <= excess) {
+            stderrWindow.shift();
+            stderrWindowBytes -= first.length;
+          } else {
+            stderrWindow[0] = first.subarray(excess);
+            stderrWindowBytes -= excess;
+          }
+        }
+      } catch {
+        // Diagnostics are best-effort and must never affect process settlement.
+      }
+    };
     const cleanupStreams = (): void => {
       if (child === undefined) return;
       try { child.stdin.removeAllListeners("error"); } catch { /* already closed */ }
       try { child.stdin.on("error", () => undefined); } catch { /* already closed */ }
       try { child.stdin.destroy(); } catch { /* already closed */ }
       try { child.stdout.removeAllListeners("data"); } catch { /* already closed */ }
-      try { child.stderr.removeAllListeners("data"); } catch { /* already closed */ }
+      try {
+        child.stderr.removeListener("data", onStderrData);
+        child.stderr.removeAllListeners("data");
+      } catch { /* already closed */ }
+      stderrWindow = [];
+      stderrWindowBytes = 0;
     };
 
     const cleanupChildListeners = (): void => {
@@ -370,6 +465,7 @@ async function runCodexSummarizer(
     }, deps.timeoutMs);
 
     try {
+      child.stderr.on("data", onStderrData);
       child.stdout.resume();
       child.stderr.resume();
     } catch (error) {
@@ -390,6 +486,10 @@ async function runCodexSummarizer(
       void finishRun(undefined, async () => {
         // Abort is handled by onAbort before this single-flight close callback.
         if (code !== 0) {
+          const gatewayCategory: CodexResponsesGatewayFailureCategory | undefined = activeGateway.upstreamFailureCategory;
+          const stderrCategory = classifyCodexStderr(Buffer.concat(stderrWindow, stderrWindowBytes).toString("utf8"));
+          const category = gatewayCategory ?? stderrCategory;
+          if (category !== undefined) throw createCodexFailureError(category, deps);
           throw createProcessCompatibilityError({
             cliName: "Codex",
             providerId: "codex-process",

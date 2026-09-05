@@ -969,9 +969,20 @@ The accepted values depend on the configured provider:
 OpenAI Chat Completions does not accept reasoning effort. Individual provider
 CLI versions and models may support only some otherwise valid values. LCM passes
 the control through and treats the provider as authoritative, including
-provider-accepted fallback behavior. A rejection produces a bounded diagnostic
-with the provider, model, effort, and fast-mode state; prompts and credentials
-are omitted.
+provider-accepted fallback behavior. A Codex process rejection is classified
+from a bounded terminal stderr window when it contains an explicit known
+phrase: usage or rate limit (wait and retry, or choose another available
+model), authentication failure (sign in again or check authentication), an
+unavailable model (select an accessible supported model), or an invalid
+request (check the model, controls, or CLI compatibility). Only the final
+16 KiB of stderr is retained for this best-effort classification, so an older
+diagnostic can be omitted when later output exceeds that window. Unknown,
+empty, and otherwise unrecognized failures retain the existing bounded
+compatibility diagnostic with the provider, model, effort, and fast-mode state;
+prompts, credentials, and provider response details are omitted. Codex usage
+and authentication failures observed as upstream 429 and 401 responses from
+LCM's loopback Responses gateway use the same safe categories without exposing
+provider detail.
 
 The intersection applies only to `llm.reasoningEffort` stored with
 `llm.provider: "auto"`, because that value must work for either process provider.
