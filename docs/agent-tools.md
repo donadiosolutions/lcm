@@ -119,6 +119,25 @@ normalized to `both`, but it is not advertised. The package
 `SearchResult.promoted` property matches the daemon's existing runtime
 response; the previously published `semantic` property was never populated.
 
+### HTTP `POST /recent`
+
+The daemon's `/recent` endpoint returns recent summaries for a project. Send a
+JSON object with `cwd` and an optional `limit`:
+
+```json
+{ "cwd": "/path/to/project", "limit": 5 }
+```
+
+`limit` must be a JSON number that is an integer from 1 through 1000. When it
+is omitted, the endpoint uses 5. The endpoint does not coerce strings,
+booleans, null, arrays, fractions, negative values, non-finite values, or
+values above 1000. Invalid limits receive HTTP 400 with
+`{ "error": "invalid limit" }` before `cwd` validation or storage access.
+
+For a valid limit, a missing or invalid `cwd` retains the existing empty 200
+response. Successful project requests return `{ "summaries": [...] }`; the
+daemon client rejects non-2xx responses, including an invalid-limit response.
+
 ### lcm_describe
 
 Inspect metadata and lineage of a memory node without expanding content. Returns depth, token count, parent/child links, and whether the node was promoted to long-term memory.

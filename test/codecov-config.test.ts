@@ -492,7 +492,8 @@ describe("Codecov configuration", () => {
 
     const components = validateComponents(configuredComponents(config));
     // #792 keeps grep session filtering and #794 grep-since validation in the
-    // existing route component.
+    // existing route component. #862 keeps recent limit validation in the
+    // same daemon-routes component.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     const expectedOwners = [
       ["bin/lcm.ts", "unit-cli"],
@@ -518,6 +519,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/search.ts", "unit-daemon-routes"],
       ["src/daemon/routes/grep.ts", "unit-daemon-routes"],
       ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/recent.ts", "unit-daemon-routes"],
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
       ["src/llm/codex-process.ts", "unit-llm-prompts"],
