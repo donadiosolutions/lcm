@@ -11,6 +11,7 @@ import { configPath as defaultConfigPath, projectsDir as lcmProjectsDir } from "
 import { sanitizeTerminalText } from "./terminal-sanitize.js";
 import { selectStorageBackendForConfig, StorageBackendUnavailableError } from "./storage/backend.js";
 import { BackendPublicationJournalError } from "./storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "./private-mutation-lock.js";
 
 export type { RecallStats };
 
@@ -352,7 +353,9 @@ export async function collectStats(): Promise<OverallStats> {
     const config = loadDaemonConfig(configFile);
     selectStorageBackendForConfig(configFile, config.storage);
   } catch (error) {
-    if (error instanceof BackendPublicationJournalError || error instanceof StorageBackendUnavailableError) throw error;
+    if (error instanceof BackendPublicationJournalError
+      || error instanceof StorageBackendUnavailableError
+      || error instanceof PrivateMutationLockContentionError) throw error;
     // Preserve the existing fallback for malformed configuration diagnostics.
   }
 
@@ -396,7 +399,11 @@ export async function collectStats(): Promise<OverallStats> {
       staleAfterDays: cfg.restoration.staleAfterDays,
       staleSurfacingWithoutUseLimit: cfg.restoration.staleSurfacingWithoutUseLimit,
     };
-  } catch { /* use defaults */ }
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError
+      || error instanceof PrivateMutationLockContentionError) throw error;
+    /* use defaults */
+  }
 
   for (const entry of readdirSync(baseDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;

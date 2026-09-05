@@ -50,7 +50,7 @@ const expectedComponents = [
   },
   {
     component_id: "unit-configuration-security",
-    name: "Unit - Configuration and Security",
+    name: "Unit - Configuration, Security, and Filesystem Topology",
     paths: [
       "^src/config-manager\\.ts$",
       "^src/config-projection\\.ts$",
@@ -485,7 +485,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(208);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#722/#786/#952/#814 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#866/#722/#786/#952/#814 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -500,13 +500,18 @@ describe("Codecov configuration", () => {
     // #814 fresh-root descriptor and pre-handoff content checks remain
     // configuration-security-owned.
     const expectedOwners = [
+      // #866 export admission failures and sensitive result emission stay CLI-owned.
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
       ["src/private-mutation-lock.ts", "unit-configuration-security"],
       ["src/home-parent-auth.ts", "unit-configuration-security"],
       ["src/runtime-paths.ts", "unit-configuration-security"],
       ["src/security-files.ts", "unit-configuration-security"],
+      ["src/sensitive.ts", "unit-configuration-security"],
       ["src/project-map.ts", "unit-project-worktrees"],
+      ["src/portable-knowledge.ts", "unit-project-worktrees"],
+      // #866 stats config retries and journal failures retain this owner.
+      ["src/stats.ts", "unit-memory-retrieval"],
       ["src/connectors/codex-hooks.ts", "unit-connectors"],
       ["src/connectors/installer.ts", "unit-connectors"],
       ["installer/install.ts", "unit-installation"],

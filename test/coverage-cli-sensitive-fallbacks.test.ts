@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
     storage: { backend: "sqlite" as const },
     security: { sensitivePatterns: [] as string[] },
   })),
+  privateContention: false,
   loadProjectPatterns: vi.fn(async () => [] as string[]),
   readSyncDate: vi.fn(() => "2026-07-18" as string | null),
   scrub: vi.fn((value: string) => value),
@@ -37,7 +38,17 @@ vi.mock("../src/security-files.js", async () => {
   };
 });
 
-vi.mock("../src/config-projection.js", () => ({ loadStoredConfigProjection: mocks.loadConfig }));
+vi.mock("../src/config-projection.js", async () => {
+  const { PrivateMutationLockContentionError } = await vi.importActual<typeof import("../src/private-mutation-lock.js")>("../src/private-mutation-lock.js");
+  return {
+    loadStoredConfigProjection: () => {
+    if (mocks.privateContention) {
+      throw new PrivateMutationLockContentionError("publication busy");
+    }
+    return mocks.loadConfig();
+  },
+  };
+});
 vi.mock("../src/daemon/project.js", () => ({ projectDir: (cwd: string): string => cwd }));
 vi.mock("../src/generated-patterns.js", () => ({ GITLEAKS_PATTERNS: [] }));
 vi.mock("../src/runtime-paths.js", () => ({
@@ -55,6 +66,7 @@ vi.mock("../src/scrub.js", () => ({
 
 import { handleSensitive } from "../src/sensitive.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "../src/private-mutation-lock.js";
 
 describe("sensitive configuration fallbacks", () => {
   it.each([
@@ -82,6 +94,16 @@ describe("sensitive configuration fallbacks", () => {
     });
     await expect(handleSensitive(["list"], "/isolated/project", "/isolated/config.json"))
       .rejects.toThrow("publication evidence is unresolved");
+  });
+
+  it("does not swallow private publication contention", async () => {
+    mocks.privateContention = true;
+    try {
+      await expect(handleSensitive(["list"], "/isolated/project", "/isolated/config.json"))
+        .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+    } finally {
+      mocks.privateContention = false;
+    }
   });
 
   it("treats a project pattern file disappearing after preflight as already removed", async () => {

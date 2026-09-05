@@ -55,9 +55,9 @@ terminal, completes both outputs, and then exits with status 1.
 
 ## Healthy-daemon routing
 
-The following six read commands use a migration-free preflight when the
-managed daemon is healthy. The shared preflight acquires an authenticated
-daemon client for each read:
+The following daemon reads use a migration-free preflight when the managed
+daemon is healthy. The shared preflight acquires an authenticated daemon
+client for each read:
 
 | Command | Operation performed by the daemon |
 |---|---|
@@ -67,6 +67,27 @@ daemon client for each read:
 | `lcm expand <nodeId>` | Expand a summary into source detail |
 | `lcm status` | Read daemon and project status |
 | `lcm stats --pool` | Read daemon connection-pool statistics |
+
+The local inspection commands `machine show`, `project list`, `project show`,
+`config get`, `stats` (without `--pool`), `events status`, `events validate`,
+`events quarantine`, `sensitive list`, `sensitive test`, and `export` also
+complete the authenticated legacy-home migration gate. When a healthy managed
+daemon is the owner of a private publication lock, the gate and the selected
+read preparation retry only the lock-acquisition callback. Output, exit status,
+and export file writes happen once after the callback succeeds. Mutation and
+lifecycle commands keep their existing admission and migration behavior.
+
+The first authenticated health probe used to identify a retryable daemon can
+take up to two seconds. After the first qualifying contention, retries share a
+single two-second wall-clock deadline and poll at most every 50 milliseconds;
+time spent in process-birth and health checks counts against that deadline.
+Bootstrap migration attempts and worktree-reconciliation lock loops have their
+own existing bounds, and ordinary command I/O plus an in-flight attempt can
+extend total command time. Missing, foreign, malformed, stale, or unhealthy
+publication evidence fails closed with the original typed error. Exhausted or
+rejected export admission exits unsuccessfully, including with `--output` or
+`--all`. An `--all` export may have already written earlier projects when a
+later project fails; those outputs remain, and no successful total is printed.
 
 `lcm search <query> --limit <n>` accepts a positive integer from 1 through
 1000 and defaults to 5. The limit is a maximum applied independently to each

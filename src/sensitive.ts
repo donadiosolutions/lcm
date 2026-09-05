@@ -19,6 +19,7 @@ import {
   withBackendPublicationConfigLock,
   withBackendPublicationConsumerLockAsync,
 } from "./storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "./private-mutation-lock.js";
 
 function defaultConfigPath(): string {
   return runtimeConfigPath();
@@ -47,7 +48,8 @@ function loadGlobalUserPatterns(configPath: string): string[] {
   try {
     return loadStoredConfigProjection(configPath).security.sensitivePatterns;
   } catch (error) {
-    if (error instanceof BackendPublicationJournalError) throw error;
+    if (error instanceof BackendPublicationJournalError
+      || error instanceof PrivateMutationLockContentionError) throw error;
     // Pattern inspection remains available when persisted configuration is invalid.
     return [];
   }

@@ -35,12 +35,15 @@ import {
   atomicWritePrivateFileDurable,
   atomicWritePrivateFileExclusive,
   assertPrivateDirectory,
+  assertPrivateDirectoryEntry,
   copyRegularFilePrivateExclusive,
   consumeAuthenticatedWriterAlias,
   consumeBoundedRegularFile,
   deleteRegularFile,
   ensurePrivateDirectory,
   openPrivateDirectory,
+  openPrivateDirectoryForCreation,
+  openPrivateDirectoryIfExists,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
@@ -89,6 +92,220 @@ function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T)
 }
 
 describe("private filesystem primitives", () => {
+  it("publishes through a borrowed parent without repairing or closing it", () => {
+    const root = makeRoot();
+    chmodSync(root, 0o700);
+    const parent = openPrivateDirectory(root);
+    let closed = false;
+    const borrowed = { ...parent, close: () => { closed = true; } };
+    try {
+      const target = join(root, "metadata.json");
+      atomicWritePrivateFile(target, "content", {}, borrowed);
+      expect(readFileSync(target, "utf8")).toBe("content");
+      expect(statSync(root).mode & 0o777).toBe(0o700);
+      expect(closed).toBe(false);
+      expect(assertPrivateDirectoryEntry(parent, root, parent.witness.uid).dev).toBe(parent.witness.dev);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("rejects borrowed publication when the parent entry is replaced by a symlink", () => {
+    const root = makeRoot();
+    const replacement = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    rmSync(root, { recursive: true, force: true });
+    symlinkSync(replacement, root);
+    try {
+      expect(() => atomicWritePrivateFile(target, "content", {}, parent)).toThrow();
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("classifies borrowed temp-open and rename topology failures", () => {
+    const root = makeRoot();
+    const replacement = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const replaceParent = (): void => {
+      rmSync(root, { recursive: true, force: true });
+      symlinkSync(replacement, root);
+    };
+    try {
+      expect(() => atomicWritePrivateFile(target, "content", {
+        open: () => {
+          replaceParent();
+          throw new Error("open failed");
+        },
+      }, parent)).toThrow(/topology/i);
+      replaceParent();
+      parent.close();
+      const secondParent = openPrivateDirectory(replacement);
+      const secondTarget = join(replacement, "metadata.json");
+      expect(() => atomicWritePrivateFile(secondTarget, "content", {
+        rename: (from, to) => {
+          renameSync(from, to);
+          rmSync(replacement, { recursive: true, force: true });
+          symlinkSync(root, replacement);
+          throw new Error("rename failed");
+        },
+      }, secondParent)).toThrow(/topology/i);
+      secondParent.close();
+    } finally {
+      try { parent.close(); } catch { /* already closed */ }
+    }
+  });
+
+  it("preserves ordinary borrowed rename failures when the parent is still valid", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    try {
+      expect(() => atomicWritePrivateFile(join(root, "metadata.json"), "content", {
+        rename: () => { throw new Error("ordinary rename failure"); },
+      }, parent)).toThrow("ordinary rename failure");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("rejects borrowed entries whose mode, owner, or inode no longer matches", () => {
+    const root = makeRoot();
+    const other = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const modeAlias = join(root, "mode-alias");
+    const ownerAlias = join(root, "owner-alias");
+    mkdirSync(modeAlias, { mode: 0o755 });
+    mkdirSync(ownerAlias, { mode: 0o700 });
+    const originalLstat = lstatSync;
+    try {
+      let modeError: unknown;
+      try {
+        withPatchedFs(
+        "lstatSync",
+        ((path: string, options?: unknown) => {
+          if (path === modeAlias) {
+            return {
+              isDirectory: () => true,
+              mode: 0o40755n,
+              uid: BigInt(parent.witness.uid),
+              dev: BigInt(parent.witness.dev),
+              ino: BigInt(parent.witness.ino),
+            };
+          }
+          return originalLstat(path, options as never);
+        }) as typeof lstatSync,
+        () => assertPrivateDirectoryEntry(parent, modeAlias),
+        );
+      } catch (error) {
+        modeError = error;
+      }
+      expect(modeError).toMatchObject({
+        name: "PrivateDirectoryTopologyError",
+        cause: { message: "private directory entry mode is not trusted" },
+      });
+      let ownerError: unknown;
+      try {
+        withPatchedFs(
+        "lstatSync",
+        ((path: string, options?: unknown) => {
+          if (path === ownerAlias) {
+            return {
+              isDirectory: () => true,
+              mode: 0o40700n,
+              uid: BigInt(parent.witness.uid + 1),
+              dev: BigInt(parent.witness.dev),
+              ino: BigInt(parent.witness.ino),
+            };
+          }
+          return originalLstat(path, options as never);
+        }) as typeof lstatSync,
+        () => assertPrivateDirectoryEntry(parent, ownerAlias),
+        );
+      } catch (error) {
+        ownerError = error;
+      }
+      expect(ownerError).toMatchObject({
+        name: "PrivateDirectoryTopologyError",
+        cause: { message: "private directory entry owner is not trusted" },
+      });
+      expect(() => assertPrivateDirectoryEntry(parent, other)).toThrow(/topology/i);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("rejects same-inode symlink evidence at the borrowed parent seam", () => {
+    const root = makeRoot();
+    const alias = join(root, "alias");
+    const parent = openPrivateDirectory(root);
+    symlinkSync(root, alias);
+    try {
+      expect(() => assertPrivateDirectoryEntry(parent, alias)).toThrow(/topology/i);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("rejects parent drift observed after a successful rename", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const originalLstat = lstatSync;
+    let drifted = false;
+    let renameCalled = false;
+    try {
+      expect(() => withPatchedFs(
+        "lstatSync",
+        ((path: string, options?: unknown) => {
+          if (path === root && drifted) return { isDirectory: () => false };
+          return originalLstat(path, options as never);
+        }) as typeof lstatSync,
+        () => atomicWritePrivateFile(target, "content", {
+          rename: (from, to) => {
+            renameCalled = true;
+            renameSync(from, to);
+            drifted = true;
+          },
+        }, parent),
+      )).toThrow(/topology/i);
+      expect(renameCalled).toBe(true);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("fails creation admission on an invalid type or owner", () => {
+    const root = makeRoot();
+    const originalFstat = fstatSync;
+    try {
+      expect(() => withPatchedFs(
+        "fstatSync",
+        ((fd: number, options?: unknown) => {
+          if ((options as { bigint?: boolean } | undefined)?.bigint === true) {
+            return { isDirectory: () => false };
+          }
+          return originalFstat(fd, options as never);
+        }) as typeof fstatSync,
+        () => openPrivateDirectoryForCreation(root),
+      )).toThrow("path is not a directory");
+      expect(() => withPatchedFs(
+        "fstatSync",
+        ((fd: number, options?: unknown) => {
+          if ((options as { bigint?: boolean } | undefined)?.bigint === true) {
+            return { isDirectory: () => true, uid: 999999n, mode: 0o40700n };
+          }
+          return originalFstat(fd, options as never);
+        }) as typeof fstatSync,
+        () => openPrivateDirectoryForCreation(root),
+      )).toThrow("private directory owner is not trusted");
+    } finally {
+      chmodSync(root, 0o700);
+    }
+  });
+
   it("consumes an authenticated writer alias while retaining the final inode", () => {
     const { aliasPath, finalPath } = writerAliasFixture();
 
@@ -472,6 +689,19 @@ describe("private filesystem primitives", () => {
     expect(() => syncPrivateDirectory(path, { expectedUid })).not.toThrow();
   });
 
+  it.each([undefined, { code: 123 }])("preserves optional directory-open failures without a string code: %j", (failure) => {
+    const root = makeRoot();
+    let caught: unknown = Symbol("did not throw");
+    withPatchedFs("openSync", () => { throw failure; }, () => {
+      try {
+        openPrivateDirectoryIfExists(root);
+      } catch (error) {
+        caught = error;
+      }
+    });
+    expect(caught).toBe(failure);
+  });
+
   it("rejects a non-directory descriptor, an unexpected owner, and a changed witness", () => {
     const root = makeRoot();
     const file = join(root, "file");
@@ -839,6 +1069,28 @@ describe("private filesystem primitives", () => {
       },
     })).toThrow(failure);
     expect(readFileSync(target, "utf-8")).toBe("original");
+    expect(existsSync(tempPath)).toBe(false);
+  });
+
+  it("preserves an unborrowed rename failure and removes only its owned temporary file", () => {
+    const root = makeRoot();
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"ab".repeat(12)}.tmp`);
+    const failure = new Error("rename failed");
+    writeFileSync(target, "original", { mode: 0o600 });
+    let caught: unknown;
+
+    try {
+      atomicWritePrivateFile(target, "replacement", {
+        random: () => Buffer.alloc(12, 0xab),
+        rename: () => { throw failure; },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBe(failure);
+    expect(readFileSync(target, "utf8")).toBe("original");
     expect(existsSync(tempPath)).toBe(false);
   });
 

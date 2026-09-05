@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -100,6 +100,9 @@ const request = {} as IncomingMessage;
 function setupProjectDb(cwd: string): DatabaseSync {
   const dbPath = projectDbPath(cwd);
   mkdirSync(dirname(dbPath), { recursive: true });
+  chmodSync(join(process.env.HOME ?? "/tmp", ".lcm"), 0o700);
+  chmodSync(dirname(dirname(dbPath)), 0o700);
+  chmodSync(dirname(dbPath), 0o700);
   const db = new DatabaseSync(dbPath);
   runLcmMigrations(db);
   return db;
