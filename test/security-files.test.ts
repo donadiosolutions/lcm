@@ -185,6 +185,37 @@ describe("private filesystem primitives", () => {
     }
   });
 
+  it("rejects same-inode symlink evidence at the borrowed parent seam", () => {
+    const root = makeRoot();
+    const alias = join(root, "alias");
+    const parent = openPrivateDirectory(root);
+    symlinkSync(root, alias);
+    try {
+      expect(() => assertPrivateDirectoryEntry(parent, alias)).toThrow(/topology/i);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("rejects parent drift observed after a successful rename", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const originalLstat = lstatSync;
+    try {
+      expect(() => withPatchedFs(
+        "lstatSync",
+        ((path: string, options?: unknown) => {
+          if (path === root) return { isDirectory: () => false };
+          return originalLstat(path, options as never);
+        }) as typeof lstatSync,
+        () => atomicWritePrivateFile(target, "content", {}, parent),
+      )).toThrow(/topology/i);
+    } finally {
+      parent.close();
+    }
+  });
+
   it("fails creation admission on an invalid type or owner", () => {
     const root = makeRoot();
     const originalFstat = fstatSync;

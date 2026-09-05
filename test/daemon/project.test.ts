@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -24,6 +25,19 @@ const POSTGRESQL_STORAGE = {
 } as unknown as ResolvedStorageConfig;
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const REMOTE_PROJECT_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
+
+function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T): T {
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const original = nodeFs[name];
+  nodeFs[name] = replacement;
+  syncBuiltinESMExports();
+  try {
+    return callback();
+  } finally {
+    nodeFs[name] = original;
+    syncBuiltinESMExports();
+  }
+}
 
 describe("secure project-root handoff", () => {
   let previousHome: string | undefined;
@@ -145,6 +159,36 @@ describe("secure project-root handoff", () => {
     expect(statSync(outside).mode & 0o777).toBe(0o755);
   });
 
+  it("rejects a pre-existing projects symlink before touching its target", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const outside = join(home, "outside-projects");
+    mkdirSync(outside, { mode: 0o755 });
+    symlinkSync(outside, join(home, ".lcm", "projects"));
+
+    expect(() => ensureProjectDirForIdentity({ id: "d".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+      .toThrow();
+    expect(statSync(outside).mode & 0o777).toBe(0o755);
+  });
+
+  it("rejects a non-directory project leaf without pathname chmod", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const projects = join(home, ".lcm", "projects");
+    const leaf = join(projects, "0".repeat(64));
+    mkdirSync(projects, { mode: 0o700 });
+    writeFileSync(leaf, "sentinel", { mode: 0o644 });
+    let chmodCalls = 0;
+    const originalChmod = chmodSync;
+    withPatchedFs("chmodSync", ((...args: Parameters<typeof chmodSync>) => {
+      chmodCalls++;
+      return originalChmod(...args);
+    }) as typeof chmodSync, () => {
+      expect(() => ensureProjectDirForIdentity({ id: "0".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow();
+    });
+    expect(readFileSync(leaf, "utf8")).toBe("sentinel");
+    expect(chmodCalls).toBe(0);
+  });
+
   it("rejects an existing project directory with a non-private mode", () => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });
     const projects = join(home, ".lcm", "projects");
@@ -175,6 +219,109 @@ describe("secure project-root handoff", () => {
       cwd: "/project",
       extra: true,
     });
+  });
+
+  it.each([
+    ["metadata", {}],
+    ["directory-only", { writeMetadata: false }],
+  ] as const)("keeps matching metadata bytes and mtime on %s early return", (_label, options) => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "b".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const metaPath = join(dir, "meta.json");
+    const content = '{"cwd":"/project","extra":"preserve"}\n';
+    writeFileSync(metaPath, content, { mode: 0o600 });
+    const before = statSync(metaPath);
+
+    ensureProjectDirForIdentity(identity, options);
+
+    const after = statSync(metaPath);
+    expect(readFileSync(metaPath, "utf8")).toBe(content);
+    expect(after.mtimeNs).toBe(before.mtimeNs);
+  });
+
+  it("converges created children under umask 077", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const previousUmask = process.umask(0o077);
+    try {
+      const identity = { id: "c".repeat(64), canonical: "/project" };
+      const dir = ensureProjectDirForIdentity(identity, { writeMetadata: false });
+      expect(statSync(join(home, ".lcm", "projects")).mode & 0o777).toBe(0o700);
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
+  it("fails closed when created-child descriptor opening returns EACCES", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectoryForCreation").mockImplementation(() => {
+      throw Object.assign(new Error("owner-read-stripping umask"), { code: "EACCES" });
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity({ id: "a".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow("owner-read-stripping umask");
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
+  it("rejects an existing unsafe child under a restrictive umask", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const projects = join(home, ".lcm", "projects");
+    const leaf = join(projects, "6".repeat(64));
+    mkdirSync(leaf, { recursive: true, mode: 0o700 });
+    chmodSync(leaf, 0o755);
+    const previousUmask = process.umask(0o077);
+    try {
+      expect(() => ensureProjectDirForIdentity({ id: "6".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow();
+      expect(statSync(leaf).mode & 0o777).toBe(0o755);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
+  it("closes an existing child when entry authentication fails", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const projects = join(home, ".lcm", "projects");
+    const id = "7".repeat(64);
+    mkdirSync(join(projects, id), { recursive: true, mode: 0o700 });
+    const originalEntry = securityFiles.assertPrivateDirectoryEntry;
+    const entrySpy = vi.spyOn(securityFiles, "assertPrivateDirectoryEntry").mockImplementation((handle, path, uid) => {
+      if (path === join(projects, id)) throw new Error("existing child authentication failed");
+      return originalEntry(handle, path, uid);
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity({ id, canonical: "/project" }, { writeMetadata: false }))
+        .toThrow("existing child authentication failed");
+    } finally {
+      entrySpy.mockRestore();
+    }
+  });
+
+  it("preserves a non-EEXIST child mkdir failure", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    withPatchedFs("mkdirSync", ((..._args: Parameters<typeof mkdirSync>) => {
+      throw Object.assign(new Error("child mkdir denied"), { code: "EACCES" });
+    }) as typeof mkdirSync, () => {
+      expect(() => ensureProjectDirForIdentity({ id: "8".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow("child mkdir denied");
+    });
+  });
+
+  it("preserves a created-child descriptor authentication failure", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectoryForCreation").mockImplementationOnce(() => {
+      throw new Error("created child authentication failed");
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity({ id: "9".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow("created child authentication failed");
+    } finally {
+      openSpy.mockRestore();
+    }
   });
 
   it("uses the default metadata for a syntax-error snapshot", () => {
