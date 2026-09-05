@@ -84,7 +84,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         exactFileScheme &&
         !foundFilePath &&
         index > separator + 2 &&
-        brackets === 0 &&
+        // Valid bracketed IP-literal authorities cannot contain a slash or backslash,
+        // so the first such separator is the file URL path boundary even when
+        // malformed bracket state is still open.
         (char === "/" || char === "\\")
       ) {
         file[index] = 1;
