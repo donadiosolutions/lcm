@@ -316,6 +316,31 @@ type RootBootstrapTestSeams = {
   attempt?: (attempt: number) => void;
 };
 
+function makeTestConvergence(
+  readOwner: () => { version: 1; pid: number; processStartTime: string; nonce: string } =
+    () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+) {
+  let now = 0;
+  return createPublicationConvergence({
+    port: 3737,
+    identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+    expectedEntrypoint: "/daemon",
+    expectedRuntimeDigest: "runtime",
+    deps: {
+      now: () => now,
+      sleep: async (delayMs: number) => { now += delayMs; },
+      readToken: () => "token",
+      readOwner,
+      processBirth: () => "birth",
+      lockPath: "/tmp/publication.lock",
+      fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+        status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite",
+        entrypoint: "/daemon", runtimeDigest: "runtime",
+      }) })) as unknown as typeof globalThis.fetch,
+    },
+  });
+}
+
 async function invoke(args: string[], seams?: RootBootstrapTestSeams): Promise<Error | undefined> {
   try {
     await runCli(["node", "lcm", ...args], seams);
@@ -434,6 +459,195 @@ describe("runCli registration and help dispatch", () => {
 
     expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
     expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
+  });
+
+  it("reuses the preAction convergence for config reads and prints once", async () => {
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      expectedEntrypoint: "/daemon",
+      expectedRuntimeDigest: "runtime",
+      deps: {
+        sleep: async () => undefined,
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth",
+        lockPath: "/tmp/publication.lock",
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+          status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite",
+          entrypoint: "/daemon", runtimeDigest: "runtime",
+        }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.configGetValue.mockImplementationOnce(() => { throw contention; });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await invoke(["config", "get", "llm.provider"]);
+
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+    expect(state.migrateLegacyHome).toHaveBeenCalledOnce();
+    expect(state.configGetValue).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledOnce();
+  });
+
+  it("preserves the original action contention when the shared deadline expires", async () => {
+    let now = 0;
+    let sleeps = 0;
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      expectedEntrypoint: "/daemon",
+      expectedRuntimeDigest: "runtime",
+      deps: {
+        now: () => now,
+        sleep: async () => { sleeps += 1; now = sleeps === 1 ? 1_990 : 2_000; },
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth",
+        lockPath: "/tmp/publication.lock",
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+          status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite",
+          entrypoint: "/daemon", runtimeDigest: "runtime",
+        }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.migrateLegacyHome.mockImplementationOnce(() => { throw contention; }).mockImplementationOnce(() => undefined);
+    state.configGetValue.mockImplementationOnce(() => { throw contention; });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    expect((await invoke(["config", "get", "llm.provider"]))?.message).toBe("exit:1");
+    expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
+    expect(state.configGetValue).toHaveBeenCalledOnce();
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it("does not retry action contention for a foreign lock owner", async () => {
+    const convergence = makeTestConvergence(() => ({
+      version: 1, pid: 99, processStartTime: "foreign", nonce: "b".repeat(32),
+    }));
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.configGetValue.mockImplementationOnce(() => { throw contention; });
+
+    expect((await invoke(["config", "get", "llm.provider"]))?.message).toBe("exit:1");
+    expect(state.configGetValue).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["machine", "show"],
+    ["project", "list"],
+    ["project", "show"],
+    ["config", "get", "llm.provider"],
+    ["stats"],
+    ["events", "status"],
+    ["events", "validate"],
+    ["events", "quarantine"],
+    ["sensitive", "list"],
+    ["sensitive", "test", "value"],
+    ["export"],
+  ])("admits selected local read %# through the convergence gate", async (...args) => {
+    state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.migrateLegacyHome.mockImplementationOnce(() => { throw contention; }).mockImplementationOnce(() => undefined);
+    state.showMachine.mockReturnValue({ version: 1, machineId: "machine", displayName: "test" });
+    state.listProjects.mockResolvedValue({ local: [], remote: null });
+    state.showProject.mockResolvedValue({ hash: "hash", entry: { canonical: "/project", aliases: [] }, remote: null });
+    await invoke(args);
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+    expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["machine", "register"],
+    ["project", "link", "target"],
+    ["config", "set", "llm.provider", "openai"],
+    ["events", "promote"],
+    ["sensitive", "add", "PATTERN"],
+  ])("keeps mutation action %# outside the read convergence gate", async (...args) => {
+    state.migrateLegacyHome.mockImplementation(() => undefined);
+    await invoke(args);
+    expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
+  });
+
+  it("pins sensitive variadic parsing and preserves mutation migration", async () => {
+    state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+    await invoke(["sensitive", "--", "list"]);
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+
+    state.createInstallerPublicationConvergence.mockClear();
+    await invoke(["sensitive"]);
+    await invoke(["sensitive", "unknown"]);
+    expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
+
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.migrateLegacyHome.mockImplementation(() => { throw contention; });
+    expect(await invoke(["sensitive", "add", "PATTERN"])).toBe(contention);
+    expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
+  });
+
+  it("retries project list and show preparation while preserving one result", async () => {
+    state.createInstallerPublicationConvergence.mockImplementation(async () => makeTestConvergence());
+    state.listProjects.mockImplementationOnce(() => { throw new PrivateMutationLockContentionError("busy"); })
+      .mockResolvedValue({ local: [], remote: null });
+    state.showProject.mockImplementationOnce(() => { throw new PrivateMutationLockContentionError("busy"); })
+      .mockResolvedValue({ hash: "hash", entry: { canonical: "/project", aliases: [] }, remote: null });
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const list = await invoke(["project", "list", "--json"]);
+    const show = await invoke(["project", "show", "--json"]);
+    expect(list).toBeUndefined();
+    expect(show).toBeUndefined();
+    expect(state.listProjects).toHaveBeenCalledTimes(2);
+    expect(state.showProject).toHaveBeenCalledTimes(2);
+    expect(output).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries stats, sensitive, and export preparation without replaying output", async () => {
+    state.createInstallerPublicationConvergence.mockImplementation(async () => makeTestConvergence());
+    const statsModule = await import("../../src/stats.js");
+    vi.mocked(statsModule.collectStats).mockImplementationOnce(() => { throw new PrivateMutationLockContentionError("busy"); });
+    await invoke(["stats"]);
+    expect(statsModule.collectStats).toHaveBeenCalledTimes(2);
+
+    const sensitiveModule = await import("../../src/sensitive.js");
+    vi.mocked(sensitiveModule.handleSensitive).mockImplementationOnce(async () => { throw new PrivateMutationLockContentionError("busy"); });
+    await invoke(["sensitive", "list"]);
+    expect(sensitiveModule.handleSensitive).toHaveBeenCalledTimes(2);
+
+  });
+
+  it("passes the captured convergence to export exactly once", async () => {
+    const convergence = makeTestConvergence();
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+    const portable = await import("../../src/portable-knowledge.js");
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await invoke(["export", "--output", "out.json"]);
+
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+    expect(portable.exportKnowledge).toHaveBeenCalledOnce();
+    expect(portable.exportKnowledge.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({ _publicationConvergence: convergence, output: "out.json" }),
+    );
+    expect(log).toHaveBeenCalledWith("  Exported 1 entries to out.json");
+  });
+
+  it("passes one captured convergence to each export-all target", async () => {
+    const convergence = makeTestConvergence();
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+    state.entries = [{ name: "project", isDirectory: () => true }];
+    state.fileText = JSON.stringify({ cwd: "/project" });
+    const portable = await import("../../src/portable-knowledge.js");
+
+    await invoke(["export", "--all"]);
+
+    expect(portable.exportKnowledge).toHaveBeenCalledOnce();
+    expect(portable.exportKnowledge.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({ _publicationConvergence: convergence }),
+    );
   });
 
   it("retries transient root bootstrap contention for an ordinary command", async () => {

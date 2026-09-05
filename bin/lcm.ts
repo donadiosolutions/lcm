@@ -1184,6 +1184,15 @@ function resolveCustomHelpRequest(cliArgv: string[]): CustomHelpRequest | undefi
   return { command };
 }
 
+type PublicationAdmissionRunner = <T>(run: () => T | Promise<T>) => Promise<T>;
+
+function isNestedUnderRoot(actionCommand: Command, parentName: string, actionName?: string): boolean {
+  const parent = actionCommand.parent;
+  return parent?.name() === parentName
+    && parent.parent?.name() === "lcm"
+    && (actionName === undefined || actionCommand.name() === actionName);
+}
+
 function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   const action = actionCommand.name();
   const topLevel = actionCommand.parent?.name() === "lcm";
@@ -1200,6 +1209,26 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   if ((action === "list" || action === "doctor") && actionCommand.parent?.name() === "connectors") return false;
   if (topLevel && ["daemon", "config", "machine", "project", "postgres", "events", "connectors"].includes(action)) return false;
   return true;
+}
+
+function shouldUsePublicationConvergence(actionCommand: Command): boolean {
+  const action = actionCommand.name();
+  const topLevel = actionCommand.parent?.name() === "lcm";
+  if (action === "install" || action === "doctor") return true;
+  if (topLevel && action === "stats") return actionCommand.opts<Record<string, unknown>>().pool !== true;
+  if (topLevel && action === "export") return true;
+  if (isNestedUnderRoot(actionCommand, "machine", "show")) return true;
+  if (isNestedUnderRoot(actionCommand, "project", "list")
+    || isNestedUnderRoot(actionCommand, "project", "show")) return true;
+  if (isNestedUnderRoot(actionCommand, "config", "get")) return true;
+  if (isNestedUnderRoot(actionCommand, "events", "status")
+    || isNestedUnderRoot(actionCommand, "events", "validate")
+    || isNestedUnderRoot(actionCommand, "events", "quarantine")) return true;
+  if (topLevel && action === "sensitive") {
+    const processed = actionCommand.processedArgs[0] as unknown;
+    return Array.isArray(processed) && (processed[0] === "list" || processed[0] === "test");
+  }
+  return false;
 }
 
 type DaemonClientOptions = {
@@ -1453,7 +1482,10 @@ function serializableCoordinationDiagnostics(
   };
 }
 
-export function registerProjectCommand(program: Command): void {
+export function registerProjectCommand(
+  program: Command,
+  publicationRetry?: PublicationAdmissionRunner,
+): void {
   type ProjectOptions = {
     help?: boolean;
     json?: boolean;
@@ -1533,7 +1565,8 @@ export function registerProjectCommand(program: Command): void {
       }
       try {
         const { listProjects } = await import("../src/identity-service.js");
-        const result = await listProjects(await loadIdentityStorageConfig());
+        const read = async () => listProjects(await loadIdentityStorageConfig());
+        const result = publicationRetry === undefined ? await read() : await publicationRetry(read);
         if (opts.json) {
           printJson(result);
           return;
@@ -1573,7 +1606,8 @@ export function registerProjectCommand(program: Command): void {
       }
       try {
         const { showProject } = await import("../src/identity-service.js");
-        const shown = await showProject(await loadIdentityStorageConfig(), target);
+        const read = async () => showProject(await loadIdentityStorageConfig(), target);
+        const shown = publicationRetry === undefined ? await read() : await publicationRetry(read);
         if (opts.json) {
           printJson(shown);
           return;
@@ -2100,6 +2134,11 @@ export async function runCli(
 
   const program = new Command();
   let publicationConvergence: import("../src/storage/publication-convergence.js").PublicationConvergence | undefined;
+  let publicationAdmissionRetry: PublicationAdmissionRunner | undefined;
+  const runWithPublicationRetry: PublicationAdmissionRunner = async <T>(run: () => T | Promise<T>) =>
+    publicationAdmissionRetry === undefined
+      ? await run()
+      : await publicationAdmissionRetry(run);
   program
     .name("lcm")
     .description("Long Context Manager for coding agents")
@@ -2277,11 +2316,12 @@ export async function runCli(
       if (opts.help) await withCustomHelp(configCmd, "config");
       try {
         const { formatConfigValue, getConfigValue } = await import("../src/config-manager.js");
-        console.log(formatConfigValue(getConfigValue({
+        const text = await runWithPublicationRetry(() => formatConfigValue(getConfigValue({
           configPath: defaultConfigPath(),
           path,
           effective: opts.effective ?? false,
         })));
+        console.log(text);
       } catch (error) {
         console.error(error instanceof Error ? error.message : "Unable to read configuration");
         exit(1);
@@ -3022,9 +3062,12 @@ export async function runCli(
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
       const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
       const configFile = defaultConfigPath();
-      selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
       const { collectStats, printStats } = await import("../src/stats.js");
-      printStats(await collectStats(), verbose);
+      const stats = await runWithPublicationRetry(async () => {
+        selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
+        return collectStats();
+      });
+      printStats(await stats, verbose);
     });
 
   // ─── doctor ────────────────────────────────────────────────────────────────
@@ -3118,10 +3161,10 @@ export async function runCli(
       }
       const jsonFlag: boolean = opts.json ?? false;
       try {
-        const output = await withPassiveEventOperatorSession(async ({ local, remote }) => ({
+        const output = await runWithPublicationRetry(() => withPassiveEventOperatorSession(async ({ local, remote }) => ({
           local: await local.getDeliveryDiagnostics(),
           remote: serializableCoordinationDiagnostics(await remote.getDiagnostics()),
-        }));
+        })));
         if (jsonFlag) {
           printJson(output);
           return;
@@ -3160,7 +3203,7 @@ export async function runCli(
       try {
         const limit = parsePositiveInteger(String(opts.limit), "--limit");
         if (limit > 500) throw new Error("--limit must not exceed 500");
-        const output = await withPassiveEventOperatorSession(async ({ local, remote }) => {
+        const output = await runWithPublicationRetry(() => withPassiveEventOperatorSession(async ({ local, remote }) => {
           const events = await local.listAwaitingRemote(limit, true);
           const records = events.length === 0
             ? []
@@ -3182,7 +3225,7 @@ export async function runCli(
             }
           }
           return { checked: events.length, matched, missing, mismatched };
-        });
+        }));
         if (jsonFlag) {
           printJson(output);
         } else {
@@ -3216,10 +3259,10 @@ export async function runCli(
       try {
         const limit = parsePositiveInteger(String(opts.limit), "--limit");
         if (limit > 500) throw new Error("--limit must not exceed 500");
-        const output = await withPassiveEventOperatorSession(async ({ local, remote }) => ({
+        const output = await runWithPublicationRetry(() => withPassiveEventOperatorSession(async ({ local, remote }) => ({
           local: await local.listQuarantined(limit),
           remote: (await remote.listQuarantined(limit)).map(serializablePassiveEvent),
-        }));
+        })));
         if (jsonFlag) {
           printJson(output);
           return;
@@ -3306,7 +3349,7 @@ export async function runCli(
   program.addCommand(eventsCmd);
 
   registerMachineCommand(program);
-  registerProjectCommand(program);
+  registerProjectCommand(program, runWithPublicationRetry);
   registerPostgreSqlCommand(program);
   registerMemoryCommands(
     program,
@@ -3621,7 +3664,10 @@ export async function runCli(
       const { join } = await import("node:path");
       const { homedir } = await import("node:os");
       const configPath = defaultConfigPath();
-      const r = await handleSensitive(args, process.cwd(), configPath);
+      const readSensitive = args[0] === "list" || args[0] === "test";
+      const r = readSensitive
+        ? await runWithPublicationRetry(() => handleSensitive(args, process.cwd(), configPath))
+        : await handleSensitive(args, process.cwd(), configPath);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });
@@ -3890,7 +3936,9 @@ export async function runCli(
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
       const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
       const configFile = defaultConfigPath();
-      selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
+      await runWithPublicationRetry(() => {
+        selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
+      });
       const { exportKnowledge } = await import("../src/portable-knowledge.js");
       const { homedir } = await import("node:os");
       const { join } = await import("node:path");
@@ -3922,7 +3970,7 @@ export async function runCli(
         const reconciled = new Map<string, string>();
         for (const candidate of candidates) {
           try {
-            const result = reconcileWorktrees(candidate);
+            const result = await runWithPublicationRetry(() => reconcileWorktrees(candidate));
             reconciled.set(result.targetHash, result.canonical);
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
@@ -3943,7 +3991,13 @@ export async function runCli(
           outFile = join(process.cwd(), `lcm-export-${slug}.json`);
         }
         try {
-          const result = await exportKnowledge(cwd, { tags, since, output: outFile });
+          const exportOptions = {
+            tags,
+            since,
+            output: outFile,
+            ...(publicationConvergence === undefined ? {} : { _publicationConvergence: publicationConvergence }),
+          };
+          const result = await exportKnowledge(cwd, exportOptions);
           total += result.exported;
           if (all) {
             console.log(`  ${cwd}: ${result.exported} entries → ${outFile}`);
@@ -4035,7 +4089,8 @@ export async function runCli(
   program.hook("preAction", async (_thisCommand, actionCommand) => {
     if (!shouldRunRootBootstrapMigration(actionCommand)) return;
     const action = actionCommand.name();
-    if (action === "install" || action === "doctor") {
+    const usePublicationConvergence = shouldUsePublicationConvergence(actionCommand);
+    if (usePublicationConvergence) {
       let withPublicationAdmissionRetry: typeof import("../src/storage/publication-convergence.js").withPublicationAdmissionRetry | undefined;
       const installer = await import("../installer/install.js");
       const factory = Object.prototype.hasOwnProperty.call(installer, "createInstallerPublicationConvergence")
@@ -4044,6 +4099,8 @@ export async function runCli(
       if (factory !== undefined) {
         publicationConvergence ??= await factory();
         withPublicationAdmissionRetry = (await import("../src/storage/publication-convergence.js")).withPublicationAdmissionRetry;
+        const admission = withPublicationAdmissionRetry;
+        publicationAdmissionRetry = (run) => admission(run, publicationConvergence);
       }
       if (withPublicationAdmissionRetry === undefined) {
         await migrateLegacyHomeWithRetry({

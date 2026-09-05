@@ -30,6 +30,10 @@ import { loadDaemonConfig } from "./daemon/config.js";
 import { configPath } from "./runtime-paths.js";
 import { selectStorageBackendForConfig } from "./storage/backend.js";
 import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
+import {
+  withPublicationAdmissionRetry,
+  type PublicationConvergence,
+} from "./storage/publication-convergence.js";
 
 export const EXPORT_VERSION = 1;
 
@@ -96,6 +100,8 @@ export interface ExportOptions {
   _lcmBaseDir?: string;
   /** Override global sensitive patterns (tests only). */
   _globalPatterns?: string[];
+  /** @internal Reuse the CLI's authenticated publication convergence. */
+  _publicationConvergence?: PublicationConvergence;
 }
 
 export interface ExportResult {
@@ -103,10 +109,15 @@ export interface ExportResult {
   projectCwd: string;
 }
 
-export async function exportKnowledge(
+type GatheredExport = Readonly<{
+  document: ExportDocument;
+  result: ExportResult;
+}>;
+
+async function gatherExport(
   cwd: string,
-  opts: ExportOptions = {},
-): Promise<ExportResult> {
+  opts: ExportOptions,
+): Promise<GatheredExport> {
   const configFile = configPath();
   const config = loadDaemonConfig(configFile);
   selectStorageBackendForConfig(configFile, config.storage);
@@ -124,14 +135,12 @@ export async function exportKnowledge(
     runLcmMigrations(db);
 
     const store = new PromotedStore(db);
-
     const rows = store.getAll({
       projectId: project.id,
       since: opts.since,
       tags: opts.tags,
     });
 
-    // Build scrubber for secret redaction
     let scrubber: ScrubEngine | null = null;
     if (!opts.skipScrub) {
       const globalPatterns = opts._globalPatterns
@@ -141,17 +150,12 @@ export async function exportKnowledge(
 
     entries = rows.map((r) => {
       let content = r.content;
-      if (scrubber) {
-        content = scrubber.scrub(content);
-      }
+      if (scrubber) content = scrubber.scrub(content);
       return {
         content,
         tags: parsePromotedTags(r.tags).map((tag) => scrubber ? scrubber.scrub(tag) : tag),
         confidence: r.confidence,
         createdAt: r.created_at,
-        // sessionId is per-project and per-machine. Nullify on export so that
-        // importing into a different project/machine does not create dead
-        // references pointing at a session that does not exist in the new context.
         sessionId: null,
       };
     });
@@ -159,22 +163,36 @@ export async function exportKnowledge(
     closeLcmConnection(dbPath, db);
   }
 
-  const doc: ExportDocument = {
+  const document: ExportDocument = {
     version: EXPORT_VERSION,
     exportedAt: new Date().toISOString(),
     projectCwd: project.canonical,
     entries,
   };
+  return {
+    document,
+    result: { exported: entries.length, projectCwd: project.canonical },
+  };
+}
 
-  const json = JSON.stringify(doc, null, 2);
+function persistExport(document: ExportDocument, output: string | undefined): void {
+  const json = JSON.stringify(document, null, 2);
+  if (output) writeFileSync(output, json, "utf-8");
+  else process.stdout.write(json + "\n");
+}
 
-  if (opts.output) {
-    writeFileSync(opts.output, json, "utf-8");
-  } else {
-    process.stdout.write(json + "\n");
-  }
-
-  return { exported: entries.length, projectCwd: project.canonical };
+export async function exportKnowledge(
+  cwd: string,
+  opts: ExportOptions = {},
+): Promise<ExportResult> {
+  const gathered = opts._publicationConvergence === undefined
+    ? await gatherExport(cwd, opts)
+    : await withPublicationAdmissionRetry(
+      () => gatherExport(cwd, opts),
+      opts._publicationConvergence,
+    );
+  persistExport(gathered.document, opts.output);
+  return gathered.result;
 }
 
 // ─── Import ──────────────────────────────────────────────────────────────────
