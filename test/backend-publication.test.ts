@@ -356,6 +356,263 @@ async function expectMaterialReadFailure(
 }
 
 describe("BackendPublicationCoordinator", () => {
+  it("rejects material whose parent identity diverges from the coordinator witness", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const materialPath = join(publicationDirectory, "publication-1.material");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; [key: string]: unknown };
+    let authenticationStarted = false;
+    let materialOpened = false;
+    let injected = false;
+    let directoryStatsAfterMaterial = 0;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      if (path === materialPath && authenticationStarted) materialOpened = true;
+      return originalOpen(path, ...args);
+    }) as never, async () => withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+      const observed = originalStat(path, options);
+      if (path === publicationDirectory && options?.bigint === true && materialOpened) {
+        directoryStatsAfterMaterial += 1;
+      }
+      if (path === publicationDirectory && options?.bigint === true && materialOpened && directoryStatsAfterMaterial === 1 && !injected) {
+        injected = true;
+        return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver, (event) => {
+        if (event === "before-material-authenticate") authenticationStarted = true;
+      }).prepare(inputFor(input))).rejects.toMatchObject({
+        reason: "unsafe-storage",
+      });
+    }));
+
+    expect(injected).toBe(true);
+    expect(readBackendPublicationJournal(home)).toMatchObject({ phase: "preparing" });
+    expect(fake.driver.publishProjectMap).not.toHaveBeenCalled();
+    expect(fake.driver.publishConfig).not.toHaveBeenCalled();
+  });
+
+  it("keeps the operation witness open across awaited driver work and closes it once", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalClose = nodeFs.closeSync as (fd: number) => void;
+    const opened: { fd: number; closed: number }[] = [];
+    const activeDescriptors = (): number => opened.filter(({ closed }) => closed === 0).length;
+    fake.driver.observeLocalState = vi.fn(async () => {
+      expect(activeDescriptors()).toBeGreaterThan(0);
+      await Promise.resolve();
+      expect(activeDescriptors()).toBeGreaterThan(0);
+      return sourceState(input);
+    });
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === publicationDirectory) opened.push({ fd, closed: 0 });
+      return fd;
+    }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+      const descriptor = [...opened].reverse().find((entry) => entry.fd === fd && entry.closed === 0);
+      if (descriptor !== undefined) descriptor.closed += 1;
+      originalClose(fd);
+    }) as never, async () => {
+      await coordinator(home, fake.driver).prepare(inputFor(input));
+    }));
+
+    expect(opened.length).toBeGreaterThan(0);
+    expect(opened.every(({ closed }) => closed === 1)).toBe(true);
+    expect(activeDescriptors()).toBe(0);
+  });
+
+  it("closes the operation witness when awaited driver work rejects", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalClose = nodeFs.closeSync as (fd: number) => void;
+    const opened: { fd: number; closed: number }[] = [];
+    fake.driver.observeLocalState = vi.fn(async () => {
+      await Promise.resolve();
+      throw new Error("driver failed");
+    });
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === publicationDirectory) opened.push({ fd, closed: 0 });
+      return fd;
+    }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+      const descriptor = [...opened].reverse().find((entry) => entry.fd === fd && entry.closed === 0);
+      if (descriptor !== undefined) descriptor.closed += 1;
+      originalClose(fd);
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver).prepare(inputFor(input))).rejects.toThrow("driver failed");
+    }));
+
+    expect(opened.length).toBeGreaterThan(0);
+    expect(opened.every(({ closed }) => closed === 1)).toBe(true);
+  });
+
+  it("normalizes an operation witness open failure after directory setup", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    let publicationDirectoryOpens = 0;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      if (path === publicationDirectory) {
+        publicationDirectoryOpens += 1;
+        if (publicationDirectoryOpens === 2) {
+          throw Object.assign(new Error("operation descriptor unavailable"), { code: "EIO" });
+        }
+      }
+      return originalOpen(path, ...args);
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver).prepare(inputFor(input))).rejects.toMatchObject({
+        reason: "unsafe-storage",
+      });
+    });
+
+    expect(publicationDirectoryOpens).toBe(2);
+    expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+  });
+
+  it("rejects publication when the retained witness drifts at the return boundary", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; [key: string]: unknown };
+    let returnBoundary = false;
+    let injected = false;
+
+    await withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+      const observed = originalStat(path, options);
+      if (path === publicationDirectory && options?.bigint === true && returnBoundary && !injected) {
+        injected = true;
+        return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver, (event) => {
+        if (event === "after-prepared") returnBoundary = true;
+      }).prepare(inputFor(input))).rejects.toMatchObject({ reason: "unsafe-storage" });
+    });
+
+    expect(injected).toBe(true);
+    expect(readBackendPublicationJournal(home)).toMatchObject({ phase: "prepared" });
+  });
+
+  it("rejects coordinator metadata drift at the return boundary", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalFstat = nodeFs.fstatSync as (
+      fd: number,
+      options?: { bigint?: boolean },
+    ) => { gid: bigint; [key: string]: unknown };
+    let publicationDirectoryOpens = 0;
+    let operationFd: number | undefined;
+    let returnBoundary = false;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === publicationDirectory) {
+        publicationDirectoryOpens += 1;
+        if (publicationDirectoryOpens === 2) operationFd = fd;
+      }
+      return fd;
+    }) as never, async () => withPatchedFsAsync("fstatSync", ((fd: number, options?: { bigint?: boolean }) => {
+      const observed = originalFstat(fd, options);
+      if (returnBoundary && fd === operationFd && options?.bigint === true) {
+        return Object.assign(observed, { gid: observed.gid + 1n });
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver, (event) => {
+        if (event === "after-prepared") returnBoundary = true;
+      }).prepare(inputFor(input))).rejects.toMatchObject({ reason: "unsafe-storage" });
+    }));
+
+    expect(operationFd).toBeDefined();
+  });
+
+  it.each([
+    "preparing",
+    "abort-releasing",
+  ] as const)("does not swallow material ENOENT with %s directory drift", async (phase) => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    if (phase === "preparing") {
+      await expect(coordinator(home, fake.driver, (event) => {
+        if (event === "after-material-seal") throw new Error("crash:sealed");
+      }).prepare(inputFor(input))).rejects.toThrow("crash:sealed");
+      expect(readBackendPublicationJournal(home)?.phase).toBe("preparing");
+    } else {
+      await coordinator(home, fake.driver).prepare(inputFor(input));
+      await expect(coordinator(home, fake.driver, (event) => {
+        if (
+          event === "before-material-authenticate"
+          && readBackendPublicationJournal(home)?.phase === "abort-releasing"
+        ) throw new Error("crash:abort-releasing");
+      }).abort()).rejects.toThrow("crash:abort-releasing");
+      expect(readBackendPublicationJournal(home)?.phase).toBe("abort-releasing");
+    }
+
+    const publicationDirectory = backendPublicationDirectory(home);
+    const materialPath = join(publicationDirectory, "publication-1.material");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; [key: string]: unknown };
+    let materialOpenAttempted = false;
+    let injected = false;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      if (path === materialPath) {
+        materialOpenAttempted = true;
+        throw Object.assign(new Error("material missing"), { code: "ENOENT" });
+      }
+      return originalOpen(path, ...args);
+    }) as never, async () => withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+      const observed = originalStat(path, options);
+      if (path === publicationDirectory && options?.bigint === true && materialOpenAttempted && !injected) {
+        injected = true;
+        return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver).abort()).rejects.toMatchObject({ reason: "unsafe-storage" });
+    }));
+
+    expect(injected).toBe(true);
+    expect(readBackendPublicationJournal(home)?.phase).toBe(phase);
+  });
+
   it("journals preparing before sealing, authenticates material, and resumes to completion", async () => {
     const home = makeHome();
     const input = material();

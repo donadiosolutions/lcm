@@ -133,6 +133,7 @@ const expectedComponents = [
     name: "Unit - Storage Abstractions",
     paths: [
       "^src/storage/backend\\.ts$",
+      // #844 keeps coordinator directory-witness authentication in this owner.
       "^src/storage/backend-publication\\.ts$",
       "^src/storage/publication-convergence\\.ts$",
       "^src/storage/capabilities\\.ts$",

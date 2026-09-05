@@ -119,6 +119,8 @@ component_management:
         # #681 retains backend-publication durable-write ownership here.
         # #722 retains one authenticated backend-publication directory identity
         # across journal, evidence, and terminal recovery-material reads.
+        # #844 extends the coordinator's locked evidence/material reads with
+        # one operation-scoped directory witness and a fail-closed return check.
         # #837 retains consumer-admission descriptor cleanup in this owner.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"

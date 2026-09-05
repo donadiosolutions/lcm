@@ -106,6 +106,17 @@ are accepted only when each exact parent device/inode matches that retained
 directory witness. Removing the directory or rebinding its pathname to another
 inode during admission is unsafe storage, not absent evidence.
 
+Coordinator operations use the same private publication-directory descriptor
+for their locked journal evidence reads and recovery-material authentication,
+including reads that happen after awaited driver work. The descriptor is
+revalidated before a successful operation return and is always closed when the
+operation settles. A directory identity or security drift is reported as
+unsafe storage; the preparing and abort-releasing missing-material recovery
+shortcuts remain limited to a genuine missing material file while the retained
+directory remains authenticated. This binding covers coordinator evidence and
+material reads and the final identity check; checkpoint writes and cleanup
+mutations remain path-addressed.
+
 The implementation persists exactly these 16 phase literals:
 
 `preparing`, `prepared`, `acquiring`, `guarded`, `map-publishing`,
