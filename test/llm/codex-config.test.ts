@@ -80,6 +80,35 @@ function hangingChild(): FakeChild {
   return child;
 }
 
+function childWithForcedGroupCleanup(configValue: unknown): {
+  child: FakeChild;
+  isGroupAlive: () => boolean;
+  killProcess: ReturnType<typeof vi.fn>;
+} {
+  const child = hangingChild();
+  child.stdin.removeAllListeners("data");
+  let groupAlive = true;
+  child.stdin.on("data", (chunk) => {
+    const requests = chunk.toString().trim().split("\n").map(line => JSON.parse(line) as { method?: string });
+    for (const request of requests) {
+      if (request.method === "initialize") {
+        child.stdout.write(`${JSON.stringify({ id: 1, result: {} })}\n`);
+      } else if (request.method === "config/read") {
+        const config = configValue === undefined ? {} : { openai_base_url: configValue };
+        child.stdout.write(`${JSON.stringify({ id: 2, result: { config } })}\n`);
+        child.stdout.end();
+      }
+    }
+  });
+  const killProcess = vi.fn((_pid: number, signal?: NodeJS.Signals | number) => {
+    if (signal === "SIGKILL") {
+      groupAlive = false;
+      child.emit("close", null, "SIGKILL");
+    }
+  });
+  return { child, isGroupAlive: () => groupAlive, killProcess };
+}
+
 describe("resolveCodexOpenAIBaseUrl", () => {
   it("covers strict framing and URL normalization edges", () => {
     const utils = __codexConfigTestUtils;
@@ -199,6 +228,69 @@ describe("resolveCodexOpenAIBaseUrl", () => {
       .resolves.toBeUndefined();
   });
 
+  it("preserves a validated endpoint after TERM is ignored and KILL settles the owned group", async () => {
+    vi.useFakeTimers();
+    try {
+      const forced = childWithForcedGroupCleanup("https://forced.example/v1/");
+      const { child, isGroupAlive, killProcess } = forced;
+      const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+      let outcome: string | undefined;
+      const pending = resolveCodexOpenAIBaseUrl({
+        spawn: spawnFor(child),
+        platform: "linux",
+        processBirthTime: () => "birth",
+        processGroupId: 8124,
+        daemonProcessGroupId: 8122,
+        processGroupIdProbe: () => 8124,
+        isProcessGroupAlive: isGroupAlive,
+        killProcess,
+        timeoutMs: 20_000,
+        daemonInstanceId: "daemon",
+        witnessStore,
+      }).then(value => { outcome = value; return value; });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(killProcess).toHaveBeenCalledWith(-8124, "SIGTERM");
+      expect(outcome).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(killProcess).not.toHaveBeenCalledWith(-8124, "SIGKILL");
+      expect(outcome).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(pending).resolves.toBe("https://forced.example/v1/responses");
+      expect(killProcess).toHaveBeenCalledWith(-8124, "SIGKILL");
+      expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves absent and null defaults after forced cleanup", async () => {
+    vi.useFakeTimers();
+    try {
+      for (const configValue of [undefined, null]) {
+        const { child, isGroupAlive, killProcess } = childWithForcedGroupCleanup(configValue);
+        const pending = resolveCodexOpenAIBaseUrl({
+          spawn: spawnFor(child),
+          platform: "linux",
+          processBirthTime: () => "birth",
+          processGroupId: 8124,
+          daemonProcessGroupId: 8122,
+          processGroupIdProbe: () => 8124,
+          isProcessGroupAlive: isGroupAlive,
+          killProcess,
+          timeoutMs: 20_000,
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(killProcess).toHaveBeenCalledWith(-8124, "SIGTERM");
+        await vi.advanceTimersByTimeAsync(2_000);
+        await expect(pending).resolves.toBeUndefined();
+        expect(killProcess).toHaveBeenCalledWith(-8124, "SIGKILL");
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("fails closed for malformed, sensitive, and non-http URLs", async () => {
     for (const value of ["not a url", "https://[", "file:///tmp/x", "https://user:pass@example.test", "https://example.test/x?q=1"]) {
       const child = childWithProtocol([
@@ -215,6 +307,23 @@ describe("resolveCodexOpenAIBaseUrl", () => {
     child.stdin.removeAllListeners("data");
     child.stdin.on("data", () => { child.stdout.end(); child.emit("close", 0); });
     await expect(resolveCodexOpenAIBaseUrl({ spawn: spawnFor(child), processBirthTime: () => "birth" }))
+      .rejects.toThrow("codex endpoint resolution failed");
+  });
+
+  it("rejects a nonzero close before a valid config response", async () => {
+    const child = hangingChild();
+    const killProcess = vi.fn();
+    child.stdin.on("data", () => { child.stdout.end(); child.emit("close", 2); });
+    await expect(resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "linux",
+      processBirthTime: () => "birth",
+      processGroupId: 8124,
+      daemonProcessGroupId: 8122,
+      processGroupIdProbe: () => 8124,
+      isProcessGroupAlive: () => false,
+      killProcess,
+    }))
       .rejects.toThrow("codex endpoint resolution failed");
   });
 
@@ -351,8 +460,17 @@ describe("resolveCodexOpenAIBaseUrl", () => {
       nonzero.stdout.end();
       nonzero.emit("close", 2);
     });
-    await expect(resolveCodexOpenAIBaseUrl({ spawn: spawnFor(nonzero), processBirthTime: () => "birth" }))
-      .rejects.toThrow("codex endpoint resolution failed");
+    await expect(resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(nonzero),
+      platform: "linux",
+      processBirthTime: () => "birth",
+      processGroupId: 8123,
+      daemonProcessGroupId: 8122,
+      processGroupIdProbe: () => 8123,
+      isProcessGroupAlive: () => false,
+      killProcess: vi.fn(),
+    }))
+      .resolves.toBeUndefined();
   });
 
   it("fails closed when the app-server stdin or teardown setup fails", async () => {
@@ -386,6 +504,171 @@ describe("resolveCodexOpenAIBaseUrl", () => {
     expect(killProcess).toHaveBeenCalled();
   });
 
+  it("removes the witness once after a proven protocol failure", async () => {
+    const child = hangingChild();
+    child.stdin.on("data", () => {
+      child.stdout.write(`${JSON.stringify({ id: 1, error: { code: "bad" } })}\n`);
+    });
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+    await expect(resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+    })).rejects.toThrow("codex endpoint resolution failed");
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+  });
+
+  it("removes the witness once after a proven child error", async () => {
+    const child = hangingChild();
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+    });
+    child.emit("error", new Error("child failed"));
+    await expect(pending).rejects.toThrow("codex endpoint resolution failed");
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+  });
+
+  it("removes the witness once after a proven stdin error", async () => {
+    const child = hangingChild();
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+    });
+    child.stdin.emit("error", new Error("stdin failed"));
+    await expect(pending).rejects.toThrow("codex endpoint resolution failed");
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+  });
+
+  it("removes the witness once after a proven abort", async () => {
+    const child = hangingChild();
+    const controller = new AbortController();
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+    }, controller.signal);
+    controller.abort("cancelled");
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+  });
+
+  it("removes the witness once after a proven timeout", async () => {
+    const child = hangingChild();
+    let timeout: (() => void) | undefined;
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+      timeoutMs: 10,
+      setTimeout: vi.fn((callback: () => void) => {
+        timeout = callback;
+        return 1 as never;
+      }) as never,
+      clearTimeout: vi.fn(),
+    });
+    await vi.waitFor(() => expect(timeout).toBeTypeOf("function"));
+    timeout?.();
+    await expect(pending).rejects.toThrow("codex endpoint resolution failed");
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+  });
+
+  it("retains the witness when failure teardown cannot prove settlement", async () => {
+    const child = hangingChild();
+    child.kill = vi.fn(() => true);
+    const timers: Array<{ callback: () => void; delay: number }> = [];
+    const setTimeoutMock = vi.fn((callback: () => void, delay: number) => {
+      timers.push({ callback, delay });
+      return timers.length as unknown as ReturnType<typeof setTimeout>;
+    }) as unknown as typeof setTimeout;
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+      timeoutMs: 10_000,
+      setTimeout: setTimeoutMock,
+      clearTimeout: vi.fn(),
+    });
+    const observed = pending.then(() => undefined, error => error);
+    child.emit("error", new Error("child failed"));
+    await vi.waitFor(() => expect(timers.filter(timer => timer.delay === 2_000)).toHaveLength(1));
+    timers.find(timer => timer.delay === 2_000)?.callback();
+    await vi.waitFor(() => expect(timers.filter(timer => timer.delay === 2_000)).toHaveLength(2));
+    timers.filter(timer => timer.delay === 2_000)[1]?.callback();
+    await expect(observed).resolves.toMatchObject({ message: expect.stringContaining("codex endpoint resolution failed") });
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).not.toHaveBeenCalled();
+  });
+
+  it("preserves the original failure when witness removal throws", async () => {
+    const child = hangingChild();
+    child.stdin.on("data", () => {
+      child.stdout.write(`${JSON.stringify({ id: 1, error: { code: "secret" } })}\n`);
+    });
+    const witnessStore = {
+      add: vi.fn(),
+      remove: vi.fn(() => { throw new Error("remove failed"); }),
+      path: "/tmp/witness",
+    };
+    await expect(resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+    })).rejects.toThrow("codex endpoint resolution failed");
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+  });
+
+  it("preserves AbortError when witness removal throws", async () => {
+    const child = hangingChild();
+    const controller = new AbortController();
+    const witnessStore = {
+      add: vi.fn(),
+      remove: vi.fn(() => { throw new Error("remove failed"); }),
+      path: "/tmp/witness",
+    };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+    }, controller.signal);
+    controller.abort("cancelled");
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+  });
+
   it("fails closed when a detached group survives intentional TERM and KILL", async () => {
     vi.useFakeTimers();
     try {
@@ -401,10 +684,13 @@ describe("resolveCodexOpenAIBaseUrl", () => {
         child.emit("close", null, "SIGTERM");
       });
       const killProcess = vi.fn();
+      const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
       const pending = resolveCodexOpenAIBaseUrl({
         spawn: spawnFor(child),
         platform: "linux",
         processBirthTime: () => "birth",
+        daemonInstanceId: "daemon",
+        witnessStore,
         processGroupIdProbe: () => 8124,
         isProcessGroupAlive: () => true,
         killProcess,
@@ -414,6 +700,8 @@ describe("resolveCodexOpenAIBaseUrl", () => {
       await vi.advanceTimersByTimeAsync(4_000);
       await expect(observed).resolves.toMatchObject({ message: expect.stringContaining("codex endpoint resolution failed") });
       expect(killProcess).toHaveBeenCalledWith(-8124, "SIGKILL");
+      expect(witnessStore.add).toHaveBeenCalledOnce();
+      expect(witnessStore.remove).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }

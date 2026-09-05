@@ -133,6 +133,7 @@ const expectedComponents = [
     name: "Unit - Storage Abstractions",
     paths: [
       "^src/storage/backend\\.ts$",
+      // #844 keeps coordinator directory-witness authentication in this owner.
       "^src/storage/backend-publication\\.ts$",
       "^src/storage/publication-convergence\\.ts$",
       "^src/storage/capabilities\\.ts$",
@@ -484,7 +485,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(208);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#866/#722 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#866/#722/#786/#952 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -493,8 +494,8 @@ describe("Codecov configuration", () => {
 
     const components = validateComponents(configuredComponents(config));
     // #792 keeps grep session filtering and #794 grep-since validation in the
-    // existing route component. #862 keeps recent limit validation in the
-    // same daemon-routes component.
+    // existing route component. #862 keeps recent limit validation and #863
+    // keeps expand depth validation in the same daemon-routes component.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     const expectedOwners = [
       ["bin/lcm.ts", "unit-cli"],
@@ -520,8 +521,8 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
       // #833 passive-event identity admission remains route-owned.
       ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"],
-      // #793 search-limit validation and #864 search candidate recall remain
-      // owned by daemon routes.
+      // #793 search-limit validation, #863 expand depth validation, and #864
+      // search candidate recall remain owned by daemon routes.
       ["src/daemon/routes/search.ts", "unit-daemon-routes"],
       ["src/daemon/routes/grep.ts", "unit-daemon-routes"],
       ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
@@ -551,6 +552,8 @@ describe("Codecov configuration", () => {
       // #793 search-limit schema remains owned by MCP tools.
       ["src/mcp/tools/lcm-search.ts", "unit-mcp"],
       ["src/mcp/tools/lcm-grep.ts", "unit-mcp"],
+      // #863 expand-depth schema remains owned by MCP tools.
+      ["src/mcp/tools/lcm-expand.ts", "unit-mcp"],
       ["src/memory/index.ts", "unit-memory-retrieval"],
       // #793 shared search-limit contract remains retrieval-owned.
       ["src/retrieval.ts", "unit-memory-retrieval"],

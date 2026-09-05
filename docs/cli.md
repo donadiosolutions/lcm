@@ -62,7 +62,7 @@ client for each read:
 | Command | Operation performed by the daemon |
 |---|---|
 | `lcm search <query>` | Search episodic and promoted memory |
-| `lcm grep <query>` | Search messages and summaries by exact text or regular expression; optional inclusive `--since` accepts `YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm)` and malformed values return HTTP 400 |
+| `lcm grep <query>` | Search messages and summaries by exact text or regular expression; optional inclusive `--since` accepts `YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm)` with normalized UTC years 0001-9999, and malformed or out-of-range values return HTTP 400 |
 | `lcm describe <nodeId>` | Read summary or stored-memory metadata |
 | `lcm expand <nodeId>` | Expand a summary into source detail |
 | `lcm status` | Read daemon and project status |
@@ -96,6 +96,10 @@ episodic history remains unfiltered. Use `--layer promoted` for tag-only
 recall. Omitted or empty tags do not filter either layer. Values outside this
 range or that are not integers are rejected by the daemon with HTTP 400
 (`invalid limit`).
+
+`lcm expand <nodeId> --depth <n>` accepts any positive integer and defaults to
+`1`; no upper bound is imposed. Malformed explicit depths are rejected by the
+daemon with HTTP 400 (`invalid depth`) before project admission.
 
 Before using this route, LCM reads a bounded, no-follow configuration snapshot
 without taking the private mutation/publication lock. If `config.json` is

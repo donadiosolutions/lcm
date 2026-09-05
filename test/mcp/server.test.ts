@@ -88,6 +88,8 @@ describe("MCP tool definitions", () => {
     expect(grep.inputSchema.properties.mode.description).toContain("full-text");
     expect(grep.inputSchema.properties.mode.description).toContain("regex");
     expect(grep.inputSchema.properties.since.description).toContain("inclusive");
+    expect(grep.inputSchema.properties.since.description).toContain("UTC years must be 0001-9999");
+    expect(grep.inputSchema.properties.since.description).toContain("HTTP 400");
     expect(grep.inputSchema.properties.since.description).toContain("1-3 fractional digits");
     expect(grep.inputSchema.properties.since.description).toContain("+/-HH:mm");
     expect(grep.inputSchema.properties.query.description).toBe(
@@ -98,6 +100,18 @@ describe("MCP tool definitions", () => {
     expect(search.description).not.toContain("semantic");
     expect(search.inputSchema.properties.tags.description).toContain("promoted");
     expect(search.inputSchema.properties.tags.description).toContain("episodic results remain unfiltered");
+  });
+
+  it("advertises the expand depth contract", () => {
+    const expand = getMcpToolDefinitions().find((t: any) => t.name === "lcm_expand") as any;
+    expect(expand.inputSchema.properties.depth).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      default: 1,
+    });
+    expect(expand.inputSchema.properties.depth).not.toHaveProperty("maximum");
+    expect(expand.inputSchema.properties.depth.description).toContain("positive integer");
+    expect(expand.inputSchema.properties.depth.description).toContain("default: 1");
   });
 
   it("lcm_store describes fields without embedding agent policy", () => {

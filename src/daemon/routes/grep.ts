@@ -63,7 +63,8 @@ function normalizeGrepSince(value: unknown): Date | null {
   }
 
   const parsed = new Date(value);
-  return parsed;
+  const normalizedYear = parsed.getUTCFullYear();
+  return normalizedYear >= 1 && normalizedYear <= 9999 ? parsed : null;
 }
 
 export function createGrepHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {

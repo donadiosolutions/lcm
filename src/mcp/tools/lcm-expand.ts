@@ -5,7 +5,12 @@ export const lcmExpandTool = {
     type: "object" as const,
     properties: {
       nodeId: { type: "string", description: "Summary node ID to expand" },
-      depth: { type: "number", description: "How many levels of the DAG to traverse (default: 1)" },
+      depth: {
+        type: "integer",
+        minimum: 1,
+        default: 1,
+        description: "How many levels of the DAG to traverse (positive integer; default: 1; no maximum)",
+      },
     },
     required: ["nodeId"],
   },

@@ -203,4 +203,73 @@ describe("POST /grep session filtering", () => {
       await daemon.stop();
     }
   });
+
+  it("accepts the normalized year-0001 lower bound across modes and scopes", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-grep-ancient-since-"));
+    tempDirs.push(tempDir);
+    ensureProjectDir(tempDir);
+
+    const db = new DatabaseSync(projectDbPath(tempDir));
+    runLcmMigrations(db);
+    const conversations = new ConversationStore(db);
+    const summaries = new SummaryStore(db);
+    const conversation = await conversations.createConversation({ sessionId: "ancient-since-session" });
+    const [message] = await conversations.createMessagesBulk([
+      { conversationId: conversation.conversationId, seq: 0, role: "user", content: "ancient bound needle", tokenCount: 2 },
+    ]);
+    const summary = await summaries.insertSummary({
+      summaryId: "ancient-bound-summary",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      content: "ancient bound needle summary",
+      tokenCount: 3,
+    });
+    db.prepare("UPDATE messages SET created_at = ? WHERE message_id = ?")
+      .run("2025-01-01 00:00:00", message.messageId);
+    db.prepare("UPDATE summaries SET created_at = ? WHERE summary_id = ?")
+      .run("2025-01-01 00:00:00", summary.summaryId);
+    db.close();
+
+    const daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    try {
+      for (const mode of ["full_text", "regex"] as const) {
+        for (const scope of ["messages", "summaries", "both"] as const) {
+          const response = await fetch(`http://127.0.0.1:${daemon.address().port}/grep`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              query: "needle",
+              cwd: tempDir,
+              mode,
+              scope,
+              since: "0001-01-01T00:00:00Z",
+            }),
+          });
+          expect(response.status).toBe(200);
+          const result = await response.json() as {
+            messages: Array<{ message_id?: number; messageId?: number }>;
+            summaries: Array<{ summary_id?: string; summaryId?: string }>;
+            totalMatches: number;
+          };
+          expect(result.messages).toHaveLength(scope === "summaries" ? 0 : 1);
+          expect(result.summaries).toHaveLength(scope === "messages" ? 0 : 1);
+          expect(result.totalMatches).toBe(scope === "both" ? 2 : 1);
+        }
+      }
+
+      const rejected = await fetch(`http://127.0.0.1:${daemon.address().port}/grep`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: "needle",
+          cwd: tempDir,
+          since: "9999-12-31T23:59:00.000-00:01",
+        }),
+      });
+      expect(rejected.status).toBe(400);
+      await expect(rejected.json()).resolves.toEqual({ error: "invalid since" });
+    } finally {
+      await daemon.stop();
+    }
+  });
 });
