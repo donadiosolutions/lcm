@@ -18,7 +18,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { platform } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   NODE_IMAGE,
@@ -32,6 +32,8 @@ import {
   canonicalCandidateParents,
   candidateTemporaryParents,
   createTestTempDirectory,
+  nonLivePlatformFallbackParents,
+  parseOriginalTemporaryParents,
 } from "./test-temp-root.mjs";
 
 export { NODE_IMAGE, POSTGRES_IMAGE };
@@ -993,28 +995,36 @@ export function harnessDirectoryFromRecord(record, dependencies = {}) {
     const environment = dependencies.environment ?? process.env;
     const handoff = environment.LCM_TEST_HARNESS_TMPDIR;
     const platformName = dependencies.platformName ?? platform();
-    const fallbackEnvironment = handoff === undefined || platformName !== "win32"
-      ? environment
-      : { ...environment, TEMP: undefined, TMP: undefined };
-    const fallbackParents = candidateTemporaryParents(
-      fallbackEnvironment,
+    const snapshot = parseOriginalTemporaryParents(
+      environment.LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS,
       platformName,
-      null,
-      handoff === undefined ? dependencies.temporaryRoot : () => (
-        platformName === "win32" ? environment.SystemRoot ?? environment.WINDIR ?? "C:\\Windows" : "/var/tmp"
-      ),
     );
-    const candidateParents = dependencies.candidateParents
-      ?? (handoff === undefined ? fallbackParents : [handoff, ...fallbackParents]);
+    const candidateParents = handoff === undefined
+      ? candidateTemporaryParents(environment, platformName, null, dependencies.temporaryRoot)
+      : [
+        ...(typeof handoff === "string"
+          && handoff.length > 0
+          && !handoff.includes("\0")
+          && (platformName === "win32" ? win32.isAbsolute(handoff) : isAbsolute(handoff))
+          ? [handoff]
+          : []),
+        ...(snapshot ?? nonLivePlatformFallbackParents(environment, platformName)),
+      ];
     const allowedParents = canonicalCandidateParents({
       environment,
       platformName,
       candidateParents,
       realpath: resolvePath,
-      temporaryRoot: dependencies.temporaryRoot,
     });
-    if (!allowedParents.includes(dirname(resolved))
-      || !/^lcm-postgresql-harness-[A-Za-z0-9_-]+$/u.test(basename(resolved))) return undefined;
+    const pathApi = platformName === "win32" ? win32 : { dirname, basename };
+    const resolvedParent = pathApi.dirname(resolved);
+    const normalizePath = pathApi.normalize ?? normalize;
+    const parentKey = (value) => {
+      const normalized = normalizePath(value);
+      return platformName === "win32" ? normalized.toLowerCase() : normalized;
+    };
+    if (!allowedParents.some((parent) => parentKey(parent) === parentKey(resolvedParent))
+      || !/^lcm-postgresql-harness-[A-Za-z0-9_-]+$/u.test(pathApi.basename(resolved))) return undefined;
     return resolved;
   } catch {
     return undefined;

@@ -92,7 +92,14 @@ Each run owns one mode-0700 root. Forked workers create a home directory and a
 sibling temporary directory below that root before test modules load, and set
 `TMPDIR`, `TMP`, and `TEMP` to the sibling. The PostgreSQL harness uses the
 same selector and passes its selected parent to nested children through the
-development-only `LCM_TEST_HARNESS_TMPDIR` handoff. Cleanup removes only roots
+development-only `LCM_TEST_HARNESS_TMPDIR` handoff. Before that handoff is
+installed, the Vitest global captures the finite original parent candidates in
+the internal `LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS` snapshot. Nested harness
+authentication uses the selected handoff and that preserved snapshot, so a
+worker's rewritten `TMPDIR`, `TMP`, and `TEMP` cannot replace the parent's
+original authentication boundary. Existing snapshots are preserved verbatim;
+malformed or missing snapshots never trigger a nested recapture and safely
+degrade to the handoff plus platform fallbacks. Cleanup removes only roots
 created by the current run.
 
 Vitest config-time roots (`createVitestRunRoot` in `vitest.config.ts` and
