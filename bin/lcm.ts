@@ -42,6 +42,7 @@ import {
 } from "../src/runtime-paths.js";
 import type { ProgressState } from "../src/cli/progress-state.js";
 import { StorageBackendUnavailableError } from "../src/storage/backend.js";
+import { PrivateMutationLockContentionError } from "../src/private-mutation-lock.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
 import { BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC } from "../src/hooks/publication-fence.js";
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
@@ -2098,6 +2099,7 @@ export async function runCli(
   const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
 
   const program = new Command();
+  let publicationConvergence: import("../src/storage/publication-convergence.js").PublicationConvergence | undefined;
   program
     .name("lcm")
     .description("Long Context Manager for coding agents")
@@ -2852,7 +2854,7 @@ export async function runCli(
         await install(new DryRunServiceDeps());
         console.log("\n  No changes written.");
       } else {
-        await install();
+        await install(undefined, publicationConvergence);
       }
     });
 
@@ -4032,6 +4034,32 @@ export async function runCli(
 
   program.hook("preAction", async (_thisCommand, actionCommand) => {
     if (!shouldRunRootBootstrapMigration(actionCommand)) return;
+    const action = actionCommand.name();
+    if (action === "install" || action === "doctor") {
+      let withPublicationAdmissionRetry: typeof import("../src/storage/publication-convergence.js").withPublicationAdmissionRetry | undefined;
+      const installer = await import("../installer/install.js");
+      const factory = Object.prototype.hasOwnProperty.call(installer, "createInstallerPublicationConvergence")
+        ? installer.createInstallerPublicationConvergence
+        : undefined;
+      if (factory !== undefined) {
+        publicationConvergence ??= await factory();
+        withPublicationAdmissionRetry = (await import("../src/storage/publication-convergence.js")).withPublicationAdmissionRetry;
+      }
+      if (withPublicationAdmissionRetry === undefined) {
+        await migrateLegacyHomeWithRetry({
+          migrate,
+          sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
+          attempt: preflightSeams?.attempt,
+        });
+        return;
+      }
+      await withPublicationAdmissionRetry(() => migrateLegacyHomeWithRetry({
+        migrate,
+        sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
+        attempt: preflightSeams?.attempt,
+      }), publicationConvergence);
+      return;
+    }
     await migrateLegacyHomeWithRetry({
       migrate,
       sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
@@ -4067,6 +4095,7 @@ export function handleCliError(err: unknown): never {
       : err instanceof ConfigValidationError
       || err instanceof StorageBackendUnavailableError
       || err instanceof BootstrapLockContentionError
+      || err instanceof PrivateMutationLockContentionError
       ? err.message
       : err,
   );

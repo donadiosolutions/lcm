@@ -199,6 +199,8 @@ export type EnsureDaemonOptions = {
   _hermeticTestSeams?: DaemonLifecycleHermeticTestSeams;
   /** @internal Test-only publication admission seam. */
   _assertBackendPublication?: (homeDir: string | undefined, backend: StorageBackend) => void;
+  /** @internal Bounded admission convergence for one lifecycle publication assert. */
+  _withPublicationAdmissionRetry?: <T>(step: () => T | Promise<T>) => Promise<T>;
   /** @internal Inject only the manager transport environment for lifecycle tests. */
   _managerTransportEnvironmentOverride?: NodeJS.ProcessEnv;
   /** @internal Deterministic per-start nonce seam for lifecycle tests. */
@@ -1577,11 +1579,13 @@ function managerTransportEnvironment(
 
 export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDaemonResult> {
   validateSpawnTimeout(opts.spawnTimeoutMs);
+  const wrap = opts._withPublicationAdmissionRetry
+    ?? (async <T>(step: () => T | Promise<T>) => await step());
   // Keep publication admission short. The child performs its own config
   // admission, so retaining the lock over spawn and health waits would deadlock.
-  assertLifecycleBackendPublication(opts);
+  await wrap(() => assertLifecycleBackendPublication(opts));
   const result = await ensureDaemonUnlocked(opts);
-  assertLifecycleBackendPublication(opts);
+  await wrap(() => assertLifecycleBackendPublication(opts));
   return result;
 }
 

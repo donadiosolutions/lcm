@@ -134,6 +134,7 @@ const expectedComponents = [
     paths: [
       "^src/storage/backend\\.ts$",
       "^src/storage/backend-publication\\.ts$",
+      "^src/storage/publication-convergence\\.ts$",
       "^src/storage/capabilities\\.ts$",
       "^src/storage/contracts\\.ts$",
       "^src/storage/errors\\.ts$",
@@ -450,7 +451,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(207);
+    expect(productionFiles).toHaveLength(208);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -480,7 +481,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(207);
+    expect(ownershipCounts.size).toBe(208);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#722 files in their intended components", () => {

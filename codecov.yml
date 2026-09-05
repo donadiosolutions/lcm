@@ -120,6 +120,7 @@ component_management:
         # #837 retains consumer-admission descriptor cleanup in this owner.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
+        - "^src/storage/publication-convergence\\.ts$"
         - "^src/storage/capabilities\\.ts$"
         - "^src/storage/contracts\\.ts$"
         - "^src/storage/errors\\.ts$"
