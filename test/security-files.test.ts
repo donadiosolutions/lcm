@@ -202,15 +202,24 @@ describe("private filesystem primitives", () => {
     const parent = openPrivateDirectory(root);
     const target = join(root, "metadata.json");
     const originalLstat = lstatSync;
+    let drifted = false;
+    let renameCalled = false;
     try {
       expect(() => withPatchedFs(
         "lstatSync",
         ((path: string, options?: unknown) => {
-          if (path === root) return { isDirectory: () => false };
+          if (path === root && drifted) return { isDirectory: () => false };
           return originalLstat(path, options as never);
         }) as typeof lstatSync,
-        () => atomicWritePrivateFile(target, "content", {}, parent),
+        () => atomicWritePrivateFile(target, "content", {
+          rename: (from, to) => {
+            renameCalled = true;
+            renameSync(from, to);
+            drifted = true;
+          },
+        }, parent),
       )).toThrow(/topology/i);
+      expect(renameCalled).toBe(true);
     } finally {
       parent.close();
     }
