@@ -164,6 +164,24 @@ function createOwnedDaemonFixture(prefix: string, pid = 200): {
 }
 
 describe("ensureDaemon", () => {
+  it("resolves production probe defaults without invoking host probes on a skipped safe path", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-probe-defaults-"));
+    tempDirs.push(tempDir);
+    const fetchMock = vi.fn().mockRejectedValue(new Error("offline"));
+    await expect(ensureDaemonProduction({
+      port: 37_373,
+      pidFilePath: join(tempDir, "daemon.pid"),
+      spawnTimeoutMs: 1,
+      expectedVersion: "1",
+      expectedRuntimeDigest: TEST_RUNTIME_DIGEST,
+      _platform: "freebsd",
+      _skipSpawn: true,
+      _fetchOverride: fetchMock as FetchOverride,
+      _assertBackendPublication: () => undefined,
+    })).resolves.toMatchObject({ connected: false, spawned: false });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("refuses startup before inspecting PID state when publication admission is blocked", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-lifecycle-publication-"));
     tempDirs.push(home);

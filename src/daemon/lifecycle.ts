@@ -78,7 +78,6 @@ import {
   processStartTime,
   readPrivateMutationLockOwner,
   PrivateMutationLockContentionError,
-  type PrivateMutationLockOwner,
 } from "../private-mutation-lock.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
@@ -90,6 +89,12 @@ type CleanupFn = () => void | Promise<void>;
 type LifecycleAdmissionEvidence = Readonly<{
   result: EnsureDaemonResult;
   health: HealthResponse;
+  expectedVersion: string;
+  expectedStorageBackend: StorageBackend;
+  expectedEntrypoint: string;
+  expectedRuntimeDigest: string;
+  processBirth: typeof processStartTime;
+  readOwner: typeof readPrivateMutationLockOwner;
   birthBefore: string;
   birthAfter: string;
   token: string;
@@ -1617,116 +1622,94 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   // Keep publication admission short. The child performs its own config
   // admission, so retaining the lock over spawn and health waits would deadlock.
   await wrap(() => assertLifecycleBackendPublication(opts));
-  let childConvergence: PublicationConvergence | undefined;
+  let admissionEvidence: LifecycleAdmissionEvidence | undefined;
   const result = await ensureDaemonUnlocked({
     ...opts,
     _onAuthenticatedDaemonResult: (evidence) => {
       opts._onAuthenticatedDaemonResult?.(evidence);
-      const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
-      const expectedEntrypoint = opts._testScope?.entrypoint
-        ?? opts.expectedEntrypoint
-        ?? opts._packagedEntrypointOverride
-        ?? PACKAGED_RUNTIME_ENTRYPOINT;
-      const expectedRuntimeDigest = opts.expectedRuntimeDigest ?? RUNTIME_DIGEST;
-      if (
-        evidence.result.connected
-        && evidence.result.pid === evidence.health.pid
-        && evidence.health.pid !== undefined
-        && evidence.health.pid > 0
-        && (evidence.result.spawned === true
-          || (opts._managedOperationAuthorized === true
-            && opts._managedOperationManagerPid === evidence.health.pid))
-        && evidence.birthBefore === evidence.birthAfter
-        && evidence.token.length > 0
-        && expectedVersion !== undefined
-        && expectedEntrypoint !== undefined
-        && expectedRuntimeDigest !== undefined
-        && !opts._abortSignal?.aborted
-      ) {
-        const dependencies = resolveLifecycleDependencies(opts);
-        const baseSleep = opts._sleepOverride ?? dependencies.sleep;
-        const sleep = async (delayMs: number): Promise<void> => {
-          if (opts._abortSignal?.aborted) throw new Error("lifecycle aborted during publication convergence");
-          await new Promise<void>((resolve, reject) => {
-            let settled = false;
-            const onAbort = (): void => {
-              if (settled) return;
-              settled = true;
-              reject(new Error("lifecycle aborted during publication convergence"));
-            };
-            opts._abortSignal?.addEventListener("abort", onAbort, { once: true });
-            void baseSleep(delayMs).then(() => {
-              if (settled) return;
-              settled = true;
-              opts._abortSignal?.removeEventListener("abort", onAbort);
-              resolve();
-            }, (error: unknown) => {
-              if (settled) return;
-              settled = true;
-              opts._abortSignal?.removeEventListener("abort", onAbort);
-              reject(error);
-            });
-          });
-        };
-        const processBirth = opts._processStartTimeForTesting
-          ?? ((pid: number, observer: Parameters<typeof processStartTime>[1], options: Parameters<typeof processStartTime>[2]) => {
-            if (opts._testScope !== undefined || opts._hermeticTestSeams !== undefined) return null;
-            return processStartTime(pid, observer, options);
-          });
-        const readOwner = opts._readPrivateMutationLockOwnerForTesting
-          ?? ((lockPath: string, label?: string): PrivateMutationLockOwner | null => {
-            if (opts._testScope !== undefined || opts._hermeticTestSeams !== undefined) return null;
-            return readPrivateMutationLockOwner(lockPath, label);
-          });
-        const readToken = (): string | null => {
-          const current = evidence.readToken();
-          return current === evidence.token ? current : null;
-        };
-        const fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-          if (opts._abortSignal?.aborted) throw new Error("lifecycle aborted during publication convergence");
-          let onAbort: (() => void) | undefined;
-          try {
-            return await Promise.race([
-              dependencies.fetch(input, init),
-              new Promise<Response>((_, reject) => {
-                onAbort = (): void => reject(new Error("lifecycle aborted during publication convergence"));
-                opts._abortSignal?.addEventListener("abort", onAbort, { once: true });
-              }),
-            ]);
-          } finally {
-            if (onAbort !== undefined) opts._abortSignal?.removeEventListener("abort", onAbort);
-          }
-        };
-        const homeDir = publicationHomeForLifecycle(opts);
-        childConvergence = createPublicationConvergence({
-          port: opts.port,
-          identity: {
-            pid: evidence.health.pid,
-            version: expectedVersion,
-            storageBackend: opts.expectedStorageBackend ?? "sqlite",
-            entrypoint: expectedEntrypoint,
-            runtimeDigest: expectedRuntimeDigest,
-          },
-          expectedEntrypoint,
-          expectedRuntimeDigest,
-          deps: {
-            now: opts._monotonicNowOverride ?? performance.now.bind(performance),
-            sleep,
-            fetch,
-            readToken,
-            readOwner,
-            processBirth: (pid, observer, options) => {
-              if (pid !== evidence.health.pid) return null;
-              const observed = processBirth(pid, observer, options);
-              return observed === evidence.birthBefore ? observed : null;
-            },
-            platform: dependencies.platform,
-            homeDir,
-          },
-        });
-      }
+      admissionEvidence = evidence;
     },
   });
+  let childConvergence: PublicationConvergence | undefined;
+  const evidence = admissionEvidence;
+  if (
+    evidence !== undefined
+    && evidence.result === result
+    && result.connected
+    && result.refusalReason === undefined
+    && result.pid === evidence.health.pid
+    && !opts._abortSignal?.aborted
+  ) {
+    const dependencies = resolveLifecycleDependencies(opts);
+    const baseSleep = dependencies.sleep;
+    const processBirth = evidence.processBirth;
+    const readOwner = evidence.readOwner;
+    const abortError = (): Error => new Error("lifecycle aborted during publication convergence");
+    const raceAbort = async <T>(operation: Promise<T>, signal: AbortSignal): Promise<T> => {
+      if (signal.aborted) throw abortError();
+      let onAbort: (() => void) | undefined;
+      try {
+        return await Promise.race([
+          operation,
+          new Promise<never>((_, reject) => {
+            onAbort = (): void => reject(abortError());
+            signal.addEventListener("abort", onAbort, { once: true });
+          }),
+        ]);
+      } finally {
+        if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+      }
+    };
+    const sleep = async (delayMs: number): Promise<void> => {
+      if (opts._abortSignal === undefined) return await baseSleep(delayMs);
+      await raceAbort(baseSleep(delayMs), opts._abortSignal);
+    };
+    const readToken = (): string | null => {
+      const current = evidence.readToken();
+      return current === evidence.token ? current : null;
+    };
+    const fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const signals = [init?.signal, opts._abortSignal]
+        .filter((signal): signal is AbortSignal => signal !== undefined);
+      const signal = signals.length === 0
+        ? new AbortController().signal
+        : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+      const request = { ...init, signal };
+      const response = await raceAbort(dependencies.fetch(input, request), signal);
+      const body = response.json.bind(response);
+      return new Proxy(response, {
+        get(target, property, receiver) {
+          if (property !== "json") return Reflect.get(target, property, receiver);
+          return async (): Promise<unknown> => await raceAbort(Promise.resolve().then(body), signal);
+        },
+      });
+    };
+    childConvergence = createPublicationConvergence({
+      port: opts.port,
+      identity: {
+        pid: evidence.health.pid!,
+        version: evidence.expectedVersion,
+        storageBackend: evidence.expectedStorageBackend,
+        entrypoint: evidence.expectedEntrypoint,
+        runtimeDigest: evidence.expectedRuntimeDigest,
+      },
+      expectedEntrypoint: evidence.expectedEntrypoint,
+      expectedRuntimeDigest: evidence.expectedRuntimeDigest,
+      deps: {
+        now: opts._monotonicNowOverride ?? performance.now.bind(performance),
+        sleep,
+        fetch,
+        readToken,
+        readOwner,
+        processBirth: (pid, observer, options) => {
+          const observed = processBirth(pid, observer, options);
+          return observed === evidence.birthBefore ? observed : null;
+        },
+        platform: dependencies.platform,
+        homeDir: publicationHomeForLifecycle(opts),
+      },
+    });
+  }
   let firstContention: unknown;
   const finalWrap = childConvergence === undefined
     ? wrap
@@ -1734,6 +1717,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         try {
           return await withPublicationAdmissionRetry(async () => {
             try {
+              if (opts._abortSignal?.aborted) throw new Error("lifecycle aborted before publication assertion");
               return await step();
             } catch (error) {
               if (error instanceof PrivateMutationLockContentionError) firstContention ??= error;
@@ -1844,13 +1828,22 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
   const readOwnedToken = (path: string): string | null => scopedState
     ? readScopedAuthToken(scopedState)
     : readAuthToken(path);
+  const fetchFn = dependencies.fetch;
+  const platform = dependencies.platform;
+  const procRoot = dependencies.procRoot;
+  const sleepFn = dependencies.sleep;
+  const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
+  const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
+  const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
+  const realpath = dependencies.realpath;
+  const deadline = monotonicNow() + opts.spawnTimeoutMs;
+  const processBirthProbe: typeof processStartTime = opts._processStartTimeForTesting
+    ?? (testScope !== undefined || hermeticSeams !== undefined ? (() => null) : processStartTime);
+  const readOwnerProbe: typeof readPrivateMutationLockOwner = opts._readPrivateMutationLockOwnerForTesting
+    ?? (testScope !== undefined || hermeticSeams !== undefined ? (() => null) : readPrivateMutationLockOwner);
   const readAdmissionBirth = (pid: number): string | null => {
     try {
-      if (opts._processStartTimeForTesting !== undefined) {
-        return opts._processStartTimeForTesting(pid, undefined, { timeoutMs: Math.max(1, deadline - monotonicNow()) });
-      }
-      if (testScope !== undefined || hermeticSeams !== undefined) return null;
-      return processStartTime(pid, undefined, { timeoutMs: Math.max(1, deadline - monotonicNow()) });
+      return processBirthProbe(pid, undefined, { timeoutMs: Math.max(1, deadline - monotonicNow()) });
     } catch {
       return null;
     }
@@ -1861,15 +1854,6 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     birthAfter: null,
     tokenAfter: null,
   });
-  const fetchFn = dependencies.fetch;
-  const platform = dependencies.platform;
-  const procRoot = dependencies.procRoot;
-  const sleepFn = dependencies.sleep;
-  const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
-  const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
-  const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
-  const realpath = dependencies.realpath;
-  const deadline = monotonicNow() + opts.spawnTimeoutMs;
   const isAlive = dependencies.isProcessAlive;
   const killProcess = dependencies.killProcess;
   const enforceParent = opts.enforceUserManagerParent === true && platform === "linux";
@@ -2099,16 +2083,17 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     const witnessEligible = !opts._skipHealthWait
       && !opts._skipSpawn
       && !opts._abortSignal?.aborted
-      && (spawned || (opts._managedOperationAuthorized === true && opts._managedOperationManagerPid !== undefined))
+      && (spawned || (opts._managedOperationAuthorized === true && opts._managedOperationManagerPid === health.pid))
       && expectedVersion !== undefined
       && expectedEntrypoint !== undefined
       && expectedRuntimeDigest !== undefined
-      && health.pid !== undefined;
+      && health.pid !== undefined
+      && (!access.alreadyVerified || admissionPins !== undefined);
     const birthBefore = witnessEligible
-      ? admissionPins?.birthBefore ?? readAdmissionBirth(health.pid!)
+      ? admissionPins !== undefined ? admissionPins.birthBefore : readAdmissionBirth(health.pid!)
       : null;
     const tokenBefore = witnessEligible
-      ? admissionPins?.tokenBefore ?? readOwnedToken(tokenPath)
+      ? admissionPins !== undefined ? admissionPins.tokenBefore : readOwnedToken(tokenPath)
       : null;
     let verifiedHealth = health;
     if (!access.alreadyVerified) {
@@ -2132,10 +2117,10 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     if (!processEntrypointMatches(verifiedHealth, expectedEntrypoint, platform, procRoot, realpath)) return null;
     if (!healthRuntimeDigestMatches(verifiedHealth, expectedRuntimeDigest)) return null;
     const birthAfter = witnessEligible
-      ? admissionPins?.birthAfter ?? readAdmissionBirth(verifiedHealth.pid!)
+      ? admissionPins !== undefined ? admissionPins.birthAfter : readAdmissionBirth(verifiedHealth.pid!)
       : null;
     const tokenAfter = witnessEligible
-      ? admissionPins?.tokenAfter ?? readOwnedToken(tokenPath)
+      ? admissionPins !== undefined ? admissionPins.tokenAfter : readOwnedToken(tokenPath)
       : null;
 
     const publishResult = (result: EnsureDaemonResult): EnsureDaemonResult => {
@@ -2152,6 +2137,12 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
         opts._onAuthenticatedDaemonResult?.({
           result,
           health: verifiedHealth,
+          expectedVersion,
+          expectedStorageBackend,
+          expectedEntrypoint,
+          expectedRuntimeDigest,
+          processBirth: processBirthProbe,
+          readOwner: readOwnerProbe,
           birthBefore,
           birthAfter,
           token: tokenBefore,
@@ -2845,7 +2836,17 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     if (publicStorageBackend === null) {
       return refusalResult("response-invalid", "managed daemon reported an unknown storage backend", { pid: observation.managerPid });
     }
-    const admissionBefore = captureAdmissionPins(health.pid!);
+    const admissionBefore = opts._managedOperationAuthorized === true
+      && opts._managedOperationManagerPid === health.pid
+      && !opts._skipHealthWait
+      && !opts._skipSpawn
+      && !opts._abortSignal?.aborted
+      && health.pid !== undefined
+      && expectedVersion !== undefined
+      && expectedEntrypoint !== undefined
+      && expectedRuntimeDigest !== undefined
+      ? captureAdmissionPins(health.pid)
+      : undefined;
     const authenticated = await checkDaemonDiagnostics(
       opts.port,
       tokenPath,
@@ -2858,7 +2859,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     if (authenticated === null) {
       return refusalResult("response-auth-failure", "managed daemon health could not be authenticated", { pid: observation.managerPid });
     }
-    const admissionPins: LifecycleAdmissionPins = {
+    const admissionPins = admissionBefore === undefined ? undefined : {
       ...admissionBefore,
       birthAfter: readAdmissionBirth(authenticated.pid!),
       tokenAfter: readOwnedToken(tokenPath),
@@ -2986,7 +2987,15 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
         if (isRecognizedDaemonHealth(health) && managerEndpointIdentityMatches(second, health, launchSpec)) {
           const storage = recognizedHealthStorageBackend(health);
           if (storage !== null) {
-            const admissionBefore = captureAdmissionPins(health.pid!);
+            const admissionBefore = !opts._skipHealthWait
+              && !opts._skipSpawn
+              && !opts._abortSignal?.aborted
+              && health.pid !== undefined
+              && expectedVersion !== undefined
+              && expectedEntrypoint !== undefined
+              && expectedRuntimeDigest !== undefined
+              ? captureAdmissionPins(health.pid)
+              : undefined;
             const authenticated = await checkDaemonDiagnostics(
               opts.port,
               tokenPath,
@@ -2997,7 +3006,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
               readOwnedToken,
             );
             if (authenticated !== null) {
-              const admissionPins: LifecycleAdmissionPins = {
+              const admissionPins = admissionBefore === undefined ? undefined : {
                 ...admissionBefore,
                 birthAfter: readAdmissionBirth(authenticated.pid!),
                 tokenAfter: readOwnedToken(tokenPath),
