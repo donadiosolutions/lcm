@@ -774,6 +774,28 @@ describe("owned process lifecycle utilities", () => {
     }
   });
 
+  it("forwards validated group teardown through the default kill seam", async () => {
+    const processKill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      const processChild = child(9132);
+      const teardown = createOwnedProcessTeardown({
+        child: processChild,
+        platform: "linux",
+        processGroupId: 9132,
+        daemonProcessGroupId: 9131,
+        processBirthTime: () => "birth-9132",
+        isProcessGroupAlive: () => false,
+      });
+      const pending = teardown.terminate();
+      expect(processKill).toHaveBeenCalledWith(-9132, "SIGTERM");
+      expect(processKill).toHaveBeenCalledTimes(1);
+      processChild.emit("close");
+      await expect(pending).resolves.toBe(true);
+    } finally {
+      processKill.mockRestore();
+    }
+  });
+
   it("derives Linux group state conservatively when explicit identities are omitted", async () => {
     const processChild = child(process.pid);
     const derived = createOwnedProcessTeardown({
