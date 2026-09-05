@@ -1474,6 +1474,35 @@ describe("runCli orchestration actions", () => {
     await expect(runCli(["node", "lcm", "stats"])).rejects.toBeInstanceOf(BackendPublicationJournalError);
   });
 
+  it("fails stats without output or retry when its second config admission rejects the journal", async () => {
+    const failure = new BackendPublicationJournalError("unresolved-publication", "private evidence");
+    const convergence = makeTestConvergence();
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+    const statsModule = await import("../../src/stats.js");
+    const actualStats = await vi.importActual<typeof import("../../src/stats.js")>("../../src/stats.js");
+    const initialConfig = state.loadConfig();
+    vi.mocked(statsModule.collectStats).mockImplementationOnce(() => {
+      state.loadConfig
+        .mockReturnValueOnce(initialConfig)
+        .mockImplementationOnce(() => { throw failure; });
+      return actualStats.collectStats();
+    });
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await invoke(["stats"]);
+
+    expect(result).toBe(failure);
+    expect(() => handleCliError(result)).toThrow("exit:1");
+    expect(diagnostic).toHaveBeenCalledExactlyOnceWith(FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC);
+    expect(statsModule.collectStats).toHaveBeenCalledOnce();
+    expect(statsModule.printStats).not.toHaveBeenCalled();
+    expect(stdout).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
+    expect(convergence.deadline).toBeUndefined();
+  });
+
   it.each(["start", "restart"])("runs managed daemon %s with staged PostgreSQL storage", async (action) => {
     state.loadConfig.mockReturnValueOnce({ daemon: { port: 3737 }, storage: { backend: "postgresql" } });
 

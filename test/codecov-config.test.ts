@@ -508,6 +508,7 @@ describe("Codecov configuration", () => {
       ["src/sensitive.ts", "unit-configuration-security"],
       ["src/project-map.ts", "unit-project-worktrees"],
       ["src/portable-knowledge.ts", "unit-project-worktrees"],
+      // #866 stats config retries and journal failures retain this owner.
       ["src/stats.ts", "unit-memory-retrieval"],
       ["src/connectors/codex-hooks.ts", "unit-connectors"],
       ["src/connectors/installer.ts", "unit-connectors"],

@@ -166,7 +166,7 @@ component_management:
       paths:
         # The #709 SearchResult compatibility bridge, #793 search-limit contract,
         # and retrieval contract remain memory/retrieval-owned. #866 stats
-        # publication retries stay in this existing owner.
+        # publication retries and fail-closed journal errors stay in this owner.
         - "src/memory/"
         - "^src/expansion\\.ts$"
         - "^src/retrieval\\.ts$"

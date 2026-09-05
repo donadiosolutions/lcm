@@ -159,7 +159,8 @@ vi.mock("node:sqlite", () => ({
 }));
 
 import { collectStats, formatNumber, formatRatio, printStats } from "../src/stats.js";
-import { StorageBackendUnavailableError } from "../src/storage/backend.js";
+import { selectStorageBackendForConfig, StorageBackendUnavailableError } from "../src/storage/backend.js";
+import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
 import { PrivateMutationLockContentionError } from "../src/private-mutation-lock.js";
 
 type Stats = Parameters<typeof printStats>[0];
@@ -239,6 +240,39 @@ describe("stats service coverage", () => {
     } finally {
       mocks.stalePrivateContention = false;
     }
+  });
+
+  it("preserves a stale-config journal failure after successful initial admission", async () => {
+    const failure = new BackendPublicationJournalError("unresolved-publication", "private evidence");
+    mocks.loadConfig
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => { throw failure; });
+
+    await expect(collectStats()).rejects.toBe(failure);
+
+    expect(mocks.loadConfig).toHaveBeenCalledTimes(2);
+    expect(selectStorageBackendForConfig).toHaveBeenCalledOnce();
+    expect(mocks.migrate).not.toHaveBeenCalled();
+    expect(mocks.collectEvents).not.toHaveBeenCalled();
+  });
+
+  it("uses stale defaults for malformed settings after successful initial admission", async () => {
+    mocks.loadConfig
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => { throw new Error("config broken"); });
+    mocks.entries = [{ name: "one", directory: true, dbExists: true }];
+    projects.set("one", {
+      messages: 1, messageTokens: 1, summaries: 0, summaryTokens: 0, maxDepth: 0, promoted: 0,
+      redactions: [], conversations: [],
+    });
+
+    expect(await collectStats()).toMatchObject({ projects: 1, messages: 1 });
+
+    expect(mocks.loadConfig).toHaveBeenCalledTimes(2);
+    expect(selectStorageBackendForConfig).toHaveBeenCalledOnce();
+    expect(mocks.findStale).toHaveBeenCalledWith(expect.objectContaining({
+      staleAfterDays: 90, staleSurfacingWithoutUseLimit: 5,
+    }));
   });
 
   it("rethrows unavailable PostgreSQL selection before populated project reads", async () => {

@@ -400,7 +400,8 @@ export async function collectStats(): Promise<OverallStats> {
       staleSurfacingWithoutUseLimit: cfg.restoration.staleSurfacingWithoutUseLimit,
     };
   } catch (error) {
-    if (error instanceof PrivateMutationLockContentionError) throw error;
+    if (error instanceof BackendPublicationJournalError
+      || error instanceof PrivateMutationLockContentionError) throw error;
     /* use defaults */
   }
 
