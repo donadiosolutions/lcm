@@ -69,12 +69,39 @@ import {
   assertStorageBackendPublication,
   withStorageBackendConsumerLock,
 } from "../storage/backend.js";
+import {
+  createPublicationConvergence,
+  withPublicationAdmissionRetry,
+  type PublicationConvergence,
+} from "../storage/publication-convergence.js";
+import {
+  processStartTime,
+  readPrivateMutationLockOwner,
+  PrivateMutationLockContentionError,
+  type PrivateMutationLockOwner,
+} from "../private-mutation-lock.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
 type SetTimeoutFn = (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
 type ClearTimeoutFn = (timeout: ReturnType<typeof setTimeout>) => void;
 type CleanupFn = () => void | Promise<void>;
+
+type LifecycleAdmissionEvidence = Readonly<{
+  result: EnsureDaemonResult;
+  health: HealthResponse;
+  birthBefore: string;
+  birthAfter: string;
+  token: string;
+  readToken: () => string | null;
+}>;
+
+type LifecycleAdmissionPins = Readonly<{
+  birthBefore: string | null;
+  tokenBefore: string | null;
+  birthAfter: string | null;
+  tokenAfter: string | null;
+}>;
 
 function publicationHomeForPidPath(pidFilePath: string): string | undefined {
   const pidPath = resolve(pidFilePath);
@@ -176,6 +203,10 @@ export type EnsureDaemonOptions = {
   _killOverride?: KillProcess;
   _sleepOverride?: SleepFn;
   _monotonicNowOverride?: () => number;
+  /** @internal Hermetic process-birth seam for lifecycle admission convergence. */
+  _processStartTimeForTesting?: typeof processStartTime;
+  /** @internal Hermetic publication-lock-owner seam for lifecycle admission convergence. */
+  _readPrivateMutationLockOwnerForTesting?: typeof readPrivateMutationLockOwner;
   _setTimeoutOverride?: SetTimeoutFn;
   _clearTimeoutOverride?: ClearTimeoutFn;
   _isProcessAliveOverride?: (pid: number) => boolean;
@@ -211,6 +242,8 @@ export type EnsureDaemonOptions = {
   _supervisorCredentialFilesOverride?: SupervisorSpec["credentialFiles"];
   /** @internal Deterministic interruption seam for lifecycle tests. */
   _abortSignal?: AbortSignal;
+  /** @internal Private lifecycle-only callback for an authenticated child witness. */
+  _onAuthenticatedDaemonResult?: (evidence: LifecycleAdmissionEvidence) => void;
 };
 
 export type EnsureDaemonResult = {
@@ -1584,8 +1617,135 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   // Keep publication admission short. The child performs its own config
   // admission, so retaining the lock over spawn and health waits would deadlock.
   await wrap(() => assertLifecycleBackendPublication(opts));
-  const result = await ensureDaemonUnlocked(opts);
-  await wrap(() => assertLifecycleBackendPublication(opts));
+  let childConvergence: PublicationConvergence | undefined;
+  const result = await ensureDaemonUnlocked({
+    ...opts,
+    _onAuthenticatedDaemonResult: (evidence) => {
+      opts._onAuthenticatedDaemonResult?.(evidence);
+      const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
+      const expectedEntrypoint = opts._testScope?.entrypoint
+        ?? opts.expectedEntrypoint
+        ?? opts._packagedEntrypointOverride
+        ?? PACKAGED_RUNTIME_ENTRYPOINT;
+      const expectedRuntimeDigest = opts.expectedRuntimeDigest ?? RUNTIME_DIGEST;
+      if (
+        evidence.result.connected
+        && evidence.result.pid === evidence.health.pid
+        && evidence.health.pid !== undefined
+        && evidence.health.pid > 0
+        && (evidence.result.spawned === true
+          || (opts._managedOperationAuthorized === true
+            && opts._managedOperationManagerPid === evidence.health.pid))
+        && evidence.birthBefore === evidence.birthAfter
+        && evidence.token.length > 0
+        && expectedVersion !== undefined
+        && expectedEntrypoint !== undefined
+        && expectedRuntimeDigest !== undefined
+        && !opts._abortSignal?.aborted
+      ) {
+        const dependencies = resolveLifecycleDependencies(opts);
+        const baseSleep = opts._sleepOverride ?? dependencies.sleep;
+        const sleep = async (delayMs: number): Promise<void> => {
+          if (opts._abortSignal?.aborted) throw new Error("lifecycle aborted during publication convergence");
+          await new Promise<void>((resolve, reject) => {
+            let settled = false;
+            const onAbort = (): void => {
+              if (settled) return;
+              settled = true;
+              reject(new Error("lifecycle aborted during publication convergence"));
+            };
+            opts._abortSignal?.addEventListener("abort", onAbort, { once: true });
+            void baseSleep(delayMs).then(() => {
+              if (settled) return;
+              settled = true;
+              opts._abortSignal?.removeEventListener("abort", onAbort);
+              resolve();
+            }, (error: unknown) => {
+              if (settled) return;
+              settled = true;
+              opts._abortSignal?.removeEventListener("abort", onAbort);
+              reject(error);
+            });
+          });
+        };
+        const processBirth = opts._processStartTimeForTesting
+          ?? ((pid: number, observer: Parameters<typeof processStartTime>[1], options: Parameters<typeof processStartTime>[2]) => {
+            if (opts._testScope !== undefined || opts._hermeticTestSeams !== undefined) return null;
+            return processStartTime(pid, observer, options);
+          });
+        const readOwner = opts._readPrivateMutationLockOwnerForTesting
+          ?? ((lockPath: string, label?: string): PrivateMutationLockOwner | null => {
+            if (opts._testScope !== undefined || opts._hermeticTestSeams !== undefined) return null;
+            return readPrivateMutationLockOwner(lockPath, label);
+          });
+        const readToken = (): string | null => {
+          const current = evidence.readToken();
+          return current === evidence.token ? current : null;
+        };
+        const fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+          if (opts._abortSignal?.aborted) throw new Error("lifecycle aborted during publication convergence");
+          let onAbort: (() => void) | undefined;
+          try {
+            return await Promise.race([
+              dependencies.fetch(input, init),
+              new Promise<Response>((_, reject) => {
+                onAbort = (): void => reject(new Error("lifecycle aborted during publication convergence"));
+                opts._abortSignal?.addEventListener("abort", onAbort, { once: true });
+              }),
+            ]);
+          } finally {
+            if (onAbort !== undefined) opts._abortSignal?.removeEventListener("abort", onAbort);
+          }
+        };
+        const homeDir = publicationHomeForLifecycle(opts);
+        childConvergence = createPublicationConvergence({
+          port: opts.port,
+          identity: {
+            pid: evidence.health.pid,
+            version: expectedVersion,
+            storageBackend: opts.expectedStorageBackend ?? "sqlite",
+            entrypoint: expectedEntrypoint,
+            runtimeDigest: expectedRuntimeDigest,
+          },
+          expectedEntrypoint,
+          expectedRuntimeDigest,
+          deps: {
+            now: opts._monotonicNowOverride ?? performance.now.bind(performance),
+            sleep,
+            fetch,
+            readToken,
+            readOwner,
+            processBirth: (pid, observer, options) => {
+              if (pid !== evidence.health.pid) return null;
+              const observed = processBirth(pid, observer, options);
+              return observed === evidence.birthBefore ? observed : null;
+            },
+            platform: dependencies.platform,
+            homeDir,
+          },
+        });
+      }
+    },
+  });
+  let firstContention: unknown;
+  const finalWrap = childConvergence === undefined
+    ? wrap
+    : async <T>(step: () => T | Promise<T>): Promise<T> => {
+        try {
+          return await withPublicationAdmissionRetry(async () => {
+            try {
+              return await step();
+            } catch (error) {
+              if (error instanceof PrivateMutationLockContentionError) firstContention ??= error;
+              throw error;
+            }
+          }, childConvergence);
+        } catch (error) {
+          if (opts._abortSignal?.aborted && firstContention !== undefined) throw firstContention;
+          throw error;
+        }
+      };
+  await finalWrap(() => assertLifecycleBackendPublication(opts));
   return result;
 }
 
@@ -1684,6 +1844,23 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
   const readOwnedToken = (path: string): string | null => scopedState
     ? readScopedAuthToken(scopedState)
     : readAuthToken(path);
+  const readAdmissionBirth = (pid: number): string | null => {
+    try {
+      if (opts._processStartTimeForTesting !== undefined) {
+        return opts._processStartTimeForTesting(pid, undefined, { timeoutMs: Math.max(1, deadline - monotonicNow()) });
+      }
+      if (testScope !== undefined || hermeticSeams !== undefined) return null;
+      return processStartTime(pid, undefined, { timeoutMs: Math.max(1, deadline - monotonicNow()) });
+    } catch {
+      return null;
+    }
+  };
+  const captureAdmissionPins = (pid: number): LifecycleAdmissionPins => ({
+    birthBefore: readAdmissionBirth(pid),
+    tokenBefore: readOwnedToken(tokenPath),
+    birthAfter: null,
+    tokenAfter: null,
+  });
   const fetchFn = dependencies.fetch;
   const platform = dependencies.platform;
   const procRoot = dependencies.procRoot;
@@ -1911,6 +2088,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     access: { alreadyVerified: true; systemdControlGroup?: string } | { alreadyVerified: false; deadline: number },
     warning?: string,
     allowParentWarning = false,
+    admissionPins?: LifecycleAdmissionPins,
   ): Promise<EnsureDaemonResult | null> {
     if (health === null || !endpointIdentityMatches(
       health,
@@ -1918,6 +2096,20 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     )) return null;
     if (!healthVersionMatches(health, expectedVersion)) return null;
     if (!healthStorageBackendMatches(health, expectedStorageBackend)) return null;
+    const witnessEligible = !opts._skipHealthWait
+      && !opts._skipSpawn
+      && !opts._abortSignal?.aborted
+      && (spawned || (opts._managedOperationAuthorized === true && opts._managedOperationManagerPid !== undefined))
+      && expectedVersion !== undefined
+      && expectedEntrypoint !== undefined
+      && expectedRuntimeDigest !== undefined
+      && health.pid !== undefined;
+    const birthBefore = witnessEligible
+      ? admissionPins?.birthBefore ?? readAdmissionBirth(health.pid!)
+      : null;
+    const tokenBefore = witnessEligible
+      ? admissionPins?.tokenBefore ?? readOwnedToken(tokenPath)
+      : null;
     let verifiedHealth = health;
     if (!access.alreadyVerified) {
       const authenticated = await checkDaemonDiagnostics(
@@ -1939,6 +2131,35 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     }
     if (!processEntrypointMatches(verifiedHealth, expectedEntrypoint, platform, procRoot, realpath)) return null;
     if (!healthRuntimeDigestMatches(verifiedHealth, expectedRuntimeDigest)) return null;
+    const birthAfter = witnessEligible
+      ? admissionPins?.birthAfter ?? readAdmissionBirth(verifiedHealth.pid!)
+      : null;
+    const tokenAfter = witnessEligible
+      ? admissionPins?.tokenAfter ?? readOwnedToken(tokenPath)
+      : null;
+
+    const publishResult = (result: EnsureDaemonResult): EnsureDaemonResult => {
+      if (
+        witnessEligible
+        && result.connected
+        && birthBefore !== null
+        && birthAfter !== null
+        && birthBefore === birthAfter
+        && tokenBefore !== null
+        && tokenBefore === tokenAfter
+        && result.pid === verifiedHealth.pid
+      ) {
+        opts._onAuthenticatedDaemonResult?.({
+          result,
+          health: verifiedHealth,
+          birthBefore,
+          birthAfter,
+          token: tokenBefore,
+          readToken: () => readOwnedToken(tokenPath),
+        });
+      }
+      return result;
+    };
 
     let parent: ParentInspection | undefined;
     if (enforceParent) {
@@ -1948,7 +2169,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
           if (parent.reason === "dead-pid" || parent.reason === "pid-not-lcm-daemon") {
             cleanOwnedPid();
           }
-          return {
+          return publishResult({
             connected: true,
             port: opts.port,
             spawned,
@@ -1958,13 +2179,13 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
             restartedForParent,
             startMethod,
             warning: warning ?? parentInvariantWarning(parent),
-          };
+          });
         }
         return null;
       }
     }
 
-    return {
+    return publishResult({
       connected: true,
       port: opts.port,
       spawned,
@@ -1976,7 +2197,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
       restartedForParent,
       startMethod,
       warning,
-    };
+    });
   }
 
   async function waitForConcurrentReplacement(pid: number): Promise<EnsureDaemonResult> {
@@ -2624,6 +2845,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     if (publicStorageBackend === null) {
       return refusalResult("response-invalid", "managed daemon reported an unknown storage backend", { pid: observation.managerPid });
     }
+    const admissionBefore = captureAdmissionPins(health.pid!);
     const authenticated = await checkDaemonDiagnostics(
       opts.port,
       tokenPath,
@@ -2636,6 +2858,11 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     if (authenticated === null) {
       return refusalResult("response-auth-failure", "managed daemon health could not be authenticated", { pid: observation.managerPid });
     }
+    const admissionPins: LifecycleAdmissionPins = {
+      ...admissionBefore,
+      birthAfter: readAdmissionBirth(authenticated.pid!),
+      tokenAfter: readOwnedToken(tokenPath),
+    };
     let finalProbe: SupervisorObservation;
     try {
       finalProbe = await supervisor.probe(requestedSpec, { deadline });
@@ -2655,6 +2882,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
       { alreadyVerified: true, systemdControlGroup: finalProbe.controlGroup },
       undefined,
       true,
+      admissionPins,
     );
     return accepted ?? refusalResult("response-invalid", "managed daemon identity could not be admitted", { pid: observation.managerPid });
   }
@@ -2758,6 +2986,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
         if (isRecognizedDaemonHealth(health) && managerEndpointIdentityMatches(second, health, launchSpec)) {
           const storage = recognizedHealthStorageBackend(health);
           if (storage !== null) {
+            const admissionBefore = captureAdmissionPins(health.pid!);
             const authenticated = await checkDaemonDiagnostics(
               opts.port,
               tokenPath,
@@ -2768,6 +2997,11 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
               readOwnedToken,
             );
             if (authenticated !== null) {
+              const admissionPins: LifecycleAdmissionPins = {
+                ...admissionBefore,
+                birthAfter: readAdmissionBirth(authenticated.pid!),
+                tokenAfter: readOwnedToken(tokenPath),
+              };
               let finalProbe: SupervisorObservation;
               try {
                 finalProbe = await supervisor.probe(launchSpec, managerOperation);
@@ -2797,6 +3031,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
                 { alreadyVerified: true, systemdControlGroup: finalProbe.controlGroup },
                 undefined,
                 true,
+                admissionPins,
               );
               if (accepted) {
                 if (managedCredentialDirectoryForCleanup !== undefined) {
