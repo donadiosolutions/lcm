@@ -174,11 +174,62 @@ describe("private filesystem primitives", () => {
     const root = makeRoot();
     const other = makeRoot();
     const parent = openPrivateDirectory(root);
+    const modeAlias = join(root, "mode-alias");
+    const ownerAlias = join(root, "owner-alias");
+    mkdirSync(modeAlias, { mode: 0o755 });
+    mkdirSync(ownerAlias, { mode: 0o700 });
+    const originalLstat = lstatSync;
     try {
-      chmodSync(root, 0o755);
-      expect(() => assertPrivateDirectoryEntry(parent, root)).toThrow(/topology/i);
-      chmodSync(root, 0o700);
-      expect(() => assertPrivateDirectoryEntry(parent, root, parent.witness.uid + 1)).toThrow(/topology/i);
+      let modeError: unknown;
+      try {
+        withPatchedFs(
+        "lstatSync",
+        ((path: string, options?: unknown) => {
+          if (path === modeAlias) {
+            return {
+              isDirectory: () => true,
+              mode: 0o40755n,
+              uid: BigInt(parent.witness.uid),
+              dev: BigInt(parent.witness.dev),
+              ino: BigInt(parent.witness.ino),
+            };
+          }
+          return originalLstat(path, options as never);
+        }) as typeof lstatSync,
+        () => assertPrivateDirectoryEntry(parent, modeAlias),
+        );
+      } catch (error) {
+        modeError = error;
+      }
+      expect(modeError).toMatchObject({
+        name: "PrivateDirectoryTopologyError",
+        cause: { message: "private directory entry mode is not trusted" },
+      });
+      let ownerError: unknown;
+      try {
+        withPatchedFs(
+        "lstatSync",
+        ((path: string, options?: unknown) => {
+          if (path === ownerAlias) {
+            return {
+              isDirectory: () => true,
+              mode: 0o40700n,
+              uid: BigInt(parent.witness.uid + 1),
+              dev: BigInt(parent.witness.dev),
+              ino: BigInt(parent.witness.ino),
+            };
+          }
+          return originalLstat(path, options as never);
+        }) as typeof lstatSync,
+        () => assertPrivateDirectoryEntry(parent, ownerAlias),
+        );
+      } catch (error) {
+        ownerError = error;
+      }
+      expect(ownerError).toMatchObject({
+        name: "PrivateDirectoryTopologyError",
+        cause: { message: "private directory entry owner is not trusted" },
+      });
       expect(() => assertPrivateDirectoryEntry(parent, other)).toThrow(/topology/i);
     } finally {
       parent.close();

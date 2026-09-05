@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, fchmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, resolve } from "node:path";
@@ -293,6 +293,87 @@ describe("secure project-root handoff", () => {
       expect(statSync(leaf).mode & 0o777).toBe(0o755);
     } finally {
       process.umask(previousUmask);
+    }
+  });
+
+  it("authenticates an EEXIST child without fchmod or creation admission", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const projects = join(home, ".lcm", "projects");
+    const id = "2".repeat(64);
+    const leaf = join(projects, id);
+    mkdirSync(leaf, { recursive: true, mode: 0o700 });
+    const originalProbe = securityFiles.openPrivateDirectoryIfExists;
+    const originalMkdir = mkdirSync;
+    const originalFchmod = fchmodSync;
+    const probeSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      if (path === leaf) return undefined;
+      return originalProbe(path, options);
+    });
+    const strictOpen = vi.spyOn(securityFiles, "openPrivateDirectory");
+    const creationSpy = vi.spyOn(securityFiles, "openPrivateDirectoryForCreation");
+    let fchmodCalls = 0;
+    try {
+      withPatchedFs("mkdirSync", ((path: string, options: Parameters<typeof mkdirSync>[1]) => {
+        if (path === leaf) throw Object.assign(new Error("already exists"), { code: "EEXIST" });
+        return originalMkdir(path, options);
+      }) as typeof mkdirSync, () => withPatchedFs(
+        "fchmodSync",
+        ((...args: Parameters<typeof fchmodSync>) => {
+          fchmodCalls++;
+          return originalFchmod(...args);
+        }) as typeof fchmodSync,
+        () => ensureProjectDirForIdentity({ id, canonical: "/project" }, { writeMetadata: false }),
+      ));
+      expect(strictOpen.mock.calls.some(([path]) => path === leaf)).toBe(true);
+      expect(creationSpy).not.toHaveBeenCalled();
+      expect(fchmodCalls).toBe(0);
+    } finally {
+      creationSpy.mockRestore();
+      strictOpen.mockRestore();
+      probeSpy.mockRestore();
+    }
+  });
+
+  it("rejects an EEXIST child when strict authentication fails and closes ancestors", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const projects = join(rootPath, "projects");
+    const id = "3".repeat(64);
+    const leaf = join(projects, id);
+    mkdirSync(leaf, { recursive: true, mode: 0o700 });
+    const closeCounts = new Map<string, number>();
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalProbe = securityFiles.openPrivateDirectoryIfExists;
+    const originalMkdir = mkdirSync;
+    const wrap = (path: string, handle: securityFiles.PrivateDirectoryHandle): securityFiles.PrivateDirectoryHandle => ({
+      ...handle,
+      close: () => {
+        closeCounts.set(path, (closeCounts.get(path) ?? 0) + 1);
+        handle.close();
+      },
+    });
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) => {
+      if (path === leaf) throw new Error("strict EEXIST authentication failed");
+      return wrap(path, originalOpen(path, options));
+    });
+    const probeSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      if (path === leaf) return undefined;
+      const handle = originalProbe(path, options);
+      return handle === undefined ? handle : wrap(path, handle);
+    });
+    try {
+      withPatchedFs("mkdirSync", ((path: string, options: Parameters<typeof mkdirSync>[1]) => {
+        if (path === leaf) throw Object.assign(new Error("already exists"), { code: "EEXIST" });
+        return originalMkdir(path, options);
+      }) as typeof mkdirSync, () => {
+        expect(() => ensureProjectDirForIdentity({ id, canonical: "/project" }, { writeMetadata: false }))
+          .toThrow("strict EEXIST authentication failed");
+      });
+      expect(closeCounts.get(rootPath)).toBe(1);
+      expect(closeCounts.get(projects)).toBe(1);
+    } finally {
+      probeSpy.mockRestore();
+      openSpy.mockRestore();
     }
   });
 

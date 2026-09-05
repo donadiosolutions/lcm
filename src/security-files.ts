@@ -256,16 +256,7 @@ export function assertPrivateDirectoryEntry(
     if (Number(entry.mode & 0o7777n) !== PRIVATE_DIRECTORY_MODE) {
       throw new Error("private directory entry mode is not trusted");
     }
-    if (entry.mode !== stat.mode) {
-      throw new Error("private directory entry mode changed during validation");
-    }
     if (entry.uid !== stat.uid) {
-      throw new Error("private directory entry owner is not trusted");
-    }
-    if (
-      expectedUid !== undefined
-      && (!Number.isSafeInteger(expectedUid) || Number(entry.uid) !== expectedUid)
-    ) {
       throw new Error("private directory entry owner is not trusted");
     }
     if (entry.dev !== stat.dev || entry.ino !== stat.ino) {
