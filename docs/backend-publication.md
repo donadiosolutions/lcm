@@ -39,6 +39,20 @@ For ordinary SQLite installations, this machinery is dormant after the
 private state root is authenticated. It does not change SQLite's storage
 semantics or require a new dependency.
 
+When lifecycle starts or replaces a managed daemon, the final publication
+assertion may encounter the child daemon's initial passive sweep. LCM permits a
+bounded 2-second convergence window only for the exact authenticated child
+admitted by that lifecycle operation (including an authorized manager
+replacement). The window polls every 50 ms and rechecks the lock owner,
+process birth, token, and health identity without replaying startup or taking
+the publication lock across a wait. A token rotation, PID or birth mismatch,
+changed runtime/version/backend/entrypoint, missing or malformed owner,
+unknown publication home, health failure, timeout, cancellation, or any other
+non-contention error fails closed. Cancellation after contention rethrows the
+original typed contention error. Platforms where process birth cannot be
+obtained decline lifecycle convergence and retain the existing fail-closed
+behavior.
+
 ## What the admission boundary protects
 
 Every project-scoped PostgreSQL query and transaction declares its complete
@@ -320,7 +334,9 @@ hashes, ownership, and modes are rechecked at each non-terminal boundary.
 During `lcm install`, publication-lock admission is bounded and authenticated
 against the managed daemon already serving the configured home. The preflight
 migration, root preparation, absent-config creation, backend selection, and
-lifecycle publication assertions share one lazily armed two-second window.
+installer publication assertions share one lazily armed two-second window.
+Lifecycle startup uses its own post-start child convergence window only after
+the exact authenticated child has been admitted.
 Only lock-acquisition callbacks are retried; writes, prompts, skill changes,
 and daemon startup remain outside those callbacks and therefore run once. A
 foreign, malformed, stale, or unverifiable owner, or any identity drift,
