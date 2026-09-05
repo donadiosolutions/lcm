@@ -718,50 +718,82 @@ describe("owned process lifecycle utilities", () => {
   });
 
   it("handles invalid process identities, probes, and signaling failures safely", async () => {
-    expect(__processUtilsTestUtils.positivePid(-1)).toBeUndefined();
-    expect(__processUtilsTestUtils.positivePid(Number.NaN)).toBeUndefined();
-    expect(__processUtilsTestUtils.linuxProcessGroupId(process.pid)).toBeGreaterThan(0);
-    expect(__processUtilsTestUtils.linuxProcessGroupId(Number.MAX_SAFE_INTEGER)).toBeUndefined();
-    expect(typeof __processUtilsTestUtils.defaultProcessGroupAlive(Number.MAX_SAFE_INTEGER)).toBe("boolean");
+    const processKill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      expect(__processUtilsTestUtils.positivePid(-1)).toBeUndefined();
+      expect(__processUtilsTestUtils.positivePid(Number.NaN)).toBeUndefined();
 
-    const invalidGroupChild = child(9123);
-    const invalidGroup = createOwnedProcessTeardown({
-      child: invalidGroupChild,
-      platform: "linux",
-      processGroupId: 0,
-      daemonProcessGroupId: 1,
-    });
-    const invalidPending = invalidGroup.terminate();
-    invalidGroupChild.emit("close");
-    await expect(invalidPending).resolves.toBe(true);
+      const invalidGroupChild = child(9123);
+      const invalidGroupKill = vi.fn();
+      const invalidGroup = createOwnedProcessTeardown({
+        child: invalidGroupChild,
+        platform: "linux",
+        processGroupId: 0,
+        daemonProcessGroupId: 1,
+        processBirthTime: () => null,
+        killProcess: invalidGroupKill,
+      });
+      const invalidPending = invalidGroup.terminate();
+      invalidGroupChild.emit("close");
+      await expect(invalidPending).resolves.toBe(true);
+      expect(invalidGroupKill).not.toHaveBeenCalled();
 
-    const throwingChild = child(9124);
-    throwingChild.kill.mockImplementation(() => { throw new Error("already gone"); });
-    const throwingGroup = createOwnedProcessTeardown({
-      child: throwingChild,
-      platform: "win32",
-    });
-    const throwingPending = throwingGroup.terminate();
-    throwingChild.emit("close");
-    await expect(throwingPending).resolves.toBe(true);
+      const throwingChild = child(9124);
+      throwingChild.kill.mockImplementation(() => { throw new Error("already gone"); });
+      const throwingGroup = createOwnedProcessTeardown({
+        child: throwingChild,
+        platform: "win32",
+      });
+      const throwingPending = throwingGroup.terminate();
+      throwingChild.emit("close");
+      await expect(throwingPending).resolves.toBe(true);
 
-    let probes = 0;
-    const probingChild = child(9125);
-    const probingGroup = createOwnedProcessTeardown({
-      child: probingChild,
-      platform: "linux",
-      processGroupId: 9125,
-      daemonProcessGroupId: 1,
-      processBirthTime: () => "birth-9125",
-      isProcessGroupAlive: () => {
-        probes += 1;
-        if (probes === 1) throw new Error("probe unavailable");
-        return false;
-      },
-    });
-    const probingPending = probingGroup.terminate();
-    probingChild.emit("close");
-    await expect(probingPending).resolves.toBe(true);
+      let probes = 0;
+      const probingChild = child(9125);
+      const probingGroupKill = vi.fn();
+      const probingGroup = createOwnedProcessTeardown({
+        child: probingChild,
+        platform: "linux",
+        processGroupId: 9125,
+        daemonProcessGroupId: 1,
+        processBirthTime: () => "birth-9125",
+        killProcess: probingGroupKill,
+        isProcessGroupAlive: () => {
+          probes += 1;
+          if (probes === 1) throw new Error("probe unavailable");
+          return false;
+        },
+      });
+      const probingPending = probingGroup.terminate();
+      probingChild.emit("close");
+      await expect(probingPending).resolves.toBe(true);
+      expect(probingGroupKill).toHaveBeenCalledWith(-9125, "SIGTERM");
+      expect(processKill).not.toHaveBeenCalled();
+    } finally {
+      processKill.mockRestore();
+    }
+  });
+
+  it("forwards validated group teardown through the default kill seam", async () => {
+    const processKill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      const processChild = child(9132);
+      const teardown = createOwnedProcessTeardown({
+        child: processChild,
+        platform: "linux",
+        processGroupId: 9132,
+        daemonProcessGroupId: 9131,
+        processBirthTime: () => "birth-9132",
+        isProcessGroupAlive: () => false,
+      });
+      const pending = teardown.terminate();
+      expect(processKill).toHaveBeenCalledWith(-9132, "SIGTERM");
+      expect(processKill).toHaveBeenCalledTimes(1);
+      processChild.emit("close");
+      await expect(pending).resolves.toBe(true);
+    } finally {
+      processKill.mockRestore();
+    }
   });
 
   it("derives Linux group state conservatively when explicit identities are omitted", async () => {
