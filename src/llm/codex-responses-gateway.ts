@@ -368,8 +368,8 @@ function upstreamUrlFor(
   authorization: ManagedAuthorization,
   options: CodexResponsesGatewayOptions,
 ): string {
-  if (options.upstreamResponsesUrl !== undefined) return options.upstreamResponsesUrl;
   if (options._upstreamUrl !== undefined) return options._upstreamUrl;
+  if (options.upstreamResponsesUrl !== undefined) return options.upstreamResponsesUrl;
   if (authorization.route === "chatgpt") return options._upstreamUrls?.chatgpt ?? CHATGPT_RESPONSES_URL;
   return options._upstreamUrls?.api ?? OPENAI_RESPONSES_URL;
 }
