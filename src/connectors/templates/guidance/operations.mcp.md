@@ -4,7 +4,7 @@
   Search broadly when injected context is absent or insufficient.
   - `query` is the natural-language search term [required]
   - `limit` optionally bounds the number of results
-  - `tags` optionally filters entries by all supplied tags
+  - `tags` optionally filters promoted entries by all supplied tags; episodic messages and summaries remain unfiltered. Select the promoted layer for tag-only recall; omitted or empty tags do not filter either layer.
 - `lcm_grep`
   Search prior context for an exact text match.
   - `query` is the exact term or phrase [required]

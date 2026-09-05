@@ -80,13 +80,13 @@ describe("search route validation boundaries", () => {
     expect(mocks.searchPromoted).toHaveBeenCalledWith("q", 1000, undefined);
   });
 
-  it("applies the normalized limit after episodic tag filtering and forwards it to promoted search", async () => {
+  it("keeps episodic history unfiltered while forwarding tags to promoted search", async () => {
     mocks.grep.mockResolvedValue({
       messages: [
-        { id: "keep-message", tags: ["keep"] },
-        { id: "drop-message", tags: ["other"] },
+        { messageId: 1, conversationId: 2, role: "user", snippet: "keep-message", createdAt: new Date("2025-01-02") },
+        { messageId: 2, conversationId: 2, role: "user", snippet: "drop-message", createdAt: new Date("2025-01-01") },
       ],
-      summaries: [{ id: "keep-summary", tags: ["keep"] }],
+      summaries: [{ summaryId: "keep-summary", conversationId: 2, kind: "leaf", snippet: "keep-summary", createdAt: new Date("2024-12-31") }],
       totalMatches: 3,
     });
     mocks.searchPromoted.mockResolvedValue([{ id: "promoted" }]);
@@ -94,13 +94,29 @@ describe("search route validation boundaries", () => {
     await invoke({ query: "q", limit: 1, cwd: "/project", tags: ["keep"] });
 
     expect(mocks.validateCwd).toHaveBeenCalledWith("/project");
-    expect(mocks.grep).toHaveBeenCalledWith({ query: "q", mode: "full_text", scope: "both" });
-    expect(mocks.grep.mock.calls[0][0]).not.toHaveProperty("limit");
+    expect(mocks.grep).toHaveBeenCalledWith({ query: "q", mode: "full_text", scope: "both", limit: 50 });
     expect(mocks.searchPromoted).toHaveBeenCalledWith("q", 1, ["keep"]);
     expect(mocks.sendJson).toHaveBeenLastCalledWith(response, 200, {
-      episodic: [{ id: "keep-message", tags: ["keep"] }],
+      episodic: [{ messageId: 1, conversationId: 2, role: "user", snippet: "keep-message", createdAt: new Date("2025-01-02") }],
       promoted: [{ id: "promoted" }],
     });
+  });
+
+  it.each(routeConfigs)("forwards the candidate floor under %s", async (_backend, routeConfig) => {
+    for (const [requested, expectedGrepLimit, expectedPromotedLimit] of [
+      [undefined, 50, 5],
+      [1, 50, 1],
+      [5, 50, 5],
+      [50, 50, 50],
+      [51, 51, 51],
+      [1000, 1000, 1000],
+    ] as const) {
+      mocks.grep.mockClear();
+      mocks.searchPromoted.mockClear();
+      await invoke({ query: "q", cwd: "/project", ...(requested === undefined ? {} : { limit: requested }) }, routeConfig);
+      expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "both", limit: expectedGrepLimit });
+      expect(mocks.searchPromoted).toHaveBeenLastCalledWith("q", expectedPromotedLimit, undefined);
+    }
   });
 
   it("uses the default limit for both layers", async () => {
@@ -111,7 +127,7 @@ describe("search route validation boundaries", () => {
     });
     await invoke({ query: "q", cwd: "/project" });
     expect(mocks.searchPromoted).toHaveBeenCalledWith("q", 5, undefined);
-    expect(mocks.grep).toHaveBeenCalledWith({ query: "q", mode: "full_text", scope: "both" });
+    expect(mocks.grep).toHaveBeenCalledWith({ query: "q", mode: "full_text", scope: "both", limit: 50 });
     expect(mocks.sendJson).toHaveBeenLastCalledWith(response, 200, {
       episodic: Array.from({ length: 5 }, (_, index) => ({ id: `message-${index}` })),
       promoted: [],

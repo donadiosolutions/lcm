@@ -513,7 +513,8 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/expand.ts", "unit-daemon-routes"],
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
-      // #793 search-limit validation remains owned by daemon routes.
+      // #793 search-limit validation and #864 search candidate recall remain
+      // owned by daemon routes.
       ["src/daemon/routes/search.ts", "unit-daemon-routes"],
       ["src/daemon/routes/grep.ts", "unit-daemon-routes"],
       ["src/daemon/routes/promote.ts", "unit-daemon-routes"],

@@ -20,7 +20,11 @@ export const lcmSearchTool = {
         description: `Maximum results per layer (positive integer from 1 to ${MAX_SEARCH_RESULT_LIMIT}; default: ${DEFAULT_SEARCH_RESULT_LIMIT})`,
       },
       layers: { type: "array", items: { type: "string", enum: [...CANONICAL_SEARCH_LAYERS] }, default: [...DEFAULT_SEARCH_LAYERS], description: "Which memory layers to search (default: both)" },
-      tags: { type: "array", items: { type: "string" }, description: "Filter results to entries that include all specified tags (e.g. ['reasoning'], ['decision', 'architecture'])" },
+      tags: {
+        type: "array",
+        items: { type: "string" },
+        description: "Filter promoted results to entries that include all specified tags; episodic results remain unfiltered. Use layers: ['promoted'] for tag-only recall (e.g. ['reasoning'], ['decision', 'architecture'])",
+      },
     },
     required: ["query"],
   },

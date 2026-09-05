@@ -70,8 +70,14 @@ daemon client for each read:
 
 `lcm search <query> --limit <n>` accepts a positive integer from 1 through
 1000 and defaults to 5. The limit is a maximum applied independently to each
-selected layer. Values outside this range or that are not integers are rejected
-by the daemon with HTTP 400 (`invalid limit`).
+selected layer. Episodic candidate recall grows to at least 50 records per
+store before the final maximum is applied. Episodic results concatenate
+messages first and then summaries, so messages can fill the maximum before a
+summary appears. `--tag <tag>` filters promoted entries by all supplied tags;
+episodic history remains unfiltered. Use `--layer promoted` for tag-only
+recall. Omitted or empty tags do not filter either layer. Values outside this
+range or that are not integers are rejected by the daemon with HTTP 400
+(`invalid limit`).
 
 Before using this route, LCM reads a bounded, no-follow configuration snapshot
 without taking the private mutation/publication lock. If `config.json` is

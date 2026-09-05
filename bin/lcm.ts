@@ -1217,7 +1217,7 @@ export function registerMemoryCommands(
     .description("Search memory across episodic and promoted layers")
     .option("--limit <n>", "Max results per layer", "5")
     .option("--layer <name>", "Layer to search: episodic or promoted (repeatable)", collectRepeatedOption, [])
-    .option("--tag <tag>", "Require a tag on matching entries (repeatable)", collectRepeatedOption, [])
+    .option("--tag <tag>", "Filter promoted entries by all specified tags; episodic history remains unfiltered (repeatable)", collectRepeatedOption, [])
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (query: string, opts) => {

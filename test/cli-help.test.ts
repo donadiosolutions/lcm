@@ -168,6 +168,8 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("lcm search");
     expect(text).toContain("--limit N");
     expect(text).toContain("--layer <name>");
+    expect(text).toContain('lcm search "hook failure" --layer promoted --tag type:solution');
+    expect(text).toContain("promoted entries");
   });
 
   it("prints the grep since timestamp contract", () => {
