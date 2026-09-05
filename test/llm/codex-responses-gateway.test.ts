@@ -737,6 +737,40 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(JSON.stringify(body)).not.toMatch(/ATTACK|secret|cache|unknown|tool-\d|additional_tools|lite-hostile/);
   });
 
+  it.each([
+    [429, "usage"],
+    [401, "authentication"],
+    [400, undefined],
+    [403, undefined],
+    [404, undefined],
+  ] as const)("latches only the safe upstream category for HTTP %s", async (status, category) => {
+    const { url: upstreamUrl } = await listenSimpleUpstream((_req, res) => {
+      res.writeHead(status, { "content-type": "text/plain" });
+      res.end("GPT-5.3-Codex-Spark 4:27 AM Bearer upstream-secret");
+    });
+    const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
+    gateways.push(gateway);
+
+    const response = await fetchGateway(gateway);
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("codex responses gateway request failed\n");
+    expect(gateway.upstreamFailureCategory).toBe(category);
+    expect(JSON.stringify({ status: response.status, body: "codex responses gateway request failed\n" }))
+      .not.toContain("upstream-secret");
+  });
+
+  it("does not classify a network-level upstream failure", async () => {
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _upstreamUrl: "http://127.0.0.1:1/v1/responses",
+    });
+    gateways.push(gateway);
+    const response = await fetchGateway(gateway);
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("codex responses gateway request failed\n");
+    expect(gateway.upstreamFailureCategory).toBeUndefined();
+  });
+
   it("preserves Responses Lite dialect while replacing its hostile additional_tools input", async () => {
     let capture: Capture | undefined;
     const upstream = createServer(async (req: IncomingMessage, res: ServerResponse) => {

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { createCodexProcessSummarizer } from "../../src/llm/codex-process.js";
 import { createAbortError, isAbortError } from "../../src/daemon/cancellation.js";
+import { sanitizeError } from "../../src/daemon/safe-error.js";
 
 const processStartTime = vi.hoisted(() => vi.fn((pid: number) => pid === 9517 ? "controlled-birth-9517" : null));
 
@@ -1117,6 +1118,122 @@ describe("createCodexProcessSummarizer", () => {
       /Codex CLI rejected.*provider codex-process.*reasoning effort "default\/omitted".*fast mode default\/omitted.*Upgrade the Codex CLI/s,
     );
     expect(readFileSyncMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["usage", "You've hit your usage limit for GPT-5.3-Codex-Spark. Try again at 4:27 AM."],
+    ["usage", "rate-limit reached"],
+    ["authentication", "authentication required"],
+    ["authentication", "invalid API key"],
+    ["model", "unsupported model"],
+    ["model", "the model is not available"],
+    ["invalid-request", "unexpected argument: --bogus"],
+    ["invalid-request", "unknown flag"],
+  ] as const)("classifies %s diagnostics with fixed safe guidance", async (category, diagnostic) => {
+    const canary = "GPT-5.3-Codex-Spark 4:27 AM Bearer secret-token";
+    const child = makeChild(1, `${diagnostic} ${canary}`);
+    const summarizer = createCodexProcessSummarizer(baseDeps(child));
+    const error = await summarizer("Conversation text", false).catch((caught: unknown) => caught as Error);
+
+    expect(error.message).toBeDefined();
+    expect(error.message).not.toContain("Upgrade the Codex CLI");
+    expect(error.message).not.toContain(canary);
+    expect(error.message).not.toContain("secret-token");
+    expect(error.cause).toBeUndefined();
+    expect(JSON.stringify(error)).not.toContain(canary);
+    expect(sanitizeError(error.message)).toBe(error.message);
+    if (category === "usage") expect(error.message).toMatch(/usage limit|rate/i);
+    if (category === "authentication") expect(error.message).toMatch(/authentication|sign in/i);
+    if (category === "model") expect(error.message).toMatch(/model|supported/i);
+    if (category === "invalid-request") expect(error.message).toMatch(/invalid|compatibility/i);
+  });
+
+  it("uses fixed precedence across the complete stderr window", async () => {
+    const diagnostics = [
+      "authentication required then usage limit",
+      "unsupported model then rate-limit",
+      "invalid request then authentication failed",
+      "unknown flag then unsupported model",
+    ];
+    const expected = ["usage limit", "usage limit", "authentication", "model"];
+    for (const [index, diagnostic] of diagnostics.entries()) {
+      const child = makeChild(1, diagnostic);
+      const error = await createCodexProcessSummarizer(baseDeps(child))("text", false)
+        .catch((caught: unknown) => caught as Error);
+      expect(error.message).toMatch(new RegExp(expected[index]!, "i"));
+    }
+  });
+
+  it("classifies split multibyte and same-tick stderr while retaining only the terminal byte window", async () => {
+    const child = makeHangingChild();
+    child.stderr.write(Buffer.from("usage lim"));
+    child.stderr.write(Buffer.from("it — ", "utf8"));
+    child.stderr.write("GPT-5.3-Codex-Spark");
+    const spawn = vi.fn().mockReturnValue(child);
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    });
+    const pending = summarizer("text", false);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.emit("close", 1);
+    const error = await pending.catch((caught: unknown) => caught as Error);
+    expect(error.message).toMatch(/usage limit/i);
+    expect(child.stderr.listenerCount("data")).toBe(0);
+  });
+
+  it("accepts string stderr chunks and ignores unsupported diagnostic chunks", async () => {
+    const child = makeHangingChild();
+    const spawn = vi.fn().mockReturnValue(child);
+    const pending = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    })("text", false);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.stderr.emit("data", "authentication   required");
+    child.stderr.emit("data", `${"x".repeat(20_000)} authentication required`);
+    child.stderr.emit("data", "");
+    child.stderr.emit("data", { unexpected: true });
+    child.emit("close", 1);
+    const error = await pending.catch((caught: unknown) => caught as Error);
+    expect(error.message).toMatch(/authentication|sign in/i);
+  });
+
+  it("trims oversized stderr chunks by bytes and evicts complete ring chunks", async () => {
+    const child = makeHangingChild();
+    const spawn = vi.fn().mockReturnValue(child);
+    const pending = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    })("text", false);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.stderr.emit("data", Buffer.alloc(10_000, "x"));
+    child.stderr.emit("data", Buffer.alloc(10_010, "x"));
+    child.stderr.emit("data", Buffer.alloc(16_384, "x"));
+    child.emit("close", 1);
+    const error = await pending.catch((caught: unknown) => caught as Error);
+    expect(error.message).toContain("Upgrade the Codex CLI");
+  });
+
+  it("falls back when a known diagnostic is pushed out of the 16 KiB terminal window", async () => {
+    const child = makeChild(1, `usage limit${"x".repeat(16 * 1024)}`);
+    const error = await createCodexProcessSummarizer(baseDeps(child))("text", false)
+      .catch((caught: unknown) => caught as Error);
+    expect(error.message).toContain("Upgrade the Codex CLI");
+  });
+
+  it.each([
+    ["usage", 429],
+    ["authentication", 401],
+  ] as const)("prefers the gateway %s category over generic stderr", async (category) => {
+    const child = makeChild(1, "codex responses gateway request failed");
+    const gateway = makeGateway({ upstreamFailureCategory: category });
+    const error = await createCodexProcessSummarizer({
+      ...baseDeps(child),
+      _createGateway: vi.fn().mockResolvedValue(gateway),
+    } as never)("text", false).catch((caught: unknown) => caught as Error);
+    expect(error.message).not.toContain("Upgrade the Codex CLI");
+    expect(error.message).toMatch(category === "usage" ? /usage limit/i : /authentication|sign in/i);
   });
 
   it("reports bounded controls without exposing CLI diagnostics", async () => {
