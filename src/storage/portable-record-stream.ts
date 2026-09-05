@@ -510,6 +510,8 @@ function validateCheckpoint(value: unknown): PortableCheckpoint {
     || typeof object.domain !== "string"
     || !PORTABLE_RECORD_DOMAIN_ORDER.includes(object.domain as PortableDomain)
     || !isSafeCount(object.nextOrdinal)
+    || Object.is(object.nextOrdinal, -0)
+    || Object.is(object.recordCount, -0)
     || object.recordCount !== object.nextOrdinal
     || !isSha256(object.prefixSha256)
     || (object.lastRecordIdentitySha256 !== null && !isSha256(object.lastRecordIdentitySha256))

@@ -2154,6 +2154,57 @@ describe("portable record stream public seam", () => {
     expectDeepFrozen(checkpoint);
   });
 
+  it("rejects negative-zero checkpoint counts across direct and wire APIs", () => {
+    const domain: PortableDomain = "native-transcripts";
+    const sourceRecords = { ...records, [domain]: [] } as Record<PortableDomain, readonly PortableRecord[]>;
+    const source = makeSourceDescription({
+      coverage: makeCoverage({ [domain]: coverageEvidence(domain, "authoritative-empty") } as never),
+    });
+    const manifest = makeManifest(source, sourceRecords);
+    const checkpoint = asPortableBatch(createPortableBatch(createBatchInput(manifest, domain, {
+      predecessor: null,
+      records: [],
+      complete: true,
+    }))).checkpoint;
+
+    expect(Object.is(checkpoint.nextOrdinal, -0)).toBe(false);
+    expect(Object.is(checkpoint.recordCount, -0)).toBe(false);
+    expect(parsePortableCheckpoint(serializePortableCheckpoint(checkpoint))).toEqual(checkpoint);
+    expect(verifyPortableCheckpoint(checkpoint, manifest)).toEqual(checkpoint);
+
+    const mutations = [
+      ["nextOrdinal", { nextOrdinal: -0 }],
+      ["recordCount", { recordCount: -0 }],
+      ["both counts", { nextOrdinal: -0, recordCount: -0 }],
+    ] as const;
+    for (const [, overrides] of mutations) {
+      const invalid = withCheckpointChecksum(checkpoint, overrides);
+      expectCode(() => serializePortableCheckpoint(invalid), "checkpoint-mismatch");
+      expectCode(() => verifyPortableCheckpoint(invalid, manifest), "checkpoint-mismatch");
+    }
+
+    const serialized = Buffer.from(serializePortableCheckpoint(checkpoint), "utf8");
+    const wireMutations = [
+      ["nextOrdinal", [['"nextOrdinal":0', '"nextOrdinal":-0']]],
+      ["recordCount", [['"recordCount":0', '"recordCount":-0']]],
+      ["both counts", [
+        ['"nextOrdinal":0', '"nextOrdinal":-0'],
+        ['"recordCount":0', '"recordCount":-0'],
+      ]],
+    ] as const;
+    for (const [, replacements] of wireMutations) {
+      let mutatedText = serialized.toString("utf8");
+      for (const [positiveZeroToken, negativeZeroToken] of replacements) {
+        mutatedText = mutatedText.replace(positiveZeroToken, negativeZeroToken);
+        expect(mutatedText).toContain(negativeZeroToken);
+      }
+      expectCode(
+        () => parsePortableCheckpoint(Buffer.from(mutatedText, "utf8")),
+        "checkpoint-mismatch",
+      );
+    }
+  });
+
   it("rejects checkpoint serialization tampering and replay across manifests or domains", () => {
     const manifest = makeManifest();
     const batch = asPortableBatch(createPortableBatch(createBatchInput(manifest, "messages", {
