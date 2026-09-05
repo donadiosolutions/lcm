@@ -43,7 +43,7 @@ Hybrid search across episodic memory (SQLite FTS5) and promoted memory. Returns 
 | Param | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `query` | string | ✅ | — | Natural language search query |
-| `limit` | number | | `5` | Max results per layer |
+| `limit` | integer | | `5` | Maximum results per layer, from 1 through 1000 |
 | `layers` | string[] | | `["episodic", "promoted"]` | `"episodic"`, `"promoted"`, or both |
 | `tags` | string[] | | — | Filter to entries that include all specified tags |
 
@@ -59,6 +59,11 @@ lcm_search(query: "database migration", layers: ["promoted"], tags: ["type:decis
 
 The deprecated `semantic` layer name remains accepted as a compatibility input
 and is normalized to `promoted`, but it is not advertised.
+
+`limit` must be a positive integer from 1 through 1000. When omitted, it
+defaults to 5. The value is a maximum applied independently to each selected
+layer; the episodic layer may return fewer matches when its history pool is
+smaller. Invalid values return HTTP 400 with `{ "error": "invalid limit" }`.
 
 ### lcm_grep
 

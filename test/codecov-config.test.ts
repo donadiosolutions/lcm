@@ -511,6 +511,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/expand.ts", "unit-daemon-routes"],
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
+      // #793 search-limit validation remains owned by daemon routes.
       ["src/daemon/routes/search.ts", "unit-daemon-routes"],
       ["src/daemon/routes/grep.ts", "unit-daemon-routes"],
       ["src/daemon/server.ts", "unit-daemon-core"],
@@ -533,9 +534,11 @@ describe("Codecov configuration", () => {
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],
+      // #793 search-limit schema remains owned by MCP tools.
       ["src/mcp/tools/lcm-search.ts", "unit-mcp"],
       ["src/mcp/tools/lcm-grep.ts", "unit-mcp"],
       ["src/memory/index.ts", "unit-memory-retrieval"],
+      // #793 shared search-limit contract remains retrieval-owned.
       ["src/retrieval.ts", "unit-memory-retrieval"],
     ] as const;
 

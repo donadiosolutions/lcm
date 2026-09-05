@@ -68,6 +68,11 @@ daemon client for each read:
 | `lcm status` | Read daemon and project status |
 | `lcm stats --pool` | Read daemon connection-pool statistics |
 
+`lcm search <query> --limit <n>` accepts a positive integer from 1 through
+1000 and defaults to 5. The limit is a maximum applied independently to each
+selected layer. Values outside this range or that are not integers are rejected
+by the daemon with HTTP 400 (`invalid limit`).
+
 Before using this route, LCM reads a bounded, no-follow configuration snapshot
 without taking the private mutation/publication lock. If `config.json` is
 absent, the snapshot uses validated defaults and records an absent witness;
