@@ -8,7 +8,7 @@ component_management:
       paths:
         # Keep the #691 routing, #734 healthy-daemon store routing, #726/#742
         # hook entrypoints, and #866 publication-converged CLI reads exclusively
-        # in Unit - CLI.
+        # in Unit - CLI, including export admission failures and sensitive output.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"

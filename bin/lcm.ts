@@ -3665,9 +3665,9 @@ export async function runCli(
       const { homedir } = await import("node:os");
       const configPath = defaultConfigPath();
       const readSensitive = args[0] === "list" || args[0] === "test";
-      const r = readSensitive
-        ? await runWithPublicationRetry(() => handleSensitive(args, process.cwd(), configPath))
-        : await handleSensitive(args, process.cwd(), configPath);
+      const r = await (readSensitive
+        ? runWithPublicationRetry(() => handleSensitive(args, process.cwd(), configPath))
+        : handleSensitive(args, process.cwd(), configPath));
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });
@@ -3973,6 +3973,7 @@ export async function runCli(
             const result = await runWithPublicationRetry(() => reconcileWorktrees(candidate));
             reconciled.set(result.targetHash, result.canonical);
           } catch (err) {
+            if (err instanceof PrivateMutationLockContentionError || err instanceof BackendPublicationJournalError) throw err;
             const message = err instanceof Error ? err.message : String(err);
             process.stderr.write(`  Warning: could not reconcile ${candidate}: ${message}\n`);
           }
@@ -4005,6 +4006,7 @@ export async function runCli(
             console.log(`  Exported ${result.exported} entries to ${outFile}`);
           }
         } catch (err: any) {
+          if (err instanceof PrivateMutationLockContentionError || err instanceof BackendPublicationJournalError) throw err;
           process.stderr.write(`  Warning: ${err.message}\n`);
         }
       }

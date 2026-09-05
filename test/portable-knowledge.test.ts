@@ -306,6 +306,53 @@ describe("portable-knowledge — export", () => {
     }
   });
 
+  it.each([
+    ["stdout", "exhausted", false, true],
+    ["file", "exhausted", true, true],
+    ["stdout", "unauthenticated", false, false],
+    ["file", "unauthenticated", true, false],
+  ])("preserves %s on %s gather admission", async (_mode, _reason, toFile, authenticated) => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const outFile = join(makeTempDir(), "existing.json");
+    writeFileSync(outFile, "previous export");
+    seedProject(baseDir, cwd, [{ content: "blocked entry", tags: ["note"] }]);
+    const migration = await import("../src/db/migration.js");
+    const { PrivateMutationLockContentionError } = await import("../src/private-mutation-lock.js");
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    const runMigration = vi.spyOn(migration, "runLcmMigrations").mockImplementation(() => { throw contention; });
+    let now = 0;
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      expectedEntrypoint: "/daemon", expectedRuntimeDigest: "runtime",
+      deps: {
+        now: () => now, sleep: async (delayMs: number) => { now += delayMs; },
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: authenticated ? 42 : 99, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth", lockPath: join(baseDir, "publication.lock"),
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+          status: "ok", pid: 42, version: "test", storageBackend: "sqlite",
+          entrypoint: "/daemon", runtimeDigest: "runtime",
+        }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await expect(exportKnowledge(cwd, {
+        output: toFile ? outFile : undefined,
+        skipScrub: true, _lcmBaseDir: baseDir, _publicationConvergence: convergence,
+      })).rejects.toBe(contention);
+      expect(output).not.toHaveBeenCalled();
+      expect(readFileSync(outFile, "utf-8")).toBe("previous export");
+      expect(runMigration).toHaveBeenCalledTimes(authenticated ? 40 : 1);
+      expect(now).toBe(authenticated ? 2000 : 0);
+    } finally {
+      runMigration.mockRestore();
+      output.mockRestore();
+    }
+  });
+
   it("scrubs secrets by default", async () => {
     const baseDir = makeTempDir();
     const cwd = makeTempDir();

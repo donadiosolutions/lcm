@@ -84,7 +84,10 @@ time spent in process-birth and health checks counts against that deadline.
 Bootstrap migration attempts and worktree-reconciliation lock loops have their
 own existing bounds, and ordinary command I/O plus an in-flight attempt can
 extend total command time. Missing, foreign, malformed, stale, or unhealthy
-publication evidence fails closed with the original typed error.
+publication evidence fails closed with the original typed error. Exhausted or
+rejected export admission exits unsuccessfully, including with `--output` or
+`--all`. An `--all` export may have already written earlier projects when a
+later project fails; those outputs remain, and no successful total is printed.
 
 `lcm search <query> --limit <n>` accepts a positive integer from 1 through
 1000 and defaults to 5. The limit is a maximum applied independently to each

@@ -498,6 +498,7 @@ describe("Codecov configuration", () => {
     // keeps expand depth validation in the same daemon-routes component.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     const expectedOwners = [
+      // #866 export admission failures and sensitive result emission stay CLI-owned.
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
       ["src/private-mutation-lock.ts", "unit-configuration-security"],

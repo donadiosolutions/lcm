@@ -662,6 +662,98 @@ describe("runCli registration and help dispatch", () => {
     );
   });
 
+  describe.each([
+    ["contention", () => new PrivateMutationLockContentionError("publication busy")],
+    ["journal", () => new BackendPublicationJournalError("unsafe-storage", "private evidence")],
+  ] as const)("export %s admission failures", (_kind, makeError) => {
+    it.each([
+      ["stdout", ["export"]],
+      ["output file", ["export", "--output", "out.json"]],
+      ["all projects", ["export", "--all"]],
+    ])("fails %s without success output or replay", async (_mode, args) => {
+      const failure = makeError();
+      state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+      state.entries = [{ name: "project", isDirectory: () => true }];
+      state.fileText = JSON.stringify({ cwd: "/project" });
+      state.exportError = failure;
+      const portable = await import("../../src/portable-knowledge.js");
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+      const result = await invoke(args);
+
+      expect(result).toBe(failure);
+      expect(() => handleCliError(result)).toThrow("exit:1");
+      expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
+        failure instanceof BackendPublicationJournalError
+          ? FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC : failure.message,
+      );
+      expect(portable.exportKnowledge).toHaveBeenCalledOnce();
+      expect(log).not.toHaveBeenCalled();
+      expect(stdout).not.toHaveBeenCalled();
+      expect(stderr).not.toHaveBeenCalled();
+    });
+
+    it("fails reconciliation before exporting or claiming a total", async () => {
+      const failure = makeError();
+      state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+      state.entries = [{ name: "project", isDirectory: () => true }];
+      state.fileText = JSON.stringify({ cwd: "/project" });
+      state.reconcileWorktrees.mockImplementation(() => { throw failure; });
+      const portable = await import("../../src/portable-knowledge.js");
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const result = await invoke(["export", "--all"]);
+
+        expect(result).toBe(failure);
+        expect(() => handleCliError(result)).toThrow("exit:1");
+        expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
+          failure instanceof BackendPublicationJournalError
+            ? FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC : failure.message,
+        );
+        expect(state.reconcileWorktrees.mock.calls.length).toBe(
+          failure instanceof PrivateMutationLockContentionError ? 40 : 1,
+        );
+        expect(portable.exportKnowledge).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+        expect(stderr).not.toHaveBeenCalled();
+      } finally {
+        state.reconcileWorktrees.mockImplementation(path => ({ targetHash: path, canonical: path }));
+      }
+    });
+
+    it("keeps prior all-project output once but fails without a success total", async () => {
+      const failure = makeError();
+      state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+      state.entries = [
+        { name: "first", isDirectory: () => true },
+        { name: "second", isDirectory: () => true },
+      ];
+      state.fileText = JSON.stringify({ cwd: "/candidate" });
+      state.reconcileWorktrees
+        .mockReturnValueOnce({ targetHash: "first", canonical: "/first" })
+        .mockReturnValueOnce({ targetHash: "second", canonical: "/second" });
+      const portable = await import("../../src/portable-knowledge.js");
+      vi.mocked(portable.exportKnowledge)
+        .mockResolvedValueOnce(state.portableResult)
+        .mockRejectedValueOnce(failure);
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+      const result = await invoke(["export", "--all"]);
+
+      expect(result).toBe(failure);
+      expect(() => handleCliError(result)).toThrow("exit:1");
+      expect(diagnostic).toHaveBeenCalledOnce();
+      expect(portable.exportKnowledge).toHaveBeenCalledTimes(2);
+      expect(log).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("/first: 1 entries"));
+    });
+  });
+
   it("retries transient root bootstrap contention for an ordinary command", async () => {
     vi.useFakeTimers();
     const contention = new actualRuntimePaths.BootstrapLockContentionError(
@@ -2518,6 +2610,19 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(stderr).toHaveBeenCalledWith(
       "  Warning: could not reconcile /unavailable: source vanished\n",
     );
+  });
+
+  it("keeps ordinary export failures as per-project warnings", async () => {
+    state.exportError = new Error("export failed");
+    state.entries = [{ name: "project", isDirectory: () => true }];
+    state.fileText = JSON.stringify({ cwd: "/project" });
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    expect(await invoke(["export", "--all"])).toBeUndefined();
+
+    expect(stderr).toHaveBeenCalledExactlyOnceWith("  Warning: export failed\n");
+    expect(log).toHaveBeenCalledExactlyOnceWith("\n  Total: 0 entries exported");
   });
 
   it("renders TTY summaries for compact and import", async () => {
