@@ -122,7 +122,12 @@ same verified pnpm pin into a fresh temporary directory, installs with
 Node, Git, `tar`, and network access to the repository and registry are needed.
 
 The installer writes its Node launcher to `~/.npm-global/bin/lcm`, adds that
-location to the active shell profile, and runs `lcm install`. Bootstrap,
-installation, or build failure stops before replacing the launcher. This
-source-based launcher follows the clone; use the tarball procedure above when
-you need an installed copy independent of the checkout.
+location to the active shell profile, and runs `lcm install`. After the build,
+it validates and wraps the bundled `dist/lcm.mjs` runtime declared by
+`package.json`'s `bin.lcm`, so the source launcher follows the same entrypoint
+as the packaged CLI. Bootstrap, installation, or build failure stops before
+replacing the launcher. If an authenticated daemon was started from an older
+source or intermediate entrypoint, adopting the canonical packaged runtime
+identity may require one daemon restart the next time it is installed or used.
+Use the tarball procedure above when you need an installed copy independent of
+the checkout.
