@@ -9,6 +9,7 @@ const FILE_SCHEME = "file";
 const WHITESPACE_PATTERN = /\s/u;
 const PATH_DELIMITERS = new Set(["#", "&", "=", "|", ",", ";", ":", "!", "?", ")", "]", "}", "'", '"', "<", ">"]);
 const URL_END_DELIMITERS = new Set(["|", ",", ";", ")", "]", "}", "'", '"', "<", ">"]);
+const NESTED_FILE_URL_DELIMITERS = new Set(["?", "#", "&", "="]);
 
 function isPathWord(char: string | undefined): boolean {
   return char !== undefined && (PATH_WORD_PATTERN.test(char) || "_.-@+~%$*".includes(char));
@@ -35,6 +36,19 @@ function quoteFromCode(code: number): string | undefined {
   if (code === 1) return "'";
   if (code === 2) return '"';
   return undefined;
+}
+
+function isNestedFileUrlStart(chars: readonly string[], index: number): boolean {
+  if (!NESTED_FILE_URL_DELIMITERS.has(chars[index])) return false;
+  return (
+    chars[index + 1]?.toLowerCase() === "f" &&
+    chars[index + 2]?.toLowerCase() === "i" &&
+    chars[index + 3]?.toLowerCase() === "l" &&
+    chars[index + 4]?.toLowerCase() === "e" &&
+    chars[index + 5] === ":" &&
+    chars[index + 6] === "/" &&
+    chars[index + 7] === "/"
+  );
 }
 
 function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
@@ -67,6 +81,18 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     if (separator >= 0 && char === "]" && brackets > 0) {
       brackets -= 1;
+      continue;
+    }
+    if (separator >= 0 && isNestedFileUrlStart(chars, index)) {
+      separator = index + 5;
+      brackets = 0;
+      exactFileScheme = true;
+      foundFilePath = false;
+      schemeLength = 0;
+      fileSchemeLength = 0;
+      schemeQuote = 0;
+      authority[index + 6] = 1;
+      authority[index + 7] = 1;
       continue;
     }
     if (separator >= 0 && brackets === 0 && URL_END_DELIMITERS.has(char)) {
