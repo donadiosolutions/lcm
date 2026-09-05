@@ -1,10 +1,11 @@
-import { readFileSync, writeFileSync } from "node:fs";
 import type { DaemonConfig } from "../config.js";
 import {
+  MAX_PROJECT_METADATA_BYTES,
   ensureProjectDirForIdentity,
   projectIdentity,
   projectPathsForIdentity,
 } from "../project.js";
+import { atomicWritePrivateFile, readBoundedRegularFile } from "../../security-files.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { shouldPromote } from "../../promotion/detector.js";
@@ -291,16 +292,29 @@ export function createPromoteHandler(
         try {
           await withCommitAdmission(async () => {
             const writeMetadata = (): void => {
-              const metaPath = paths.metaPath;
+              const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
               let meta: Record<string, unknown> = {};
               try {
-                meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+                const parsed: unknown = JSON.parse(readBoundedRegularFile(paths.metaPath, {
+                  allowedRoot: paths.dir,
+                  maxBytes: MAX_PROJECT_METADATA_BYTES,
+                  expectedUid,
+                  requireSingleLink: true,
+                }));
+                if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+                  throw new Error("invalid project metadata");
+                }
+                meta = parsed as Record<string, unknown>;
               } catch (error) {
                 if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
               }
               meta.cwd = paths.canonical;
               meta.lastPromote = new Date().toISOString();
-              writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
+              const serialized = JSON.stringify(meta, null, 2) + "\n";
+              if (Buffer.byteLength(serialized, "utf8") > MAX_PROJECT_METADATA_BYTES) {
+                throw new Error("project metadata exceeds size limit");
+              }
+              atomicWritePrivateFile(paths.metaPath, serialized);
             };
             if (context?.withPublicationAdmission !== undefined) {
               await context.withPublicationAdmission(() => writeMetadata());
