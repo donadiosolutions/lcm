@@ -11,6 +11,7 @@ type FakeChild = EventEmitter & {
   stdout: PassThrough;
   stderr: PassThrough;
   kill: ReturnType<typeof vi.fn>;
+  requests: unknown[];
   pid?: number;
 };
 
@@ -20,6 +21,7 @@ function childWithProtocol(lines: string[]): FakeChild {
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
   child.kill = vi.fn(() => { child.emit("close", 0); return true; });
+  child.requests = [];
   child.pid = 8123;
   let requestBuffer = "";
   let responseIndex = 0;
@@ -32,6 +34,7 @@ function childWithProtocol(lines: string[]): FakeChild {
       newline = requestBuffer.indexOf("\n");
       let parsed: unknown;
       try { parsed = JSON.parse(request) as unknown; } catch { continue; }
+      child.requests.push(parsed);
       const method = parsed && typeof parsed === "object" && !Array.isArray(parsed)
         ? (parsed as { method?: unknown }).method
         : undefined;
@@ -119,6 +122,19 @@ describe("resolveCodexOpenAIBaseUrl", () => {
     const spawn = spawnFor(child);
     await expect(resolveCodexOpenAIBaseUrl({ spawn, processBirthTime: () => "birth", env: { CODEX_HOME: "/private/.codex" } }))
       .resolves.toBe("https://proxy.example/v1/responses");
+    expect(child.requests).toEqual([
+      {
+        id: 1,
+        method: "initialize",
+        params: { clientInfo: { name: "lcm", version: "1" } },
+      },
+      { method: "initialized" },
+      {
+        id: 2,
+        method: "config/read",
+        params: { includeLayers: false, cwd: process.cwd() },
+      },
+    ]);
     expect((spawn as unknown as ReturnType<typeof vi.fn>).mock.calls[0]).toEqual(expect.arrayContaining([
       "codex", ["app-server", "--listen", "stdio://"], expect.objectContaining({ env: { CODEX_HOME: "/private/.codex" } }),
     ]));
