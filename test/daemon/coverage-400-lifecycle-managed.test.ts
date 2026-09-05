@@ -763,7 +763,6 @@ describe("issue 400 managed ensure admission matrix", () => {
         nonce: "a".repeat(32),
       }),
     });
-
     await expect(ensureDaemon(options)).resolves.toMatchObject({
       connected: true,
       spawned: true,
@@ -806,6 +805,7 @@ describe("issue 400 managed ensure admission matrix", () => {
         nonce: "a".repeat(32),
       }),
     });
+    delete options._monotonicNowOverride;
 
     await expect(ensureDaemon(options)).resolves.toMatchObject({
       connected: true,

@@ -1653,7 +1653,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       signal.addEventListener("abort", onAbort, { once: true });
       try {
         return await Promise.race([
-          operation(),
+          Promise.resolve().then(operation),
           abortPromise,
         ]);
       } finally {
