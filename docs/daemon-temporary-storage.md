@@ -20,6 +20,13 @@ link, resolves to the exact expected pathname, and remains contained beneath
 the canonical state root. Any unsafe, partial, or raced condition fails closed;
 LCM does not chmod or repair an unsafe existing leaf.
 
+If an unsafe leaf was left by an older release, inspect the state root and
+verify that the leaf is owned by the expected user before repairing it. For an
+owned directory, either run `chmod 0700 <canonical state root>/daemon-tmp` or,
+when it is empty, remove it with `rmdir <canonical state root>/daemon-tmp`, then
+start again under an owner-preserving umask such as `0077`. LCM never performs
+these operator repairs automatically.
+
 The same state-root path is reused across daemon restarts, stop operations,
 credential cleanup, and launchd plist cleanup. This makes temporary files
 available to the daemon across a restart while keeping them private to the
