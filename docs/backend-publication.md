@@ -249,6 +249,20 @@ The normal `lcm install` and bootstrap paths establish the root through one
 guarded TypeScript bootstrap operation. Do not pre-create a replacement root
 with an untrusted recursive `mkdir -p` or copy state into it by hand.
 
+During a first bootstrap, LCM retains the descriptor for the root it created
+and records the authenticated tree before handing control to backend
+publication consumers. The consumer-side tree is compared with that
+pre-handoff contract before LCM writes the direct-system-root parent witness.
+For a root created by the current operation, the contract is an empty tree;
+for a trusted root reused through an existing-directory compatibility path, the
+bounded authenticated contents present before handoff are retained. A root
+whose canonical path disappears, is rebound, changes owner or mode, or no
+longer matches its pre-handoff contents fails closed with the bootstrap handoff
+error. LCM preserves the root and its evidence for inspection; it does not
+recreate or automatically repair a replacement. After the concurrent
+operation is resolved, retrying revalidates the established root and its
+current evidence.
+
 The bootstrap checks the actual `$HOME` before creating state. `$HOME` must be
 an existing, non-symlink directory owned by the current user and must not be
 group- or world-writable. The active `~/.lcm` root is created as one final
