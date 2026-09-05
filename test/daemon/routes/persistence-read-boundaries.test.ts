@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   stats: vi.fn(() => ({ projects: 0 })),
   promotedSearch: vi.fn(() => [] as unknown[]),
   recentSummaries: vi.fn(async () => [] as unknown[]),
+  getConversationBySessionId: vi.fn(async () => null),
   projectClose: vi.fn(async () => undefined),
   factoryClose: vi.fn(async () => undefined),
   openProject: vi.fn(),
@@ -168,8 +169,9 @@ describe("persistence read route boundaries", () => {
     mocks.stats.mockReturnValue({ projects: 0 });
     mocks.promotedSearch.mockReturnValue([]);
     mocks.recentSummaries.mockResolvedValue([]);
+    mocks.getConversationBySessionId.mockResolvedValue(null);
     const project = {
-      conversations: {}, summaries: { listRecentSummaries: mocks.recentSummaries },
+      conversations: { getConversationBySessionId: mocks.getConversationBySessionId }, summaries: { listRecentSummaries: mocks.recentSummaries },
       largeFiles: {}, lexicalSearch: { searchPromoted: mocks.promotedSearch },
       close: mocks.projectClose,
     };
@@ -292,11 +294,18 @@ describe("persistence read route boundaries", () => {
     mocks.validate.mockImplementationOnce(() => { throw new Error("bad cwd"); });
     await invoke(handler, { query: "q", cwd: "/bad" });
     expectLast(200, { matches: [] });
+    mocks.validate.mockImplementationOnce(() => { throw new Error("bad cwd"); });
+    await invoke(handler, { query: "q", cwd: "/bad", sessionId: "session" });
+    expectLast(200, { matches: [] });
     mocks.projectExists.mockResolvedValueOnce(false);
     await invoke(handler, { query: "q", cwd: "/missing" });
     expectLast(200, { matches: [] });
+    mocks.projectExists.mockResolvedValueOnce(false);
+    await invoke(handler, { query: "q", cwd: "/missing", sessionId: "session" });
+    expectLast(200, { matches: [] });
     await invoke(handler, { query: "q", cwd: "/ok" });
     expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "both", since: undefined });
+    expect(mocks.getConversationBySessionId).not.toHaveBeenCalled();
     await invoke(handler, { query: "q", cwd: "/ok", mode: "full_text", scope: "messages" });
     expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "messages", since: undefined });
     await invoke(handler, { query: "q", cwd: "/ok", mode: "regex", scope: "messages", since: "2025" });
@@ -305,9 +314,48 @@ describe("persistence read route boundaries", () => {
     expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "summaries", since: undefined });
     await invoke(handler, { query: "q", cwd: "/ok", scope: "all" });
     expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "both", since: undefined });
+    const sessionId = " exact-session-id ";
+    mocks.getConversationBySessionId.mockResolvedValueOnce({ conversationId: 42, sessionId } as never);
+    await invoke(handler, { query: "q", cwd: "/ok", sessionId, scope: "messages" });
+    expect(mocks.getConversationBySessionId).toHaveBeenLastCalledWith(sessionId);
+    expect(mocks.grep).toHaveBeenLastCalledWith({
+      query: "q", mode: "full_text", scope: "messages", since: undefined, conversationId: 42,
+    });
+    mocks.getConversationBySessionId.mockResolvedValueOnce(null);
+    mocks.grep.mockClear();
+    await invoke(handler, { query: "q", cwd: "/ok", sessionId: "unknown" });
+    expectLast(200, { messages: [], summaries: [], totalMatches: 0 });
+    expect(mocks.grep).not.toHaveBeenCalled();
+    const malformedSessionIds: unknown[] = [null, [], {}, false, 1, "", "   ", "bad\0session"];
+    for (const malformed of malformedSessionIds) {
+      mocks.validate.mockClear();
+      const openCalls = mocks.openProject.mock.calls.length;
+      await invoke(handler, { query: "q", cwd: "/ok", sessionId: malformed });
+      expectLast(400, { error: "invalid sessionId" });
+      expect(mocks.validate).not.toHaveBeenCalled();
+      expect(mocks.openProject.mock.calls.length).toBe(openCalls);
+    }
     mocks.grep.mockRejectedValueOnce(new Error("grep broke"));
     await invoke(handler, { query: "q", cwd: "/ok" });
     expectLast(200, { matches: [] });
+    mocks.getConversationBySessionId.mockRejectedValueOnce(new Error("session lookup broke"));
+    await invoke(handler, { query: "q", cwd: "/ok", sessionId: "lookup-failure" });
+    expectLast(200, { matches: [] });
+    expect(mocks.projectClose).toHaveBeenCalled();
+    const lookupStorageFailure = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      "/ok",
+      "conversations",
+      "getConversationBySessionId",
+    );
+    mocks.getConversationBySessionId.mockRejectedValueOnce(lookupStorageFailure);
+    await invoke(
+      createGrepHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())),
+      { query: "q", cwd: "/ok", sessionId: "lookup-storage-failure" },
+    );
+    expectLast(503, { ...lookupStorageFailure.toJSON() });
+    expect(mocks.projectClose).toHaveBeenCalled();
     await invoke(createGrepHandler(config, injectedFactory()), { query: "q", cwd: "/ok" });
     const failure = storageFailure("lexical-search", "grep");
     mocks.grep.mockRejectedValueOnce(failure);

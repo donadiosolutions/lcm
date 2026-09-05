@@ -74,6 +74,13 @@ Search conversation history by keyword or regex across raw messages and summarie
 | `sessionId` | string | | — | Filter to a specific session |
 | `since` | string | | — | ISO datetime lower bound |
 
+Omit `sessionId` to search the whole project. When supplied, it selects the
+project's canonical newest conversation for that session identifier; an
+unknown identifier returns empty `messages` and `summaries`. Values must be
+nonempty strings without NUL characters, and the identifier is looked up byte
+for byte without trimming or coercion. The `restore` flow has separate
+historical-context behavior and is unaffected by this filter.
+
 **Returns:** Array of matches with content snippet, type (message or summary), and session ID.
 
 **Examples:**
