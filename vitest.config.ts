@@ -10,6 +10,15 @@ const packageConfigTests = ["test/package-config.test.ts"];
 const e2eTests = ["test/e2e/**/*.test.ts"];
 const runtimeHomeSetup = ["test/setup/isolate-runtime-home.ts"];
 const runtimeHomeGlobalSetup = ["test/setup/runtime-home-global.ts"];
+const vitestRunRootCleanupRegistryKey = Symbol.for(
+  "donadiosolutions/lcm:vitest-run-root-cleanups:v1",
+);
+
+type VitestRunRootCleanup = () => void;
+
+type ProcessWithSymbolProperties = NodeJS.Process & {
+  [key: symbol]: unknown;
+};
 
 export interface VitestRunRootDependencies {
   readonly environment?: NodeJS.ProcessEnv;
@@ -24,6 +33,46 @@ export interface VitestRunRootDependencies {
 
 export interface VitestConfigurationResolverDependencies {
   readonly createRunRoot?: () => string;
+}
+
+export function drainVitestRunRootCleanups(
+  registry: Set<VitestRunRootCleanup>,
+): void {
+  const cleanups = [...registry];
+  registry.clear();
+  for (const cleanup of cleanups) {
+    try {
+      cleanup();
+    } catch {
+      // Cleanup is best effort and must not interfere with process exit.
+    }
+  }
+}
+
+function registerVitestRunRootCleanup(cleanup: VitestRunRootCleanup): void {
+  const processWithRegistry = process as ProcessWithSymbolProperties;
+  const existingRegistry = processWithRegistry[vitestRunRootCleanupRegistryKey] as
+    | Set<VitestRunRootCleanup>
+    | undefined;
+  if (existingRegistry !== undefined) {
+    existingRegistry.add(cleanup);
+    return;
+  }
+
+  const registry = new Set<VitestRunRootCleanup>();
+  const drain = (): void => drainVitestRunRootCleanups(registry);
+  try {
+    process.once("exit", drain);
+    processWithRegistry[vitestRunRootCleanupRegistryKey] = registry;
+  } catch (error) {
+    try {
+      process.removeListener("exit", drain);
+    } catch {
+      // Preserve the original setup error if listener rollback itself fails.
+    }
+    throw error;
+  }
+  registry.add(cleanup);
 }
 
 function assertFreshExplicitRoot(
@@ -60,8 +109,7 @@ export function createVitestRunRoot(
   const secureDirectory = dependencies.chmodSync ?? chmodSync;
   const inspectPath = dependencies.lstatSync ?? lstatSync;
   const removeDirectory = dependencies.rmSync ?? rmSync;
-  const registerProcessExit = dependencies.registerProcessExit
-    ?? ((listener: (code: number) => void) => process.once("exit", listener));
+  const registerProcessExit = dependencies.registerProcessExit;
   const override = environment.LCM_TEST_ARTIFACT_ROOT;
   let root: string;
 
@@ -91,7 +139,11 @@ export function createVitestRunRoot(
   try {
     secureDirectory(root, 0o700);
     if (override === undefined || override === "") {
-      registerProcessExit(cleanup);
+      if (registerProcessExit === undefined) {
+        registerVitestRunRootCleanup(cleanup);
+      } else {
+        registerProcessExit(cleanup);
+      }
     }
   } catch (error) {
     cleanup();
