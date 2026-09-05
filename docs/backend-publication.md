@@ -259,6 +259,12 @@ open flags where the platform provides them. Configuration reads and writes
 are bounded and descriptor-aware; a config symlink, non-regular file, or
 oversized file is rejected before mutation.
 
+Read-only publication probes distinguish an absent root at the initial open
+from an authentication failure after that root was opened. The former remains
+compatible with legacy SQLite installations and is rechecked at later
+boundaries. The latter is unsafe storage and fails closed; diagnose the root's
+permissions, ownership, and filesystem state before retrying.
+
 Bootstrap admission also uses an owner-only, bounded lock file in the home
 directory. A lock record created by the current runtime includes the owner PID,
 nonce, and process-start witness. If a later bootstrap finds that record and the
