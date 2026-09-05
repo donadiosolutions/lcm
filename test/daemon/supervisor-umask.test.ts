@@ -10,6 +10,7 @@ const fixture = vi.hoisted(() => ({
   clippedReads: 0,
   failReads: 0,
   failRemovals: 0,
+  nlinkOverride: undefined as bigint | undefined,
   parentPath: undefined as string | undefined,
   invalidParent: false,
 }));
@@ -38,6 +39,7 @@ vi.mock("node:fs", async () => {
           configurable: true,
           value: (stat.mode as bigint) & ~0o700n,
         });
+        if (fixture.nlinkOverride !== undefined) Object.defineProperty(stat, "nlink", { configurable: true, value: fixture.nlinkOverride });
       }
       return stat;
     }),
@@ -90,6 +92,7 @@ describe("created daemon temporary directories under owner-clearing masks", () =
     fixture.clippedReads = 0;
     fixture.failReads = 0;
     fixture.failRemovals = 0;
+    fixture.nlinkOverride = undefined;
     fixture.parentPath = undefined;
     fixture.invalidParent = false;
     for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -114,7 +117,6 @@ describe("created daemon temporary directories under owner-clearing masks", () =
   it("keeps a replacement inode when the rollback witness changes", async () => {
     const root = makeRoot();
     fixture.clippedReads = 1;
-    const replacement = makeRoot();
     const command = runner();
     const spec = makeSpec(root);
     let replaced = false;
@@ -133,6 +135,36 @@ describe("created daemon temporary directories under owner-clearing masks", () =
     expect(replaced).toBe(true);
     expect(command.calls).not.toContain("systemd-run");
     expect(lstatSync(join(root, "daemon-tmp")).isDirectory()).toBe(true);
+  });
+
+  it("removes a clipped leaf when the filesystem reports link count one", async () => {
+    const root = makeRoot();
+    fixture.clippedReads = 2;
+    fixture.nlinkOverride = 1n;
+    const command = runner();
+    await expect(createSupervisor("systemd-user", {
+      run: command.run,
+      platform: "linux",
+      uid: 501,
+    }).start(makeSpec(root))).rejects.toThrow("owner-preserving umask");
+    expect(command.calls).not.toContain("systemd-run");
+    expect(() => lstatSync(join(root, "daemon-tmp"))).toThrow();
+  });
+
+  it("leaves the same clipped inode when rmdir rejects a nonempty directory", async () => {
+    const root = makeRoot();
+    fixture.clippedReads = 2;
+    const command = runner();
+    await expect(createSupervisor("systemd-user", {
+      run: command.run,
+      platform: "linux",
+      uid: 501,
+      _daemonTempRaceForTesting: (path, phase) => {
+        if (phase === "before-rollback") writeFileSync(join(path, "child"), "content");
+      },
+    }).start(makeSpec(root))).rejects.toThrow("supervisor manager command failed");
+    expect(command.calls).not.toContain("systemd-run");
+    expect(lstatSync(join(root, "daemon-tmp", "child")).isFile()).toBe(true);
   });
 
   it("fails closed when the creation witness is unavailable", async () => {

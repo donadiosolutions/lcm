@@ -743,7 +743,6 @@ type DaemonTempCreationStat = Readonly<{
   ino: bigint;
   uid: bigint;
   mode: bigint;
-  nlink: bigint;
   isDirectory: () => boolean;
   isSymbolicLink: () => boolean;
 }>;
@@ -2146,8 +2145,7 @@ function prepareManagedDaemonTempDirectory(
           && current.uid === initial.uid
           && current.isDirectory()
           && !current.isSymbolicLink()
-          && (current.mode & 0o7777n) === initialMode
-          && current.nlink === 2n;
+          && (current.mode & 0o7777n) === initialMode;
         const sameParent = currentParent.dev === parent.dev
           && currentParent.ino === parent.ino
           && currentParent.uid === parent.uid
@@ -3057,7 +3055,7 @@ export function createSupervisor(
         await settleLaunchdLabelReuse(operationDeadline);
         return startInternal(spec, true, operationDeadline);
       }
-      throw error instanceof SupervisorCommandError || error instanceof SupervisorDaemonTempCreationError
+      throw (error instanceof SupervisorCommandError || error instanceof SupervisorDaemonTempCreationError)
         ? error
         : commandFailedError();
     } finally {
