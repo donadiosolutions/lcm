@@ -79,6 +79,10 @@ recall. Omitted or empty tags do not filter either layer. Values outside this
 range or that are not integers are rejected by the daemon with HTTP 400
 (`invalid limit`).
 
+`lcm expand <nodeId> --depth <n>` accepts any positive integer and defaults to
+`1`; no upper bound is imposed. Malformed explicit depths are rejected by the
+daemon with HTTP 400 (`invalid depth`) before project admission.
+
 Before using this route, LCM reads a bounded, no-follow configuration snapshot
 without taking the private mutation/publication lock. If `config.json` is
 absent, the snapshot uses validated defaults and records an absent witness;

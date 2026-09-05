@@ -270,6 +270,7 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { expanded: null, error: "project not found" });
     await invoke(handler, { nodeId: "n", cwd: "/ok", depth: 3 });
     expect(mocks.expand).toHaveBeenLastCalledWith({ summaryIds: ["n"], maxDepth: 3 });
+    expectLast(200, { expanded: ["node"] });
     mocks.expand.mockRejectedValueOnce(new Error("expand failed at C:\\Users\\operator\\private.db"));
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
     expectLast(200, { expanded: null, error: "expand failed at <path>" });
@@ -284,6 +285,77 @@ describe("persistence read route boundaries", () => {
     expectLast(503, {
       ...failure.toJSON(),
     });
+  });
+
+  it("rejects malformed expand depths before cwd and storage admission", async () => {
+    const malformed = [
+      '{"nodeId":"n","cwd":"/ok","depth":null}',
+      '{"nodeId":"n","cwd":"/ok","depth":"1"}',
+      '{"nodeId":"n","cwd":"/ok","depth":true}',
+      '{"nodeId":"n","cwd":"/ok","depth":false}',
+      '{"nodeId":"n","cwd":"/ok","depth":[]}',
+      '{"nodeId":"n","cwd":"/ok","depth":{}}',
+      '{"nodeId":"n","cwd":"/ok","depth":0}',
+      '{"nodeId":"n","cwd":"/ok","depth":-0}',
+      '{"nodeId":"n","cwd":"/ok","depth":-1}',
+      '{"nodeId":"n","cwd":"/ok","depth":1.5}',
+      '{"nodeId":"n","cwd":"/ok","depth":1e400}',
+      '{"nodeId":"n","cwd":"/ok","depth":-1e400}',
+      '{"nodeId":"n","depth":null}',
+      '{"nodeId":"n","cwd":"/bad","depth":1e400}',
+    ];
+    const handlers = [
+      createExpandHandler(config),
+      createExpandHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())),
+    ];
+
+    for (const handler of handlers) {
+      for (const body of malformed) {
+        mocks.send.mockClear();
+        mocks.writeHead.mockClear();
+        mocks.end.mockClear();
+        mocks.validate.mockClear();
+        mocks.projectIdentity.mockClear();
+        mocks.projectExists.mockClear();
+        mocks.openProject.mockClear();
+        mocks.createFactory.mockClear();
+        mocks.expand.mockClear();
+
+        await invoke(handler, body);
+
+        expectLast(400, { error: "invalid depth" });
+        expect(mocks.validate).not.toHaveBeenCalled();
+        expect(mocks.projectIdentity).not.toHaveBeenCalled();
+        expect(mocks.projectExists).not.toHaveBeenCalled();
+        expect(mocks.openProject).not.toHaveBeenCalled();
+        expect(mocks.createFactory).not.toHaveBeenCalled();
+        expect(mocks.expand).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it("preserves nodeId precedence when depth is invalid", async () => {
+    const handler = createExpandHandler(config);
+    await invoke(handler, '{"cwd":"/bad","depth":null}');
+    expectLast(400, { error: "nodeId is required" });
+    expect(mocks.validate).not.toHaveBeenCalled();
+    expect(mocks.projectIdentity).not.toHaveBeenCalled();
+    expect(mocks.expand).not.toHaveBeenCalled();
+  });
+
+  it("forwards omitted and positive integer depths unchanged", async () => {
+    const handler = createExpandHandler(config);
+    for (const [body, expected] of [
+      ['{"nodeId":"n","cwd":"/ok"}', 1],
+      ['{"nodeId":"n","cwd":"/ok","depth":1}', 1],
+      ['{"nodeId":"n","cwd":"/ok","depth":2}', 2],
+      ['{"nodeId":"n","cwd":"/ok","depth":9007199254740991}', 9007199254740991],
+    ] as const) {
+      mocks.expand.mockClear();
+      await invoke(handler, body);
+      expectLast(200, { expanded: ["node"] });
+      expect(mocks.expand).toHaveBeenLastCalledWith({ summaryIds: ["n"], maxDepth: expected });
+    }
   });
 
   it("covers grep validation, defaults, missing projects, success, and failure", async () => {

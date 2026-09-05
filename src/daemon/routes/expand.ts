@@ -21,6 +21,11 @@ export function createExpandHandler(config: DaemonConfig, storageFactory?: Stora
       return;
     }
 
+    if (typeof depth !== "number" || !Number.isInteger(depth) || depth < 1) {
+      sendJson(res, 400, { error: "invalid depth" });
+      return;
+    }
+
     let cwd: string | undefined;
     if (input.cwd) {
       try {
