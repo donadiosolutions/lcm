@@ -83,7 +83,8 @@ component_management:
         # #705 prompt-search surfacing-log failures, #709 search and grep routes,
         # #710 grep mode, #792 session filtering, #793 search-limit validation,
         # #794 grep-since validation, #825 bounded atomic promotion metadata,
-        # #862 recent limit validation and #864 episodic search candidate recall,
+        # #862 recent limit validation, #863 expand depth validation, and #864
+        # episodic search candidate recall,
         # and #833 passive-event identity admission remain route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
@@ -94,7 +95,8 @@ component_management:
       name: "Unit - MCP"
       paths:
         # The #709 canonical search and grep MCP tools, #710 grep mode, #793
-        # search-limit schema, and #794 grep-since schema remain MCP-owned.
+        # search-limit schema, #794 grep-since schema, and #863 expand-depth
+        # schema remain MCP-owned.
         - "src/mcp/"
     - component_id: "unit-llm-prompts"
       name: "Unit - LLM, Responses, and Prompts"

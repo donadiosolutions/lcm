@@ -100,6 +100,18 @@ describe("MCP tool definitions", () => {
     expect(search.inputSchema.properties.tags.description).toContain("episodic results remain unfiltered");
   });
 
+  it("advertises the expand depth contract", () => {
+    const expand = getMcpToolDefinitions().find((t: any) => t.name === "lcm_expand") as any;
+    expect(expand.inputSchema.properties.depth).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      default: 1,
+    });
+    expect(expand.inputSchema.properties.depth).not.toHaveProperty("maximum");
+    expect(expand.inputSchema.properties.depth.description).toContain("positive integer");
+    expect(expand.inputSchema.properties.depth.description).toContain("default: 1");
+  });
+
   it("lcm_store describes fields without embedding agent policy", () => {
     const tool = getMcpToolDefinitions().find((t: any) => t.name === "lcm_store");
     const description = tool!.inputSchema.properties.tags.description;

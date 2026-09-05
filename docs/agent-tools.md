@@ -164,7 +164,11 @@ Decompress a summary node into its full source content by traversing the DAG. Us
 | Param | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `nodeId` | string | ✅ | — | Summary node ID to expand |
-| `depth` | number | | `1` | How many levels of the DAG to traverse |
+| `depth` | integer | | `1` | Positive number of DAG levels to traverse; no maximum |
+
+`depth` defaults to `1` and must be a positive integer. Malformed explicit
+values receive HTTP 400 (`invalid depth`) before `cwd` validation or project
+admission. There is no upper bound beyond the positive-integer requirement.
 
 **Examples:**
 
