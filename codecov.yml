@@ -227,7 +227,7 @@ component_management:
     - component_id: "integration-postgresql-memory"
       name: "Integration - PostgreSQL Memory"
       paths:
-        # The #760 repository cancellation machine-identity context remains memory-owned.
+        # The #760/#805 repository machine-identity context remains memory-owned.
         - "^src/storage/postgresql/memory-repositories\\.ts$"
         - "^src/storage/postgresql/summary-context-repositories\\.ts$"
     - component_id: "integration-postgresql-search"

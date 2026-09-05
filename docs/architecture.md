@@ -111,7 +111,11 @@ cancellation errors retain scoped project and machine identity while excluding
 SQL text, query values, and driver details. Machine-owning coordination
 operations and explicitly fence-bound summary, context, and shared-core
 operations preserve that machine identity in query and transaction cancellation
-context; deliberately unfenced project readers remain machine-less. The
+context; a bound fence machine ID must be a UUIDv7, is accepted
+case-insensitively, and is stored in canonical lowercase. Invalid fence
+machine IDs fail synchronously during repository construction with a sanitized
+`machine_id` data error that never serializes the supplied value. Deliberately
+unfenced project readers remain machine-less. The
 sanitization boundary continues to exclude SQL, bound values, raw driver
 details, and transport metadata.
 

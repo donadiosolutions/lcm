@@ -1221,6 +1221,63 @@ describe("PostgreSQL summary/context transaction seams", () => {
     await expect(repository.getSummary("summary-a"))
       .rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
   });
+
+  it("validates fenced machine IDs before any executor access", () => {
+    const constructors = [
+      (db: ReturnType<typeof executor>, fence: never) =>
+        new PostgreSqlSummaryRepository(db, projectId, { fence }),
+      (db: ReturnType<typeof executor>, fence: never) =>
+        new PostgreSqlContextRepository(db, projectId, { fence }),
+      (db: ReturnType<typeof executor>, fence: never) =>
+        new PostgreSqlLargeFileRepository(db, projectId, { fence }),
+    ];
+    const invalidMachineIds: unknown[] = [
+      "opaque-caller-id",
+      "018f22c4-6d2a-4f10-8a4c-6b8d3e5f9030",
+      "018f22c4-6d2a-7f10-ca4c-6b8d3e5f9030",
+      ` ${machineId}`,
+      `${machineId} `,
+      "",
+      "   ",
+      1,
+      "bad\0machine",
+      "\ud800",
+    ];
+
+    for (const create of constructors) {
+      for (const invalidMachineId of invalidMachineIds) {
+        const db = executor(() => {
+          throw new Error("executor must not be accessed");
+        });
+        const fence = {
+          machineId: invalidMachineId,
+          processId: "process-a",
+          operation: "compact",
+          fencingToken: 1n,
+        } as never;
+        let caught: unknown;
+        try {
+          create(db, fence);
+        } catch (error) {
+          caught = error;
+        }
+        expect(caught).toBeInstanceOf(PostgreSqlSummaryContextDataError);
+        expect(caught).toMatchObject({
+          domain: "summaries",
+          operation: "construct",
+          field: "machine_id",
+        });
+        const serialized = JSON.stringify(caught);
+        expect(serialized).not.toContain("machineId");
+        expect(serialized).not.toContain("executor must not be accessed");
+        if (typeof invalidMachineId === "string" && invalidMachineId.length > 0) {
+          expect(serialized).not.toContain(invalidMachineId);
+        }
+        expect(db.query).not.toHaveBeenCalled();
+        expect(db.transaction).not.toHaveBeenCalled();
+      }
+    }
+  });
 });
 
 describe("PostgreSQL summary/context defensive branches", () => {
@@ -2019,6 +2076,85 @@ describe("PostgreSQL summary/context defensive branches", () => {
     ]) {
       expect(contextSerialized).not.toContain(canary);
     }
+  });
+
+  it("normalizes fenced machine IDs across all repository diagnostics", async () => {
+    const canonical = machineId;
+    const uppercase = machineId.toUpperCase();
+    const directRead = [
+      async (db: ReturnType<typeof executor>, fence: never) =>
+        new PostgreSqlSummaryRepository(db, projectId, { fence })
+          .getSummary("summary-a"),
+      async (db: ReturnType<typeof executor>, fence: never) =>
+        new PostgreSqlContextRepository(db, projectId, { fence })
+          .getContextItems(41),
+      async (db: ReturnType<typeof executor>, fence: never) =>
+        new PostgreSqlLargeFileRepository(db, projectId, { fence })
+          .getLargeFile("file-a"),
+    ];
+
+    for (const machine of [canonical, uppercase]) {
+      for (const read of directRead) {
+        const fence = {
+          machineId: machine,
+          processId: "process-a",
+          operation: "compact",
+          fencingToken: 1n,
+        } as never;
+        const directDb = executor((_config, options) => {
+          throw new PostgreSqlStorageOperationError(
+            "STORAGE_OPERATION_FAILED",
+            {
+              domain: options.domain,
+              operation: options.operation,
+              projectId: options.projectId,
+              machineId: options.machineId,
+            },
+            null,
+            false,
+          );
+        });
+        const directError = await read(directDb, fence)
+          .catch((error: unknown) => error);
+        expect(directError).toMatchObject({ machineId: canonical });
+        expect(JSON.stringify(directError)).toContain(`"machineId":"${canonical}"`);
+
+        const driverDb = executor(() => {
+          throw Object.assign(new Error("private cancellation"), {
+            code: "57014",
+          });
+        });
+        const driverError = await read(driverDb, fence)
+          .catch((error: unknown) => error);
+        expect(driverError).toMatchObject({
+          machineId: canonical,
+          sqlState: "57014",
+          retryable: false,
+        });
+        expect(JSON.stringify(driverError)).toContain(`"machineId":"${canonical}"`);
+      }
+    }
+
+    const callerFence = {
+      machineId: uppercase,
+      processId: "process-a",
+      operation: "compact",
+      fencingToken: 1n,
+    };
+    const snapshotDb = executor((config, options) => {
+      expect(options.machineId).toBe(canonical);
+      return config.text.includes("FROM lcm.summaries")
+        ? result([summaryRow])
+        : result([]);
+    });
+    const snapshotRepository = new PostgreSqlSummaryRepository(
+      snapshotDb,
+      projectId,
+      { fence: callerFence },
+    );
+    callerFence.machineId = "opaque-caller-id";
+    await expect(snapshotRepository.getSummary("summary-a"))
+      .resolves.toMatchObject({ summaryId: "summary-a" });
   });
 
   it("classifies corrupt identities, missing targets, and conversation races", async () => {
