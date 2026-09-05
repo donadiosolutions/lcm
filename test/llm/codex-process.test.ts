@@ -550,6 +550,96 @@ describe("createCodexProcessSummarizer", () => {
     });
   });
 
+  it("keeps the shared budget monotonic across a backward wall-clock step during discovery", async () => {
+    let monotonicNow = 100;
+    let wallNow = 1_000;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const delays: number[] = [];
+    const child = makeChild(0);
+    const gateway = makeGateway();
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const resolveConfig = vi.fn(() => {
+      wallNow = 500;
+      monotonicNow = 125;
+      return "https://proxy.example/v1/responses";
+    });
+    const createGateway = vi.fn(async () => {
+      monotonicNow = 140;
+      return gateway;
+    });
+    const setTimeoutMock = vi.fn((callback: Parameters<typeof setTimeout>[0], delay?: number) => {
+      delays.push(delay ?? 0);
+      return setTimeout(callback, delay);
+    });
+    try {
+      const summarizer = createCodexProcessSummarizer({
+        ...baseDeps(child, {
+          timeoutMs: 100,
+          _resolveConfig: resolveConfig,
+          _createGateway: createGateway,
+          setTimeout: setTimeoutMock,
+          rmSync: rmSyncMock,
+        }),
+      } as never);
+
+      await expect(summarizer("backward wall step", false)).resolves.toBe("summary");
+      expect(resolveConfig).toHaveBeenCalledWith(undefined, 100, undefined);
+      expect(delays[0]).toBeCloseTo(75, 6);
+      expect(delays[1]).toBeCloseTo(60, 6);
+      expect(gateway.close).toHaveBeenCalledOnce();
+      expect(rmSyncMock).toHaveBeenCalledOnce();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("keeps the shared budget monotonic across a forward wall-clock step during gateway startup", async () => {
+    let monotonicNow = 200;
+    let wallNow = 2_000;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const delays: number[] = [];
+    const child = makeChild(0);
+    const gateway = makeGateway();
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const resolveConfig = vi.fn(() => {
+      monotonicNow = 210;
+      return "https://proxy.example/v1/responses";
+    });
+    const createGateway = vi.fn(async () => {
+      wallNow = 50_000;
+      monotonicNow = 230;
+      return gateway;
+    });
+    const setTimeoutMock = vi.fn((callback: Parameters<typeof setTimeout>[0], delay?: number) => {
+      delays.push(delay ?? 0);
+      return setTimeout(callback, delay);
+    });
+    try {
+      const summarizer = createCodexProcessSummarizer({
+        ...baseDeps(child, {
+          timeoutMs: 100,
+          _resolveConfig: resolveConfig,
+          _createGateway: createGateway,
+          setTimeout: setTimeoutMock,
+          rmSync: rmSyncMock,
+        }),
+      } as never);
+
+      await expect(summarizer("forward wall step", false)).resolves.toBe("summary");
+      expect(resolveConfig).toHaveBeenCalledWith(undefined, 100, undefined);
+      expect(delays[0]).toBeCloseTo(90, 6);
+      expect(delays[1]).toBeCloseTo(70, 6);
+      expect(gateway.close).toHaveBeenCalledOnce();
+      expect(rmSyncMock).toHaveBeenCalledOnce();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
   it("cleans up when gateway startup fails or reaches the shared deadline", async () => {
     const failed = createCodexProcessSummarizer({
       ...baseDeps(makeHangingChild(), {
