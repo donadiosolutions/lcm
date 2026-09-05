@@ -71,6 +71,50 @@ describe("test temporary parent selector", () => {
     expect(createDirectory).toHaveBeenCalledTimes(2);
   });
 
+  it("cleans a failed secure root and advances automatically", () => {
+    const removeDirectory = vi.fn();
+    const secureFailure = new Error("chmod denied");
+    const createDirectory = vi.fn()
+      .mockReturnValueOnce("/first/lcm-test-root")
+      .mockReturnValueOnce("/second/lcm-test-root");
+    const secureDirectory = vi.fn()
+      .mockImplementationOnce(() => { throw secureFailure; })
+      .mockImplementation(() => {});
+    const result = createTestTempDirectory({
+      environment: {},
+      candidateParents: ["/first", "/second"],
+      realpath: (path: string) => path,
+      markerProbe: absent,
+      createDirectory,
+      secureDirectory,
+      removeDirectory,
+    });
+    expect(result.parent).toBe("/second");
+    expect(removeDirectory).toHaveBeenCalledWith("/first/lcm-test-root");
+    expect(secureDirectory).toHaveBeenCalledTimes(2);
+  });
+
+  it("cleans an explicit failed secure root and preserves its cause", () => {
+    const removeDirectory = vi.fn();
+    const secureFailure = new Error("chmod denied");
+    let thrown: unknown;
+    try {
+      createTestTempDirectory({
+        environment: { LCM_TEST_VITEST_RUNTIME_ROOT_PARENT: "/explicit" },
+        realpath: (path: string) => path,
+        markerProbe: absent,
+        createDirectory: vi.fn(() => "/explicit/lcm-test-root"),
+        secureDirectory: vi.fn(() => { throw secureFailure; }),
+        removeDirectory,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ cause: secureFailure });
+    expect((thrown as Error).message).toMatch(/LCM_TEST_VITEST_RUNTIME_ROOT_PARENT/iu);
+    expect(removeDirectory).toHaveBeenCalledWith("/explicit/lcm-test-root");
+  });
+
   it("does not fall back from an explicit contaminated parent", () => {
     expect(() => selectTestTempParent({
       environment: { LCM_TEST_VITEST_RUNTIME_ROOT_PARENT: "/explicit" },
@@ -163,6 +207,25 @@ describe("test temporary parent selector", () => {
       "C:\\Temp",
       "C:\\Windows\\Temp",
     ]);
+  });
+
+  it("reports exhausted Windows candidates with marker reasons", () => {
+    const environment = {
+      TEMP: "C:\\Temp",
+      TMP: "D:\\Scratch",
+      SystemRoot: "C:\\Windows",
+    };
+    const temporaryRoot = () => "E:\\Temp";
+    const candidates = candidateTemporaryParents(environment, "win32", undefined, temporaryRoot);
+    expect(() => selectTestTempParent({
+      environment,
+      platformName: "win32",
+      temporaryRoot,
+      realpath: (path: string) => path,
+      markerProbe: () => ({ present: true }),
+    })).toThrow(new RegExp(candidates
+      .map((candidate) => `${candidate.replaceAll("\\", "\\\\")} \\(marker\\)`)
+      .join(".*"), "u"));
   });
 
   it("authenticates canonical candidate parents without requiring them to be clean now", () => {

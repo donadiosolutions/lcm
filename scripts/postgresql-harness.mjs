@@ -17,7 +17,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { platform, tmpdir } from "node:os";
+import { platform } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -1655,7 +1655,7 @@ export async function runHarness(options = {}) {
     prefix: "lcm-postgresql-harness-",
     createDirectory: mkdtempSync,
     secureDirectory: chmodSync,
-    removeDirectory: rmSync,
+    removeDirectory: (path) => rmSync(path, { recursive: true, force: true }),
   });
   const directory = allocation.root;
   const parent = allocation.parent;

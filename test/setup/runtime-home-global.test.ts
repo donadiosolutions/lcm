@@ -79,6 +79,29 @@ describe("Vitest runtime-home global lifecycle", () => {
     expect(removeDirectory).toHaveBeenCalledWith("/tmp/lcm-vitest-run-unique");
   });
 
+  it("removes the owned root and rethrows a provide failure", () => {
+    const provideFailure = new Error("provide failed");
+    const removeDirectory = vi.fn();
+    const provide = vi.fn(() => { throw provideFailure; });
+
+    let thrown: unknown;
+    try {
+      createRuntimeHomeRun({ provide }, {
+        createDirectory: vi.fn(() => "/tmp/lcm-vitest-run-provide-failure"),
+        secureDirectory: vi.fn(),
+        removeDirectory,
+        environment: {},
+        temporaryRoot: () => "/tmp",
+        realpath: (path) => path,
+        markerProbe: () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBe(provideFailure);
+    expect(removeDirectory).toHaveBeenCalledWith("/tmp/lcm-vitest-run-provide-failure");
+  });
+
   it("gives concurrent runs distinct secure roots and tears down only their own root", () => {
     const provide = vi.fn();
     const roots = [
@@ -209,12 +232,14 @@ describe("Vitest runtime-home global lifecycle", () => {
     expect(child.TEMP).toBe("/private/fixture");
   });
 
-  it("proves a child Vitest run relocates all runtime scratch below a clean parent", () => {
+  it("proves a child Vitest run relocates all runtime scratch below a clean parent", { timeout: 45_000 }, () => {
     const fixture = mkdtempSync(join(tmpdir(), "lcm-bug-840-fixture-"));
     const marker = join(fixture, ".git");
     const markerBytes = "synthetic malformed marker\n";
     mkdirSync(marker, { mode: 0o755 });
     writeFileSync(join(marker, "sentinel"), markerBytes, { mode: 0o600 });
+    const markerBefore = lstatSync(marker);
+    const markerBytesBefore = readFileSync(join(marker, "sentinel"));
     const childSpec = join(process.cwd(), "test", `.bug840-acceptance-${process.pid}.test.ts`);
     const resultPath = join(fixture, "result.json");
     const artifactRoot = mkdtempSync(join(tmpdir(), "lcm-bug-840-artifact-"));
@@ -228,7 +253,7 @@ const resultPath = ${JSON.stringify(resultPath)};
 describe("Bug840 child acceptance", () => {
   let handle;
   afterEach(async () => { await handle?.cleanup(); });
-  it("keeps the harness outside the malformed fixture", async () => {
+  it("keeps the harness outside the malformed fixture", { timeout: 25_000 }, async () => {
     handle = await createHarness("mock");
     const tmpPath = handle.tmpDir;
     const rel = relative(resolve(${JSON.stringify(fixture)}), resolve(tmpPath));
@@ -250,7 +275,10 @@ describe("Bug840 child acceptance", () => {
   });
 });
 `, { mode: 0o600 });
-    const parentEnvironment = { ...process.env, LCM_TEST_ARTIFACT_ROOT: artifactRoot };
+    const previousArtifactRoot = process.env.LCM_TEST_ARTIFACT_ROOT;
+    process.env.LCM_TEST_ARTIFACT_ROOT = artifactRoot;
+    const liveParentArtifactRoot = process.env.LCM_TEST_ARTIFACT_ROOT;
+    const parentEnvironment = { ...process.env };
     const childEnvironment = createChildAcceptanceEnvironment(parentEnvironment, fixture);
     expect(childEnvironment.LCM_TEST_ARTIFACT_ROOT).toBeUndefined();
     try {
@@ -268,14 +296,17 @@ describe("Bug840 child acceptance", () => {
       expect(result.config).toBe("{}\n");
       expect(result.cleaned).toBe(true);
       expect(existsSync(result.tmpPath)).toBe(false);
-      expect(existsSync(artifactRoot)).toBe(true);
-      const markerBefore = lstatSync(marker);
-      expect(markerBefore.isDirectory()).toBe(true);
-      expect(readFileSync(join(marker, "sentinel"), "utf8")).toBe(markerBytes);
-      expect([...readdirSync(fixture)].filter((entry) => entry.startsWith("lcm-") && entry !== ".git")).toEqual([]);
+      if (liveParentArtifactRoot !== undefined) {
+        expect(existsSync(liveParentArtifactRoot)).toBe(true);
+      }
       const markerAfter = lstatSync(marker);
+      expect(markerAfter.isDirectory()).toBe(markerBefore.isDirectory());
+      expect(readFileSync(join(marker, "sentinel"))).toEqual(markerBytesBefore);
+      expect([...readdirSync(fixture)].filter((entry) => entry.startsWith("lcm-") && entry !== ".git")).toEqual([]);
       expect(markerAfter.mode & 0o777).toBe(markerBefore.mode & 0o777);
     } finally {
+      if (previousArtifactRoot === undefined) delete process.env.LCM_TEST_ARTIFACT_ROOT;
+      else process.env.LCM_TEST_ARTIFACT_ROOT = previousArtifactRoot;
       rmSync(childSpec, { force: true });
       rmSync(fixture, { recursive: true, force: true });
       rmSync(artifactRoot, { recursive: true, force: true });

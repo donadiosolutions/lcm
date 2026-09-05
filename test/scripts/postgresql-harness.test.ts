@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { lstatSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
@@ -114,7 +115,7 @@ describe("PostgreSQL harness utilities", () => {
   });
 
   it("classifies and reclaims an owned alternate-parent harness directory", async () => {
-    const parent = mkdtempSync("/var/tmp/lcm-bug-840-auth-parent-");
+    const parent = mkdtempSync(join(tmpdir(), "lcm-bug-840-auth-parent-"));
     const directory = mkdtempSync(join(parent, "lcm-postgresql-harness-"));
     const runId = "e".repeat(32);
     const names = createRunNames(runId);
