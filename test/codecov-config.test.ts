@@ -50,7 +50,7 @@ const expectedComponents = [
   },
   {
     component_id: "unit-configuration-security",
-    name: "Unit - Configuration and Security",
+    name: "Unit - Configuration, Security, and Filesystem Topology",
     paths: [
       "^src/config-manager\\.ts$",
       "^src/config-projection\\.ts$",

@@ -836,6 +836,24 @@ authenticates the private LCM root and project directory. Promotion refuses a
 directory with the wrong owner or exact mode, a symlink, or topology that
 changes during validation.
 
+Project directories are admitted one component at a time. An existing
+`~/.lcm/projects` or `~/.lcm/projects/<id>` entry is authenticated and is never
+repaired by changing its mode; symlinks, wrong types, wrong owners, and modes
+other than `0700` are rejected. If a confirmed owner-held real directory has
+only an unsafe mode, repair it explicitly with `chmod 0700 <path>` and retry.
+Directories created by LCM are tightened through their retained descriptor;
+an owner-read-stripping umask can prevent that descriptor from being opened and
+fails closed with `EACCES`. Restore a usable umask and remove only the
+untrusted child after confirming its ownership before retrying.
+
+The admission and metadata publication checks provide a bounded observed
+topology guarantee: they reject unsafe state observed at each boundary,
+including symlinks and replaced device/inode identities. Portable pathname
+operations cannot prevent a same-user namespace substitution after the final
+check, and retained descriptor evidence ends when the helper returns and closes
+its handles. A later replacement is therefore a new observation rather than a
+claim of kernel-atomic namespace protection.
+
 Session restore locks use a SHA-256 digest of the agent session ID under `~/.lcm/tmp`; session IDs are never used as path components. LCM reads restored `AGENTS.md` and `CLAUDE.md` instructions only from regular, non-symlink files inside their expected roots, with a combined 1 MiB limit. Unsafe instruction files are skipped.
 Cached instructions are isolated by local project, machine, client, agent
 session, verified worktree, and exact working directory. A compact/resume

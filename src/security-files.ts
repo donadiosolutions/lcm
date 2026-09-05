@@ -52,6 +52,14 @@ export type PrivateDirectoryHandle = Readonly<{
   close: () => void;
 }>;
 
+/** A retained private-directory path no longer names its authenticated inode. */
+export class PrivateDirectoryTopologyError extends Error {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super(message, options);
+    this.name = "PrivateDirectoryTopologyError";
+  }
+}
+
 type BigIntDirectoryStat = Readonly<{
   isDirectory: () => boolean;
   mode: bigint;
@@ -98,8 +106,20 @@ function currentUid(): number | undefined {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
 }
 
+function errorCode(error: unknown): string | undefined {
+  return error !== null && typeof error === "object" && "code" in error
+    && typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
+
 type PrivateDirectoryOpenOptions = Readonly<{
   expectedUid?: number;
+}>;
+
+type PrivateDirectoryAuthenticationOptions = PrivateDirectoryOpenOptions & Readonly<{
+  /** @internal Creation-only path that authenticates type/owner before fchmod. */
+  allowUntrustedMode?: boolean;
 }>;
 
 const PRIVATE_DIRECTORY_OPEN_FLAGS = constants.O_RDONLY
@@ -114,13 +134,23 @@ function openPrivateDirectoryDescriptor(path: string): number {
 function authenticateOpenPrivateDirectory(
   path: string,
   fd: number,
-  options: PrivateDirectoryOpenOptions,
+  options: PrivateDirectoryAuthenticationOptions,
 ): PrivateDirectoryHandle {
   let closed = false;
   try {
     const stat = directoryStat(fd);
     const expectedUid = options.expectedUid ?? currentUid();
-    assertPrivateDirectoryStat(stat, expectedUid);
+    if (options.allowUntrustedMode) {
+      if (!stat.isDirectory()) throw new Error("path is not a directory");
+      if (
+        expectedUid !== undefined
+        && (!Number.isSafeInteger(expectedUid) || Number(stat.uid) !== expectedUid)
+      ) {
+        throw new Error("private directory owner is not trusted");
+      }
+    } else {
+      assertPrivateDirectoryStat(stat, expectedUid);
+    }
     const canonicalPath = realpathSync(path);
     const pathStat = statSync(canonicalPath, { bigint: true }) as unknown as BigIntDirectoryStat;
     if (pathStat.dev !== stat.dev || pathStat.ino !== stat.ino) {
@@ -156,6 +186,21 @@ export function openPrivateDirectory(
 }
 
 /**
+ * Open a directory created by the caller before mode tightening.  This is
+ * deliberately separate from openPrivateDirectory so existing callers never
+ * relax the exact-0700 authentication policy.
+ */
+export function openPrivateDirectoryForCreation(
+  path: string,
+  options: PrivateDirectoryOpenOptions = {},
+): PrivateDirectoryHandle {
+  return authenticateOpenPrivateDirectory(path, openPrivateDirectoryDescriptor(path), {
+    ...options,
+    allowUntrustedMode: true,
+  });
+}
+
+/**
  * Open an optional private directory while distinguishing initial absence
  * from interruption after its descriptor has been acquired.
  */
@@ -167,7 +212,7 @@ export function openPrivateDirectoryIfExists(
   try {
     fd = openPrivateDirectoryDescriptor(path);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if (errorCode(error) === "ENOENT") return undefined;
     throw error;
   }
   return authenticateOpenPrivateDirectory(path, fd, options);
@@ -192,6 +237,35 @@ export function assertPrivateDirectory(
     throw new Error("private directory witness changed");
   }
   return actual;
+}
+
+/**
+ * Authenticate the exact directory entry without following its final path
+ * component, against a descriptor retained by the caller.
+ */
+export function assertPrivateDirectoryEntry(
+  handle: PrivateDirectoryHandle,
+  path: string,
+  expectedUid: number | undefined = currentUid(),
+): PrivateDirectoryWitness {
+  try {
+    const stat = directoryStat(handle.fd);
+    assertPrivateDirectoryStat(stat, expectedUid);
+    const entry = lstatSync(path, { bigint: true }) as unknown as BigIntDirectoryStat;
+    if (!entry.isDirectory()) throw new Error("private directory entry is not a directory");
+    if (Number(entry.mode & 0o7777n) !== PRIVATE_DIRECTORY_MODE) {
+      throw new Error("private directory entry mode is not trusted");
+    }
+    if (entry.uid !== stat.uid) {
+      throw new Error("private directory entry owner is not trusted");
+    }
+    if (entry.dev !== stat.dev || entry.ino !== stat.ino) {
+      throw new Error("private directory entry changed during validation");
+    }
+    return privateDirectoryWitness(stat);
+  } catch (error) {
+    throw new PrivateDirectoryTopologyError("private directory topology is not trusted", { cause: error });
+  }
 }
 
 /** Flush a private directory through a descriptor with strict open flags. */
@@ -776,9 +850,17 @@ export function atomicWritePrivateFile(
     readonly sync?: typeof fsyncSync;
     readonly write?: typeof writeFileSync;
   } = {},
+  parent?: PrivateDirectoryHandle,
 ): void {
   const directory = dirname(path);
-  ensurePrivateDirectory(directory);
+  if (parent === undefined) {
+    ensurePrivateDirectory(directory);
+  } else {
+    assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+  }
+  const parentIdentity = parent === undefined
+    ? undefined
+    : { dev: BigInt(parent.witness.dev), ino: BigInt(parent.witness.ino) };
   const tempPath = join(
     directory,
     `.${basename(path)}.${(operations.random ?? randomBytes)(12).toString("hex")}.tmp`,
@@ -786,11 +868,23 @@ export function atomicWritePrivateFile(
   let ownsTempPath = false;
   let tempIdentity: PrivateFileIdentity | undefined;
   try {
-    const fd = (operations.open ?? openSync)(tempPath, "wx", PRIVATE_FILE_MODE);
+    let fd: number;
+    try {
+      fd = (operations.open ?? openSync)(tempPath, "wx", PRIVATE_FILE_MODE);
+    } catch (error) {
+      if (parent !== undefined) {
+        try {
+          assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+        } catch (topologyError) {
+          throw topologyError;
+        }
+      }
+      throw error;
+    }
     ownsTempPath = true;
     tempIdentity = privateFileIdentity(
       fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
-      privatePathIdentity(directory),
+      parentIdentity ?? privatePathIdentity(directory),
     );
     try {
       (operations.write ?? writeFileSync)(fd, content, "utf-8");
@@ -799,8 +893,22 @@ export function atomicWritePrivateFile(
     } finally {
       (operations.close ?? closeSync)(fd);
     }
-    (operations.rename ?? renameSync)(tempPath, path);
+    try {
+      (operations.rename ?? renameSync)(tempPath, path);
+    } catch (error) {
+      if (parent !== undefined) {
+        try {
+          assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+        } catch (topologyError) {
+          throw topologyError;
+        }
+      }
+      throw error;
+    }
     ownsTempPath = false;
+    if (parent !== undefined) {
+      assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+    }
   } finally {
     if (ownsTempPath && tempIdentity !== undefined) {
       unlinkPrivateFileIfIdentityMatches(

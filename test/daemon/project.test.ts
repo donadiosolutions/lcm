@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, fchmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -24,6 +25,19 @@ const POSTGRESQL_STORAGE = {
 } as unknown as ResolvedStorageConfig;
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const REMOTE_PROJECT_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
+
+function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T): T {
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const original = nodeFs[name];
+  nodeFs[name] = replacement;
+  syncBuiltinESMExports();
+  try {
+    return callback();
+  } finally {
+    nodeFs[name] = original;
+    syncBuiltinESMExports();
+  }
+}
 
 describe("secure project-root handoff", () => {
   let previousHome: string | undefined;
@@ -129,6 +143,492 @@ describe("secure project-root handoff", () => {
       expect(statSync(join(dir, "meta.json")).mode & 0o777).toBe(0o600);
     } finally {
       process.umask(previousUmask);
+    }
+  });
+
+  it("rejects a pre-existing project symlink without changing its target", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const outside = join(home, "outside");
+    mkdirSync(outside, { mode: 0o755 });
+    const projects = join(home, ".lcm", "projects");
+    mkdirSync(projects, { mode: 0o700 });
+    symlinkSync(outside, join(projects, "e".repeat(64)));
+
+    expect(() => ensureProjectDirForIdentity({ id: "e".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+      .toThrow();
+    expect(statSync(outside).mode & 0o777).toBe(0o755);
+  });
+
+  it("rejects a pre-existing projects symlink before touching its target", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const outside = join(home, "outside-projects");
+    mkdirSync(outside, { mode: 0o755 });
+    symlinkSync(outside, join(home, ".lcm", "projects"));
+
+    expect(() => ensureProjectDirForIdentity({ id: "d".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+      .toThrow();
+    expect(statSync(outside).mode & 0o777).toBe(0o755);
+  });
+
+  it("rejects a non-directory project leaf without pathname chmod", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const projects = join(home, ".lcm", "projects");
+    const leaf = join(projects, "0".repeat(64));
+    mkdirSync(projects, { mode: 0o700 });
+    writeFileSync(leaf, "sentinel", { mode: 0o644 });
+    let chmodCalls = 0;
+    const originalChmod = chmodSync;
+    withPatchedFs("chmodSync", ((...args: Parameters<typeof chmodSync>) => {
+      chmodCalls++;
+      return originalChmod(...args);
+    }) as typeof chmodSync, () => {
+      expect(() => ensureProjectDirForIdentity({ id: "0".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow();
+    });
+    expect(readFileSync(leaf, "utf8")).toBe("sentinel");
+    expect(chmodCalls).toBe(0);
+  });
+
+  it("rejects an existing project directory with a non-private mode", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const projects = join(home, ".lcm", "projects");
+    const leaf = join(projects, "f".repeat(64));
+    mkdirSync(leaf, { recursive: true, mode: 0o700 });
+    chmodSync(leaf, 0o755);
+
+    expect(() => ensureProjectDirForIdentity({ id: "f".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+      .toThrow();
+    expect(statSync(leaf).mode & 0o777).toBe(0o755);
+  });
+
+  it("rejects an invalid project identity before opening the LCM root", () => {
+    expect(() => ensureProjectDirForIdentity({ id: "bad", canonical: "/project" })).toThrow(/valid hash/);
+    expect(existsSync(join(home, ".lcm"))).toBe(false);
+  });
+
+  it("preserves metadata keys while replacing a stale canonical cwd", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "1".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, "meta.json"), JSON.stringify({ cwd: "/old", extra: true }));
+
+    ensureProjectDirForIdentity(identity);
+
+    expect(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"))).toMatchObject({
+      cwd: "/project",
+      extra: true,
+    });
+  });
+
+  it.each([
+    ["metadata", {}],
+    ["directory-only", { writeMetadata: false }],
+  ] as const)("rejects injected matching-entry drift without changing metadata on %s early return", (_label, options) => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "b".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const metaPath = join(dir, "meta.json");
+    const content = '{"cwd":"/project","extra":"preserve"}\n';
+    writeFileSync(metaPath, content, { mode: 0o600 });
+    const before = statSync(metaPath, { bigint: true });
+    let leafAssertions = 0;
+    const originalEntry = securityFiles.assertPrivateDirectoryEntry;
+    const entrySpy = vi.spyOn(securityFiles, "assertPrivateDirectoryEntry").mockImplementation((handle, path, uid) => {
+      if (path === dir) {
+        leafAssertions++;
+        if (leafAssertions === 3) throw new Error("injected matching-entry drift");
+      }
+      return originalEntry(handle, path, uid);
+    });
+
+    try {
+      expect(() => ensureProjectDirForIdentity(identity, options)).toThrow("injected matching-entry drift");
+    } finally {
+      entrySpy.mockRestore();
+    }
+
+    const after = statSync(metaPath, { bigint: true });
+    expect(readFileSync(metaPath, "utf8")).toBe(content);
+    expect(after.mtimeNs).toBe(before.mtimeNs);
+  });
+
+  it("converges created children under umask 077", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const previousUmask = process.umask(0o077);
+    try {
+      const identity = { id: "c".repeat(64), canonical: "/project" };
+      const dir = ensureProjectDirForIdentity(identity, { writeMetadata: false });
+      expect(statSync(join(home, ".lcm", "projects")).mode & 0o777).toBe(0o700);
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
+  it("fails closed when created-child descriptor opening returns EACCES", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectoryForCreation").mockImplementation(() => {
+      throw Object.assign(new Error("owner-read-stripping umask"), { code: "EACCES" });
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity({ id: "a".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow("owner-read-stripping umask");
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
+  it("rejects an existing unsafe child under a restrictive umask", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const projects = join(home, ".lcm", "projects");
+    const leaf = join(projects, "6".repeat(64));
+    mkdirSync(leaf, { recursive: true, mode: 0o700 });
+    chmodSync(leaf, 0o755);
+    const previousUmask = process.umask(0o077);
+    try {
+      expect(() => ensureProjectDirForIdentity({ id: "6".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow();
+      expect(statSync(leaf).mode & 0o777).toBe(0o755);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
+  it("authenticates an EEXIST child without fchmod or creation admission", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const projects = join(home, ".lcm", "projects");
+    const id = "2".repeat(64);
+    const leaf = join(projects, id);
+    mkdirSync(leaf, { recursive: true, mode: 0o700 });
+    const originalProbe = securityFiles.openPrivateDirectoryIfExists;
+    const originalMkdir = mkdirSync;
+    const originalFchmod = fchmodSync;
+    const probeSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      if (path === leaf) return undefined;
+      return originalProbe(path, options);
+    });
+    const strictOpen = vi.spyOn(securityFiles, "openPrivateDirectory");
+    const creationSpy = vi.spyOn(securityFiles, "openPrivateDirectoryForCreation");
+    let fchmodCalls = 0;
+    try {
+      withPatchedFs("mkdirSync", ((path: string, options: Parameters<typeof mkdirSync>[1]) => {
+        if (path === leaf) throw Object.assign(new Error("already exists"), { code: "EEXIST" });
+        return originalMkdir(path, options);
+      }) as typeof mkdirSync, () => withPatchedFs(
+        "fchmodSync",
+        ((...args: Parameters<typeof fchmodSync>) => {
+          fchmodCalls++;
+          return originalFchmod(...args);
+        }) as typeof fchmodSync,
+        () => ensureProjectDirForIdentity({ id, canonical: "/project" }, { writeMetadata: false }),
+      ));
+      expect(strictOpen.mock.calls.some(([path]) => path === leaf)).toBe(true);
+      expect(creationSpy).not.toHaveBeenCalled();
+      expect(fchmodCalls).toBe(0);
+    } finally {
+      creationSpy.mockRestore();
+      strictOpen.mockRestore();
+      probeSpy.mockRestore();
+    }
+  });
+
+  it("rejects an EEXIST child when strict authentication fails and closes ancestors", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const projects = join(rootPath, "projects");
+    const id = "3".repeat(64);
+    const leaf = join(projects, id);
+    mkdirSync(leaf, { recursive: true, mode: 0o700 });
+    const closeCounts = new Map<string, number>();
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalProbe = securityFiles.openPrivateDirectoryIfExists;
+    const originalMkdir = mkdirSync;
+    const wrap = (path: string, handle: securityFiles.PrivateDirectoryHandle): securityFiles.PrivateDirectoryHandle => ({
+      ...handle,
+      close: () => {
+        closeCounts.set(path, (closeCounts.get(path) ?? 0) + 1);
+        handle.close();
+      },
+    });
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) => {
+      if (path === leaf) throw new Error("strict EEXIST authentication failed");
+      return wrap(path, originalOpen(path, options));
+    });
+    const probeSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      if (path === leaf) return undefined;
+      const handle = originalProbe(path, options);
+      return handle === undefined ? handle : wrap(path, handle);
+    });
+    try {
+      withPatchedFs("mkdirSync", ((path: string, options: Parameters<typeof mkdirSync>[1]) => {
+        if (path === leaf) throw Object.assign(new Error("already exists"), { code: "EEXIST" });
+        return originalMkdir(path, options);
+      }) as typeof mkdirSync, () => {
+        expect(() => ensureProjectDirForIdentity({ id, canonical: "/project" }, { writeMetadata: false }))
+          .toThrow("strict EEXIST authentication failed");
+      });
+      expect(closeCounts.get(rootPath)).toBe(1);
+      expect(closeCounts.get(projects)).toBe(1);
+    } finally {
+      probeSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("closes an existing child when entry authentication fails", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const projects = join(home, ".lcm", "projects");
+    const id = "7".repeat(64);
+    mkdirSync(join(projects, id), { recursive: true, mode: 0o700 });
+    const closeCounts = new Map<string, number>();
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalOpenIfExists = securityFiles.openPrivateDirectoryIfExists;
+    const originalOpenCreation = securityFiles.openPrivateDirectoryForCreation;
+    const wrap = (path: string, handle: securityFiles.PrivateDirectoryHandle): securityFiles.PrivateDirectoryHandle => ({
+      ...handle,
+      close: () => {
+        closeCounts.set(path, (closeCounts.get(path) ?? 0) + 1);
+        handle.close();
+      },
+    });
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) =>
+      wrap(path, originalOpen(path, options)));
+    const optionalSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      const handle = originalOpenIfExists(path, options);
+      return handle === undefined ? handle : wrap(path, handle);
+    });
+    const creationSpy = vi.spyOn(securityFiles, "openPrivateDirectoryForCreation").mockImplementation((path, options) =>
+      wrap(path, originalOpenCreation(path, options)));
+    const originalEntry = securityFiles.assertPrivateDirectoryEntry;
+    const entrySpy = vi.spyOn(securityFiles, "assertPrivateDirectoryEntry").mockImplementation((handle, path, uid) => {
+      if (path === join(projects, id)) throw new Error("existing child authentication failed");
+      return originalEntry(handle, path, uid);
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity({ id, canonical: "/project" }, { writeMetadata: false }))
+        .toThrow("existing child authentication failed");
+      expect(closeCounts.get(join(home, ".lcm"))).toBe(1);
+      expect(closeCounts.get(projects)).toBe(1);
+      expect(closeCounts.get(join(projects, id))).toBe(1);
+    } finally {
+      entrySpy.mockRestore();
+      creationSpy.mockRestore();
+      optionalSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("preserves a non-EEXIST child mkdir failure", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const closeCounts = new Map<string, number>();
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) => {
+      const handle = originalOpen(path, options);
+      return {
+        ...handle,
+        close: () => {
+          closeCounts.set(path, (closeCounts.get(path) ?? 0) + 1);
+          handle.close();
+        },
+      };
+    });
+    withPatchedFs("mkdirSync", ((..._args: Parameters<typeof mkdirSync>) => {
+      throw Object.assign(new Error("child mkdir denied"), { code: "EACCES" });
+    }) as typeof mkdirSync, () => {
+      expect(() => ensureProjectDirForIdentity({ id: "8".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow("child mkdir denied");
+    });
+    expect(closeCounts.get(rootPath)).toBe(1);
+    openSpy.mockRestore();
+  });
+
+  it("preserves a created-child descriptor authentication failure", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const projectsPath = join(rootPath, "projects");
+    const id = "9".repeat(64);
+    const leafPath = join(projectsPath, id);
+    const closeCounts = new Map<string, number>();
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalOpenIfExists = securityFiles.openPrivateDirectoryIfExists;
+    const wrap = (path: string, handle: securityFiles.PrivateDirectoryHandle): securityFiles.PrivateDirectoryHandle => ({
+      ...handle,
+      close: () => {
+        closeCounts.set(path, (closeCounts.get(path) ?? 0) + 1);
+        handle.close();
+      },
+    });
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) =>
+      wrap(path, originalOpen(path, options)));
+    const optionalSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      const handle = originalOpenIfExists(path, options);
+      return handle === undefined ? handle : wrap(path, handle);
+    });
+    const originalOpenCreation = securityFiles.openPrivateDirectoryForCreation;
+    const creationSpy = vi.spyOn(securityFiles, "openPrivateDirectoryForCreation").mockImplementation((path, options) =>
+      wrap(path, originalOpenCreation(path, options)));
+    const originalEntry = securityFiles.assertPrivateDirectoryEntry;
+    const entrySpy = vi.spyOn(securityFiles, "assertPrivateDirectoryEntry").mockImplementation((handle, path, uid) => {
+      if (path === leafPath && existsSync(leafPath)) throw new Error("created child authentication failed");
+      return originalEntry(handle, path, uid);
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity({ id, canonical: "/project" }, { writeMetadata: false }))
+        .toThrow("created child authentication failed");
+      expect(closeCounts.get(rootPath)).toBe(1);
+      expect(closeCounts.get(projectsPath)).toBe(1);
+      expect(closeCounts.get(leafPath)).toBe(1);
+    } finally {
+      entrySpy.mockRestore();
+      creationSpy.mockRestore();
+      optionalSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("uses the default metadata for a syntax-error snapshot", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "2".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, "meta.json"), "{");
+
+    ensureProjectDirForIdentity(identity);
+
+    expect(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"))).toEqual({ cwd: "/project" });
+  });
+
+  it("returns early when metadata already has the canonical cwd", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "4".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, "meta.json"), JSON.stringify({ cwd: "/project", extra: true }));
+
+    expect(ensureProjectDirForIdentity(identity)).toBe(dir);
+    expect(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"))).toEqual({ cwd: "/project", extra: true });
+  });
+
+  it.each(["null", "[]", "42"])("falls back for a parsed non-object metadata value %s", (content) => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "5".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, "meta.json"), content);
+
+    expect(() => ensureProjectDirForIdentity(identity)).not.toThrow();
+    expect(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"))).toEqual({ cwd: "/project" });
+  });
+
+  it("propagates non-syntax parser failures", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "6".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, "meta.json"), "{}");
+    const parseSpy = vi.spyOn(JSON, "parse").mockImplementationOnce(() => {
+      throw new Error("parser failed");
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity(identity)).toThrow("parser failed");
+    } finally {
+      parseSpy.mockRestore();
+    }
+  });
+
+  it("reports a descriptor close failure after a successful admission", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const closeError = new Error("root close failed");
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) => {
+      const handle = originalOpen(path, options);
+      return path === rootPath ? { ...handle, close: () => { throw closeError; } } : handle;
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity({ id: "7".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow(closeError);
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
+  it("aggregates multiple descriptor close failures after admission", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    mkdirSync(join(rootPath, "projects"), { mode: 0o700 });
+    const closeError = new Error("directory close failed");
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalOpenIfExists = securityFiles.openPrivateDirectoryIfExists;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) => {
+      const handle = originalOpen(path, options);
+      return path === rootPath ? { ...handle, close: () => { throw closeError; } } : handle;
+    });
+    const optionalSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      const handle = originalOpenIfExists(path, options);
+      return handle === undefined ? handle : { ...handle, close: () => { throw closeError; } };
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity({ id: "9".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow(AggregateError);
+    } finally {
+      optionalSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("preserves an admission error when descriptor cleanup also fails", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const projects = join(rootPath, "projects");
+    const leaf = join(projects, "8".repeat(64));
+    mkdirSync(leaf, { recursive: true, mode: 0o755 });
+    const closeError = new Error("root close failed");
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) => {
+      const handle = originalOpen(path, options);
+      return path === rootPath ? { ...handle, close: () => { throw closeError; } } : handle;
+    });
+    try {
+      expect(() => ensureProjectDirForIdentity({ id: "8".repeat(64), canonical: "/project" }, { writeMetadata: false }))
+        .toThrow(AggregateError);
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
+  it("propagates bounded metadata policy failures instead of overwriting them", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "3".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    symlinkSync(join(home, "outside-meta"), join(dir, "meta.json"));
+
+    expect(() => ensureProjectDirForIdentity(identity)).toThrow();
+  });
+
+  it("preserves an explicitly thrown undefined metadata-read failure", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "a".repeat(64), canonical: "/project" };
+    const readSpy = vi.spyOn(securityFiles, "readBoundedRegularFile").mockImplementationOnce(() => {
+      throw undefined;
+    });
+    try {
+      let didThrow = false;
+      let caught: unknown = "sentinel";
+      try {
+        ensureProjectDirForIdentity(identity);
+      } catch (error) {
+        didThrow = true;
+        caught = error;
+      }
+      expect(didThrow).toBe(true);
+      expect(caught).toBeUndefined();
+    } finally {
+      readSpy.mockRestore();
     }
   });
 

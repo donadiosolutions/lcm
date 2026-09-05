@@ -47,6 +47,7 @@ process.env.TMP = state.workerTemp;
 process.env.TEMP = state.workerTemp;
 
 mkdirSync(join(state.testHome, ".lcm"), { recursive: true });
+chmodSync(join(state.testHome, ".lcm"), 0o700);
 mkdirSync(join(state.testHome, ".claude"), { recursive: true });
 mkdirSync(join(state.testHome, ".codex"), { recursive: true });
 mkdirSync(state.workerTemp, { recursive: true, mode: 0o700 });
