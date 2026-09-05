@@ -95,6 +95,8 @@ describe("MCP tool definitions", () => {
     expect(search.description).toContain("promoted");
     expect(search.description).not.toContain("Qdrant");
     expect(search.description).not.toContain("semantic");
+    expect(search.inputSchema.properties.tags.description).toContain("promoted");
+    expect(search.inputSchema.properties.tags.description).toContain("episodic results remain unfiltered");
   });
 
   it("lcm_store describes fields without embedding agent policy", () => {

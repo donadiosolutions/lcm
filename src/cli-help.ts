@@ -157,12 +157,12 @@ const HELP: Record<string, CommandHelp> = {
     options: [
       ["--limit N", "Max results per layer (default: 5)"],
       ["--layer <name>", "Layer to search: episodic or promoted (repeatable)"],
-      ["--tag <tag>", "Filter to entries that include all specified tags (repeatable)"],
+      ["--tag <tag>", "Filter promoted entries by all specified tags; episodic history remains unfiltered (repeatable)"],
     ],
     examples: [
       ["lcm search \"authentication decision\"", "Search both memory layers for auth-related context"],
       ["lcm search \"sqlite migration\" --layer episodic", "Search only episodic memory"],
-      ["lcm search \"hook failure\" --tag type:solution", "Filter by tag"],
+      ["lcm search \"hook failure\" --layer promoted --tag type:solution", "Filter promoted entries by tag"],
     ],
   },
 

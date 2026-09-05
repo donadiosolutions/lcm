@@ -544,23 +544,40 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { episodic: [], promoted: [] });
 
     mocks.grep.mockResolvedValueOnce({
-      messages: [{ id: "match", tags: ["a", "b"] }, { id: "wrong", tags: ["b"] }],
-      summaries: [{ id: "untagged", tags: "a" }],
+      messages: [
+        { messageId: 1, conversationId: 2, role: "user", snippet: "first", createdAt: new Date("2025-01-02") },
+        { messageId: 2, conversationId: 2, role: "user", snippet: "second", createdAt: new Date("2025-01-01") },
+      ],
+      summaries: [{ summaryId: "untagged", conversationId: 2, kind: "leaf", snippet: "summary", createdAt: new Date("2024-12-31") }],
       matches: [],
     });
     mocks.promotedSearch.mockResolvedValueOnce([{ id: "promoted" }]);
-    await invoke(handler, { query: "q", cwd: "/ok", tags: ["a"], limit: 1 });
-    expectLast(200, { episodic: [{ id: "match", tags: ["a", "b"] }], promoted: [{ id: "promoted" }] });
-    expect(mocks.promotedSearch).toHaveBeenLastCalledWith("q", 1, ["a"]);
+    await invoke(handler, { query: "q", cwd: "/ok", tags: ["a"], limit: 2 });
+    expectLast(200, {
+      episodic: [
+        { messageId: 1, conversationId: 2, role: "user", snippet: "first", createdAt: "2025-01-02T00:00:00.000Z" },
+        { messageId: 2, conversationId: 2, role: "user", snippet: "second", createdAt: "2025-01-01T00:00:00.000Z" },
+      ],
+      promoted: [{ id: "promoted" }],
+    });
+    expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "both", limit: 50 });
+    expect(mocks.promotedSearch).toHaveBeenLastCalledWith("q", 2, ["a"]);
 
     mocks.promotedSearch.mockResolvedValueOnce([{ id: "legacy-promoted" }]);
     await invoke(handler, { query: "q", cwd: "/ok", layers: ["semantic"] });
     expectLast(200, { episodic: [], promoted: [{ id: "legacy-promoted" }] });
     expect(mocks.promotedSearch).toHaveBeenLastCalledWith("q", 5, undefined);
 
-    mocks.grep.mockResolvedValueOnce({ messages: [{ id: "all" }], summaries: [], matches: [] });
+    mocks.grep.mockResolvedValueOnce({
+      messages: [{ messageId: 3, conversationId: 2, role: "user", snippet: "all", createdAt: new Date("2025-01-03") }],
+      summaries: [],
+      matches: [],
+    });
     await invoke(handler, { query: "q", cwd: "/ok", tags: [], layers: ["episodic"] });
-    expectLast(200, { episodic: [{ id: "all" }], promoted: [] });
+    expectLast(200, {
+      episodic: [{ messageId: 3, conversationId: 2, role: "user", snippet: "all", createdAt: "2025-01-03T00:00:00.000Z" }],
+      promoted: [],
+    });
     await invoke(handler, { query: "q", cwd: "/ok", tags: "invalid", layers: [] });
     expectLast(200, { episodic: [], promoted: [] });
 
