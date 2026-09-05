@@ -1,6 +1,5 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +15,7 @@ import {
 interface ChildDefaultRootResult {
   readonly before: number;
   readonly after: number;
+  readonly count: number;
   readonly roots: string[];
   readonly warningNames: string[];
   readonly allRootsExist: boolean;
@@ -59,6 +59,7 @@ await new Promise((resolve) => setImmediate(resolve));
 writeFileSync(resultPath, JSON.stringify({
   before,
   after,
+  count,
   roots,
   warningNames: warnings,
   allRootsExist: roots.every((root) => existsSync(root)),
@@ -608,13 +609,13 @@ describe("Vitest artifact-root configuration", () => {
     const parentOwnedRoot = join(parent, "parent-owned");
     const configPath = resolve(dirname(fileURLToPath(import.meta.url)), "../vitest.config.ts");
     mkdirSync(parentOwnedRoot, { mode: 0o700 });
-    const count = Math.max(12, EventEmitter.defaultMaxListeners + 2);
 
     try {
       const result = runDefaultRootChild(parent, configPath);
       expect(result.after - result.before).toBe(1);
-      expect(result.roots).toHaveLength(count);
-      expect(new Set(result.roots)).toHaveLength(count);
+      expect(result.count).toBeGreaterThanOrEqual(12);
+      expect(result.roots).toHaveLength(result.count);
+      expect(new Set(result.roots)).toHaveLength(result.count);
       expect(result.allRootsExist).toBe(true);
       expect(result.warningNames.some(
         (warning) => warning.startsWith("MaxListenersExceededWarning|")

@@ -469,6 +469,117 @@ describe("verify-consumer-topology", () => {
     }
   });
 
+  it("propagates an undefined cleanup failure after successful verification", async () => {
+    const module = await import(scriptPath);
+    const expectedResult = { verified: true };
+    const execute = vi.fn((scratch: string) => {
+      expect(existsSync(scratch)).toBe(true);
+      return expectedResult;
+    });
+    const cleanup = vi.fn(() => {
+      throw undefined;
+    });
+    const reporter = vi.fn();
+    let returned = false;
+    let caught = false;
+    let caughtError: unknown;
+    try {
+      try {
+        const result = module.runConsumerTopology({ execute, cleanup, reportCleanupFailure: reporter });
+        returned = true;
+        expect(result).toBe(expectedResult);
+      } catch (error) {
+        caught = true;
+        caughtError = error;
+      }
+      expect(caught).toBe(true);
+      expect(returned).toBe(false);
+      expect(caughtError).toBeUndefined();
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledWith(execute.mock.calls[0]![0]);
+      expect(reporter).not.toHaveBeenCalled();
+    } finally {
+      const scratch = execute.mock.calls[0]?.[0];
+      if (scratch) rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("reports an undefined cleanup failure after verification fails", async () => {
+    const module = await import(scriptPath);
+    const primaryError = new Error("verification failed");
+    const execute = vi.fn((scratch: string) => {
+      expect(existsSync(scratch)).toBe(true);
+      throw primaryError;
+    });
+    const cleanup = vi.fn(() => {
+      throw undefined;
+    });
+    const reporter = vi.fn();
+    let returned = false;
+    let caught = false;
+    let caughtError: unknown;
+    try {
+      try {
+        module.runConsumerTopology({ execute, cleanup, reportCleanupFailure: reporter });
+        returned = true;
+      } catch (error) {
+        caught = true;
+        caughtError = error;
+      }
+      expect(caught).toBe(true);
+      expect(returned).toBe(false);
+      expect(caughtError).toBe(primaryError);
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledWith(execute.mock.calls[0]![0]);
+      expect(reporter).toHaveBeenCalledTimes(1);
+      expect(reporter).toHaveBeenCalledWith(execute.mock.calls[0]![0], undefined);
+    } finally {
+      const scratch = execute.mock.calls[0]?.[0];
+      if (scratch) rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a primary undefined verification failure", async () => {
+    const module = await import(scriptPath);
+    const cleanupError = new Error("cleanup failed");
+    const reporterError = new Error("reporter failed");
+    const execute = vi.fn((scratch: string) => {
+      expect(existsSync(scratch)).toBe(true);
+      throw undefined;
+    });
+    const cleanup = vi.fn(() => {
+      throw cleanupError;
+    });
+    const reporter = vi.fn(() => {
+      throw reporterError;
+    });
+    let returned = false;
+    let caught = false;
+    let caughtError: unknown = Symbol("unset");
+    try {
+      try {
+        module.runConsumerTopology({ execute, cleanup, reportCleanupFailure: reporter });
+        returned = true;
+      } catch (error) {
+        caught = true;
+        caughtError = error;
+      }
+      expect(caught).toBe(true);
+      expect(returned).toBe(false);
+      expect(caughtError).toBeUndefined();
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledWith(execute.mock.calls[0]![0]);
+      expect(reporter).toHaveBeenCalledTimes(1);
+      expect(reporter).toHaveBeenCalledWith(execute.mock.calls[0]![0], cleanupError);
+    } finally {
+      const scratch = execute.mock.calls[0]?.[0];
+      if (scratch) rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("keeps packed CLI failure diagnostics unchanged", async () => {
     const module = await import(scriptPath);
     const root = isolatedRoot("verify-errors-");
