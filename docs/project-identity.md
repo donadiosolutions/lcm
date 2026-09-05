@@ -387,6 +387,15 @@ lcm project show <local-hash>
 lcm project show <remote-project-uuid>
 ```
 
+`project list` and `project show` finish the authenticated legacy-home
+migration gate before reading the map. If the managed daemon is completing a
+private publication, the read preparation retries only while the authenticated
+daemon identity, process birth, and health evidence continue to match. The
+same bounded gate applies to `machine show`; output is emitted only after the
+read succeeds, so a contention retry cannot duplicate output. A missing or
+foreign owner, changed publication evidence, or failed health check remains a
+fail-closed error.
+
 Under SQLite, `list` and `show` use only the local map. Under PostgreSQL they
 also read the authoritative remote projects. A missing remote project for a
 stored binding fails closed and includes an explicit unlink or relink command.

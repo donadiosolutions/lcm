@@ -27,6 +27,7 @@ import { lcmHomeDir } from "../src/runtime-paths.js";
 import { isLcmConnectionOpen } from "../src/db/connection.js";
 import { ScrubEngine } from "../src/scrub.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
+import { createPublicationConvergence } from "../src/storage/publication-convergence.js";
 
 const tempDirs: string[] = [];
 const originalHome = process.env.HOME;
@@ -208,6 +209,148 @@ describe("portable-knowledge — export", () => {
     const doc: ExportDocument = JSON.parse(readFileSync(outFile, "utf-8"));
     expect(doc.entries).toHaveLength(1);
     expect(doc.entries[0].content).toBe("Entry one");
+  });
+
+  it("supports an internal convergence runner while persisting once", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const outFile = join(makeTempDir(), "converged.json");
+    seedProject(baseDir, cwd, [{ content: "Converged entry", tags: ["note"] }]);
+
+    const result = await exportKnowledge(cwd, {
+      output: outFile,
+      skipScrub: true,
+      _lcmBaseDir: baseDir,
+      _publicationConvergence: createPublicationConvergence({ port: 3737 }),
+    });
+
+    expect(result.exported).toBe(1);
+    expect(JSON.parse(readFileSync(outFile, "utf-8")).entries).toHaveLength(1);
+  });
+
+  it("retries export gathering and writes only the winning document", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const outFile = join(makeTempDir(), "retried.json");
+    seedProject(baseDir, cwd, [{ content: "Retried entry", tags: ["note"] }]);
+    const migration = await import("../src/db/migration.js");
+    const contention = new (await import("../src/private-mutation-lock.js")).PrivateMutationLockContentionError("busy");
+    const runMigration = vi.spyOn(migration, "runLcmMigrations");
+    runMigration.mockImplementationOnce(() => { throw contention; });
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      expectedEntrypoint: "/daemon",
+      expectedRuntimeDigest: "runtime",
+      deps: {
+        now: (() => { let value = 0; return () => value; })(),
+        sleep: async () => undefined,
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth",
+        lockPath: join(baseDir, "publication.lock"),
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+          status: "ok", pid: 42, version: "test", storageBackend: "sqlite",
+          entrypoint: "/daemon", runtimeDigest: "runtime",
+        }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    try {
+      const result = await exportKnowledge(cwd, {
+        output: outFile,
+        skipScrub: true,
+        _lcmBaseDir: baseDir,
+        _publicationConvergence: convergence,
+      });
+      expect(result.exported).toBe(1);
+      expect(runMigration).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(readFileSync(outFile, "utf-8")).entries).toHaveLength(1);
+    } finally {
+      runMigration.mockRestore();
+    }
+  });
+
+  it("retries export gathering before emitting one stdout document", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    seedProject(baseDir, cwd, [{ content: "stdout retry", tags: ["note"] }]);
+    const migration = await import("../src/db/migration.js");
+    const contention = new (await import("../src/private-mutation-lock.js")).PrivateMutationLockContentionError("busy");
+    const runMigration = vi.spyOn(migration, "runLcmMigrations");
+    runMigration.mockImplementationOnce(() => { throw contention; });
+    let now = 0;
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      expectedEntrypoint: "/daemon", expectedRuntimeDigest: "runtime",
+      deps: {
+        now: () => now, sleep: async (delayMs: number) => { now += delayMs; },
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth", lockPath: join(baseDir, "publication.lock"),
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+          status: "ok", pid: 42, version: "test", storageBackend: "sqlite",
+          entrypoint: "/daemon", runtimeDigest: "runtime",
+        }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await exportKnowledge(cwd, { skipScrub: true, _lcmBaseDir: baseDir, _publicationConvergence: convergence });
+      const documents = output.mock.calls.map(([value]) => String(value)).filter(value => value.includes('"version"'));
+      expect(documents).toHaveLength(1);
+      expect(JSON.parse(documents[0]!).entries).toHaveLength(1);
+      expect(runMigration).toHaveBeenCalledTimes(2);
+    } finally {
+      runMigration.mockRestore();
+    }
+  });
+
+  it.each([
+    ["stdout", "exhausted", false, true],
+    ["file", "exhausted", true, true],
+    ["stdout", "unauthenticated", false, false],
+    ["file", "unauthenticated", true, false],
+  ])("preserves %s on %s gather admission", async (_mode, _reason, toFile, authenticated) => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const outFile = join(makeTempDir(), "existing.json");
+    writeFileSync(outFile, "previous export");
+    seedProject(baseDir, cwd, [{ content: "blocked entry", tags: ["note"] }]);
+    const migration = await import("../src/db/migration.js");
+    const { PrivateMutationLockContentionError } = await import("../src/private-mutation-lock.js");
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    const runMigration = vi.spyOn(migration, "runLcmMigrations").mockImplementation(() => { throw contention; });
+    let now = 0;
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      expectedEntrypoint: "/daemon", expectedRuntimeDigest: "runtime",
+      deps: {
+        now: () => now, sleep: async (delayMs: number) => { now += delayMs; },
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: authenticated ? 42 : 99, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth", lockPath: join(baseDir, "publication.lock"),
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+          status: "ok", pid: 42, version: "test", storageBackend: "sqlite",
+          entrypoint: "/daemon", runtimeDigest: "runtime",
+        }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await expect(exportKnowledge(cwd, {
+        output: toFile ? outFile : undefined,
+        skipScrub: true, _lcmBaseDir: baseDir, _publicationConvergence: convergence,
+      })).rejects.toBe(contention);
+      expect(output).not.toHaveBeenCalled();
+      expect(readFileSync(outFile, "utf-8")).toBe("previous export");
+      expect(runMigration).toHaveBeenCalledTimes(authenticated ? 40 : 1);
+      expect(now).toBe(authenticated ? 2000 : 0);
+    } finally {
+      runMigration.mockRestore();
+      output.mockRestore();
+    }
   });
 
   it("scrubs secrets by default", async () => {

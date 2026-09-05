@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LocalHookEventRow } from "../../src/storage/local-hook-outbox.js";
 import type { PostgreSqlPassiveEventRecord } from "../../src/storage/postgresql/passive-event-repository.js";
+import { createPublicationConvergence } from "../../src/storage/publication-convergence.js";
 
 const state = vi.hoisted(() => ({
   exit: vi.fn((code?: string | number | null): never => {
@@ -30,6 +31,7 @@ const state = vi.hoisted(() => ({
   readEvents: vi.fn(),
   listQuarantined: vi.fn(),
   replayRemote: vi.fn(),
+  factory: vi.fn(),
 }));
 
 vi.mock("node:process", async (importOriginal) => ({
@@ -40,6 +42,11 @@ vi.mock("node:process", async (importOriginal) => ({
 vi.mock("../../src/daemon/config.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../src/daemon/config.js")>()),
   loadDaemonConfig: state.loadConfig,
+}));
+
+vi.mock("../../installer/install.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../installer/install.js")>()),
+  createInstallerPublicationConvergence: state.factory,
 }));
 
 vi.mock("../../src/runtime-paths.js", async (importOriginal) => ({
@@ -251,6 +258,7 @@ describe("lcm events staged PostgreSQL operator commands", () => {
     state.readEvents.mockResolvedValue([]);
     state.listQuarantined.mockResolvedValue([]);
     state.replayRemote.mockResolvedValue(null);
+    state.factory.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -276,6 +284,37 @@ describe("lcm events staged PostgreSQL operator commands", () => {
     expect(state.outboxOpen).toHaveBeenCalledWith("/lcm/events/project.db");
     expect(state.outboxClose).toHaveBeenCalledOnce();
     expect(state.runtimeClose).toHaveBeenCalledOnce();
+  });
+
+  it("retries event read preparation under the authenticated publication owner", async () => {
+    let now = 0;
+    state.factory.mockResolvedValue(createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      expectedEntrypoint: "/daemon",
+      expectedRuntimeDigest: "runtime",
+      deps: {
+        now: () => now,
+        sleep: async (delayMs: number) => { now += delayMs; },
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth",
+        lockPath: "/tmp/publication.lock",
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+          status: "ok", pid: 42, version: "test", storageBackend: "sqlite",
+          entrypoint: "/daemon", runtimeDigest: "runtime",
+        }) })) as unknown as typeof globalThis.fetch,
+      },
+    }));
+    const contention = new (await import("../../src/private-mutation-lock.js")).PrivateMutationLockContentionError("busy");
+    state.reconcileWorktree.mockImplementationOnce(() => { throw contention; });
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await invoke("events", "status", "--json");
+
+    expect(state.factory).toHaveBeenCalledOnce();
+    expect(state.reconcileWorktree).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(stdoutText(stdout)).local.pending).toBe(2);
   });
 
   it("carries a reconciled worktree binding through ordered operator admission", async () => {

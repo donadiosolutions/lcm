@@ -6,7 +6,9 @@ component_management:
     - component_id: "unit-cli"
       name: "Unit - CLI"
       paths:
-        # Keep the #691 routing, #734 healthy-daemon store routing, and #726/#742 hook entrypoints exclusively in Unit - CLI.
+        # Keep the #691 routing, #734 healthy-daemon store routing, #726/#742
+        # hook entrypoints, and #866 publication-converged CLI reads exclusively
+        # in Unit - CLI, including export admission failures and sensitive output.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
@@ -20,6 +22,7 @@ component_management:
       name: "Unit - Configuration, Security, and Filesystem Topology"
       paths:
         # The #691 connector-doctor fallback uses the lock-free config snapshot here.
+        # #866 keeps sensitive read contention handling in this existing owner.
         # #824 keeps connector snapshots and process-owner authentication in
         # the same configuration-security component.
         # #681 keeps durable configuration writes in this existing component.
@@ -166,7 +169,8 @@ component_management:
       name: "Unit - Memory and Retrieval"
       paths:
         # The #709 SearchResult compatibility bridge, #793 search-limit contract,
-        # and retrieval contract remain memory/retrieval-owned.
+        # and retrieval contract remain memory/retrieval-owned. #866 stats
+        # publication retries and fail-closed journal errors stay in this owner.
         - "src/memory/"
         - "^src/expansion\\.ts$"
         - "^src/retrieval\\.ts$"
@@ -185,6 +189,8 @@ component_management:
     - component_id: "unit-project-worktrees"
       name: "Unit - Projects and Worktrees"
       paths:
+        # #866 export gather and project read preparation remain in this
+        # existing component.
         - "^src/codex-project-resolution\\.ts$"
         - "^src/git-project\\.ts$"
         - "^src/machine-identity\\.ts$"

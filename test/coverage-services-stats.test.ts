@@ -48,6 +48,8 @@ const mocks = vi.hoisted(() => {
     eventsFail: false,
     publicationBlocked: false,
     storageUnavailable: false,
+    privateContention: false,
+    stalePrivateContention: false,
     entries: [] as Array<{ name: string; directory: boolean; dbExists: boolean }>,
     close: vi.fn<(project: string) => void>(),
     migrate: vi.fn<(db: FakeDatabaseState) => void>(),
@@ -91,6 +93,10 @@ vi.mock("../src/daemon/config.js", () => ({
     storage: { backend: "sqlite" };
   } => {
     mocks.loadConfig(path);
+    if (mocks.privateContention) throw new PrivateMutationLockContentionError("publication busy");
+    if (mocks.stalePrivateContention && mocks.loadConfig.mock.calls.length > 1) {
+      throw new PrivateMutationLockContentionError("publication busy");
+    }
     if (mocks.configFails) throw new Error("config broken");
     return {
       restoration: { staleAfterDays: 12, staleSurfacingWithoutUseLimit: 3 },
@@ -153,7 +159,9 @@ vi.mock("node:sqlite", () => ({
 }));
 
 import { collectStats, formatNumber, formatRatio, printStats } from "../src/stats.js";
-import { StorageBackendUnavailableError } from "../src/storage/backend.js";
+import { selectStorageBackendForConfig, StorageBackendUnavailableError } from "../src/storage/backend.js";
+import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "../src/private-mutation-lock.js";
 
 type Stats = Parameters<typeof printStats>[0];
 
@@ -175,6 +183,8 @@ describe("stats service coverage", () => {
     mocks.eventsFail = false;
     mocks.publicationBlocked = false;
     mocks.storageUnavailable = false;
+    mocks.privateContention = false;
+    mocks.stalePrivateContention = false;
     mocks.entries = [];
     projects.clear();
     mocks.getRecallStats.mockReturnValue({ memoriesSurfaced: 0, memoriesActedUpon: 0, recallPrecision: null, topRecalled: [] });
@@ -201,11 +211,68 @@ describe("stats service coverage", () => {
     expect(mocks.collectEvents).not.toHaveBeenCalled();
   });
 
+  it("rethrows private publication contention before collecting an empty aggregate", async () => {
+    mocks.privateContention = true;
+    try {
+      await expect(collectStats()).rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+      expect(mocks.collectEvents).not.toHaveBeenCalled();
+    } finally {
+      mocks.privateContention = false;
+    }
+  });
+
   it("rethrows unavailable PostgreSQL selection before an empty aggregate", async () => {
     mocks.storageUnavailable = true;
     mocks.baseExists = false;
     await expect(collectStats()).rejects.toBeInstanceOf(StorageBackendUnavailableError);
     expect(mocks.collectEvents).not.toHaveBeenCalled();
+  });
+
+  it("rethrows private publication contention during stale-config loading", async () => {
+    mocks.stalePrivateContention = true;
+    mocks.entries = [{ name: "alpha", directory: true, dbExists: true }];
+    projects.set("alpha", {
+      messages: 1, messageTokens: 4, summaries: 0, summaryTokens: 0, maxDepth: 0, promoted: 0,
+      redactions: [], conversations: [],
+    });
+    try {
+      await expect(collectStats()).rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+    } finally {
+      mocks.stalePrivateContention = false;
+    }
+  });
+
+  it("preserves a stale-config journal failure after successful initial admission", async () => {
+    const failure = new BackendPublicationJournalError("unresolved-publication", "private evidence");
+    mocks.loadConfig
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => { throw failure; });
+
+    await expect(collectStats()).rejects.toBe(failure);
+
+    expect(mocks.loadConfig).toHaveBeenCalledTimes(2);
+    expect(selectStorageBackendForConfig).toHaveBeenCalledOnce();
+    expect(mocks.migrate).not.toHaveBeenCalled();
+    expect(mocks.collectEvents).not.toHaveBeenCalled();
+  });
+
+  it("uses stale defaults for malformed settings after successful initial admission", async () => {
+    mocks.loadConfig
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => { throw new Error("config broken"); });
+    mocks.entries = [{ name: "one", directory: true, dbExists: true }];
+    projects.set("one", {
+      messages: 1, messageTokens: 1, summaries: 0, summaryTokens: 0, maxDepth: 0, promoted: 0,
+      redactions: [], conversations: [],
+    });
+
+    expect(await collectStats()).toMatchObject({ projects: 1, messages: 1 });
+
+    expect(mocks.loadConfig).toHaveBeenCalledTimes(2);
+    expect(selectStorageBackendForConfig).toHaveBeenCalledOnce();
+    expect(mocks.findStale).toHaveBeenCalledWith(expect.objectContaining({
+      staleAfterDays: 90, staleSurfacingWithoutUseLimit: 5,
+    }));
   });
 
   it("rethrows unavailable PostgreSQL selection before populated project reads", async () => {
