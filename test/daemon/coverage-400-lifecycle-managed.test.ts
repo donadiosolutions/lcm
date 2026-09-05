@@ -726,6 +726,14 @@ describe("issue 400 managed ensure admission matrix", () => {
   it("converges a final publication contention for the newly admitted child", async () => {
     let now = 0;
     let publicationAssertions = 0;
+    const nativeResponse = new Response(JSON.stringify({
+      status: "ok",
+      version: "1",
+      storageBackend: "sqlite",
+      runtimeDigest: "a".repeat(64),
+      pid: 4242,
+      entrypoint: "/tmp/lcm-daemon-entrypoint.mjs",
+    }), { status: 200 });
     const fixture = createFixture({
       isAlive: () => true,
       fetch: sequenceFetch([
@@ -733,8 +741,7 @@ describe("issue 400 managed ensure admission matrix", () => {
         healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
         healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
         response({ totalConnections: 0 }),
-        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
-        new Response(JSON.stringify({ status: "ok", version: "1", storageBackend: "sqlite", runtimeDigest: "a".repeat(64), pid: 4242, entrypoint: "/tmp/lcm-daemon-entrypoint.mjs" }), { status: 200 }),
+        nativeResponse,
       ]),
       sleep: async (ms) => { now += ms; },
     });
@@ -768,6 +775,8 @@ describe("issue 400 managed ensure admission matrix", () => {
       spawned: true,
       pid: 4242,
     });
+    expect(nativeResponse.bodyUsed).toBe(true);
+    expect(fixture.seams.fetch).toHaveBeenCalledTimes(5);
     expect(publicationAssertions).toBe(3);
     expect(fixture.start).toHaveBeenCalledOnce();
   });
@@ -939,10 +948,11 @@ describe("issue 400 managed ensure admission matrix", () => {
     vi.useFakeTimers();
     try {
       let fetchCalls = 0;
+      let retrySignal: AbortSignal | null | undefined;
       let publicationAssertions = 0;
       const contention = new PrivateMutationLockContentionError("helper timeout contention");
       const fixture = createFixture({ isAlive: () => true });
-      fixture.seams.fetch = vi.fn(async () => {
+      fixture.seams.fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
         fetchCalls += 1;
         if (fetchCalls < 5) {
           const values = [
@@ -955,6 +965,7 @@ describe("issue 400 managed ensure admission matrix", () => {
           if (value instanceof Error) throw value;
           return value;
         }
+        retrySignal = init?.signal;
         return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
       }) as never;
       const hangingJson = vi.spyOn(Response.prototype, "json").mockImplementation(
@@ -981,6 +992,7 @@ describe("issue 400 managed ensure admission matrix", () => {
       await handled;
       expect(observedError).toBe(contention);
       expect(hangingJson).toHaveBeenCalled();
+      expect(retrySignal?.aborted).toBe(true);
     } finally {
       vi.useRealTimers();
     }
