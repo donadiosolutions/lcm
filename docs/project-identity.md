@@ -571,6 +571,15 @@ empty ingestion still authenticate the selected backend before returning their
 normal no-op result. Passive hooks write the local SQLite outbox first; the
 daemon's selected-backend consumer processes it in bounded batches.
 
+Passive-event promotion derives scrubber paths from the same retained local
+project identity used for backend admission. A mismatch in `id`,
+`localProjectId`, `canonical`, or `remoteProjectId` is rejected before a
+project backend opens or an event is acknowledged. The route returns a
+sanitized `503` publication-admission response, leaves that batch pending, and
+allows a later retry to reconcile the path and storage identity. In an
+all-project promotion, projects completed before the mismatch stay committed;
+the scan stops without visiting later sidecars.
+
 Request cancellation closes project storage, and daemon shutdown drains active
 routes and passive consumers before closing the shared factory. Recovery means
 restoring PostgreSQL service or grants and retrying. Rollback means publishing
