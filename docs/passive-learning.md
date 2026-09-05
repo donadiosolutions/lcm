@@ -101,6 +101,15 @@ The daemon uses bounded triggers so passive learning stays fresh without making 
 - A startup sweep and a 5-minute periodic sweep scan up to 20 metadata-backed sidecars per pass.
 - Active-project background processing promotes at most one batch per pass, then requeues remaining work.
 
+Each non-empty promotion batch snapshots the admitted project identity before
+constructing its scrubber and pairs that snapshot with storage admission. If
+the identity changes before the backend opens, promotion is deferred with a
+`503` response (`status: "blocked"`) and the batch remains pending. Direct
+promotion retries the pending events on a later run. An `lcm events promote
+--all` scan stops at that project after any earlier projects have committed;
+the blocked response has no aggregate counts, and later sidecars remain
+available for the next retry.
+
 While a larger passive-learning batch is running, the daemon can remain alive
 and own its configured listener even if bounded health checks cannot complete.
 Lifecycle admission preserves that exact likely-LCM process and its PID/token
