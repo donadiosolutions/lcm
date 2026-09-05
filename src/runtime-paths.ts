@@ -461,6 +461,49 @@ function openPrivateRoot(root: string): OpenDirectory {
   return openDirectory(root, "private LCM root", { privateExact: true });
 }
 
+const BOOTSTRAP_HANDOFF_ERROR = "private LCM root changed before bootstrap handoff";
+
+function assertBootstrapRootCanonical(root: OpenDirectory, rootPath: string): void {
+  try {
+    assertPathMatchesDirectory(root, rootPath, "private LCM root");
+    const stat = fstatSync(root.fd, { bigint: true }) as unknown as BigIntFileStat;
+    if (!stat.isDirectory() || modeOf(stat) !== PRIVATE_ROOT_MODE || !ownerMatches(stat)) {
+      throw new Error(BOOTSTRAP_HANDOFF_ERROR);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === BOOTSTRAP_HANDOFF_ERROR) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    if (isMissing(error)
+      || message.includes("changed during validation")
+      || message.includes("path is a symlink or non-canonical path")) {
+      throw new Error(BOOTSTRAP_HANDOFF_ERROR);
+    }
+    throw error;
+  }
+}
+
+function captureBootstrapRootWitness(root: OpenDirectory, rootPath: string): TreeWitness {
+  assertBootstrapRootCanonical(root, rootPath);
+  let witness: TreeWitness;
+  try {
+    witness = treeWitnessOf(rootPath);
+  } catch (error) {
+    if (isMissing(error)) throw new Error(BOOTSTRAP_HANDOFF_ERROR);
+    throw error;
+  }
+  assertBootstrapRootCanonical(root, rootPath);
+  const retainedStat = fstatSync(root.fd, { bigint: true }) as unknown as BigIntFileStat;
+  const retained: TreeWitness = {
+    identity: statIdentity(retainedStat),
+    mode: modeOf(retainedStat),
+    uid: Number(retainedStat.uid),
+    gid: Number(retainedStat.gid),
+    hash: witness.hash,
+  };
+  if (!sameRootMetadata(witness, retained)) throw new Error(BOOTSTRAP_HANDOFF_ERROR);
+  return witness;
+}
+
 function parentObservation(topology: HomeTopology, homeDir: string) {
   const homePath = resolve(homeDir);
   const parentPath = dirname(homePath);
@@ -1868,19 +1911,27 @@ export function bootstrapLcmHome(homeDir: string = homedir()): RuntimeHomeBootst
     const result = migrateLegacyHomeUnlocked(homeDir, topology, admission);
     const root = lstatIfPresent(lcmHomeDir(homeDir));
     if (root === undefined) {
-      const created = createPrivateRoot(topology, homeDir);
-      created.root.close();
-      return admission.withFinalLock(() => {
-        refreshHomeParentWitness(topology, homeDir, admission.parentAuthority);
-        const expected = treeWitnessOf(lcmHomeDir(homeDir));
-        const current = treeWitnessOf(lcmHomeDir(homeDir));
-        if (!sameIdentity(current.identity, expected.identity) || current.hash !== expected.hash || current.mode !== PRIVATE_ROOT_MODE) {
-          throw new Error("private LCM root changed before bootstrap handoff");
+      const createdRoot = createPrivateRoot(topology, homeDir);
+      const rootPath = lcmHomeDir(homeDir);
+      try {
+        const captured = captureBootstrapRootWitness(createdRoot.root, rootPath);
+        const expectedHash = createdRoot.created ? emptyDirectoryTreeHash() : captured.hash;
+        if (captured.hash !== expectedHash) {
+          throw new Error(BOOTSTRAP_HANDOFF_ERROR);
         }
-        const rootHandle = openPrivateRoot(lcmHomeDir(homeDir));
-        rootHandle.close();
-        return { ...result, created: true };
-      });
+        const expected = { ...captured, hash: expectedHash };
+        return admission.withFinalLock(() => {
+          const current = captureBootstrapRootWitness(createdRoot.root, rootPath);
+          if (!sameTreeWitness(current, expected)) throw new Error(BOOTSTRAP_HANDOFF_ERROR);
+          // Compare before the legitimate direct-system-root witness write;
+          // that write changes the root's child set and therefore its hash.
+          refreshHomeParentWitness(topology, homeDir, admission.parentAuthority);
+          assertBootstrapRootCanonical(createdRoot.root, rootPath);
+          return { ...result, created: true };
+        });
+      } finally {
+        createdRoot.root.close();
+      }
     }
     refreshHomeParentWitness(topology, homeDir, admission.parentAuthority);
     const rootHandle = openPrivateRoot(lcmHomeDir(homeDir));

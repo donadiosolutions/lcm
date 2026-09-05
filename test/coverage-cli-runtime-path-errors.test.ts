@@ -33,6 +33,7 @@ const fsControl = vi.hoisted(() => ({
   fsyncError: undefined as NodeJS.ErrnoException | undefined,
   missingSecureOpenFlags: false,
   fstatHook: undefined as ((path: string, stat: unknown) => unknown) | undefined,
+  fstatFdHook: undefined as ((path: string, fd: number, stat: unknown) => void) | undefined,
   closeHook: undefined as ((path: string, fd: number) => void) | undefined,
   readlinkError: undefined as NodeJS.ErrnoException | undefined,
   readlinkHook: undefined as ((path: string) => string | undefined) | undefined,
@@ -105,6 +106,7 @@ vi.mock("node:fs", async () => {
     },
     fstatSync: (fd: number, options?: { bigint?: boolean }) => {
       const stat = actual.fstatSync(fd, options);
+      fsControl.fstatFdHook?.(fsControl.fdPaths.get(fd) ?? "", fd, stat);
       const hook = fsControl.fstatHook;
       return hook === undefined
         ? stat
@@ -259,6 +261,7 @@ afterEach(() => {
   fsControl.fsyncError = undefined;
   fsControl.missingSecureOpenFlags = false;
   fsControl.fstatHook = undefined;
+  fsControl.fstatFdHook = undefined;
   fsControl.closeHook = undefined;
   fsControl.readlinkError = undefined;
   fsControl.readlinkHook = undefined;
@@ -1030,6 +1033,51 @@ describe("runtime home rename failures", () => {
     expect(existsSync(lcmHomeDir(home))).toBe(true);
   });
 
+  it("rejects content added after the pre-handoff contract is captured", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-current-child-"));
+    homes.push(home);
+    const root = lcmHomeDir(home);
+    let rootOpens = 0;
+    fsControl.openHook = (path) => {
+      if (path === root && ++rootOpens === 4) writeFileSync(join(root, "late-child"), "child");
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("changed before bootstrap handoff");
+    expect(existsSync(join(root, "home-parent-witness.json"))).toBe(false);
+  });
+
+  it("rejects unexpected children in a root created by this bootstrap", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-created-child-"));
+    homes.push(home);
+    fsControl.mkdirHook = (path) => writeFileSync(join(path, "unexpected"), "child");
+
+    expect(() => bootstrapLcmHome(home)).toThrow("changed before bootstrap handoff");
+  });
+
+  it("accepts bounded content in a trusted existing root", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-existing-child-"));
+    homes.push(home);
+    const root = lcmHomeDir(home);
+    mkdirSync(root, { mode: 0o700 });
+    writeFileSync(join(root, "config.json"), "{}", { mode: 0o600 });
+
+    expect(bootstrapLcmHome(home)).toMatchObject({ created: false, migrated: false });
+  });
+
+  it("accepts bounded content in a root reused after an EEXIST race", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-race-child-"));
+    homes.push(home);
+    const root = lcmHomeDir(home);
+    fsControl.mkdirEexistPath = root;
+    fsControl.mkdirHook = (path) => {
+      if (path !== root) return;
+      mkdirSync(path, { mode: 0o700 });
+      writeFileSync(join(path, "config.json"), "{}", { mode: 0o600 });
+    };
+
+    expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
+  });
+
   it.each(["regular file", "symlink"])("rejects an unsafe root that appears before private-root validation (%s)", (kind) => {
     const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-appearance-"));
     homes.push(home);
@@ -1051,7 +1099,10 @@ describe("runtime home rename failures", () => {
     homes.push(home);
     fsControl.lstatRacePath = lcmHomeDir(home);
     fsControl.lstatRaceCall = 5;
-    fsControl.lstatRaceCreate = (path) => mkdirSync(path, { mode: 0o700 });
+    fsControl.lstatRaceCreate = (path) => {
+      mkdirSync(path, { mode: 0o700 });
+      writeFileSync(join(path, "config.json"), "{}", { mode: 0o600 });
+    };
 
     expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
   });
@@ -1060,12 +1111,155 @@ describe("runtime home rename failures", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-handoff-"));
     homes.push(home);
     const root = lcmHomeDir(home);
-    let rootCloses = 0;
-    fsControl.closeHook = (path) => {
-      if (path === root && ++rootCloses === 2) chmodSync(root, 0o755);
+    let retainedFd: number | undefined;
+    let finalLockObserved = false;
+    fsControl.openHook = (path, fd) => {
+      if (path === root && retainedFd === undefined) retainedFd = fd;
+      if (path.includes(".lcm.backend-publication.lock")) finalLockObserved = true;
+    };
+    fsControl.closeHook = (path, fd) => {
+      if (finalLockObserved && path === root && fd !== retainedFd) {
+        finalLockObserved = false;
+        chmodSync(root, 0o755);
+      }
     };
 
     expect(() => bootstrapLcmHome(home)).toThrow("changed before bootstrap handoff");
+  });
+
+  it("rejects a root that disappears during publication handoff and closes its retained descriptor once", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-disappears-"));
+    homes.push(home);
+    const root = lcmHomeDir(home);
+    let rootOpens = 0;
+    let retainedFd: number | undefined;
+    let retainedCloses = 0;
+    fsControl.openHook = (path, fd) => {
+      if (path !== root) return;
+      rootOpens += 1;
+      if (retainedFd === undefined) retainedFd = fd;
+      if (rootOpens === 4) rmSync(root, { recursive: true, force: true });
+    };
+    fsControl.closeHook = (_path, fd) => {
+      if (fd === retainedFd) retainedCloses += 1;
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("changed before bootstrap handoff");
+    expect(existsSync(join(root, "home-parent-witness.json"))).toBe(false);
+    expect(retainedCloses).toBe(1);
+  });
+
+  it("rejects a root rebound to a fresh empty directory during publication handoff", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-rebound-"));
+    homes.push(home);
+    const root = lcmHomeDir(home);
+    let retainedFd: number | undefined;
+    let finalLockObserved = false;
+    fsControl.openHook = (path, fd) => {
+      if (path === root && retainedFd === undefined) retainedFd = fd;
+      if (path.includes(".lcm.backend-publication.lock")) finalLockObserved = true;
+    };
+    fsControl.closeHook = (path, fd) => {
+      if (finalLockObserved && path === root && fd !== retainedFd) {
+        finalLockObserved = false;
+        rmSync(root, { recursive: true, force: true });
+        mkdirSync(root, { mode: 0o700 });
+      }
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("changed before bootstrap handoff");
+    expect(existsSync(join(root, "home-parent-witness.json"))).toBe(false);
+  });
+
+  it("preserves a retained-descriptor error during final root admission", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-retained-error-"));
+    homes.push(home);
+    const root = lcmHomeDir(home);
+    let retainedFd: number | undefined;
+    let retainedFstats = 0;
+    let retainedCloses = 0;
+    fsControl.openHook = (path, fd) => {
+      if (path === root && retainedFd === undefined) retainedFd = fd;
+    };
+    fsControl.fstatFdHook = (path, fd) => {
+      if (path === root && fd === retainedFd && ++retainedFstats === 5) {
+        throw Object.assign(new Error("synthetic retained fstat failure"), { code: "EIO" });
+      }
+    };
+    fsControl.closeHook = (_path, fd) => {
+      if (fd === retainedFd) retainedCloses += 1;
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("synthetic retained fstat failure");
+    expect(existsSync(join(root, "home-parent-witness.json"))).toBe(false);
+    expect(retainedCloses).toBe(1);
+  });
+
+  it("preserves a non-Error retained-descriptor failure", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-retained-nonerror-"));
+    homes.push(home);
+    const root = lcmHomeDir(home);
+    let retainedFd: number | undefined;
+    let retainedFstats = 0;
+    let retainedCloses = 0;
+    fsControl.openHook = (path, fd) => {
+      if (path === root && retainedFd === undefined) retainedFd = fd;
+    };
+    fsControl.fstatFdHook = (path, fd) => {
+      if (path === root && fd === retainedFd && ++retainedFstats === 5) {
+        throw "synthetic non-error retained failure";
+      }
+    };
+    fsControl.closeHook = (_path, fd) => {
+      if (fd === retainedFd) retainedCloses += 1;
+    };
+
+    let failure: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBe("synthetic non-error retained failure");
+    expect(retainedCloses).toBe(1);
+  });
+
+  it("rejects a retained root metadata witness mismatch", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-witness-mismatch-"));
+    homes.push(home);
+    const root = lcmHomeDir(home);
+    let rootFstats = 0;
+    fsControl.fstatHook = (path, stat) => {
+      if (path === root) ++rootFstats;
+      if (path === root && rootFstats === 19) {
+        return Object.assign(stat as object, { gid: (stat as { gid: bigint }).gid + 1n });
+      }
+      return stat;
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("changed before bootstrap handoff");
+  });
+
+  it("preserves a tree-witness reader error and closes the retained root", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-root-tree-error-"));
+    homes.push(home);
+    const root = lcmHomeDir(home);
+    let retainedFd: number | undefined;
+    let retainedCloses = 0;
+    fsControl.openHook = (path, fd) => {
+      if (path === root && retainedFd === undefined) retainedFd = fd;
+    };
+    fsControl.fstatFdHook = (path, fd) => {
+      if (path === root && fd !== retainedFd) {
+        throw Object.assign(new Error("synthetic tree-witness fstat failure"), { code: "EIO" });
+      }
+    };
+    fsControl.closeHook = (_path, fd) => {
+      if (fd === retainedFd) retainedCloses += 1;
+    };
+
+    expect(() => bootstrapLcmHome(home)).toThrow("synthetic tree-witness fstat failure");
+    expect(retainedCloses).toBe(1);
   });
 
   it("rejects a non-directory home descriptor", () => {
@@ -1090,6 +1284,7 @@ describe("runtime home rename failures", () => {
       : stat;
 
     expect(bootstrapLcmHome(home)).toMatchObject({ created: true, migrated: false });
+    expect(existsSync(join(lcmHomeDir(home), "home-parent-witness.json"))).toBe(true);
   });
 
   it("propagates a non-missing parent witness read failure", () => {

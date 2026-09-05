@@ -28,6 +28,8 @@ component_management:
         # #681 keeps durable configuration writes in this existing component.
         # #722 distinguishes initial absence from interrupted validation in
         # the shared authenticated-directory open seam.
+        # #814 retains the fresh-root descriptor and authenticates its
+        # pre-handoff content within this configuration-security boundary.
         # #828 authenticates project-directory topology with retained
         # no-follow descriptors and borrowed publication parents.
         - "^src/config-manager\\.ts$"
