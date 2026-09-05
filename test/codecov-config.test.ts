@@ -483,7 +483,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(207);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#722/#833 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#722 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -507,6 +507,7 @@ describe("Codecov configuration", () => {
       ["installer/install.ts", "unit-installation"],
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
+      ["src/daemon/project.ts", "unit-daemon-core"],
       ["src/daemon/routes/compact.ts", "unit-daemon-routes"],
       ["src/daemon/routes/describe.ts", "unit-daemon-routes"],
       ["src/daemon/routes/expand.ts", "unit-daemon-routes"],
@@ -514,9 +515,11 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
       // #833 passive-event identity admission remains route-owned.
       ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"],
-      // #793 search-limit validation remains owned by daemon routes.
+      // #793 search-limit validation and #864 search candidate recall remain
+      // owned by daemon routes.
       ["src/daemon/routes/search.ts", "unit-daemon-routes"],
       ["src/daemon/routes/grep.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
       ["src/llm/codex-process.ts", "unit-llm-prompts"],
@@ -527,6 +530,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],
+      // #837 consumer-admission descriptor cleanup remains storage-owned.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],

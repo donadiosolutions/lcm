@@ -24,7 +24,7 @@ import { resolveStorageIdentityContext } from "../storage/identity-context.js";
 import type { ResolvedStorageConfig } from "./config.js";
 import { ensureWorktreeProjectReconciled } from "../worktree-reconciliation.js";
 
-const MAX_PROJECT_METADATA_BYTES = 1024 * 1024;
+export const MAX_PROJECT_METADATA_BYTES = 1024 * 1024;
 const MAX_PROJECT_MAP_COMPATIBILITY_BYTES = 4 * 1024 * 1024;
 const PROJECT_HASH_PATTERN = /^[a-f0-9]{64}$/u;
 

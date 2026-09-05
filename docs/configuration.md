@@ -1142,6 +1142,8 @@ internal retries and applies this one bounded exponential-backoff policy, so
 configured attempt counts remain exact. Process providers do not retry because
 relaunching a CLI process could duplicate expensive work.
 
+Codex compaction spends one monotonic `llm.requestTimeoutMs` budget across config discovery, gateway startup, and execution.
+
 With `llm.provider` set to `auto`, the timeout follows the effective process
 provider: manual batch compaction resolves to Claude, while Claude and Codex
 hooks resolve to their matching process provider. A one-invocation

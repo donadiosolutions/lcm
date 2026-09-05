@@ -45,7 +45,7 @@ Hybrid search across episodic memory (SQLite FTS5) and promoted memory. Returns 
 | `query` | string | ✅ | — | Natural language search query |
 | `limit` | integer | | `5` | Maximum results per layer, from 1 through 1000 |
 | `layers` | string[] | | `["episodic", "promoted"]` | `"episodic"`, `"promoted"`, or both |
-| `tags` | string[] | | — | Filter to entries that include all specified tags |
+| `tags` | string[] | | — | Filter promoted entries to those that include all specified tags; episodic results remain unfiltered |
 
 **Examples:**
 
@@ -57,13 +57,20 @@ lcm_search(query: "authentication decision")
 lcm_search(query: "database migration", layers: ["promoted"], tags: ["type:decision"])
 ```
 
+Tags apply only to promoted memories, which are the tagged search records.
+Episodic messages and summaries remain searchable without a tag predicate. Use
+`layers: ["promoted"]` when you want tag-only recall; omitted or empty tags do
+not filter either layer.
+
 The deprecated `semantic` layer name remains accepted as a compatibility input
 and is normalized to `promoted`, but it is not advertised.
 
 `limit` must be a positive integer from 1 through 1000. When omitted, it
 defaults to 5. The value is a maximum applied independently to each selected
-layer; the episodic layer may return fewer matches when its history pool is
-smaller. Invalid values return HTTP 400 with `{ "error": "invalid limit" }`.
+layer; episodic candidate recall grows to at least 50 records per store before
+the final maximum is applied. Episodic results concatenate messages first and
+then summaries, so a message-heavy result can fill the maximum before a
+summary appears. Invalid values return HTTP 400 with `{ "error": "invalid limit" }`.
 
 ### lcm_grep
 

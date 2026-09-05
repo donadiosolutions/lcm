@@ -577,7 +577,7 @@ export function createCodexProcessSummarizer(opts: CodexProcessDeps = {}): LcmSu
         setTimeout: opts.setTimeout,
         clearTimeout: opts.clearTimeout,
       }, signal)),
-    now: opts._now ?? Date.now,
+    now: opts._now ?? (() => performance.now()),
     platform: opts.platform,
     detachedProcessGroup: opts.detachedProcessGroup,
     killProcess: opts.killProcess,

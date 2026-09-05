@@ -56,7 +56,8 @@ component_management:
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
-        # Keep the #691/#700 response fences, #701 terminal factory-close retry, and runtime identity here.
+        # Keep the #691/#700 response fences, #701 terminal factory-close retry,
+        # runtime identity, and #825 bounded project metadata limit here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
@@ -81,8 +82,9 @@ component_management:
         # handling remain route-owned; #703 describe/expand compatibility errors,
         # #705 prompt-search surfacing-log failures, #709 search and grep routes,
         # #710 grep mode, #792 session filtering, #793 search-limit validation,
-        # #794 grep-since validation, and #833 passive-event identity admission
-        # remain route-owned.
+        # #794 grep-since validation, #825 bounded atomic promotion metadata,
+        # #864 episodic search candidate recall, and #833 passive-event identity
+        # admission remain route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -115,6 +117,7 @@ component_management:
         # #681 retains backend-publication durable-write ownership here.
         # #722 retains one authenticated backend-publication directory identity
         # across journal, evidence, and terminal recovery-material reads.
+        # #837 retains consumer-admission descriptor cleanup in this owner.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
         - "^src/storage/capabilities\\.ts$"

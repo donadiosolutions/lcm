@@ -58,15 +58,14 @@ export function createSearchHandler(config: DaemonConfig, storageFactory?: Stora
             if (activeLayers.includes("episodic")) {
               try {
                 const retrieval = createRetrievalEngine(project);
-                const episodicResult = await retrieval.grep({ query, mode: "full_text", scope: "both" });
+                const episodicResult = await retrieval.grep({
+                  query,
+                  mode: "full_text",
+                  scope: "both",
+                  limit: Math.max(50, normalizedLimit),
+                });
                 const allMatches = [...episodicResult.messages, ...episodicResult.summaries];
-                const episodicMatches = filterTags
-                  ? allMatches.filter((m) => {
-                      const t = (m as Record<string, unknown>).tags;
-                      return Array.isArray(t) && filterTags.every(ft => t.includes(ft));
-                    })
-                  : allMatches;
-                episodic = episodicMatches.slice(0, normalizedLimit);
+                episodic = allMatches.slice(0, normalizedLimit);
               } catch (error) {
                 if (config.storage.backend === "postgresql" && error instanceof StorageOperationError) throw error;
               }

@@ -71,6 +71,100 @@ async function interruptPublicationDirectoryValidation(
   return { injected, error };
 }
 
+type DescriptorLifetime = Readonly<{
+  id: number;
+  path: string;
+  fd: number;
+  closed: boolean;
+}>;
+
+type DescriptorProbeOptions = Readonly<{
+  readonly openErrorCode?: "EACCES" | "ENOTDIR" | "ELOOP";
+  readonly validationFailure?: boolean;
+}>;
+
+type ConsumerAction = (home: string, onRun: () => void) => unknown | Promise<unknown>;
+
+async function observeConsumerDescriptorLifetimes(
+  home: string,
+  action: () => unknown | Promise<unknown>,
+  options: DescriptorProbeOptions = {},
+): Promise<Readonly<{
+  readonly injected: boolean;
+  readonly unrelatedDelegated: boolean;
+  readonly error: unknown;
+  readonly lifetimes: readonly DescriptorLifetime[];
+}>> {
+  const root = join(home, ".lcm");
+  const publication = backendPublicationDirectory(home);
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+  const originalClose = nodeFs.closeSync as (fd: number) => void;
+  const originalRealpath = nodeFs.realpathSync as (...args: unknown[]) => unknown;
+  const live = new Map<number, DescriptorLifetime>();
+  const lifetimes: DescriptorLifetime[] = [];
+  let nextId = 0;
+  let injected = false;
+  let unrelatedDelegated = false;
+  let error: unknown;
+  const targetPaths = new Set([root, publication]);
+  try {
+    nodeFs.openSync = ((path: unknown, ...args: unknown[]) => {
+      const pathString = typeof path === "string" ? path : undefined;
+      if (pathString !== undefined && !targetPaths.has(pathString)) unrelatedDelegated = true;
+      if (pathString === publication && options.openErrorCode !== undefined && !injected) {
+        injected = true;
+        const failure = new Error(`injected ${options.openErrorCode}`) as NodeJS.ErrnoException;
+        failure.code = options.openErrorCode;
+        throw failure;
+      }
+      const fd = originalOpen(path, ...args);
+      if (pathString !== undefined && targetPaths.has(pathString)) {
+        const lifetime = { id: nextId++, path: pathString, fd, closed: false };
+        lifetimes.push(lifetime);
+        live.set(fd, lifetime);
+      }
+      return fd;
+    }) as never;
+    nodeFs.closeSync = ((fd: number) => {
+      const lifetime = live.get(fd);
+      const result = originalClose(fd);
+      if (lifetime !== undefined) {
+        lifetime.closed = true;
+        live.delete(fd);
+      }
+      return result;
+    }) as never;
+    if (options.validationFailure) {
+      nodeFs.realpathSync = ((path: unknown, ...args: unknown[]) => {
+        if (path === publication && !injected) {
+          injected = true;
+          throw new Error("injected publication validation failure");
+        }
+        return originalRealpath(path, ...args);
+      }) as never;
+    }
+    syncBuiltinESMExports();
+    const unrelatedFd = nodeFs.openSync(join(home, "unrelated-seam-check"), "w") as number;
+    nodeFs.closeSync(unrelatedFd);
+    try {
+      await action();
+    } catch (caught) {
+      error = caught;
+    }
+  } finally {
+    // Snapshot before restoring the seam; helper cleanup must never count as
+    // production cleanup in the lifetime observations.
+    const outstanding = [...live.values()];
+    nodeFs.openSync = originalOpen;
+    nodeFs.closeSync = originalClose;
+    nodeFs.realpathSync = originalRealpath;
+    syncBuiltinESMExports();
+    for (const lifetime of outstanding) originalClose(lifetime.fd);
+  }
+  return { injected, unrelatedDelegated, error, lifetimes };
+}
+
 afterEach(() => {
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
 });
@@ -162,6 +256,139 @@ describe("backend publication consumer admission", () => {
     expect(callbackRan).toBe(false);
     expect(observed.error).toBeInstanceOf(BackendPublicationJournalError);
     expect(observed.error).toMatchObject({ reason: "unsafe-storage" });
+  });
+
+  it.each([
+    ["synchronous", (home: string, onRun: () => void) => withStorageBackendConsumerLock(home, () => {
+      onRun();
+      return "never";
+    })],
+    ["asynchronous", (home: string, onRun: () => void) => withStorageBackendConsumerLockAsync(home, () => {
+      onRun();
+      return "never";
+    })],
+  ] satisfies readonly [string, ConsumerAction][])("releases the root descriptor when publication opening fails (%s)", async (_label, action) => {
+    const home = makeHome(true);
+    let callbackRan = false;
+    const observed = await observeConsumerDescriptorLifetimes(home, () => action(home, () => {
+      callbackRan = true;
+    }), {
+      openErrorCode: "EACCES",
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(observed.unrelatedDelegated).toBe(true);
+    expect(observed.error).toMatchObject({ name: "BackendPublicationJournalError", reason: "unsafe-storage" });
+    expect(callbackRan).toBe(false);
+    const rootLifetimes = observed.lifetimes.filter(({ path }) => path === join(home, ".lcm"));
+    const publicationLifetimes = observed.lifetimes.filter(({ path }) => path === backendPublicationDirectory(home));
+    expect(rootLifetimes).toHaveLength(1);
+    expect(rootLifetimes.every(({ closed }) => closed)).toBe(true);
+    expect(publicationLifetimes).toHaveLength(0);
+  });
+
+  it.each([
+    ["synchronous", (home: string, onRun: () => void) => withStorageBackendConsumerLock(home, () => {
+      onRun();
+      return "never";
+    })],
+    ["asynchronous", (home: string, onRun: () => void) => withStorageBackendConsumerLockAsync(home, () => {
+      onRun();
+      return "never";
+    })],
+  ] satisfies readonly [string, ConsumerAction][])("releases descriptors after publication validation fails (%s)", async (_label, action) => {
+    const home = makeHome(true);
+    let callbackRan = false;
+    const observed = await observeConsumerDescriptorLifetimes(home, () => action(home, () => {
+      callbackRan = true;
+    }), {
+      validationFailure: true,
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(observed.error).toMatchObject({ name: "BackendPublicationJournalError", reason: "unsafe-storage" });
+    expect(callbackRan).toBe(false);
+    expect(observed.lifetimes.filter(({ path }) => path === join(home, ".lcm"))).toEqual([
+      expect.objectContaining({ closed: true }),
+    ]);
+    expect(observed.lifetimes.filter(({ path }) => path === backendPublicationDirectory(home))).toEqual([
+      expect.objectContaining({ closed: true }),
+    ]);
+  });
+
+  it.each([
+    ["synchronous", (home: string, onRun: () => void) => withBackendPublicationConsumerLock(home, () => {
+      onRun();
+      return "admitted";
+    }, { allowUnresolved: true })],
+    ["asynchronous", (home: string, onRun: () => void) => withBackendPublicationConsumerLockAsync(home, () => {
+      onRun();
+      return "admitted";
+    }, { allowUnresolved: true })],
+  ] satisfies readonly [string, ConsumerAction][])("closes one handle for each initial probe (%s)", async (_label, action) => {
+    const home = makeHome(true);
+    let callbackRan = false;
+    const observed = await observeConsumerDescriptorLifetimes(home, () => action(home, () => {
+      callbackRan = true;
+    }));
+
+    expect(observed.error).toBeUndefined();
+    expect(callbackRan).toBe(true);
+    expect(observed.lifetimes.filter(({ path }) => path === join(home, ".lcm"))).toEqual([
+      expect.objectContaining({ closed: true }),
+    ]);
+    expect(observed.lifetimes.filter(({ path }) => path === backendPublicationDirectory(home))).toEqual([
+      expect.objectContaining({ closed: true }),
+    ]);
+  });
+
+  it.each([
+    ["synchronous", (home: string, onRun: () => void) => withBackendPublicationConsumerLock(home, () => {
+      onRun();
+      return "legacy";
+    }, { allowUnresolved: true })],
+    ["asynchronous", (home: string, onRun: () => void) => withBackendPublicationConsumerLockAsync(home, () => {
+      onRun();
+      return "legacy";
+    }, { allowUnresolved: true })],
+  ] satisfies readonly [string, ConsumerAction][])("does not probe descriptors for a missing root (%s)", async (_label, action) => {
+    const home = makeHome();
+    rmSync(join(home, ".lcm"), { recursive: true, force: true });
+    let callbackRan = false;
+    const observed = await observeConsumerDescriptorLifetimes(home, () => action(home, () => {
+      callbackRan = true;
+    }));
+
+    expect(observed.error).toBeUndefined();
+    expect(callbackRan).toBe(true);
+    expect(observed.lifetimes).toEqual([]);
+  });
+
+  it.each([
+    ["synchronous", (home: string, onRun: () => void) => withStorageBackendConsumerLock(home, () => {
+      onRun();
+      return "never";
+    })],
+    ["asynchronous", (home: string, onRun: () => void) => withStorageBackendConsumerLockAsync(home, () => {
+      onRun();
+      return "never";
+    })],
+  ] satisfies readonly [string, ConsumerAction][])("releases descriptors for unsafe publication modes (%s)", async (_label, action) => {
+    const home = makeHome(true);
+    chmodSync(join(home, ".lcm", "backend-publication"), 0o755);
+    let callbackRan = false;
+    const observed = await observeConsumerDescriptorLifetimes(home, () => action(home, () => {
+      callbackRan = true;
+    }));
+
+    expect(observed.error).toMatchObject({ name: "BackendPublicationJournalError", reason: "unsafe-storage" });
+    expect(callbackRan).toBe(false);
+    expect(observed.lifetimes.filter(({ path }) => path === join(home, ".lcm"))).toEqual([
+      expect.objectContaining({ closed: true }),
+    ]);
+    expect(observed.lifetimes.filter(({ path }) => path === backendPublicationDirectory(home))).toEqual([
+      expect.objectContaining({ closed: true }),
+    ]);
   });
 
   it("reuses the exact live token for the same canonical home and revokes retained continuations", async () => {
