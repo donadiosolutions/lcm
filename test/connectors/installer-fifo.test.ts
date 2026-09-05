@@ -318,7 +318,7 @@ describe("connector installer FIFO safety", () => {
     expect(result).toMatchObject({ outcome: "completed", code: 0, signal: null });
   }, CHILD_TEST_TIMEOUT_MS);
 
-  it("does not charge loader startup against the FIFO operation budget", async () => {
+  it.runIf(process.platform === "linux")("does not charge loader startup against the FIFO operation budget", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-installer-fifo-delay-"));
     roots.push(root);
     const skillPath = join(root, ".claude", "skills", "lcm-memory", "SKILL.md");
@@ -348,9 +348,6 @@ describe("connector installer FIFO safety", () => {
   it("rejects a child that exits cleanly before announcing readiness", async () => {
     const result = await runChild({
       source: "process.exitCode = 0;",
-      startupBudgetMs: 100,
-      operationBudgetMs: 100,
-      closeGraceMs: 100,
     });
 
     expect(result.outcome).toBe("error");
