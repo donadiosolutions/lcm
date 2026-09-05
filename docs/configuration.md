@@ -1065,6 +1065,9 @@ The validated endpoint is authoritative for both managed bearer classes. When
 it is absent or `null`, the existing `sk-` API and ChatGPT bearer defaults are
 preserved. The resolver never logs or persists the surrounding Codex
 configuration, endpoint contents, or authentication data.
+Once the endpoint has been validated and the one-shot app-server has provably
+settled, that endpoint remains authoritative regardless of its exit status or
+signal.
 
 Codex-process compaction then uses a private, one-use loopback Responses gateway for
 each summarize call. The gateway binds only to `127.0.0.1` on an ephemeral port

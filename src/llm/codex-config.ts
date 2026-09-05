@@ -189,8 +189,6 @@ export async function resolveCodexOpenAIBaseUrl(
       options.witnessStore!.add(witness);
       witnessAdded = true;
     }
-    let closeCode: number | null | undefined;
-    let closeSignal: NodeJS.Signals | null | undefined;
     const result = await new Promise<string | undefined>((resolve, reject) => {
       const decoder = new TextDecoder("utf-8", { fatal: true });
       const lineState = { line: "" };
@@ -213,10 +211,6 @@ export async function resolveCodexOpenAIBaseUrl(
       }, timeoutMs);
       child.once("error", () => settle(resolutionError()));
       child.stdin.on("error", () => settle(resolutionError()));
-      child.once("close", (code: number | null, signal: NodeJS.Signals | null) => {
-        closeCode = code;
-        closeSignal = signal;
-      });
       void (async () => {
         try {
           writeMessage(child, {
@@ -268,9 +262,6 @@ export async function resolveCodexOpenAIBaseUrl(
     const terminated = await teardown.terminate("close");
     teardownSettled = terminated;
     if (!terminated) throw resolutionError();
-    if (closeCode === undefined || (closeCode !== 0 && !(closeCode === null && closeSignal === "SIGTERM"))) {
-      throw resolutionError();
-    }
     return result;
   } catch (error) {
     const reason = aborted ? "abort" : timedOut ? "timeout" : "close";
