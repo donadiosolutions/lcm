@@ -522,6 +522,78 @@ describe("persistence read route boundaries", () => {
     });
   });
 
+  it("rejects malformed recent limits before cwd and storage admission", async () => {
+    const malformed = [
+      '{"limit":null}',
+      '{"cwd":"/bad","limit":null}',
+      '{"cwd":"/ok","limit":null}',
+      '{"cwd":"/ok","limit":"5"}',
+      '{"cwd":"/ok","limit":true}',
+      '{"cwd":"/ok","limit":{}}',
+      '{"cwd":"/ok","limit":[]}',
+      '{"cwd":"/ok","limit":0}',
+      '{"cwd":"/ok","limit":-0}',
+      '{"cwd":"/ok","limit":-1}',
+      '{"cwd":"/ok","limit":1.5}',
+      '{"cwd":"/ok","limit":1e400}',
+      '{"cwd":"/ok","limit":-1e400}',
+      '{"cwd":"/ok","limit":1001}',
+    ];
+    const handlers = [
+      createRecentHandler(config),
+      createRecentHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())),
+    ];
+
+    for (const handler of handlers) {
+      for (const body of malformed) {
+        mocks.send.mockClear();
+        mocks.writeHead.mockClear();
+        mocks.end.mockClear();
+        mocks.validate.mockClear();
+        mocks.projectIdentity.mockClear();
+        mocks.projectExists.mockClear();
+        mocks.openProject.mockClear();
+        mocks.recentSummaries.mockClear();
+        mocks.createFactory.mockClear();
+
+        await invoke(handler, body);
+
+        expectLast(400, { error: "invalid limit" });
+        expect(mocks.validate).not.toHaveBeenCalled();
+        expect(mocks.projectIdentity).not.toHaveBeenCalled();
+        expect(mocks.projectExists).not.toHaveBeenCalled();
+        expect(mocks.openProject).not.toHaveBeenCalled();
+        expect(mocks.recentSummaries).not.toHaveBeenCalled();
+        expect(mocks.createFactory).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it("forwards bounded recent limits and preserves valid cwd fallbacks", async () => {
+    const handler = createRecentHandler(config);
+    for (const [body, expected] of [
+      [{ cwd: "/ok", limit: 1 }, 1],
+      [{ cwd: "/ok", limit: 5 }, 5],
+      [{ cwd: "/ok", limit: 1000 }, 1000],
+      [{ cwd: "/ok" }, 5],
+    ] as const) {
+      mocks.recentSummaries.mockClear();
+      await invoke(handler, body);
+      expectLast(200, { summaries: [] });
+      expect(mocks.recentSummaries).toHaveBeenLastCalledWith(expected);
+    }
+
+    mocks.recentSummaries.mockClear();
+    await invoke(handler, { limit: 1 });
+    expectLast(200, { summaries: [] });
+    expect(mocks.recentSummaries).not.toHaveBeenCalled();
+
+    mocks.validate.mockImplementationOnce(() => { throw new Error("bad cwd"); });
+    await invoke(handler, { cwd: "/bad", limit: 1 });
+    expectLast(200, { summaries: [] });
+    expect(mocks.recentSummaries).not.toHaveBeenCalled();
+  });
+
   it("covers pool and aggregate stats success and failure payloads", async () => {
     await invoke(createPoolStatsHandler(), {});
     expectLast(200, { totalConnections: 0 });
