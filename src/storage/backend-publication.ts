@@ -1274,9 +1274,8 @@ function openOptionalPublicationDirectory(homeDir?: string): ReturnType<typeof o
 
 function openOptionalRootDirectory(homeDir?: string): ReturnType<typeof openPrivateDirectory> | undefined {
   try {
-    return openPrivateDirectory(rootPath(homeDir));
+    return openPrivateDirectoryIfExists(rootPath(homeDir));
   } catch (error) {
-    if (isMissing(error)) return undefined;
     // Older ordinary SQLite installations may have a non-private .lcm root.
     // Do not repair it during a read-only publication preflight. If the
     // publication directory exists, however, its authenticated root is part

@@ -8,9 +8,11 @@ import {
   assertBackendPublicationConfigAccess,
   backendPublicationDirectory,
   backendPublicationHomeForConfigPath,
+  openBackendPublicationReadRoot,
   withBackendPublicationConfigLock,
   withBackendPublicationConsumerLock,
   withBackendPublicationConsumerLockAsync,
+  withBackendPublicationReadRoot,
 } from "../../src/storage/backend-publication.js";
 import {
   assertStorageBackendPublication,
@@ -80,6 +82,8 @@ type DescriptorLifetime = Readonly<{
 
 type DescriptorProbeOptions = Readonly<{
   readonly openErrorCode?: "EACCES" | "ENOTDIR" | "ELOOP";
+  readonly openFailure?: Readonly<{ path: string; error: NodeJS.ErrnoException }>;
+  readonly realpathFailure?: Readonly<{ path: string; error: NodeJS.ErrnoException }>;
   readonly validationFailure?: boolean;
 }>;
 
@@ -112,6 +116,10 @@ async function observeConsumerDescriptorLifetimes(
     nodeFs.openSync = ((path: unknown, ...args: unknown[]) => {
       const pathString = typeof path === "string" ? path : undefined;
       if (pathString !== undefined && !targetPaths.has(pathString)) unrelatedDelegated = true;
+      if (options.openFailure !== undefined && pathString === options.openFailure.path && !injected) {
+        injected = true;
+        throw options.openFailure.error;
+      }
       if (pathString === publication && options.openErrorCode !== undefined && !injected) {
         injected = true;
         const failure = new Error(`injected ${options.openErrorCode}`) as NodeJS.ErrnoException;
@@ -140,6 +148,15 @@ async function observeConsumerDescriptorLifetimes(
         if (path === publication && !injected) {
           injected = true;
           throw new Error("injected publication validation failure");
+        }
+        return originalRealpath(path, ...args);
+      }) as never;
+    }
+    if (options.realpathFailure !== undefined) {
+      nodeFs.realpathSync = ((path: unknown, ...args: unknown[]) => {
+        if (path === options.realpathFailure?.path && !injected) {
+          injected = true;
+          throw options.realpathFailure.error;
         }
         return originalRealpath(path, ...args);
       }) as never;
@@ -256,6 +273,137 @@ describe("backend publication consumer admission", () => {
     expect(callbackRan).toBe(false);
     expect(observed.error).toBeInstanceOf(BackendPublicationJournalError);
     expect(observed.error).toMatchObject({ reason: "unsafe-storage" });
+  });
+
+  it("classifies root ENOENT after descriptor acquisition as unsafe storage", async () => {
+    const home = makeHome();
+    const root = join(home, ".lcm");
+    const rootValidationError = new Error("injected root validation ENOENT") as NodeJS.ErrnoException;
+    rootValidationError.code = "ENOENT";
+    const observed = await observeConsumerDescriptorLifetimes(home, () => {
+      const handle = openBackendPublicationReadRoot(home);
+      handle?.close();
+    }, {
+      realpathFailure: { path: root, error: rootValidationError },
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(observed.error).toMatchObject({
+      name: "BackendPublicationJournalError",
+      reason: "unsafe-storage",
+    });
+    expect(observed.error).not.toMatchObject({ reason: "publication-evidence-missing" });
+    expect(observed.lifetimes.filter(({ path }) => path === root)).toEqual([
+      expect.objectContaining({ closed: true }),
+    ]);
+    expect(observed.lifetimes.filter(({ path }) => path === backendPublicationDirectory(home))).toEqual([]);
+  });
+
+  it.each([
+    ["synchronous", (home: string, onRun: () => void) => withBackendPublicationConsumerLock(home, () => {
+      onRun();
+      return "never";
+    })],
+    ["asynchronous", (home: string, onRun: () => void) => withBackendPublicationConsumerLockAsync(home, () => {
+      onRun();
+      return "never";
+    })],
+  ] satisfies readonly [string, ConsumerAction][]) (
+    "fails closed when root authentication raises ENOENT (%s)",
+    async (_label, action) => {
+      const home = makeHome();
+      const root = join(home, ".lcm");
+      const rootValidationError = new Error("injected root validation ENOENT") as NodeJS.ErrnoException;
+      rootValidationError.code = "ENOENT";
+      let callbackRan = false;
+      const observed = await observeConsumerDescriptorLifetimes(home, () => action(home, () => {
+        callbackRan = true;
+      }), {
+        realpathFailure: { path: root, error: rootValidationError },
+      });
+
+      expect(observed.injected).toBe(true);
+      expect(observed.error).toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+      });
+      expect(callbackRan).toBe(false);
+      expect(observed.lifetimes.filter(({ path }) => path === root)).toEqual([
+        expect.objectContaining({ closed: true }),
+      ]);
+      expect(observed.lifetimes.filter(({ path }) => path === backendPublicationDirectory(home))).toEqual([]);
+    },
+  );
+
+  it("fails closed through lock-free read admission after root authentication ENOENT", async () => {
+    const home = makeHome();
+    const root = join(home, ".lcm");
+    const rootValidationError = new Error("injected root validation ENOENT") as NodeJS.ErrnoException;
+    rootValidationError.code = "ENOENT";
+    let callbackEntered = false;
+    let workAfterAssertionRan = false;
+    const observed = await observeConsumerDescriptorLifetimes(home, () => withBackendPublicationReadRoot(
+      home,
+      assertReadRoot => {
+        callbackEntered = true;
+        assertReadRoot();
+        workAfterAssertionRan = true;
+      },
+    ), {
+      realpathFailure: { path: root, error: rootValidationError },
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(callbackEntered).toBe(true);
+    expect(workAfterAssertionRan).toBe(false);
+    expect(observed.error).toMatchObject({
+      name: "BackendPublicationJournalError",
+      reason: "unsafe-storage",
+    });
+    expect((observed.error as Error).message).not.toContain("changed during validation");
+    expect(observed.lifetimes.filter(({ path }) => path === root)).toEqual([
+      expect.objectContaining({ closed: true }),
+    ]);
+  });
+
+  it("preserves optional root compatibility and refreshes after initial absence", async () => {
+    const absentHome = mkdtempSync(join(tmpdir(), "lcm-backend-consumer-absent-"));
+    homes.push(absentHome);
+    expect(openBackendPublicationReadRoot(absentHome)).toBeUndefined();
+
+    const legacyHome = makeHome();
+    chmodSync(join(legacyHome, ".lcm"), 0o755);
+    expect(openBackendPublicationReadRoot(legacyHome)).toBeUndefined();
+
+    const legacyEvidenceHome = makeHome(true);
+    chmodSync(join(legacyEvidenceHome, ".lcm"), 0o755);
+    expectReason(() => openBackendPublicationReadRoot(legacyEvidenceHome), "unsafe-storage");
+
+    const healthyHome = makeHome();
+    const healthyRoot = openBackendPublicationReadRoot(healthyHome);
+    expect(healthyRoot).toBeDefined();
+    healthyRoot?.close();
+
+    const refreshHome = makeHome();
+    const refreshRoot = join(refreshHome, ".lcm");
+    const initialAbsence = new Error("injected initial root absence") as NodeJS.ErrnoException;
+    initialAbsence.code = "ENOENT";
+    let assertions = 0;
+    const observed = await observeConsumerDescriptorLifetimes(refreshHome, () => withBackendPublicationReadRoot(
+      refreshHome,
+      assertReadRoot => {
+        assertReadRoot();
+        assertions += 1;
+        assertReadRoot();
+      },
+    ), {
+      openFailure: { path: refreshRoot, error: initialAbsence },
+    });
+    expect(observed.injected).toBe(true);
+    expect(observed.error).toBeUndefined();
+    expect(assertions).toBe(1);
+    expect(observed.lifetimes.filter(({ path }) => path === refreshRoot)).toHaveLength(1);
+    expect(observed.lifetimes.filter(({ path }) => path === refreshRoot).every(({ closed }) => closed)).toBe(true);
   });
 
   it.each([
