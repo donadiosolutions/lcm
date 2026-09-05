@@ -1,5 +1,6 @@
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import * as fs from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -188,7 +189,8 @@ describe("home parent authentication", () => {
   });
 
   it("does not treat namespace UID zero mapped to the current user as host-root mapping", () => {
-    const home = fs.mkdtempSync("/tmp/lcm-home-parent-current-root-");
+    const home = fs.mkdtempSync(join(tmpdir(), "lcm-home-parent-current-root-"));
+    expect(dirname(home)).toBe(tmpdir());
     const root = join(home, ".lcm");
     fs.mkdirSync(root, { mode: 0o700 });
     const live = observationFromPaths({
@@ -264,7 +266,8 @@ describe("home parent authentication", () => {
     expect(() => classifyHomeParent(observation(65534), { rootPresent: true, witnessRoot: "/home/user" }))
       .toThrow("without current UID");
 
-    const home = fs.mkdtempSync("/tmp/lcm-home-parent-auth-");
+    const home = fs.mkdtempSync(join(tmpdir(), "lcm-home-parent-auth-"));
+    expect(dirname(home)).toBe(tmpdir());
     const root = join(home, ".lcm");
     fs.mkdirSync(root, { mode: 0o700 });
     const live = observationFromPaths({ ...observation(65534), homePath: home, parentPath: dirname(home) });
@@ -279,7 +282,8 @@ describe("home parent authentication", () => {
       "/proc/sys/kernel/overflowuid": "65534\n",
       "/proc/self/uid_map": "1000 1000 1\n",
     });
-    const home = fs.mkdtempSync("/tmp/lcm-home-parent-root-");
+    const home = fs.mkdtempSync(join(tmpdir(), "lcm-home-parent-root-"));
+    expect(dirname(home)).toBe(tmpdir());
     const root = join(home, ".lcm");
     fs.mkdirSync(root, { mode: 0o755 });
     expect(() => classifyHomeParent(observation(65534), { rootPresent: true, witnessRoot: home }))
@@ -306,7 +310,8 @@ describe("home parent authentication", () => {
       "/proc/sys/kernel/overflowuid": "65534\n",
       "/proc/self/uid_map": "1000 1000 1\n",
     });
-    const home = fs.mkdtempSync("/tmp/lcm-home-parent-witness-");
+    const home = fs.mkdtempSync(join(tmpdir(), "lcm-home-parent-witness-"));
+    expect(dirname(home)).toBe(tmpdir());
     const root = join(home, ".lcm");
     fs.mkdirSync(root, { mode: 0o700 });
     const homeStat = fs.statSync(home, { bigint: true });
@@ -350,7 +355,8 @@ describe("user-manager host-view fallback for an absent witness", () => {
   };
 
   function liveHome(): { home: string; live: ReturnType<typeof observationFromPaths>; parentGid: string } {
-    const home = fs.mkdtempSync("/tmp/lcm-home-parent-hostview-");
+    const home = fs.mkdtempSync(join(tmpdir(), "lcm-home-parent-hostview-"));
+    expect(dirname(home)).toBe(tmpdir());
     fs.mkdirSync(join(home, ".lcm"), { mode: 0o700 });
     const homeStat = fs.statSync(home, { bigint: true });
     const parentStat = fs.statSync(dirname(home), { bigint: true });
@@ -586,7 +592,8 @@ describe("user-manager host-view fallback for an absent witness", () => {
   });
 
   it("runs the real fixed helper source against a live directory", () => {
-    const home = fs.mkdtempSync("/tmp/lcm-home-parent-helper-src-");
+    const home = fs.mkdtempSync(join(tmpdir(), "lcm-home-parent-helper-src-"));
+    expect(dirname(home)).toBe(tmpdir());
     try {
       // Observe a quiescent directory this test owns so concurrent workers
       // creating siblings under the shared temporary root cannot move ctime.

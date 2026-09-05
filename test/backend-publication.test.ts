@@ -2743,6 +2743,7 @@ describe("revocable mutation permits", () => {
     expect(() => withBackendPublicationConsumerLock(nonCanonicalHome, () => undefined))
       .toThrow("path is not canonical");
 
+    // POSIX-only fixture: this must exercise the real root-owned sticky /tmp parent.
     const stickyParentHome = mkdtempSync("/tmp/lcm-consumer-sticky-parent-");
     roots.push(stickyParentHome);
     withBackendPublicationConsumerLock(stickyParentHome, () => undefined);

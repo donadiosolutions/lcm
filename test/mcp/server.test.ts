@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { __lcmMcpTestHooks, getMcpToolDefinitions, handleDaemonRequest } from "../../src/mcp/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import * as storageBackend from "../../src/storage/backend.js";
@@ -150,7 +151,8 @@ describe("handleDaemonRequest", () => {
   });
 
   it("refuses a request whose publication scope is not canonical", async () => {
-    const home = mkdtempSync(join("/tmp", "lcm-mcp-publication-"));
+    const home = mkdtempSync(join(tmpdir(), "lcm-mcp-publication-"));
+    expect(dirname(home)).toBe(tmpdir());
     const publicationDir = join(home, ".lcm", "backend-publication");
     mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
     writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
