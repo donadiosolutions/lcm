@@ -8,6 +8,7 @@ import {
   mkdirSync,
   openSync,
   realpathSync,
+  rmdirSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
@@ -296,7 +297,7 @@ export interface SupervisorDependencies {
   /** @internal Deterministic daemon-temp race seam for coverage tests. */
   readonly _daemonTempRaceForTesting?: (
     path: string,
-    phase: "before-open" | "before-manager",
+    phase: "before-open" | "before-rollback" | "before-manager",
   ) => void;
 }
 
@@ -727,6 +728,24 @@ class SupervisorCommandError extends Error {
     this.reason = reason;
   }
 }
+
+class SupervisorDaemonTempCreationError extends Error {
+  constructor() {
+    super(
+      "newly created daemon temp directory lacked required owner permissions, was removed, and retry should use an owner-preserving umask such as 0077",
+    );
+    this.name = "SupervisorDaemonTempCreationError";
+  }
+}
+
+type DaemonTempCreationStat = Readonly<{
+  dev: bigint;
+  ino: bigint;
+  uid: bigint;
+  mode: bigint;
+  isDirectory: () => boolean;
+  isSymbolicLink: () => boolean;
+}>;
 
 function commandFailedError(reason?: SupervisorCommandFailureClass): Error {
   return new SupervisorCommandError(reason);
@@ -2075,11 +2094,76 @@ function prepareManagedDaemonTempDirectory(
   raceFault?: SupervisorDependencies["_daemonTempRaceForTesting"],
 ): PrivateDirectoryHandle {
   const path = managedDaemonTempPath(spec.stateRoot);
+  let created = false;
   try {
     mkdirSync(path, { mode: 0o700 });
+    created = true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
       throw new Error("supervisor daemon temporary directory is unavailable");
+    }
+  }
+  if (created) {
+    let initial: DaemonTempCreationStat;
+    try {
+      initial = lstatSync(path, { bigint: true }) as unknown as DaemonTempCreationStat;
+    } catch {
+      throw new Error("supervisor daemon temporary directory validation could not be confirmed");
+    }
+    const initialMode = initial.mode & 0o7777n;
+    const ownerUid = expectedUid === undefined ? undefined : BigInt(expectedUid);
+    const clipped = initial.isDirectory()
+      && !initial.isSymbolicLink()
+      && ownerUid !== undefined
+      && initial.uid === ownerUid
+      && (initialMode & ~0o700n) === 0n
+      && initialMode !== 0o700n;
+    if (clipped) {
+      const canonicalRoot = resolve(spec.stateRoot);
+      const canonicalLeaf = managedDaemonTempPath(canonicalRoot);
+      let parent: DaemonTempCreationStat;
+      try {
+        parent = lstatSync(canonicalRoot, { bigint: true }) as unknown as DaemonTempCreationStat;
+        if (
+          !parent.isDirectory()
+          || parent.isSymbolicLink()
+          || realpathSync(canonicalRoot) !== canonicalRoot
+          || realpathSync(path) !== canonicalLeaf
+        ) throw new Error("canonical path validation failed");
+      } catch {
+        throw new Error("supervisor daemon temporary directory validation could not be confirmed");
+      }
+      raceFault?.(path, "before-rollback");
+      let current: DaemonTempCreationStat;
+      let currentParent: DaemonTempCreationStat;
+      let cleanupConfirmed = false;
+      try {
+        current = lstatSync(path, { bigint: true }) as unknown as DaemonTempCreationStat;
+        currentParent = lstatSync(canonicalRoot, { bigint: true }) as unknown as DaemonTempCreationStat;
+        const sameLeaf = current.dev === initial.dev
+          && current.ino === initial.ino
+          && current.uid === initial.uid
+          && current.isDirectory()
+          && !current.isSymbolicLink()
+          && (current.mode & 0o7777n) === initialMode;
+        const sameParent = currentParent.dev === parent.dev
+          && currentParent.ino === parent.ino
+          && currentParent.uid === parent.uid
+          && currentParent.isDirectory()
+          && !currentParent.isSymbolicLink()
+          && realpathSync(canonicalRoot) === canonicalRoot
+          && realpathSync(path) === canonicalLeaf;
+        if (sameLeaf && sameParent) {
+          rmdirSync(path);
+          cleanupConfirmed = true;
+        }
+      } catch {
+        cleanupConfirmed = false;
+      }
+      if (!cleanupConfirmed) {
+        throw new Error("supervisor daemon temporary directory cleanup could not be confirmed");
+      }
+      throw new SupervisorDaemonTempCreationError();
     }
   }
   raceFault?.(path, "before-open");
@@ -2971,7 +3055,9 @@ export function createSupervisor(
         await settleLaunchdLabelReuse(operationDeadline);
         return startInternal(spec, true, operationDeadline);
       }
-      throw error instanceof SupervisorCommandError ? error : commandFailedError();
+      throw (error instanceof SupervisorCommandError || error instanceof SupervisorDaemonTempCreationError)
+        ? error
+        : commandFailedError();
     } finally {
       try {
         daemonTempHandle?.close();

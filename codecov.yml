@@ -202,6 +202,7 @@ component_management:
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"
         - "^src/daemon/managed-path\\.ts$"
+        # #786/#952 creation-only daemon-tmp rollback remains service-manager owned.
         - "^src/daemon/supervisor\\.ts$"
     - component_id: "integration-postgresql-runtime"
       name: "Integration - PostgreSQL Runtime"
