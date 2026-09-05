@@ -1645,42 +1645,40 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     const processBirth = evidence.processBirth;
     const readOwner = evidence.readOwner;
     const abortError = (): Error => new Error("lifecycle aborted during publication convergence");
-    const raceAbort = async <T>(operation: Promise<T>, signal: AbortSignal): Promise<T> => {
+    const raceAbort = async <T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> => {
       if (signal.aborted) throw abortError();
-      let onAbort: (() => void) | undefined;
+      let rejectAbort!: (reason?: unknown) => void;
+      const abortPromise = new Promise<never>((_, reject) => { rejectAbort = reject; });
+      const onAbort = (): void => rejectAbort(abortError());
+      signal.addEventListener("abort", onAbort, { once: true });
       try {
         return await Promise.race([
-          operation,
-          new Promise<never>((_, reject) => {
-            onAbort = (): void => reject(abortError());
-            signal.addEventListener("abort", onAbort, { once: true });
-          }),
+          operation(),
+          abortPromise,
         ]);
       } finally {
-        if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+        signal.removeEventListener("abort", onAbort);
       }
     };
     const sleep = async (delayMs: number): Promise<void> => {
       if (opts._abortSignal === undefined) return await baseSleep(delayMs);
-      await raceAbort(baseSleep(delayMs), opts._abortSignal);
+      await raceAbort(() => baseSleep(delayMs), opts._abortSignal);
     };
     const readToken = (): string | null => {
       const current = evidence.readToken();
       return current === evidence.token ? current : null;
     };
     const fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-      const signals = [init?.signal, opts._abortSignal]
-        .filter((signal): signal is AbortSignal => signal !== undefined);
-      const signal = signals.length === 0
-        ? new AbortController().signal
-        : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+      const signal = opts._abortSignal === undefined
+        ? init!.signal!
+        : AbortSignal.any([init!.signal!, opts._abortSignal]);
       const request = { ...init, signal };
-      const response = await raceAbort(dependencies.fetch(input, request), signal);
+      const response = await raceAbort(() => dependencies.fetch(input, request), signal);
       const body = response.json.bind(response);
       return new Proxy(response, {
         get(target, property, receiver) {
-          if (property !== "json") return Reflect.get(target, property, receiver);
-          return async (): Promise<unknown> => await raceAbort(Promise.resolve().then(body), signal);
+          if (property !== "json") return Reflect.get(target, property, target);
+          return async (): Promise<unknown> => await raceAbort(() => Promise.resolve().then(body), signal);
         },
       });
     };
