@@ -212,6 +212,29 @@ describe("persistence read route boundaries", () => {
     });
   });
 
+  it("sanitizes nested file URLs in describe read errors", async () => {
+    mocks.describe.mockRejectedValueOnce(
+      new Error("read failed for https://outer.test/x?next=file://host.invalid/Users/canary/private.db"),
+    );
+    await invoke(createDescribeHandler(config), { nodeId: "n", cwd: "/ok" });
+    expectLast(200, {
+      node: null,
+      error: "read failed for https://outer.test/x?next=file://host.invalid<path>",
+    });
+  });
+
+  it("sanitizes nested file URLs in expand read errors", async () => {
+    mocks.expand.mockRejectedValueOnce(
+      new Error("expand failed for https://outer.test/x?next=file://host.invalid/Users/canary/private.db"),
+    );
+    await invoke(createExpandHandler(config), { nodeId: "n", cwd: "/ok" });
+    expect(mocks.expand).toHaveBeenCalled();
+    expectLast(200, {
+      expanded: null,
+      error: "expand failed for https://outer.test/x?next=file://host.invalid<path>",
+    });
+  });
+
   it("uses the injected backend without consulting a local SQLite path", async () => {
     mocks.exists.mockReturnValue(false);
     mocks.projectExists.mockResolvedValue(true);
