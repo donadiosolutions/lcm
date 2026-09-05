@@ -43,6 +43,7 @@ import {
   ensurePrivateDirectory,
   openPrivateDirectory,
   openPrivateDirectoryForCreation,
+  openPrivateDirectoryIfExists,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
@@ -688,6 +689,19 @@ describe("private filesystem primitives", () => {
     expect(() => syncPrivateDirectory(path, { expectedUid })).not.toThrow();
   });
 
+  it.each([undefined, { code: 123 }])("preserves optional directory-open failures without a string code: %j", (failure) => {
+    const root = makeRoot();
+    let caught: unknown = Symbol("did not throw");
+    withPatchedFs("openSync", () => { throw failure; }, () => {
+      try {
+        openPrivateDirectoryIfExists(root);
+      } catch (error) {
+        caught = error;
+      }
+    });
+    expect(caught).toBe(failure);
+  });
+
   it("rejects a non-directory descriptor, an unexpected owner, and a changed witness", () => {
     const root = makeRoot();
     const file = join(root, "file");
@@ -1055,6 +1069,28 @@ describe("private filesystem primitives", () => {
       },
     })).toThrow(failure);
     expect(readFileSync(target, "utf-8")).toBe("original");
+    expect(existsSync(tempPath)).toBe(false);
+  });
+
+  it("preserves an unborrowed rename failure and removes only its owned temporary file", () => {
+    const root = makeRoot();
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"ab".repeat(12)}.tmp`);
+    const failure = new Error("rename failed");
+    writeFileSync(target, "original", { mode: 0o600 });
+    let caught: unknown;
+
+    try {
+      atomicWritePrivateFile(target, "replacement", {
+        random: () => Buffer.alloc(12, 0xab),
+        rename: () => { throw failure; },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBe(failure);
+    expect(readFileSync(target, "utf8")).toBe("original");
     expect(existsSync(tempPath)).toBe(false);
   });
 
