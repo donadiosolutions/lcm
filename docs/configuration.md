@@ -1050,7 +1050,23 @@ replacement. If that proof is unavailable, the command remains in draining
 state, reports the unproved condition, and fails closed rather than signaling an
 unknown process or claiming that cancellation completed.
 
-Codex-process compaction uses a private, one-use loopback Responses gateway for
+Codex-process compaction first asks a one-shot Codex `app-server` process for
+the effective `openai_base_url` in the current LCM process context. The resolver
+uses only the `config/read` result, keeps its JSONL stdin open until that
+response arrives, and accepts an absent or explicit `null` value as the normal
+token-class default. A configured absolute `http://` or `https://` URL is
+validated in memory, has trailing slashes normalized, and receives exactly one
+`/responses` suffix. Credentials, query or fragment delimiters, whitespace,
+controls, malformed protocol data, oversized output, unsupported values, and
+timeouts fail closed before any upstream request. Cleartext HTTP is accepted
+for configured private proxy parity; use HTTPS when the endpoint supports it.
+
+The validated endpoint is authoritative for both managed bearer classes. When
+it is absent or `null`, the existing `sk-` API and ChatGPT bearer defaults are
+preserved. The resolver never logs or persists the surrounding Codex
+configuration, endpoint contents, or authentication data.
+
+Codex-process compaction then uses a private, one-use loopback Responses gateway for
 each summarize call. The gateway binds only to `127.0.0.1` on an ephemeral port
 and exposes a high-entropy capability path that accepts one exact
 `POST /<capability>/responses` request. Codex runs from an empty per-call temporary
@@ -1067,12 +1083,13 @@ Only the validated model, reasoning controls, and supported service tier are
 retained from Codex's request. `instructions`, `previous_response_id`,
 `client_metadata`, `prompt_cache_key`, `include`, and `stream_options` are not
 forwarded. The gateway requires one managed `Authorization: Bearer ...`
-header. A bearer token beginning with `sk-` selects only
-`https://api.openai.com/v1/responses`; any other valid managed bearer selects
-only `https://chatgpt.com/backend-api/codex/responses`, whether or not a
-`ChatGPT-Account-Id` is present. A valid account ID is forwarded when supplied,
-but its absence does not select the public API route. Redirects and ambiguous
-request or shutdown outcomes fail closed.
+header. A bearer token beginning with `sk-` selects the configured endpoint
+when one was resolved; otherwise it selects only
+`https://api.openai.com/v1/responses`. Any other valid managed bearer follows
+the same configured endpoint, or falls back to only
+`https://chatgpt.com/backend-api/codex/responses`. A valid account ID is
+forwarded when supplied, but its absence does not select the public API route.
+Redirects and ambiguous request or shutdown outcomes fail closed.
 
 Gateway success follows the Responses protocol rather than an exact Codex CLI
 version or HTTP transport EOF. LCM accepts only a complete, well-formed
