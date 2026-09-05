@@ -6,7 +6,15 @@ always set to `<canonical state root>/daemon-tmp`.
 
 Before a daemon is registered with systemd or launchd, LCM creates that leaf
 only when it is absent. Creation is non-recursive and uses mode `0700`. An
-existing leaf is accepted only when it is a directory owned by the current
+owner-clearing process umask can clip those requested owner bits. When that
+happens during a creation performed by LCM, the newly created empty leaf is
+removed after an identity and canonical-path recheck, and startup reports that
+an owner-preserving umask such as `0077` is required. LCM does not change the
+process umask or repair an existing path. If validation or the bounded removal
+cannot be confirmed, the leaf is retained as evidence and may need operator
+attention.
+
+An existing leaf is accepted only when it is a directory owned by the current
 user, has exactly the private mode (including special bits), is not a symbolic
 link, resolves to the exact expected pathname, and remains contained beneath
 the canonical state root. Any unsafe, partial, or raced condition fails closed;
