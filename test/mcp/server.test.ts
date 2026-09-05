@@ -86,6 +86,9 @@ describe("MCP tool definitions", () => {
     expect(grep.inputSchema.properties.mode.default).toBe("full_text");
     expect(grep.inputSchema.properties.mode.description).toContain("full-text");
     expect(grep.inputSchema.properties.mode.description).toContain("regex");
+    expect(grep.inputSchema.properties.since.description).toContain("inclusive");
+    expect(grep.inputSchema.properties.since.description).toContain("1-3 fractional digits");
+    expect(grep.inputSchema.properties.since.description).toContain("+/-HH:mm");
     expect(grep.inputSchema.properties.query.description).toBe(
       "Keyword, phrase, or pattern to search; interpretation follows mode (full_text by default, regex when selected)",
     );

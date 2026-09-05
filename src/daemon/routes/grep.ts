@@ -9,6 +9,63 @@ import {
   withProjectStorage,
 } from "./storage-lifecycle.js";
 
+const GREP_SINCE_PATTERN = /^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,3}))?(Z|[+-][0-9]{2}:[0-9]{2})$/u;
+
+function isLeapYear(year: number): boolean {
+  return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+}
+
+function normalizeGrepSince(value: unknown): Date | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const match = GREP_SINCE_PATTERN.exec(value);
+  if (!match) {
+    return null;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const offset = match[8];
+  const offsetHour = offset === "Z" ? 0 : Number(offset.slice(1, 3));
+  const offsetMinute = offset === "Z" ? 0 : Number(offset.slice(4, 6));
+  const daysInMonth = [
+    31,
+    isLeapYear(year) ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ][month - 1];
+
+  if (
+    daysInMonth === undefined
+    || day < 1
+    || day > daysInMonth
+    || hour > 23
+    || minute > 59
+    || second > 59
+    || offsetHour > 23
+    || offsetMinute > 59
+  ) {
+    return null;
+  }
+
+  const parsed = new Date(value);
+  return parsed;
+}
+
 export function createGrepHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
@@ -37,6 +94,13 @@ export function createGrepHandler(config: DaemonConfig, storageFactory?: Storage
       return;
     }
 
+    const normalizedSince = since === undefined ? undefined : normalizeGrepSince(since);
+    if (since !== undefined && normalizedSince === null) {
+      sendJson(res, 400, { error: "invalid since" });
+      return;
+    }
+    const effectiveSince = normalizedSince ?? undefined;
+
     if (!input.cwd) {
       sendJson(res, 200, { matches: [] });
       return;
@@ -63,7 +127,7 @@ export function createGrepHandler(config: DaemonConfig, storageFactory?: Storage
               query,
               mode: normalizedMode,
               scope: normalizedScope,
-              since,
+              since: effectiveSince,
               conversationId: conversation.conversationId,
             });
           }
@@ -71,7 +135,7 @@ export function createGrepHandler(config: DaemonConfig, storageFactory?: Storage
             query,
             mode: normalizedMode,
             scope: normalizedScope,
-            since,
+            since: effectiveSince,
           });
         },
       );

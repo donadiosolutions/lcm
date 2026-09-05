@@ -161,6 +161,9 @@ describe("transport-pure guidance", () => {
     expect(operations).toContain("`mode` optionally selects `full_text` or `regex`");
     expect(operations).toContain("defaults to `full_text`");
     expect(operations).toContain("regex pattern");
+    expect(operations).toContain("inclusive ISO datetime lower bound");
+    expect(operations).toContain("1-3 fractional digits");
+    expect(operations).toContain("invalid since");
   });
 
   it("uses the exact memory header and emits feedback only for actual IDs", () => {
