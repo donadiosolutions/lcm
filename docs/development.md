@@ -77,6 +77,13 @@ integration files run only through `pnpm run test:postgresql`; see
 [PostgreSQL development](../src/storage/postgresql/reference/postgresql-development.md)
 for the isolated container prerequisites and lifecycle.
 
+## Coordinated Bug campaigns
+
+Use the repository's [triage-fix-all-bugs skill](triage-fix-all-bugs.md) to
+coordinate triage, independent reviews, and merges for all currently open native
+GitHub Bug issues. The guide explains invocation, prerequisites, progress reports,
+and how follow-up Bugs remain outside the campaign's frozen scope.
+
 ## Codex Responses gateway fixtures
 
 Gateway tests may provide the internal `_upstreamUrl` option to target a
