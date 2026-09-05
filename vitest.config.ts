@@ -161,6 +161,7 @@ export function createVitestConfiguration(root: string): UserConfig {
       setupFiles: runtimeHomeSetup,
       include: ["**/*.test.ts"],
       exclude: ["node_modules/**", ".claude/**"],
+      pool: "forks",
       coverage: {
         include: ["bin/**/*.ts", "installer/**/*.ts", "src/**/*.ts"],
         reportsDirectory: join(root, "coverage"),
@@ -179,6 +180,7 @@ export function createVitestConfiguration(root: string): UserConfig {
         {
           test: {
             name: "unit-parallel",
+            pool: "forks",
             globalSetup: runtimeHomeGlobalSetup,
             setupFiles: runtimeHomeSetup,
             include: ["test/**/*.test.ts"],
@@ -197,6 +199,7 @@ export function createVitestConfiguration(root: string): UserConfig {
         {
           test: {
             name: "unit-package",
+            pool: "forks",
             globalSetup: runtimeHomeGlobalSetup,
             setupFiles: runtimeHomeSetup,
             include: packageConfigTests,
@@ -212,6 +215,7 @@ export function createVitestConfiguration(root: string): UserConfig {
         {
           test: {
             name: "unit-sqlite-routes",
+            pool: "forks",
             globalSetup: runtimeHomeGlobalSetup,
             setupFiles: runtimeHomeSetup,
             include: serialSqliteTests,
@@ -228,6 +232,7 @@ export function createVitestConfiguration(root: string): UserConfig {
         {
           test: {
             name: "e2e",
+            pool: "forks",
             globalSetup: runtimeHomeGlobalSetup,
             setupFiles: runtimeHomeSetup,
             include: e2eTests,

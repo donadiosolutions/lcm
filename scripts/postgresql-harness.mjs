@@ -17,7 +17,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { platform, tmpdir } from "node:os";
+import { platform } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -28,6 +28,11 @@ import {
   POSTGRES_TEMPLATE_MARKER,
   validatePostgreSqlTemplateArchive,
 } from "./ci-environment.mjs";
+import {
+  canonicalCandidateParents,
+  candidateTemporaryParents,
+  createTestTempDirectory,
+} from "./test-temp-root.mjs";
 
 export { NODE_IMAGE, POSTGRES_IMAGE };
 export const RUN_LABEL = "com.donadiosolutions.lcm.postgresql-test-run";
@@ -977,15 +982,38 @@ function shortRunPrefixFromName(name) {
   return name.match(/^lcm-pg-(?:net-|data-|restore-|runner-)?([0-9a-f]{20})$/u)?.[1];
 }
 
-function harnessDirectoryFromRecord(record) {
+export function harnessDirectoryFromRecord(record, dependencies = {}) {
   const mounts = (record?.Mounts ?? []).filter((mount) => mount?.Destination === "/run/lcm-harness");
   if (mounts.length !== 1) return undefined;
   const mount = mounts[0];
   if (mount.Type !== "bind" || mount.RW !== false || typeof mount.Source !== "string") return undefined;
   try {
-    const resolved = realpathSync(mount.Source);
-    const temporaryRoot = realpathSync(tmpdir());
-    if (dirname(resolved) !== temporaryRoot
+    const resolvePath = dependencies.realpath ?? realpathSync;
+    const resolved = resolvePath(mount.Source);
+    const environment = dependencies.environment ?? process.env;
+    const handoff = environment.LCM_TEST_HARNESS_TMPDIR;
+    const platformName = dependencies.platformName ?? platform();
+    const fallbackEnvironment = handoff === undefined || platformName !== "win32"
+      ? environment
+      : { ...environment, TEMP: undefined, TMP: undefined };
+    const fallbackParents = candidateTemporaryParents(
+      fallbackEnvironment,
+      platformName,
+      null,
+      handoff === undefined ? dependencies.temporaryRoot : () => (
+        platformName === "win32" ? environment.SystemRoot ?? environment.WINDIR ?? "C:\\Windows" : "/var/tmp"
+      ),
+    );
+    const candidateParents = dependencies.candidateParents
+      ?? (handoff === undefined ? fallbackParents : [handoff, ...fallbackParents]);
+    const allowedParents = canonicalCandidateParents({
+      environment,
+      platformName,
+      candidateParents,
+      realpath: resolvePath,
+      temporaryRoot: dependencies.temporaryRoot,
+    });
+    if (!allowedParents.includes(dirname(resolved))
       || !/^lcm-postgresql-harness-[A-Za-z0-9_-]+$/u.test(basename(resolved))) return undefined;
     return resolved;
   } catch {
@@ -1154,7 +1182,7 @@ export async function discoverHarnessRuns(dependencies = {}) {
       run.classification = "ambiguous";
     }
     const harnessDirectory = ownership.kind === "database"
-      ? (dependencies.resolveHarnessDirectory?.(record) ?? harnessDirectoryFromRecord(record))
+      ? (dependencies.resolveHarnessDirectory?.(record) ?? harnessDirectoryFromRecord(record, dependencies))
       : undefined;
     const resourceEntry = {
       ...resource,
@@ -1516,7 +1544,9 @@ async function runTests(context, ci, setupDocker = docker, testProcess = runProc
   delete env.LCM_TEST_POSTGRES_FORK_PROBE;
   delete env.LCM_TEST_POSTGRES_FORK_WORKER_PID_FILE;
   delete env.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT;
+  delete env.LCM_TEST_HARNESS_TMPDIR;
   if (!ci) env.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT = context.directory;
+  env.LCM_TEST_HARNESS_TMPDIR = context.parent;
   const secrets = context.secrets ?? [];
   for (const key of Object.keys(env)) {
     if (key.startsWith("PG") || key === "LCM_POSTGRES_URL" || key === "LCM_POSTGRES_CA_FILE") delete env[key];
@@ -1616,8 +1646,19 @@ export async function runHarness(options = {}) {
     throw error;
   }
   const names = createRunNames(runId);
-  const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-harness-"));
-  chmodSync(directory, 0o700);
+  const harnessEnvironment = { ...process.env };
+  const hasHarnessParent = harnessEnvironment.LCM_TEST_HARNESS_TMPDIR !== undefined;
+  if (!hasHarnessParent) delete harnessEnvironment.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT;
+  const allocation = createTestTempDirectory({
+    environment: harnessEnvironment,
+    explicitVariable: hasHarnessParent ? "LCM_TEST_HARNESS_TMPDIR" : undefined,
+    prefix: "lcm-postgresql-harness-",
+    createDirectory: mkdtempSync,
+    secureDirectory: chmodSync,
+    removeDirectory: (path) => rmSync(path, { recursive: true, force: true }),
+  });
+  const directory = allocation.root;
+  const parent = allocation.parent;
   const passwords = {
     admin: randomBytes(32).toString("base64url"),
     migrator: randomBytes(32).toString("base64url"),
@@ -1760,12 +1801,13 @@ export async function runHarness(options = {}) {
       LCM_TEST_POSTGRES_WRONG_HOST: ci ? names.wrongAlias : "localhost",
     };
     try {
-      if (options.runTests) await options.runTests({ runId, names, directory, environment }, ci);
+      if (options.runTests) await options.runTests({ runId, names, directory, parent, environment }, ci);
       else await runTests(
         {
           runId,
           names,
           directory,
+          parent,
           environment,
           secrets,
           owner,
