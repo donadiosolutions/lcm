@@ -4813,7 +4813,7 @@ describe("worktree reconciliation", () => {
       "eventsDb component appeared after the reconciliation snapshot",
     );
     expect(existsSync(recreatedEvents)).toBe(true);
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("never archives patterns that changed after they were merged", () => {
     const { main, linked } = makeRepository(home);
@@ -5126,6 +5126,7 @@ describe("worktree reconciliation", () => {
         expect(listProjectMapEntries()).toHaveProperty(sourceHash);
       }
     },
+    FULL_SUITE_PROCESS_TEST_TIMEOUT_MS,
   );
 
   it("journals the map backup before publishing the folded project map", () => {
@@ -5160,7 +5161,7 @@ describe("worktree reconciliation", () => {
       [targetHash]: { canonical, aliases: [linked] },
     });
     expect(reconcileWorktrees(main).status).toBe("completed");
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("waits for a competing first-use reconciliation and then re-reads state", () => {
     const { main, linked } = makeRepository(home);
