@@ -153,9 +153,9 @@ describe("periodic transcript scan boundaries", () => {
 
     daemon = await createDaemon(config());
     const projects = join(home, ".lcm", "projects");
-    mkdirSync(projects, { recursive: true });
+    mkdirSync(projects, { recursive: true, mode: 0o700 });
     const project = join(projects, "periodic-error");
-    mkdirSync(project);
+    mkdirSync(project, { mode: 0o700 });
     writeFileSync(join(project, "meta.json"), JSON.stringify({ cwd: home }));
     const sessionsDir = join(home, ".claude", "projects", claudeProjectDirName(home));
     mkdirSync(sessionsDir, { recursive: true });
@@ -195,16 +195,16 @@ describe("periodic transcript scan boundaries", () => {
     expect(scan).toBeDefined();
     await scan!(); // projects directory absent
 
-    const projects = join(home, ".lcm", "projects"); mkdirSync(projects, { recursive: true });
+    const projects = join(home, ".lcm", "projects"); mkdirSync(projects, { recursive: true, mode: 0o700 });
     writeFileSync(join(projects, "not-a-dir"), "x");
-    mkdirSync(join(projects, "no-meta"));
-    mkdirSync(join(projects, "bad-meta")); writeFileSync(join(projects, "bad-meta", "meta.json"), "{");
-    mkdirSync(join(projects, "no-cwd")); writeFileSync(join(projects, "no-cwd", "meta.json"), "{}");
-    mkdirSync(join(projects, "no-sessions")); writeFileSync(join(projects, "no-sessions", "meta.json"), JSON.stringify({ cwd: "/tmp" }));
+    mkdirSync(join(projects, "no-meta"), { mode: 0o700 });
+    mkdirSync(join(projects, "bad-meta"), { mode: 0o700 }); writeFileSync(join(projects, "bad-meta", "meta.json"), "{");
+    mkdirSync(join(projects, "no-cwd"), { mode: 0o700 }); writeFileSync(join(projects, "no-cwd", "meta.json"), "{}");
+    mkdirSync(join(projects, "no-sessions"), { mode: 0o700 }); writeFileSync(join(projects, "no-sessions", "meta.json"), JSON.stringify({ cwd: "/tmp" }));
     await expect(scan!()).resolves.toBeUndefined();
 
     const blockedProject = join(projects, "blocked");
-    mkdirSync(blockedProject);
+    mkdirSync(blockedProject, { mode: 0o700 });
     writeFileSync(join(blockedProject, "meta.json"), JSON.stringify({ cwd: home }));
     const sessionsDir = join(home, ".claude", "projects", claudeProjectDirName(home));
     mkdirSync(sessionsDir, { recursive: true });

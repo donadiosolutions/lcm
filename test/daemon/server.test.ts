@@ -597,6 +597,10 @@ describe("daemon server", () => {
       },
     );
     config.restoration.promptSearchMaxResults = 0;
+    mkdirSync(join(tempHome!, ".lcm"), { recursive: true, mode: 0o700 });
+    chmodSync(join(tempHome!, ".lcm"), 0o700);
+    mkdirSync(join(tempHome!, ".lcm", "projects"), { recursive: true, mode: 0o700 });
+    chmodSync(join(tempHome!, ".lcm", "projects"), 0o700);
     daemon = await createDaemon(config, {
       _scanForTranscripts: scanForTranscripts,
       _assertBackendPublication: () => undefined,
@@ -666,6 +670,8 @@ describe("daemon server", () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(request.body),
       });
+      if (request.path === "/promote") {
+      }
       expect(response.status).toBe(409);
       const identityRequired = await response.json() as Record<string, unknown>;
       expect(identityRequired).toEqual({
@@ -753,6 +759,10 @@ describe("daemon server", () => {
         body: { cwd: tempHome },
       },
     ];
+    chmodSync(join(tempHome!, ".lcm", "projects"), 0o700);
+    const stagedProjectDir = projectDir(tempHome!);
+    mkdirSync(stagedProjectDir, { recursive: true, mode: 0o700 });
+    chmodSync(stagedProjectDir, 0o700);
     for (const request of stagedProjectRequests) {
       const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {
         method: "POST",
@@ -822,7 +832,8 @@ describe("daemon server", () => {
   it("watches map.json and reformats valid user edits", async () => {
     const project = mkdtempSync(join(tmpdir(), "lcm-map-watch-project-"));
     const hash = hashProjectPath(normalizeProjectPath(project));
-    mkdirSync(join(homedir(), ".lcm"), { recursive: true });
+    mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
+    chmodSync(join(homedir(), ".lcm"), 0o700);
     const mapPath = projectMapPath();
     writeFileSync(mapPath, JSON.stringify({ [hash]: { canonical: project, aliases: [] } }), { mode: 0o600 });
 
@@ -856,7 +867,8 @@ describe("daemon server", () => {
     const canonical = mkdtempSync(join(tmpdir(), "lcm-scan-canonical-"));
     const alias = mkdtempSync(join(tmpdir(), "lcm-scan-alias-"));
     const hash = hashProjectPath(normalizeProjectPath(canonical));
-    mkdirSync(join(homedir(), ".lcm"), { recursive: true });
+    mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
+    chmodSync(join(homedir(), ".lcm"), 0o700);
     writeFileSync(projectMapPath(), JSON.stringify({
       [hash]: { canonical: normalizeProjectPath(canonical), aliases: [normalizeProjectPath(alias)] },
     }, null, 2) + "\n", { mode: 0o600 });
@@ -880,7 +892,8 @@ describe("daemon server", () => {
 
   it("falls back to meta cwd while map.json is temporarily invalid", () => {
     const canonical = mkdtempSync(join(tmpdir(), "lcm-scan-invalid-map-"));
-    mkdirSync(join(homedir(), ".lcm"), { recursive: true });
+    mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
+    chmodSync(join(homedir(), ".lcm"), 0o700);
     writeFileSync(projectMapPath(), "{not-json");
     clearProjectMapCache();
 
@@ -916,7 +929,7 @@ describe("daemon server", () => {
     const configPath = join(homedir(), ".lcm", "config.json");
     mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
     writeFileSync(configPath, "{}\n", { mode: 0o600 });
-    mkdirSync(join(homedir(), ".lcm", "projects", hash), { recursive: true });
+    mkdirSync(join(homedir(), ".lcm", "projects", hash), { recursive: true, mode: 0o700 });
     writeFileSync(join(homedir(), ".lcm", "projects", hash, "meta.json"), JSON.stringify({ cwd: normalizedCanonical }, null, 2) + "\n");
     writeFileSync(projectMapPath(), JSON.stringify({
       [hash]: { canonical: normalizedCanonical, aliases: [normalizedAlias] },
