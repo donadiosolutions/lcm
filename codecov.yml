@@ -82,7 +82,8 @@ component_management:
         # handling remain route-owned; #703 describe/expand compatibility errors,
         # #705 prompt-search surfacing-log failures, #709 search and grep routes,
         # #710 grep mode, #792 session filtering, #793 search-limit validation,
-        # and #825 bounded atomic promotion metadata remain route-owned.
+        # #794 grep-since validation, and #825 bounded atomic promotion metadata
+        # remain route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -91,14 +92,14 @@ component_management:
     - component_id: "unit-mcp"
       name: "Unit - MCP"
       paths:
-        # The #709 canonical search and grep MCP tools, #710 grep mode, and #793
-        # search-limit schema remain MCP-owned.
+        # The #709 canonical search and grep MCP tools, #710 grep mode, #793
+        # search-limit schema, and #794 grep-since schema remain MCP-owned.
         - "src/mcp/"
     - component_id: "unit-llm-prompts"
       name: "Unit - LLM, Responses, and Prompts"
       paths:
-        # The #779 authenticated Responses terminal gateway and #780 bounded
-        # Codex failure classification remain LLM-owned.
+        # The #779 authenticated Responses terminal gateway, #780 bounded
+        # Codex failure classification, and #790 endpoint resolver remain LLM-owned.
         - "src/llm/"
         - "src/prompts/"
     - component_id: "unit-local-persistence"

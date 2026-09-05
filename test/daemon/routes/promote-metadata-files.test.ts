@@ -107,7 +107,11 @@ describe("promote metadata files", () => {
   it("tightens a benign legacy metadata mode while retaining unrelated keys", async () => {
     const tempDir = tempDirs[0]!;
     const metadataPath = join(tempDir, "meta.json");
-    writeFileSync(metadataPath, JSON.stringify({ retained: "value", cwd: "/old" }), "utf8");
+    writeFileSync(metadataPath, JSON.stringify({
+      retained: "value",
+      cwd: "/old",
+      lastPromote: "1970-01-01T00:00:00.000Z",
+    }), "utf8");
     chmodSync(metadataPath, 0o664);
     const before = JSON.parse(readFileSync(metadataPath, "utf8")) as { lastPromote?: string };
 
@@ -120,7 +124,7 @@ describe("promote metadata files", () => {
     const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as Record<string, unknown>;
     expect(metadata).toMatchObject({ retained: "value", cwd: "/integration/project" });
     expect(metadata.lastPromote).toEqual(expect.any(String));
-    expect(metadata.lastPromote).not.toBe(before.lastPromote);
+    expect(Date.parse(String(metadata.lastPromote))).toBeGreaterThan(Date.parse(String(before.lastPromote)));
     expect(lstatSync(metadataPath).mode & 0o777).toBe(0o600);
     expect(readdirSync(tempDir).filter(name => /^\.meta\.json\..+\.tmp$/u.test(name))).toEqual([]);
   });

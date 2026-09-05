@@ -170,6 +170,15 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("--layer <name>");
   });
 
+  it("prints the grep since timestamp contract", () => {
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    printHelp("grep");
+    const text = out.mock.calls.map(c => c[0]).join("");
+    expect(text).toContain("YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm)");
+    expect(text).toContain("invalid values return HTTP 400");
+    expect(text).toContain("Omit it to include all history");
+  });
+
   it("prints doctor command help with sidecar scan limit", () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     printHelp("doctor");

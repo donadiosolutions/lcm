@@ -77,7 +77,7 @@ Search conversation history by keyword or regex across raw messages and summarie
 | `mode` | string | | `full_text` | `full_text` for literal/full-text matching or `regex` for regular-expression matching |
 | `scope` | string | | `"both"` | `"messages"`, `"summaries"`, or `"both"` |
 | `sessionId` | string | | — | Filter to a specific session |
-| `since` | string | | — | ISO datetime lower bound |
+| `since` | string | | — | Inclusive ISO datetime lower bound. Use `YYYY-MM-DDTHH:mm:ss` with optional 1-3 fractional digits and `Z` or `+/-HH:mm`; omit to include all history. Invalid values return `{ "error": "invalid since" }`. |
 
 Omit `sessionId` to search the whole project. When supplied, it selects the
 project's canonical newest conversation for that session identifier; an
@@ -100,6 +100,12 @@ lcm_grep(query: 'config\\.threshold', scope: 'summaries')
 # Interpret the query as a regular expression
 lcm_grep(query: 'config\\.(threshold|limit)', mode: 'regex')
 ```
+
+`since` is an inclusive lower bound. For example, `since: '2025-01-01T00:00:00Z'` includes matches created exactly at that instant and
+later. The accepted form is `YYYY-MM-DDTHH:mm:ss` with an optional 1-3 digit
+fraction and a required `Z` or numeric `+/-HH:mm` timezone. Omit `since` to
+search all history; malformed values return `{ "error": "invalid since" }`
+before project validation or storage access.
 
 The deprecated `all` scope remains accepted as a compatibility input and is
 normalized to `both`, but it is not advertised. The package
