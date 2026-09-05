@@ -217,8 +217,15 @@ The `Security` section of the doctor output shows:
   redaction; valid bracketed IPv6 authorities, including zone IDs, remain
   intact. In unquoted file URLs, whitespace and the existing path
   delimiters, including later colons, `?`, and `#`, end the redacted span, so
-  text after those delimiters can remain visible. Ordinary HTTP and HTTPS URLs
-  retain their authorities, slashes, and paths. When an exact case-insensitive
+  text after those delimiters can remain visible. Before the first path
+  separator, semicolons, commas, apostrophes, closing parentheses, and closing
+  braces remain part of an exact `file://` authority; after the path begins,
+  those characters retain their existing path and prose delimiter behavior.
+  A quote immediately before the `file` scheme establishes a quote boundary:
+  its matching quote still terminates the URL, while an apostrophe inside an
+  unquoted or double-quoted authority remains authority text. Double quotes
+  remain hard boundaries for quoted or structured text. Ordinary HTTP and
+  HTTPS URLs retain their authorities, slashes, and paths. When an exact case-insensitive
   `file://` literal begins immediately after `?`, `#`, `&`, or `=` inside any
   URL, LCM also redacts that nested file URL path while preserving the outer URL
   text. This bounded rule does not parse general query values, decode escaped

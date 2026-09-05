@@ -179,6 +179,66 @@ describe("sanitizeError", () => {
       absent: ["C:", "Users", "canary", "private.db"],
     },
     {
+      input: "file://host;name/Users/canary/private.db",
+      expected: "file://host;name<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://host,name/Users/canary/private.db",
+      expected: "file://host,name<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://host'name/Users/canary/private.db",
+      expected: "file://host'name<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://host)name/Users/canary/private.db",
+      expected: "file://host)name<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://host}name/Users/canary/private.db",
+      expected: "file://host}name<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://host;name,other'part)tail}/Users/canary/private.db",
+      expected: "file://host;name,other'part)tail}<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "file://host;name/C:\\Users\\canary\\private.db",
+      expected: "file://host;name<path>",
+      absent: ["C:", "Users", "canary", "private.db"],
+    },
+    {
+      input: "file://host,name\\Users\\canary\\private.db",
+      expected: "file://host,name<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "FiLe://HOST}NAME/Users/canary/private.db",
+      expected: "FiLe://HOST}NAME<path>",
+      absent: ["Users", "canary", "private.db"],
+    },
+    {
+      input: "'file://host;name/My Files/private.db'",
+      expected: "'file://host;name<path>'",
+      absent: ["host;name/My Files", "private.db"],
+    },
+    {
+      input: '\"file://host\'name/My Files/private.db\"',
+      expected: '\"file://host\'name<path>\"',
+      absent: ["host'name/My Files", "private.db"],
+    },
+    {
+      input: "file://host;name/",
+      expected: "file://host;name/",
+      absent: [],
+    },
+    {
       input: "'file://remote.invalid/Users/canary/My Files/private.db'",
       expected: "'file://remote.invalid<path>'",
       absent: ["Users", "canary", "My Files", "private.db"],
@@ -284,6 +344,18 @@ describe("sanitizeError", () => {
       'https://outer.test/x?next="file://host.invalid/Users/canary/My Files/private.db"',
       'https://outer.test/x?next="file://host.invalid<path>"',
     ],
+    [
+      "https://outer.test/x?next=file://host;name,other'part)tail}/Users/canary/private.db",
+      "https://outer.test/x?next=file://host;name,other'part)tail}<path>",
+    ],
+    [
+      "https://outer.test/x?next=file://host;name[/Users/canary/private.db",
+      "https://outer.test/x?next=file://host;name[<path>",
+    ],
+    [
+      'https://outer.test/x?next="file://host\'name/My Files/private.db"',
+      'https://outer.test/x?next="file://host\'name<path>"',
+    ],
   ] as const)("redacts nested file URL paths: %#", (input, expected) => {
     const result = sanitizeError(input);
 
@@ -381,6 +453,46 @@ describe("sanitizeError", () => {
     [
       "file://remote.invalid/Reports:2024/private.db",
       "file://remote.invalid<path>:2024/private.db",
+    ],
+    [
+      "file://host;name/Users/canary/private.db;retry",
+      "file://host;name<path>;retry",
+    ],
+    [
+      "'file://host' then see https://example.test/x",
+      "'file://host' then see https://example.test/x",
+    ],
+    [
+      "'file://host' /Users/canary/private.db then see https://example.test/x",
+      "'file://host' <path> then see https://example.test/x",
+    ],
+    [
+      '"file://host"/Users/canary/private.db then see https://example.test/x',
+      '"file://host"<path>',
+    ],
+    [
+      "file://host|name/Users/canary/private.db",
+      "file://host|name/Users/canary/private.db",
+    ],
+    [
+      "file://host<name/Users/canary/private.db",
+      "file://host<name/Users/canary/private.db",
+    ],
+    [
+      "file://host>name/Users/canary/private.db",
+      "file://host>name/Users/canary/private.db",
+    ],
+    [
+      "file://host]name/Users/canary/private.db",
+      "file://host]name/Users/canary/private.db",
+    ],
+    [
+      'file://host"name/Users/canary/private.db',
+      'file://host"name/Users/canary/private.db',
+    ],
+    [
+      "https://host;name/Users/canary/private.db",
+      "https://host;name/Users/canary/private.db",
     ],
   ] as const)("preserves file URL compatibility boundary %#", (input, expected) => {
     const result = sanitizeError(input);
