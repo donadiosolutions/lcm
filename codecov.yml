@@ -139,6 +139,8 @@ component_management:
         # #898 applies required promoted tags before the caller result maximum
         # while retaining local-persistence ownership.
         # #898's guarded dual-JSON eligibility keeps this search in the same owner.
+        # #992 keeps pre-initialization SQLite leaf admission and final
+        # opened-identity fencing local-persistence-owned.
         - "src/db/"
         - "src/storage/sqlite/"
         - "src/store/"
@@ -222,6 +224,7 @@ component_management:
         - "^src/codex-project-resolution\\.ts$"
         - "^src/git-project\\.ts$"
         - "^src/machine-identity\\.ts$"
+        # #889 keeps private import metadata publication in this owner.
         - "^src/portable-knowledge\\.ts$"
         - "^src/project-map\\.ts$"
         - "^src/worktree-reconciliation-fence\\.ts$"
@@ -238,9 +241,10 @@ component_management:
         - "^src/daemon/health-observation\\.ts$"
         # Lifecycle consumes the same canonical #691 entrypoint comparison as the CLI and keeps #804's kernel-cgroup listener witness manager-owned.
         # #865 keeps post-start publication convergence inside the lifecycle
-        # owner, while #944 keeps bounded daemon-tmp retry guidance within the
-        # supervisor/lifecycle boundary; their paired managed lifecycle tests
-        # remain this component's coverage boundary.
+        # owner, #944 keeps bounded daemon-tmp retry guidance within the
+        # supervisor/lifecycle boundary, and #966 keeps optional birth-sample
+        # budgeting in lifecycle admission. Their paired managed lifecycle
+        # tests remain this component's coverage boundary.
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"

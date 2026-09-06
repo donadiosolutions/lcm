@@ -60,6 +60,16 @@ changed in `config.json` or with `lcm config set`. The public
 `daemon.idleTimeoutMs` setting is separate: it controls normal idle daemon
 lifetime and does not change manager-command deadlines.
 
+Process-birth evidence collected during startup admission is optional and
+bounded within that same lifecycle deadline. Each sample receives at most 100
+milliseconds and at most one quarter of the time remaining when it starts,
+rounded down to a whole millisecond; LCM skips the sample when less than one
+millisecond remains or startup has been interrupted. A slow, unavailable, or
+failed sample can therefore omit the authenticated recovery witness and its
+publication-convergence retry, while ordinary token, process, manager, runtime,
+and backend admission checks remain unchanged. Missing process-birth evidence
+never authorizes recovery.
+
 During that code-5 recovery only, a transient malformed metadata observation
 does not authorize bootstrap. LCM may wait briefly and observe the exact label
 again within the same deadline, but it still requires both exact absence proofs
