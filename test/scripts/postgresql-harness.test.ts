@@ -182,6 +182,14 @@ describe("PostgreSQL harness utilities", () => {
       { environment: windowsEnvironment, realpath, platformName: "win32" },
     )).toBe("C:\\Windows\\Temp\\lcm-postgresql-harness-fallback");
     expect(harnessDirectoryFromRecord(
+      mount("C:\\Windows\\lcm-postgresql-harness-owned"),
+      { environment: windowsEnvironment, realpath, platformName: "win32" },
+    )).toBeUndefined();
+    expect(harnessDirectoryFromRecord(
+      mount("D:\\Other\\lcm-postgresql-harness-unrelated"),
+      { environment: windowsEnvironment, realpath, platformName: "win32" },
+    )).toBeUndefined();
+    expect(harnessDirectoryFromRecord(
       mount("C:\\WorkerScratch\\lcm-postgresql-harness-worker"),
       { environment: windowsEnvironment, realpath, platformName: "win32" },
     )).toBeUndefined();
