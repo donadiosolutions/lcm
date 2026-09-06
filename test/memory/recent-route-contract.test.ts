@@ -1,5 +1,8 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createServer, type AddressInfo, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { createRecentHandler } from "../../src/daemon/routes/recent.js";
@@ -18,7 +21,9 @@ vi.mock("../../src/daemon/routes/storage-lifecycle.js", async (importOriginal) =
   withProjectStorage: seams.withProjectStorage,
 }));
 
-const config = loadDaemonConfig("/tmp/lcm-recent-route-contract");
+const testRoot = mkdtempSync(join(tmpdir(), "lcm-recent-route-contract-"));
+const config = loadDaemonConfig(join(testRoot, "config.json"));
+const tokenPath = join(testRoot, "token");
 const fakeSummaries = [{
   summaryId: "sum-1",
   content: "A retrieved summary",
@@ -32,9 +37,10 @@ async function listen(handler: ReturnType<typeof createRecentHandler>): Promise<
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const rawBody = Buffer.concat(chunks).toString("utf8");
+    const body = JSON.parse(rawBody);
     bodies.push(body);
-    await handler(req, res, JSON.stringify(body));
+    await handler(req, res, rawBody);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -70,11 +76,15 @@ describe("MemoryApi recent HTTP contract", () => {
     vi.restoreAllMocks();
   });
 
+  afterAll(() => {
+    rmSync(testRoot, { recursive: true, force: true });
+  });
+
   it("retrieves summaries through the real client and route using cwd", async () => {
     const route = createRecentHandler(config);
     const { server, port, bodies } = await listen(route);
     try {
-      const api = createMemoryApi(new DaemonClient(`http://127.0.0.1:${port}`, "/tmp/lcm-recent-route-contract-token"));
+      const api = createMemoryApi(new DaemonClient(`http://127.0.0.1:${port}`, tokenPath));
       const result = await api.recent("/workspace/project", 2);
 
       expect(JSON.stringify(bodies[0])).toBe(JSON.stringify({ cwd: "/workspace/project", limit: 2 }));
@@ -101,7 +111,7 @@ describe("MemoryApi recent HTTP contract", () => {
     const route = createRecentHandler(config);
     const { server, port, bodies } = await listen(route);
     try {
-      const api = createMemoryApi(new DaemonClient(`http://127.0.0.1:${port}`, "/tmp/lcm-recent-route-contract-token"));
+      const api = createMemoryApi(new DaemonClient(`http://127.0.0.1:${port}`, tokenPath));
       await expect(api.recent("/workspace/project", 0)).rejects.toMatchObject({
         message: "invalid limit",
         statusCode: 400,
