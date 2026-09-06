@@ -30,11 +30,15 @@ lock() {
     chmod 700 -- "$directory" || return 2
     digest=$(printf '%s' "$resource" | sha256sum) || return 2
     lockfile=$directory/${digest%% *}.lock
+    if [[ -L $lockfile || ( -e $lockfile && ! -f $lockfile ) ]]; then
+        printf 'Unsafe lockfile: %s\n' "$lockfile" >&2
+        return 2
+    fi
     exec 9<>"$lockfile" || return 2
     if flock -x -n -E 75 9; then
         acquired=$(date '+%Y-%m-%dT%H:%M:%S%:z') &&
             printf 'thread=%s\nacquired=%s\nresource=%s\n' \
-                "$thread" "$acquired" "$resource" >"$lockfile" || {
+                "$thread" "$acquired" "$resource" >/proc/self/fd/9 || {
                     exec 9>&-
                     return 2
                 }

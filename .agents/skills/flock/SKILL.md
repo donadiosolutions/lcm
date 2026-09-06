@@ -13,11 +13,13 @@ or `$flock powerhome/lcm:worktree-499`. Quote names containing spaces.
 
 ## Acquire and use
 
-In a dedicated Bash shell, source [scripts/lock.sh](scripts/lock.sh), then call
-`lock` with the resource as its sole argument:
+In a dedicated Bash shell at the repository root, source
+[scripts/lock.sh](scripts/lock.sh), then call `lock` with the resource as its sole
+argument. From another directory, use the absolute path to this repository
+skill's helper:
 
 ```sh
-source "${CODEX_HOME:-$HOME/.codex}/skills/flock/scripts/lock.sh"
+source .agents/skills/flock/scripts/lock.sh
 lock 'lcm-daemon' || exit "$?"
 # Perform the protected work here, while this shell still owns descriptor 9.
 ```
@@ -34,7 +36,8 @@ Never guess, generate an identity, substitute a task name, or ask the caller to
 supply its own UUID. If neither source exposes it, stop without acquiring.
 
 The helper opens without truncation, attempts exclusive nonblocking `flock`,
-then replaces the contents of the same file only after acquisition:
+rejects pre-existing symlink or non-regular lockfiles, then replaces metadata
+through the locked descriptor only after acquisition:
 
 ```text
 thread=0199b4ef-dfde-7a81-b33e-c439d91932d8

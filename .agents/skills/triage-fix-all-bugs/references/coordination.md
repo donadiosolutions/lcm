@@ -82,8 +82,7 @@ lock 'lcm-daemon-update' || exit "$?"
 exec 9>&-
 ```
 
-The repository-relative source above replaces the copied skill's user-global
-source example. Follow that skill's UUID and shared runtime-directory rules.
+Follow that skill's UUID and shared runtime-directory rules.
 Keep this same shell alive, with descriptor 9 open, through the entire protected
 operation, including required installation, connector, test, and health checks.
 For multiple tool calls, retain one live interactive shell session; acquisition
