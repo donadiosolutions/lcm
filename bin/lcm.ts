@@ -1214,7 +1214,7 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
 function shouldUsePublicationConvergence(actionCommand: Command): boolean {
   const action = actionCommand.name();
   const topLevel = actionCommand.parent?.name() === "lcm";
-  if (action === "install" || action === "doctor") return true;
+  if (topLevel && (action === "install" || action === "doctor")) return true;
   if (topLevel && action === "stats") return actionCommand.opts<Record<string, unknown>>().pool !== true;
   if (topLevel && action === "export") return true;
   if (isNestedUnderRoot(actionCommand, "machine", "show")) return true;
