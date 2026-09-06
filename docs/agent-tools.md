@@ -76,13 +76,13 @@ summary appears. Invalid values return HTTP 400 with `{ "error": "invalid limit"
 
 ### lcm_grep
 
-Search conversation history by keyword or regex across raw messages and summaries.
+Search conversation history by keyword or regex across raw messages and summaries; interpretation follows the selected mode.
 
 **Parameters:**
 
 | Param | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `query` | string | ✅ | — | Keyword, phrase, or regex to search |
+| `query` | string | ✅ | — | Keyword, phrase, or regex to search; interpretation follows the selected mode |
 | `mode` | string | | `full_text` | `full_text` for literal/full-text matching or `regex` for regular-expression matching |
 | `scope` | string | | `"both"` | `"messages"`, `"summaries"`, or `"both"` |
 | `sessionId` | string | | — | Filter to a specific session |
