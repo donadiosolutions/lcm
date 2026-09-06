@@ -262,6 +262,13 @@ function openLcmConnection(
     parent.assertCurrent();
     db = new DatabaseSync(location);
     parent.assertCurrent();
+    const openedIdentity = inspectExistingLcmDatabasePath(dbPath);
+    if (!openedIdentity) {
+      throw new Error("database path disappeared while opening");
+    }
+    if (expectedIdentity && !sameDatabaseFileIdentity(expectedIdentity, openedIdentity)) {
+      throw new Error("database path changed while opening");
+    }
     chmodSync(dbPath, PRIVATE_FILE_MODE);
     // Enable WAL mode for better concurrent read performance
     parent.assertCurrent();
@@ -275,7 +282,7 @@ function openLcmConnection(
     if (!fileIdentity) {
       throw new Error("database path disappeared while opening");
     }
-    if (expectedIdentity && !sameDatabaseFileIdentity(expectedIdentity, fileIdentity)) {
+    if (!sameDatabaseFileIdentity(openedIdentity, fileIdentity)) {
       throw new Error("database path changed while opening");
     }
     releaseParent();
