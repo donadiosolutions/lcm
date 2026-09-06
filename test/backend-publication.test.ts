@@ -570,6 +570,7 @@ describe("BackendPublicationCoordinator", () => {
           directory: string,
           action: (observer: (event: string) => void) => Promise<R>,
         ): Promise<R> => {
+          let materialWindowStart: number | undefined;
           currentOperation = { label, directory };
           tracking.beginOperation(directory);
           tracking.setPhase(directory, "operation");
@@ -577,8 +578,12 @@ describe("BackendPublicationCoordinator", () => {
             return await action((event) => {
               if (event === "before-material-authenticate") {
                 captureOperationGeneration();
+                materialWindowStart = tracking.records.length;
                 tracking.setPhase(directory, "material");
               } else if (event === "after-material-authenticate") {
+                expect(materialWindowStart, label).toBeDefined();
+                expect(tracking.records.length, label).toBe(materialWindowStart);
+                materialWindowStart = undefined;
                 tracking.setPhase(directory, "operation");
               }
             });
@@ -624,6 +629,8 @@ describe("BackendPublicationCoordinator", () => {
           expect(record, label).toBeDefined();
           if (label === "first-resume") {
             expect(record!.fstatPhases, label).toContain("journal");
+          } else if (label === "first-prepare" || label === "other-prepare") {
+            expect(record!.fstatPhases, label).not.toContain("journal");
           }
           expect(record!.fstatPhases, label).toContain("material");
           expect(record!.closed, label).toBe(1);
@@ -724,6 +731,7 @@ describe("BackendPublicationCoordinator", () => {
           }
         },
       );
+      expect(tracking.records.length).toBeGreaterThan(0);
       expect(tracking.records.every((record) => record.closed === 1)).toBe(true);
     });
 
