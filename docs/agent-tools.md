@@ -107,6 +107,12 @@ meaning across search modes or hit types. The input `sessionId` is a string
 filter resolved to a conversation and is not returned on hits, and neither hit
 type has a `type` field.
 
+Message timestamps stored by the local SQLite backend without a timezone
+designator (for example, `YYYY-MM-DD HH:mm:ss`) are UTC instants and are
+converted to the same UTC representation on reads. Fractional seconds are
+preserved to JavaScript `Date` millisecond precision; already-qualified `Z` or
+numeric-offset timestamps retain their represented instant.
+
 A successful search with no matches, including an unknown `sessionId`, returns
 `{ "messages": [], "summaries": [], "totalMatches": 0 }`. If `cwd` is
 missing or invalid, the project is unavailable, or an unclassified error is
