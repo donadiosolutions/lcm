@@ -21,7 +21,8 @@ named parameters shown below; a model value may be a model name or exact route I
 | `REVIEWER_B_MODEL` | Grok 4.6 | `REVIEWER_B_REASONING` | medium | `REVIEWER_B_TIER` | default |
 | `SYNTHESIS_REVIEWER_MODEL` | Opus 5 | `SYNTHESIS_REVIEWER_REASONING` | medium | `SYNTHESIS_REVIEWER_TIER` | default |
 
-`MAX_ACTIVE_OWNERS = 7`; `WATCHDOG_MINUTES = 30`. User-authorized overrides
+`MAX_ACTIVE_OWNERS` defaults to **7**; `WATCHDOG_MINUTES` defaults to **30**.
+User-authorized overrides
 become recorded run-contract revisions, not implicit scope or budget changes.
 The initial P2 budget remains three completed candidate rounds per item.
 

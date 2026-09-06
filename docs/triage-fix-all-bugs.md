@@ -10,8 +10,8 @@ Use $triage-fix-all-bugs to triage and remediate all currently open native Bug i
 
 An agent that does not discover repository skills automatically can read
 [the skill entrypoint](../.agents/skills/triage-fix-all-bugs/SKILL.md) directly.
-The skill is repository tooling: it does not create an LCM CLI command, install
-repository tooling, or change the installed `lcm-memory` skill.
+The skill is repository tooling: it does not create an LCM CLI command or
+change the installed `lcm-memory` skill.
 
 ## What the campaign does
 
@@ -42,8 +42,9 @@ TRIAGE_REASONING=high, and TRIAGE_TIER=priority.
 ```
 
 `TRIAGE_MODEL`, `TRIAGE_REASONING`, and `TRIAGE_TIER` are instructions to the
-agent, not command-line flags. The top-level `TRIAGE_MODEL` configuration
-provides the default model, high reasoning, and the best-effort priority tier.
+agent, not command-line flags. The entrypoint defines separate defaults for
+`TRIAGE_MODEL`, `TRIAGE_REASONING`, and `TRIAGE_TIER`: the model, high reasoning,
+and a best-effort priority tier.
 The shared role defaults and override rules are in
 [the canonical configuration table](procedural-development.md#role-configuration).
 An invocation value wins over a wrapper value, which wins over that table's
