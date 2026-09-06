@@ -1540,6 +1540,13 @@ describe("runCli orchestration actions", () => {
   });
 
   it("fails stats without output or retry when its second config admission rejects the journal", async () => {
+    const builtinFs = (process as NodeJS.Process & {
+      getBuiltinModule: (specifier: "node:fs") => typeof import("node:fs");
+    }).getBuiltinModule("node:fs");
+    const fixtureRoot = builtinFs.mkdtempSync(join(tmpdir(), "lcm-cli-stats-"));
+    state.runtimeHome = join(fixtureRoot, ".lcm");
+    builtinFs.mkdirSync(state.runtimeHome, { mode: 0o700 });
+    builtinFs.mkdirSync(join(state.runtimeHome, "projects"), { mode: 0o700 });
     const failure = new BackendPublicationJournalError("unresolved-publication", "private evidence");
     const convergence = makeTestConvergence();
     state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
@@ -1556,16 +1563,20 @@ describe("runCli orchestration actions", () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
-    const result = await invoke(["stats"]);
+    try {
+      const result = await invoke(["stats"]);
 
-    expect(result).toBe(failure);
-    expect(() => handleCliError(result)).toThrow("exit:1");
-    expect(diagnostic).toHaveBeenCalledExactlyOnceWith(FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC);
-    expect(statsModule.collectStats).toHaveBeenCalledOnce();
-    expect(statsModule.printStats).not.toHaveBeenCalled();
-    expect(stdout).not.toHaveBeenCalled();
-    expect(log).not.toHaveBeenCalled();
-    expect(convergence.deadline).toBeUndefined();
+      expect(result).toBe(failure);
+      expect(() => handleCliError(result)).toThrow("exit:1");
+      expect(diagnostic).toHaveBeenCalledExactlyOnceWith(FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC);
+      expect(statsModule.collectStats).toHaveBeenCalledOnce();
+      expect(statsModule.printStats).not.toHaveBeenCalled();
+      expect(stdout).not.toHaveBeenCalled();
+      expect(log).not.toHaveBeenCalled();
+      expect(convergence.deadline).toBeUndefined();
+    } finally {
+      builtinFs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
   });
 
   it.each(["start", "restart"])("runs managed daemon %s with staged PostgreSQL storage", async (action) => {

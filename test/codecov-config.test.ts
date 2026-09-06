@@ -183,7 +183,8 @@ const expectedComponents = [
     component_id: "unit-memory-retrieval",
     name: "Unit - Memory and Retrieval",
     paths: [
-      // The #971 compact cwd client contract remains memory/retrieval-owned.
+      // The #971 compact cwd client contract and #973 stats database admission
+      // remain memory/retrieval-owned.
       "src/memory/",
       "^src/expansion\\.ts$",
       "^src/retrieval\\.ts$",
@@ -518,7 +519,8 @@ describe("Codecov configuration", () => {
       ["src/sensitive.ts", "unit-configuration-security"],
       ["src/project-map.ts", "unit-project-worktrees"],
       ["src/portable-knowledge.ts", "unit-project-worktrees"],
-      // #866 stats config retries and journal failures retain this owner.
+      // #866 stats config retries and journal failures, plus #973 project
+      // database admission, retain this owner.
       ["src/stats.ts", "unit-memory-retrieval"],
       ["src/connectors/codex-hooks.ts", "unit-connectors"],
       ["src/connectors/installer.ts", "unit-connectors"],
