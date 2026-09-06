@@ -1229,6 +1229,25 @@ function withSourceWriteFence<T>(
   }
 }
 
+function rollbackTargetReconciliationTransaction(
+  target: DatabaseSync,
+  committed: boolean,
+  primaryError: unknown,
+): never {
+  if (!committed && target.isTransaction !== false) {
+    try {
+      target.exec("ROLLBACK");
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [primaryError, rollbackError],
+        `worktree reconciliation target transaction failed: ${String(primaryError)}`,
+        { cause: primaryError },
+      );
+    }
+  }
+  throw primaryError;
+}
+
 function mergeMainDatabase(
   sourcePath: string,
   targetPath: string,
@@ -1266,6 +1285,7 @@ function mergeMainDatabase(
           `);
           assertTarget();
           target.exec("BEGIN IMMEDIATE");
+          let committed = false;
           try {
             afterSourceFenceCommit?.();
             assertTarget();
@@ -1278,6 +1298,7 @@ function mergeMainDatabase(
             ) {
               assertTarget();
               target.exec("COMMIT");
+              committed = true;
               assertTarget();
               return;
             }
@@ -1336,10 +1357,10 @@ function mergeMainDatabase(
               .run(sourceHash);
             assertTarget();
             target.exec("COMMIT");
+            committed = true;
             assertTarget();
           } catch (error) {
-            target.exec("ROLLBACK");
-            throw error;
+            rollbackTargetReconciliationTransaction(target, committed, error);
           }
         } finally {
           closeLcmConnection(targetPath, target);
@@ -1390,6 +1411,7 @@ function mergeEventsDatabase(
       `);
       assertTarget();
       target.exec("BEGIN IMMEDIATE");
+      let committed = false;
       try {
         if (
           row(
@@ -1402,6 +1424,7 @@ function mergeEventsDatabase(
           afterSourceFenceCommit?.();
           assertTarget();
           target.exec("COMMIT");
+          committed = true;
           assertTarget();
           return;
         }
@@ -1718,10 +1741,10 @@ function mergeEventsDatabase(
         afterSourceFenceCommit?.();
         assertTarget();
         target.exec("COMMIT");
+        committed = true;
         assertTarget();
       } catch (error) {
-        target.exec("ROLLBACK");
-        throw error;
+        rollbackTargetReconciliationTransaction(target, committed, error);
       }
     } finally {
       closeLcmConnection(targetPath, target);

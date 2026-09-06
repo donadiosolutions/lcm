@@ -737,6 +737,114 @@ function makeEventsReconciliation(root: string): {
   };
 }
 
+function makeProjectReconciliation(root: string): {
+  readonly main: string;
+  readonly targetHash: string;
+  readonly sourceHash: string;
+  readonly targetDir: string;
+  readonly sourceDir: string;
+  readonly targetPath: string;
+  readonly sourcePath: string;
+} {
+  const { main, linked } = makeRepository(root);
+  const canonical = resolveGitProjectAnchor(main)!.canonical;
+  const targetHash = hashProjectPath(canonical);
+  const sourceHash = hashProjectPath(linked);
+  writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+    [targetHash]: { canonical, aliases: [] },
+    [sourceHash]: { canonical: linked, aliases: [] },
+  }, null, 2)}\n`);
+  clearProjectMapCache();
+  const targetDir = join(root, ".lcm", "projects", targetHash);
+  const sourceDir = join(root, ".lcm", "projects", sourceHash);
+  return {
+    main,
+    targetHash,
+    sourceHash,
+    targetDir,
+    sourceDir,
+    targetPath: join(targetDir, "db.sqlite"),
+    sourcePath: join(sourceDir, "db.sqlite"),
+  };
+}
+
+function instrumentTargetReconciliationCommit(
+  onCommit: (target: DatabaseSync) => void,
+  options: {
+    readonly onBegin?: (target: DatabaseSync) => void;
+    readonly rollbackError?: Error;
+  } = {},
+): {
+  readonly restore: () => void;
+  readonly targetRollbackCount: () => number;
+} {
+  const originalExec = DatabaseSync.prototype.exec;
+  let reconciliationTarget: DatabaseSync | undefined;
+  let armedTarget: DatabaseSync | undefined;
+  let targetRollbackCount = 0;
+  let injected = false;
+  const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(
+    function (this: DatabaseSync, sql: string): void {
+      const result = originalExec.call(this, sql);
+      const statement = sql.replace(/\s+/gu, " ").trim();
+      if (statement.includes("CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources")) {
+        reconciliationTarget = this;
+      }
+      if (reconciliationTarget === this && statement === "BEGIN IMMEDIATE") {
+        armedTarget = this;
+        options.onBegin?.(this);
+      }
+      if (armedTarget === this && statement === "ROLLBACK") {
+        targetRollbackCount += 1;
+        if (options.rollbackError !== undefined) throw options.rollbackError;
+      }
+      if (armedTarget === this && statement === "COMMIT" && !injected) {
+        injected = true;
+        onCommit(this);
+      }
+      return result;
+    },
+  );
+  return {
+    restore: () => execSpy.mockRestore(),
+    targetRollbackCount: () => targetRollbackCount,
+  };
+}
+
+async function importReconciliationWithTransactionMode(
+  mode: "missing" | "false",
+  rollbackError?: Error,
+): Promise<typeof import("../src/worktree-reconciliation.js")> {
+  vi.resetModules();
+  vi.doMock("node:sqlite", async () => {
+    const actual = await vi.importActual<typeof import("node:sqlite")>("node:sqlite");
+    class OptionalTransactionDatabase extends actual.DatabaseSync {
+      constructor(...args: ConstructorParameters<typeof actual.DatabaseSync>) {
+        super(...args);
+        const target = this;
+        return new Proxy(target, {
+          get(database, property) {
+            if (property === "isTransaction") return mode === "missing" ? undefined : false;
+            const value = Reflect.get(database, property, target);
+            if (property !== "exec" || typeof value !== "function") {
+              return typeof value === "function" ? value.bind(target) : value;
+            }
+            return (sql: string): void => {
+              const result = value.call(target, sql);
+              if (sql.trim() === "ROLLBACK" && rollbackError !== undefined) {
+                throw rollbackError;
+              }
+              return result;
+            };
+          },
+        });
+      }
+    }
+    return { ...actual, DatabaseSync: OptionalTransactionDatabase };
+  });
+  return import("../src/worktree-reconciliation.js");
+}
+
 function setMissingCwdState(
   path: string,
   observations: number,
@@ -1761,6 +1869,178 @@ describe("worktree reconciliation", () => {
       phase: "completed",
     }]);
   });
+
+  it.each([
+    { label: "project merge", kind: "project", alreadyImported: false },
+    { label: "project already-imported merge", kind: "project", alreadyImported: true },
+    { label: "events merge", kind: "events", alreadyImported: false },
+    { label: "events already-imported merge", kind: "events", alreadyImported: true },
+  ] as const)(
+    "preserves a topology error after the $label COMMIT",
+    ({ kind, alreadyImported }) => {
+      let main: string;
+      let sourceHash = "";
+      let targetDir: string | undefined;
+      const targetPath = kind === "project"
+        ? (() => {
+          const fixture = makeProjectReconciliation(home);
+          main = fixture.main;
+          sourceHash = fixture.sourceHash;
+          targetDir = fixture.targetDir;
+          makeDatabase(fixture.sourcePath, "post-commit-project", "source", fixture.sourceHash);
+          if (alreadyImported) {
+            makeDatabase(fixture.targetPath, "post-commit-project-target", "target", fixture.targetHash);
+            const target = new DatabaseSync(fixture.targetPath);
+            target.exec(`
+              CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources (
+                source_hash TEXT PRIMARY KEY,
+                merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+              )
+            `);
+            target.prepare(
+              "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
+            ).run(fixture.sourceHash);
+            target.close();
+          }
+          return fixture.targetPath;
+        })()
+        : (() => {
+          const fixture = makeEventsReconciliation(home);
+          main = fixture.main;
+          sourceHash = hashProjectPath(join(home, "linked"));
+          makeVersionedEvents(fixture.sourceEvents);
+          if (alreadyImported) {
+            makeVersionedEvents(fixture.targetEvents);
+            const target = new DatabaseSync(fixture.targetEvents);
+            target.exec(`
+              CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources (
+                source_hash TEXT PRIMARY KEY,
+                merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+              )
+            `);
+            target.prepare(
+              "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
+            ).run(sourceHash);
+            target.close();
+          }
+          return fixture.targetEvents;
+        })();
+      const displaced = kind === "project"
+        ? `${targetDir!}.post-commit-displaced`
+        : `${join(home, ".lcm", "events")}.post-commit-displaced`;
+      const instrumentation = instrumentTargetReconciliationCommit(() => {
+        if (kind === "project") {
+          renameSync(targetDir!, displaced);
+          makePrivateFixtureDirectory(targetDir!);
+        } else {
+          const eventsDir = join(home, ".lcm", "events");
+          renameSync(eventsDir, displaced);
+          makePrivateFixtureDirectory(eventsDir);
+        }
+      });
+      let caught: unknown;
+      try {
+        reconcileWorktrees(main);
+      } catch (error) {
+        caught = error;
+      } finally {
+        instrumentation.restore();
+      }
+
+      expect(caught).toBeInstanceOf(Error);
+      expect(String(caught)).toContain("private directory topology is not trusted");
+      expect(String(caught)).not.toContain("no transaction is active");
+      expect(instrumentation.targetRollbackCount()).toBe(0);
+      expect(listWorktreeReconciliationJournals()).toMatchObject([{
+        phase: "blocked",
+        reason: expect.stringContaining("private directory topology is not trusted"),
+      }]);
+      expect(existsSync(displaced)).toBe(true);
+    },
+  );
+
+  it("rolls back an active target transaction when a merge fails before COMMIT", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "pre-commit-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "pre-commit-target", "source", fixture.sourceHash);
+    const instrumentation = instrumentTargetReconciliationCommit(() => undefined);
+    let caught: unknown;
+    try {
+      reconcileWorktrees(fixture.main);
+    } catch (error) {
+      caught = error;
+    } finally {
+      instrumentation.restore();
+    }
+
+    expect(String(caught)).toContain("divergent conversation collision");
+    expect(instrumentation.targetRollbackCount()).toBe(1);
+  });
+
+  it("retains the pre-COMMIT merge error when target rollback also fails", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "rollback-failure-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "rollback-failure-target", "source", fixture.sourceHash);
+    const rollbackError = new Error("injected target rollback failure");
+    const instrumentation = instrumentTargetReconciliationCommit(
+      () => undefined,
+      { rollbackError },
+    );
+    let caught: unknown;
+    try {
+      reconcileWorktrees(fixture.main);
+    } catch (error) {
+      caught = error;
+    } finally {
+      instrumentation.restore();
+    }
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    const aggregate = caught as AggregateError;
+    expect(aggregate.errors[0]).toMatchObject({
+      message: expect.stringContaining("divergent conversation collision"),
+    });
+    expect(aggregate.errors[1]).toBe(rollbackError);
+    expect(aggregate.cause).toBe(aggregate.errors[0]);
+    expect(aggregate.message).toContain("divergent conversation collision");
+    expect(instrumentation.targetRollbackCount()).toBe(1);
+  });
+
+  it.each([
+    { label: "missing", value: "missing" },
+    { label: "explicitly inactive", value: "false" },
+  ] as const)(
+    "handles an $label optional isTransaction property",
+    async ({ value }) => {
+      const fixture = makeProjectReconciliation(home);
+      makeDatabase(fixture.targetPath, `optional-${value}-target`, "target", fixture.targetHash);
+      makeDatabase(fixture.sourcePath, `optional-${value}-target`, "source", fixture.sourceHash);
+      const rollbackError = new Error(`optional ${value} rollback failure`);
+      const isolated = await importReconciliationWithTransactionMode(value, rollbackError);
+      let caught: unknown;
+      try {
+        isolated.reconcileWorktrees(fixture.main);
+      } catch (error) {
+        caught = error;
+      } finally {
+        vi.doUnmock("node:sqlite");
+        vi.resetModules();
+      }
+
+      if (value === "missing") {
+        expect(caught).toBeInstanceOf(AggregateError);
+        const aggregate = caught as AggregateError;
+        expect(aggregate.errors[0]).toMatchObject({
+          message: expect.stringContaining("divergent conversation collision"),
+        });
+        expect(aggregate.errors[1]).toBe(rollbackError);
+        expect(aggregate.cause).toBe(aggregate.errors[0]);
+      } else {
+        expect(String(caught)).toContain("divergent conversation collision");
+        expect(String(caught)).not.toContain("optional false rollback failure");
+      }
+    },
+  );
 
   it("fails closed on divergent global bookkeeping identities", () => {
     const { main, linked } = makeRepository(home);

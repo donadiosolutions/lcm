@@ -218,6 +218,8 @@ const expectedComponents = [
     component_id: "unit-project-worktrees",
     name: "Unit - Projects and Worktrees",
     paths: [
+      // #1070 preserves post-commit topology diagnostics in this existing
+      // reconciliation owner.
       // #974 keeps target-parent reconciliation hardening in this
       // existing component.
       "^src/codex-project-resolution\\.ts$",
