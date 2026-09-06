@@ -25,11 +25,15 @@ With the default SQLite backend, all storage is on your machine:
   available. Malformed, oversized, linked, non-regular, or owner-mismatched
   metadata is left unchanged by those final timestamp updates. Promote
   authenticates the immediate metadata parent directory before reading
-  `meta.json`, retains that admitted directory through parsing and publication,
-  and fails closed if its directory entry changes. Promotion database work
-  completed before the metadata update is not rolled back. This guarantee
-  covers the immediate metadata parent; it does not reauthenticate the full
-  ancestor chain.
+  `meta.json` and retains that admitted directory through parsing and
+  publication. A successful bounded read is accepted only when the reader's
+  sampled parent device and inode match the admitted directory. Persistent
+  directory-entry replacement detected during failure handling or publication
+  also fails closed. Promotion database work completed before the metadata
+  update is not rolled back. These checks cover the immediate metadata parent
+  at their stated samples; they do not reauthenticate the full ancestor chain
+  or claim detection of every transient replacement. A missing-file race has no
+  sampled parent identity and remains outside this guarantee.
 - **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
 - **`~/.lcm/daemon.pid`** — Daemon process ID (transient).

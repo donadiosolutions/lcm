@@ -35,6 +35,8 @@ const mocks = vi.hoisted(() => ({
   scrubForProject: vi.fn(async () => ({ scrub: (content: string) => content })),
   beforeMetadataRead: vi.fn(),
   afterMetadataRead: vi.fn(),
+  beforeBoundedReader: vi.fn(),
+  afterBoundedReader: vi.fn(),
 }));
 
 vi.mock("../../../src/daemon/project.js", () => ({
@@ -62,6 +64,16 @@ vi.mock("../../../src/security-files.js", async (importOriginal) => {
       });
       mocks.afterMetadataRead();
       return content;
+    },
+    readBoundedRegularFileWithStat: (path: string, options: BoundedFileOptions) => {
+      mocks.beforeBoundedReader();
+      const result = actual.readBoundedRegularFileWithStat(path, {
+        ...options,
+        _beforeReadForTesting: mocks.beforeMetadataRead,
+      });
+      mocks.afterMetadataRead();
+      mocks.afterBoundedReader();
+      return result;
     },
   };
 });
@@ -111,6 +123,8 @@ describe("promote metadata files", () => {
     mocks.scrubForProject.mockResolvedValue({ scrub: (content: string) => content });
     mocks.beforeMetadataRead.mockReset();
     mocks.afterMetadataRead.mockReset();
+    mocks.beforeBoundedReader.mockReset();
+    mocks.afterBoundedReader.mockReset();
   });
 
   afterEach(() => {
@@ -193,5 +207,40 @@ describe("promote metadata files", () => {
     expect(readFileSync(displacedMetadataPath, "utf8")).toBe(original);
     expect(readdirSync(tempDir).filter(name => /^\.meta\.json\..+\.tmp$/u.test(name))).toEqual([]);
     expect(readdirSync(displacedDir).filter(name => /^\.meta\.json\..+\.tmp$/u.test(name))).toEqual([]);
+  });
+
+  it("rejects metadata read from a sampled replacement after the admitted parent is restored", async () => {
+    const admittedDir = tempDirs[0]!;
+    const displacedDir = `${admittedDir}-displaced`;
+    const replacementDir = `${admittedDir}-replacement`;
+    tempDirs.push(displacedDir, replacementDir);
+    const admittedMetadataPath = join(admittedDir, "meta.json");
+    const replacementMetadataPath = join(replacementDir, "meta.json");
+    const original = JSON.stringify({ retained: "original" });
+    const replacement = JSON.stringify({ retained: "replacement" });
+    writeFileSync(admittedMetadataPath, original, { encoding: "utf8", mode: 0o600 });
+    mocks.beforeBoundedReader.mockImplementationOnce(() => {
+      renameSync(admittedDir, displacedDir);
+      mkdirSync(admittedDir, { mode: 0o700 });
+      writeFileSync(admittedMetadataPath, replacement, { encoding: "utf8", mode: 0o600 });
+    });
+    mocks.afterBoundedReader.mockImplementationOnce(() => {
+      renameSync(admittedDir, replacementDir);
+      renameSync(displacedDir, admittedDir);
+    });
+
+    await createPromoteHandler(config, makeMockStorageFactory({
+      projectExists: mocks.projectExists,
+      openProject: mocks.openProject,
+      close: mocks.closeFactory,
+    }))({} as never, response, JSON.stringify({ cwd: "/integration/project" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+    expect(readFileSync(admittedMetadataPath, "utf8")).toBe(original);
+    expect(readFileSync(replacementMetadataPath, "utf8")).toBe(replacement);
+    expect(readdirSync(admittedDir).filter(name => /^\.meta\.json\..+\.tmp$/u.test(name))).toEqual([]);
+    expect(readdirSync(replacementDir).filter(name => /^\.meta\.json\..+\.tmp$/u.test(name))).toEqual([]);
   });
 });

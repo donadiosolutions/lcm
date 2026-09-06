@@ -17,6 +17,15 @@ const mocks = vi.hoisted(() => ({
   read: vi.fn(() => "{}"),
   write: vi.fn(),
   readMetadata: vi.fn(() => "{}"),
+  readMetadataWithStat: vi.fn(),
+  metadataResult: vi.fn((content: string, parentDev = "1", parentIno = "1") => {
+    const result = { content, mtimeMs: 0 };
+    Object.defineProperties(result, {
+      parentDev: { value: parentDev, enumerable: false },
+      parentIno: { value: parentIno, enumerable: false },
+    });
+    return result as typeof result & { parentDev: string; parentIno: string };
+  }),
   writeMetadata: vi.fn(),
   assertDirectoryEntry: vi.fn(),
   openDirectory: vi.fn(() => ({
@@ -77,6 +86,7 @@ vi.mock("../../../src/daemon/project.js", () => ({
 vi.mock("../../../src/security-files.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../../src/security-files.js")>(),
   readBoundedRegularFile: mocks.readMetadata,
+  readBoundedRegularFileWithStat: mocks.readMetadataWithStat,
   atomicWritePrivateFile: mocks.writeMetadata,
   assertPrivateDirectoryEntry: mocks.assertDirectoryEntry,
   openPrivateDirectory: mocks.openDirectory,
@@ -107,6 +117,9 @@ describe("promote persistence boundaries", () => {
     mocks.projectExists.mockResolvedValue(true);
     mocks.read.mockReturnValue("{}");
     mocks.readMetadata.mockReturnValue("{}");
+    mocks.readMetadataWithStat.mockReset();
+    mocks.readMetadataWithStat.mockImplementation((path: string, options: unknown) =>
+      mocks.metadataResult(mocks.readMetadata(path, options), "1", "1"));
     mocks.openDirectory.mockReset();
     mocks.openDirectory.mockImplementation(() => ({
       fd: 1,
@@ -498,6 +511,48 @@ describe("promote persistence boundaries", () => {
       requireSingleLink: true,
     });
     expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["device", "2", "1"],
+    ["inode", "1", "2"],
+  ])("fails closed when the sampled metadata parent %s differs", async (_field, parentDev, parentIno) => {
+    const close = vi.fn();
+    mocks.openDirectory.mockReturnValueOnce({
+      fd: 1,
+      witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+      close,
+    });
+    mocks.readMetadataWithStat.mockReturnValueOnce(
+      mocks.metadataResult(JSON.stringify({ injected: true }), parentDev, parentIno),
+    );
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/sampled-parent" }));
+
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it("accepts matching non-enumerable sampled parent identity", async () => {
+    const observed = mocks.metadataResult(JSON.stringify({ retained: true }));
+    expect(Object.keys(observed)).not.toContain("parentDev");
+    expect(Object.keys(observed)).not.toContain("parentIno");
+    mocks.readMetadataWithStat.mockReturnValueOnce(observed);
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/matching-parent" }));
+
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    const [, serialized] = mocks.writeMetadata.mock.calls[0] as [string, string];
+    expect(JSON.parse(serialized)).toMatchObject({ retained: true, cwd: "/matching-parent" });
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
   });
 
   it("bounds serialized metadata by bytes and keeps the promotion result", async () => {

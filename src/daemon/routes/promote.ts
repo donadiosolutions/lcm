@@ -10,7 +10,7 @@ import {
   atomicWritePrivateFile,
   openPrivateDirectory,
   PrivateDirectoryTopologyError,
-  readBoundedRegularFile,
+  readBoundedRegularFileWithStat,
   type PrivateDirectoryHandle,
 } from "../../security-files.js";
 import { sendJson } from "../server.js";
@@ -344,12 +344,21 @@ export function createPromoteHandler(
                 try {
                   let meta: Record<string, unknown> = {};
                   try {
-                    const parsed: unknown = JSON.parse(readBoundedRegularFile(paths.metaPath, {
+                    const observed = readBoundedRegularFileWithStat(paths.metaPath, {
                       allowedRoot: paths.dir,
                       maxBytes: MAX_PROJECT_METADATA_BYTES,
                       expectedUid,
                       requireSingleLink: true,
-                    }));
+                    });
+                    if (
+                      observed.parentDev !== parent.witness.dev
+                      || observed.parentIno !== parent.witness.ino
+                    ) {
+                      throw new PrivateDirectoryTopologyError(
+                        "project directory topology changed before metadata publication",
+                      );
+                    }
+                    const parsed: unknown = JSON.parse(observed.content);
                     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
                       throw new Error("invalid project metadata");
                     }
