@@ -61,6 +61,8 @@ Tags apply only to promoted memories, which are the tagged search records.
 Episodic messages and summaries remain searchable without a tag predicate. Use
 `layers: ["promoted"]` when you want tag-only recall; omitted or empty tags do
 not filter either layer.
+For promoted searches, all required tags are applied before the caller's result
+maximum, so the maximum counts eligible records.
 
 The deprecated `semantic` layer name remains accepted as a compatibility input
 and is normalized to `promoted`, but it is not advertised.
@@ -121,6 +123,19 @@ normalized to `both`, but it is not advertised. The package
 `SearchResult.promoted` property matches the daemon's existing runtime
 response; the previously published `semantic` property was never populated.
 
+### Daemon JSON request bodies
+
+The `/describe`, `/expand`, `/grep`, `/recent`, `/search`, `/store`, `/ingest`,
+`/restore`, `/promote`, `/status`, `/session-complete`, `/promote-events`,
+`/promote-events/notify`, and `/review-stale` daemon endpoints require a JSON
+object as the top-level request body. Top-level `null`, arrays, strings,
+numbers, and booleans receive HTTP 400 with
+`{ "error": "invalid request body" }` before route storage or processing
+effects. An empty body keeps its existing `{}` fallback, and malformed JSON
+syntax keeps each endpoint's existing error behavior. In particular,
+`/recent` now rejects a non-object body instead of treating some primitives as
+an empty request.
+
 ### HTTP `POST /recent`
 
 The daemon's `/recent` endpoint returns recent summaries for a project. Send a
@@ -139,6 +154,45 @@ values above 1000. Invalid limits receive HTTP 400 with
 For a valid limit, a missing or invalid `cwd` retains the existing empty 200
 response. Successful project requests return `{ "summaries": [...] }`; the
 daemon client rejects non-2xx responses, including an invalid-limit response.
+
+The package root exposes the same request through `memory.recent`:
+
+```js
+import { memory } from "@donadiosolutions/lcm";
+
+const result = await memory.recent("/path/to/project", 5);
+```
+
+The first argument is an absolute project directory and is sent as `cwd`. If
+you have an older call that supplied a project hash as `projectId`, migrate it
+to the corresponding project directory; hashes are not interpreted as paths
+and no ambient working-directory fallback is used. Once a project is admitted,
+existing storage responses remain observable, including HTTP 409 identity
+configuration failures and HTTP 503 PostgreSQL storage failures.
+
+### HTTP `POST /compact`
+
+The daemon's `/compact` endpoint compacts a session transcript for a project.
+The package root exposes it through `memory.compact`:
+
+```js
+import { memory } from "@donadiosolutions/lcm";
+
+const result = await memory.compact(
+  "session-id",
+  "/path/to/transcript.jsonl",
+  "/path/to/project",
+);
+```
+
+`memory.compact(sessionId, transcriptPath, cwd)` sends `session_id`,
+`transcript_path`, and `cwd` to the daemon. The third `cwd` argument is
+optional and defaults to the caller's current working directory when the
+method is invoked. Supply an explicit absolute project directory when the
+transcript is stored elsewhere or the caller's working directory is not the
+project being compacted. Existing two-argument calls continue to work with
+that invocation-time default. The daemon validates the project directory and
+continues to return its existing compaction response or admission error.
 
 ### lcm_describe
 
@@ -171,6 +225,8 @@ Decompress a summary node into its full source content by traversing the DAG. Us
 `depth` defaults to `1` and must be a positive integer. Malformed explicit
 values receive HTTP 400 (`invalid depth`) before `cwd` validation or project
 admission. There is no upper bound beyond the positive-integer requirement.
+The direct daemon request also follows the shared JSON-object body contract
+above.
 
 **Examples:**
 

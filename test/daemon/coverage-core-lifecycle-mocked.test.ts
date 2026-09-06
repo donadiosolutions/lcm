@@ -167,8 +167,6 @@ describe("mocked lifecycle identity boundaries", () => {
         entrypoint: "/opt/lcm.mjs",
         runtimeDigest: "a".repeat(64),
       },
-      expectedEntrypoint: "/opt/lcm.mjs",
-      expectedRuntimeDigest: "a".repeat(64),
       deps: {
         now: () => now,
         sleep: async (ms) => { now += ms; },

@@ -15,6 +15,7 @@ component_management:
     - component_id: "unit-installation"
       name: "Unit - Installation"
       paths:
+        # #881 keeps absent-config journal checksum admission installer-owned.
         - "installer/"
         - "src/installer/"
         - "^src/bootstrap\\.ts$"
@@ -77,6 +78,7 @@ component_management:
         - "^src/daemon/project\\.ts$"
         - "^src/daemon/proxy-manager\\.ts$"
         - "^src/daemon/remediation\\.ts$"
+        # Error sanitization, including #893 adjacent-path redaction, remains daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -90,7 +92,8 @@ component_management:
         # #705 prompt-search surfacing-log failures, #709 search and grep routes,
         # #710 grep mode, #792 session filtering, #793 search-limit validation,
         # #794 grep-since validation, #825 bounded atomic promotion metadata,
-        # #862 recent limit validation, #863 expand depth validation, and #864
+        # #862 recent limit validation, #863 expand depth validation, #930
+        # expand body-shape validation, #969 route body-shape validation, and #864
         # episodic search candidate recall,
         # and #833 passive-event identity admission remain route-owned.
         # #828 promotes topology failures through the route boundary while
@@ -99,6 +102,8 @@ component_management:
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
       paths:
+        # #969 promote-events notification body-shape validation remains
+        # daemon-events-owned.
         - "^src/daemon/passive-event-processor\\.ts$"
     - component_id: "unit-mcp"
       name: "Unit - MCP"
@@ -120,6 +125,9 @@ component_management:
         # The #700 SQLite signal fences, #756 SQLite factory-health
         # closed-dominance responsibility, #935 database-parent admission,
         # and single-owner cleanup remain local-persistence-owned.
+        # #898 applies required promoted tags before the caller result maximum
+        # while retaining local-persistence ownership.
+        # #898's guarded dual-JSON eligibility keeps this search in the same owner.
         - "src/db/"
         - "src/storage/sqlite/"
         - "src/store/"
@@ -173,7 +181,8 @@ component_management:
       name: "Unit - Memory and Retrieval"
       paths:
         # The #709 SearchResult compatibility bridge, #793 search-limit contract,
-        # and retrieval contract remain memory/retrieval-owned. #866 stats
+        # retrieval contract, and #971 compact cwd client contract remain
+        # memory/retrieval-owned. #866 stats
         # publication retries and fail-closed journal errors stay in this owner.
         - "src/memory/"
         - "^src/expansion\\.ts$"

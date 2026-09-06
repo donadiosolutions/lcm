@@ -38,18 +38,83 @@ describe("createMemoryApi", () => {
     expect(mockPost).toHaveBeenLastCalledWith("/search", { query: "legacy", layers: ["semantic"] });
   });
 
-  it("compact calls POST /compact via daemon", async () => {
-    const mockPost = vi.fn().mockResolvedValue({ summary: "Compacted" });
+  it("compact forwards an explicit cwd and preserves the daemon response", async () => {
+    const response = { summary: "Compacted" };
+    const mockPost = vi.fn().mockResolvedValue(response);
     const api = createMemoryApi({ post: mockPost, health: vi.fn() } as any);
-    const result = await api.compact("sess-1", "/path/transcript");
-    expect(result.summary).toBe("Compacted");
-    expect(mockPost).toHaveBeenCalledWith("/compact", expect.objectContaining({ session_id: "sess-1" }));
+    const result = await api.compact("sess-1", "/path/transcript", "/workspace/project");
+    expect(result).toBe(response);
+    expect(mockPost).toHaveBeenCalledWith("/compact", {
+      session_id: "sess-1",
+      transcript_path: "/path/transcript",
+      cwd: "/workspace/project",
+    });
   });
 
-  it("recent calls POST /recent", async () => {
-    const mockPost = vi.fn().mockResolvedValue({ summaries: [] });
+  it("compact resolves the default cwd at each invocation", async () => {
+    const mockPost = vi.fn().mockResolvedValue({ summary: "Compacted" });
     const api = createMemoryApi({ post: mockPost, health: vi.fn() } as any);
-    await api.recent("project-hash-123");
-    expect(mockPost).toHaveBeenCalledWith("/recent", expect.objectContaining({ projectId: "project-hash-123" }));
+    const cwdSpy = vi.spyOn(process, "cwd");
+    try {
+      cwdSpy.mockReturnValue("/workspace/first");
+      await api.compact("sess-1", "/path/transcript");
+      cwdSpy.mockReturnValue("/workspace/second");
+      await api.compact("sess-2", "/path/transcript-2");
+    } finally {
+      cwdSpy.mockRestore();
+    }
+    expect(mockPost).toHaveBeenNthCalledWith(1, "/compact", {
+      session_id: "sess-1",
+      transcript_path: "/path/transcript",
+      cwd: "/workspace/first",
+    });
+    expect(mockPost).toHaveBeenNthCalledWith(2, "/compact", {
+      session_id: "sess-2",
+      transcript_path: "/path/transcript-2",
+      cwd: "/workspace/second",
+    });
+  });
+
+  it("compact forwards daemon rejections unchanged", async () => {
+    const rejection = new Error("compact failed");
+    const mockPost = vi.fn().mockRejectedValue(rejection);
+    const api = createMemoryApi({ post: mockPost, health: vi.fn() } as any);
+    await expect(api.compact("sess-1", "/path/transcript", "/workspace/project")).rejects.toBe(rejection);
+  });
+
+  it.each(["", "relative/project"])("compact forwards an explicit cwd unchanged: %j", async (cwd) => {
+    const mockPost = vi.fn().mockResolvedValue({ summary: "Compacted" });
+    const api = createMemoryApi({ post: mockPost, health: vi.fn() } as any);
+    await api.compact("sess-1", "/path/transcript", cwd);
+    expect(mockPost).toHaveBeenCalledWith("/compact", {
+      session_id: "sess-1",
+      transcript_path: "/path/transcript",
+      cwd,
+    });
+  });
+
+  it("recent posts an absolute cwd with the default limit", async () => {
+    const response = { summaries: [{ summary_id: "s1" }] };
+    const mockPost = vi.fn().mockResolvedValue(response);
+    const api = createMemoryApi({ post: mockPost, health: vi.fn() } as any);
+    const result = await api.recent("/workspace/project");
+    expect(mockPost).toHaveBeenCalledWith("/recent", { cwd: "/workspace/project", limit: 5 });
+    expect(result).toBe(response);
+  });
+
+  it("recent posts an explicit limit without changing the result", async () => {
+    const response = { summaries: [{ summary_id: "s2" }] };
+    const mockPost = vi.fn().mockResolvedValue(response);
+    const api = createMemoryApi({ post: mockPost, health: vi.fn() } as any);
+    const result = await api.recent("/workspace/project", 12);
+    expect(mockPost).toHaveBeenCalledWith("/recent", { cwd: "/workspace/project", limit: 12 });
+    expect(result).toBe(response);
+  });
+
+  it("recent forwards daemon rejections", async () => {
+    const rejection = new Error("invalid limit");
+    const mockPost = vi.fn().mockRejectedValue(rejection);
+    const api = createMemoryApi({ post: mockPost, health: vi.fn() } as any);
+    await expect(api.recent("/workspace/project", 0)).rejects.toBe(rejection);
   });
 });

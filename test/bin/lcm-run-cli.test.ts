@@ -324,8 +324,6 @@ function makeTestConvergence(
   return createPublicationConvergence({
     port: 3737,
     identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-    expectedEntrypoint: "/daemon",
-    expectedRuntimeDigest: "runtime",
     deps: {
       now: () => now,
       sleep: async (delayMs: number) => { now += delayMs; },
@@ -417,8 +415,6 @@ describe("runCli registration and help dispatch", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-      expectedEntrypoint: "/daemon",
-      expectedRuntimeDigest: "runtime",
       deps: {
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
@@ -439,8 +435,6 @@ describe("runCli registration and help dispatch", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-      expectedEntrypoint: "/daemon",
-      expectedRuntimeDigest: "runtime",
       deps: {
         now: (() => { let value = 0; return () => value; })(),
         sleep: async () => undefined,
@@ -461,12 +455,31 @@ describe("runCli registration and help dispatch", () => {
     expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps nested connector installation on ordinary migration", async () => {
+    state.createInstallerPublicationConvergence.mockImplementation(() => {
+      throw new Error("nested connector install must not create convergence");
+    });
+    const migrate = vi.fn();
+
+    expect(await invoke(["connectors", "install", "codex"], {
+      migrate,
+      sleep: async (_delayMs: number) => undefined,
+    })).toBeUndefined();
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.installConnector).toHaveBeenCalledWith(
+      "codex",
+      undefined,
+      process.cwd(),
+      { persistTransport: false, queryCodexMcp: false },
+    );
+    expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
+  });
+
   it("reuses the preAction convergence for config reads and prints once", async () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-      expectedEntrypoint: "/daemon",
-      expectedRuntimeDigest: "runtime",
       deps: {
         sleep: async () => undefined,
         readToken: () => "token",
@@ -498,8 +511,6 @@ describe("runCli registration and help dispatch", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-      expectedEntrypoint: "/daemon",
-      expectedRuntimeDigest: "runtime",
       deps: {
         now: () => now,
         sleep: async () => { sleeps += 1; now = sleeps === 1 ? 1_990 : 2_000; },
@@ -1270,6 +1281,7 @@ describe("runCli daemon-backed and utility actions", () => {
     for (const args of pureCases) await invoke(args, { migrate, sleep });
 
     expect(migrate).not.toHaveBeenCalled();
+    expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
   });
 
   it("keeps mutation and unclassified actions on the migration path", async () => {

@@ -68,6 +68,10 @@ client for each read:
 | `lcm status` | Read daemon and project status |
 | `lcm stats --pool` | Read daemon connection-pool statistics |
 
+When `--since` is supplied, its value is forwarded to the daemon exactly as
+provided. An empty or whitespace-only value is therefore invalid and returns
+HTTP 400; omit the option when no lower-bound filter is wanted.
+
 The local inspection commands `machine show`, `project list`, `project show`,
 `config get`, `stats` (without `--pool`), `events status`, `events validate`,
 `events quarantine`, `sensitive list`, `sensitive test`, and `export` also
@@ -96,13 +100,18 @@ store before the final maximum is applied. Episodic results concatenate
 messages first and then summaries, so messages can fill the maximum before a
 summary appears. `--tag <tag>` filters promoted entries by all supplied tags;
 episodic history remains unfiltered. Use `--layer promoted` for tag-only
-recall. Omitted or empty tags do not filter either layer. Values outside this
+recall. All required promoted tags are applied before the caller's result
+maximum, so the maximum counts eligible records. Omitted or empty tags do not
+filter either layer. Values outside this
 range or that are not integers are rejected by the daemon with HTTP 400
 (`invalid limit`).
 
 `lcm expand <nodeId> --depth <n>` accepts any positive integer and defaults to
 `1`; no upper bound is imposed. Malformed explicit depths are rejected by the
-daemon with HTTP 400 (`invalid depth`) before project admission.
+daemon with HTTP 400 (`invalid depth`) before project admission. The direct
+daemon request body must be a JSON object; top-level `null`, arrays, and other
+JSON primitives receive HTTP 400 (`invalid request body`) before project
+admission. Malformed JSON syntax keeps the existing server error behavior.
 
 Before using this route, LCM reads a bounded, no-follow configuration snapshot
 without taking the private mutation/publication lock. If `config.json` is
@@ -183,6 +192,13 @@ A foreign, ambiguous, malformed, stale, missing, or unreadable owner, an
 identity mismatch, a failed authenticated probe, or any error other than lock
 contention propagates unchanged and doctor reports the stage as failed.
 
+Doctor must also resolve and hash its own packaged runtime before it can retry
+publication contention. If that local runtime identity is unavailable, doctor
+does not infer a digest from daemon health or treat the missing value as a
+wildcard; it reports the original contention for the affected stage. Run
+doctor from the installed `lcm.mjs` artifact. If that artifact is unreadable or
+damaged, reinstall LCM and rerun `lcm doctor`.
+
 The retry budget is a single two-second wall-clock window shared by every
 stage of one doctor run, polled at most every 50 milliseconds. Time spent
 inside a refused attempt, the platform process-birth probe, and the
@@ -193,8 +209,10 @@ daemon token or starting the health exchange. The final wait is likewise
 shortened to whatever remains. Once the window is spent no further retries
 occur in that run. This is what prevents a healthy managed daemon's short
 background publication reconciliation immediately after `lcm install` from
-failing the next `lcm doctor` or `lcm connectors install codex`; it does not
-wait for a stuck or foreign lock holder.
+failing the next `lcm doctor`; `lcm connectors install codex` retains the
+ordinary root-migration path and connector-owned verification, without the
+top-level installer's publication-convergence retry. The retry does not wait
+for a stuck or foreign lock holder.
 
 `lcm install` uses the same bounded publication admission for its preflight
 migration and each installer lock-taking stage, including daemon lifecycle
@@ -206,6 +224,12 @@ and polls every 50 milliseconds. Bootstrap-lock retries remain unchanged and
 may add a bounded overshoot of up to one second when both locks contend.
 Identity, token, process-birth, health, entrypoint, version, backend, or
 runtime-digest mismatches fail closed with the original typed contention error.
+
+Lock-free configuration preparation also rejects a configuration or
+publication journal that changes between its two authenticated snapshots. Once
+the active publication has settled, rerun `lcm install` manually. This drift
+refusal is not retried automatically, and rerunning the installer does not imply
+that unrelated installation failures have resolved.
 
 ## Daemon-dependent resilience
 

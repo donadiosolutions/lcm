@@ -40,6 +40,7 @@ import { PrivateMutationLockContentionError } from "../../src/private-mutation-l
 import { createPublicationConvergence } from "../../src/storage/publication-convergence.js";
 import { PACKAGED_RUNTIME_ENTRYPOINT, PKG_VERSION, RUNTIME_DIGEST } from "../../src/daemon/version.js";
 import * as backendPublication from "../../src/storage/backend-publication.js";
+import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-publication-journal.js";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -2065,6 +2066,20 @@ describe("installer publication admission integration", () => {
     };
   }
 
+  function absentRawSnapshot() {
+    return {
+      content: "{}",
+      witness: {
+        presence: "absent" as const,
+        rawSha256: null,
+        byteLength: 0,
+        dev: null,
+        ino: null,
+        mtimeMs: null,
+      },
+    };
+  }
+
   it("captures configured and default daemon ports through the real factory", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-installer-factory-port-"));
     try {
@@ -2174,6 +2189,79 @@ describe("installer publication admission integration", () => {
     }
   });
 
+  it.each([
+    { label: "stable missing evidence", checksums: [null, null], rejects: false },
+    { label: "stable terminal evidence", checksums: ["journal-a", "journal-a"], rejects: false },
+    { label: "changed terminal evidence", checksums: ["journal-a", "journal-b"], rejects: true },
+    { label: "introduced terminal evidence", checksums: [null, "journal-a"], rejects: true },
+    { label: "removed terminal evidence", checksums: ["journal-a", null], rejects: true },
+  ] as const)("handles $label across absent lock-free config snapshots", ({ checksums, rejects }) => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-absent-checksum-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    fsMkdirSync(root, { mode: 0o700 });
+    const admissions = vi.fn()
+      .mockReturnValueOnce({ journalChecksumSha256: checksums[0] })
+      .mockReturnValueOnce({ journalChecksumSha256: checksums[1] });
+    const readSnapshot = vi.fn(() => absentRawSnapshot());
+    const inspect = () => prepareInstallConfig({
+      ...makeDeps(),
+      ensureLcmHome: vi.fn(),
+      readBoundedRegularFile,
+      _forceLockFreePublicationReadForTesting: true,
+      _readDaemonConfigRawSnapshot: readSnapshot,
+      _assertBackendPublicationConfigReadAccess: admissions,
+    }, configPath);
+    try {
+      if (rejects) {
+        expect(inspect).toThrow("configuration changed during lock-free publication admission");
+      } else {
+        expect(inspect()).toEqual({ exists: false, content: null });
+      }
+      expect(readSnapshot).toHaveBeenCalledTimes(2);
+      expect(admissions).toHaveBeenCalledTimes(2);
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects real terminal journal drift between absent config snapshots", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-absent-journal-drift-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    fsMkdirSync(root, { mode: 0o700 });
+    const firstChecksum = writeAbortedTerminalPublicationJournal(home, "terminal-publication-a");
+    const admissions: Array<string | null> = [];
+    let snapshotCalls = 0;
+    let secondChecksum: string | undefined;
+    try {
+      expect(() => prepareInstallConfig({
+        ...makeDeps(),
+        ensureLcmHome: vi.fn(),
+        readBoundedRegularFile,
+        _forceLockFreePublicationReadForTesting: true,
+        _readDaemonConfigRawSnapshot: () => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            secondChecksum = writeAbortedTerminalPublicationJournal(home, "terminal-publication-b");
+          }
+          return absentRawSnapshot();
+        },
+        _assertBackendPublicationConfigReadAccess: (...args) => {
+          const admission = backendPublication.assertBackendPublicationConfigReadAccess(...args);
+          admissions.push(admission.journalChecksumSha256);
+          return admission;
+        },
+      }, configPath)).toThrow("configuration changed during lock-free publication admission");
+      expect(snapshotCalls).toBe(2);
+      expect(admissions).toEqual([firstChecksum, secondChecksum]);
+      expect(secondChecksum).toBeDefined();
+      expect(secondChecksum).not.toBe(firstChecksum);
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("reads an existing canonical config through the production bounded reader", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-installer-publication-existing-"));
     const previousHome = process.env.HOME;
@@ -2241,8 +2329,6 @@ describe("installer publication admission integration", () => {
         entrypoint: "/opt/lcm.mjs",
         runtimeDigest: "a".repeat(64),
       },
-      expectedEntrypoint: "/opt/lcm.mjs",
-      expectedRuntimeDigest: "a".repeat(64),
       deps: {
         now: () => now,
         sleep: async (ms) => { sleeps.push(ms); now += ms; },

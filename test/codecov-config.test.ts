@@ -96,6 +96,7 @@ const expectedComponents = [
       "^src/daemon/project\\.ts$",
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
+      // Error sanitization, including #893 adjacent-path redaction, remains daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -126,6 +127,8 @@ const expectedComponents = [
   {
     component_id: "unit-local-persistence",
     name: "Unit - Local Persistence",
+    // #898 applies required promoted tags before the caller result maximum while retaining local-persistence ownership.
+    // #898's guarded dual-JSON eligibility keeps this search in the same owner.
     paths: ["src/db/", "src/storage/sqlite/", "src/store/"],
   },
   {
@@ -180,6 +183,7 @@ const expectedComponents = [
     component_id: "unit-memory-retrieval",
     name: "Unit - Memory and Retrieval",
     paths: [
+      // The #971 compact cwd client contract remains memory/retrieval-owned.
       "src/memory/",
       "^src/expansion\\.ts$",
       "^src/retrieval\\.ts$",
@@ -486,7 +490,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(209);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#866/#722/#786/#952/#814 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#866/#722/#786/#952/#814/#930/#969 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -495,8 +499,11 @@ describe("Codecov configuration", () => {
 
     const components = validateComponents(configuredComponents(config));
     // #792 keeps grep session filtering and #794 grep-since validation in the
-    // existing route component. #862 keeps recent limit validation and #863
+    // existing route component. #862 keeps recent limit validation, #863
     // keeps expand depth validation in the same daemon-routes component.
+    // #930 keeps expand body-shape validation in that component as well.
+    // #969 keeps the route-family and passive notification body-shape
+    // validation in their existing route and daemon-events components.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     // #814 fresh-root descriptor and pre-handoff content checks remain
     // configuration-security-owned.
@@ -515,6 +522,7 @@ describe("Codecov configuration", () => {
       ["src/stats.ts", "unit-memory-retrieval"],
       ["src/connectors/codex-hooks.ts", "unit-connectors"],
       ["src/connectors/installer.ts", "unit-connectors"],
+      // #881 keeps absent-config journal checksum admission installer-owned.
       ["installer/install.ts", "unit-installation"],
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
@@ -522,6 +530,11 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/compact.ts", "unit-daemon-routes"],
       ["src/daemon/routes/describe.ts", "unit-daemon-routes"],
       ["src/daemon/routes/expand.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/ingest.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/store.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/status.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/session-complete.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/review-stale.ts", "unit-daemon-routes"],
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
       // #833 passive-event identity admission remains route-owned.
@@ -532,6 +545,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/grep.ts", "unit-daemon-routes"],
       ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
       ["src/daemon/routes/recent.ts", "unit-daemon-routes"],
+      ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
       ["src/llm/codex-process.ts", "unit-llm-prompts"],

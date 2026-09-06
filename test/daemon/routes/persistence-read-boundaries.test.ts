@@ -235,6 +235,29 @@ describe("persistence read route boundaries", () => {
     });
   });
 
+  it("sanitizes adjacent post-bracket paths in describe read errors", async () => {
+    mocks.describe.mockRejectedValueOnce(
+      new Error("read failed for file://host.invalid[/Users/canary/one.db]/Users/canary/two.db"),
+    );
+    await invoke(createDescribeHandler(config), { nodeId: "n", cwd: "/ok" });
+    expectLast(200, {
+      node: null,
+      error: "read failed for file://host.invalid[<path>]<path>",
+    });
+  });
+
+  it("sanitizes adjacent post-bracket paths in expand read errors", async () => {
+    mocks.expand.mockRejectedValueOnce(
+      new Error("expand failed for file://host.invalid[/Users/canary/one.db]/Users/canary/two.db"),
+    );
+    await invoke(createExpandHandler(config), { nodeId: "n", cwd: "/ok" });
+    expect(mocks.expand).toHaveBeenCalled();
+    expectLast(200, {
+      expanded: null,
+      error: "expand failed for file://host.invalid[<path>]<path>",
+    });
+  });
+
   it("uses the injected backend without consulting a local SQLite path", async () => {
     mocks.exists.mockReturnValue(false);
     mocks.projectExists.mockResolvedValue(true);
@@ -332,6 +355,51 @@ describe("persistence read route boundaries", () => {
         expect(mocks.expand).not.toHaveBeenCalled();
       }
     }
+  });
+
+  it("rejects non-object expand bodies before cwd and storage admission", async () => {
+    const openExistingProject = vi.fn(async () => {
+      throw new Error("storage admission should not run for invalid body shape");
+    });
+    const factory = { ...postgresqlFactory(injectedFactory()), openExistingProject };
+    const handlers = [
+      createExpandHandler(config),
+      createExpandHandler(postgresqlConfig(), factory),
+    ];
+    const bodies = ["null", "[]", "\"text\"", "1", "true", "false"];
+
+    for (const handler of handlers) {
+      for (const body of bodies) {
+        mocks.send.mockClear();
+        mocks.writeHead.mockClear();
+        mocks.end.mockClear();
+        mocks.validate.mockClear();
+        mocks.projectIdentity.mockClear();
+        mocks.projectExists.mockClear();
+        mocks.openProject.mockClear();
+        mocks.createFactory.mockClear();
+        mocks.expand.mockClear();
+
+        await expect(invoke(handler, body)).resolves.toBeUndefined();
+
+        expectLast(400, { error: "invalid request body" });
+        expect(mocks.validate).not.toHaveBeenCalled();
+        expect(mocks.projectIdentity).not.toHaveBeenCalled();
+        expect(mocks.projectExists).not.toHaveBeenCalled();
+        expect(mocks.openProject).not.toHaveBeenCalled();
+        expect(mocks.createFactory).not.toHaveBeenCalled();
+        expect(mocks.expand).not.toHaveBeenCalled();
+        expect(openExistingProject).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it("preserves expand JSON syntax errors and object validation", async () => {
+    await expect(invoke(createExpandHandler(config), "{"))
+      .rejects.toBeInstanceOf(SyntaxError);
+
+    await invoke(createExpandHandler(config), "{}");
+    expectLast(400, { error: "nodeId is required" });
   });
 
   it("preserves nodeId precedence when depth is invalid", async () => {

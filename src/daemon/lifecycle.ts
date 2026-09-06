@@ -1691,8 +1691,6 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
         entrypoint: evidence.expectedEntrypoint,
         runtimeDigest: evidence.expectedRuntimeDigest,
       },
-      expectedEntrypoint: evidence.expectedEntrypoint,
-      expectedRuntimeDigest: evidence.expectedRuntimeDigest,
       deps: {
         now: opts._monotonicNowOverride ?? performance.now.bind(performance),
         sleep,

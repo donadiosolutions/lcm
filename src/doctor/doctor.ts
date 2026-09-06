@@ -260,15 +260,15 @@ const PUBLICATION_CONVERGENCE_POLL_MS = 50;
 
 /**
  * The exact managed daemon that doctor is willing to wait for. Every field is
- * taken from token-authenticated health so that only the daemon holding the
- * daemon token can be treated as the convergence owner.
+ * derived from the local installation except the PID observed by the initial
+ * health probe. Token-authenticated retry health must prove every field.
  */
 type ConvergenceDaemonIdentity = Readonly<{
   pid: number;
   version: string | undefined;
   storageBackend: "sqlite" | "postgresql";
   entrypoint: string | undefined;
-  runtimeDigest: string | undefined;
+  runtimeDigest: string;
 }>;
 
 /**
@@ -286,7 +286,6 @@ type PublicationConvergence = Readonly<{
 function daemonHealthMatchesIdentity(
   health: DoctorDaemonHealth | null,
   identity: ConvergenceDaemonIdentity,
-  expectedRuntimeDigest: string | undefined,
   platform: NodeJS.Platform,
 ): boolean {
   return health !== null
@@ -294,7 +293,7 @@ function daemonHealthMatchesIdentity(
     && health.version === identity.version
     && (health.storageBackend ?? "sqlite") === identity.storageBackend
     && daemonEntrypointMatches(health.entrypoint, identity.entrypoint, platform)
-    && (expectedRuntimeDigest === undefined || health.runtimeDigest === expectedRuntimeDigest);
+    && health.runtimeDigest === identity.runtimeDigest;
 }
 
 /**
@@ -312,6 +311,7 @@ function expectedConvergenceIdentity(
 ): ConvergenceDaemonIdentity | undefined {
   if (
     initialHealthPid === undefined
+    || expectedRuntimeDigest === undefined
     || (config.storageBackend !== "sqlite" && config.storageBackend !== "postgresql")
   ) return undefined;
   return {
@@ -394,7 +394,6 @@ async function convergenceRetryDelay(
     !daemonHealthMatchesIdentity(
       health,
       convergence.identity,
-      convergence.identity.runtimeDigest,
       deps.platform,
     )
     || convergence.now() >= convergence.deadline

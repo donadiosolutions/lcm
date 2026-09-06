@@ -113,6 +113,10 @@ export function createPromoteHandler(
 
     try {
       const input = JSON.parse(body || "{}") as PromoteRequestBody;
+      if (input === null || typeof input !== "object" || Array.isArray(input)) {
+        sendJson(res, 400, { error: "invalid request body" });
+        return;
+      }
       const { dry_run = false } = input;
 
       if (!input.cwd) {
