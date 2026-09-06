@@ -74,6 +74,22 @@ the final maximum is applied. Episodic results concatenate messages first and
 then summaries, so a message-heavy result can fill the maximum before a
 summary appears. Invalid values return HTTP 400 with `{ "error": "invalid limit" }`.
 
+To search a specific project's stored history, pass its existing absolute
+directory as `cwd`:
+
+```text
+memory.search("authentication decision", {
+  cwd: "/workspace/project",
+  layers: ["episodic", "promoted"],
+  limit: 10,
+})
+```
+
+The daemon validates `cwd` and uses it to select project storage. There is no
+implicit working-directory fallback, and the legacy `projectId` option does not
+select a project or apply a similarity threshold. Omit `cwd` to preserve the
+legacy empty-result response.
+
 ### lcm_grep
 
 Search conversation history by keyword or regex across raw messages and summaries.

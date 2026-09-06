@@ -178,7 +178,8 @@ component_management:
       paths:
         # The #709 SearchResult compatibility bridge, #793 search-limit contract,
         # retrieval contract, and #971 compact cwd client contract remain
-        # memory/retrieval-owned. #866 stats
+        # memory/retrieval-owned. #972 search cwd client typing and transport
+        # contract stay with this same owner. #866 stats
         # publication retries and fail-closed journal errors stay in this owner.
         - "src/memory/"
         - "^src/expansion\\.ts$"
