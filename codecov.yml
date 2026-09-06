@@ -151,6 +151,8 @@ component_management:
         # across journal, evidence, and terminal recovery-material reads.
         # #844 extends the coordinator's locked evidence/material reads with
         # one operation-scoped directory witness and a fail-closed return check.
+        # #942 binds every coordinator checkpoint read and write boundary to
+        # that retained operation-scoped directory witness.
         # #837 retains consumer-admission descriptor cleanup in this owner.
         # #906 keeps bounded publication-convergence probe expiry and error
         # selection in this storage-abstractions owner.
