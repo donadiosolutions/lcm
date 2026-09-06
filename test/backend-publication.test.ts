@@ -3311,3 +3311,208 @@ describe("revocable mutation permits", () => {
     expect(() => retained?.assertActive()).toThrow(PrivateMutationPermitRevokedError);
   });
 });
+
+describe("backend publication directory link-count policy", () => {
+  type NlinkMutationEvidence = Readonly<{
+    beforeNlink: bigint;
+    afterNlink: bigint;
+    injectionCount: number;
+  }>;
+
+  async function withOneShotMaterialDirectoryNlink<T>(
+    home: string,
+    callback: (controls: Readonly<{
+      armAfterNextDirectoryFstat: () => void;
+      armOnSuccessfulMaterialOpen: () => void;
+    }>) => Promise<T>,
+  ): Promise<Readonly<{ result: T; evidence: NlinkMutationEvidence | undefined }>> {
+    const publicationDirectory = backendPublicationDirectory(home);
+    const materialPath = join(publicationDirectory, "publication-1.material");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalClose = nodeFs.closeSync as (fd: number) => void;
+    const originalFstat = nodeFs.fstatSync as (
+      fd: number,
+      options?: { bigint?: boolean },
+    ) => {
+      dev: bigint;
+      ino: bigint;
+      mode: bigint;
+      uid: bigint;
+      gid: bigint;
+      nlink: bigint;
+      isDirectory: () => boolean;
+      [key: string]: unknown;
+    };
+    const directoryFds = new Set<number>();
+    let armMode: "idle" | "after-next-directory-fstat" | "on-material-open" | "armed" | "done" = "idle";
+    let lastDirectoryFstatFd: number | undefined;
+    let targetFd: number | undefined;
+    let injectionCount = 0;
+    let evidence: NlinkMutationEvidence | undefined;
+
+    const controls = {
+      armAfterNextDirectoryFstat: (): void => {
+        expect(armMode).toBe("idle");
+        armMode = "after-next-directory-fstat";
+      },
+      armOnSuccessfulMaterialOpen: (): void => {
+        expect(armMode).toBe("idle");
+        armMode = "on-material-open";
+      },
+    } as const;
+
+    return withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === publicationDirectory) directoryFds.add(fd);
+      if (path === materialPath && armMode === "on-material-open") {
+        expect(lastDirectoryFstatFd).toBeDefined();
+        expect(directoryFds.has(lastDirectoryFstatFd!)).toBe(true);
+        targetFd = lastDirectoryFstatFd;
+        armMode = "armed";
+      }
+      return fd;
+    }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+      originalClose(fd);
+      directoryFds.delete(fd);
+    }) as never, async () => withPatchedFsAsync("fstatSync", ((
+      fd: number,
+      options?: { bigint?: boolean },
+    ) => {
+      const observed = originalFstat(fd, options);
+      if (!directoryFds.has(fd) || options?.bigint !== true) return observed;
+
+      lastDirectoryFstatFd = fd;
+      if (armMode === "after-next-directory-fstat") {
+        targetFd = fd;
+        armMode = "armed";
+        return observed;
+      }
+      if (armMode !== "armed" || fd !== targetFd) return observed;
+
+      const prototype = Object.getPrototypeOf(observed);
+      const beforeDescriptors = Object.getOwnPropertyDescriptors(observed);
+      const beforeNlink = observed.nlink;
+      const pathStat = statSync(publicationDirectory, { bigint: true });
+      expect(observed.isDirectory()).toBe(true);
+      expect(observed.dev).toBe(pathStat.dev);
+      expect(observed.ino).toBe(pathStat.ino);
+      Object.defineProperty(observed, "nlink", { value: beforeNlink + 1n });
+      const afterDescriptors = Object.getOwnPropertyDescriptors(observed);
+      delete beforeDescriptors.nlink;
+      delete afterDescriptors.nlink;
+      expect(Object.getPrototypeOf(observed)).toBe(prototype);
+      expect(afterDescriptors).toEqual(beforeDescriptors);
+      injectionCount += 1;
+      evidence = { beforeNlink, afterNlink: observed.nlink, injectionCount };
+      armMode = "done";
+      return observed;
+    }) as never, async () => {
+      const result = await callback(controls);
+      return { result, evidence };
+    })));
+  }
+
+  function expectNlinkMutation(evidence: NlinkMutationEvidence | undefined): void {
+    expect(evidence).toBeDefined();
+    expect(evidence?.afterNlink).toBe(evidence!.beforeNlink + 1n);
+    expect(evidence?.injectionCount).toBe(1);
+  }
+
+  async function sealedPreparingFixture(): Promise<{
+    home: string;
+    input: BackendPublicationRecoveryMaterial;
+    fake: ReturnType<typeof makeDriver>;
+  }> {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    await expect(coordinator(home, fake.driver, (event) => {
+      if (event === "after-material-seal") throw new Error("crash:after-material-seal");
+    }).prepare(inputFor(input))).rejects.toThrow("crash:after-material-seal");
+    expect(readBackendPublicationJournal(home)?.phase).toBe("preparing");
+    return { home, input, fake };
+  }
+
+  it("allows prepare to authenticate across directory nlink churn", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+
+    const observed = await withOneShotMaterialDirectoryNlink(home, async (controls) => {
+      const journal = await coordinator(home, fake.driver, (event) => {
+        if (event === "before-material-authenticate") controls.armAfterNextDirectoryFstat();
+      }).prepare(inputFor(input));
+      return journal;
+    });
+
+    expect(observed.result.phase).toBe("prepared");
+    expect(fake.calls).toEqual([]);
+    expectNlinkMutation(observed.evidence);
+  });
+
+  it("allows prepared resume material context across directory nlink churn", async () => {
+    const { home, fake } = await preparedFixture();
+
+    const observed = await withOneShotMaterialDirectoryNlink(home, async (controls) => {
+      controls.armOnSuccessfulMaterialOpen();
+      return coordinator(home, fake.driver).resume();
+    });
+
+    expect(observed.result.phase).toBe("completed");
+    expect(fake.calls).toEqual(["publish-map", "publish-config"]);
+    expectNlinkMutation(observed.evidence);
+  });
+
+  it("allows preparing resume across directory nlink churn", async () => {
+    const { home, fake } = await sealedPreparingFixture();
+
+    const observed = await withOneShotMaterialDirectoryNlink(home, async (controls) => {
+      controls.armOnSuccessfulMaterialOpen();
+      return coordinator(home, fake.driver).resume();
+    });
+
+    expect(observed.result.phase).toBe("completed");
+    expect(fake.calls).toEqual(["publish-map", "publish-config"]);
+    expectNlinkMutation(observed.evidence);
+  });
+
+  it("allows preparing abort across directory nlink churn", async () => {
+    const { home, fake } = await sealedPreparingFixture();
+
+    const observed = await withOneShotMaterialDirectoryNlink(home, async (controls) => {
+      controls.armOnSuccessfulMaterialOpen();
+      return coordinator(home, fake.driver).abort();
+    });
+
+    expect(observed.result.phase).toBe("aborted");
+    expect(fake.calls).toEqual([]);
+    expect(existsSync(join(backendPublicationDirectory(home), "publication-1.material"))).toBe(false);
+    expectNlinkMutation(observed.evidence);
+  });
+
+  it("keeps completed consumer material authentication strict", async () => {
+    const { home, fake } = await preparedFixture();
+    await coordinator(home, fake.driver).resume();
+    let controlAdmitted = false;
+    withBackendPublicationConsumerLock(home, () => {
+      controlAdmitted = true;
+    });
+    expect(controlAdmitted).toBe(true);
+
+    let mutatedAdmitted = false;
+    const observed = await withOneShotMaterialDirectoryNlink(home, async (controls) => {
+      controls.armOnSuccessfulMaterialOpen();
+      expect(() => withBackendPublicationConsumerLock(home, () => {
+        mutatedAdmitted = true;
+      })).toThrowError(expect.objectContaining({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: expect.stringContaining("changed during material authentication"),
+      }));
+    });
+
+    expect(mutatedAdmitted).toBe(false);
+    expectNlinkMutation(observed.evidence);
+  });
+});
