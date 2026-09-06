@@ -171,6 +171,10 @@ Decompress a summary node into its full source content by traversing the DAG. Us
 `depth` defaults to `1` and must be a positive integer. Malformed explicit
 values receive HTTP 400 (`invalid depth`) before `cwd` validation or project
 admission. There is no upper bound beyond the positive-integer requirement.
+The direct daemon request body must be a JSON object. Top-level `null`, arrays,
+and other JSON primitives receive HTTP 400 (`invalid request body`) before
+`cwd` validation or project admission. Malformed JSON syntax keeps the
+existing server error behavior.
 
 **Examples:**
 
