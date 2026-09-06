@@ -24,6 +24,14 @@ With the default SQLite backend, all storage is on your machine:
   a best-effort write, and require a matching owner when the process user ID is
   available. Malformed, oversized, linked, non-regular, or owner-mismatched
   metadata is left unchanged by those final timestamp updates.
+  `lcm import-knowledge` uses a separate create-only path. When metadata is
+  missing, it atomically publishes the complete project identity with mode
+  `0600` and tightens the project directory to mode `0700`. Existing metadata
+  is never replaced by import, including malformed files and dangling symbolic
+  links. Import still completes when such an entry is preserved, but malformed
+  or dangling metadata is not automatically repaired and may keep the project
+  from being discovered by `lcm export --all` until you correct or
+  remove that entry.
 - **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
 - **`~/.lcm/daemon.pid`** — Daemon process ID (transient).
