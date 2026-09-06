@@ -363,6 +363,126 @@ describe("promote persistence boundaries", () => {
     });
   });
 
+  it.each(["EMFILE", "ENFILE", "ENOSPC"])(
+    "keeps promotion successful when metadata parent open fails with direct %s",
+    async (code) => {
+      const resourceError = Object.assign(new Error(`metadata parent ${code}`), { code });
+      mocks.openDirectory.mockImplementationOnce(() => { throw resourceError; });
+
+      await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/resource" }));
+
+      expect(mocks.writeMetadata).not.toHaveBeenCalled();
+      expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+        processed: 0,
+        promoted: 0,
+        conversations: 0,
+      });
+    },
+  );
+
+  it("keeps a metadata-parent resource failure best-effort through publication admission", async () => {
+    const resourceError = Object.assign(new Error("metadata parent unavailable"), { code: "EMFILE" });
+    mocks.openDirectory.mockImplementationOnce(() => { throw resourceError; });
+    const withPublicationAdmission = vi.fn(
+      async <T>(operation: (token: object) => Promise<T> | T): Promise<T> => operation({}),
+    );
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/resource-admission" }), {
+      withPublicationAdmission,
+    });
+
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it.each([
+    ["ENOENT", Object.assign(new Error("metadata parent missing"), { code: "ENOENT" })],
+    ["ELOOP", Object.assign(new Error("metadata parent loop"), { code: "ELOOP" })],
+    ["ENOTDIR", Object.assign(new Error("metadata parent is not a directory"), { code: "ENOTDIR" })],
+    ["ENOMEM", Object.assign(new Error("metadata parent allocation failed"), { code: "ENOMEM" })],
+    ["owner rejection", new Error("metadata parent owner is not trusted")],
+    ["mode rejection", new Error("metadata parent mode is not trusted")],
+    ["unknown error", new Error("metadata parent failed")],
+    [
+      "non-resource code with a resource cause",
+      Object.assign(
+        new Error("metadata parent failed", {
+          cause: Object.assign(new Error("descriptor exhaustion"), { code: "EMFILE" }),
+        }),
+        { code: "EIO" },
+      ),
+    ],
+    [
+      "unknown error with a resource cause",
+      new Error("metadata parent failed", {
+        cause: Object.assign(new Error("descriptor exhaustion"), { code: "ENFILE" }),
+      }),
+    ],
+  ])("fails closed for metadata parent open %s", async (_label, parentError) => {
+    mocks.openDirectory.mockImplementationOnce(() => { throw parentError; });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/parent-failure" }));
+
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it.each([
+    [
+      "typed topology",
+      Object.assign(new PrivateDirectoryTopologyError("typed topology"), { code: "EMFILE" }),
+    ],
+    [
+      "named topology",
+      Object.assign(new Error("named topology"), {
+        code: "ENFILE",
+        name: "PrivateDirectoryTopologyError",
+      }),
+    ],
+    [
+      "cancellation",
+      Object.assign(createAbortError(), { code: "ENOSPC" }),
+    ],
+  ])("keeps a resource-coded %s failure critical", async (_label, topologyError) => {
+    mocks.openDirectory.mockImplementationOnce(() => { throw topologyError; });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/critical-resource" }));
+
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it("keeps a resource-coded publication admission failure blocked", async () => {
+    const admissionError = Object.assign(
+      new BackendPublicationJournalError("unexpected-state", "publication changed"),
+      { code: "ENOSPC" },
+    );
+    const withPublicationAdmission = vi.fn()
+      .mockImplementationOnce(async (operation: (token: object) => Promise<unknown> | unknown) => operation({}))
+      .mockRejectedValueOnce(admissionError);
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/critical-admission" }), {
+      withPublicationAdmission,
+    });
+
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
+    expect(mocks.openDirectory).not.toHaveBeenCalled();
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+  });
+
   it("does not swallow a topology failure while reopening metadata parent", async () => {
     mocks.openDirectory.mockImplementationOnce(() => {
       throw new PrivateDirectoryTopologyError("project directory topology changed");

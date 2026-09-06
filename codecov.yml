@@ -99,6 +99,8 @@ component_management:
         # and #833 passive-event identity admission remain route-owned.
         # #828 promotes topology failures through the route boundary while
         # preserving ordinary best-effort metadata persistence.
+        # #947 keeps direct metadata-parent resource exhaustion best-effort
+        # while preserving fail-closed topology handling in the route owner.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"

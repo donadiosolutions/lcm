@@ -348,6 +348,11 @@ export function createPromoteHandler(
               try {
                 parent = openPrivateDirectory(paths.dir, { expectedUid });
               } catch (error) {
+                const code = errorCode(error);
+                if (
+                  !isCriticalMetadataError(error)
+                  && (code === "EMFILE" || code === "ENFILE" || code === "ENOSPC")
+                ) throw error;
                 throw new PrivateDirectoryTopologyError(
                   "project directory topology changed before metadata publication",
                   { cause: error },
