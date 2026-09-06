@@ -165,7 +165,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         quoteCode(char) === schemeQuote &&
         (char === '"' || isFileUrlLiteral(chars, index + 1))
       );
-    if (separator >= 0 && brackets === 0 && URL_END_DELIMITERS.has(char) && !fileAuthorityDelimiter) {
+    // A matching path quote ends redaction even inside an open bracket. End
+    // URL classification there too so it cannot hide a later standalone path.
+    const closesQuotedFilePath = foundFilePath && schemeQuote !== 0 && quoteCode(char) === schemeQuote;
+    if (
+      separator >= 0 &&
+      (brackets === 0 || closesQuotedFilePath) &&
+      URL_END_DELIMITERS.has(char) &&
+      !fileAuthorityDelimiter
+    ) {
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;

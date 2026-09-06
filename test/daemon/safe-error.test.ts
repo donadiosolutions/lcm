@@ -409,6 +409,25 @@ describe("sanitizeError", () => {
     expect(sanitizeError(first)).toBe(first);
   });
 
+  it("redacts a path after a bracket-wrapped quoted file path on the first pass", () => {
+    const result = sanitizeError("'file://host'['/private']?/Users/SECRET");
+
+    expect(result).toBe("'file://host'['<path>']?<path>");
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["'file://host'[['/private']]#/Users/SECRET", "'file://host'[['<path>']]#<path>"],
+    ['"file://host["/private"]?/Users/SECRET', '"file://host["<path>"]?<path>'],
+    ["'file://host'[\\C:\\private']?/Users/SECRET", "'file://host'[<path>']?<path>"],
+    ["'file://host'['/private'?/Users/SECRET", "'file://host'['<path>'?<path>"],
+  ] as const)("ends quoted file path classification inside brackets: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
   it.each([
     [
       "file://remote.invalid[/Users/canary/one.db]/Users/canary/two.db",

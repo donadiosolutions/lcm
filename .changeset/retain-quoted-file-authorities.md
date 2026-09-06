@@ -4,4 +4,5 @@
 
 Redact private paths after ambiguous apostrophes in single-quoted `file://`
 authorities, including separately quoted nested file URLs whose paths contain
-spaces.
+spaces. Close quoted file paths inside brackets so later standalone paths are
+also redacted on the first pass.

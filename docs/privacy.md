@@ -270,9 +270,11 @@ The `Security` section of the doctor output shows:
   (`|`, `<`, `>`, and closing square brackets subject to the existing bracket
   handling) ends it. After a path begins, these characters retain their
   existing path and prose delimiter behavior, and a matching quote closes the
-  redacted path. A quoted path can contain spaces; redaction continues to that
-  matching quote, a newline, or EOF. Empty and root-only file URLs remain
-  unchanged. Unspaced text after an apparent pathless closing apostrophe can be
+  redacted path, even inside unmatched or path-wrapping brackets. The matching
+  quote also ends that URL's classification, so a later standalone local path
+  is redacted in the same pass. A quoted path can contain spaces; redaction
+  continues to that matching quote, a newline, or EOF. Empty and root-only file
+  URLs remain unchanged. Unspaced text after an apparent pathless closing apostrophe can be
   treated as continuing authority text, so an eventual path can cause
   conservative redaction of that later text. Whitespace-separated following
   prose or URLs are classified normally. Double quotes in non-file URLs or
