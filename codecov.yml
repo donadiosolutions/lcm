@@ -147,6 +147,8 @@ component_management:
         # #989 retains event-sidecar parent authentication in this owner.
         # #992 keeps pre-initialization SQLite leaf admission and final
         # opened-identity fencing local-persistence-owned.
+        # #1020 keeps UTC message timestamp mapping in conversation-store-owned
+        # local persistence paths.
         - "src/db/"
         - "src/storage/sqlite/"
         - "src/store/"

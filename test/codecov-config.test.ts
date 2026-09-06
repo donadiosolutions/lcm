@@ -600,6 +600,9 @@ describe("Codecov configuration", () => {
       ["src/db/connection.ts", "unit-local-persistence"],
       ["src/db/database-parent.ts", "unit-local-persistence"],
       ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
+      // #1020 keeps message timestamp mapping in the existing local-persistence
+      // component; conversation timestamps remain on their existing mapper.
+      ["src/store/conversation-store.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],
