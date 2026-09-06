@@ -1101,7 +1101,7 @@ describe("daemon idle timeout", () => {
 });
 
 describe("daemon auth", () => {
-  it("keeps expand body-shape and JSON syntax errors distinct over authenticated HTTP", async () => {
+  it("rejects null bodies across authenticated route admission modes", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-expand-body-"));
     const lcmDir = join(dir, ".lcm");
     const configPath = join(lcmDir, "config.json");
@@ -1123,13 +1123,15 @@ describe("daemon auth", () => {
         Authorization: `Bearer ${readAuthToken(tokenPath)!}`,
         "Content-Type": "application/json",
       };
-      const shapeResponse = await fetch(`http://127.0.0.1:${authDaemon.address().port}/expand`, {
-        method: "POST",
-        headers,
-        body: "null",
-      });
-      expect(shapeResponse.status).toBe(400);
-      await expect(shapeResponse.json()).resolves.toEqual({ error: "invalid request body" });
+      for (const path of ["/expand", "/promote-events/notify", "/review-stale"]) {
+        const shapeResponse = await fetch(`http://127.0.0.1:${authDaemon.address().port}${path}`, {
+          method: "POST",
+          headers,
+          body: "null",
+        });
+        expect(shapeResponse.status, path).toBe(400);
+        await expect(shapeResponse.json(), path).resolves.toEqual({ error: "invalid request body" });
+      }
 
       const syntaxResponse = await fetch(`http://127.0.0.1:${authDaemon.address().port}/expand`, {
         method: "POST",

@@ -91,7 +91,7 @@ component_management:
         # #710 grep mode, #792 session filtering, #793 search-limit validation,
         # #794 grep-since validation, #825 bounded atomic promotion metadata,
         # #862 recent limit validation, #863 expand depth validation, #930
-        # expand body-shape validation, and #864
+        # expand body-shape validation, #969 route body-shape validation, and #864
         # episodic search candidate recall,
         # and #833 passive-event identity admission remain route-owned.
         # #828 promotes topology failures through the route boundary while
@@ -100,6 +100,8 @@ component_management:
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
       paths:
+        # #969 promote-events notification body-shape validation remains
+        # daemon-events-owned.
         - "^src/daemon/passive-event-processor\\.ts$"
     - component_id: "unit-mcp"
       name: "Unit - MCP"

@@ -47,6 +47,10 @@ function resolveMessages(input: { client?: unknown; messages?: unknown; provider
 export function createIngestHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      sendJson(res, 400, { error: "invalid request body" });
+      return;
+    }
     const { session_id } = input;
 
     if (!session_id || !input.cwd) {

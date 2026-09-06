@@ -49,6 +49,10 @@ export function createStoreHandler(
 ): RouteHandler {
   return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      sendJson(res, 400, { error: "invalid request body" });
+      return;
+    }
     const { text, tags = [], metadata = {} } = input;
 
     if (typeof text !== "string" || !text) {

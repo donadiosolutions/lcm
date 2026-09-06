@@ -719,6 +719,40 @@ describe("PassiveEventProcessor", () => {
 });
 
 describe("createPromoteEventsNotifyHandler", () => {
+  it.each(["null", "[]", "[1]", '"text"', "0", "42", "true", "false"])(
+    "rejects the non-object body %s before notification",
+    async (body) => {
+      const processor = { notify: vi.fn() } as unknown as PassiveEventProcessor;
+      const handler = createPromoteEventsNotifyHandler(processor);
+      const { res, getBody } = mockRes();
+
+      await expect(handler(request, res, body)).resolves.toBeUndefined();
+
+      expect(res.writeHead).toHaveBeenCalledWith(400, expect.any(Object));
+      expect(getBody()).toEqual({ error: "invalid request body" });
+      expect(processor.notify).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves empty-body fallback and malformed JSON handling", async () => {
+    const processor = { notify: vi.fn() } as unknown as PassiveEventProcessor;
+    const handler = createPromoteEventsNotifyHandler(processor);
+    const empty = mockRes();
+    const object = mockRes();
+    const malformed = mockRes();
+
+    await handler(request, empty.res, "");
+    await handler(request, object.res, "{}");
+    await handler(request, malformed.res, "{");
+
+    expect(empty.res.writeHead).toHaveBeenCalledWith(400, expect.any(Object));
+    expect(empty.getBody()).toEqual({ error: "cwd is required" });
+    expect(object.getBody()).toEqual(empty.getBody());
+    expect(malformed.res.writeHead).toHaveBeenCalledWith(400, expect.any(Object));
+    expect(malformed.getBody()).toEqual({ error: "invalid json" });
+    expect(processor.notify).not.toHaveBeenCalled();
+  });
+
   it("validates cwd and queues processor work", async () => {
     const processor = { notify: vi.fn() } as unknown as PassiveEventProcessor;
     const handler = createPromoteEventsNotifyHandler(processor);

@@ -486,7 +486,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(208);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#866/#722/#786/#952/#814/#930 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#866/#722/#786/#952/#814/#930/#969 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -498,6 +498,8 @@ describe("Codecov configuration", () => {
     // existing route component. #862 keeps recent limit validation, #863
     // keeps expand depth validation in the same daemon-routes component.
     // #930 keeps expand body-shape validation in that component as well.
+    // #969 keeps the route-family and passive notification body-shape
+    // validation in their existing route and daemon-events components.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     // #814 fresh-root descriptor and pre-handoff content checks remain
     // configuration-security-owned.
@@ -523,6 +525,11 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/compact.ts", "unit-daemon-routes"],
       ["src/daemon/routes/describe.ts", "unit-daemon-routes"],
       ["src/daemon/routes/expand.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/ingest.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/store.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/status.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/session-complete.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/review-stale.ts", "unit-daemon-routes"],
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
       // #833 passive-event identity admission remains route-owned.
@@ -533,6 +540,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/grep.ts", "unit-daemon-routes"],
       ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
       ["src/daemon/routes/recent.ts", "unit-daemon-routes"],
+      ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
       ["src/llm/codex-process.ts", "unit-llm-prompts"],

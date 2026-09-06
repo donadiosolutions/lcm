@@ -316,6 +316,10 @@ export function createPromoteEventsNotifyHandler(processor: PassiveEventProcesso
       sendJson(res, 400, { error: "invalid json" });
       return;
     }
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      sendJson(res, 400, { error: "invalid request body" });
+      return;
+    }
     const cwd = typeof input.cwd === "string" ? input.cwd.trim() : "";
     if (cwd.length === 0) {
       sendJson(res, 400, { error: "cwd is required" });
