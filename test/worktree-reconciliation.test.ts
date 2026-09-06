@@ -827,7 +827,7 @@ function findTopologyError(error: unknown): unknown {
 
 async function importReconciliationWithTransactionMode(
   mode: "missing" | "false",
-  rollbackError?: Error,
+  rollbackError: Error,
 ): Promise<typeof import("../src/worktree-reconciliation.js")> {
   vi.resetModules();
   vi.doMock("node:sqlite", async () => {
@@ -845,7 +845,7 @@ async function importReconciliationWithTransactionMode(
             }
             return (sql: string): void => {
               const result = value.call(target, sql);
-              if (sql.trim() === "ROLLBACK" && rollbackError !== undefined) {
+              if (sql.trim() === "ROLLBACK") {
                 throw rollbackError;
               }
               return result;
@@ -1895,7 +1895,7 @@ describe("worktree reconciliation", () => {
       let main: string;
       let sourceHash = "";
       let targetDir: string | undefined;
-      const targetPath = kind === "project"
+      void (kind === "project"
         ? (() => {
           const fixture = makeProjectReconciliation(home);
           main = fixture.main;
@@ -1938,7 +1938,7 @@ describe("worktree reconciliation", () => {
             target.close();
           }
           return fixture.targetEvents;
-        })();
+        })());
       const displaced = kind === "project"
         ? `${targetDir!}.post-commit-displaced`
         : `${join(home, ".lcm", "events")}.post-commit-displaced`;
