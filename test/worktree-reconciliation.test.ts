@@ -2643,6 +2643,167 @@ describe("worktree reconciliation", () => {
         "reconciliation target directory cleanup failed",
       );
       expect(isolated.remainingDescriptorPaths()).toEqual([]);
+      const journalPath = join(home, ".lcm", "reconciliations", `${targetHash}.json`);
+      const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+        phase: string;
+        blockedFrom?: string;
+        reason?: string;
+      };
+      expect(journal.phase).toBe("completed");
+      expect(journal).not.toHaveProperty("blockedFrom");
+      expect(journal).not.toHaveProperty("reason");
+      expect(listProjectMapEntries()).toEqual({
+        [targetHash]: { canonical, aliases: [linked] },
+      });
+      expect(statSync(join(home, ".lcm", "projects", sourceHash)).isFile()).toBe(true);
+      expect(readdirSync(join(home, ".lcm", "oldprojects"))).toHaveLength(1);
+
+      const linkedB = join(home, "linked-b");
+      git(main, "worktree", "add", "-qb", "linked-b", linkedB);
+      const sourceBHash = hashProjectPath(linkedB);
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+        [targetHash]: listProjectMapEntries()[targetHash],
+        [sourceBHash]: { canonical: linkedB, aliases: [] },
+      }, null, 2)}\n`);
+      clearProjectMapCache();
+      makeDatabase(
+        join(home, ".lcm", "projects", sourceBHash, "db.sqlite"),
+        "fresh-retry",
+        "fresh retry content",
+        sourceBHash,
+      );
+
+      expect(isolated.module.reconcileWorktrees(main).status).toBe("completed");
+      expect(listProjectMapEntries()).toEqual({
+        [targetHash]: { canonical, aliases: expect.arrayContaining([linked, linkedB]) },
+      });
+      expect(listProjectMapEntries()).not.toHaveProperty(sourceBHash);
+      const targetDb = new DatabaseSync(
+        join(home, ".lcm", "projects", targetHash, "db.sqlite"),
+        { readOnly: true },
+      );
+      expect(targetDb.prepare(
+        "SELECT session_id FROM conversations WHERE session_id = 'fresh-retry'",
+      ).get()).toEqual({ session_id: "fresh-retry" });
+      targetDb.close();
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("blocks new work after a completed journal when it fails before completion", async () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    makePrivateFixtureDirectory(join(home, ".lcm", "projects", sourceHash), { recursive: true });
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir: join(home, ".lcm", "projects", targetHash),
+    });
+    try {
+      expect(isolated.module.reconcileWorktrees(main).status).toBe("completed");
+      const linkedB = join(home, "linked-b");
+      git(main, "worktree", "add", "-qb", "linked-b", linkedB);
+      const sourceBHash = hashProjectPath(linkedB);
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+        [targetHash]: listProjectMapEntries()[targetHash],
+        [sourceBHash]: { canonical: linkedB, aliases: [] },
+      }, null, 2)}\n`);
+      clearProjectMapCache();
+      makeDatabase(
+        join(home, ".lcm", "projects", sourceBHash, "db.sqlite"),
+        "pre-completion-failure",
+        "content",
+        sourceBHash,
+      );
+      expect(() => isolated.module.reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event === "before-source-main-merge") {
+            throw new Error("injected pre-completion failure");
+          }
+        },
+      })).toThrow("injected pre-completion failure");
+      const journal = JSON.parse(readFileSync(
+        join(home, ".lcm", "reconciliations", `${targetHash}.json`),
+        "utf8",
+      )) as {
+        phase: string;
+        blockedFrom?: string;
+        reason?: string;
+        sourceHashes: string[];
+      };
+      expect(journal.phase).toBe("blocked");
+      expect(journal.blockedFrom).toBe("planned");
+      expect(journal.reason).toContain("injected pre-completion failure");
+      expect(journal.sourceHashes).toEqual([sourceHash, sourceBHash]);
+      expect(listProjectMapEntries()).toHaveProperty(sourceBHash);
+      expect(existsSync(join(home, ".lcm", "projects", sourceBHash, "db.sqlite"))).toBe(true);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("blocks new work when a stale completed journal is observed before discovery", async () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    makePrivateFixtureDirectory(join(home, ".lcm", "projects", sourceHash), { recursive: true });
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const isolated = await importReconciliationWithDirectoryFaults({ targetDir });
+    try {
+      expect(isolated.module.reconcileWorktrees(main).status).toBe("completed");
+      const linkedB = join(home, "linked-b");
+      git(main, "worktree", "add", "-qb", "linked-b", linkedB);
+      const sourceBHash = hashProjectPath(linkedB);
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+        [targetHash]: listProjectMapEntries()[targetHash],
+        [sourceBHash]: { canonical: linkedB, aliases: [] },
+      }, null, 2)}\n`);
+      clearProjectMapCache();
+      makeDatabase(
+        join(home, ".lcm", "projects", sourceBHash, "db.sqlite"),
+        "early-stale-completed-failure",
+        "content",
+        sourceBHash,
+      );
+      const journalPath = join(home, ".lcm", "reconciliations", `${targetHash}.json`);
+      expect(() => isolated.module.reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event !== "after-map-preflight") return;
+          const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+            phase: string;
+            sourceHashes: string[];
+            pendingSourceHashes: string[];
+          };
+          expect(journal.phase).toBe("completed");
+          expect(journal.sourceHashes).toEqual([sourceHash]);
+          expect(journal.pendingSourceHashes).toEqual([]);
+          throw new Error("injected stale-completed precompletion failure");
+        },
+      })).toThrow("injected stale-completed precompletion failure");
+      const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+        phase: string;
+        blockedFrom?: string;
+        reason?: string;
+        sourceHashes: string[];
+        pendingSourceHashes: string[];
+      };
+      expect(journal.phase).toBe("blocked");
+      expect(journal.blockedFrom).toBe("planned");
+      expect(journal.reason).toContain("injected stale-completed precompletion failure");
+      expect(journal.sourceHashes).toEqual([sourceHash]);
+      expect(journal.pendingSourceHashes).toEqual([]);
+      expect(listProjectMapEntries()).toHaveProperty(sourceBHash);
+      expect(existsSync(join(home, ".lcm", "projects", sourceBHash, "db.sqlite"))).toBe(true);
     } finally {
       resetReconciliationModuleMocks();
     }

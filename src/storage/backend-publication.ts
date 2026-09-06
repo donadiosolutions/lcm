@@ -7,6 +7,7 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
+  PrivateMutationLockContentionError,
   PrivateMutationPermit,
   withPrivateMutationLock,
   withPrivateMutationLockAsync,
@@ -1297,6 +1298,55 @@ function openOptionalRootDirectory(homeDir?: string): ReturnType<typeof openPriv
   }
 }
 
+type ConsumerOperationOutcome<T> =
+  | Readonly<{ succeeded: true; value: T }>
+  | Readonly<{ succeeded: false; error: unknown }>;
+
+function completeConsumerOperation<T>(
+  publicationHandle: ReturnType<typeof openPrivateDirectory> | undefined,
+  rootHandle: ReturnType<typeof openPrivateDirectory> | undefined,
+  outcome: ConsumerOperationOutcome<T>,
+): T {
+  const cleanupErrors: unknown[] = [];
+  for (const handle of [publicationHandle, rootHandle]) {
+    try {
+      handle?.close();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (cleanupErrors.length === 0) {
+    if (outcome.succeeded) return outcome.value;
+    throw outcome.error;
+  }
+  if (outcome.succeeded) {
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    throw new AggregateError(
+      cleanupErrors,
+      "backend publication consumer descriptor cleanup failed",
+    );
+  }
+  const aggregate = new AggregateError(
+    [outcome.error, ...cleanupErrors],
+    "backend publication consumer operation and descriptor cleanup failed",
+    { cause: outcome.error },
+  );
+  if (outcome.error instanceof BackendPublicationJournalError) {
+    throw new BackendPublicationJournalError(
+      outcome.error.reason,
+      outcome.error.message,
+      { cause: aggregate },
+    );
+  }
+  if (outcome.error instanceof PrivateMutationLockContentionError) {
+    throw new PrivateMutationLockContentionError(
+      outcome.error.message,
+      { cause: aggregate },
+    );
+  }
+  throw aggregate;
+}
+
 /** Open the canonical LCM root using the consumer path's legacy-read compatibility rule. */
 export function openBackendPublicationReadRoot(
   homeDir?: string,
@@ -1378,15 +1428,16 @@ function consumerLockCallback<T>(
       revokeLockToken(token);
     }
   };
+  let outcome: ConsumerOperationOutcome<T>;
   try {
     publicationHandle = rootHandle === undefined
       ? undefined
       : openOptionalPublicationDirectory(homeDir);
-    return withBackendPublicationLock(homeDir, run);
-  } finally {
-    publicationHandle?.close();
-    rootHandle?.close();
+    outcome = { succeeded: true, value: withBackendPublicationLock(homeDir, run) };
+  } catch (error) {
+    outcome = { succeeded: false, error };
   }
+  return completeConsumerOperation(publicationHandle, rootHandle, outcome);
 }
 
 /** Serialize a synchronous local consumer without creating publication roots. */
@@ -1439,15 +1490,19 @@ export async function withBackendPublicationConsumerLockAsync<T>(
       revokeLockToken(token);
     }
   };
+  let outcome: ConsumerOperationOutcome<T>;
   try {
     publicationHandle = rootHandle === undefined
       ? undefined
       : openOptionalPublicationDirectory(homeDir);
-    return await withBackendPublicationLockAsync(homeDir, run);
-  } finally {
-    publicationHandle?.close();
-    rootHandle?.close();
+    outcome = {
+      succeeded: true,
+      value: await withBackendPublicationLockAsync(homeDir, run),
+    };
+  } catch (error) {
+    outcome = { succeeded: false, error };
   }
+  return completeConsumerOperation(publicationHandle, rootHandle, outcome);
 }
 
 export function assertBackendPublicationConsumerAccess(options: {

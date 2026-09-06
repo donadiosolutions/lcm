@@ -171,6 +171,7 @@ component_management:
         # #942 binds every coordinator checkpoint read and write boundary to
         # that retained operation-scoped directory witness.
         # #837 retains consumer-admission descriptor cleanup in this owner.
+        # #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
         # #906 keeps bounded publication-convergence probe expiry and error
         # selection in this storage-abstractions owner.
         - "^src/storage/backend\\.ts$"
@@ -245,9 +246,13 @@ component_management:
         - "^src/machine-identity\\.ts$"
         # #889 keeps private import metadata publication in this owner.
         - "^src/portable-knowledge\\.ts$"
+        # #1049 keeps project metadata owner and single-link admission in this
+        # existing component; no taxonomy, status, or policy change.
         - "^src/project-map\\.ts$"
         - "^src/worktree-reconciliation-fence\\.ts$"
         # #1044 keeps the existing owner; no taxonomy, status, or policy change.
+        # #1069 preserves completed reconciliation evidence after retained
+        # directory cleanup failures in this existing component.
         - "^src/worktree-reconciliation\\.ts$"
     - component_id: "unit-diagnostics"
       name: "Unit - Diagnostics"
