@@ -313,8 +313,7 @@ describe("publication convergence", () => {
         }),
       })) as unknown as typeof globalThis.fetch;
       const sleep = vi.fn(async () => {
-        if (sleep.mock.calls.length === 1) monotonicNow = 2_099.5;
-        else wallNow = Number.MAX_SAFE_INTEGER;
+        monotonicNow = 2_099.5;
       });
       const convergence = createPublicationConvergence({
         port: 3737,
@@ -324,6 +323,7 @@ describe("publication convergence", () => {
       let attempts = 0;
       await expect(withPublicationAdmissionRetry(() => {
         attempts += 1;
+        if (attempts > 3) throw new Error("fractional retry did not expire");
         throw attempts === 1 ? first : second;
       }, convergence)).rejects.toBe(first);
       expect(attempts).toBe(2);
