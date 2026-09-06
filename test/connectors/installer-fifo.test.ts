@@ -1,9 +1,10 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const STARTUP_BUDGET_MS = 10_000;
 const OPERATION_BUDGET_MS = 1_000;
@@ -13,6 +14,7 @@ const CHILD_TEST_TIMEOUT_MS = 20_000;
 const roots: string[] = [];
 const activeChildren = new Set<ChildProcess>();
 const closedChildren = new WeakSet<ChildProcess>();
+const reapPromises = new WeakMap<ChildProcess, Promise<void>>();
 
 type ChildPhase = "startup" | "operation" | "exited";
 type ChildResult = {
@@ -27,7 +29,40 @@ type ChildOptions = {
   readonly startupBudgetMs?: number;
   readonly operationBudgetMs?: number;
   readonly closeGraceMs?: number;
+  readonly spawnFactory?: () => ChildProcess;
 };
+
+class FakeChild extends EventEmitter {
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+  connected = true;
+  killCalls = 0;
+  disconnectCalls = 0;
+
+  constructor(private readonly onDisconnect?: () => void) {
+    super();
+  }
+
+  kill(): boolean {
+    this.killCalls += 1;
+    return true;
+  }
+
+  disconnect(): void {
+    this.disconnectCalls += 1;
+    this.connected = false;
+    this.onDisconnect?.();
+  }
+
+  send(_message: unknown, callback?: (error: Error | null) => void): boolean {
+    callback?.(null);
+    return true;
+  }
+
+  asChildProcess(): ChildProcess {
+    return this as unknown as ChildProcess;
+  }
+}
 
 function killQuietly(child: ChildProcess): void {
   try {
@@ -47,19 +82,45 @@ function disconnectQuietly(child: ChildProcess): void {
 }
 
 async function reapChild(child: ChildProcess, graceMs = CLOSE_GRACE_MS): Promise<void> {
-  if (closedChildren.has(child)) return;
-  if (child.exitCode === null && child.signalCode === null) {
-    disconnectQuietly(child);
-    killQuietly(child);
+  if (closedChildren.has(child)) {
+    activeChildren.delete(child);
+    return;
+  }
+  const existingReap = reapPromises.get(child);
+  if (existingReap !== undefined) {
+    await existingReap;
+    return;
   }
 
-  await new Promise<void>((resolveReap) => {
-    const grace = setTimeout(resolveReap, graceMs);
-    child.once("close", () => {
-      clearTimeout(grace);
+  let resolveReap!: () => void;
+  let settled = false;
+  let grace: ReturnType<typeof setTimeout> | undefined;
+  const reap = new Promise<void>((resolve) => {
+    resolveReap = resolve;
+    const complete = (): void => {
+      if (settled) return;
+      settled = true;
+      if (grace !== undefined) clearTimeout(grace);
+      child.removeListener("close", onClose);
+      activeChildren.delete(child);
       resolveReap();
-    });
+    };
+    const onClose = (): void => {
+      closedChildren.add(child);
+      complete();
+    };
+    child.once("close", onClose);
+    grace = setTimeout(complete, graceMs);
+    if (child.exitCode === null && child.signalCode === null) {
+      disconnectQuietly(child);
+      killQuietly(child);
+    }
   });
+  const trackedReap = reap.finally(() => {
+    reapPromises.delete(child);
+  });
+  reapPromises.set(child, trackedReap);
+  await trackedReap;
 }
 
 function runChild({
@@ -67,6 +128,7 @@ function runChild({
   startupBudgetMs = STARTUP_BUDGET_MS,
   operationBudgetMs = OPERATION_BUDGET_MS,
   closeGraceMs = CLOSE_GRACE_MS,
+  spawnFactory,
 }: ChildOptions): Promise<ChildResult> {
   const sourceLoader = `data:text/javascript,${encodeURIComponent([
     "export async function resolve(specifier, context, nextResolve) {",
@@ -74,17 +136,17 @@ function runChild({
     "  return nextResolve(specifier, context);",
     "}",
   ].join("\n"))}`;
-  const child = spawn(process.execPath, [
-    "--experimental-transform-types",
-    "--loader",
-    sourceLoader,
-    "--input-type=module",
-    "--eval",
-    source,
-  ], {
-    env: process.env,
-    stdio: ["ignore", "ignore", "ignore", "ipc"],
-  });
+  const child = spawnFactory?.() ?? spawn(process.execPath, [
+      "--experimental-transform-types",
+      "--loader",
+      sourceLoader,
+      "--input-type=module",
+      "--eval",
+      source,
+    ], {
+      env: process.env,
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
   activeChildren.add(child);
 
   const lifecycle = new Promise<ChildResult>((resolveResult) => {
@@ -111,7 +173,6 @@ function runChild({
       if (settled) return;
       settled = true;
       clearTimers();
-      activeChildren.delete(child);
       resolveResult(nextResult);
     };
 
@@ -182,6 +243,7 @@ function runChild({
     child.once("exit", onExit);
     child.once("close", (code, signal) => {
       closedChildren.add(child);
+      activeChildren.delete(child);
       if (exitSnapshot === undefined) exitSnapshot = { code, signal };
       if (result !== undefined && result.outcome === "timeout") {
         result = {
@@ -300,6 +362,132 @@ function installerChildSource(
 afterEach(async () => {
   await Promise.all([...activeChildren].map((child) => reapChild(child)));
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+describe("connector installer child ownership", () => {
+  it("retains ownership until the final reap completes after exit without close", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let run: Promise<ChildResult> | undefined;
+    let settled = false;
+    const child = new FakeChild();
+    try {
+      run = runChild({
+        source: "",
+        closeGraceMs: 5,
+        spawnFactory: () => child.asChildProcess(),
+      });
+      run.then(() => { settled = true; });
+      child.emit("exit", 0, null);
+
+      await vi.advanceTimersByTimeAsync(5);
+      await Promise.resolve();
+
+      expect(activeChildren.has(child.asChildProcess())).toBe(true);
+      expect(settled).toBe(false);
+      expect(child.listenerCount("close")).toBe(2);
+
+      await vi.advanceTimersByTimeAsync(CLOSE_GRACE_MS);
+      await run;
+
+      expect(activeChildren.has(child.asChildProcess())).toBe(false);
+      expect(child.listenerCount("close")).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      if (run !== undefined) {
+        await vi.runAllTimersAsync();
+        await run;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("observes close during the final reap and cleans its temporary listener", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let run: Promise<ChildResult> | undefined;
+    const child = new FakeChild(() => child.emit("close", 0, null));
+    try {
+      run = runChild({
+        source: "",
+        closeGraceMs: 5,
+        spawnFactory: () => child.asChildProcess(),
+      });
+      child.emit("exit", 1, null);
+
+      await vi.advanceTimersByTimeAsync(5);
+      await Promise.resolve();
+
+      await run;
+
+      expect(child.disconnectCalls).toBe(1);
+      expect(child.killCalls).toBe(1);
+      expect(activeChildren.has(child.asChildProcess())).toBe(false);
+      expect(child.listenerCount("close")).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      if (run !== undefined) {
+        await vi.runAllTimersAsync();
+        await run;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases ownership when the final reap grace expires without close", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let run: Promise<ChildResult> | undefined;
+    const child = new FakeChild();
+    try {
+      run = runChild({
+        source: "",
+        closeGraceMs: 5,
+        spawnFactory: () => child.asChildProcess(),
+      });
+      child.emit("exit", 1, null);
+
+      await vi.advanceTimersByTimeAsync(5);
+      await Promise.resolve();
+      expect(activeChildren.has(child.asChildProcess())).toBe(true);
+      expect(child.listenerCount("close")).toBe(2);
+
+      await vi.advanceTimersByTimeAsync(CLOSE_GRACE_MS);
+      await run;
+
+      expect(activeChildren.has(child.asChildProcess())).toBe(false);
+      expect(child.listenerCount("close")).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      if (run !== undefined) {
+        await vi.runAllTimersAsync();
+        await run;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases ownership on a normal close without leaving timers", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let run: Promise<ChildResult> | undefined;
+    const child = new FakeChild();
+    try {
+      run = runChild({
+        source: "",
+        spawnFactory: () => child.asChildProcess(),
+      });
+      child.emit("close", 0, null);
+
+      await run;
+
+      expect(activeChildren.has(child.asChildProcess())).toBe(false);
+      expect(child.listenerCount("close")).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      if (run !== undefined) {
+        await vi.runAllTimersAsync();
+        await run;
+      }
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("connector installer FIFO safety", () => {
