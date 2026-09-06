@@ -39,7 +39,7 @@ export interface DoctorDeps {
   _lstatLcmRootForTesting?: typeof import("node:fs").lstatSync;
   /** Internal seam invoked between the two convergence stage attempts. */
   _betweenConvergenceAttemptsForTesting?: () => void;
-  /** Internal convergence clock seam used by deterministic publication tests. */
+  /** Internal monotonic elapsed-milliseconds seam for publication retry deadlines. */
   _publicationConvergenceNow?: () => number;
   /** Internal convergence wait seam used by deterministic publication tests. */
   _publicationConvergenceSleep?: (delayMs: number) => Promise<void>;

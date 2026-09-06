@@ -272,9 +272,9 @@ type ConvergenceDaemonIdentity = Readonly<{
 }>;
 
 /**
- * Doctor stages that must remain eligible for convergence share one wall-clock
- * budget so the total time spent waiting on the daemon's publication work is
- * bounded across the entire doctor run, not per stage.
+ * Doctor stages that must remain eligible for convergence share one monotonic
+ * elapsed-time budget so the total time spent waiting on the daemon's
+ * publication work is bounded across the entire doctor run, not per stage.
  */
 type PublicationConvergence = Readonly<{
   identity: ConvergenceDaemonIdentity | undefined;
@@ -329,7 +329,7 @@ function createPublicationConvergence(
   deps: DoctorDeps,
   identity: ConvergenceDaemonIdentity | undefined,
 ): PublicationConvergence {
-  const now = deps._publicationConvergenceNow ?? Date.now;
+  const now = deps._publicationConvergenceNow ?? performance.now.bind(performance);
   const sleep = deps._publicationConvergenceSleep
     ?? ((delayMs: number) => new Promise<void>(resolve => setTimeout(resolve, delayMs)));
   return {

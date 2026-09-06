@@ -67,7 +67,8 @@ component_management:
       name: "Unit - Daemon Core"
       paths:
         # Keep the #691/#700 response fences, #701 terminal factory-close retry,
-        # runtime identity, and #825 bounded project metadata limit here.
+        # runtime identity, #825 bounded project metadata, and #1003
+        # owner/single-link preliminary metadata admission here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
@@ -78,6 +79,7 @@ component_management:
         - "^src/daemon/orientation\\.ts$"
         - "^src/daemon/project-queue\\.ts$"
         - "^src/daemon/project\\.ts$"
+        # Monotonic proxy startup polling remains daemon-core-owned.
         - "^src/daemon/proxy-manager\\.ts$"
         - "^src/daemon/remediation\\.ts$"
         # Error sanitization, including #893 adjacent-path redaction, remains daemon-core-owned.
@@ -228,6 +230,7 @@ component_management:
       name: "Unit - Diagnostics"
       paths:
         - "^src/diagnose\\.ts$"
+        # #997 keeps doctor publication retry deadlines monotonic in this owner.
         - "src/doctor/"
     - component_id: "integration-service-managers"
       name: "Integration - Service Managers and Legacy Migration"

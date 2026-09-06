@@ -202,9 +202,9 @@ function runChild({
     const killForFailure = (error: Error, timeout: boolean): void => {
       if (settled) return;
       setFailure(error, timeout);
+      armCloseGrace();
       if (child.exitCode !== null || child.signalCode !== null) return;
       killQuietly(child);
-      armCloseGrace();
     };
 
     const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
@@ -365,6 +365,133 @@ afterEach(async () => {
 });
 
 describe("connector installer child ownership", () => {
+  it("settles an error after an exited child reports an exit code without close", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let run: Promise<ChildResult> | undefined;
+    let settled = false;
+    const child = new FakeChild();
+    const originalError = new Error("original exit-code failure");
+    child.exitCode = 7;
+    try {
+      run = runChild({
+        source: "",
+        closeGraceMs: 5,
+        spawnFactory: () => child.asChildProcess(),
+      });
+      run.then(() => { settled = true; });
+      child.emit("error", originalError);
+      child.emit("exit", 11, "SIGTERM");
+
+      await vi.advanceTimersByTimeAsync(5);
+      await Promise.resolve();
+      expect(activeChildren.has(child.asChildProcess())).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(CLOSE_GRACE_MS);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(settled).toBe(true);
+      expect(child.killCalls).toBe(0);
+      expect(child.disconnectCalls).toBe(0);
+      expect(activeChildren.has(child.asChildProcess())).toBe(false);
+      expect(child.listenerCount("close")).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+
+      const result = await run;
+      expect(result).toMatchObject({ outcome: "error", code: 7, signal: null });
+      expect(result.error).toBe(originalError);
+    } finally {
+      if (run !== undefined) {
+        child.emit("close", 7, null);
+        await vi.runAllTimersAsync();
+        await run;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("settles an error after an exited child reports a signal without close", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let run: Promise<ChildResult> | undefined;
+    let settled = false;
+    const child = new FakeChild();
+    const originalError = new Error("original signal failure");
+    child.signalCode = "SIGTERM";
+    try {
+      run = runChild({
+        source: "",
+        closeGraceMs: 5,
+        spawnFactory: () => child.asChildProcess(),
+      });
+      run.then(() => { settled = true; });
+      child.emit("error", originalError);
+      child.emit("exit", 11, null);
+
+      await vi.advanceTimersByTimeAsync(5);
+      await Promise.resolve();
+      expect(activeChildren.has(child.asChildProcess())).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(CLOSE_GRACE_MS);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(settled).toBe(true);
+      expect(child.killCalls).toBe(0);
+      expect(child.disconnectCalls).toBe(0);
+      expect(activeChildren.has(child.asChildProcess())).toBe(false);
+      expect(child.listenerCount("close")).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+
+      const result = await run;
+      expect(result).toMatchObject({ outcome: "error", code: null, signal: "SIGTERM" });
+      expect(result.error).toBe(originalError);
+    } finally {
+      if (run !== undefined) {
+        child.emit("close", null, "SIGTERM");
+        await vi.runAllTimersAsync();
+        await run;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves an already-exited failure when close arrives before grace", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let run: Promise<ChildResult> | undefined;
+    let settled = false;
+    const child = new FakeChild();
+    const originalError = new Error("close-before-grace failure");
+    child.exitCode = 13;
+    try {
+      run = runChild({
+        source: "",
+        closeGraceMs: 5,
+        spawnFactory: () => child.asChildProcess(),
+      });
+      run.then(() => { settled = true; });
+      child.emit("error", originalError);
+      child.emit("exit", 17, "SIGTERM");
+      child.emit("close", 13, null);
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(true);
+      expect(child.killCalls).toBe(0);
+      expect(child.disconnectCalls).toBe(0);
+      expect(activeChildren.has(child.asChildProcess())).toBe(false);
+      expect(child.listenerCount("close")).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+
+      const result = await run;
+      expect(result).toMatchObject({ outcome: "error", code: 13, signal: null });
+      expect(result.error).toBe(originalError);
+    } finally {
+      if (run !== undefined) {
+        child.emit("close", 13, null);
+        await vi.runAllTimersAsync();
+        await run;
+      }
+      vi.useRealTimers();
+    }
+  });
+
   it("retains ownership until the final reap completes after exit without close", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     let run: Promise<ChildResult> | undefined;
@@ -490,6 +617,90 @@ describe("connector installer child ownership", () => {
   });
 });
 
+describe("connector installer child lifecycle ordering", () => {
+  const earlyExitCases = [
+    {
+      name: "exit then disconnect then close",
+      expectedMessage: "child exited before completing the operation",
+      emit: (child: FakeChild): void => {
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+        child.connected = false;
+        child.emit("disconnect");
+        child.emit("close", 0, null);
+      },
+    },
+    {
+      name: "disconnect then exit then close",
+      expectedMessage: "child disconnected before completion",
+      emit: (child: FakeChild): void => {
+        child.connected = false;
+        child.emit("disconnect");
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+        child.emit("close", 0, null);
+      },
+    },
+  ] as const;
+
+  it.each(earlyExitCases)("reports an Error for $name", async ({ emit, expectedMessage }) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let run: Promise<ChildResult> | undefined;
+    const child = new FakeChild();
+    try {
+      run = runChild({
+        source: "",
+        spawnFactory: () => child.asChildProcess(),
+      });
+      emit(child);
+
+      const result = await run;
+
+      expect(result.outcome).toBe("error");
+      expect(result.error).toBeInstanceOf(Error);
+      expect(result.error?.message).toBe(expectedMessage);
+      expect(activeChildren.has(child.asChildProcess())).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      if (run !== undefined) {
+        await vi.runAllTimersAsync();
+        await run;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("completes a ready child after a result before exit and close", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let run: Promise<ChildResult> | undefined;
+    const child = new FakeChild();
+    try {
+      run = runChild({
+        source: "",
+        spawnFactory: () => child.asChildProcess(),
+      });
+      child.emit("message", { type: "ready" });
+      child.emit("message", { type: "result", code: 0 });
+      child.exitCode = 0;
+      child.emit("exit", 0, null);
+      child.emit("close", 0, null);
+
+      const result = await run;
+
+      expect(result).toMatchObject({ outcome: "completed", code: 0, signal: null });
+      expect(result.error).toBeUndefined();
+      expect(activeChildren.has(child.asChildProcess())).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      if (run !== undefined) {
+        await vi.runAllTimersAsync();
+        await run;
+      }
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("connector installer FIFO safety", () => {
   it.runIf(process.platform === "linux")("rejects a FIFO without blocking the public installer API", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-installer-fifo-"));
@@ -539,6 +750,6 @@ describe("connector installer FIFO safety", () => {
     });
 
     expect(result.outcome).toBe("error");
-    expect(result.error?.message).toContain("before completion");
+    expect(result.error).toBeInstanceOf(Error);
   }, CHILD_TEST_TIMEOUT_MS);
 });

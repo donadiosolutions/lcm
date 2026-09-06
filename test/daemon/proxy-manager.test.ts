@@ -58,6 +58,107 @@ describe("ClaudeCliProxyManager", () => {
   });
 
   describe("start()", () => {
+    it("admits health before the monotonic deadline after a forward wall-clock jump", async () => {
+      vi.useFakeTimers({
+        now: new Date("2026-01-01T00:00:00.000Z"),
+        toFake: ["Date", "performance", "setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+      });
+      const child = makeMockChild();
+      (spawn as ReturnType<typeof vi.fn>).mockReturnValue(child);
+      (existsSync as ReturnType<typeof vi.fn>).mockReturnValue(false);
+      const mockFetch = vi.fn()
+        .mockResolvedValueOnce({ ok: false, json: () => Promise.resolve({}) })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ service: "claude-server" }),
+        });
+      const performanceNowSpy = vi.spyOn(performance, "now");
+      manager = createClaudeCliProxyManager({
+        port: 13456,
+        startupTimeoutMs: 500,
+        model: "claude-haiku-4-5",
+        pidFilePath: "/tmp/test-lcm-proxy.pid",
+        healthPollIntervalMs: 50,
+        _fetchOverride: mockFetch,
+      });
+
+      try {
+        const start = manager.start();
+        await vi.advanceTimersByTimeAsync(0);
+        const monotonicBeforeJump = performance.now();
+        vi.setSystemTime(new Date("2027-01-01T00:00:00.000Z"));
+        expect(Date.now()).toBeGreaterThan(new Date("2026-01-01T00:00:00.000Z").getTime());
+        expect(performance.now()).toBe(monotonicBeforeJump);
+
+        await vi.advanceTimersByTimeAsync(50);
+        await expect(start).resolves.toBeUndefined();
+        expect(manager.available).toBe(true);
+        expect(child.kill).not.toHaveBeenCalled();
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+      } finally {
+        await manager.stop();
+        performanceNowSpy.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    it("times out and cleans up after a backward wall-clock jump", async () => {
+      vi.useFakeTimers({
+        now: new Date("2026-01-01T00:00:00.000Z"),
+        toFake: ["Date", "performance", "setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+      });
+      const child = makeMockChild();
+      (spawn as ReturnType<typeof vi.fn>).mockReturnValue(child);
+      (existsSync as ReturnType<typeof vi.fn>)
+        .mockReturnValueOnce(false)
+        .mockReturnValue(true);
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: false,
+        json: () => Promise.resolve({}),
+      });
+      const performanceNowSpy = vi.spyOn(performance, "now");
+      manager = createClaudeCliProxyManager({
+        port: 13456,
+        startupTimeoutMs: 100,
+        model: "claude-haiku-4-5",
+        pidFilePath: "/tmp/test-lcm-proxy.pid",
+        healthPollIntervalMs: 50,
+        _fetchOverride: mockFetch,
+      });
+
+      try {
+        const initialWallClock = Date.now();
+        const start = manager.start();
+        let settledAfterMonotonicBudget = false;
+        const completion = start.then(
+          () => { settledAfterMonotonicBudget = true; },
+          () => { settledAfterMonotonicBudget = true; },
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        const monotonicBeforeJump = performance.now();
+        vi.setSystemTime(new Date(initialWallClock - 1_000));
+        expect(performance.now()).toBe(monotonicBeforeJump);
+
+        await vi.advanceTimersByTimeAsync(100);
+        const settledAtMonotonicBudget = settledAfterMonotonicBudget;
+        if (!settledAtMonotonicBudget) {
+          vi.setSystemTime(new Date(initialWallClock + 101));
+          await vi.advanceTimersByTimeAsync(50);
+        }
+        await completion;
+
+        expect(settledAtMonotonicBudget).toBe(true);
+        expect(manager.available).toBe(false);
+        expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+        expect(unlinkSync).toHaveBeenCalledWith("/tmp/test-lcm-proxy.pid");
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        await manager.stop();
+        performanceNowSpy.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
     it("spawns claude-server and writes PID file when no existing process", async () => {
       const child = makeMockChild();
       (spawn as ReturnType<typeof vi.fn>).mockReturnValue(child);

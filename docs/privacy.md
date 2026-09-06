@@ -10,18 +10,26 @@ With the default SQLite backend, all storage is on your machine:
 
 - **`~/.lcm/projects/{hash}/db.sqlite`** — Conversation messages, summaries, and promoted long-term memory for each project. The hash is a SHA-256 of the project directory path.
 - **`~/.lcm/projects/{hash}/meta.json`** — Local project identity and route
-  timestamps. Final successful ingest and compact timestamp updates read at
-  most 1 MiB from a single-link regular file, require its owner to match when a
-  process user ID is available, and replace valid metadata atomically with mode
-  `0600`. Missing metadata is created. Malformed, oversized, linked, or
-  non-regular metadata is left unchanged, as is owner-mismatched metadata when a
-  process user ID is available. These checks apply to the final route timestamp
-  update. Promote authenticates the immediate metadata parent directory before
-  reading `meta.json`, retains that admitted directory through parsing and
-  publication, and fails closed if its directory entry changes. Promotion
-  database work completed before the metadata update is not rolled back. This
-  guarantee covers the immediate metadata parent; it does not reauthenticate
-  the full ancestor chain.
+  timestamps. During preliminary project-directory initialization with
+  metadata writing enabled, LCM reads at most 1 MiB from a single-link regular
+  file whose owner matches the private LCM directory. Oversized, linked,
+  non-regular, or owner-mismatched metadata is rejected before its contents are
+  parsed or rewritten. Missing metadata is created; malformed or non-object
+  metadata is rebuilt; valid metadata with the current project path is left
+  unchanged; and valid metadata with a different path is replaced atomically
+  with mode `0600`. If metadata restored as another user blocks initialization,
+  correct its ownership or remove `meta.json`; missing metadata is regenerated
+  on the next initialization. Separately, final successful ingest and compact
+  timestamp updates use the same size, regular-file, and single-link checks as
+  a best-effort write, and require a matching owner when the process user ID is
+  available. Malformed, oversized, linked, non-regular, or owner-mismatched
+  metadata is left unchanged by those final timestamp updates. Promote
+  authenticates the immediate metadata parent directory before reading
+  `meta.json`, retains that admitted directory through parsing and publication,
+  and fails closed if its directory entry changes. Promotion database work
+  completed before the metadata update is not rolled back. This guarantee
+  covers the immediate metadata parent; it does not reauthenticate the full
+  ancestor chain.
 - **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
 - **`~/.lcm/daemon.pid`** — Daemon process ID (transient).
