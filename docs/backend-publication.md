@@ -337,13 +337,18 @@ hashes, ownership, and modes are rechecked at each non-terminal boundary.
 During `lcm install`, publication-lock admission is bounded and authenticated
 against the managed daemon already serving the configured home. The preflight
 migration, root preparation, absent-config creation, backend selection, and
-installer publication assertions share one lazily armed two-second window.
+installer publication assertions share one lazily armed two-second monotonic
+elapsed window. Wall-clock corrections do not extend or shorten this
+publication retry duration.
 Lifecycle startup uses its own post-start child convergence window only after
 the exact authenticated child has been admitted.
 Only lock-acquisition callbacks are retried; writes, prompts, skill changes,
 and daemon startup remain outside those callbacks and therefore run once. A
 foreign, malformed, stale, or unverifiable owner, or any identity drift,
-preserves the original typed contention failure and fails closed.
+fails closed. A bounded process-birth or authenticated-health probe that
+settles failed at or after the armed deadline preserves the original
+contention without another wait; the same failed evidence while time remains
+reports the later contention, and admission stays fail-closed in both cases.
 
 The terminal journal deliberately does not rehash mutable `~/.lcm/` content on
 later startups. Normal database, daemon, transcript, and configuration writes

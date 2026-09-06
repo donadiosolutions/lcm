@@ -1272,6 +1272,7 @@ describe("PostgreSQL summary/context transaction seams", () => {
         expect(serialized).not.toContain("executor must not be accessed");
         if (typeof invalidMachineId === "string" && invalidMachineId.length > 0) {
           expect(serialized).not.toContain(invalidMachineId);
+          expect(serialized).not.toContain(JSON.stringify(invalidMachineId).slice(1, -1));
         }
         expect(db.query).not.toHaveBeenCalled();
         expect(db.transaction).not.toHaveBeenCalled();

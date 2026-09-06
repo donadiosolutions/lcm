@@ -158,6 +158,26 @@ describe("transport-pure guidance", () => {
 
   it("documents the MCP grep mode contract", () => {
     const operations = readFileSync(join(process.cwd(), "src/connectors/templates/guidance/operations.mcp.md"), "utf8");
+    const leadIn = "Search prior context using full-text or regular-expression matching.";
+    const queryDescription = "- `query` is the keyword, phrase, or regex pattern to search, interpreted according to mode [required]";
+    const staleLeadIn = "Search prior context for an exact text match.";
+    const staleQueryDescription = "- `query` is the exact term or phrase [required]";
+    const renderedOperations = (guidance: string): string =>
+      guidance.match(/### MCP operations\n[\s\S]*?(?=\n## |$)/u)?.[0] ?? "";
+
+    expect(operations).toContain(leadIn);
+    expect(operations).toContain(queryDescription);
+    expect(operations).not.toContain(staleLeadIn);
+    expect(operations).not.toContain(staleQueryDescription);
+
+    for (const guidance of [renderGuidance("skill", "mcp"), renderGuidance("rules", "mcp")]) {
+      const section = renderedOperations(guidance);
+      expect(section).toContain(leadIn);
+      expect(section).toContain(queryDescription);
+      expect(section).not.toContain(staleLeadIn);
+      expect(section).not.toContain(staleQueryDescription);
+    }
+
     expect(operations).toContain("`mode` optionally selects `full_text` or `regex`");
     expect(operations).toContain("defaults to `full_text`");
     expect(operations).toContain("regex pattern");

@@ -184,6 +184,159 @@ describe("publication convergence", () => {
     expect(exhaustedNow).toBe(2_000);
   });
 
+  it("keeps the default retry window bounded across a backward wall-clock step", async () => {
+    let monotonicNow = 100;
+    let wallNow = 10_000;
+    let sleepCount = 0;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const contention = new PrivateMutationLockContentionError("backward wall step");
+    try {
+      const convergence = createPublicationConvergence({
+        port: 3737,
+        identity,
+        deps: deps({
+          sleep: async (delayMs) => {
+            sleepCount += 1;
+            if (sleepCount === 1) wallNow = 0;
+            monotonicNow += delayMs;
+            wallNow += delayMs;
+          },
+        }),
+      });
+      let attempts = 0;
+      await expect(withPublicationAdmissionRetry(() => {
+        attempts += 1;
+        if (attempts > 45) throw new Error("retry window did not expire");
+        throw contention;
+      }, convergence)).rejects.toBe(contention);
+      expect(attempts).toBe(40);
+      expect(sleepCount).toBe(40);
+      expect(dateNow).not.toHaveBeenCalled();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("does not reject the second attempt after a forward wall-clock step", async () => {
+    let monotonicNow = 100;
+    let wallNow = 10_000;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const contention = new PrivateMutationLockContentionError("forward wall step");
+    try {
+      const sleep = vi.fn(async (delayMs: number) => {
+        monotonicNow += delayMs;
+        wallNow = Number.MAX_SAFE_INTEGER;
+      });
+      const convergence = createPublicationConvergence({
+        port: 3737,
+        identity,
+        deps: deps({ sleep }),
+      });
+      let attempts = 0;
+      await expect(withPublicationAdmissionRetry(() => {
+        attempts += 1;
+        if (attempts === 1) throw contention;
+        return "second attempt";
+      }, convergence)).resolves.toBe("second attempt");
+      expect(attempts).toBe(2);
+      expect(sleep).toHaveBeenCalledOnce();
+      expect(dateNow).not.toHaveBeenCalled();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("charges birth and health probe time to the default monotonic window", async () => {
+    let monotonicNow = 100;
+    let wallNow = 1_000;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const contention = new PrivateMutationLockContentionError("probe cost");
+    try {
+      const processBirth = vi.fn(() => {
+        monotonicNow = 2_050;
+        return "birth";
+      });
+      const fetch = vi.fn(async () => {
+        monotonicNow = 2_110;
+        return {
+          ok: true,
+          json: async () => ({
+            status: "ok", pid: identity.pid, version: identity.version,
+            storageBackend: identity.storageBackend, entrypoint: identity.entrypoint,
+            runtimeDigest: identity.runtimeDigest,
+          }),
+        };
+      }) as unknown as typeof globalThis.fetch;
+      const sleep = vi.fn(async (_delayMs: number) => undefined);
+      const convergence = createPublicationConvergence({
+        port: 3737,
+        identity,
+        deps: deps({ processBirth, fetch, sleep }),
+      });
+      let attempts = 0;
+      await expect(withPublicationAdmissionRetry(() => {
+        attempts += 1;
+        if (attempts > 2) throw new Error("probe budget did not expire");
+        throw contention;
+      }, convergence)).rejects.toBe(contention);
+      expect(attempts).toBe(1);
+      expect(processBirth).toHaveBeenCalledOnce();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(sleep).not.toHaveBeenCalled();
+      expect(dateNow).not.toHaveBeenCalled();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("floors a fractional default birth budget and preserves the first error", async () => {
+    let monotonicNow = 100;
+    let wallNow = 1_000;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const first = new PrivateMutationLockContentionError("first fractional error");
+    const second = new PrivateMutationLockContentionError("second fractional error");
+    try {
+      const processBirth = vi.fn(() => "birth");
+      const fetch = vi.fn(async () => ({
+        ok: true,
+        json: async () => ({
+          status: "ok", pid: identity.pid, version: identity.version,
+          storageBackend: identity.storageBackend, entrypoint: identity.entrypoint,
+          runtimeDigest: identity.runtimeDigest,
+        }),
+      })) as unknown as typeof globalThis.fetch;
+      const sleep = vi.fn(async () => {
+        monotonicNow = 2_099.5;
+      });
+      const convergence = createPublicationConvergence({
+        port: 3737,
+        identity,
+        deps: deps({ processBirth, fetch, sleep }),
+      });
+      let attempts = 0;
+      await expect(withPublicationAdmissionRetry(() => {
+        attempts += 1;
+        if (attempts > 3) throw new Error("fractional retry did not expire");
+        throw attempts === 1 ? first : second;
+      }, convergence)).rejects.toBe(first);
+      expect(attempts).toBe(2);
+      expect(processBirth).toHaveBeenCalledOnce();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(sleep).toHaveBeenCalledOnce();
+      expect(dateNow).not.toHaveBeenCalled();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
   it("fails closed for foreign owners, missing evidence, and noncontention errors", async () => {
     const foreign = createPublicationConvergence({ port: 3737, identity, deps: deps({
       readOwner: () => ({ version: 1, pid: 99, processStartTime: "birth", nonce: "b".repeat(32) }),
@@ -351,6 +504,164 @@ describe("publication convergence", () => {
     }, convergence)).rejects.toBe(second);
     expect(attempts).toBe(2);
     expect(now).toBe(50);
+  });
+
+  it.each([
+    ["birth null", "null", () => null],
+    ["birth mismatch", "mismatch", () => "other"],
+    ["birth throw", "throw", () => { throw new Error("birth"); }],
+  ])("preserves the first contention when %s settles at or after the deadline", async (_label, _kind, failedBirth) => {
+    for (const deadlineNow of [2_000, 2_001]) {
+      let now = 0;
+      let birthCalls = 0;
+      const first = new PrivateMutationLockContentionError(`first ${String(_kind)}`);
+      const second = new PrivateMutationLockContentionError(`second ${String(_kind)}`);
+      const sleep = vi.fn(async (ms: number) => { now += ms; });
+      const convergence = createPublicationConvergence({
+        port: 3737,
+        identity,
+        deps: deps({
+          now: () => now,
+          sleep,
+          processBirth: () => {
+            birthCalls += 1;
+            if (birthCalls === 2) now = deadlineNow;
+            return birthCalls === 1 ? "birth" : failedBirth();
+          },
+        }),
+      });
+      let attempts = 0;
+      await expect(withPublicationAdmissionRetry(() => {
+        attempts += 1;
+        throw attempts === 1 ? first : second;
+      }, convergence)).rejects.toBe(first);
+      expect(attempts).toBe(2);
+      expect(sleep).toHaveBeenCalledTimes(1);
+      expect(sleep).toHaveBeenCalledWith(50);
+      expect(birthCalls).toBe(2);
+      expect(convergence.deadline).toBe(2_000);
+      expect(convergence.deps.fetch).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it.each([
+    ["before", 1_999],
+    ["at", 2_000],
+    ["after", 2_001],
+  ])("keeps the later contention for a failed birth probe %s the deadline", async (_label, deadlineNow) => {
+    let now = 0;
+    let birthCalls = 0;
+    const first = new PrivateMutationLockContentionError("first birth");
+    const second = new PrivateMutationLockContentionError("second birth");
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity,
+      deps: deps({
+        now: () => now,
+        sleep: async (ms) => { now += ms; },
+        processBirth: () => {
+          birthCalls += 1;
+          if (birthCalls === 2) now = deadlineNow;
+          return birthCalls === 1 ? "birth" : "other";
+        },
+      }),
+    });
+    let attempts = 0;
+    await expect(withPublicationAdmissionRetry(() => {
+      attempts += 1;
+      throw attempts === 1 ? first : second;
+    }, convergence)).rejects.toBe(deadlineNow < 2_000 ? second : first);
+    expect(attempts).toBe(2);
+    expect(birthCalls).toBe(2);
+    expect(convergence.deadline).toBe(2_000);
+  });
+
+  it.each([
+    ["health mismatch", "mismatch"],
+    ["health rejection", "reject"],
+    ["health malformed", "malformed"],
+  ])("preserves the first contention when %s settles at or after the deadline", async (_label, kind) => {
+    for (const deadlineNow of [2_000, 2_001]) {
+      let now = 0;
+      let fetchCalls = 0;
+      const first = new PrivateMutationLockContentionError(`first ${String(kind)}`);
+      const second = new PrivateMutationLockContentionError(`second ${String(kind)}`);
+      const sleep = vi.fn(async (ms: number) => { now += ms; });
+      const fetch = vi.fn(async () => {
+        fetchCalls += 1;
+        if (fetchCalls === 2) {
+          now = deadlineNow;
+          if (kind === "reject") throw new Error("health");
+          if (kind === "malformed") return { ok: true, json: async () => "malformed" };
+          return { ok: true, json: async () => ({ status: "ok", pid: 99 }) };
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            status: "ok", pid: identity.pid, version: identity.version,
+            storageBackend: identity.storageBackend, entrypoint: identity.entrypoint,
+            runtimeDigest: identity.runtimeDigest,
+          }),
+        };
+      }) as unknown as typeof globalThis.fetch;
+      const convergence = createPublicationConvergence({
+        port: 3737,
+        identity,
+        deps: deps({ now: () => now, sleep, fetch }),
+      });
+      let attempts = 0;
+      await expect(withPublicationAdmissionRetry(() => {
+        attempts += 1;
+        throw attempts === 1 ? first : second;
+      }, convergence)).rejects.toBe(first);
+      expect(attempts).toBe(2);
+      expect(sleep).toHaveBeenCalledTimes(1);
+      expect(sleep).toHaveBeenCalledWith(50);
+      expect(fetchCalls).toBe(2);
+      expect(convergence.deadline).toBe(2_000);
+    }
+  });
+
+  it.each([
+    ["before", 1_999],
+    ["at", 2_000],
+    ["after", 2_001],
+  ])("keeps the later contention for a failed health probe %s the deadline", async (_label, deadlineNow) => {
+    let now = 0;
+    let fetchCalls = 0;
+    const first = new PrivateMutationLockContentionError("first health");
+    const second = new PrivateMutationLockContentionError("second health");
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity,
+      deps: deps({
+        now: () => now,
+        sleep: async (ms) => { now += ms; },
+        fetch: vi.fn(async () => {
+          fetchCalls += 1;
+          if (fetchCalls === 2) {
+            now = deadlineNow;
+            return { ok: true, json: async () => ({ status: "ok", pid: 99 }) };
+          }
+          return {
+            ok: true,
+            json: async () => ({
+              status: "ok", pid: identity.pid, version: identity.version,
+              storageBackend: identity.storageBackend, entrypoint: identity.entrypoint,
+              runtimeDigest: identity.runtimeDigest,
+            }),
+          };
+        }) as unknown as typeof globalThis.fetch,
+      }),
+    });
+    let attempts = 0;
+    await expect(withPublicationAdmissionRetry(() => {
+      attempts += 1;
+      throw attempts === 1 ? first : second;
+    }, convergence)).rejects.toBe(deadlineNow < 2_000 ? second : first);
+    expect(attempts).toBe(2);
+    expect(fetchCalls).toBe(2);
+    expect(convergence.deadline).toBe(2_000);
   });
 
   it("keeps a later ordinary error unchanged after contention", async () => {

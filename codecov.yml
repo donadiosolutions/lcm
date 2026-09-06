@@ -96,10 +96,13 @@ component_management:
         # #888 bounded atomic ingest and compact metadata timestamps,
         # #862 recent limit validation, #863 expand depth validation, #930
         # expand body-shape validation, #969 route body-shape validation, and #864
-        # episodic search candidate recall,
+        # episodic search candidate recall, and #890 bounded best-effort status
+        # metadata reads,
         # and #833 passive-event identity admission remain route-owned.
         # #828 promotes topology failures through the route boundary while
         # preserving ordinary best-effort metadata persistence.
+        # #947 keeps direct metadata-parent resource exhaustion best-effort
+        # while preserving fail-closed topology handling in the route owner.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -144,8 +147,11 @@ component_management:
         # #844 extends the coordinator's locked evidence/material reads with
         # one operation-scoped directory witness and a fail-closed return check.
         # #837 retains consumer-admission descriptor cleanup in this owner.
+        # #906 keeps bounded publication-convergence probe expiry and error
+        # selection in this storage-abstractions owner.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
+        # #910 keeps shared publication retry deadlines monotonic in this owner.
         - "^src/storage/publication-convergence\\.ts$"
         - "^src/storage/capabilities\\.ts$"
         - "^src/storage/contracts\\.ts$"
@@ -226,8 +232,9 @@ component_management:
         - "^src/daemon/health-observation\\.ts$"
         # Lifecycle consumes the same canonical #691 entrypoint comparison as the CLI and keeps #804's kernel-cgroup listener witness manager-owned.
         # #865 keeps post-start publication convergence inside the lifecycle
-        # owner; its paired managed lifecycle tests remain this component's
-        # coverage boundary.
+        # owner, while #944 keeps bounded daemon-tmp retry guidance within the
+        # supervisor/lifecycle boundary; their paired managed lifecycle tests
+        # remain this component's coverage boundary.
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"

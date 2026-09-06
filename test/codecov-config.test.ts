@@ -135,9 +135,12 @@ const expectedComponents = [
     component_id: "unit-storage-abstractions",
     name: "Unit - Storage Abstractions",
     paths: [
+      // #906 keeps bounded publication-convergence probe expiry and error
+      // selection in this storage-abstractions owner.
       "^src/storage/backend\\.ts$",
       // #844 keeps coordinator directory-witness authentication in this owner.
       "^src/storage/backend-publication\\.ts$",
+      // #910 keeps shared publication retry deadlines monotonic in this owner.
       "^src/storage/publication-convergence\\.ts$",
       "^src/storage/capabilities\\.ts$",
       "^src/storage/contracts\\.ts$",
@@ -506,6 +509,9 @@ describe("Codecov configuration", () => {
     // #969 keeps the route-family and passive notification body-shape
     // validation in their existing route and daemon-events components.
     // #888 keeps private final ingest and compact metadata writes route-owned.
+    // #890 keeps bounded best-effort status metadata reads route-owned.
+    // #947 keeps promote metadata-parent resource handling and fail-closed
+    // topology behavior in the existing daemon-routes component.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     // #814 fresh-root descriptor and pre-handoff content checks remain
     // configuration-security-owned.
@@ -559,6 +565,8 @@ describe("Codecov configuration", () => {
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
       ["src/llm/process-utils.ts", "unit-llm-prompts"],
       ["src/doctor/doctor.ts", "unit-diagnostics"],
+      // #944 keeps typed supervisor daemon-tmp diagnostic propagation within
+      // the existing service-manager component.
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],
