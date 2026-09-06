@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { chmodSync, existsSync, fchmodSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, fchmodSync, fstatSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, resolve } from "node:path";
@@ -915,6 +915,57 @@ describe("secure project-root handoff", () => {
 
     expect(ensureProjectDirForIdentity(identity)).toBe(dir);
     expect(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"))).toEqual({ cwd: "/project", extra: true });
+  });
+
+  it.each([
+    ["the canonical cwd", "/project"],
+    ["a different cwd", "/old-project"],
+  ])("rejects hard-linked metadata containing %s", (_description, storedCwd) => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "d".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    const targetPath = join(home, "linked-project-metadata.json");
+    const metaPath = join(dir, "meta.json");
+    const original = JSON.stringify({ cwd: storedCwd, extra: true });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(targetPath, original);
+    linkSync(targetPath, metaPath);
+
+    expect(() => ensureProjectDirForIdentity(identity)).toThrow("multiple hard links");
+    expect(readFileSync(metaPath, "utf8")).toBe(original);
+    expect(readFileSync(targetPath, "utf8")).toBe(original);
+    expect(statSync(metaPath).ino).toBe(statSync(targetPath).ino);
+  });
+
+  it("rejects foreign-owned metadata before parsing or rewriting it", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "e".repeat(64), canonical: "/project" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    const metaPath = join(dir, "meta.json");
+    const original = JSON.stringify({ cwd: "/old-project", extra: true });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(metaPath, original);
+    const metadataStat = statSync(metaPath);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalFstat = nodeFs.fstatSync as typeof fstatSync;
+    const parseSpy = vi.spyOn(JSON, "parse");
+    const writeSpy = vi.spyOn(securityFiles, "atomicWritePrivateFile");
+    try {
+      expect(() => withPatchedFs("fstatSync", ((fd: number, options?: unknown) => {
+        const observed = originalFstat(fd, options as never);
+        if (observed.dev !== metadataStat.dev || observed.ino !== metadataStat.ino) return observed;
+        const foreign = Object.create(observed) as typeof observed;
+        Object.defineProperty(foreign, "uid", { value: metadataStat.uid + 1 });
+        return foreign;
+      }) as typeof fstatSync, () => ensureProjectDirForIdentity(identity)))
+        .toThrow("file owner is not trusted");
+      expect(parseSpy).not.toHaveBeenCalled();
+      expect(writeSpy).not.toHaveBeenCalled();
+      expect(readFileSync(metaPath, "utf8")).toBe(original);
+    } finally {
+      writeSpy.mockRestore();
+      parseSpy.mockRestore();
+    }
   });
 
   it.each(["null", "[]", "42"])("falls back for a parsed non-object metadata value %s", (content) => {
