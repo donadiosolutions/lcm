@@ -6,6 +6,7 @@ import {
   projectPathsForIdentity,
 } from "../project.js";
 import {
+  assertPrivateDirectoryEntry,
   atomicWritePrivateFile,
   openPrivateDirectory,
   PrivateDirectoryTopologyError,
@@ -323,27 +324,6 @@ export function createPromoteHandler(
           await withCommitAdmission(async () => {
             const writeMetadata = (): void => {
               const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
-              let meta: Record<string, unknown> = {};
-              try {
-                const parsed: unknown = JSON.parse(readBoundedRegularFile(paths.metaPath, {
-                  allowedRoot: paths.dir,
-                  maxBytes: MAX_PROJECT_METADATA_BYTES,
-                  expectedUid,
-                  requireSingleLink: true,
-                }));
-                if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-                  throw new Error("invalid project metadata");
-                }
-                meta = parsed as Record<string, unknown>;
-              } catch (error) {
-                if (errorCode(error) !== "ENOENT") throw error;
-              }
-              meta.cwd = paths.canonical;
-              meta.lastPromote = new Date().toISOString();
-              const serialized = JSON.stringify(meta, null, 2) + "\n";
-              if (Buffer.byteLength(serialized, "utf8") > MAX_PROJECT_METADATA_BYTES) {
-                throw new Error("project metadata exceeds size limit");
-              }
               let parent: PrivateDirectoryHandle;
               try {
                 parent = openPrivateDirectory(paths.dir, { expectedUid });
@@ -361,7 +341,41 @@ export function createPromoteHandler(
               let primaryError: unknown;
               let hasPrimaryError = false;
               try {
-                atomicWritePrivateFile(paths.metaPath, serialized, {}, parent);
+                try {
+                  let meta: Record<string, unknown> = {};
+                  try {
+                    const parsed: unknown = JSON.parse(readBoundedRegularFile(paths.metaPath, {
+                      allowedRoot: paths.dir,
+                      maxBytes: MAX_PROJECT_METADATA_BYTES,
+                      expectedUid,
+                      requireSingleLink: true,
+                    }));
+                    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+                      throw new Error("invalid project metadata");
+                    }
+                    meta = parsed as Record<string, unknown>;
+                  } catch (error) {
+                    if (errorCode(error) !== "ENOENT") throw error;
+                  }
+                  meta.cwd = paths.canonical;
+                  meta.lastPromote = new Date().toISOString();
+                  const serialized = JSON.stringify(meta, null, 2) + "\n";
+                  if (Buffer.byteLength(serialized, "utf8") > MAX_PROJECT_METADATA_BYTES) {
+                    throw new Error("project metadata exceeds size limit");
+                  }
+                  atomicWritePrivateFile(paths.metaPath, serialized, {}, parent);
+                } catch (error) {
+                  if (isCriticalMetadataError(error)) throw error;
+                  try {
+                    assertPrivateDirectoryEntry(parent, paths.dir, parent.witness.uid);
+                  } catch (topologyError) {
+                    throw new PrivateDirectoryTopologyError(
+                      "project directory topology changed before metadata publication",
+                      { cause: topologyError },
+                    );
+                  }
+                  throw error;
+                }
               } catch (error) {
                 hasPrimaryError = true;
                 primaryError = error;

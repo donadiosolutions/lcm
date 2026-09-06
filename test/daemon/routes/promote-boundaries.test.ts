@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   write: vi.fn(),
   readMetadata: vi.fn(() => "{}"),
   writeMetadata: vi.fn(),
+  assertDirectoryEntry: vi.fn(),
   openDirectory: vi.fn(() => ({
     fd: 1,
     witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
@@ -77,6 +78,7 @@ vi.mock("../../../src/security-files.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../../src/security-files.js")>(),
   readBoundedRegularFile: mocks.readMetadata,
   atomicWritePrivateFile: mocks.writeMetadata,
+  assertPrivateDirectoryEntry: mocks.assertDirectoryEntry,
   openPrivateDirectory: mocks.openDirectory,
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
@@ -105,6 +107,21 @@ describe("promote persistence boundaries", () => {
     mocks.projectExists.mockResolvedValue(true);
     mocks.read.mockReturnValue("{}");
     mocks.readMetadata.mockReturnValue("{}");
+    mocks.openDirectory.mockReset();
+    mocks.openDirectory.mockImplementation(() => ({
+      fd: 1,
+      witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+      close: vi.fn(),
+    }));
+    mocks.assertDirectoryEntry.mockReset();
+    mocks.assertDirectoryEntry.mockReturnValue({
+      mode: 0o700,
+      uid: 0,
+      gid: 0,
+      nlink: "1",
+      dev: "1",
+      ino: "1",
+    });
     mocks.getConnection.mockReturnValue({});
     mocks.conversations.mockResolvedValue([]);
     mocks.summaries.mockResolvedValue([]);
@@ -225,6 +242,9 @@ describe("promote persistence boundaries", () => {
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok", dry_run: true }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { processed: 2, promoted: 1, conversations: 1 });
     expect(mocks.dedup).not.toHaveBeenCalled();
+    expect(mocks.openDirectory).not.toHaveBeenCalled();
+    expect(mocks.readMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
     expect(mocks.writeMetadata).not.toHaveBeenCalled();
   });
 
@@ -325,6 +345,144 @@ describe("promote persistence boundaries", () => {
     });
   });
 
+  it.each([
+    ["bounded read", () => mocks.readMetadata.mockImplementationOnce(() => {
+      throw new Error("metadata read failed");
+    })],
+    ["JSON parse", () => mocks.readMetadata.mockReturnValueOnce("{")],
+    ["metadata shape", () => mocks.readMetadata.mockReturnValueOnce("[]")],
+    ["serialized size", () => mocks.readMetadata.mockReturnValueOnce(
+      JSON.stringify({ existing: "é".repeat(524_288) }),
+    )],
+  ])("revalidates and closes the admitted parent after an ordinary %s failure", async (_label, fail) => {
+    const close = vi.fn();
+    const parent = {
+      fd: 1,
+      witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+      close,
+    };
+    mocks.openDirectory.mockReturnValueOnce(parent);
+    fail();
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ordinary-failure" }));
+
+    expect(mocks.openDirectory.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.readMetadata.mock.invocationCallOrder[0]!);
+    expect(mocks.assertDirectoryEntry).toHaveBeenCalledOnce();
+    expect(mocks.assertDirectoryEntry).toHaveBeenCalledWith(parent, "/lcm/projects/pid", 0);
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it.each([
+    ["bounded read", () => mocks.readMetadata.mockImplementationOnce(() => {
+      throw new Error("file changed during validation");
+    })],
+    ["JSON parse", () => mocks.readMetadata.mockReturnValueOnce("{")],
+    ["metadata shape", () => mocks.readMetadata.mockReturnValueOnce("[]")],
+    ["serialized size", () => mocks.readMetadata.mockReturnValueOnce(
+      JSON.stringify({ existing: "é".repeat(524_288) }),
+    )],
+  ])("fails closed when ordinary %s failure reveals a replaced parent", async (_label, fail) => {
+    const close = vi.fn();
+    const parent = {
+      fd: 1,
+      witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+      close,
+    };
+    mocks.openDirectory.mockReturnValueOnce(parent);
+    fail();
+    mocks.assertDirectoryEntry.mockImplementationOnce(() => {
+      throw new PrivateDirectoryTopologyError("private directory topology is not trusted", {
+        cause: Object.assign(new Error("resource-coded assertion cause"), { code: "EMFILE" }),
+      });
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/replaced-parent" }));
+
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it("preserves a critical read primary without assertion masking", async () => {
+    const close = vi.fn();
+    const topologyError = new PrivateDirectoryTopologyError("critical metadata read");
+    mocks.openDirectory.mockReturnValueOnce({
+      fd: 1,
+      witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+      close,
+    });
+    mocks.readMetadata.mockImplementationOnce(() => {
+      throw topologyError;
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/critical-read" }));
+
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "critical metadata read",
+    });
+  });
+
+  it("preserves assertion failure when retained-parent cleanup also fails", async () => {
+    const close = vi.fn(() => {
+      throw new Error("metadata parent close failed");
+    });
+    mocks.openDirectory.mockReturnValueOnce({
+      fd: 1,
+      witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+      close,
+    });
+    mocks.readMetadata.mockImplementationOnce(() => {
+      throw new Error("metadata read failed");
+    });
+    mocks.assertDirectoryEntry.mockImplementationOnce(() => {
+      throw new PrivateDirectoryTopologyError("parent replaced");
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/assertion-close" }));
+
+    expect(close).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it("keeps ordinary read and cleanup failures best-effort", async () => {
+    const close = vi.fn(() => {
+      throw new Error("metadata parent close failed");
+    });
+    mocks.openDirectory.mockReturnValueOnce({
+      fd: 1,
+      witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+      close,
+    });
+    mocks.readMetadata.mockImplementationOnce(() => {
+      throw new Error("metadata read failed");
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ordinary-close" }));
+
+    expect(mocks.assertDirectoryEntry).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
   it("covers platforms without process.getuid while preserving bounded read options", async () => {
     const originalGetuid = process.getuid;
     Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
@@ -371,6 +529,8 @@ describe("promote persistence boundaries", () => {
 
       await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/resource" }));
 
+      expect(mocks.readMetadata).not.toHaveBeenCalled();
+      expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
       expect(mocks.writeMetadata).not.toHaveBeenCalled();
       expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
         processed: 0,
@@ -392,6 +552,8 @@ describe("promote persistence boundaries", () => {
     });
 
     expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
+    expect(mocks.readMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
     expect(mocks.writeMetadata).not.toHaveBeenCalled();
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
       processed: 0,
@@ -428,6 +590,8 @@ describe("promote persistence boundaries", () => {
 
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/parent-failure" }));
 
+    expect(mocks.readMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
     expect(mocks.writeMetadata).not.toHaveBeenCalled();
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
       error: "project directory topology changed before metadata publication",
@@ -455,6 +619,8 @@ describe("promote persistence boundaries", () => {
 
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/critical-resource" }));
 
+    expect(mocks.readMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
     expect(mocks.writeMetadata).not.toHaveBeenCalled();
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
       error: "project directory topology changed before metadata publication",
@@ -473,9 +639,10 @@ describe("promote persistence boundaries", () => {
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/critical-admission" }), {
       withPublicationAdmission,
     });
-
     expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
     expect(mocks.openDirectory).not.toHaveBeenCalled();
+    expect(mocks.readMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
     expect(mocks.writeMetadata).not.toHaveBeenCalled();
     expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
       status: "blocked",
@@ -490,6 +657,8 @@ describe("promote persistence boundaries", () => {
 
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/topology" }));
 
+    expect(mocks.readMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
       error: "project directory topology changed before metadata publication",
     });

@@ -16,7 +16,12 @@ With the default SQLite backend, all storage is on your machine:
   `0600`. Missing metadata is created. Malformed, oversized, linked, or
   non-regular metadata is left unchanged, as is owner-mismatched metadata when a
   process user ID is available. These checks apply to the final route timestamp
-  update.
+  update. Promote authenticates the immediate metadata parent directory before
+  reading `meta.json`, retains that admitted directory through parsing and
+  publication, and fails closed if its directory entry changes. Promotion
+  database work completed before the metadata update is not rolled back. This
+  guarantee covers the immediate metadata parent; it does not reauthenticate
+  the full ancestor chain.
 - **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
 - **`~/.lcm/daemon.pid`** — Daemon process ID (transient).

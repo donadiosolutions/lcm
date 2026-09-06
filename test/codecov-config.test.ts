@@ -512,6 +512,8 @@ describe("Codecov configuration", () => {
     // #890 keeps bounded best-effort status metadata reads route-owned.
     // #947 keeps promote metadata-parent resource handling and fail-closed
     // topology behavior in the existing daemon-routes component.
+    // #948 keeps promote metadata parent-first admission and retained identity
+    // revalidation in the existing daemon-routes component.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     // #814 fresh-root descriptor and pre-handoff content checks remain
     // configuration-security-owned.
