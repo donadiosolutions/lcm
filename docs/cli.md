@@ -102,7 +102,10 @@ range or that are not integers are rejected by the daemon with HTTP 400
 
 `lcm expand <nodeId> --depth <n>` accepts any positive integer and defaults to
 `1`; no upper bound is imposed. Malformed explicit depths are rejected by the
-daemon with HTTP 400 (`invalid depth`) before project admission.
+daemon with HTTP 400 (`invalid depth`) before project admission. The direct
+daemon request body must be a JSON object; top-level `null`, arrays, and other
+JSON primitives receive HTTP 400 (`invalid request body`) before project
+admission. Malformed JSON syntax keeps the existing server error behavior.
 
 Before using this route, LCM reads a bounded, no-follow configuration snapshot
 without taking the private mutation/publication lock. If `config.json` is

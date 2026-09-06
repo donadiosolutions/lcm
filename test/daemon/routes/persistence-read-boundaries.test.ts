@@ -334,6 +334,51 @@ describe("persistence read route boundaries", () => {
     }
   });
 
+  it("rejects non-object expand bodies before cwd and storage admission", async () => {
+    const openExistingProject = vi.fn(async () => {
+      throw new Error("storage admission should not run for invalid body shape");
+    });
+    const factory = { ...postgresqlFactory(injectedFactory()), openExistingProject };
+    const handlers = [
+      createExpandHandler(config),
+      createExpandHandler(postgresqlConfig(), factory),
+    ];
+    const bodies = ["null", "[]", "\"text\"", "1", "true", "false"];
+
+    for (const handler of handlers) {
+      for (const body of bodies) {
+        mocks.send.mockClear();
+        mocks.writeHead.mockClear();
+        mocks.end.mockClear();
+        mocks.validate.mockClear();
+        mocks.projectIdentity.mockClear();
+        mocks.projectExists.mockClear();
+        mocks.openProject.mockClear();
+        mocks.createFactory.mockClear();
+        mocks.expand.mockClear();
+
+        await expect(invoke(handler, body)).resolves.toBeUndefined();
+
+        expectLast(400, { error: "invalid request body" });
+        expect(mocks.validate).not.toHaveBeenCalled();
+        expect(mocks.projectIdentity).not.toHaveBeenCalled();
+        expect(mocks.projectExists).not.toHaveBeenCalled();
+        expect(mocks.openProject).not.toHaveBeenCalled();
+        expect(mocks.createFactory).not.toHaveBeenCalled();
+        expect(mocks.expand).not.toHaveBeenCalled();
+        expect(openExistingProject).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it("preserves expand JSON syntax errors and object validation", async () => {
+    await expect(invoke(createExpandHandler(config), "{"))
+      .rejects.toBeInstanceOf(SyntaxError);
+
+    await invoke(createExpandHandler(config), "{}");
+    expectLast(400, { error: "nodeId is required" });
+  });
+
   it("preserves nodeId precedence when depth is invalid", async () => {
     const handler = createExpandHandler(config);
     await invoke(handler, '{"cwd":"/bad","depth":null}');

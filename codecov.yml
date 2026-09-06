@@ -90,7 +90,8 @@ component_management:
         # #705 prompt-search surfacing-log failures, #709 search and grep routes,
         # #710 grep mode, #792 session filtering, #793 search-limit validation,
         # #794 grep-since validation, #825 bounded atomic promotion metadata,
-        # #862 recent limit validation, #863 expand depth validation, and #864
+        # #862 recent limit validation, #863 expand depth validation, #930
+        # expand body-shape validation, and #864
         # episodic search candidate recall,
         # and #833 passive-event identity admission remain route-owned.
         # #828 promotes topology failures through the route boundary while

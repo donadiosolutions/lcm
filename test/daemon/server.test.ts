@@ -1101,6 +1101,49 @@ describe("daemon idle timeout", () => {
 });
 
 describe("daemon auth", () => {
+  it("keeps expand body-shape and JSON syntax errors distinct over authenticated HTTP", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-expand-body-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    const tokenPath = join(lcmDir, "daemon.token");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    chmodSync(lcmDir, 0o700);
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    ensureAuthToken(tokenPath);
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      tokenPath,
+      _testIdentity: testIdentity,
+      _assertBackendPublication: () => undefined,
+    });
+
+    try {
+      const headers = {
+        Authorization: `Bearer ${readAuthToken(tokenPath)!}`,
+        "Content-Type": "application/json",
+      };
+      const shapeResponse = await fetch(`http://127.0.0.1:${authDaemon.address().port}/expand`, {
+        method: "POST",
+        headers,
+        body: "null",
+      });
+      expect(shapeResponse.status).toBe(400);
+      await expect(shapeResponse.json()).resolves.toEqual({ error: "invalid request body" });
+
+      const syntaxResponse = await fetch(`http://127.0.0.1:${authDaemon.address().port}/expand`, {
+        method: "POST",
+        headers,
+        body: "{",
+      });
+      expect(syntaxResponse.status).toBe(500);
+      await expect(syntaxResponse.json()).resolves.toMatchObject({ error: expect.any(String) });
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("maps an unbuffered public-health payload error without exposing details", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-public-health-error-"));
     const lcmDir = join(dir, ".lcm");
