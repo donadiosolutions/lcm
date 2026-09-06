@@ -167,9 +167,17 @@ function authenticateOpenPrivateDirectory(
         }
       },
     };
-  } catch (error) {
-    closeSync(fd);
-    throw error;
+  } catch (authenticationError) {
+    try {
+      closeSync(fd);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [authenticationError, cleanupError],
+        "private directory authentication and cleanup failed",
+        { cause: authenticationError },
+      );
+    }
+    throw authenticationError;
   }
 }
 
