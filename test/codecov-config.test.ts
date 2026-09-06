@@ -518,6 +518,7 @@ describe("Codecov configuration", () => {
     // #888 keeps private final ingest and compact metadata writes route-owned.
     // #890 keeps bounded best-effort status metadata reads route-owned.
     // #1003 keeps preliminary metadata admission daemon-core-owned.
+    // #1050 keeps bounded preliminary metadata serialization there too.
     // #947 keeps promote metadata-parent resource handling and fail-closed
     // topology behavior in the existing daemon-routes component.
     // #948 keeps promote metadata parent-first admission, sampled read binding,

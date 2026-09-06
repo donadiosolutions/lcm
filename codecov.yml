@@ -67,8 +67,8 @@ component_management:
       name: "Unit - Daemon Core"
       paths:
         # Keep the #691/#700 response fences, #701 terminal factory-close retry,
-        # runtime identity, #825 bounded project metadata, and #1003
-        # owner/single-link preliminary metadata admission here.
+        # runtime identity, #825 bounded project metadata, #1003 owner/single-link
+        # admission, and #1050 bounded preliminary serialization here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
