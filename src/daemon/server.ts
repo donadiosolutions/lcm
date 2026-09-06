@@ -41,6 +41,7 @@ import {
   type BackgroundPublicationAdmission,
 } from "./passive-event-processor.js";
 import { createStatsHandler } from "./routes/stats.js";
+import { backendDiagnosticFailure } from "../storage/diagnostics.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
 import { createReviewStaleHandler } from "./routes/review-stale.js";
 import { createInvocationControlHandler } from "./routes/invocation-control.js";
@@ -778,13 +779,13 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   registerBuiltInRoute(
     "GET",
     "/stats",
-    sqliteStorage ? createStatsHandler() : stagedPostgreSqlUnavailableHandler("stats"),
+    createStatsHandler(publicationHome, storageFactory),
     "read",
   );
   registerBuiltInRoute(
     "GET",
     "/stats/pool",
-    sqliteStorage ? createPoolStatsHandler() : stagedPostgreSqlUnavailableHandler("pool stats"),
+    createPoolStatsHandler(publicationHome, storageFactory),
     "read",
   );
   registerBuiltInRoute(
@@ -902,6 +903,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     );
     const requestSignal = cancellation.signal;
     let bufferedResponse: BufferedServerResponse | undefined;
+    const diagnosticRoute = ["GET /stats", "GET /stats/pool", "POST /status"].includes(`${req.method} ${req.url?.split("?")[0]}`);
     try {
       const key = `${req.method} ${req.url?.split("?")[0]}`;
       const route = routes.get(key);
@@ -987,6 +989,11 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         }
       }
     } catch (err: unknown) {
+      if (diagnosticRoute) {
+        bufferedResponse?.discard();
+        sendJsonIfWritable(res, 503, { backendDiagnostics: backendDiagnosticFailure(err, config.storage.backend) });
+        return;
+      }
       if (bufferedResponse !== undefined) {
         bufferedResponse.discard();
         if (err instanceof BackendPublicationJournalError) {
@@ -1061,9 +1068,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       registerBuiltInRoute(
         "POST",
         "/status",
-        sqliteStorage
-          ? createStatusHandler(config, startTime, actualPort)
-          : stagedPostgreSqlUnavailableHandler("status"),
+        createStatusHandler(config, startTime, actualPort, publicationHome, storageFactory),
         "read",
       );
       passiveEventProcessor.start();

@@ -1113,3 +1113,72 @@ describe("daemon route publication admission", () => {
     }
   });
 });
+
+describe("diagnostic route publication refusal", () => {
+  it.each([
+    ["GET", "/stats"], ["GET", "/stats/pool"], ["POST", "/status"],
+  ])("blocks %s %s before the handler and returns only the common safe snapshot", async (method, path) => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-diagnostic-route-"));
+    const root = join(home, ".lcm");
+    mkdirSync(root, { mode: 0o700 });
+    const configPath = join(root, "config.json");
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    let daemon: DaemonInstance | undefined;
+    try {
+      daemon = await createDaemon(loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } }), { publicationConfigPath: configPath });
+      const handler = vi.fn(async (_req, res) => { res.end(JSON.stringify({ messages: 123, transcript: "private-canary-secret" })); });
+      daemon.registerRoute(method, path, handler, "read");
+      const publication = join(root, "backend-publication");
+      mkdirSync(publication, { mode: 0o700 });
+      writeFileSync(join(publication, "journal.json"), '{private-canary-secret', { mode: 0o600 });
+      const response = await fetch(`http://127.0.0.1:${daemon.address().port}${path}`, {
+        method,
+        ...(method === "POST" ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd: home }) } : {}),
+      });
+      expect(response.status).toBe(503);
+      const value = await response.json() as Record<string, unknown>;
+      expect(Object.keys(value)).toEqual(["backendDiagnostics"]);
+      expect(value).toMatchObject({ backendDiagnostics: { backend: "sqlite", classification: "unavailable", publication: "unavailable", schema: "unverified", outbox: { status: "unverified" } } });
+      expect(value).not.toHaveProperty("backendDiagnostics.metrics");
+      expect(JSON.stringify(value)).not.toMatch(/private-canary|transcript|messages|123|journal\.json/);
+      expect(handler).not.toHaveBeenCalled();
+    } finally {
+      await daemon?.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["GET", "/stats"], ["GET", "/stats/pool"], ["POST", "/status"],
+  ])("discards buffered %s %s data when publication changes after handler execution", async (method, path) => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-diagnostic-route-"));
+    const root = join(home, ".lcm");
+    mkdirSync(root, { mode: 0o700 });
+    const configPath = join(root, "config.json");
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    let daemon: DaemonInstance | undefined;
+    try {
+      daemon = await createDaemon(loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } }), { publicationConfigPath: configPath });
+      const handler = vi.fn(async (_req, res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ messages: 123, transcript: "private-canary-secret" }));
+        mkdirSync(join(root, "backend-publication"), { mode: 0o700 });
+      });
+      daemon.registerRoute(method, path, handler, "read");
+      const response = await fetch(`http://127.0.0.1:${daemon.address().port}${path}`, {
+        method,
+        ...(method === "POST" ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd: home }) } : {}),
+      });
+      expect(response.status).toBe(503);
+      const value = await response.json() as Record<string, unknown>;
+      expect(Object.keys(value)).toEqual(["backendDiagnostics"]);
+      expect(value).toMatchObject({ backendDiagnostics: { backend: "sqlite", classification: "stale-publication", publication: "unavailable" } });
+      expect(value).not.toHaveProperty("backendDiagnostics.metrics");
+      expect(JSON.stringify(value)).not.toMatch(/private-canary|transcript|messages|123/);
+      expect(handler).toHaveBeenCalledOnce();
+    } finally {
+      await daemon?.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});

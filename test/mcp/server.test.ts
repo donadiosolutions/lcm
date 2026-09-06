@@ -6,6 +6,24 @@ import { __lcmMcpTestHooks, getMcpToolDefinitions, handleDaemonRequest } from ".
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import * as storageBackend from "../../src/storage/backend.js";
 import { DEFAULT_SEARCH_RESULT_LIMIT, MAX_SEARCH_RESULT_LIMIT } from "../../src/retrieval.js";
+import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { StatsUnavailableError } from "../../src/stats.js";
+import type { BackendDiagnosticSnapshot } from "../../src/storage/diagnostics.js";
+
+type LocalToolHandler = (request: { params: { name: string; arguments?: Record<string, unknown> } }) => Promise<{
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+}>;
+const localStatsMocks = vi.hoisted(() => ({
+  handlers: new Map<unknown, LocalToolHandler>(),
+  collectStats: vi.fn(),
+  post: vi.fn(),
+}));
+
+vi.mock("../../src/stats.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/stats.js")>();
+  return { ...actual, collectStats: localStatsMocks.collectStats };
+});
 
 const ensureDaemonMcpMock = vi.hoisted(() => vi.fn().mockResolvedValue({ connected: true, port: 9999, spawned: false }));
 
@@ -18,7 +36,7 @@ vi.mock("../../src/daemon/config.js", () => ({
 vi.mock("@modelcontextprotocol/sdk/server/index.js", () => ({
   Server: vi.fn().mockImplementation(function () {
     return {
-      setRequestHandler: vi.fn(),
+      setRequestHandler: vi.fn((schema: unknown, handler: LocalToolHandler) => localStatsMocks.handlers.set(schema, handler)),
       connect: vi.fn().mockResolvedValue(undefined),
     };
   }),
@@ -31,7 +49,7 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
 vi.mock("../../src/daemon/client.js", () => ({
   DaemonClient: vi.fn().mockImplementation(function () {
     return {
-      post: vi.fn(),
+      post: localStatsMocks.post,
     };
   }),
 }));
@@ -630,5 +648,67 @@ describe("handleDaemonRequest spawn opts propagation", () => {
 
     expect(ensureDaemonSpy).not.toHaveBeenCalled();
     expect(client.post).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("local lcm_stats diagnostic failures", () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    localStatsMocks.handlers.clear();
+    localStatsMocks.collectStats.mockReset();
+    const { startMcpServer } = await import("../../src/mcp/server.js");
+    await startMcpServer();
+    // Connection startup is operational; the individual stats invocation is not.
+    ensureDaemonMcpMock.mockClear();
+  });
+
+  it.each(["unavailable", "permission-denied", "timeout", "stale-publication"] as const)(
+    "returns fixed %s observations without leaking exception data or invoking lifecycle",
+    async (classification) => {
+      const diagnostics: BackendDiagnosticSnapshot = {
+        backend: "postgresql", classification,
+        publication: "unverified", tls: "unverified", schema: "unavailable",
+        extensions: "unverified", search: "unverified",
+        pool: { origin: "diagnostic-probe", status: "unavailable" },
+        identity: { status: "unverified" }, outbox: { status: "unverified" },
+        remediation: "Run `lcm doctor` and review the storage configuration.",
+      };
+      const canaries = [
+        "RAW_SQL_VALUE_CANARY", "PRIVATE_TRANSCRIPT_CANARY", SYNTHETIC_CREDENTIAL,
+        SYNTHETIC_PRIVATE_PATH, "postgresql://secret:password@private-host.example/db",
+      ];
+      const error = new StatsUnavailableError(diagnostics);
+      error.message = canaries.join(" ");
+      error.cause = new Error(canaries.join("\n"));
+      localStatsMocks.collectStats.mockRejectedValueOnce(error);
+
+      const result = await localStatsMocks.handlers.get(CallToolRequestSchema)!({
+        params: { name: "lcm_stats", arguments: { verbose: true } },
+      });
+
+      expect(result).toEqual({ content: [{
+        type: "text",
+        text: `Storage: postgresql (${classification}). ${diagnostics.remediation}`,
+      }] });
+      for (const canary of canaries) expect(JSON.stringify(result)).not.toContain(canary);
+      expect(result.content[0].text).not.toContain("| Projects |");
+      expect(localStatsMocks.collectStats).toHaveBeenCalledExactlyOnceWith();
+      expect(ensureDaemonMcpMock).not.toHaveBeenCalled();
+      expect(localStatsMocks.post).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves structured MCP failure handling for unclassified stats errors", async () => {
+    localStatsMocks.collectStats.mockRejectedValueOnce(new Error(`password=${SYNTHETIC_CREDENTIAL}`));
+
+    const result = await localStatsMocks.handlers.get(CallToolRequestSchema)!({
+      params: { name: "lcm_stats" },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("password=<redacted>");
+    expect(result.content[0].text).not.toContain(SYNTHETIC_CREDENTIAL);
+    expect(ensureDaemonMcpMock).not.toHaveBeenCalled();
+    expect(localStatsMocks.post).not.toHaveBeenCalled();
   });
 });

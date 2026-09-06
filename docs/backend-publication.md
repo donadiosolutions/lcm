@@ -11,9 +11,13 @@ This boundary is now consumed by the daemon and MCP project-storage routes.
 SQLite remains the default, while an explicitly published PostgreSQL selection
 becomes authoritative only after runtime readiness, machine identity, project
 binding, and terminal publication evidence all verify. Issue #618 still owns
-CLI/import-export and portable transfer; #619 still owns stats, pool
-diagnostics, status, and doctor parity. Those boundaries do not weaken daemon
-route admission or authorize a SQLite fallback.
+CLI/import-export and portable transfer. Stats, pool diagnostics, status, and
+doctor share an [observational backend snapshot](cli.md#observational-diagnostics).
+It authenticates publication/configuration evidence before and after probes;
+changed witnesses discard collected metrics and report `stale-publication`.
+This optimistic observation is not a transaction-wide authority guarantee.
+Diagnostics neither write publication evidence nor acquire mutation locks,
+and never authorize a SQLite fallback.
 
 ## Current backend boundaries
 
@@ -32,8 +36,8 @@ LCM keeps the following Epic #79 invariants:
   fails closed. LCM never treats a partially written configuration or project
   map as proof that a backend is active.
 - The publication boundary is the single coordination seam for active daemon
-  and MCP routing. Future #618/#619 work must consume it rather than introduce
-  a second lock, journal, or fencing protocol.
+  and MCP routing and observational diagnostics. CLI/import-export work must
+  consume it rather than introduce a second lock, journal, or fencing protocol.
 
 For ordinary SQLite installations, this machinery is dormant after the
 private state root is authenticated. It does not change SQLite's storage
@@ -577,7 +581,8 @@ administrator. The runtime role must not own the schema or run migrations.
 The [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md)
 and [configuration guide](configuration.md#provisioning-a-postgresql-database)
 contain the complete deployment sequence. Applying that sequence enables the
-selected daemon project routes; #618 and #619 remain outside this boundary.
+selected daemon project routes and observational diagnostics. CLI/import-export
+activation remains tracked by #618.
 
 The final audit found the SQL changes already implemented for chore #408
 sufficient; this documentation lane required no additional SQL correction:

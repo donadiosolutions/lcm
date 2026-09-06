@@ -291,7 +291,7 @@ The `Security` section of the doctor output shows:
   defense-in-depth behavior.
 - Hook project paths retain leading and trailing whitespace. Directories whose names differ only by that whitespace remain separate LCM projects.
 - Hook errors are attached to a project sidecar only when the reported working directory is an existing directory. Invalid paths are recorded in the bounded fallback log without creating project metadata.
-- `lcm stats` and verbose `lcm doctor` remove terminal control sequences and line breaks from persisted text before displaying it. SQLite content is not modified by display sanitization.
+- Stats, status, pool diagnostics, and doctor use an allowlisted backend snapshot. They omit recalled-text previews (`topRecalled`), memory and transcript payloads, raw errors, SQL values, URLs, role names, CA paths, and arbitrary local paths. Verbose diagnostics retain the same boundary. Only observed numeric aggregates, safe identifiers, classified states, and fixed guidance are exposed. SQLite content is not modified; necessary WAL/SHM read coordination may occur. See [observational diagnostics](cli.md#observational-diagnostics).
 - Sidecar scans return a single aggregate truncation record when their time or database limit is reached, so diagnostic responses remain bounded even if the events directory contains many files.
 
 ## Summary

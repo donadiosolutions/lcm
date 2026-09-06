@@ -172,7 +172,7 @@ describe("collectEventStats", () => {
 
   it("normalizes non-Error sidecar scan failures", async () => {
     writeFileSync(join(tempDir, "string-error.db"), "trigger");
-    expect((await collectEventSidecars({ pruneOrphanSidecars: false }))[0].scanError)
+    expect((await collectEventSidecars({ pruneOrphanSidecars: true }))[0].scanError)
       .toBe("failed to scan sidecar");
   });
 

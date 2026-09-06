@@ -116,28 +116,23 @@ validates the complete effective configuration before asking the manager to
 replace the service, then waits for authenticated health. Run it once after a
 configuration or package update instead of starting a competing daemon.
 
-### Doctor recovery for stale daemon configuration
+### Doctor findings and explicit repair
 
-When the daemon is healthy and its version matches the installed LCM version,
-`lcm doctor` first performs the normal non-destructive daemon validation. If
-that validation identifies the managed service registration as exactly
-`stale-config`, doctor performs one authenticated restart using the same
-validated port, state paths, storage identity, executable, entrypoint, and
-user-service-manager safeguards. It then checks authenticated daemon health
-again before reporting the result.
+`lcm doctor` is observational. It checks existing-daemon identity and bounded
+authenticated health, then reports findings and operator commands. It does not
+start or restart the daemon, repair a service registration, clear notices, or
+write settings. A stale, unavailable, or unverified daemon remains unchanged.
 
-This behavior adds no new configuration options. It uses the existing daemon
-port, storage backend, runtime/entrypoint, state paths, and user manager
-configuration, and is invoked with `lcm doctor`.
+After a configuration or package change, use one explicit
+`lcm daemon restart` to request authenticated managed-service replacement.
+For stale Claude Code hooks or MCP settings, run `lcm install`; for another
+connector, run `lcm connectors install <agent>`. Rerun doctor after repair.
+These commands retain their normal identity checks and fail-closed refusals.
+Do not manually stop an unidentified process or start a competing daemon.
 
-A successful repair is reported as a warning with `fixApplied: true` because
-doctor changed the managed service state; the output explicitly says that the
-stale configuration was repaired and the daemon restarted. Other lifecycle
-refusals are not converted into restart permission. If the explicit repair is
-refused, doctor reports a failure and keeps the lifecycle refusal's exact
-remediation, such as running `lcm daemon restart` for another explicit,
-fail-closed attempt. Do not manually stop a process or start a competing
-daemon.
+Doctor's MCP check observes registration and static protocol capability. It
+reports live protocol readiness as not probed and never spawns a server for a
+handshake. Verify tools through the intended agent after connector repair.
 
 ## One-time migration after a Linux upgrade
 
@@ -146,8 +141,9 @@ inside the older generated transient systemd unit. v1.4.2 uses a stable
 state-root unit name, so the stable unit can initially appear absent while the
 older daemon is still serving requests.
 
-During `lcm doctor` or an explicit `lcm daemon restart`, LCM can migrate that
-old unit once, but only when all of these independent checks agree:
+During an explicit `lcm daemon restart`, LCM can migrate that old unit once,
+but only when all of these independent checks agree. `lcm doctor` leaves the
+legacy service unchanged:
 
 - the canonical `daemon.pid` is a stable, regular, non-symlink file naming a
   live process;

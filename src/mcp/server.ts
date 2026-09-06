@@ -18,7 +18,6 @@ import { lcmStoreTool } from "./tools/lcm-store.js";
 import { lcmStatsTool } from "./tools/lcm-stats.js";
 import { lcmDoctorTool } from "./tools/lcm-doctor.js";
 import {
-  selectStorageBackendForConfig,
   assertStorageBackendPublication,
 } from "../storage/backend.js";
 import {
@@ -102,12 +101,15 @@ function redactQuotedMcpAssignments(value: string, redactionKeyMarker: string, r
 
 const LOCAL_TOOLS: Record<string, (args: Record<string, unknown>) => Promise<string>> = {
   lcm_stats: async (args) => {
-    const configFile = defaultConfigPath();
-    selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
-    const { collectStats, formatNumber } = await import("../stats.js");
-    const stats = await collectStats();
+    const { collectStats, formatNumber, StatsUnavailableError } = await import("../stats.js");
+    let stats;
+    try { stats = await collectStats(); }
+    catch (error) {
+      if (!(error instanceof StatsUnavailableError)) throw error;
+      return `Storage: ${error.diagnostics.backend} (${error.diagnostics.classification}). ${error.diagnostics.remediation}`;
+    }
     const verbose = args.verbose === true;
-    const lines: string[] = [];
+    const lines: string[] = [`Storage: ${stats.backendDiagnostics.backend} (${stats.backendDiagnostics.classification})`, ""];
 
     // Memory section
     lines.push("## 🧠 Memory");
@@ -120,8 +122,8 @@ const LOCAL_TOOLS: Record<string, (args: Record<string, unknown>) => Promise<str
     lines.push(`| Summaries | ${formatNumber(stats.summaries)} |`);
     lines.push(`| DAG depth | ${stats.maxDepth} |`);
     lines.push(`| Promoted memories | ${stats.promotedCount} |`);
-    if (stats.eventsCaptured > 0) {
-      lines.push(`| Events | ${formatNumber(stats.eventsCaptured)} captured (${stats.eventsUnprocessed} unprocessed, ${stats.eventsErrors} errors (30d)) |`);
+    if ((stats.eventsCaptured ?? 0) > 0) {
+      lines.push(`| Events | ${formatNumber(stats.eventsCaptured!)} captured (${stats.eventsUnprocessed} unprocessed, ${stats.eventsErrors} errors (30d)) |`);
     }
 
     // Compression section (only when summarization has happened)
@@ -153,7 +155,7 @@ const LOCAL_TOOLS: Record<string, (args: Record<string, unknown>) => Promise<str
 
       // Per Conversation (verbose, compacted-only)
       if (verbose) {
-        const compactedDetails = stats.conversationDetails.filter((c) => c.summaries > 0);
+        const compactedDetails = (stats.conversationDetails ?? []).filter((c) => c.summaries > 0);
         if (compactedDetails.length > 0) {
           lines.push("");
           lines.push("## Per Conversation");

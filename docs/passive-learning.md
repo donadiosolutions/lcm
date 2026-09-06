@@ -213,8 +213,9 @@ They require PostgreSQL configuration, a registered machine, and a linked
 remote project. `status` and `validate` expose the durable checkpoints;
 `quarantine` lists local compatibility failures and remote poison rows; and
 `replay` retries one exact local or remote event. These commands do not start
-replication. CLI/import-export remains #618-owned; passive-learning stats and
-doctor presentation remain #619-owned.
+replication. CLI/import-export remains #618-owned. Stats and doctor expose
+observed local outbox counts alongside selected-backend readiness through the
+[shared diagnostic snapshot](cli.md#observational-diagnostics).
 
 ### Learned Insights
 
@@ -314,7 +315,6 @@ When passive learning hooks are installed, `lcm doctor` includes a "Passive Lear
 |-------|-----------------|
 | `events-capture` | Total events captured, unprocessed count |
 | `events-errors` | Hook error count (last 30 days) |
-| `events-sidecar-prune` | Empty or stale orphan sidecars removed during the scan |
 | `events-sidecar-scan` | Sidecar DBs that failed to scan because of corruption or I/O errors |
 | `events-sidecar-scan-skipped` | Sidecar DBs intentionally skipped by the scan count or timeout budget |
 | `events-staleness` | Time since last event capture |
@@ -325,7 +325,8 @@ When passive learning hooks are installed, `lcm doctor` includes a "Passive Lear
 `lcm events validate` when a crash or outage makes a local/remote checkpoint
 uncertain.
 
-Run `lcm doctor --verbose` to see the per-project breakdown and recent error details.
+Run `lcm doctor --verbose` for available detailed numeric observations. Raw
+recent errors, event payloads, and project paths are omitted from diagnostics.
 
 By default, doctor scans up to 50 passive-learning sidecar DBs. Use `lcm doctor --events-max-dbs <n>` to set another count limit, or `lcm doctor --events-max-dbs all` / `lcm doctor --events-max-dbs unlimited` to remove the count limit. Sidecars skipped because of the count or timeout budget are reported as skipped, not warnings.
 
@@ -337,28 +338,19 @@ daemon and storage are healthy but 200 or more queued events remain across
 project sidecars, `lcm doctor` warns and suggests `lcm events promote --all`
 instead of asking you to restart the daemon.
 
-During the sidecar scan, lcm also prunes orphan sidecars that are safe to
-remove. A sidecar is pruned only when its project metadata is missing, it has
-no unprocessed events, and it has no pending, claimed, retryable, replicated,
-or quarantined delivery. Empty orphan sidecars are removed immediately;
-acknowledged-only orphan sidecars are removed after the 30-day stale retention
-window, but only after every acknowledged row has a durable
-`remote_pruned_at` checkpoint. An acknowledged row still awaiting exact remote
-pruning retains the sidecar.
+Doctor and stats scan sidecars observationally with orphan pruning disabled.
+Existing orphan sidecars, including their unprocessed events, delivery
+checkpoints, and error records, are preserved. A diagnostic never drains a
+queue or repairs delivery state. SQLite may perform necessary WAL/SHM read
+coordination, but diagnostics do not checkpoint or change journal mode.
 
-LCM scans and prunes only through an existing owner-controlled events directory
-with mode `0700`. It retains that directory's identity across sidecar health
-reads, recent-error reads, database close, and every database, WAL, or SHM
-removal. If the directory path changes during a scan, LCM reports the current
-sidecar as a scan failure and stops before inspecting or pruning another
-sidecar. A missing, unreadable, or unsafe directory at initial admission is
-treated as having no available sidecars.
-
-These checks close replacement opportunities across asynchronous work and
-between removals. Portable pathname removal still has a narrow interval between
-the final identity check and the individual removal, so this is not an atomic
-guarantee against an external process that can replace entries through a
-writable ancestor.
+Scans require an existing owner-controlled events directory with mode `0700`
+and retain its identity during reads and close. A directory replacement or
+unsafe sidecar is reported without attempting repair or deletion. Count and
+time limits produce explicit skipped observations; missing or failed
+observations must not be interpreted as a verified zero backlog. The backend
+snapshot uses a 2000-millisecond deadline, including when a caller removes the
+sidecar count limit.
 
 ### `lcm stats`
 
@@ -372,6 +364,6 @@ Events          1,234 captured (42 unprocessed, 3 errors (30d))
 
 All hooks use a three-layer error fence (`safeLogError`):
 
-1. **Layer 1**: Write to sidecar DB `error_log` table (queryable by doctor/stats)
+1. **Layer 1**: Write to sidecar DB `error_log` table (doctor/stats expose numeric error counts only)
 2. **Layer 2**: Append to `~/.lcm/logs/events.log` (flat file fallback)
 3. **Layer 3**: Swallow silently — hooks must never crash or interfere with Claude Code

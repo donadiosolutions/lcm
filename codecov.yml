@@ -243,6 +243,9 @@ component_management:
       name: "Unit - Diagnostics"
       paths:
         - "^src/diagnose\\.ts$"
+        - "^src/storage/diagnostics\\.ts$"
+        - "^src/storage/diagnostic-project\\.ts$"
+        - "^src/storage/postgresql/diagnostics\\.ts$"
         # #997 keeps doctor publication retry deadlines monotonic in this owner.
         - "src/doctor/"
     - component_id: "integration-service-managers"

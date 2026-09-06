@@ -87,7 +87,10 @@ vi.mock("../src/storage/backend-publication.js", async importOriginal => {
     } as never)),
   };
 });
-vi.mock("../src/stats.js", () => ({ collectStats: mocks.collectStats, formatNumber: (n: number) => `n${n}` }));
+vi.mock("../src/stats.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/stats.js")>();
+  return { ...actual, collectStats: mocks.collectStats, formatNumber: (n: number) => `n${n}` };
+});
 vi.mock("../src/doctor/doctor.js", () => ({ runDoctor: mocks.runDoctor, formatResultsPlain: mocks.formatResultsPlain }));
 
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -178,8 +181,10 @@ describe("MCP service coverage", () => {
     expect(mocks.ensureDaemon).toHaveBeenCalledOnce();
   });
 
-  it("formats all local stats branches", async () => {
+  it.each(["sqlite", "postgresql"] as const)("formats local %s stats without lifecycle or staged rejection", async (backend) => {
+    mocks.storageBackend = backend;
     mocks.collectStats.mockReturnValue({
+      backendDiagnostics: { backend: mocks.storageBackend, classification: "healthy", remediation: "No action required." },
       projects: 2,
       conversations: 3,
       compactedConversations: 1,
@@ -199,27 +204,24 @@ describe("MCP service coverage", () => {
       ],
       redactionCounts: { total: 6, builtIn: 3, global: 2, project: 1 },
     });
+    mocks.ensureDaemon.mockClear();
     const result = await call("lcm_stats", { verbose: true, ignored: true });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain(`Storage: ${backend} (healthy)`);
+    expect(mocks.collectStats).toHaveBeenCalledExactlyOnceWith();
+    expect(mocks.ensureDaemon).not.toHaveBeenCalled();
+    expect(mocks.post).not.toHaveBeenCalled();
     expect(result.content[0].text).toContain("## Per Conversation");
     expect(result.content[0].text).toContain("6 total");
     expect(result.content[0].text).not.toContain("ignored");
   });
 
-  it("refuses local stats when the effective backend is unavailable", async () => {
-    mocks.storageBackend = "postgresql";
-
-    await expect(call("lcm_stats")).resolves.toMatchObject({
-      isError: true,
-      content: [{ text: expect.stringContaining("postgresql storage backend is not available") }],
-    });
-    expect(mocks.collectStats).not.toHaveBeenCalled();
-  });
-
-  it("formats zero-token, zero-ratio, empty-detail and zero-redaction stats branches", async () => {
+  it.each([undefined, []])("formats zero-token, zero-ratio and zero-redaction stats with details %j", async (conversationDetails) => {
     mocks.collectStats.mockReturnValue({
+      backendDiagnostics: { backend: mocks.storageBackend, classification: "healthy", remediation: "No action required." },
       projects: 0, conversations: 0, compactedConversations: 0, messages: 0, summaries: 1,
       maxDepth: 0, promotedCount: 0, eventsCaptured: 0, eventsUnprocessed: 0, eventsErrors: 0,
-      rawTokens: 0, summaryTokens: 0, ratio: 0, conversationDetails: [],
+      rawTokens: 0, summaryTokens: 0, ratio: 0, conversationDetails,
       redactionCounts: { total: 0, builtIn: 0, global: 0, project: 0 },
     });
     const result = await call("lcm_stats", { verbose: true });
@@ -230,16 +232,19 @@ describe("MCP service coverage", () => {
 
   it("omits compression for summary-free stats", async () => {
     mocks.collectStats.mockReturnValue({
+      backendDiagnostics: { backend: mocks.storageBackend, classification: "healthy", remediation: "No action required." },
       projects: 0, conversations: 0, compactedConversations: 0, messages: 0, summaries: 0,
-      maxDepth: 0, promotedCount: 0, eventsCaptured: 0, rawTokens: 0, summaryTokens: 0,
+      maxDepth: 0, promotedCount: 0, rawTokens: 0, summaryTokens: 0,
       ratio: 0, conversationDetails: [], redactionCounts: { total: 0, builtIn: 0, global: 0, project: 0 },
     });
     const result = await call("lcm_stats");
     expect(result.content[0].text).not.toContain("## Compression");
+    expect(result.content[0].text).not.toContain("| Events |");
   });
 
   it("omits verbose details when disabled and formats a zero conversation ratio", async () => {
     mocks.collectStats.mockReturnValue({
+      backendDiagnostics: { backend: mocks.storageBackend, classification: "healthy", remediation: "No action required." },
       projects: 1, conversations: 1, compactedConversations: 1, messages: 1, summaries: 1,
       maxDepth: 1, promotedCount: 0, eventsCaptured: 0, rawTokens: 10, summaryTokens: 5,
       ratio: 2, conversationDetails: [

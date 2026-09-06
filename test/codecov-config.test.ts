@@ -232,7 +232,7 @@ const expectedComponents = [
   {
     component_id: "unit-diagnostics",
     name: "Unit - Diagnostics",
-    paths: ["^src/diagnose\\.ts$", "src/doctor/"],
+    paths: ["^src/diagnose\\.ts$", "^src/storage/diagnostics\\.ts$", "^src/storage/diagnostic-project\\.ts$", "^src/storage/postgresql/diagnostics\\.ts$", "src/doctor/"],
   },
   {
     component_id: "integration-service-managers",
@@ -468,7 +468,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(209);
+    expect(productionFiles).toHaveLength(214);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -498,7 +498,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(209);
+    expect(ownershipCounts.size).toBe(214);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#964 files in their intended components", () => {
@@ -595,6 +595,11 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.
       ["src/db/event-sidecars.ts", "unit-local-persistence"],
+      ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"],
+      ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"],
+      ["src/storage/diagnostics.ts", "unit-diagnostics"],
+      ["src/storage/diagnostic-project.ts", "unit-diagnostics"],
+      ["src/storage/postgresql/diagnostics.ts", "unit-diagnostics"],
       // #992 keeps pre-initialization SQLite leaf admission and final
       // opened-identity fencing local-persistence-owned.
       ["src/db/connection.ts", "unit-local-persistence"],

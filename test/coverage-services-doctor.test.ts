@@ -1,31 +1,8 @@
-import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderGuidance } from "../src/connectors/template-service.js";
-
-type FakeStdin = EventEmitter & {
-  write: ReturnType<typeof vi.fn>;
-  end: ReturnType<typeof vi.fn>;
-  destroy: ReturnType<typeof vi.fn>;
-  writable: boolean;
-  destroyed: boolean;
-  writableEnded: boolean;
-};
-
-type FakeStdout = EventEmitter & {
-  destroy: ReturnType<typeof vi.fn>;
-};
-
-type FakeChild = EventEmitter & {
-  stdout: FakeStdout;
-  stdin: FakeStdin;
-  kill: ReturnType<typeof vi.fn>;
-  unref: ReturnType<typeof vi.fn>;
-  exitCode: number | null;
-  signalCode: NodeJS.Signals | null;
-};
 
 const mocks = vi.hoisted(() => ({
   ensureDaemon: vi.fn(),
@@ -33,11 +10,7 @@ const mocks = vi.hoisted(() => ({
   collectEvents: vi.fn(),
   collectDetailedEvents: vi.fn(),
   spawnSync: vi.fn(),
-  mcpStdout: "",
-  mcpError: false,
-  mcpHang: false,
-  mcpSetup: undefined as ((child: FakeChild) => void) | undefined,
-  mcpChild: undefined as FakeChild | undefined,
+  spawn: vi.fn(),
 }));
 
 vi.mock("../src/daemon/lifecycle.js", () => ({
@@ -50,47 +23,14 @@ vi.mock("../src/db/events-stats.js", () => ({
 }));
 vi.mock("node:child_process", () => ({
   spawnSync: (...args: unknown[]) => mocks.spawnSync(...args),
-  spawn: vi.fn().mockImplementation(() => {
-    const child = new EventEmitter() as FakeChild;
-    child.stdout = Object.assign(new EventEmitter(), { destroy: vi.fn() });
-    child.stdin = Object.assign(new EventEmitter(), {
-      write: vi.fn(),
-      end: vi.fn(() => { child.stdin.writableEnded = true; }),
-      destroy: vi.fn(() => { child.stdin.destroyed = true; }),
-      writable: true,
-      destroyed: false,
-      writableEnded: false,
-    });
-    child.exitCode = null;
-    child.signalCode = null;
-    child.unref = vi.fn();
-    child.kill = vi.fn(() => {
-      child.signalCode = "SIGTERM";
-      child.emit("close", null, "SIGTERM");
-    });
-    mocks.mcpChild = child;
-    if (mocks.mcpSetup) {
-      mocks.mcpSetup(child);
-      return child;
-    }
-    setTimeout(() => {
-      if (mocks.mcpHang) return;
-      if (mocks.mcpError) child.emit("error", new Error("spawn failed"));
-      else {
-        if (mocks.mcpStdout) child.stdout.emit("data", Buffer.from(mocks.mcpStdout));
-        child.exitCode = 0;
-        child.emit("close", 0);
-      }
-    }, 1);
-    return child;
-  }),
+  spawn: (...args: unknown[]) => mocks.spawn(...args),
 }));
 
 import { formatResultsPlain, printResults, runDoctor } from "../src/doctor/doctor.js";
 import { LCM_MD_CONTENT } from "../src/daemon/orientation.js";
 import { ScrubEngine } from "../src/scrub.js";
-import { mergeClaudeSettings, REQUIRED_HOOKS } from "../installer/install.js";
 import type { CheckResult, DoctorDeps } from "../src/doctor/types.js";
+import { backendDiagnosticFailure } from "../src/storage/diagnostics.js";
 import { doctorConfigReadFailureSeams, doctorConfigSeams } from "./doctor/config-seams.js";
 
 function isolatedPath(name: string): string {
@@ -137,6 +77,7 @@ function makeDeps(options: {
       if (path.endsWith("settings.json")) {
         return options.settingsText ?? JSON.stringify(options.settings ?? { mcpServers: { lcm: {} } });
       }
+      if (path.endsWith("daemon.token")) return "doctor-fixture-token";
       if (path.endsWith("package.json")) return JSON.stringify(options.pkg ?? { version: "1.2.3" });
       if (path.endsWith("CLAUDE.md")) return options.claudeMd ?? "<!-- lcm:start -->\n@lcm.md\n<!-- lcm:end -->";
       if (path.endsWith("lcm.md")) return options.lcmMd ?? LCM_MD_CONTENT;
@@ -144,10 +85,10 @@ function makeDeps(options: {
       if (path.startsWith("/proc/")) return options.procEnviron ?? "";
       return "{}";
     },
-    writeFileSync: (path, content) => {
+    writeFileSync: vi.fn((_path, content) => {
       if (options.writeError) throw options.writeError;
-      if (path.endsWith("settings.json")) options.writes?.push(content);
-    },
+      options.writes?.push(content);
+    }),
     mkdirSync: vi.fn(),
     spawnSync: (...args) => mocks.spawnSync(...args),
     fetch: vi.fn().mockImplementation(async () => health.shift() ?? { ok: false }) as typeof fetch,
@@ -155,23 +96,17 @@ function makeDeps(options: {
     platform: "linux",
     cwd: DOCTOR_CWD,
     managedDaemonPath: options.managedDaemonPath,
+    _expectedRuntimeDigestForTesting: "doctor-fixture-digest",
     ...configSeams,
   };
 }
 
-async function runWithHandshake(deps: DoctorDeps) {
-  const promise = runDoctor(deps);
-  await vi.advanceTimersByTimeAsync(1000);
-  return promise;
-}
-
-function healthyDeps(): DoctorDeps {
-  return makeDeps({
-    health: [
-      { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-      { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-    ],
-  });
+function readyHealth(overrides: Record<string, unknown> = {}) {
+  return { ok: true, json: async () => ({
+    status: "ok", version: "1.2.3", pid: 4242, storageBackend: "sqlite",
+    entrypoint: join(process.cwd(), "dist", "lcm.mjs"),
+    runtimeDigest: "doctor-fixture-digest", ...overrides,
+  }) };
 }
 
 describe("doctor service coverage", () => {
@@ -186,11 +121,6 @@ describe("doctor service coverage", () => {
     mocks.spawnSync.mockReturnValue({ status: 0, stdout: "", stderr: "" });
     mocks.collectEvents.mockReturnValue({ captured: 1, unprocessed: 0, errors: 0, lastCapture: null });
     mocks.collectDetailedEvents.mockReturnValue({ captured: 1, unprocessed: 0, errors: 0, lastCapture: null, projects: [], recentErrors: [] });
-    mocks.mcpStdout = "";
-    mocks.mcpError = false;
-    mocks.mcpHang = false;
-    mocks.mcpSetup = undefined;
-    mocks.mcpChild = undefined;
     vi.spyOn(ScrubEngine, "loadProjectPatterns").mockResolvedValue([]);
   });
 
@@ -198,6 +128,9 @@ describe("doctor service coverage", () => {
     rmSync(DOCTOR_HOME, { recursive: true, force: true });
     rmSync(DOCTOR_CWD, { recursive: true, force: true });
     vi.useRealTimers();
+    expect(mocks.ensureDaemon).not.toHaveBeenCalled();
+    expect(mocks.restartDaemon).not.toHaveBeenCalled();
+    expect(mocks.spawn).not.toHaveBeenCalled();
     vi.restoreAllMocks();
   });
 
@@ -205,534 +138,41 @@ describe("doctor service coverage", () => {
     rmSync(DOCTOR_FIXTURE_ROOT, { recursive: true, force: true });
   });
 
-  it.each([
-    [JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", result: { tools: Array(7).fill({}) } }), "pass", "7/7"],
-    [JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: Array(6).fill({}) } }), "warn", "6/7"],
-    [`not-json\n${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: Array(3).fill({}) } })}\n{ "id" : 2, "result" : { "tools" : [ {}, {}, {}, {}, {}, {}, {} ] } }`, "pass", "7/7"],
-    ["not-json tools/list", "warn", "0/7"],
-    ["ordinary output", "warn", "0/7"],
-    [JSON.stringify({ id: 2, tools: [] }), "warn", "0/7"],
-    [JSON.stringify({ id: 2, method: "tools/list", result: {} }), "warn", "0/7"],
-  ])("covers MCP handshake output %s", async (stdout, status, message) => {
-    vi.useFakeTimers();
-    mocks.mcpStdout = stdout;
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    const results = await runWithHandshake(makeDeps({
-      health: [
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-      ],
-    }));
-    expect(results.find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({ status, message: expect.stringContaining(message) });
-  });
-
-  it("completes the normal MCP handshake lifecycle in protocol order", async () => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = () => {};
-
-    const promise = runDoctor(healthyDeps());
-    await vi.advanceTimersByTimeAsync(0);
-    const child = mocks.mcpChild!;
-
-    expect(child.stdin.write).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(String(child.stdin.write.mock.calls[0]?.[0]).trim())).toMatchObject({
-      id: 1,
-      method: "initialize",
-      params: { protocolVersion: "2024-11-05", clientInfo: { name: "doctor", version: "0.1" } },
+  it("does not start an MCP handshake or invoke daemon lifecycle operations", async () => {
+    const deps = makeDeps({ health: [readyHealth()] });
+    const results = await runDoctor(deps);
+    expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "pass" });
+    expect(deps.fetch).toHaveBeenCalledExactlyOnceWith("http://127.0.0.1:3737/health", {
+      headers: { Authorization: "Bearer doctor-fixture-token" }, signal: expect.any(AbortSignal),
     });
-
-    await vi.advanceTimersByTimeAsync(299);
-    expect(child.stdin.write).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(child.stdin.write).toHaveBeenCalledTimes(2);
-    expect(JSON.parse(String(child.stdin.write.mock.calls[1]?.[0]).trim())).toEqual({
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/list",
-      params: {},
-    });
-
-    await vi.advanceTimersByTimeAsync(499);
-    expect(child.stdin.end).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
-    expect(child.stdin.end).toHaveBeenCalledOnce();
-    child.stdin.emit("close");
-    expect(child.kill).not.toHaveBeenCalled();
-
-    child.stdout.emit("data", Buffer.from(JSON.stringify({ id: 2, method: "tools/list", result: { tools: Array(7).fill({}) } })));
-    child.exitCode = 0;
-    child.emit("close", 0);
-
-    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({
-      status: "pass",
-      message: "lcm: 7/7 tools",
-    });
-    await vi.advanceTimersByTimeAsync(6000);
-    expect(child.kill).not.toHaveBeenCalled();
-  });
-
-  it("reports MCP spawn failure", async () => {
-    vi.useFakeTimers();
-    mocks.mcpError = true;
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    const results = await runWithHandshake(makeDeps({
-      health: [
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-      ],
-    }));
-    expect(results.find((result) => result.name === "mcp-handshake-lcm")?.message).toContain("Could not spawn");
-  });
-
-  it("stops delayed stdin work after an early close and ignores late duplicate events", async () => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      setTimeout(() => {
-        child.exitCode = 0;
-        child.emit("close", 0);
-      }, 1);
-    };
-
-    const results = await runWithHandshake(healthyDeps());
-    const child = mocks.mcpChild!;
-    child.emit("error", new Error("late child error"));
-    child.stdin.emit("error", new Error("late stdin error"));
-    child.emit("close", 0);
-    await vi.advanceTimersByTimeAsync(7000);
-
-    expect(results.find((result) => result.name === "mcp-handshake-lcm")?.message).toContain("0/7");
-    expect(child.stdin.write).toHaveBeenCalledTimes(1);
-    expect(child.stdin.end).not.toHaveBeenCalled();
-    expect(child.kill).not.toHaveBeenCalled();
-  });
-
-  it("drains late handshake output after stdin errors", async () => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      setTimeout(() => {
-        child.kill.mockImplementationOnce(() => { child.signalCode = "SIGTERM"; });
-        child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
-        setTimeout(() => {
-          child.stdout.emit("data", Buffer.from(JSON.stringify({ id: 2, method: "tools/list", result: { tools: Array(7).fill({}) } })));
-          child.emit("close", null, "SIGTERM");
-        }, 1);
-      }, 1);
-    };
-
-    const results = await runWithHandshake(healthyDeps());
-    expect(results.find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({ status: "pass", message: "lcm: 7/7 tools" });
-    expect(mocks.mcpChild?.stdin.end).not.toHaveBeenCalled();
-    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
-    await vi.advanceTimersByTimeAsync(7000);
-    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
-  });
-
-  it("drains late handshake output after stdout errors", async () => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      setTimeout(() => {
-        child.kill.mockImplementationOnce(() => { child.signalCode = "SIGTERM"; });
-        child.stdout.emit("error", new Error("stdout failed"));
-        setTimeout(() => {
-          child.stdout.emit("data", Buffer.from(JSON.stringify({ id: 2, result: { tools: Array(7).fill({}) } })));
-          child.emit("close", null, "SIGTERM");
-        }, 1);
-      }, 1);
-    };
-
-    const results = await runWithHandshake(healthyDeps());
-    expect(results.find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({ status: "pass", message: "lcm: 7/7 tools" });
-    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
-    await vi.advanceTimersByTimeAsync(7000);
-    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
-  });
-
-  it("stops a live child when stdin closes unexpectedly", async () => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      setTimeout(() => { child.stdin.emit("close"); }, 1);
-    };
-
-    const results = await runWithHandshake(healthyDeps());
-    const child = mocks.mcpChild!;
-    expect(results.find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({ status: "warn", message: "lcm: 0/7 tools" });
-    expect(child.kill).toHaveBeenCalledOnce();
-    expect(child.stdin.write).toHaveBeenCalledOnce();
-    expect(child.stdin.end).not.toHaveBeenCalled();
-  });
-
-  it("escalates to SIGKILL when a child never closes after stdin failure", async () => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      child.kill.mockImplementation((signal: NodeJS.Signals) => {
-        if (signal === "SIGKILL") {
-          child.signalCode = signal;
-          child.emit("close", null, signal);
-        }
-        return true;
-      });
-      setTimeout(() => { child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" })); }, 1);
-    };
-
-    const promise = runDoctor(healthyDeps());
-    await vi.advanceTimersByTimeAsync(250);
-    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
-    expect(mocks.mcpChild?.stdin.write).toHaveBeenCalledOnce();
-    expect(mocks.mcpChild?.stdin.end).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
-
-    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({
-      status: "warn",
-      message: "lcm: 0/7 tools",
-    });
-    expect(mocks.mcpChild?.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
-  });
-
-  it("serializes termination while ignoring child errors emitted during shutdown", async () => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      child.kill.mockImplementation((signal: NodeJS.Signals) => {
-        if (signal === "SIGKILL") {
-          setTimeout(() => {
-            child.signalCode = signal;
-            child.emit("close", null, signal);
-          }, 1);
-        }
-        return true;
-      });
-      setTimeout(() => {
-        child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
-        setTimeout(() => { child.emit("error", new Error("termination failed")); }, 1);
-      }, 1);
-    };
-
-    const settled = vi.fn();
-    const promise = runDoctor(healthyDeps());
-    void promise.then(settled);
-    await vi.advanceTimersByTimeAsync(2);
-    const child = mocks.mcpChild!;
-
-    expect(settled).not.toHaveBeenCalled();
-    expect(child.kill).toHaveBeenCalledOnce();
-    expect(child.stdin.write).toHaveBeenCalledOnce();
-    expect(child.stdin.end).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(248);
-    expect(settled).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(2);
-
-    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({
-      status: "warn",
-      message: "lcm: 0/7 tools",
-    });
-    expect(child.kill).toHaveBeenCalledTimes(2);
-    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
-    expect(child.stdin.write).toHaveBeenCalledOnce();
-    expect(child.stdin.end).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(6000);
-    expect(child.kill).toHaveBeenCalledTimes(2);
-  });
-
-  it.each(["returns-false", "throws"] as const)("escalates a failed SIGTERM when kill %s", async (failure) => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      child.kill = vi.fn((signal: NodeJS.Signals) => {
-        if (signal === "SIGTERM") {
-          if (failure === "throws") throw new Error("kill failed");
-          return false;
-        }
-        child.signalCode = signal;
-        child.emit("close", null, signal);
-        return true;
-      });
-      setTimeout(() => {
-        child.stdout.emit("data", Buffer.from(JSON.stringify({ id: 2, result: { tools: Array(7).fill({}) } })));
-        child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
-        child.stdout.emit("error", new Error("duplicate pipe failure"));
-        child.stdin.emit("close");
-      }, 1);
-    };
-
-    const promise = runDoctor(healthyDeps());
-    await vi.advanceTimersByTimeAsync(1000);
-    const child = mocks.mcpChild!;
-    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
-    expect(child.stdin.write).toHaveBeenCalledOnce();
-    expect(child.stdin.end).not.toHaveBeenCalled();
-
-    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({
-      status: "pass",
-      message: "lcm: 7/7 tools",
-    });
-    expect(child.kill).toHaveBeenCalledTimes(2);
-  });
-
-  it.each(["destroyed", "unwritable"])("settles without writing when stdin is initially %s", async (state) => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      if (state === "destroyed") child.stdin.destroyed = true;
-      else child.stdin.writable = false;
-    };
-
-    const results = await runWithHandshake(healthyDeps());
-    expect(results.find((result) => result.name === "mcp-handshake-lcm")?.message).toContain("0/7");
-    expect(mocks.mcpChild?.stdin.write).not.toHaveBeenCalled();
-    expect(mocks.mcpChild?.stdin.end).not.toHaveBeenCalled();
-    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
-  });
-
-  it.each([
-    ["exitCode", "tools-list"],
-    ["signalCode", "tools-list"],
-    ["exitCode", "stdin-end"],
-    ["signalCode", "stdin-end"],
-  ] as const)("waits for stdout close when the child sets %s before delayed %s", async (exitState, delayedAction) => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = () => {};
-
-    const promise = runDoctor(healthyDeps());
-    await vi.advanceTimersByTimeAsync(0);
-    const child = mocks.mcpChild!;
-    await vi.advanceTimersByTimeAsync(delayedAction === "tools-list" ? 100 : 400);
-    if (exitState === "exitCode") child.exitCode = 0;
-    else child.signalCode = "SIGTERM";
-    await vi.advanceTimersByTimeAsync(delayedAction === "tools-list" ? 200 : 400);
-
-    expect(child.stdin.write).toHaveBeenCalledTimes(delayedAction === "tools-list" ? 1 : 2);
-    expect(child.stdin.end).not.toHaveBeenCalled();
-
-    child.stdout.emit("data", Buffer.from(JSON.stringify({ id: 2, method: "tools/list", result: { tools: Array(7).fill({}) } })));
-    child.emit("close", exitState === "exitCode" ? 0 : null, exitState === "signalCode" ? "SIGTERM" : null);
-
-    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({
-      status: "pass",
-      message: "lcm: 7/7 tools",
-    });
-    expect(child.kill).not.toHaveBeenCalled();
-  });
-
-  it("settles when stdin becomes unusable before the delayed close", async () => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = () => {};
-
-    const promise = runDoctor(healthyDeps());
-    await vi.advanceTimersByTimeAsync(300);
-    const child = mocks.mcpChild!;
-    expect(child.stdin.write).toHaveBeenCalledTimes(2);
-
-    child.stdin.destroyed = true;
-    await vi.advanceTimersByTimeAsync(500);
-
-    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({
-      status: "warn",
-      message: "lcm: 0/7 tools",
-    });
-    expect(child.stdin.end).not.toHaveBeenCalled();
-    expect(child.kill).toHaveBeenCalledOnce();
-  });
-
-  it.each(["initialize", "tools-list", "stdin-end"])("contains a synchronous %s stream failure", async (stage) => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      if (stage === "initialize") child.stdin.write.mockImplementationOnce(() => { throw new Error("write failed"); });
-      if (stage === "tools-list") child.stdin.write.mockImplementationOnce(() => true).mockImplementationOnce(() => { throw new Error("write failed"); });
-      if (stage === "stdin-end") child.stdin.end.mockImplementationOnce(() => { throw new Error("end failed"); });
-    };
-
-    const results = await runWithHandshake(healthyDeps());
-    expect(results.find((result) => result.name === "mcp-handshake-lcm")?.message).toContain("0/7");
-    expect(mocks.mcpChild?.kill).toHaveBeenCalledOnce();
-  });
-
-  it("contains synchronous or asynchronous MCP handshake failures", async () => {
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    const results = await runDoctor({
-      ...makeDeps({
-        health: [
-          { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-          { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-        ],
-      }),
-      _testMcpHandshake: vi.fn(() => { throw new Error("synchronous spawn boundary"); }),
-    });
-
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
+    expect(deps.mkdirSync).not.toHaveBeenCalled();
+    expect(results.some((result) => "fixApplied" in result)).toBe(false);
     expect(results.find((result) => result.name === "mcp-handshake-lcm")).toMatchObject({
-      status: "warn",
-      message: "Could not test MCP handshake",
+      status: "skip", message: expect.stringMatching(/not.probed/i),
     });
+    expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(mocks.ensureDaemon).not.toHaveBeenCalled();
+    expect(mocks.restartDaemon).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])("escalates a hung MCP handshake at timeout when SIGTERM throws=%s", async (killThrows) => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      child.kill = vi.fn((signal: NodeJS.Signals) => {
-        if (signal === "SIGTERM" && killThrows) throw new Error("kill failed");
-        if (signal === "SIGKILL") {
-          child.signalCode = signal;
-          child.emit("close", null, signal);
-        }
-        return true;
-      });
-    };
-    const promise = runDoctor(healthyDeps());
-    await vi.advanceTimersByTimeAsync(6250);
-    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")?.status).toBe("warn");
-    expect(mocks.mcpChild?.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
-  });
-
-  it("bounds cleanup when both child signals fail without a close event", async () => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      child.kill = vi.fn(() => false);
-    };
-
-    const settled = vi.fn();
-    const promise = runDoctor(healthyDeps());
-    void promise.then(settled);
-    await vi.advanceTimersByTimeAsync(6000);
-
-    const child = mocks.mcpChild!;
-    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
-    expect(settled).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(249);
-    expect(settled).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
-    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")?.status).toBe("warn");
-    expect(child.stdin.destroy).toHaveBeenCalledOnce();
-    expect(child.stdout.destroy).toHaveBeenCalledOnce();
-    expect(child.unref).toHaveBeenCalledOnce();
-  });
-
-  it.each([false, true])("bounds post-SIGKILL cleanup when teardown throws=%s", async (teardownThrows) => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      child.kill = vi.fn(() => true);
-      if (teardownThrows) {
-        child.stdin.destroy.mockImplementation(() => { throw new Error("stdin destroy failed"); });
-        child.stdout.destroy.mockImplementation(() => { throw new Error("stdout destroy failed"); });
-        child.unref.mockImplementation(() => { throw new Error("unref failed"); });
-      }
-    };
-
-    const settled = vi.fn();
-    const promise = runDoctor(healthyDeps());
-    void promise.then(settled);
-    await vi.advanceTimersByTimeAsync(6249);
-
-    const child = mocks.mcpChild!;
-    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM"]);
-    expect(settled).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(1);
-    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
-    expect(settled).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(249);
-    expect(settled).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
-    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")?.status).toBe("warn");
-    expect(child.stdin.destroy).toHaveBeenCalledOnce();
-    expect(child.stdout.destroy).toHaveBeenCalledOnce();
-    expect(child.unref).toHaveBeenCalledOnce();
-  });
-
-  it("does not abandon a child that closes during the post-SIGKILL grace", async () => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      child.kill = vi.fn((signal: NodeJS.Signals) => {
-        if (signal === "SIGKILL") {
-          setTimeout(() => {
-            child.signalCode = signal;
-            child.emit("close", null, signal);
-          }, 100);
-        }
-        return true;
-      });
-    };
-
-    const settled = vi.fn();
-    const promise = runDoctor(healthyDeps());
-    void promise.then(settled);
-    await vi.advanceTimersByTimeAsync(6349);
-
-    const child = mocks.mcpChild!;
-    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
-    expect(settled).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(1);
-    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")?.status).toBe("warn");
-    expect(child.stdin.destroy).not.toHaveBeenCalled();
-    expect(child.stdout.destroy).not.toHaveBeenCalled();
-    expect(child.unref).not.toHaveBeenCalled();
-  });
-
-  it("handles a child exit racing the timeout signal", async () => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      let exitCodeReads = 0;
-      Object.defineProperty(child, "exitCode", {
-        configurable: true,
-        get: () => exitCodeReads++ < 2 ? null : 0,
-      });
-      setTimeout(() => {
-        child.stdin.emit("error", Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
-      }, 1);
-    };
-
-    const promise = runDoctor(healthyDeps());
-    await vi.advanceTimersByTimeAsync(6000);
-
-    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")?.status).toBe("warn");
-    expect(mocks.mcpChild?.kill).not.toHaveBeenCalled();
-  });
-
-  it("does not kill a child that exited without close before the process timeout", async () => {
-    vi.useFakeTimers();
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
-    mocks.mcpSetup = (child) => {
-      setTimeout(() => { child.exitCode = 0; }, 1000);
-    };
-    const promise = runDoctor(healthyDeps());
-    await vi.advanceTimersByTimeAsync(6000);
-    expect((await promise).find((result) => result.name === "mcp-handshake-lcm")?.status).toBe("warn");
-    expect(mocks.mcpChild?.kill).not.toHaveBeenCalled();
-  });
-
-  it("prints and formats every result status, category transition, stack, and auto-fix suffix", () => {
+  it("prints and formats every result status, category transition, stack, and ignores obsolete repair metadata", () => {
     const results: CheckResult[] = [
       { name: "stack", category: "Stack", status: "pass", message: "stack detail" },
       { name: "pass", category: "One", status: "pass", message: "passed" },
-      { name: "warn", category: "One", status: "warn", message: "warning", fixApplied: true },
+      { name: "warn", category: "One", status: "warn", message: "warning", ...{ fixApplied: true } },
       { name: "skip", category: "Two", status: "skip", message: "skipped" },
       { name: "fail", category: "Two", status: "fail", message: "failed" },
     ];
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     printResults(results);
     const printed = log.mock.calls.flat().join("\n");
-    expect(printed).toContain("auto-fixed");
+    expect(printed).not.toContain("auto-fixed");
     expect(printed).toContain("1 passed · 1 failed · 1 warnings · 1 skipped");
     const plain = formatResultsPlain(results);
     expect(plain).toContain("## Stack");
     expect(plain).toContain("| skip | ⏭️ skipped |");
-    expect(plain).toContain("(auto-fixed)");
+    expect(plain).not.toContain("(auto-fixed)");
   });
 
   it("executes default filesystem, process, and directory dependency wrappers in an isolated home", async () => {
@@ -746,13 +186,14 @@ describe("doctor service coverage", () => {
       const results = await runDoctor({
         homedir: home,
         cwd: join(home, "project"),
+        collectBackendSnapshot: async () => backendDiagnosticFailure(new Error("fixture unavailable")),
         fetch: vi.fn().mockResolvedValue({ ok: false }) as typeof fetch,
       });
       expect(results.find((result) => result.name === "claude-process")?.status).toBe("fail");
       expect(results.find((result) => result.name === "codex-process")?.status).toBe("fail");
       expect(mocks.spawnSync.mock.calls.length).toBeGreaterThanOrEqual(2);
       expect(JSON.parse(readFileSync(join(home, ".claude", "settings.json"), "utf8")).hooks)
-        .toBeDefined();
+        .toBeUndefined();
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -769,19 +210,15 @@ describe("doctor service coverage", () => {
     [JSON.stringify({ daemon: { port: 65536 } }), 3737],
     [JSON.stringify({ daemon: { port: 4545 }, storage: { backend: "invalid" } }), 4545],
     ["{bad", 3737],
-  ])("observes but does not repair from malformed config %s", async (configText, expectedPort) => {
+  ])("observes but does not repair from malformed config %s", async (configText) => {
     const deps = makeDeps({ configText });
     const results = await runDoctor(deps);
     expect(results.find((result) => result.name === "config")?.status).toBe("fail");
     expect(results.find((result) => result.name === "daemon")).toMatchObject({
-      status: "fail",
-      fixApplied: false,
-      message: expect.stringContaining("automatic start skipped because config is invalid"),
+      status: "skip",
+      message: expect.stringMatching(/config/i),
     });
-    expect(deps.fetch).toHaveBeenCalledWith(
-      `http://127.0.0.1:${expectedPort}/health`,
-      { signal: expect.any(AbortSignal) },
-    );
+    expect(deps.fetch).not.toHaveBeenCalled();
     expect(mocks.ensureDaemon).not.toHaveBeenCalled();
   });
 
@@ -837,8 +274,7 @@ describe("doctor service coverage", () => {
     });
   });
 
-  it("checks providers against the reused daemon process PATH", async () => {
-    mocks.ensureDaemon.mockResolvedValue({ connected: true, pid: 4242 });
+  it("checks providers against the authenticated daemon process PATH", async () => {
     mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
       if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
         const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
@@ -851,17 +287,16 @@ describe("doctor service coverage", () => {
       config: { llm: { provider: "codex-process" } },
       procEnviron: "HOME=/isolated\0PATH=/daemon/runtime/bin:/usr/bin\0LANG=C\0",
       health: [
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 4242 }) },
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 4242 }) },
+        readyHealth({ pid: 4242 }),
+        readyHealth({ pid: 4242 }),
       ],
     }));
 
     expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
   });
 
-  it("uses the recognized health PID after lifecycle validation omits its PID", async () => {
+  it("uses the PID from authenticated matching health", async () => {
     const readPaths: string[] = [];
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
     mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
       if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
         const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
@@ -875,8 +310,8 @@ describe("doctor service coverage", () => {
       procEnviron: "PATH=/health-pid/bin:/usr/bin\0",
       readPaths,
       health: [
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 4343 }) },
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 4343 }) },
+        readyHealth({ pid: 4343 }),
+        readyHealth({ pid: 4343 }),
       ],
     }));
 
@@ -884,58 +319,19 @@ describe("doctor service coverage", () => {
     expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
   });
 
-  it("uses only the lifecycle-verified PID when post-validation health reports another PID", async () => {
-    const readPaths: string[] = [];
-    mocks.ensureDaemon.mockResolvedValue({ connected: true, pid: 4242 });
-    mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
-      if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
-        const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
-        return { status: path === "/verified/bin" ? 0 : 1, stdout: "", stderr: "" };
-      }
-      return { status: 0, stdout: "", stderr: "" };
-    });
-
-    const results = await runDoctor(makeDeps({
-      config: { llm: { provider: "codex-process" } },
-      procEnviron: "PATH=/verified/bin\0",
-      readPaths,
-      health: [
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 9999 }) },
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 9999 }) },
-      ],
-    }));
-
-    expect(readPaths).toContain("/proc/4242/environ");
-    expect(readPaths).not.toContain("/proc/9999/environ");
-    expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
-  });
-
-  it.each(["disconnected", "throws"] as const)(
-    "does not inspect the initial health PID when daemon validation %s",
-    async (failure) => {
+  it.each(["version", "runtimeDigest", "entrypoint", "storageBackend"])(
+    "does not inspect a health PID when %s mismatches the expected identity",
+    async (field) => {
       const readPaths: string[] = [];
-      if (failure === "disconnected") {
-        mocks.ensureDaemon.mockResolvedValue({ connected: false });
-      } else {
-        mocks.ensureDaemon.mockRejectedValue(new Error("validation failed"));
-      }
-      mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
-        if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
-          const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
-          return { status: path?.includes("/stale/bin") ? 1 : 0, stdout: "", stderr: "" };
-        }
-        return { status: 0, stdout: "", stderr: "" };
-      });
-
       const results = await runDoctor(makeDeps({
-        config: { llm: { provider: "codex-process" } },
-        health: [{ ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 4242 }) }],
-        procEnviron: "PATH=/stale/bin\0",
-        readPaths,
+        config: { llm: { provider: "codex-process" } }, readPaths,
+        health: [readyHealth({ [field]: "untrusted-identity-canary" })],
       }));
-
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("fail");
       expect(readPaths).not.toContain("/proc/4242/environ");
-      expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
+      expect(mocks.ensureDaemon).not.toHaveBeenCalled();
+      expect(mocks.restartDaemon).not.toHaveBeenCalled();
+      expect(JSON.stringify(results)).not.toContain("untrusted-identity-canary");
     },
   );
 
@@ -950,7 +346,6 @@ describe("doctor service coverage", () => {
     procEnviron,
     readFails,
   ) => {
-    mocks.ensureDaemon.mockResolvedValue({ connected: true, pid });
     mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
       if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
         const path = (opts as { env?: { PATH?: string } } | undefined)?.env?.PATH;
@@ -969,8 +364,8 @@ describe("doctor service coverage", () => {
       procEnviron,
       readError: (path) => readFails && path === "/proc/4242/environ" ? new Error("proc hidden") : undefined,
       health: [
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid }) },
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid }) },
+        readyHealth({ pid }),
+        readyHealth({ pid }),
       ],
     }));
 
@@ -978,7 +373,6 @@ describe("doctor service coverage", () => {
   });
 
   it("tests an explicitly empty daemon PATH without falling back", async () => {
-    mocks.ensureDaemon.mockResolvedValue({ connected: true, pid: 4242 });
     let checkedPath: string | undefined;
     mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
       if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
@@ -992,8 +386,8 @@ describe("doctor service coverage", () => {
       config: { llm: { provider: "codex-process" } },
       procEnviron: "HOME=/isolated\0PATH=\0LANG=C\0",
       health: [
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
+        readyHealth(),
+        readyHealth(),
       ],
     }));
 
@@ -1029,109 +423,32 @@ describe("doctor service coverage", () => {
     expect(results.some((result) => result.name === "claude-process")).toBe(true);
   });
 
-  it("covers settings parse/repair/read failures and canonical skill cleanup failures", async () => {
-    const settingsWithDuplicate = {
-      hooks: { SessionStart: [{ hooks: [{ command: "lcm restore" }] }] },
-    };
-    let results = await runDoctor(makeDeps({
-      settings: settingsWithDuplicate,
-      writeError: new Error("cannot write"),
-      exists: (path) => !path.endsWith("lcm.md") && !path.endsWith("lcm-memory/SKILL.md"),
-    }));
-    expect(results.find((result) => result.name === "hooks")?.message).toContain("Could not manage native Claude Code hooks");
-    expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("fail");
-    expect(results.find((result) => result.name === "lcm-md")?.status).toBe("fail");
+  it.each([new Error("private-read-error-canary"), "private-read-error-canary"])(
+    "reports settings and skill read failures without raw errors",
+    async (failure) => {
+      const deps = makeDeps({
+        readError: (path) => path.endsWith("settings.json") || path.endsWith("lcm-memory/SKILL.md") ? failure : undefined,
+      });
+      const results = await runDoctor(deps);
+      expect(results.find((result) => result.name === "hooks")?.status).toBe("fail");
+      expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("fail");
+      expect(JSON.stringify(results)).not.toContain("private-read-error-canary");
+      expect(deps.writeFileSync).not.toHaveBeenCalled();
+      expect(deps.mkdirSync).not.toHaveBeenCalled();
+    },
+  );
 
-    results = await runDoctor(makeDeps({
-      settings: { mcpServers: { lcm: {} } },
-      claudeMd: "no managed block",
-      lcmMd: "stale",
-      readError: (path) => path.endsWith("CLAUDE.md") ? new Error("cannot read claude") : undefined,
-    }));
-    expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("warn");
-    expect(results.filter((result) => result.name === "lcm-md").at(-1)).toMatchObject({
-      status: "fail",
-      message: expect.stringContaining("lcm-memory skill repair failed: cannot read claude"),
+  it("observes stale hooks and missing skill without attempting repair", async () => {
+    const deps = makeDeps({
+      settings: { hooks: { SessionStart: [{ hooks: [{ command: "lcm restore" }] }] } },
+      exists: (path) => !path.endsWith("lcm-memory/SKILL.md"),
+      writeError: new Error("unexpected write"),
     });
-
-    results = await runDoctor(makeDeps({
-      readError: (path) => path.endsWith("settings.json") || path.endsWith("lcm.md") ? new Error("cannot read") : undefined,
-    }));
-    expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("fail");
-    expect(results.find((result) => result.name === "lcm-md")?.status).toBe("fail");
-  });
-
-  it("covers non-Error settings parsing and transport-specific Claude repair branches", async () => {
-    let results = await runDoctor(makeDeps({
-      readError: (path) => path.endsWith("settings.json") ? "plain settings failure" : undefined,
-    }));
-    expect(results.find((result) => result.name === "hooks")?.message).toContain("plain settings failure");
-
-    const runtimePath = join(process.cwd(), "dist", "lcm.mjs");
-    const cliHooks = mergeClaudeSettings({}, runtimePath, process.execPath, "cli").hooks;
-    const canonicalMcp = {
-      type: "stdio",
-      command: process.execPath,
-      args: [runtimePath, "mcp"],
-    };
-    const writes: string[] = [];
-    results = await runDoctor({
-      ...makeDeps({
-        settings: { hooks: cliHooks, mcpServers: { lcm: canonicalMcp } },
-        writes,
-      }),
-      _claudeTransport: "cli",
-    });
-    expect(results.find((result) => result.name === "mcp-lcm")).toMatchObject({
-      status: "warn",
-      fixApplied: true,
-      message: "Removed the owned Claude MCP entry for CLI transport",
-    });
-    expect(JSON.parse(writes.at(-1)!)).not.toHaveProperty("mcpServers");
-
-    results = await runDoctor({
-      ...makeDeps({ settings: { hooks: cliHooks, mcpServers: {} } }),
-      _claudeTransport: "cli",
-    });
-    expect(results.find((result) => result.name === "mcp-lcm")).toMatchObject({
-      status: "pass",
-      message: "Claude CLI transport does not use MCP",
-    });
-
-    results = await runDoctor({
-      ...makeDeps({
-        settings: { hooks: cliHooks, mcpServers: { lcm: canonicalMcp }, },
-        writeError: new Error("cannot remove MCP"),
-      }),
-      _claudeTransport: "cli",
-    });
-    expect(results.find((result) => result.name === "mcp-lcm")).toMatchObject({
-      status: "fail",
-      message: "Owned Claude MCP entry could not be removed — run: lcm install",
-    });
-  });
-
-  it("covers MCP repair failure and unreadable canonical skill recovery", async () => {
-    const runtimePath = join(process.cwd(), "dist", "lcm.mjs");
-    const mcpHooks = mergeClaudeSettings({}, runtimePath, process.execPath, "mcp").hooks;
-
-    let results = await runDoctor(makeDeps({
-      settings: { hooks: mcpHooks, mcpServers: { lcm: {} } },
-      writeError: new Error("cannot repair MCP"),
-    }));
-    expect(results.find((result) => result.name === "mcp-lcm")).toMatchObject({
-      status: "fail",
-      message: "mcpServers.lcm could not be repaired — run: lcm install",
-    });
-
-    results = await runDoctor(makeDeps({
-      settings: { hooks: mcpHooks, mcpServers: { lcm: {} } },
-      readError: (path) => path.endsWith("lcm-memory/SKILL.md") ? new Error("skill unreadable") : undefined,
-    }));
-    expect(results.find((result) => result.name === "lcm-md")).toMatchObject({
-      status: "fail",
-      message: expect.stringContaining("skill unreadable"),
-    });
+    const results = await runDoctor(deps);
+    expect(results.find((result) => result.name === "hooks")?.status).toBe("warn");
+    expect(results.find((result) => result.name === "lcm-md")?.status).toBe("warn");
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
+    expect(deps.mkdirSync).not.toHaveBeenCalled();
   });
 
   it("gives matching actionable JSON guidance for malformed Claude settings", async () => {
@@ -1145,75 +462,18 @@ describe("doctor service coverage", () => {
     expect(mcp?.message).toContain("Fix the JSON, then run: lcm install");
   });
 
-  it("repairs only MCP fields owned by LCM", async () => {
-    const writes: string[] = [];
-    const results = await runDoctor(makeDeps({
-      settings: {
-        theme: "dark",
-        mcpServers: {
-          other: { command: "other" },
-          lcm: {
-            type: "sse",
-            url: "https://example.invalid/lcm",
-            headers: { Authorization: "Bearer secret" },
-            transport: "sse",
-            env: { LCM_POSTGRES_URL: "postgresql://configured" },
-            futureOption: { enabled: true },
-          },
-        },
-      },
-      writes,
-    }));
-
+  it.each([
+    { type: "sse", url: "https://private-host-canary/lcm", headers: { Authorization: "private-token-canary" }, env: { LCM_POSTGRES_URL: "postgresql://private-database-canary" } },
+    ["malformed"],
+  ])("observes stale MCP registration without changing any settings", async (lcm) => {
+    const settings = { theme: "dark", mcpServers: { other: { command: "other" }, lcm } };
+    const before = JSON.stringify(settings);
+    const deps = makeDeps({ settings });
+    const results = await runDoctor(deps);
     expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("warn");
-    const repaired = writes
-      .map((content) => JSON.parse(content))
-      .find((settings) => settings.mcpServers?.lcm?.command === process.execPath);
-    expect(repaired).toEqual(expect.objectContaining({
-      theme: "dark",
-      mcpServers: {
-        other: { command: "other" },
-        lcm: {
-          type: "stdio",
-          command: process.execPath,
-          args: [expect.stringContaining("/dist/lcm.mjs"), "mcp"],
-          env: { LCM_POSTGRES_URL: "postgresql://configured" },
-          futureOption: { enabled: true },
-        },
-      },
-    }));
-
-    const rerunWrites: string[] = [];
-    const rerun = await runDoctor(makeDeps({ settings: repaired, writes: rerunWrites }));
-    expect(rerun.find((result) => result.name === "mcp-lcm")?.status).toBe("pass");
-    expect(rerunWrites).toEqual([]);
-  });
-
-  it("replaces a malformed managed MCP entry without disturbing its siblings", async () => {
-    const writes: string[] = [];
-    const results = await runDoctor(makeDeps({
-      settings: {
-        mcpServers: {
-          other: { command: "other", env: { KEEP: "true" } },
-          lcm: ["malformed"],
-        },
-      },
-      writes,
-    }));
-
-    expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("warn");
-    const repaired = writes
-      .map((content) => JSON.parse(content))
-      .find((settings) => settings.mcpServers?.lcm?.command === process.execPath);
-    expect(repaired).toBeDefined();
-    expect(repaired!.mcpServers).toEqual({
-      other: { command: "other", env: { KEEP: "true" } },
-      lcm: {
-        type: "stdio",
-        command: process.execPath,
-        args: [expect.stringContaining("/dist/lcm.mjs"), "mcp"],
-      },
-    });
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
+    expect(JSON.stringify(settings)).toBe(before);
+    expect(JSON.stringify(results)).not.toMatch(/private-(host|token|database)-canary/);
   });
 
   it("covers passive-learning detailed boundaries", async () => {
@@ -1235,8 +495,10 @@ describe("doctor service coverage", () => {
       recentErrors: [{ created_at: "now", hook: "PostToolUse", error: "failure" }],
     });
     const results = await runDoctor(makeDeps(), { verbose: true, eventsMaxDbs: 3 });
-    expect(results.find((result) => result.name === "events-recent-errors")?.message).toContain("PostToolUse");
+    expect(results.some((result) => result.name === "events-recent-errors")).toBe(false);
     expect(results.filter((result) => result.name.startsWith("events-project-"))).toHaveLength(8);
+    expect(JSON.stringify(results)).not.toMatch(/PostToolUse|failure|\/cwd|\/p[1-8]/);
+    expect(mocks.collectDetailedEvents).toHaveBeenCalledWith(expect.objectContaining({ pruneOrphanSidecars: false, maxDbs: 3 }));
     expect(results.find((result) => result.name === "events-errors")?.status).toBe("warn");
 
     mocks.collectEvents.mockReturnValue({ captured: 1, unprocessed: 0, errors: 0, lastCapture: "invalid-date" });
@@ -1245,53 +507,26 @@ describe("doctor service coverage", () => {
 
   it("covers healthy daemon backlog without sidecar metadata notes and plural scan messages", async () => {
     vi.useFakeTimers();
-    mocks.mcpStdout = JSON.stringify({ id: 2, result: { tools: Array(7).fill({}) } });
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
     mocks.collectEvents.mockReturnValue({
       captured: 300, unprocessed: 250, errors: 0, lastCapture: null,
       sidecarsWithUnprocessed: 0, orphanedSidecarsWithUnprocessed: 0,
       scanErrors: 2, scanSkipped: 2, prunedSidecars: 2,
     });
-    const results = await runWithHandshake(makeDeps({
+    const results = await runDoctor(makeDeps({
       health: [
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-        { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
+        readyHealth(),
+        readyHealth(),
       ],
     }));
     expect(results.find((result) => result.name === "events-capture")?.message).toContain("run: lcm events promote --all");
     expect(results.find((result) => result.name === "events-sidecar-scan")?.message).toContain("sidecars");
   });
 
-  it("covers daemon restart failure, offline rejection, and warning-bearing successful restarts", async () => {
-    let results: CheckResult[];
-
-    mocks.restartDaemon.mockResolvedValueOnce({ connected: false, restarted: false });
-    results = await runDoctor(makeDeps({ health: [{ ok: true, json: async () => ({ status: "ok", version: "old" }) }] }));
-    expect(results.find((result) => result.name === "daemon")?.message).toContain("restart failed");
-
-    mocks.ensureDaemon.mockRejectedValueOnce(new Error("start failed"));
-    results = await runDoctor(makeDeps());
+  it("reports an offline daemon without starting or restarting it", async () => {
+    const results = await runDoctor(makeDeps());
     expect(results.find((result) => result.name === "daemon")?.status).toBe("fail");
-
-    vi.useFakeTimers();
-    mocks.mcpStdout = JSON.stringify({ id: 2, result: { tools: Array(7).fill({}) } });
-    mocks.restartDaemon.mockResolvedValueOnce({ connected: true, restarted: true, warning: "restart warning" });
-    results = await runWithHandshake(makeDeps({ health: [
-      { ok: true, json: async () => ({ status: "ok", version: "old" }) },
-      { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-    ] }));
-    expect(results.find((result) => result.name === "daemon")?.message).toContain("restart warning");
-
-    mocks.ensureDaemon.mockResolvedValueOnce({ connected: true, restartedForParent: true, warning: "parent warning" });
-    results = await runWithHandshake(makeDeps({ health: [
-      { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-      { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-    ] }));
-    expect(results.find((result) => result.name === "daemon")?.message).toContain("parent warning");
-
-    mocks.ensureDaemon.mockResolvedValueOnce({ connected: true });
-    results = await runWithHandshake(makeDeps());
-    expect(results.find((result) => result.name === "daemon")?.message).toContain("started");
+    expect(mocks.ensureDaemon).not.toHaveBeenCalled();
+    expect(mocks.restartDaemon).not.toHaveBeenCalled();
   });
 
   it("covers singular passive sidecar wording and recent aggregate staleness", async () => {
@@ -1302,70 +537,32 @@ describe("doctor service coverage", () => {
       lastCapture: new Date(Date.now() - 2 * 60 * 60_000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, ""),
     });
     const results = await runDoctor(makeDeps());
-    expect(results.find((result) => result.name === "events-sidecar-prune")?.message).toContain("sidecar");
+    expect(results.some((result) => result.name === "events-sidecar-prune")).toBe(false);
+    expect(mocks.collectEvents).toHaveBeenCalledWith(expect.objectContaining({ pruneOrphanSidecars: false }));
     expect(results.find((result) => result.name === "events-staleness")?.message).toContain("h ago");
-  });
-
-  it("covers multiple duplicate hook repair failure and canonical skill cleanup paths", async () => {
-    const hooks: Record<string, unknown[]> = {};
-    for (const { event, command } of REQUIRED_HOOKS) hooks[event] = [{ hooks: [{ command: `lcm ${command}` }] }];
-    let results = await runDoctor(makeDeps({ settings: { hooks }, writeError: "plain write failure" }));
-    expect(results.find((result) => result.name === "hooks")?.message).toContain("Could not manage native Claude Code hooks");
-
-    results = await runDoctor(makeDeps({ claudeMd: "no reference" }));
-    expect(results.find((result) => result.name === "lcm-md")?.message).toContain("canonical Claude lcm-memory skill is installed");
-
-    results = await runDoctor(makeDeps({
-      exists: (path) => !path.endsWith("lcm.md"),
-      writeError: "plain write failure",
-    }));
-    expect(results.filter((result) => result.name === "lcm-md").at(-1)?.message).toContain("plain write failure");
-  });
-
-  it("formats future captures as just now in verbose project output", async () => {
-    mocks.collectDetailedEvents.mockReturnValue({
-      captured: 1, unprocessed: 0, errors: 0, lastCapture: null,
-      projects: [{
-        file: "future", path: "/future", captured: 1, unprocessed: 0, projectId: "future-project",
-        lastCapture: new Date(Date.now() + 60_000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, ""),
-      }],
-      recentErrors: [],
-    });
-    const results = await runDoctor(makeDeps(), true);
-    expect(results.find((result) => result.name === "events-project-future")?.message).toContain("just now");
   });
 
   it("covers healthy singular-sidecar scope and one-to-seven-day aggregate staleness", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-10T00:00:00Z"));
-    mocks.mcpStdout = JSON.stringify({ id: 2, result: { tools: Array(7).fill({}) } });
-    mocks.ensureDaemon.mockResolvedValue({ connected: true });
     mocks.collectEvents.mockReturnValue({
       captured: 250, unprocessed: 250, errors: 0,
       sidecarsWithUnprocessed: 1, orphanedSidecarsWithUnprocessed: 0,
       lastCapture: "2026-01-08 00:00:00",
     });
-    const results = await runWithHandshake(makeDeps({ health: [
-      { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
-      { ok: true, json: async () => ({ status: "ok", version: "1.2.3" }) },
+    const results = await runDoctor(makeDeps({ health: [
+      readyHealth(),
+      readyHealth(),
     ] }));
     expect(results.find((result) => result.name === "events-capture")?.message).toContain("1 project sidecar");
     expect(results.find((result) => result.name === "events-staleness")?.message).toContain("2d ago");
   });
 
   it("covers isolated project-map, generated-pattern, MCP normalization, and config fallback branches", async () => {
-    const root = mkdtempSync(join(tmpdir(), "lcm-doctor-isolated-"));
-    const mapPath = join(root, "map.json");
-    writeFileSync(mapPath, "{}");
-    let validation: unknown = { ok: true, fixApplied: false, warnings: [], errors: [], path: mapPath, map: undefined };
-    let thrown: unknown;
+    const mapPath = join(DOCTOR_HOME, ".lcm", "map.json");
+    writeFileSync(mapPath, "{}", { mode: 0o600 });
 
     vi.resetModules();
-    vi.doMock("../src/project-map.js", async (importOriginal) => ({
-      ...(await importOriginal<typeof import("../src/project-map.js")>()),
-      validateProjectMap: () => { if (thrown !== undefined) throw thrown; return validation; },
-      projectMapPath: () => mapPath,
-    }));
     vi.doMock("../src/generated-patterns.js", () => ({ GITLEAKS_PATTERNS: [] }));
     vi.doMock("../src/scrub.js", async (importOriginal) => {
       const original = await importOriginal<typeof import("../src/scrub.js")>();
@@ -1375,31 +572,27 @@ describe("doctor service coverage", () => {
         ScrubEngine: { loadProjectPatterns: vi.fn().mockResolvedValue([]) },
       };
     });
-    vi.doMock("../src/daemon/config.js", async (importOriginal) => ({
-      ...(await importOriginal<typeof import("../src/daemon/config.js")>()),
-      loadDaemonConfig: () => ({}),
-    }));
     vi.doMock("../installer/install.js", async (importOriginal) => ({
       ...(await importOriginal<typeof import("../installer/install.js")>()),
       mergeClaudeSettings: () => ({}),
     }));
     const isolated = await import("../src/doctor/doctor.js");
 
-    thrown = "plain map failure";
-    expect((await isolated.runDoctor(makeDeps())).find((result) => result.name === "project-map")?.message).toContain("plain map failure");
-    thrown = undefined;
+    writeFileSync(mapPath, "invalid-map-canary", { mode: 0o600 });
+    const invalidResults = await isolated.runDoctor(makeDeps());
+    expect(invalidResults.find((result) => result.name === "project-map")?.status).toBe("fail");
+    expect(JSON.stringify(invalidResults)).not.toContain("invalid-map-canary");
+    expect(readFileSync(mapPath, "utf8")).toBe("invalid-map-canary");
 
-    validation = { ok: true, fixApplied: true, warnings: [], errors: [], path: mapPath };
-    expect((await isolated.runDoctor(makeDeps())).find((result) => result.name === "project-map")?.message).toBe("formatted map.json");
-    validation = { ok: true, fixApplied: true, warnings: ["map warning"], errors: [], path: mapPath };
-    expect((await isolated.runDoctor(makeDeps())).find((result) => result.name === "project-map")?.message).toBe("map warning");
-
-    validation = { ok: true, fixApplied: false, warnings: [], errors: [], path: mapPath, map: undefined };
+    writeFileSync(mapPath, "{}", { mode: 0o600 });
     expect((await isolated.runDoctor(makeDeps())).find((result) => result.name === "project-map")?.message).toContain("0 mapped projects");
-    validation = { ok: true, fixApplied: false, warnings: [], errors: [], path: mapPath, map: { one: {} } };
+    const map = { ["a".repeat(64)]: { canonical: "/one", aliases: [] } };
+    writeFileSync(mapPath, JSON.stringify(map), { mode: 0o600 });
     expect((await isolated.runDoctor(makeDeps())).find((result) => result.name === "project-map")?.message).toContain("1 mapped project");
-    validation = { ok: true, fixApplied: false, warnings: [], errors: [], path: mapPath, map: { one: {}, two: {} } };
+    const two = JSON.stringify({ ...map, ["b".repeat(64)]: { canonical: "/two", aliases: [] } });
+    writeFileSync(mapPath, two, { mode: 0o600 });
     const finalResults = await isolated.runDoctor(makeDeps({ settings: { mcpServers: { lcm: {} } } }));
+    expect(readFileSync(mapPath, "utf8")).toBe(two);
     expect(finalResults.find((result) => result.name === "project-map")?.message).toContain("2 mapped projects");
     expect(finalResults.find((result) => result.name === "secret-detection")).toMatchObject({
       status: "fail",
@@ -1424,6 +617,5 @@ describe("doctor service coverage", () => {
     syncDate = undefined;
     expect((await syncDateDoctor.runDoctor(makeDeps())).find((result) => result.name === "secret-detection")?.message)
       .not.toContain("(synced ");
-    rmSync(root, { recursive: true, force: true });
   });
 });

@@ -49,7 +49,7 @@ vi.mock("../../src/daemon/client.js", () => ({
     }
 
     async get() {
-      return { totalConnections: 0, activeConnections: 0, idleConnections: 0, connections: [] };
+      return { backendDiagnostics: { backend: "sqlite", classification: "healthy", remediation: "No action required.", pool: { origin: "daemon", status: "ready", total: 0, idle: 0 } } };
     }
   },
 }));

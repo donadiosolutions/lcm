@@ -365,8 +365,10 @@ target is SQLite, then restart the daemon; do not edit `map.json` or
 `config.json` independently.
 
 CLI/import-export and portable transfer remain #618-owned. Stats, pool
-diagnostics, status, and doctor presentation remain #619-owned; their current
-limitations do not change the daemon's project identity or publication gate.
+diagnostics, status, and doctor use the selected-backend
+[observational snapshot](cli.md#observational-diagnostics), with safe identity
+fields and no project registration or repair. Diagnostic observations do not
+weaken the daemon's project identity or publication gate.
 
 ## Same-machine aliases
 
@@ -611,7 +613,8 @@ lcm project list --json
 lcm doctor
 ```
 
-`lcm doctor` validates `map.json`, reports invalid JSON/schema/UUIDs and
-cross-entry collisions, and can normalize formatting or remove same-entry
-duplicate aliases. It preserves the last valid daemon map during transient
-invalid editor saves and never auto-repairs an ambiguous mapping by guessing.
+`lcm doctor` validates `map.json` and reports invalid JSON/schema/UUIDs and
+cross-entry collisions. It does not normalize formatting, remove duplicate
+aliases, reconcile worktrees, or write the map. Review the findings and resolve
+the intended mapping through explicit project commands before rerunning
+doctor. Ambiguous mappings are never resolved by guessing.
