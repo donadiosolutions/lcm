@@ -85,9 +85,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (separator >= 0 && char === "]" && brackets > 0) {
       const closesFilePathWrapper = foundFilePath && brackets === filePathBracketDepth;
       brackets -= 1;
-      if (closesFilePathWrapper && (chars[index + 1] === "/" || chars[index + 1] === "\\")) {
-        foundFilePath = false;
-        filePathBracketDepth = 0;
+      if (closesFilePathWrapper) {
+        filePathBracketDepth = brackets;
+        if (chars[index + 1] === "/" || chars[index + 1] === "\\") foundFilePath = false;
       }
       continue;
     }

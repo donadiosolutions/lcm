@@ -290,6 +290,14 @@ describe("sanitizeError", () => {
       "file://remote.invalid[[[<path>]<path>]<path>]<path>",
     ],
     [
+      "file://remote.invalid[[/Users/canary/one.db]]/Users/canary/two/deeper.db",
+      "file://remote.invalid[[<path>]]<path>",
+    ],
+    [
+      "file://remote.invalid[[[/Users/canary/one.db]]]/Users/canary/two/deeper.db",
+      "file://remote.invalid[[[<path>]]]<path>",
+    ],
+    [
       "FILE://LOCALHOST[/Users/canary/one.db]/Users/canary/two.db",
       "FILE://LOCALHOST[<path>]<path>",
     ],
@@ -362,6 +370,26 @@ describe("sanitizeError", () => {
   });
 
   it.each([
+    [
+      "file://host[/private]?next=[label]/https://public.test/x",
+      "file://host[<path>]?next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host[/private]#next=[label]/https://public.test/x",
+      "file://host[<path>]#next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host[/private]&next=[label]/https://public.test/x",
+      "file://host[<path>]&next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host[/private]=next=[label]/https://public.test/x",
+      "file://host[<path>]=next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host[/private]x[/label]/https://public.test/x",
+      "file://host[<path>]x[/label]/https://public.test/x",
+    ],
     [
       "file://host/private?next=[label]/https://public.test/x",
       "file://host<path>?next=[label]/https://public.test/x",
