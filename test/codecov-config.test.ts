@@ -214,6 +214,8 @@ const expectedComponents = [
     component_id: "unit-project-worktrees",
     name: "Unit - Projects and Worktrees",
     paths: [
+      // #974 keeps target-parent reconciliation hardening in this
+      // existing component.
       "^src/codex-project-resolution\\.ts$",
       "^src/git-project\\.ts$",
       "^src/machine-identity\\.ts$",
