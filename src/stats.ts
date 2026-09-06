@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
-import { readdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
+import { lstatSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { runLcmMigrations } from "./db/migration.js";
 import { collectEventStats } from "./db/events-stats.js";
 import { RecallStore, type RecallStats } from "./db/recall.js";
@@ -12,6 +12,13 @@ import { sanitizeTerminalText } from "./terminal-sanitize.js";
 import { selectStorageBackendForConfig, StorageBackendUnavailableError } from "./storage/backend.js";
 import { BackendPublicationJournalError } from "./storage/backend-publication.js";
 import { PrivateMutationLockContentionError } from "./private-mutation-lock.js";
+import {
+  assertPrivateDirectoryEntry,
+  openPrivateDirectory,
+  openPrivateDirectoryIfExists,
+  PrivateDirectoryTopologyError,
+  type PrivateDirectoryHandle,
+} from "./security-files.js";
 
 export type { RecallStats };
 
@@ -53,11 +60,148 @@ interface OverallStats {
   staleCount: number;
 }
 
-function queryProjectStats(dbPath: string, projectId: string, staleCfg: { staleAfterDays: number; staleSurfacingWithoutUseLimit: number }): Omit<OverallStats, "projects" | "recallStats" | "staleCount"> & { recallStats: RecallStats; staleCount: number } {
-  const db = new DatabaseSync(dbPath);
-  db.exec("PRAGMA busy_timeout = 5000");
+type ProjectStats = Omit<OverallStats, "projects" | "recallStats" | "staleCount"> & {
+  recallStats: RecallStats;
+  staleCount: number;
+};
+
+type DatabaseFileWitness = Readonly<{
+  device: bigint;
+  inode: bigint;
+}>;
+
+type RetainedDirectory = Readonly<{
+  handle: PrivateDirectoryHandle;
+  path: string;
+}>;
+
+const STATS_ADMISSION_MESSAGE = "stats database topology is not trusted; restore owner-only LCM state directories and a regular project database";
+
+/** A stats database path failed private-state admission. */
+export class StatsDatabaseAdmissionError extends Error {
+  constructor() {
+    super(STATS_ADMISSION_MESSAGE);
+    this.name = "StatsDatabaseAdmissionError";
+  }
+}
+
+function isMissing(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+function normalizeStatsFilesystemError(
+  error: unknown,
+): StatsDatabaseAdmissionError | PrivateDirectoryTopologyError {
+  if (error instanceof StatsDatabaseAdmissionError
+    || error instanceof PrivateDirectoryTopologyError) return error;
+  return new StatsDatabaseAdmissionError();
+}
+
+function admitFilesystemOperation<T>(operation: () => T): T {
+  try {
+    return operation();
+  } catch (error) {
+    throw normalizeStatsFilesystemError(error);
+  }
+}
+
+function openOptionalStatsDirectory(path: string): PrivateDirectoryHandle | undefined {
+  return admitFilesystemOperation(() => openPrivateDirectoryIfExists(path));
+}
+
+function openStatsDirectory(path: string): PrivateDirectoryHandle {
+  return admitFilesystemOperation(() => openPrivateDirectory(path));
+}
+
+function assertStatsDirectories(directories: readonly RetainedDirectory[]): void {
+  for (const directory of directories) {
+    assertPrivateDirectoryEntry(
+      directory.handle,
+      directory.path,
+      directory.handle.witness.uid,
+    );
+  }
+}
+
+function closeStatsDirectories(
+  handles: readonly (PrivateDirectoryHandle | undefined)[],
+  operationFailed: boolean,
+): void {
+  let closeFailure: StatsDatabaseAdmissionError | PrivateDirectoryTopologyError | undefined;
+  for (const handle of handles) {
+    if (!handle) continue;
+    try {
+      handle.close();
+    } catch (error) {
+      closeFailure ??= normalizeStatsFilesystemError(error);
+    }
+  }
+  if (closeFailure && !operationFailed) throw closeFailure;
+}
+
+function inspectStatsDatabasePath(path: string): DatabaseFileWitness | null {
+  try {
+    const stat = lstatSync(path, { bigint: true });
+    if (!stat.isFile()) throw new StatsDatabaseAdmissionError();
+    return { device: stat.dev, inode: stat.ino };
+  } catch (error) {
+    if (isMissing(error)) return null;
+    if (error instanceof StatsDatabaseAdmissionError) throw error;
+    throw new StatsDatabaseAdmissionError();
+  }
+}
+
+function sameDatabaseFile(
+  left: DatabaseFileWitness,
+  right: DatabaseFileWitness,
+): boolean {
+  return left.device === right.device && left.inode === right.inode;
+}
+
+function assertStatsDatabasePath(
+  path: string,
+  expected: DatabaseFileWitness,
+): void {
+  const actual = inspectStatsDatabasePath(path);
+  if (actual === null || !sameDatabaseFile(expected, actual)) {
+    throw new StatsDatabaseAdmissionError();
+  }
+}
+
+function queryProjectStats(
+  dbPath: string,
+  projectId: string,
+  staleCfg: { staleAfterDays: number; staleSurfacingWithoutUseLimit: number },
+  directories: readonly RetainedDirectory[],
+): ProjectStats | null {
+  assertStatsDirectories(directories);
+  const expectedDatabase = inspectStatsDatabasePath(dbPath);
+  if (expectedDatabase === null) return null;
+
+  const databaseUrl = pathToFileURL(dbPath);
+  databaseUrl.searchParams.set("mode", "rw");
+  let db: DatabaseSync | undefined;
+  let queryFailed = false;
 
   try {
+    try {
+      // DatabaseSync has no portable descriptor-bound constructor. Retained
+      // private 0700 parents and pre/post identity checks reject persistent
+      // path drift, while a same-owner swap-and-restore ABA remains possible.
+      db = new DatabaseSync(databaseUrl);
+    } catch (error) {
+      assertStatsDirectories(directories);
+      const currentDatabase = inspectStatsDatabasePath(dbPath);
+      if (currentDatabase === null) return null;
+      if (!sameDatabaseFile(expectedDatabase, currentDatabase)) {
+        throw new StatsDatabaseAdmissionError();
+      }
+      throw error;
+    }
+
+    assertStatsDirectories(directories);
+    assertStatsDatabasePath(dbPath, expectedDatabase);
+    db.exec("PRAGMA busy_timeout = 5000");
     runLcmMigrations(db);
     const msgStats = db.prepare(
       `SELECT COUNT(*) as count, COALESCE(SUM(token_count), 0) as tokens FROM messages`
@@ -131,7 +275,7 @@ function queryProjectStats(dbPath: string, projectId: string, staleCfg: { staleA
       }).length;
     } catch { /* non-fatal */ }
 
-    return {
+    const result: ProjectStats = {
       conversations: convRows.length,
       compactedConversations: compacted.length,
       messages: msgStats.count,
@@ -147,8 +291,20 @@ function queryProjectStats(dbPath: string, projectId: string, staleCfg: { staleA
       recallStats,
       staleCount,
     };
+    assertStatsDirectories(directories);
+    assertStatsDatabasePath(dbPath, expectedDatabase);
+    return result;
+  } catch (error) {
+    queryFailed = true;
+    throw error;
   } finally {
-    db.close();
+    if (db) {
+      try {
+        db.close();
+      } catch (error) {
+        if (!queryFailed) throw error;
+      }
+    }
   }
 }
 
@@ -345,6 +501,7 @@ export function printStats(stats: OverallStats, verbose: boolean): void {
 
 export async function collectStats(): Promise<OverallStats> {
   const baseDir = lcmProjectsDir();
+  const stateRoot = dirname(baseDir);
 
   // Admission must happen before the empty-project fast path. Otherwise an
   // unresolved publication could be hidden by an installation with no projects.
@@ -363,119 +520,166 @@ export async function collectStats(): Promise<OverallStats> {
     memoriesSurfaced: 0, memoriesActedUpon: 0, recallPrecision: null, topRecalled: [],
   };
 
-  if (!existsSync(baseDir)) {
-    return {
-      projects: 0, conversations: 0, compactedConversations: 0, messages: 0, summaries: 0,
-      maxDepth: 0, rawTokens: 0, summaryTokens: 0, ratio: 0,
-      promotedCount: 0, conversationDetails: [],
-      redactionCounts: { builtIn: 0, global: 0, project: 0, total: 0 },
-      eventsCaptured: 0, eventsUnprocessed: 0, eventsErrors: 0,
-      recallStats: emptyRecallStats,
-      staleCount: 0,
-    };
-  }
+  const emptyStats = (): OverallStats => ({
+    projects: 0, conversations: 0, compactedConversations: 0, messages: 0, summaries: 0,
+    maxDepth: 0, rawTokens: 0, summaryTokens: 0, ratio: 0,
+    promotedCount: 0, conversationDetails: [],
+    redactionCounts: { builtIn: 0, global: 0, project: 0, total: 0 },
+    eventsCaptured: 0, eventsUnprocessed: 0, eventsErrors: 0,
+    recallStats: emptyRecallStats,
+    staleCount: 0,
+  });
 
-  let totalProjects = 0;
-  let totalConversations = 0;
-  let totalCompacted = 0;
-  let totalMessages = 0;
-  let totalSummaries = 0;
-  let totalMaxDepth = 0;
-  let totalRawTokens = 0;
-  let totalSummaryTokens = 0;
-  let totalPromoted = 0;
-  let totalStale = 0;
-  let allDetails: ConversationStats[] = [];
-  const totalRedactions: RedactionCounts = { builtIn: 0, global: 0, project: 0, total: 0 };
-  let totalMemoriesSurfaced = 0;
-  let totalMemoriesActedUpon = 0;
-  const allTopRecalled: Array<{ id: string; content: string; actCount: number }> = [];
-
-  // Load stale config once for all projects
-  let staleCfg = { staleAfterDays: 90, staleSurfacingWithoutUseLimit: 5 };
+  let rootHandle: PrivateDirectoryHandle | undefined;
+  let projectsHandle: PrivateDirectoryHandle | undefined;
+  let collectionFailed = false;
   try {
-    const cfg = loadDaemonConfig(defaultConfigPath());
-    staleCfg = {
-      staleAfterDays: cfg.restoration.staleAfterDays,
-      staleSurfacingWithoutUseLimit: cfg.restoration.staleSurfacingWithoutUseLimit,
+    rootHandle = openOptionalStatsDirectory(stateRoot);
+    if (!rootHandle) return emptyStats();
+    const rootDirectory = { handle: rootHandle, path: stateRoot };
+    assertStatsDirectories([rootDirectory]);
+
+    projectsHandle = openOptionalStatsDirectory(baseDir);
+    assertStatsDirectories([rootDirectory]);
+    if (!projectsHandle) return emptyStats();
+    const retainedDirectories = [
+      rootDirectory,
+      { handle: projectsHandle, path: baseDir },
+    ] as const;
+    assertStatsDirectories(retainedDirectories);
+
+    const entries = admitFilesystemOperation(
+      () => readdirSync(baseDir, { withFileTypes: true }),
+    );
+    assertStatsDirectories(retainedDirectories);
+
+    let totalProjects = 0;
+    let totalConversations = 0;
+    let totalCompacted = 0;
+    let totalMessages = 0;
+    let totalSummaries = 0;
+    let totalMaxDepth = 0;
+    let totalRawTokens = 0;
+    let totalSummaryTokens = 0;
+    let totalPromoted = 0;
+    let totalStale = 0;
+    let allDetails: ConversationStats[] = [];
+    const totalRedactions: RedactionCounts = { builtIn: 0, global: 0, project: 0, total: 0 };
+    let totalMemoriesSurfaced = 0;
+    let totalMemoriesActedUpon = 0;
+    const allTopRecalled: Array<{ id: string; content: string; actCount: number }> = [];
+
+    // Load stale config once for all projects
+    let staleCfg = { staleAfterDays: 90, staleSurfacingWithoutUseLimit: 5 };
+    try {
+      const cfg = loadDaemonConfig(defaultConfigPath());
+      staleCfg = {
+        staleAfterDays: cfg.restoration.staleAfterDays,
+        staleSurfacingWithoutUseLimit: cfg.restoration.staleSurfacingWithoutUseLimit,
+      };
+    } catch (error) {
+      if (error instanceof BackendPublicationJournalError
+        || error instanceof PrivateMutationLockContentionError) throw error;
+      /* use defaults */
+    }
+
+    for (const entry of entries) {
+      // readdir reports symlink entries as non-directories, so a project that
+      // is already a symlink remains excluded from aggregate stats.
+      if (!entry.isDirectory()) continue;
+      assertStatsDirectories(retainedDirectories);
+      const projectPath = join(baseDir, entry.name);
+      let projectHandle: PrivateDirectoryHandle | undefined;
+      let projectFailed = false;
+      try {
+        projectHandle = openStatsDirectory(projectPath);
+        const projectDirectories = [
+          ...retainedDirectories,
+          { handle: projectHandle, path: projectPath },
+        ];
+        assertStatsDirectories(projectDirectories);
+        const dbPath = join(projectPath, "db.sqlite");
+
+        try {
+          const projStats = queryProjectStats(dbPath, entry.name, staleCfg, projectDirectories);
+          if (projStats === null || projStats.messages === 0) continue;
+          totalProjects++;
+          totalConversations += projStats.conversations;
+          totalCompacted += projStats.compactedConversations;
+          totalMessages += projStats.messages;
+          totalSummaries += projStats.summaries;
+          totalMaxDepth = Math.max(totalMaxDepth, projStats.maxDepth);
+          totalRawTokens += projStats.rawTokens;
+          totalSummaryTokens += projStats.summaryTokens;
+          totalPromoted += projStats.promotedCount;
+          totalStale += projStats.staleCount;
+          allDetails = allDetails.concat(projStats.conversationDetails);
+          totalRedactions.builtIn += projStats.redactionCounts.builtIn;
+          totalRedactions.global += projStats.redactionCounts.global;
+          totalRedactions.project += projStats.redactionCounts.project;
+          totalRedactions.total += projStats.redactionCounts.total;
+          totalMemoriesSurfaced += projStats.recallStats.memoriesSurfaced;
+          totalMemoriesActedUpon += projStats.recallStats.memoriesActedUpon;
+          allTopRecalled.push(...projStats.recallStats.topRecalled);
+        } catch (error) {
+          if (error instanceof StatsDatabaseAdmissionError
+            || error instanceof PrivateDirectoryTopologyError) throw error;
+          // Busy, locked, malformed-schema, and other SQLite failures remain
+          // best-effort per-project skips.
+        }
+      } catch (error) {
+        projectFailed = true;
+        throw error;
+      } finally {
+        closeStatsDirectories([projectHandle], projectFailed);
+      }
+    }
+
+    // Passive learning event stats
+    let eventsCaptured = 0;
+    let eventsUnprocessed = 0;
+    let eventsErrors = 0;
+    try {
+      const eventStats = await collectEventStats(2000);
+      eventsCaptured = eventStats.captured;
+      eventsUnprocessed = eventStats.unprocessed;
+      eventsErrors = eventStats.errors;
+    } catch { /* non-fatal */ }
+
+    // Deduplicate and sort allTopRecalled, take top 5 globally
+    const topRecalledByCount = allTopRecalled
+      .sort((a, b) => b.actCount - a.actCount)
+      .slice(0, 5);
+    const recallPrecision = totalMemoriesSurfaced > 0
+      ? Math.min(100, (totalMemoriesActedUpon / totalMemoriesSurfaced) * 100)
+      : null;
+
+    return {
+      projects: totalProjects,
+      conversations: totalConversations,
+      compactedConversations: totalCompacted,
+      messages: totalMessages,
+      summaries: totalSummaries,
+      maxDepth: totalMaxDepth,
+      rawTokens: totalRawTokens,
+      summaryTokens: totalSummaryTokens,
+      ratio: totalSummaryTokens > 0 ? totalRawTokens / totalSummaryTokens : 0,
+      promotedCount: totalPromoted,
+      conversationDetails: allDetails,
+      redactionCounts: totalRedactions,
+      eventsCaptured, eventsUnprocessed, eventsErrors,
+      recallStats: {
+        memoriesSurfaced: totalMemoriesSurfaced,
+        memoriesActedUpon: totalMemoriesActedUpon,
+        recallPrecision,
+        topRecalled: topRecalledByCount,
+      },
+      staleCount: totalStale,
     };
   } catch (error) {
-    if (error instanceof BackendPublicationJournalError
-      || error instanceof PrivateMutationLockContentionError) throw error;
-    /* use defaults */
+    collectionFailed = true;
+    throw error;
+  } finally {
+    closeStatsDirectories([projectsHandle, rootHandle], collectionFailed);
   }
-
-  for (const entry of readdirSync(baseDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const dbPath = join(baseDir, entry.name, "db.sqlite");
-    if (!existsSync(dbPath)) continue;
-
-    try {
-      const projStats = queryProjectStats(dbPath, entry.name, staleCfg);
-      // Only count projects with stored messages
-      if (projStats.messages === 0) continue;
-      totalProjects++;
-      totalConversations += projStats.conversations;
-      totalCompacted += projStats.compactedConversations;
-      totalMessages += projStats.messages;
-      totalSummaries += projStats.summaries;
-      totalMaxDepth = Math.max(totalMaxDepth, projStats.maxDepth);
-      totalRawTokens += projStats.rawTokens;
-      totalSummaryTokens += projStats.summaryTokens;
-      totalPromoted += projStats.promotedCount;
-      totalStale += projStats.staleCount;
-      allDetails = allDetails.concat(projStats.conversationDetails);
-      totalRedactions.builtIn += projStats.redactionCounts.builtIn;
-      totalRedactions.global += projStats.redactionCounts.global;
-      totalRedactions.project += projStats.redactionCounts.project;
-      totalRedactions.total += projStats.redactionCounts.total;
-      totalMemoriesSurfaced += projStats.recallStats.memoriesSurfaced;
-      totalMemoriesActedUpon += projStats.recallStats.memoriesActedUpon;
-      allTopRecalled.push(...projStats.recallStats.topRecalled);
-    } catch {
-      // skip corrupt databases
-    }
-  }
-
-  // Passive learning event stats
-  let eventsCaptured = 0;
-  let eventsUnprocessed = 0;
-  let eventsErrors = 0;
-  try {
-    const eventStats = await collectEventStats(2000);
-    eventsCaptured = eventStats.captured;
-    eventsUnprocessed = eventStats.unprocessed;
-    eventsErrors = eventStats.errors;
-  } catch { /* non-fatal */ }
-
-  // Deduplicate and sort allTopRecalled, take top 5 globally
-  const topRecalledByCount = allTopRecalled
-    .sort((a, b) => b.actCount - a.actCount)
-    .slice(0, 5);
-  const recallPrecision = totalMemoriesSurfaced > 0
-    ? Math.min(100, (totalMemoriesActedUpon / totalMemoriesSurfaced) * 100)
-    : null;
-
-  return {
-    projects: totalProjects,
-    conversations: totalConversations,
-    compactedConversations: totalCompacted,
-    messages: totalMessages,
-    summaries: totalSummaries,
-    maxDepth: totalMaxDepth,
-    rawTokens: totalRawTokens,
-    summaryTokens: totalSummaryTokens,
-    ratio: totalSummaryTokens > 0 ? totalRawTokens / totalSummaryTokens : 0,
-    promotedCount: totalPromoted,
-    conversationDetails: allDetails,
-    redactionCounts: totalRedactions,
-    eventsCaptured, eventsUnprocessed, eventsErrors,
-    recallStats: {
-      memoriesSurfaced: totalMemoriesSurfaced,
-      memoriesActedUpon: totalMemoriesActedUpon,
-      recallPrecision,
-      topRecalled: topRecalledByCount,
-    },
-    staleCount: totalStale,
-  };
 }
