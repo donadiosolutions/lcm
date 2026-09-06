@@ -464,4 +464,7 @@ If cancellation cannot prove that the managed daemon and its owned provider
 work disappeared, LCM does not signal an unknown process or claim success. It
 stays in draining state, reports the missing proof, and fails closed. This also
 applies when a managed restart cannot prove old-instance disappearance and
-replacement identity.
+replacement identity. Replacement proof requires the packaged runtime digest
+of the invoking CLI to exactly match the new daemon. When that digest is
+unavailable, including source-style CLI execution without packaged build
+metadata, the drain remains unproved and reports the missing identity proof.

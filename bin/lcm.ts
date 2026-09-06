@@ -733,6 +733,7 @@ export async function cancelAndDrainCompactInvocation(
   }
 
   let restartDeadline: number | undefined;
+  let replacementProofDiagnostic: string | undefined;
   const boundedRestart = async <T>(
     operation: (signal: AbortSignal) => Promise<T>,
   ): Promise<BoundedResult<T>> => {
@@ -765,15 +766,27 @@ export async function cancelAndDrainCompactInvocation(
     if (!oldGone || !providersGone) return false;
     const replacementResult = await boundedRestart(signal => health(options.createFreshClient(), { signal }));
     const replacement = replacementResult.value;
-    replacementVerified = replacementResult.settled
+    const replacementIdentityWithoutRuntime = replacementResult.settled
       && replacementResult.error === undefined
       && replacement !== null
       && replacement !== undefined
       && replacement.daemonInstanceId !== undefined
       && replacement.daemonInstanceId !== options.originalHealth?.daemonInstanceId
-      && (options.expectedRuntimeDigest === undefined || replacement.runtimeDigest === options.expectedRuntimeDigest)
       && (options.expectedStorageBackend === undefined || replacement.storageBackend === options.expectedStorageBackend)
       && (replacement.status === "ok" || replacement.status === "healthy");
+    const expectedRuntimeDigest = options.expectedRuntimeDigest;
+    const expectedRuntimeDigestAvailable = typeof expectedRuntimeDigest === "string"
+      && expectedRuntimeDigest.length > 0;
+    if (replacementIdentityWithoutRuntime) {
+      if (!expectedRuntimeDigestAvailable) {
+        replacementProofDiagnostic = "expected runtime digest is unavailable; cannot verify replacement identity";
+      } else if (replacement.runtimeDigest !== expectedRuntimeDigest) {
+        replacementProofDiagnostic = "replacement daemon runtime digest does not match the invoking CLI";
+      }
+    }
+    replacementVerified = replacementIdentityWithoutRuntime
+      && expectedRuntimeDigestAvailable
+      && replacement.runtimeDigest === expectedRuntimeDigest;
     return replacementVerified;
   };
 
@@ -781,6 +794,7 @@ export async function cancelAndDrainCompactInvocation(
     restartAttempted = true;
     if (session.restart !== undefined) {
       if (await proveReplacement(session.restart)) daemonZero = true;
+      else if (replacementProofDiagnostic !== undefined) diagnostic = replacementProofDiagnostic;
     } else if (session.restartPromise !== undefined) {
       const pendingRestart = await boundedRestart(async () => await session.restartPromise!);
       if (pendingRestart.settled
@@ -789,6 +803,7 @@ export async function cancelAndDrainCompactInvocation(
         session.restart = pendingRestart.value;
         session.restartPromise = undefined;
         if (await proveReplacement(pendingRestart.value)) daemonZero = true;
+        else if (replacementProofDiagnostic !== undefined) diagnostic = replacementProofDiagnostic;
       } else if (pendingRestart.settled) {
         // A terminally failed attempt no longer owns restart admission. Permit
         // a later drain iteration to start one fresh managed restart.
@@ -825,7 +840,9 @@ export async function cancelAndDrainCompactInvocation(
       }
       if (await proveReplacement(restart)) daemonZero = true;
       if (!replacementVerified) {
-        diagnostic = restart.warning ?? "managed daemon restart did not prove replacement identity";
+        diagnostic = replacementProofDiagnostic
+          ?? restart.warning
+          ?? "managed daemon restart did not prove replacement identity";
       }
     } catch (error) {
       diagnostic = error instanceof Error ? error.message : "managed daemon restart was not verified";
