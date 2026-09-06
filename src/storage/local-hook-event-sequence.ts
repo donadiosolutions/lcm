@@ -1,9 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
-import { dirname } from "node:path";
 import { closeLcmConnection, getLcmConnection } from "../db/connection.js";
 import { eventSequenceDbPath } from "../db/events-path.js";
-import { ensurePrivateDirectory } from "../security-files.js";
 
 const MAX_POSTGRESQL_BIGINT = 9_223_372_036_854_775_807n;
 const EXHAUSTED_SEQUENCE_CHECKPOINT = MAX_POSTGRESQL_BIGINT + 1n;
@@ -80,7 +78,6 @@ export class LocalHookEventSequenceAllocator {
   private closed = false;
 
   constructor(private readonly sequencePath = eventSequenceDbPath()) {
-    ensurePrivateDirectory(dirname(sequencePath));
     const db = getLcmConnection(sequencePath);
     this.db = db;
     try {

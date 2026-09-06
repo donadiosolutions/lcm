@@ -1,13 +1,18 @@
 import { DatabaseSync } from "node:sqlite";
-import { chmodSync, lstatSync } from "node:fs";
-import { dirname } from "node:path";
+import { chmodSync, lstatSync, realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { ensurePrivateDirectory, PRIVATE_FILE_MODE } from "../security-files.js";
+import { PRIVATE_FILE_MODE } from "../security-files.js";
+import {
+  admitDatabaseParent,
+  type DatabaseParentIdentity,
+  type DatabaseParentTestingOptions,
+} from "./database-parent.js";
 
 type ConnectionEntry = {
   db: DatabaseSync;
   refs: number;
   fileIdentity: DatabaseFileIdentity | null;
+  parentIdentity: DatabaseParentIdentity | null;
 };
 
 type DatabaseFileIdentity = {
@@ -149,91 +154,179 @@ export function inspectExistingLcmDatabasePath(dbPath: string): DatabaseFileIden
   }
 }
 
-function preparePersistentDatabasePath(dbPath: string): void {
-  ensurePrivateDirectory(dirname(dbPath));
-  // Validate any existing leaf. A missing leaf is expected for create-capable
-  // opens and will be created atomically by SQLite.
-  inspectExistingLcmDatabasePath(dbPath);
-}
+export type LcmConnectionOptions = Readonly<{
+  /** @internal Deterministic database-parent admission seams for tests. */
+  _databaseParentForTesting?: DatabaseParentTestingOptions;
+}>;
 
-function openLcmConnection(dbPath: string, createIfMissing: boolean): DatabaseSync | null {
+export type ExistingLcmConnectionOptions = LcmConnectionOptions & Readonly<{
+  /** Safely repair the authenticated existing parent to mode 0700. */
+  tightenDatabaseParent?: boolean;
+}>;
+
+function openLcmConnection(
+  dbPath: string,
+  createIfMissing: boolean,
+  options: ExistingLcmConnectionOptions = {},
+): DatabaseSync | null {
   const isInMemory = dbPath === ":memory:";
-  // Persistent callers must validate the current filesystem leaf before a
-  // pooled handle can be reused. An unlinked/rotated database may remain fully
-  // usable through SQLite while no longer representing the requested path.
-  const expectedIdentity = !isInMemory
-    ? inspectExistingLcmDatabasePath(dbPath)
-    : undefined;
-  if (!createIfMissing && (isInMemory || expectedIdentity === null)) return null;
-  const pooledEntry = _connections.get(dbPath);
-  if (
-    !isInMemory
-    && pooledEntry
-    && (
-      !expectedIdentity
-      || !pooledEntry.fileIdentity
-      || !sameDatabaseFileIdentity(pooledEntry.fileIdentity, expectedIdentity)
-    )
-  ) {
-    if (createIfMissing) {
-      throw new Error("pooled database path no longer matches the requested file");
+  if (isInMemory) {
+    if (!createIfMissing) return null;
+    const pooled = getPooledLcmConnection(dbPath);
+    if (pooled) return pooled;
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec("PRAGMA journal_mode = WAL");
+      db.exec("PRAGMA busy_timeout = 5000");
+      db.exec("PRAGMA foreign_keys = ON");
+    } catch (error) {
+      forceCloseConnection({
+        db,
+        refs: 0,
+        fileIdentity: null,
+        parentIdentity: null,
+      });
+      throw error;
     }
-    return null;
+    _connections.set(dbPath, {
+      db,
+      refs: 1,
+      fileIdentity: null,
+      parentIdentity: null,
+    });
+    return db;
   }
 
-  const pooled = getPooledLcmConnection(dbPath);
-  if (pooled) return pooled;
-
-  if (!isInMemory && createIfMissing) preparePersistentDatabasePath(dbPath);
-
-  // SQLite's URI mode=rw opens an existing database read/write but atomically
-  // refuses to create it if another process removes it after the lstat above.
-  const location = createIfMissing || isInMemory
-    ? dbPath
-    : (() => {
-      const url = pathToFileURL(dbPath);
-      url.searchParams.set("mode", "rw");
-      return url;
-    })();
+  const pooledEntry = _connections.get(dbPath);
+  const parent = admitDatabaseParent(dbPath, {
+    createIfMissing,
+    tighten: createIfMissing || options.tightenDatabaseParent === true,
+    expectedIdentity: pooledEntry?.parentIdentity ?? undefined,
+    _databaseParentForTesting: options._databaseParentForTesting,
+  });
+  if (parent === null) return null;
+  let parentClosed = false;
+  let primaryError: unknown;
   let db: DatabaseSync | undefined;
   let fileIdentity: DatabaseFileIdentity | null = null;
+
+  const releaseParent = (): void => {
+    parent.assertCurrent();
+    parent.close();
+    parentClosed = true;
+  };
+
   try {
+    // Persistent callers must validate the current filesystem leaf before a
+    // pooled handle can be reused. An unlinked/rotated database may remain fully
+    // usable through SQLite while no longer representing the requested path.
+    parent.assertCurrent();
+    const expectedIdentity = inspectExistingLcmDatabasePath(dbPath);
+    if (!createIfMissing && expectedIdentity === null) return null;
+    if (
+      pooledEntry
+      && (
+        !expectedIdentity
+        || !pooledEntry.fileIdentity
+        || !sameDatabaseFileIdentity(pooledEntry.fileIdentity, expectedIdentity)
+      )
+    ) {
+      if (createIfMissing) {
+        throw new Error("pooled database path no longer matches the requested file");
+      }
+      return null;
+    }
+
+    if (pooledEntry) {
+      if (isConnectionHealthy(pooledEntry.db)) {
+        releaseParent();
+        pooledEntry.refs += 1;
+        return pooledEntry.db;
+      }
+      forceCloseConnection(pooledEntry);
+      _connections.delete(dbPath);
+    }
+
+    // SQLite's URI mode=rw opens an existing database read/write but atomically
+    // refuses to create it if another process removes it after the lstat above.
+    const location = createIfMissing
+      ? dbPath
+      : (() => {
+        // URL parsing removes dot segments lexically. Resolve the admitted,
+        // existing leaf through the filesystem first so an interior symlink
+        // followed by `..` keeps the same kernel path semantics as admission.
+        const url = pathToFileURL(realpathSync.native(dbPath));
+        url.searchParams.set("mode", "rw");
+        return url;
+      })();
+    parent.assertCurrent();
     db = new DatabaseSync(location);
-    if (!isInMemory) chmodSync(dbPath, PRIVATE_FILE_MODE);
+    parent.assertCurrent();
+    chmodSync(dbPath, PRIVATE_FILE_MODE);
     // Enable WAL mode for better concurrent read performance
+    parent.assertCurrent();
     db.exec("PRAGMA journal_mode = WAL");
     // Wait up to 5 seconds on busy instead of failing immediately
     db.exec("PRAGMA busy_timeout = 5000");
     // Enable foreign key enforcement
     db.exec("PRAGMA foreign_keys = ON");
-    fileIdentity = isInMemory ? null : inspectExistingLcmDatabasePath(dbPath);
-    if (!isInMemory && !fileIdentity) {
+    parent.assertCurrent();
+    fileIdentity = inspectExistingLcmDatabasePath(dbPath);
+    if (!fileIdentity) {
       throw new Error("database path disappeared while opening");
     }
-    if (expectedIdentity && fileIdentity && !sameDatabaseFileIdentity(expectedIdentity, fileIdentity)) {
+    if (expectedIdentity && !sameDatabaseFileIdentity(expectedIdentity, fileIdentity)) {
       throw new Error("database path changed while opening");
     }
+    releaseParent();
+    _connections.set(dbPath, {
+      db,
+      refs: 1,
+      fileIdentity,
+      parentIdentity: parent.identity,
+    });
+    return db;
   } catch (error) {
-    if (db) forceCloseConnection({ db, refs: 0, fileIdentity });
+    primaryError = error;
+    if (db) {
+      forceCloseConnection({
+        db,
+        refs: 0,
+        fileIdentity,
+        parentIdentity: parent.identity,
+      });
+    }
     // An existing-only caller treats an unlink after the pre-open lstat as
     // absence, not an initialization failure. It must never recreate the file.
-    if (!createIfMissing && !isInMemory && inspectExistingLcmDatabasePath(dbPath) === null) {
-      return null;
+    if (!createIfMissing) {
+      parent.assertCurrent();
+      if (inspectExistingLcmDatabasePath(dbPath) === null) return null;
     }
     throw error;
+  } finally {
+    if (!parentClosed) {
+      try {
+        parent.close();
+      } catch (closeError) {
+        if (primaryError === undefined) throw closeError;
+      }
+    }
   }
-
-  _connections.set(dbPath, { db: db!, refs: 1, fileIdentity });
-  return db!;
 }
 
-export function getLcmConnection(dbPath: string): DatabaseSync {
-  return openLcmConnection(dbPath, true)!;
+export function getLcmConnection(
+  dbPath: string,
+  options: LcmConnectionOptions = {},
+): DatabaseSync {
+  return openLcmConnection(dbPath, true, options)!;
 }
 
 /** Open an existing pooled or on-disk database without creating backend state. */
-export function getExistingLcmConnection(dbPath: string): DatabaseSync | null {
-  return openLcmConnection(dbPath, false);
+export function getExistingLcmConnection(
+  dbPath: string,
+  options: ExistingLcmConnectionOptions = {},
+): DatabaseSync | null {
+  return openLcmConnection(dbPath, false, options);
 }
 
 export interface PoolStats {
