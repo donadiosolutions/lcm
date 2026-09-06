@@ -95,7 +95,8 @@ component_management:
         # #794 grep-since validation, #825 bounded atomic promotion metadata,
         # #862 recent limit validation, #863 expand depth validation, #930
         # expand body-shape validation, #969 route body-shape validation, and #864
-        # episodic search candidate recall,
+        # episodic search candidate recall, and #890 bounded best-effort status
+        # metadata reads,
         # and #833 passive-event identity admission remain route-owned.
         # #828 promotes topology failures through the route boundary while
         # preserving ordinary best-effort metadata persistence.

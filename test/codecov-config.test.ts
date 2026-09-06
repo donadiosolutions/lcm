@@ -508,6 +508,7 @@ describe("Codecov configuration", () => {
     // #930 keeps expand body-shape validation in that component as well.
     // #969 keeps the route-family and passive notification body-shape
     // validation in their existing route and daemon-events components.
+    // #890 keeps bounded best-effort status metadata reads route-owned.
     // #947 keeps promote metadata-parent resource handling and fail-closed
     // topology behavior in the existing daemon-routes component.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
