@@ -529,6 +529,7 @@ describe("Codecov configuration", () => {
       ["src/security-files.ts", "unit-configuration-security"],
       ["src/sensitive.ts", "unit-configuration-security"],
       ["src/project-map.ts", "unit-project-worktrees"],
+      // #889 keeps private import metadata publication in this owner.
       ["src/portable-knowledge.ts", "unit-project-worktrees"],
       // #866 stats config retries and journal failures, plus #973 project
       // database admission, retain this owner.
@@ -585,6 +586,9 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.
       ["src/db/event-sidecars.ts", "unit-local-persistence"],
+      // #992 keeps pre-initialization SQLite leaf admission and final
+      // opened-identity fencing local-persistence-owned.
+      ["src/db/connection.ts", "unit-local-persistence"],
       ["src/db/database-parent.ts", "unit-local-persistence"],
       ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],

@@ -13,7 +13,7 @@
  * Deduplication is performed on import via deduplicateAndInsert().
  */
 
-import { existsSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
+import { existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -34,6 +34,7 @@ import {
   withPublicationAdmissionRetry,
   type PublicationConvergence,
 } from "./storage/publication-convergence.js";
+import { atomicWritePrivateFileExclusive } from "./security-files.js";
 
 export const EXPORT_VERSION = 1;
 
@@ -292,12 +293,14 @@ export async function importKnowledge(
 
   // Write meta.json if it doesn't already exist so this project is visible
   // to `lcm export --all` (which enumerates projects by scanning for meta.json).
-  // Use a tmp-file + rename for atomicity — a crash mid-write would corrupt the file.
+  // Publish atomically and exclusively so concurrent importers cannot replace
+  // an existing project identity.
   const metaPath = join(projDir, "meta.json");
   if (!existsSync(metaPath)) {
-    const tmpPath = metaPath + ".tmp";
-    writeFileSync(tmpPath, JSON.stringify({ cwd: project.canonical }, null, 2) + "\n", "utf-8");
-    renameSync(tmpPath, metaPath);
+    atomicWritePrivateFileExclusive(
+      metaPath,
+      JSON.stringify({ cwd: project.canonical }, null, 2) + "\n",
+    );
   }
 
   return {

@@ -251,6 +251,12 @@ repositories are bound to that project. Application code depends on these
 interfaces, while the SQLite adapter alone owns `DatabaseSync`, migrations,
 SQLite feature probes, FTS5 details, and connection pooling.
 
+Persistent SQLite opens revalidate the database pathname immediately after the
+SQLite handle opens and fail closed before changing file permissions or running
+initialization PRAGMAs. A final identity comparison before pooling also covers
+databases created by that open and rejects pathname changes detected during
+initialization.
+
 The project scope groups operations by domain:
 
 | `ProjectStorage` repository | Responsibility |

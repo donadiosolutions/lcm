@@ -609,6 +609,45 @@ describe("isLcmConnectionOpen", () => {
     }
   });
 
+  it("rejects replacement of a newly created leaf during initialization", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-created-leaf-swap-test-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "created.sqlite");
+    const openedPath = join(tempDir, "created.sqlite.opened");
+    const replacementPath = join(tempDir, "created.sqlite.replacement");
+    const replacement = new DatabaseSync(replacementPath);
+    replacement.exec("CREATE TABLE replacement_data (value TEXT)");
+    replacement.close();
+    const originalExec = DatabaseSync.prototype.exec;
+    let swapped = false;
+    const exec = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
+      this: DatabaseSync,
+      sql: string,
+    ) {
+      const result = originalExec.call(this, sql);
+      if (!swapped && sql === "PRAGMA foreign_keys = ON") {
+        swapped = true;
+        renameSync(dbPath, openedPath);
+        renameSync(replacementPath, dbPath);
+      }
+      return result;
+    });
+    const close = vi.spyOn(DatabaseSync.prototype, "close");
+
+    try {
+      expect(() => getLcmConnection(dbPath)).toThrow("database path changed while opening");
+      expect(close).toHaveBeenCalledOnce();
+      expect(isLcmConnectionOpen(dbPath)).toBe(false);
+      const rejectedReplacement = new DatabaseSync(dbPath);
+      expect(rejectedReplacement.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all())
+        .toContainEqual({ name: "replacement_data" });
+      rejectedReplacement.close();
+    } finally {
+      exec.mockRestore();
+      close.mockRestore();
+    }
+  });
+
   it("opens SQLite's in-memory target without filesystem permission work", () => {
     const db = getLcmConnection(":memory:", {
       _databaseParentForTesting: {
