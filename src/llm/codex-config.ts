@@ -271,6 +271,7 @@ export async function resolveCodexOpenAIBaseUrl(
     });
     const terminated = await teardown.terminate("close");
     teardownSettled = terminated;
+    if (aborted) throw createAbortError(signal?.reason);
     if (!terminated) throw resolutionError();
     return result;
   } catch (error) {
