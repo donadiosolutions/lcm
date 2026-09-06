@@ -89,8 +89,12 @@ deadline. Wall-clock corrections do not extend or shorten this retry duration.
 Bootstrap migration attempts and worktree-reconciliation lock loops have their
 own existing bounds, and ordinary command I/O plus an in-flight attempt can
 extend total command time. Missing, foreign, malformed, stale, or unhealthy
-publication evidence fails closed with the original typed error. Exhausted or
-rejected export admission exits unsuccessfully, including with `--output` or
+publication evidence still fails closed and exits with status 1. Before the
+retry deadline's expiry is recognized, a refusal reports the current typed
+contention; after recognized expiry, if at least one retry was admitted, the
+first contention is preserved, while with no admitted retry the current
+contention is reported. Exhausted or rejected export admission exits
+unsuccessfully, including with `--output` or
 `--all`. An `--all` export may have already written earlier projects when a
 later project fails; those outputs remain, and no successful total is printed.
 
@@ -244,7 +248,11 @@ do not extend or shorten this publication retry duration. Bootstrap-lock retries
 remain unchanged and
 may add a bounded overshoot of up to one second when both locks contend.
 Identity, token, process-birth, health, entrypoint, version, backend, or
-runtime-digest mismatches fail closed with the original typed contention error.
+runtime-digest mismatches still fail closed and exit with status 1. Before the
+retry deadline's expiry is recognized, a refusal reports the current typed
+contention; after recognized expiry, if at least one retry was admitted, the
+first contention is preserved, while with no admitted retry the current
+contention is reported.
 
 Lock-free configuration preparation also rejects a configuration or
 publication journal that changes between its two authenticated snapshots. Once
