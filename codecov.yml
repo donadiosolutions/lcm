@@ -107,6 +107,8 @@ component_management:
         # preserving ordinary best-effort metadata persistence.
         # #947 keeps direct metadata-parent resource exhaustion best-effort
         # while preserving fail-closed topology handling in the route owner.
+        # #948 admits the promote metadata parent before bounded reads, binds a
+        # successful read's sampled parent, and retains failure-path identity.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
