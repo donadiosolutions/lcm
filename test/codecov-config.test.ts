@@ -224,6 +224,8 @@ const expectedComponents = [
       "^src/git-project\\.ts$",
       "^src/machine-identity\\.ts$",
       "^src/portable-knowledge\\.ts$",
+      // #1049 keeps project metadata owner and single-link admission in this
+      // existing component; no taxonomy, status, or policy change.
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
       // #1044 keeps the existing owner; no taxonomy, status, or policy change.
@@ -502,7 +504,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(209);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#964 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -539,6 +541,7 @@ describe("Codecov configuration", () => {
       ["src/runtime-paths.ts", "unit-configuration-security"],
       ["src/security-files.ts", "unit-configuration-security"],
       ["src/sensitive.ts", "unit-configuration-security"],
+      // #1049 keeps project metadata owner and single-link admission here.
       ["src/project-map.ts", "unit-project-worktrees"],
       // #889 keeps private import metadata publication in this owner.
       ["src/portable-knowledge.ts", "unit-project-worktrees"],
