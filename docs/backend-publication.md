@@ -521,12 +521,14 @@ original typed publication-contention error and the restart command fails. An
 ordinary publication error observed on a later assertion remains the reported
 failure even when the contention allowance has just expired.
 
-When directory authentication rejects a consumer admission, LCM attempts to
-release the temporary root and publication descriptors acquired for that
-check. If cleanup succeeds, LCM returns the original authentication refusal.
-If cleanup also fails, the reported error preserves both failures and records
-the authentication failure as its cause. The rejection remains fail-closed;
-releasing those resources does not repair or change the publication state.
+After a consumer operation, LCM attempts to release the temporary publication
+and root descriptors in that order. A single cleanup failure is reported
+directly when the operation succeeded; multiple cleanup failures are reported
+together in release order. If the operation and cleanup both fail, the
+reported error preserves the operation failure first, records it as the cause,
+and then includes every cleanup failure. Typed publication admission and lock
+contention failures retain their classification so callers remain fail-closed.
+Releasing those resources does not repair or change the publication state.
 
 - **Daemon and health:** an unresolved or inconsistent publication returns a
   sanitized HTTP `503` with `status: "blocked"` and no filesystem, SQL, URL,
