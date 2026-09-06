@@ -484,6 +484,36 @@ The check is deliberately short-lived around each operation; it is not held
 across network calls, request bodies, model work, daemon spawning, or unrelated
 health waits.
 
+An explicit daemon restart authenticates publication lock contention at three
+separate assertions: before it changes the current daemon, at the replacement
+daemon's initial admission, and after the replacement has been admitted. LCM
+may wait up to two seconds for the authenticated current daemon's publication
+sweep and up to another two seconds shared by the replacement's initial and
+final assertions. Manager stop/start and daemon admission time do not consume
+these retry windows, so the maximum added contention wait is approximately four
+seconds. The replacement daemon's existing final-admission wait has its own
+independent two-second allowance, so a restart can spend approximately six
+seconds waiting if all three windows encounter contention. Each restart and
+ensure operation still runs once; only the blocked publication assertion is
+retried.
+
+The wait remains fail-closed. The current daemon must have a canonical owned
+PID and token, matching public and authenticated health, stable process-birth
+evidence, and the installed entrypoint. The replacement additionally must match
+the installed version, backend, entrypoint, and packaged-runtime digest. A
+replacement managed by systemd or launchd may briefly lack its PID file during
+its initial sweep, but only when the manager supplied the same positive PID
+reported by authenticated health. LCM does not wait when that manager PID is
+missing, health is unavailable or staged, the current daemon's owned PID is
+absent, or any PID, token, birth, owner, entrypoint, or runtime field changes.
+Lock-owner metadata only checks the independently authenticated PID; it never
+supplies restart authority.
+
+If identity capture is refused or a retry allowance expires, LCM preserves the
+original typed publication-contention error and the restart command fails. An
+ordinary publication error observed on a later assertion remains the reported
+failure even when the contention allowance has just expired.
+
 When directory authentication rejects a consumer admission, LCM attempts to
 release the temporary root and publication descriptors acquired for that
 check. If cleanup succeeds, LCM returns the original authentication refusal.
