@@ -68,6 +68,10 @@ client for each read:
 | `lcm status` | Read daemon and project status |
 | `lcm stats --pool` | Read daemon connection-pool statistics |
 
+When `--since` is supplied, its value is forwarded to the daemon exactly as
+provided. An empty or whitespace-only value is therefore invalid and returns
+HTTP 400; omit the option when no lower-bound filter is wanted.
+
 The local inspection commands `machine show`, `project list`, `project show`,
 `config get`, `stats` (without `--pool`), `events status`, `events validate`,
 `events quarantine`, `sensitive list`, `sensitive test`, and `export` also

@@ -565,6 +565,28 @@ describe("runCli identity boundaries", () => {
     await expect(actions.get("store")!("text", { help: true })).rejects.toThrow("exit:0");
     await expect(actions.get("store")!("text", { tag: "not-an-array" })).resolves.toBeUndefined();
   });
+
+  it("forwards every explicit grep since value through Commander", async () => {
+    const cases: Array<{ args: string[]; since: string | undefined }> = [
+      { args: ["grep", "query", "--since", ""], since: "" },
+      { args: ["grep", "query", "--since="], since: "" },
+      { args: ["grep", "query"], since: undefined },
+      { args: ["grep", "query", "--since", "2026-01-01T00:00:00Z"], since: "2026-01-01T00:00:00Z" },
+      { args: ["grep", "query", "--since", "2026-01-01T00:00:00+03:00"], since: "2026-01-01T00:00:00+03:00" },
+      { args: ["grep", "query", "--since", "not-a-date"], since: "not-a-date" },
+      { args: ["grep", "query", "--since", " "], since: " " },
+    ];
+
+    for (const testCase of cases) {
+      state.post.mockClear();
+      await expect(invoke(testCase.args)).resolves.toBeUndefined();
+      expect(state.post).toHaveBeenCalledWith("/grep", expect.objectContaining({ since: testCase.since }));
+    }
+
+    const emptyError = Object.assign(new Error("invalid since"), { statusCode: 400 });
+    state.post.mockRejectedValueOnce(emptyError);
+    await expect(invoke(["grep", "query", "--since", ""])).resolves.toBe(emptyError);
+  });
 });
 
 describe("runCli lifecycle and connector boundaries", () => {

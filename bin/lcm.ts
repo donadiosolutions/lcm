@@ -1284,7 +1284,7 @@ export function registerMemoryCommands(
         query,
         mode,
         scope,
-        since: typeof opts.since === "string" && opts.since.length > 0 ? opts.since : undefined,
+        since: typeof opts.since === "string" ? opts.since : undefined,
       });
       printJson(result);
     });
