@@ -135,9 +135,12 @@ const expectedComponents = [
     component_id: "unit-storage-abstractions",
     name: "Unit - Storage Abstractions",
     paths: [
+      // #906 keeps bounded publication-convergence probe expiry and error
+      // selection in this storage-abstractions owner.
       "^src/storage/backend\\.ts$",
       // #844 keeps coordinator directory-witness authentication in this owner.
       "^src/storage/backend-publication\\.ts$",
+      // #910 keeps shared publication retry deadlines monotonic in this owner.
       "^src/storage/publication-convergence\\.ts$",
       "^src/storage/capabilities\\.ts$",
       "^src/storage/contracts\\.ts$",
@@ -183,7 +186,8 @@ const expectedComponents = [
     component_id: "unit-memory-retrieval",
     name: "Unit - Memory and Retrieval",
     paths: [
-      // The #971 compact cwd client contract remains memory/retrieval-owned.
+      // The #971 compact cwd client contract and #973 stats database admission
+      // remain memory/retrieval-owned.
       "src/memory/",
       "^src/expansion\\.ts$",
       "^src/retrieval\\.ts$",
@@ -505,6 +509,8 @@ describe("Codecov configuration", () => {
     // #969 keeps the route-family and passive notification body-shape
     // validation in their existing route and daemon-events components.
     // #890 keeps bounded best-effort status metadata reads route-owned.
+    // #947 keeps promote metadata-parent resource handling and fail-closed
+    // topology behavior in the existing daemon-routes component.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     // #814 fresh-root descriptor and pre-handoff content checks remain
     // configuration-security-owned.
@@ -519,7 +525,8 @@ describe("Codecov configuration", () => {
       ["src/sensitive.ts", "unit-configuration-security"],
       ["src/project-map.ts", "unit-project-worktrees"],
       ["src/portable-knowledge.ts", "unit-project-worktrees"],
-      // #866 stats config retries and journal failures retain this owner.
+      // #866 stats config retries and journal failures, plus #973 project
+      // database admission, retain this owner.
       ["src/stats.ts", "unit-memory-retrieval"],
       ["src/connectors/codex-hooks.ts", "unit-connectors"],
       ["src/connectors/installer.ts", "unit-connectors"],
@@ -550,11 +557,15 @@ describe("Codecov configuration", () => {
       ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
+      // #885 keeps the shared missing-Codex diagnostic and its resolver
+      // identity handling within the existing LLM component.
       ["src/llm/codex-process.ts", "unit-llm-prompts"],
       ["src/llm/codex-config.ts", "unit-llm-prompts"],
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
       ["src/llm/process-utils.ts", "unit-llm-prompts"],
       ["src/doctor/doctor.ts", "unit-diagnostics"],
+      // #944 keeps typed supervisor daemon-tmp diagnostic propagation within
+      // the existing service-manager component.
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],

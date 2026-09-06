@@ -10,6 +10,7 @@ import {
   reconcileProviderProcessWitnesses,
   readProviderProcessWitnesses,
   boundedModelForDisplay,
+  createFriendlyMissingCodexError,
   normalizeProcessBirthTime,
 } from "../../src/llm/process-utils.js";
 import { PrivateMutationLockContentionError, withPrivateMutationLock } from "../../src/private-mutation-lock.js";
@@ -42,6 +43,14 @@ describe("owned process lifecycle utilities", () => {
 
   it("uses a default model label for blank display input", () => {
     expect(boundedModelForDisplay("   ")).toBe("default");
+  });
+
+  it("creates the stable missing Codex diagnostic", () => {
+    expect(createFriendlyMissingCodexError().message).toBe([
+      "Codex CLI is not installed or not on PATH.",
+      "Install it first, for example: npm install -g @openai/codex",
+      "Then run lcm again.",
+    ].join("\n"));
   });
 
   it("uses the direct child when the pid/group identity is not safe", async () => {

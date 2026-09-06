@@ -30,6 +30,7 @@ import {
   assertBackendPublicationConfigReadAccess,
   assertBackendPublicationConfigMutation,
   assertBackendPublicationConsumerAccess,
+  BackendPublicationJournalError,
   backendPublicationHomeForConfigPath,
   openBackendPublicationReadRoot,
   withBackendPublicationConfigLock,
@@ -554,7 +555,10 @@ export function prepareInstallConfig(deps: ServiceDeps, path: string): InstallCo
     const second = read();
     if (first.exists !== second.exists || first.content !== second.content || first.journalChecksum !== second.journalChecksum
       || !daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
-      throw new Error("configuration changed during lock-free publication admission");
+      throw new BackendPublicationJournalError(
+        "unexpected-state",
+        "configuration changed during lock-free publication admission",
+      );
     }
     return { exists: first.exists, content: first.content };
   });

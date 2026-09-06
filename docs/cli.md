@@ -93,8 +93,9 @@ lifecycle commands keep their existing admission and migration behavior.
 
 The first authenticated health probe used to identify a retryable daemon can
 take up to two seconds. After the first qualifying contention, retries share a
-single two-second wall-clock deadline and poll at most every 50 milliseconds;
-time spent in process-birth and health checks counts against that deadline.
+single two-second monotonic elapsed deadline and poll at most every 50
+milliseconds; time spent in process-birth and health checks counts against that
+deadline. Wall-clock corrections do not extend or shorten this retry duration.
 Bootstrap migration attempts and worktree-reconciliation lock loops have their
 own existing bounds, and ordinary command I/O plus an in-flight attempt can
 extend total command time. Missing, foreign, malformed, stale, or unhealthy
@@ -102,6 +103,24 @@ publication evidence fails closed with the original typed error. Exhausted or
 rejected export admission exits unsuccessfully, including with `--output` or
 `--all`. An `--all` export may have already written earlier projects when a
 later project fails; those outputs remain, and no successful total is printed.
+
+The local `lcm stats` project-database scan authenticates the LCM state root,
+the `projects` directory, and each project directory as owner-held directories
+with exact mode `0700`. It opens only an existing regular `db.sqlite`; a missing
+state root or `projects` directory returns empty project statistics, and a
+missing project database is skipped without creating it. An authenticated
+legacy database may be migrated before its statistics are read. Busy, locked,
+or malformed project databases remain best-effort skips. Unsafe state or
+projects topology, a project replaced after enumeration, and an unsafe or
+replaced database leaf abort the scan with a path-free remediation message. A
+project that is already a symlink when enumeration begins is excluded.
+
+This boundary starts at the `.lcm` state root; operating-system directories
+above it are outside the project-statistics admission policy. The portable
+SQLite API opens a pathname rather than a retained file descriptor, so the
+scan checks directory and database identity before and after opening but cannot
+eliminate a same-account swap-and-restore race. Event statistics use their own
+storage scan and are outside this project-database no-creation guarantee.
 
 `lcm search <query> --limit <n>` accepts a positive integer from 1 through
 1000 and defaults to 5. The limit is a maximum applied independently to each
@@ -229,8 +248,10 @@ migration and each installer lock-taking stage, including daemon lifecycle
 publication assertions. A retry re-attempts only a lock-acquisition callback;
 the callback body has not run when contention is raised, so prompts, settings
 writes, skill installation, and daemon startup are not repeated. The shared
-window is armed at the first qualifying contention, lasts up to two seconds,
-and polls every 50 milliseconds. Bootstrap-lock retries remain unchanged and
+window is armed at the first qualifying contention, lasts up to two seconds of
+monotonic elapsed time, and polls every 50 milliseconds. Wall-clock corrections
+do not extend or shorten this publication retry duration. Bootstrap-lock retries
+remain unchanged and
 may add a bounded overshoot of up to one second when both locks contend.
 Identity, token, process-birth, health, entrypoint, version, backend, or
 runtime-digest mismatches fail closed with the original typed contention error.
@@ -240,6 +261,7 @@ publication journal that changes between its two authenticated snapshots. Once
 the active publication has settled, rerun `lcm install` manually. This drift
 refusal is not retried automatically, and rerunning the installer does not imply
 that unrelated installation failures have resolved.
+The refusal is reported as a stable diagnostic so you can rerun once concurrent publication activity has settled.
 
 Before `lcm install` reuses a healthy daemon identity for those retries, it
 revalidates the complete configuration snapshot and terminal publication
@@ -279,9 +301,15 @@ best-effort basis. Metadata is bounded to 1 MiB and published atomically with
 0600 permissions, including when tightening a legacy file that was more
 permissive. Invalid, unreadable, or untrusted metadata is left unchanged and
 does not undo promoted memories; promotion counts and results are independent
-of this metadata update. `--dry-run` never writes metadata. On platforms with a
-POSIX UID, the existing metadata file must be owned by the current UID; where
-UIDs are unavailable, that ownership check is skipped.
+of this metadata update. If reopening the authenticated metadata parent fails
+directly because the process or system file-descriptor limit is exhausted
+(`EMFILE` or `ENFILE`), or because the target filesystem has no space
+(`ENOSPC`), LCM skips the metadata update and returns the completed promotion
+result. Parent absence, symlink loops, non-directory components, ownership or
+mode rejection, and other topology failures remain fail-closed and return an
+error. `--dry-run` never writes metadata. On platforms with a POSIX UID, the
+existing metadata file must be owned by the current UID; where UIDs are
+unavailable, that ownership check is skipped.
 
 `lcm compact --all` reports each SQLite project that it cannot open, migrate, or
 scan as a failure in the Compact phase while continuing with readable projects.

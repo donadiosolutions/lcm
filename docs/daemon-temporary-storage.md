@@ -14,6 +14,13 @@ process umask or repair an existing path. If validation or the bounded removal
 cannot be confirmed, the leaf is retained as evidence and may need operator
 attention.
 
+When this creation error reaches the managed daemon lifecycle, its refusal
+contains the fixed retry guidance above for initial starts, stale-registration
+repairs, authenticated legacy migrations, and ordinary managed restarts. Other
+supervisor failures retain a generic warning; their error text is not exposed.
+The ordinary CLI failure renderer does not currently display this lifecycle
+warning. That separate CLI reporting gap is tracked independently.
+
 An existing leaf is accepted only when it is a directory owned by the current
 user, has exactly the private mode (including special bits), is not a symbolic
 link, resolves to the exact expected pathname, and remains contained beneath

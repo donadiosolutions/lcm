@@ -6,6 +6,7 @@ import { PrivateMutationLockContentionError } from "../../src/private-mutation-l
 import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 import { createPublicationConvergence } from "../../src/storage/publication-convergence.js";
+import { readBoundedRegularFile } from "../../src/security-files.js";
 
 const FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC =
   "lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.";
@@ -911,6 +912,58 @@ describe("runCli registration and help dispatch", () => {
     expect(rendered).not.toContain("\\u001b");
   });
 
+  it("renders the installer snapshot drift throw as one fixed diagnostic", async () => {
+    const installer = await vi.importActual<typeof import("../../installer/install.js")>("../../installer/install.js");
+    const home = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-installer-drift-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    const content = '{"daemon":{}}';
+    actualFs.mkdirSync(root, { mode: 0o700 });
+    actualFs.writeFileSync(configPath, content, { mode: 0o600 });
+    const readSnapshot = vi.fn()
+      .mockReturnValueOnce({
+        content,
+        witness: { presence: "present", rawSha256: "a", byteLength: Buffer.byteLength(content), dev: "1", ino: "2", mtimeMs: 0 },
+      })
+      .mockReturnValueOnce({
+        content,
+        witness: { presence: "present", rawSha256: "b", byteLength: Buffer.byteLength(content), dev: "1", ino: "2", mtimeMs: 0 },
+      });
+    const deps = {
+      spawnSync: vi.fn(),
+      readFileSync: vi.fn(),
+      writeFileSync: vi.fn(),
+      mkdirSync: vi.fn(),
+      existsSync: actualFs.existsSync,
+      promptUser: vi.fn(),
+      ensureLcmHome: vi.fn(),
+      readBoundedRegularFile,
+      _forceLockFreePublicationReadForTesting: true,
+      _readDaemonConfigRawSnapshot: readSnapshot,
+      _assertBackendPublicationConfigReadAccess: vi.fn(() => ({ journalChecksumSha256: null })),
+    } satisfies import("../../installer/install.js").ServiceDeps;
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      let thrown: unknown;
+      try {
+        installer.prepareInstallConfig(deps, configPath);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(BackendPublicationJournalError);
+      expect(readSnapshot).toHaveBeenCalledTimes(2);
+      expect(deps.writeFileSync).not.toHaveBeenCalled();
+      expect(() => handleCliError(thrown)).toThrow("exit:1");
+      expect(diagnostic).toHaveBeenCalledTimes(1);
+      expect(diagnostic).toHaveBeenCalledWith(FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC);
+      const rendered = JSON.stringify(diagnostic.mock.calls);
+      expect(rendered).not.toContain("configuration changed during lock-free publication admission");
+      expect(rendered).not.toContain("BackendPublicationJournalError");
+    } finally {
+      actualFs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("waits for the stdin timeout when a pipe never closes", async () => {
     vi.useFakeTimers();
     fakeStdin.isTTY = false;
@@ -1487,6 +1540,13 @@ describe("runCli orchestration actions", () => {
   });
 
   it("fails stats without output or retry when its second config admission rejects the journal", async () => {
+    const builtinFs = (process as NodeJS.Process & {
+      getBuiltinModule: (specifier: "node:fs") => typeof import("node:fs");
+    }).getBuiltinModule("node:fs");
+    const fixtureRoot = builtinFs.mkdtempSync(join(tmpdir(), "lcm-cli-stats-"));
+    state.runtimeHome = join(fixtureRoot, ".lcm");
+    builtinFs.mkdirSync(state.runtimeHome, { mode: 0o700 });
+    builtinFs.mkdirSync(join(state.runtimeHome, "projects"), { mode: 0o700 });
     const failure = new BackendPublicationJournalError("unresolved-publication", "private evidence");
     const convergence = makeTestConvergence();
     state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
@@ -1503,16 +1563,20 @@ describe("runCli orchestration actions", () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
-    const result = await invoke(["stats"]);
+    try {
+      const result = await invoke(["stats"]);
 
-    expect(result).toBe(failure);
-    expect(() => handleCliError(result)).toThrow("exit:1");
-    expect(diagnostic).toHaveBeenCalledExactlyOnceWith(FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC);
-    expect(statsModule.collectStats).toHaveBeenCalledOnce();
-    expect(statsModule.printStats).not.toHaveBeenCalled();
-    expect(stdout).not.toHaveBeenCalled();
-    expect(log).not.toHaveBeenCalled();
-    expect(convergence.deadline).toBeUndefined();
+      expect(result).toBe(failure);
+      expect(() => handleCliError(result)).toThrow("exit:1");
+      expect(diagnostic).toHaveBeenCalledExactlyOnceWith(FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC);
+      expect(statsModule.collectStats).toHaveBeenCalledOnce();
+      expect(statsModule.printStats).not.toHaveBeenCalled();
+      expect(stdout).not.toHaveBeenCalled();
+      expect(log).not.toHaveBeenCalled();
+      expect(convergence.deadline).toBeUndefined();
+    } finally {
+      builtinFs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
   });
 
   it.each(["start", "restart"])("runs managed daemon %s with staged PostgreSQL storage", async (action) => {
