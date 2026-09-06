@@ -124,6 +124,72 @@ describe("isLcmConnectionOpen", () => {
     }
   });
 
+  it("uses the kernel-resolved parent and database for create-capable paths", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-parent-dotdot-create-test-"));
+    tempDirs.push(tempDir);
+    const lexicalParent = join(tempDir, "lexical-parent");
+    const actualParent = join(tempDir, "actual-parent");
+    const actualNested = join(actualParent, "nested");
+    mkdirSync(lexicalParent, { mode: 0o755 });
+    mkdirSync(actualNested, { recursive: true, mode: 0o755 });
+    chmodSync(lexicalParent, 0o755);
+    chmodSync(actualParent, 0o755);
+    symlinkSync(actualNested, join(lexicalParent, "alias"));
+
+    const lexicalDbPath = join(lexicalParent, "events.sqlite");
+    const actualDbPath = join(actualParent, "events.sqlite");
+    const lexical = new DatabaseSync(lexicalDbPath);
+    lexical.exec("CREATE TABLE identity (value TEXT); INSERT INTO identity VALUES ('lexical')");
+    lexical.close();
+    const actual = new DatabaseSync(actualDbPath);
+    actual.exec("CREATE TABLE identity (value TEXT); INSERT INTO identity VALUES ('actual')");
+    actual.close();
+    const requestedPath = `${join(lexicalParent, "alias")}/../events.sqlite`;
+
+    const db = getLcmConnection(requestedPath);
+    expect(db.prepare("SELECT value FROM identity").get()).toEqual({ value: "actual" });
+    expect(statSync(actualParent).mode & 0o777).toBe(0o700);
+    expect(statSync(lexicalParent).mode & 0o777).toBe(0o755);
+
+    const originalActualParent = join(tempDir, "original-actual-parent");
+    renameSync(actualParent, originalActualParent);
+    mkdirSync(actualNested, { recursive: true, mode: 0o755 });
+    chmodSync(actualParent, 0o755);
+    linkSync(join(originalActualParent, "events.sqlite"), actualDbPath);
+
+    expect(() => getLcmConnection(requestedPath)).toThrow("parent");
+    expect(statSync(actualParent).mode & 0o777).toBe(0o755);
+    expect(getPoolStats().connections).toMatchObject([{ path: requestedPath, refs: 1 }]);
+  });
+
+  it("uses the kernel-resolved database for existing-only paths", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-parent-dotdot-existing-test-"));
+    tempDirs.push(tempDir);
+    const lexicalParent = join(tempDir, "lexical-parent");
+    const actualParent = join(tempDir, "actual-parent");
+    const actualNested = join(actualParent, "nested");
+    mkdirSync(lexicalParent, { mode: 0o755 });
+    mkdirSync(actualNested, { recursive: true, mode: 0o755 });
+    chmodSync(lexicalParent, 0o755);
+    chmodSync(actualParent, 0o755);
+    symlinkSync(actualNested, join(lexicalParent, "alias"));
+
+    const lexicalDbPath = join(lexicalParent, "events.sqlite");
+    const actualDbPath = join(actualParent, "events.sqlite");
+    const lexical = new DatabaseSync(lexicalDbPath);
+    lexical.exec("CREATE TABLE identity (value TEXT); INSERT INTO identity VALUES ('lexical')");
+    lexical.close();
+    const actual = new DatabaseSync(actualDbPath);
+    actual.exec("CREATE TABLE identity (value TEXT); INSERT INTO identity VALUES ('actual')");
+    actual.close();
+    const requestedPath = `${join(lexicalParent, "alias")}/../events.sqlite`;
+
+    const db = getExistingLcmConnection(requestedPath);
+    expect(db?.prepare("SELECT value FROM identity").get()).toEqual({ value: "actual" });
+    expect(statSync(actualParent).mode & 0o777).toBe(0o755);
+    expect(statSync(lexicalParent).mode & 0o777).toBe(0o755);
+  });
+
   it("rejects a pooled parent replacement before increasing its ref-count", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-conn-parent-replaced-pool-test-"));
     tempDirs.push(tempDir);

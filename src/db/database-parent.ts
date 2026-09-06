@@ -8,7 +8,7 @@ import {
   openSync,
   type BigIntStats,
 } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname } from "node:path";
 import {
   PRIVATE_DIRECTORY_MODE,
   PrivateDirectoryTopologyError,
@@ -301,7 +301,7 @@ export function admitDatabaseParent(
   dbPath: string,
   options: DatabaseParentAdmissionOptions,
 ): DatabaseParentHandle | null {
-  const parentPath = resolve(dirname(dbPath));
+  const parentPath = dirname(dbPath);
   const existing = openExistingDatabaseParent(parentPath, options);
   if (existing) return existing;
   if (options.expectedIdentity) {

@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { chmodSync, lstatSync } from "node:fs";
+import { chmodSync, lstatSync, realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { PRIVATE_FILE_MODE } from "../security-files.js";
 import {
@@ -252,7 +252,10 @@ function openLcmConnection(
     const location = createIfMissing
       ? dbPath
       : (() => {
-        const url = pathToFileURL(dbPath);
+        // URL parsing removes dot segments lexically. Resolve the admitted,
+        // existing leaf through the filesystem first so an interior symlink
+        // followed by `..` keeps the same kernel path semantics as admission.
+        const url = pathToFileURL(realpathSync.native(dbPath));
         url.searchParams.set("mode", "rw");
         return url;
       })();

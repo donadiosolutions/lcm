@@ -1354,6 +1354,12 @@ open, permission, initialization, and pooling boundaries; these checks are not
 a kernel-atomic guarantee against another process substituting a path through
 a writable ancestor between system calls.
 
+Database paths retain normal filesystem semantics when an ancestor alias is
+followed by `..`: LCM authenticates and opens the directory reached by the
+kernel. Existing-only SQLite URI opens first resolve the admitted database leaf
+through the filesystem so URL dot-segment normalization cannot select a
+different lexical database.
+
 ### Inspecting the database
 
 ```bash
