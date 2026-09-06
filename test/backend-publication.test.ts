@@ -331,6 +331,71 @@ async function preparedFixture(): Promise<{
   return { home, input, fake };
 }
 
+type CoordinatorDriftCheckpoint =
+  | "preparing"
+  | "guarded"
+  | "map-publishing"
+  | "map-published"
+  | "config-publishing"
+  | "aborting"
+  | "config-restoring"
+  | "map-restoring"
+  | "abort-releasing"
+  | "released-replay"
+  | "released-forward";
+
+async function coordinatorDriftFixture(checkpoint: CoordinatorDriftCheckpoint): Promise<{
+  home: string;
+  fake: ReturnType<typeof makeDriver>;
+}> {
+  const home = makeHome();
+  const input = material();
+  const fake = makeDriver(input);
+  if (checkpoint === "preparing") {
+    await expect(coordinator(home, fake.driver, (event) => {
+      if (event === "after-material-seal") throw new Error("crash:park-preparing");
+    }).prepare(inputFor(input))).rejects.toThrow("crash:park-preparing");
+  } else {
+    await coordinator(home, fake.driver).prepare(inputFor(input));
+    if (checkpoint !== "released-forward") {
+      if (checkpoint === "config-restoring") fake.setState(targetState(input));
+      const aborting = ["aborting", "config-restoring", "map-restoring", "abort-releasing"].includes(checkpoint);
+      const parkedPhase = checkpoint === "released-replay" ? "released" : checkpoint;
+      const parked = coordinator(home, fake.driver, (event) => {
+        if (
+          event === "after-journal-write"
+          && readBackendPublicationJournal(home)?.phase === parkedPhase
+        ) throw new Error(`crash:park-${checkpoint}`);
+      });
+      await expect(aborting ? parked.abort() : parked.resume()).rejects.toThrow(`crash:park-${checkpoint}`);
+    }
+  }
+  expect(readBackendPublicationJournal(home)?.phase).toBe(
+    checkpoint === "released-forward"
+      ? "prepared"
+      : checkpoint === "released-replay" ? "released" : checkpoint,
+  );
+  fake.calls.length = 0;
+  vi.mocked(fake.driver.observeLocalState).mockClear();
+  vi.mocked(fake.driver.publishProjectMap).mockClear();
+  vi.mocked(fake.driver.publishConfig).mockClear();
+  vi.mocked(fake.driver.restoreConfig).mockClear();
+  vi.mocked(fake.driver.restoreProjectMap).mockClear();
+  return { home, fake };
+}
+
+function coordinatorDriverCallCounts(driver: BackendPublicationDriver): Record<string, number> {
+  return {
+    observeLocalState: vi.mocked(driver.observeLocalState).mock.calls.length,
+    publishProjectMap: vi.mocked(driver.publishProjectMap).mock.calls.length,
+    publishConfig: vi.mocked(driver.publishConfig).mock.calls.length,
+    restoreConfig: vi.mocked(driver.restoreConfig).mock.calls.length,
+    restoreProjectMap: vi.mocked(driver.restoreProjectMap).mock.calls.length,
+    retainCompletedMaterial: vi.mocked(driver.retainCompletedMaterial!).mock.calls.length,
+    cleanupAbortedMaterial: vi.mocked(driver.cleanupAbortedMaterial!).mock.calls.length,
+  };
+}
+
 async function expectJournalReadFailure(
   mutate: (journal: Record<string, unknown>) => Record<string, unknown>,
   reason: BackendPublicationJournalError["reason"] = "malformed-journal",
@@ -612,6 +677,149 @@ describe("BackendPublicationCoordinator", () => {
     expect(injected).toBe(true);
     expect(readBackendPublicationJournal(home)?.phase).toBe(phase);
   });
+
+  it.each([
+    { checkpoint: "preparing", targetPhase: "preparing", gate: "trailing", operation: "resume" },
+    { checkpoint: "preparing", targetPhase: "preparing", gate: "trailing", operation: "abort" },
+    { checkpoint: "guarded", targetPhase: "guarded", gate: "leading", operation: "resume" },
+    { checkpoint: "map-publishing", targetPhase: "map-publishing", gate: "leading", operation: "recover" },
+    { checkpoint: "map-published", targetPhase: "map-published", gate: "leading", operation: "resume" },
+    { checkpoint: "config-publishing", targetPhase: "config-publishing", gate: "leading", operation: "recover" },
+    { checkpoint: "aborting", targetPhase: "aborting", gate: "leading", operation: "abort" },
+    { checkpoint: "config-restoring", targetPhase: "config-restoring", gate: "leading", operation: "recover-abort" },
+    { checkpoint: "map-restoring", targetPhase: "map-restoring", gate: "leading", operation: "resume" },
+    { checkpoint: "abort-releasing", targetPhase: "abort-releasing", gate: "leading", operation: "recover" },
+    { checkpoint: "released-replay", targetPhase: "released", gate: "leading", operation: "resume" },
+    { checkpoint: "released-forward", targetPhase: "released", gate: "leading", operation: "resume" },
+  ] as const)(
+    "rejects $checkpoint $operation material-authentication drift before later writes",
+    async ({ checkpoint, targetPhase, gate, operation }) => {
+      const { home, fake } = await coordinatorDriftFixture(checkpoint);
+      const publicationDirectory = backendPublicationDirectory(home);
+      const journalPath = backendPublicationJournalPath(home);
+      const materialPath = join(publicationDirectory, "publication-1.material");
+      const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+      const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+      const originalClose = nodeFs.closeSync as (fd: number) => void;
+      const originalFstat = nodeFs.fstatSync as (
+        fd: number,
+        options?: { bigint?: boolean },
+      ) => { dev: bigint; [key: string]: unknown };
+      const originalStat = nodeFs.statSync as (
+        path: string,
+        options?: { bigint?: boolean },
+      ) => { dev: bigint; [key: string]: unknown };
+      const retained = vi.fn(async () => undefined);
+      const cleanup = vi.fn(async () => undefined);
+      fake.driver.retainCompletedMaterial = retained;
+      fake.driver.cleanupAbortedMaterial = cleanup;
+      const events: string[] = [];
+      const publicationDirectoryFds = new Set<number>();
+      let operationFd: number | undefined;
+      let driftActive = false;
+      let fstatInjected = false;
+      let statInjected = false;
+      let fstatDriftDev: bigint | undefined;
+      let statDriftDev: bigint | undefined;
+      let boundary: Readonly<{
+        journal: string;
+        checksumSha256: string;
+        material: Buffer;
+        calls: Record<string, number>;
+        mutations: readonly string[];
+        eventCount: number;
+      }> | undefined;
+      const captureBoundary = (): void => {
+        const journal = readBackendPublicationJournal(home);
+        if (journal === null) throw new Error("expected durable publication journal");
+        boundary = {
+          journal: readFileSync(journalPath, "utf8"),
+          checksumSha256: journal.checksumSha256,
+          material: readFileSync(materialPath),
+          calls: coordinatorDriverCallCounts(fake.driver),
+          mutations: [...fake.calls],
+          eventCount: events.length,
+        };
+      };
+      if (gate === "trailing") captureBoundary();
+
+      const observer = (event: string): void => {
+        events.push(event);
+        if (
+          gate === "leading"
+          && !driftActive
+          && event === "before-material-authenticate"
+          && readBackendPublicationJournal(home)?.phase === targetPhase
+        ) {
+          captureBoundary();
+          driftActive = true;
+        }
+      };
+      const invoke = async (): Promise<unknown> => {
+        const active = coordinator(home, fake.driver, observer);
+        if (operation === "abort") return active.abort();
+        if (operation === "recover") return active.recoverPending();
+        if (operation === "recover-abort") return active.recoverPending({ disposition: "abort" });
+        return active.resume();
+      };
+
+      let thrown: unknown;
+      await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+        const fd = originalOpen(path, ...args);
+        if (path === publicationDirectory) {
+          publicationDirectoryFds.add(fd);
+          operationFd ??= fd;
+        }
+        if (gate === "trailing" && path === materialPath && !driftActive) driftActive = true;
+        return fd;
+      }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+        publicationDirectoryFds.delete(fd);
+        originalClose(fd);
+      }) as never, async () => withPatchedFsAsync("fstatSync", ((fd: number, options?: { bigint?: boolean }) => {
+        const observed = originalFstat(fd, options);
+        if (driftActive && publicationDirectoryFds.has(fd) && options?.bigint === true) {
+          fstatInjected = true;
+          fstatDriftDev = observed.dev + 1n;
+          return Object.assign(observed, { dev: fstatDriftDev });
+        }
+        return observed;
+      }) as never, async () => withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+        const observed = originalStat(path, options);
+        if (driftActive && path === publicationDirectory && options?.bigint === true) {
+          statInjected = true;
+          statDriftDev = observed.dev + 1n;
+          return Object.assign(observed, { dev: statDriftDev });
+        }
+        return observed;
+      }) as never, async () => {
+        try {
+          await invoke();
+        } catch (error) {
+          thrown = error;
+        }
+      }))));
+
+      expect(thrown).toBeInstanceOf(BackendPublicationJournalError);
+      if (!(thrown instanceof BackendPublicationJournalError)) throw thrown;
+      expect(thrown.reason).toBe("unsafe-storage");
+      expect(fstatDriftDev).toBe(statDriftDev);
+      expect(thrown.message).toBe(
+        "backend publication directory changed during material authentication: private directory identity changed",
+      );
+      expect(operationFd).toBeDefined();
+      expect(fstatInjected).toBe(true);
+      expect(statInjected).toBe(true);
+      if (boundary === undefined) throw new Error("target material-authentication boundary was not reached");
+      expect(readFileSync(journalPath, "utf8")).toBe(boundary.journal);
+      expect(readBackendPublicationJournal(home)?.checksumSha256).toBe(boundary.checksumSha256);
+      expect(readFileSync(materialPath)).toEqual(boundary.material);
+      expect(coordinatorDriverCallCounts(fake.driver)).toEqual(boundary.calls);
+      expect(fake.calls).toEqual(boundary.mutations);
+      expect(events).toHaveLength(boundary.eventCount);
+      expect(retained).not.toHaveBeenCalled();
+      expect(cleanup).not.toHaveBeenCalled();
+    },
+  );
 
   it("journals preparing before sealing, authenticates material, and resumes to completion", async () => {
     const home = makeHome();
