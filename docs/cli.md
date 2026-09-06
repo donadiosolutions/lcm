@@ -216,6 +216,12 @@ may add a bounded overshoot of up to one second when both locks contend.
 Identity, token, process-birth, health, entrypoint, version, backend, or
 runtime-digest mismatches fail closed with the original typed contention error.
 
+Lock-free configuration preparation also rejects a configuration or
+publication journal that changes between its two authenticated snapshots. Once
+the active publication has settled, rerun `lcm install` manually. This drift
+refusal is not retried automatically, and rerunning the installer does not imply
+that unrelated installation failures have resolved.
+
 ## Daemon-dependent resilience
 
 `lcm doctor` limits the complete daemon health exchange to two seconds. The

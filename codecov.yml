@@ -15,6 +15,7 @@ component_management:
     - component_id: "unit-installation"
       name: "Unit - Installation"
       paths:
+        # #881 keeps absent-config journal checksum admission installer-owned.
         - "installer/"
         - "src/installer/"
         - "^src/bootstrap\\.ts$"
