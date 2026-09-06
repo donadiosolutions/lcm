@@ -244,13 +244,22 @@ The `Security` section of the doctor output shows:
   delimiters, including later colons, `?`, and `#`, end the redacted span, so
   text after those delimiters can remain visible. Before the first path
   separator, semicolons, commas, apostrophes, closing parentheses, and closing
-  braces remain part of an exact `file://` authority; after the path begins,
-  those characters retain their existing path and prose delimiter behavior.
-  A quote immediately before the `file` scheme establishes a quote boundary:
-  its matching quote still terminates the URL, while an apostrophe inside an
-  unquoted or double-quoted authority remains authority text. Double quotes
-  remain hard boundaries for quoted or structured text. Ordinary HTTP and
-  HTTPS URLs retain their authorities, slashes, and paths. In an unquoted exact
+  braces remain part of an exact `file://` authority. In a single-quoted exact
+  file URL, that includes an apostrophe matching the quote before the scheme;
+  the existing outer-quoted query and fragment markers, `?` and `#`, also keep
+  exact-file classification before the first path. Pre-path whitespace resets
+  classification. The remaining URL-ending punctuation (`|`, double quotes,
+  `<`, `>`, and closing square brackets subject to the existing bracket
+  handling) ends it. After a path begins, those characters retain their
+  existing path and prose delimiter behavior, and a matching apostrophe closes
+  the redacted path. A quoted path can contain spaces; redaction continues to
+  that matching apostrophe, a newline, or EOF. Empty and root-only file URLs
+  remain unchanged. Unspaced text after an apparent pathless closing apostrophe
+  can be treated as continuing authority text, so an eventual path can cause
+  conservative redaction of that later text. Whitespace-separated following
+  prose or URLs are classified normally. Double quotes remain hard boundaries
+  for quoted or structured text. Ordinary HTTP and HTTPS URLs retain their
+  authorities, slashes, and paths. In an unquoted exact
   `file://` URL with no path, a `?` or `#` outside still-open brackets ends the
   file URL authority classification. Following text is classified from fresh
   state: a nested non-file URL remains intact, while standalone POSIX, Windows,

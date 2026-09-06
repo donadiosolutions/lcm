@@ -281,6 +281,96 @@ describe("sanitizeError", () => {
 
   it.each([
     [
+      "'file://host'name/Users/canary/private.db'",
+      "'file://host'name<path>'",
+    ],
+    [
+      "'file://ho'st'name/Users/canary/private.db'",
+      "'file://ho'st'name<path>'",
+    ],
+    [
+      "'file://host''name/Users/canary/private.db'",
+      "'file://host''name<path>'",
+    ],
+    [
+      "'file://host'name/My Files/private.db'",
+      "'file://host'name<path>'",
+    ],
+    [
+      "'file://host'name/Users/canary/private.db trailing prose",
+      "'file://host'name<path>",
+    ],
+    [
+      "'file://host'name/Users/canary/private.db\ntrailing prose",
+      "'file://host'name<path>\ntrailing prose",
+    ],
+    [
+      "'file://host'/Users/canary/private.db'",
+      "'file://host'<path>'",
+    ],
+    [
+      "'file://host'name/Users/canary/private.db' later'",
+      "'file://host'name<path>' later'",
+    ],
+    ["'file://host'name'", "'file://host'name'"],
+    ["'file://host'name/'", "'file://host'name/'"],
+    [
+      "'file://host'name' https://example.test/x'",
+      "'file://host'name' https://example.test/x'",
+    ],
+    [
+      "'https://host'name/Users/canary/private.db'",
+      "'https://host'name/Users/canary/private.db'",
+    ],
+    [
+      "'file://host'name/C:/Users/canary/private.db'",
+      "'file://host'name<path>'",
+    ],
+    [
+      "'file://host'name\\Users\\canary\\private.db'",
+      "'file://host'name<path>'",
+    ],
+    [
+      "'file://authority-authority-authority-authority-authority.invalid'name/Users/canary/private.db'",
+      "'file://authority-authority-authority-authority-authority.invalid'name<path>'",
+    ],
+    [
+      "'file://höst'name/Users/canary/private.db'",
+      "'file://höst'name<path>'",
+    ],
+    [
+      "'file://host;na,me')tail}/Users/canary/private.db'",
+      "'file://host;na,me')tail}<path>'",
+    ],
+    [
+      "'file://host'name?part/Users/canary/private.db'",
+      "'file://host'name?part<path>'",
+    ],
+    [
+      "'file://host'name#part/Users/canary/private.db'",
+      "'file://host'name#part<path>'",
+    ],
+    [
+      "'file://host'na me/Users/canary/private.db'",
+      "'file://host'na me/Users/canary/private.db'",
+    ],
+    [
+      "file://host'name/Users/canary/private.db",
+      "file://host'name<path>",
+    ],
+    [
+      '\"file://host\'name/Users/canary/private.db\"',
+      '\"file://host\'name<path>\"',
+    ],
+  ] as const)("handles ambiguous apostrophes in quoted file authorities: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    [
       "file://remote.invalid[/Users/canary/one.db]/Users/canary/two.db",
       "file://remote.invalid[<path>]<path>",
     ],
