@@ -34,7 +34,8 @@ function isValidTemporaryParent(candidate, platformName) {
   return typeof candidate === "string"
     && candidate.length > 0
     && !candidate.includes("\0")
-    && isAbsolutePlatformPath(candidate, platformName);
+    && isAbsolutePlatformPath(candidate, platformName)
+    && (platformName !== "win32" || win32.parse(candidate).root.length > 1);
 }
 
 function selectorInputs(options, environment) {
@@ -261,7 +262,10 @@ export function selectTestTempParent(options = {}) {
   const diagnostics = [];
   const seen = new Set();
   for (const candidate of candidates) {
-    if (!isValidTemporaryParent(candidate, platformName)) continue;
+    if (!isValidTemporaryParent(candidate, platformName)) {
+      diagnostics.push({ candidate, reason: "invalid" });
+      continue;
+    }
     const inspected = inspectGitFreeParent(candidate, options);
     if (inspected.parent && seen.has(inspected.parent)) continue;
     if (inspected.parent) seen.add(inspected.parent);
@@ -293,7 +297,10 @@ export function createTestTempDirectory(options = {}) {
   const diagnostics = [];
   const seen = new Set();
   for (const candidate of candidates) {
-    if (!isValidTemporaryParent(candidate, platformName)) continue;
+    if (!isValidTemporaryParent(candidate, platformName)) {
+      diagnostics.push({ candidate, reason: "invalid" });
+      continue;
+    }
     const inspected = inspectGitFreeParent(candidate, options);
     if (inspected.parent && seen.has(inspected.parent)) continue;
     if (inspected.parent) seen.add(inspected.parent);

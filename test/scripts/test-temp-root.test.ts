@@ -133,6 +133,10 @@ describe("test temporary parent selector", () => {
     ["LCM_TEST_HARNESS_TMPDIR", "relative", "linux"],
     ["LCM_TEST_VITEST_RUNTIME_ROOT_PARENT", "C:relative", "win32"],
     ["LCM_TEST_HARNESS_TMPDIR", "C:relative", "win32"],
+    ["LCM_TEST_VITEST_RUNTIME_ROOT_PARENT", "\\tmp", "win32"],
+    ["LCM_TEST_HARNESS_TMPDIR", "\\tmp", "win32"],
+    ["LCM_TEST_VITEST_RUNTIME_ROOT_PARENT", "/tmp", "win32"],
+    ["LCM_TEST_HARNESS_TMPDIR", "/tmp", "win32"],
     ["LCM_TEST_VITEST_RUNTIME_ROOT_PARENT", "", "linux"],
     ["LCM_TEST_HARNESS_TMPDIR", "/bad\0path", "linux"],
   ])("rejects invalid explicit %s value %j before probing", (variable, value, platformName) => {
@@ -203,25 +207,79 @@ describe("test temporary parent selector", () => {
     expect(realpath).not.toHaveBeenCalledWith("relative");
   });
 
+  it("skips Windows root-relative candidates and uses a fully qualified successor", () => {
+    for (const operation of [selectTestTempParent, createTestTempDirectory]) {
+      const realpath = vi.fn((path: string) => path);
+      const markerProbe = vi.fn(absent);
+      const createDirectory = vi.fn(() => "C:\\absolute\\lcm-test-root");
+      const result = operation({
+        environment: {},
+        platformName: "win32",
+        candidateParents: ["\\tmp", "/tmp", "C:\\absolute"],
+        realpath,
+        markerProbe,
+        createDirectory,
+        secureDirectory: vi.fn(),
+      });
+
+      if (operation === selectTestTempParent) {
+        expect(result).toBe("C:\\absolute");
+      } else {
+        expect(result).toEqual({
+          root: "C:\\absolute\\lcm-test-root",
+          parent: "C:\\absolute",
+        });
+      }
+      expect(realpath).toHaveBeenCalledTimes(1);
+      expect(realpath).toHaveBeenCalledWith("C:\\absolute");
+      expect(markerProbe).not.toHaveBeenCalledWith("\\tmp\\.git");
+      expect(markerProbe).not.toHaveBeenCalledWith("\\.git");
+    }
+  });
+
   it.each([
-    "C:\\Harness",
-    "C:/Harness",
-    "\\\\server\\share",
-  ])("accepts Windows absolute parent %j", (parent) => {
+    ["C:\\Harness", "win32"],
+    ["C:/Harness", "win32"],
+    ["\\\\server\\share", "win32"],
+    ["/tmp", "linux"],
+  ])("accepts fully qualified %s parent on %s", (parent, platformName) => {
+    const root = platformName === "win32"
+      ? `${parent}\\lcm-test-root`
+      : `${parent}/lcm-test-root`;
     expect(selectTestTempParent({
       environment: { LCM_TEST_HARNESS_TMPDIR: parent },
-      platformName: "win32",
+      platformName,
       realpath: (path: string) => path,
       markerProbe: absent,
     })).toBe(parent);
     expect(createTestTempDirectory({
       environment: { LCM_TEST_HARNESS_TMPDIR: parent },
-      platformName: "win32",
+      platformName,
       realpath: (path: string) => path,
       markerProbe: absent,
-      createDirectory: () => `${parent}\\lcm-test-root`,
+      createDirectory: () => root,
       secureDirectory: vi.fn(),
-    })).toEqual({ root: `${parent}\\lcm-test-root`, parent });
+    })).toEqual({ root, parent });
+  });
+
+  it("reports all invalid candidates without probing them", () => {
+    for (const operation of [selectTestTempParent, createTestTempDirectory]) {
+      const realpath = vi.fn((path: string) => path);
+      const markerProbe = vi.fn(absent);
+      const createDirectory = vi.fn(() => "/unused/lcm-test-root");
+
+      expect(() => operation({
+        environment: {},
+        candidateParents: ["relative", ""],
+        realpath,
+        markerProbe,
+        createDirectory,
+        secureDirectory: vi.fn(),
+      })).toThrow(/relative \(invalid\).* \(invalid\)/u);
+      expect(realpath).not.toHaveBeenCalled();
+      expect(markerProbe).not.toHaveBeenCalled();
+      expect(createDirectory).not.toHaveBeenCalled();
+    }
   });
 
   it("keeps nested allocations on the stable handoff parent", () => {

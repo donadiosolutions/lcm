@@ -103,9 +103,11 @@ temporary locations). A marker of any type, including an empty or malformed
 realpath, and creation failures advance to the next finite candidate. An
 explicit `LCM_TEST_VITEST_RUNTIME_ROOT_PARENT` or
 `LCM_TEST_HARNESS_TMPDIR` must name a non-empty absolute path for the active
-platform. Invalid or relative explicit values are rejected before filesystem
-checks and never fall back. Invalid or relative automatic candidates are
-skipped in favor of the next finite candidate.
+platform. On Windows, the path must be fully qualified with a drive or UNC
+share; root-relative paths such as `\\tmp` or `/tmp` are rejected because they
+vary with the process's current drive. Invalid or relative explicit values are
+rejected before filesystem checks and never fall back. Invalid or relative
+automatic candidates are skipped in favor of the next finite candidate.
 
 Each run owns one mode-0700 root. Forked workers create a home directory and a
 sibling temporary directory below that root before test modules load, and set
