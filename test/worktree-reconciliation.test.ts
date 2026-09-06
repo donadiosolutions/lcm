@@ -785,18 +785,18 @@ function instrumentTargetReconciliationCommit(
   let injected = false;
   const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(
     function (this: DatabaseSync, sql: string): void {
-      const result = originalExec.call(this, sql);
       const statement = sql.replace(/\s+/gu, " ").trim();
+      if (armedTarget === this && statement === "ROLLBACK") {
+        targetRollbackCount += 1;
+        if (options.rollbackError !== undefined) throw options.rollbackError;
+      }
+      const result = originalExec.call(this, sql);
       if (statement.includes("CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources")) {
         reconciliationTarget = this;
       }
       if (reconciliationTarget === this && statement === "BEGIN IMMEDIATE") {
         armedTarget = this;
         options.onBegin?.(this);
-      }
-      if (armedTarget === this && statement === "ROLLBACK") {
-        targetRollbackCount += 1;
-        if (options.rollbackError !== undefined) throw options.rollbackError;
       }
       if (armedTarget === this && statement === "COMMIT" && !injected) {
         injected = true;
