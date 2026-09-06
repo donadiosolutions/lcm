@@ -150,14 +150,14 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       restartedPathlessFile = false;
       queryOrFragment = false;
     }
-    // These characters are valid in a file URL authority. Keep classifying
-    // until the first path separator, except when one closes a quote that
-    // immediately preceded the scheme. Once a path starts, all URL-ending
-    // delimiters retain their existing termination behavior below.
+    // Conservatively keep supported punctuation and embedded double quotes in
+    // an exact file URL authority until the first path separator. A quote that
+    // matches one immediately before the scheme still closes that quoted URL;
+    // once a path starts, URL-ending delimiters keep their existing behavior.
     const fileAuthorityDelimiter =
       exactFileScheme &&
       !foundFilePath &&
-      FILE_URL_AUTHORITY_DELIMITERS.has(char) &&
+      (char === '"' || FILE_URL_AUTHORITY_DELIMITERS.has(char)) &&
       !(schemeQuote !== 0 && quoteCode(char) === schemeQuote);
     if (separator >= 0 && brackets === 0 && URL_END_DELIMITERS.has(char) && !fileAuthorityDelimiter) {
       schemeLength = 0;
