@@ -1,6 +1,5 @@
 import {
   chmodSync,
-  closeSync,
   constants,
   lstatSync,
   mkdirSync,
