@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   rmSync,
   statSync,
+  symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -114,6 +115,21 @@ describe("local hook event sequence", () => {
       "SELECT next_sequence FROM local_hook_sequence WHERE singleton = 1",
     ).get()).toEqual({ next_sequence: "1" });
     raw.close();
+  });
+
+  it("rejects a symlink checkpoint parent before changing its target", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-event-sequence-symlink-"));
+    directories.push(directory);
+    const target = join(directory, "target");
+    const linkedParent = join(directory, "linked-parent");
+    mkdirSync(target, { mode: 0o755 });
+    chmodSync(target, 0o755);
+    symlinkSync(target, linkedParent);
+    const path = join(linkedParent, "sequence.sqlite");
+
+    expect(() => new LocalHookEventSequenceAllocator(path)).toThrow();
+    expect(statSync(target).mode & 0o777).toBe(0o755);
+    expect(isLcmConnectionOpen(path)).toBe(false);
   });
 
   it.each([Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5])(

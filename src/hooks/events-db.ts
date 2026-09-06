@@ -1,7 +1,6 @@
 // src/hooks/events-db.ts
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { chmodSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
   getExistingLcmConnection,
@@ -10,10 +9,6 @@ import {
   isLcmConnectionOpen,
 } from "../db/connection.js";
 import { sanitizeError } from "../daemon/safe-error.js";
-import {
-  ensurePrivateDirectory,
-  PRIVATE_DIRECTORY_MODE,
-} from "../security-files.js";
 import { readMachineIdentity } from "../machine-identity.js";
 import { sanitizeHookErrorDiagnostic } from "./hook-error-diagnostic.js";
 import {
@@ -263,16 +258,10 @@ export class EventsDb {
     dbPath: string,
     options: LocalHookOutboxOpenOptions = {},
   ): EventsDb | null {
-    const connection = getExistingLcmConnection(dbPath);
+    const connection = getExistingLcmConnection(dbPath, {
+      tightenDatabaseParent: true,
+    });
     if (connection === null) return null;
-    try {
-      chmodSync(dirname(dbPath), PRIVATE_DIRECTORY_MODE);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        closeLcmConnection(dbPath, connection);
-        throw error;
-      }
-    }
     return new EventsDb(dbPath, options, connection);
   }
 
@@ -285,9 +274,6 @@ export class EventsDb {
     if (existingConnection) {
       this.db = existingConnection;
     } else {
-      // Create-capable opens always enforce the private-directory invariant,
-      // including when getLcmConnection reuses an already-pooled handle.
-      ensurePrivateDirectory(dirname(dbPath));
       // getLcmConnection returns the pooled (or newly-opened) DatabaseSync handle
       // and increments its ref-count. Connections are kept alive across EventsDb
       // instances so that high-frequency hooks (PostToolUse fires 50-200x/session)

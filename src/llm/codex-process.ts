@@ -7,6 +7,7 @@ import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, type CodexProcessReasoningEffort } from
 import {
   createOwnedProcessTeardown,
   boundedModelForDisplay,
+  createFriendlyMissingCodexError,
   normalizeProcessBirthTime,
   createProcessCompatibilityError,
   type ProviderProcessWitness,
@@ -123,17 +124,9 @@ function buildPrompt(text: string, aggressive: boolean | undefined, ctx: Summari
   return [LCM_SUMMARIZER_SYSTEM_PROMPT, summaryPrompt].filter(Boolean).join("\n\n");
 }
 
-function friendlyMissingCodexError(): Error {
-  return new Error([
-    "Codex CLI is not installed or not on PATH.",
-    "Install it first, for example: npm install -g @openai/codex",
-    "Then run lcm again.",
-  ].join("\n"));
-}
-
 function normalizeSpawnError(error: unknown): Error {
   if (error && typeof error === "object" && (error as { code?: unknown }).code === "ENOENT") {
-    return friendlyMissingCodexError();
+    return createFriendlyMissingCodexError();
   }
   return error instanceof Error ? error : new Error(String(error));
 }
