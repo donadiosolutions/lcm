@@ -16,7 +16,6 @@ import {
   assertPrivateDirectoryEntry,
   openPrivateDirectory,
   openPrivateDirectoryIfExists,
-  PrivateDirectoryTopologyError,
   type PrivateDirectoryHandle,
 } from "./security-files.js";
 
@@ -91,9 +90,8 @@ function isMissing(error: unknown): boolean {
 
 function normalizeStatsFilesystemError(
   error: unknown,
-): StatsDatabaseAdmissionError | PrivateDirectoryTopologyError {
-  if (error instanceof StatsDatabaseAdmissionError
-    || error instanceof PrivateDirectoryTopologyError) return error;
+): StatsDatabaseAdmissionError {
+  if (error instanceof StatsDatabaseAdmissionError) return error;
   return new StatsDatabaseAdmissionError();
 }
 
@@ -115,10 +113,12 @@ function openStatsDirectory(path: string): PrivateDirectoryHandle {
 
 function assertStatsDirectories(directories: readonly RetainedDirectory[]): void {
   for (const directory of directories) {
-    assertPrivateDirectoryEntry(
-      directory.handle,
-      directory.path,
-      directory.handle.witness.uid,
+    admitFilesystemOperation(
+      () => assertPrivateDirectoryEntry(
+        directory.handle,
+        directory.path,
+        directory.handle.witness.uid,
+      ),
     );
   }
 }
@@ -127,7 +127,7 @@ function closeStatsDirectories(
   handles: readonly (PrivateDirectoryHandle | undefined)[],
   operationFailed: boolean,
 ): void {
-  let closeFailure: StatsDatabaseAdmissionError | PrivateDirectoryTopologyError | undefined;
+  let closeFailure: StatsDatabaseAdmissionError | undefined;
   for (const handle of handles) {
     if (!handle) continue;
     try {
@@ -622,8 +622,7 @@ export async function collectStats(): Promise<OverallStats> {
           totalMemoriesActedUpon += projStats.recallStats.memoriesActedUpon;
           allTopRecalled.push(...projStats.recallStats.topRecalled);
         } catch (error) {
-          if (error instanceof StatsDatabaseAdmissionError
-            || error instanceof PrivateDirectoryTopologyError) throw error;
+          if (error instanceof StatsDatabaseAdmissionError) throw error;
           // Busy, locked, malformed-schema, and other SQLite failures remain
           // best-effort per-project skips.
         }

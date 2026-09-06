@@ -2,6 +2,7 @@ import { afterAll, beforeEach, beforeAll, describe, expect, it, vi } from "vites
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname } from "node:path";
+import { inspect } from "node:util";
 import type { RecallStats } from "../src/stats.js";
 
 interface FakeDatabaseState {
@@ -472,10 +473,28 @@ describe("stats service coverage", () => {
     expect(mocks.constructDatabase).not.toHaveBeenCalled();
   });
 
-  it("preserves typed directory failures from the open boundary", async () => {
+  it("removes retained-directory causes from inspected admission errors", async () => {
+    setProject();
+    const sentinel = "secret-topology-cause";
+    mocks.assertDirectory.mockImplementation((path) => {
+      if (path.endsWith("/alpha")) {
+        throw new PrivateDirectoryTopologyError(
+          "private directory topology is not trusted",
+          { cause: new Error(sentinel) },
+        );
+      }
+    });
+
+    const error = await collectStats().catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(StatsDatabaseAdmissionError);
+    expect(error).not.toHaveProperty("cause");
+    expect(inspect(error)).not.toContain(sentinel);
+  });
+
+  it("normalizes typed directory failures from the open boundary", async () => {
     const failure = new PrivateDirectoryTopologyError("private directory topology is not trusted");
     mocks.openOptionalDirectory.mockImplementation(() => { throw failure; });
-    await expect(collectStats()).rejects.toBe(failure);
+    await expect(collectStats()).rejects.toBeInstanceOf(StatsDatabaseAdmissionError);
 
     const admission = new StatsDatabaseAdmissionError();
     mocks.openOptionalDirectory.mockImplementation(() => { throw admission; });
@@ -538,7 +557,7 @@ describe("stats service coverage", () => {
       });
     });
 
-    await expect(collectStats()).rejects.toBeInstanceOf(PrivateDirectoryTopologyError);
+    await expect(collectStats()).rejects.toBeInstanceOf(StatsDatabaseAdmissionError);
     expect(mocks.execDatabase).not.toHaveBeenCalled();
     expect(mocks.migrate).not.toHaveBeenCalled();
     expect(mocks.close).toHaveBeenCalledOnce();
@@ -569,7 +588,7 @@ describe("stats service coverage", () => {
 
   it("attempts every directory close while preserving the admission failure", async () => {
     setProject();
-    const failure = new PrivateDirectoryTopologyError("private directory topology is not trusted");
+    const failure = new StatsDatabaseAdmissionError();
     mocks.constructDatabase.mockImplementation(() => {
       mocks.assertDirectory.mockImplementation((path) => {
         if (path.endsWith("/alpha")) throw failure;
@@ -605,7 +624,7 @@ describe("stats service coverage", () => {
       });
     });
 
-    await expect(collectStats()).rejects.toBeInstanceOf(PrivateDirectoryTopologyError);
+    await expect(collectStats()).rejects.toBeInstanceOf(StatsDatabaseAdmissionError);
     expect(mocks.databaseStat).not.toHaveBeenCalled();
     expect(mocks.constructDatabase).not.toHaveBeenCalled();
     expect(mocks.execDatabase).not.toHaveBeenCalled();
@@ -623,7 +642,7 @@ describe("stats service coverage", () => {
       throw new Error("unable to open");
     });
 
-    await expect(collectStats()).rejects.toBeInstanceOf(PrivateDirectoryTopologyError);
+    await expect(collectStats()).rejects.toBeInstanceOf(StatsDatabaseAdmissionError);
     expect(mocks.databaseStat).toHaveBeenCalledOnce();
     expect(mocks.close).not.toHaveBeenCalled();
     expect(mocks.closeDirectory).toHaveBeenCalledTimes(3);
