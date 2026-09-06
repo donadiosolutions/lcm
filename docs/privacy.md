@@ -32,15 +32,19 @@ With the default SQLite backend, all storage is on your machine:
   or dangling metadata is not automatically repaired and may keep the project
   from being discovered by `lcm export --all` until you correct or
   remove that entry.
-  Promote authenticates the immediate metadata parent directory before reading
-  `meta.json` and retains that admitted directory through parsing and
-  publication. A successful bounded read is accepted only when the reader's
-  sampled parent device and inode match the admitted directory. Persistent
-  directory-entry replacement detected during failure handling or publication
-  also fails closed. Promotion database work completed before the metadata
-  update is not rolled back. These checks cover the immediate metadata parent
-  at their stated samples; they do not reauthenticate the full ancestor chain
-  or claim detection of every transient replacement. A missing-file race has no
+  Promote opens the snapshotted LCM root, `projects` directory, and project
+  directory separately before reading `meta.json`. It retains and reasserts all
+  three directory entries through parsing and publication. A successful bounded
+  read is accepted only when the reader's sampled parent device and inode match
+  the retained project directory. A symlink visible during chain acquisition,
+  or persistent directory-entry replacement detected at a later sample, fails
+  closed. Promotion database work and a metadata update completed before a
+  post-publication failure are not rolled back. The guarantee begins when the
+  metadata phase acquires this chain, so an independently valid private
+  hierarchy substituted before that phase can be admitted. Pathname operations
+  inside the atomic writer also leave a bounded race where a replacement can
+  receive a write before the postcondition reports failure. These checks do not
+  claim detection of every transient replacement. A missing-file race has no
   sampled parent identity and remains outside this guarantee.
 - **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
