@@ -96,9 +96,11 @@ take up to two seconds. After the first qualifying contention, retries share a
 single two-second monotonic elapsed deadline and poll at most every 50
 milliseconds; time spent in process-birth and health checks counts against that
 deadline. Wall-clock corrections do not extend or shorten this retry duration.
-Bootstrap migration attempts and worktree-reconciliation lock loops have their
-own existing bounds, and ordinary command I/O plus an in-flight attempt can
-extend total command time. Missing, foreign, malformed, stale, or unhealthy
+Bootstrap migration attempts have their own existing bounds. Worktree
+reconciliation lock acquisition uses a five-second monotonic retry window and
+polls at most every 50 milliseconds; wall-clock corrections do not extend or
+shorten that window. Ordinary command I/O plus an in-flight attempt can extend
+total command time. Missing, foreign, malformed, stale, or unhealthy
 publication evidence still fails closed and exits with status 1. Before the
 retry deadline's expiry is recognized, a refusal reports the current typed
 contention; after recognized expiry, the first contention for the current

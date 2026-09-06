@@ -2318,7 +2318,7 @@ export function reconcileWorktrees(
   if (opts.dryRun) return execute(readProjectMapSnapshot(opts.homeDir, opts._publicationLockToken));
   const lockWaitMs = opts._lockWaitMs ?? 5_000;
   const retryDelayMs = opts._lockRetryDelayMs ?? 50;
-  const deadline = Date.now() + lockWaitMs;
+  const deadline = performance.now() + lockWaitMs;
   let retryWaiter: Int32Array | undefined;
   while (true) {
     try {
@@ -2332,14 +2332,14 @@ export function reconcileWorktrees(
         ),
       );
     } catch (error) {
-      if (!(error instanceof PrivateMutationLockContentionError) || Date.now() >= deadline) {
+      if (!(error instanceof PrivateMutationLockContentionError) || performance.now() >= deadline) {
         throw error;
       }
       Atomics.wait(
         retryWaiter ??= new Int32Array(new SharedArrayBuffer(4)),
         0,
         0,
-        Math.min(retryDelayMs, Math.max(1, deadline - Date.now())),
+        Math.min(retryDelayMs, Math.max(1, deadline - performance.now())),
       );
     }
   }
