@@ -96,6 +96,7 @@ const expectedComponents = [
       "^src/daemon/project\\.ts$",
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
+      // Error sanitization, including #893 adjacent-path redaction, remains daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",

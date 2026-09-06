@@ -363,6 +363,27 @@ describe("sanitizeError", () => {
 
   it.each([
     [
+      "file://host/private?next=[label]/https://public.test/x",
+      "file://host<path>?next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host/private#next=[label]/https://public.test/x",
+      "file://host<path>#next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host/private&next=[label]/https://public.test/x",
+      "file://host<path>&next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host/private=next=[label]/https://public.test/x",
+      "file://host<path>=next=[label]/https://public.test/x",
+    ],
+  ] as const)("preserves non-file URL tails after unrelated brackets: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
+  });
+
+  it.each([
+    [
       "https://outer.test/x?next=file://host.invalid/Users/canary/private.db",
       "https://outer.test/x?next=file://host.invalid<path>",
     ],
