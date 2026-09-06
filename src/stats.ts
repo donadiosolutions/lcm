@@ -1,3 +1,4 @@
+import { renderBackendDiagnostics } from "./storage/diagnostic-renderer.js";
 import { readDiagnosticSqlite } from "./db/diagnostic-sqlite.js";
 import { lstatSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -345,8 +346,7 @@ export function printStats(stats: OverallStats, verbose: boolean): void {
   console.log();
   console.log(`    ${bold}${cyan}🧠 Long Context Manager (LCM)${reset}`);
   if (stats.backendDiagnostics) {
-    const backend = stats.backendDiagnostics;
-    console.log(`    Storage: ${backend.backend} (${backend.classification}). ${backend.remediation}`);
+    console.log(renderBackendDiagnostics(stats.backendDiagnostics));
   }
   console.log();
 

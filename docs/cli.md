@@ -251,6 +251,26 @@ Configuration alone never proves readiness. Unobserved subfacts are
 `unverified`, failed observations are `unavailable`, and facts that do not apply
 to the selected backend are `not-applicable`; verified facts are `ready`.
 
+Text output shows these readiness fields even when statistics are unavailable,
+including search readiness, pool origin and counts, project scope, machine
+identity, local outbox delivery counts, and a fixed next action. It never
+renders a database error or arbitrary configuration value as guidance.
+
+The `project` snapshot field distinguishes `aggregate` observations from a
+`selected` project. A ready selection includes its admitted PostgreSQL UUID
+or SQLite project hash and, when available, the associated local hash used
+for outbox counts. No project paths are printed. An unknown selection is
+reported as unavailable and never falls back to aggregating all projects.
+A selected remote UUID without an observed local binding leaves the local
+outbox unverified. Failures retain the requested scope but discard identifiers
+when their observation cannot be trusted.
+
+SQLite does not require machine registration: an absent machine identity is
+`not-applicable`. If a machine UUID is present and validated, it is shown as
+an identity observed in this configured home. PostgreSQL still requires its
+machine identity to be verified. Aggregate project scope means no individual
+project ID was selected; an absent ID is not evidence of a missing project.
+
 | Snapshot state | Meaning and next action |
 |---|---|
 | `healthy` | All required readiness observations verified. |
@@ -261,7 +281,10 @@ to the selected backend are `not-applicable`; verified facts are `ready`.
 | `stale-publication` | Publication evidence is unresolved or inconsistent, or authenticated evidence changed during collection. Preserve the evidence and follow the [publication recovery guidance](backend-publication.md#journal-less-publication-evidence). |
 
 Backend snapshot collection has a default deadline of 2000 milliseconds and
-honors caller cancellation. A timeout is reported even if a probe stalls;
+honors caller cancellation. SQLite project and event-sidecar reads share one
+owned child process for the complete snapshot, so additional projects do not
+incur a new process launch for every database. All discovered sidecars are
+considered within that same deadline. A timeout is reported even if a probe stalls;
 cleanup does not replace the primary failure classification. A diagnostic
 probe owns and closes its own resources, while a daemon's shared pool stays
 open. `lcm stats --pool` reports safe pool counts and whether they came from
@@ -299,7 +322,11 @@ filesystem authority. Event scans likewise preserve existing sidecars and
 report skipped or failed observations without pruning them.
 
 `lcm status` reports verified daemon details, available numeric project counts,
-and the same backend diagnostic snapshot. It omits the former `lastIngest`,
+and the same backend diagnostic snapshot. If authenticated daemon health is
+available but its status request fails, the daemon remains reported as up and
+the command performs a fresh local diagnostic observation. The output identifies
+that fallback; backend readiness can change between the two observations.
+It omits the former `lastIngest`,
 `lastCompact`, and `lastPromote` fields: project metadata values are not part of
 the diagnostic allowlist. A missing or unreadable project has no numeric
 project object, so an unavailable observation cannot be confused with an

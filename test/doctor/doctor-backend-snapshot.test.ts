@@ -1,3 +1,4 @@
+import { renderBackendDiagnostics } from "../../src/storage/diagnostic-renderer.js";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -43,9 +44,9 @@ describe("doctor common backend snapshot", () => {
     expect(collectStats).not.toHaveBeenCalled();
     const result = results.find(row => row.name === "backend-health");
     expect(result).toEqual({ name: "backend-health", category: "Storage", status,
-      message: `Backend: postgresql; health: ${classification}. ${diagnostics.remediation}`,
+      message: renderBackendDiagnostics(diagnostics),
       backendDiagnostics: diagnostics });
-    expect(formatResultsPlain(results)).toContain(`health: ${classification}`);
+    expect(formatResultsPlain(results)).toContain(`Classification: ${classification}`);
   });
 
   it("uses the stats reader bridge with the configured home for SQLite readiness", async () => {

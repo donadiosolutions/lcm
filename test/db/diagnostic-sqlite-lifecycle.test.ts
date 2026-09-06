@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const harness = vi.hoisted(() => ({ fork: vi.fn() }));
 vi.mock("node:child_process", () => ({ fork: harness.fork }));
-import { readDiagnosticSqlite } from "../../src/db/diagnostic-sqlite.js";
+import { readDiagnosticSqlite, withDiagnosticSqliteSession } from "../../src/db/diagnostic-sqlite.js";
 
 class DiagnosticChild extends EventEmitter {
   send = vi.fn((_request: unknown, callback: (error: Error | null) => void) => { callback(null); });
@@ -108,5 +108,124 @@ describe("diagnostic child ownership and lifecycle", () => {
     await rejection;
     expect(child.kill).toHaveBeenCalledOnce();
     expect(child.unref).toHaveBeenCalledOnce();
+  });
+});
+
+
+describe("snapshot-owned SQLite session", () => {
+  const start = (operation: (signal: AbortSignal) => Promise<unknown>) => {
+    const controller = new AbortController();
+    return {controller, result: withDiagnosticSqliteSession(controller.signal, () => operation(controller.signal))};
+  };
+  it("serializes queued requests in one child and finalizes once", async () => {
+    const {result} = start(async signal => {
+      const first = readDiagnosticSqlite({...request,signal});
+      const second = readDiagnosticSqlite({...request,signal});
+      expect(child.send).toHaveBeenCalledTimes(1);
+      child.emit("message", "ready");
+      child.emit("message", {id:1,ok:true,rows:[1]});
+      expect(child.send).toHaveBeenCalledTimes(2);
+      child.emit("message", {id:2,ok:true,rows:[2]});
+      return Promise.all([first,second]);
+    });
+    expect(await result).toEqual([[1],[2]]);
+    expect(harness.fork).toHaveBeenCalledOnce();
+    expect(child.kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+    child.emit("error", new Error("late private failure"));
+    child.emit("exit", 0);
+    expect(child.kill).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("borrows the enclosing session for a nested sidecar scan", async () => {
+    const {result} = start(signal => withDiagnosticSqliteSession(signal, async () => {
+      const reading = readDiagnosticSqlite({...request,signal});
+      child.emit("message", {id:1,ok:true,rows:[]});
+      return reading;
+    }));
+    expect(await result).toEqual([]);
+    expect(harness.fork).toHaveBeenCalledOnce();
+    expect(child.kill).toHaveBeenCalledOnce();
+  });
+  it.each(["error", "exit", "send", "throw", "spawn", "kill"])("preserves sanitized session failure from %s", async kind => {
+    if (kind === "spawn") harness.fork.mockImplementation(()=>{throw new Error("private spawn");});
+    if (kind === "send") child.send.mockImplementation((_request,callback)=>callback(new Error("private IPC")));
+    if (kind === "throw") child.send.mockImplementation(()=>{throw new Error("private IPC");});
+    if (kind === "kill") child.kill.mockImplementation(()=>{throw new Error("private kill");});
+    const {result} = start(signal => {
+      const reading = readDiagnosticSqlite({...request,signal});
+      if (["error","exit","kill"].includes(kind)) child.emit(kind === "kill" ? "error" : kind, new Error("private transport"));
+      return reading;
+    });
+    await expect(result).rejects.toMatchObject({code:"DIAGNOSTIC_SQLITE_WORKER",message:"SQLite diagnostic unavailable"});
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it.each(["EACCES", "EPERM", "ENOENT", "ELOOP", "DIAGNOSTIC_SQLITE_IDENTITY", "DIAGNOSTIC_SQLITE_RESULT_TOO_LARGE", "DIAGNOSTIC_SQLITE_REQUEST_TOO_LARGE", "DIAGNOSTIC_SQLITE_QUERY", "private"])("sanitizes a session %s refusal", async code => {
+    const {result} = start(signal => {
+      const reading=readDiagnosticSqlite({...request,signal});
+      child.emit("message", {id:1,ok:false,code});
+      return reading;
+    });
+    await expect(result).rejects.toMatchObject({code:code === "private" ? "DIAGNOSTIC_SQLITE_WORKER" : code});
+  });
+  it.each(["active", "idle"])("rejects an unmatched reply while %s so it cannot satisfy another request", async state => {
+    const {result} = start(async signal => {
+      const reading=readDiagnosticSqlite({...request,signal});
+      if (state === "idle") {
+        child.emit("message", {id:1,ok:true,rows:[1]});
+        await reading;
+      }
+      child.emit("message", {id:99,ok:true,rows:[99]});
+      if (state === "active") return reading;
+      return readDiagnosticSqlite({...request,signal});
+    });
+    await expect(result).rejects.toMatchObject({code:"DIAGNOSTIC_SQLITE_WORKER"});
+  });
+  it("aborts all queued reads and closes exactly once", async () => {
+    const controller=new AbortController();
+    const result=withDiagnosticSqliteSession(controller.signal, () => {
+      const first=readDiagnosticSqlite({...request,signal:controller.signal});
+      const second=readDiagnosticSqlite({...request,signal:controller.signal});
+      controller.abort();
+      return Promise.all([first,second]);
+    });
+    await expect(result).rejects.toMatchObject({code:"DIAGNOSTIC_SQLITE_ABORTED"});
+    expect(child.kill).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("does not spawn when the scope is already aborted", async () => {
+    const controller=new AbortController();controller.abort();
+    await expect(withDiagnosticSqliteSession(controller.signal, ()=>readDiagnosticSqlite({...request,signal:controller.signal}))).rejects.toMatchObject({code:"DIAGNOSTIC_SQLITE_ABORTED"});
+    expect(harness.fork).not.toHaveBeenCalled();
+  });
+  it.each([20, 2000])("owns a total lifetime bound and shortened request deadline %i", async timeoutMs => {
+    const {result}=start(signal=>readDiagnosticSqlite({...request,signal,timeoutMs}));
+    const rejection=expect(result).rejects.toMatchObject({code:"DIAGNOSTIC_SQLITE_TIMEOUT"});
+    await vi.advanceTimersByTimeAsync(timeoutMs);
+    await rejection;
+    expect(child.kill).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("bounds queued requests without sending or retaining unbounded frames", async () => {
+    const {result}=start(async signal=>{
+      const readings=Array.from({length:34},()=>readDiagnosticSqlite({...request,signal}));
+      const outcomes=Promise.allSettled(readings);
+      child.emit("error",new Error("stop owned fixture"));
+      return outcomes;
+    });
+    const outcomes=await result as PromiseSettledResult<unknown>[];
+    expect(outcomes).toHaveLength(34);
+    expect(outcomes.every(item=>item.status === "rejected")).toBe(true);
+    expect(child.send).toHaveBeenCalledOnce();
+  });
+  it("refuses oversized requests before spawning", async () => {
+    const {result}=start(signal=>readDiagnosticSqlite({...request,signal,statements:[{sql:"x".repeat(1024*1024),mode:"get"}]}));
+    await expect(result).rejects.toMatchObject({code:"DIAGNOSTIC_SQLITE_REQUEST_TOO_LARGE"});
+    expect(harness.fork).not.toHaveBeenCalled();
+  });
+  it("closes an unused scope without spawning", async () => {
+    const {result}=start(async()=>42);
+    expect(await result).toBe(42);
+    expect(harness.fork).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

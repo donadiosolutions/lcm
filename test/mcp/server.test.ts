@@ -1,3 +1,4 @@
+import { renderBackendDiagnostics } from "../../src/storage/diagnostic-renderer.js";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -670,7 +671,7 @@ describe("local lcm_stats diagnostic failures", () => {
         publication: "unverified", tls: "unverified", schema: "unavailable",
         extensions: "unverified", search: "unverified",
         pool: { origin: "diagnostic-probe", status: "unavailable" },
-        identity: { status: "unverified" }, outbox: { status: "unverified" },
+        project: { scope: "aggregate", status: "unverified" }, identity: { status: "unverified" }, outbox: { status: "unverified" },
         remediation: "Run `lcm doctor` and review the storage configuration.",
       };
       const canaries = [
@@ -688,7 +689,7 @@ describe("local lcm_stats diagnostic failures", () => {
 
       expect(result).toEqual({ content: [{
         type: "text",
-        text: `Storage: postgresql (${classification}). ${diagnostics.remediation}`,
+        text: renderBackendDiagnostics(diagnostics),
       }] });
       for (const canary of canaries) expect(JSON.stringify(result)).not.toContain(canary);
       expect(result.content[0].text).not.toContain("| Projects |");

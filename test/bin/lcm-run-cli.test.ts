@@ -12,7 +12,14 @@ const FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC =
   "lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.";
 
 const state = vi.hoisted(() => ({
-  diagnostics: { backend: "sqlite", classification: "healthy", remediation: "No action required.", pool: { origin: "local", status: "ready", total: 0, idle: 0 } },
+  diagnostics: {
+    backend: "sqlite", classification: "healthy", remediation: "No action required.",
+    publication: "ready", tls: "not-applicable", schema: "ready",
+    extensions: "not-applicable", search: "ready",
+    pool: { origin: "local", status: "ready", total: 0, idle: 0 },
+    project: { scope: "aggregate", status: "ready" },
+    identity: { status: "not-applicable" }, outbox: { status: "ready", captured: 0 },
+  },
   exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
   printHelp: vi.fn(),
   ensureDaemon: vi.fn(async () => ({ connected: true, spawned: false, restartedForParent: false, pid: 42 })),
@@ -1524,6 +1531,69 @@ describe("runCli daemon-backed and utility actions", () => {
 });
 
 describe("runCli orchestration actions", () => {
+  it.each([
+    { json: false, localHealthy: false }, { json: true, localHealthy: false },
+    { json: false, localHealthy: true }, { json: true, localHealthy: true },
+  ])("retains authenticated daemon up after backend status refusal (json=$json, localHealthy=$localHealthy)", async ({ json, localHealthy }) => {
+    const root = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-status-refusal-"));
+    actualFs.mkdirSync(join(root, ".lcm"), { recursive: true });
+    state.runtimeHome = root;
+    state.health.mockResolvedValue({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      entrypoint: "/daemon", runtimeDigest: "runtime", uptime: 7,
+    });
+    const statsModule = await import("../../src/stats.js");
+    const classification = localHealthy ? "healthy" : "stale-publication";
+    const diagnostic = { ...state.diagnostics, classification };
+    state.post.mockRejectedValueOnce(Object.assign(new Error("private refusal canary"), { statusCode: 503 }));
+    // The transport exposes statusCode only. Backend facts are freshly observed
+    // locally, which may already be healthy after the earlier remote refusal.
+    if (localHealthy) vi.mocked(statsModule.collectStats).mockResolvedValueOnce({
+      messages: 0, summaries: 0, promotedCount: 0, backendDiagnostics: diagnostic,
+    } as never);
+    else vi.mocked(statsModule.collectStats).mockRejectedValueOnce(new statsModule.StatsUnavailableError(diagnostic as never));
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      expect(await invoke(json ? ["status", "--json"] : ["status"])).toBeUndefined();
+      expect(state.post).toHaveBeenCalledWith("/status", { cwd: process.cwd() }, { timeoutMs: 2000 });
+      if (json) {
+        expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toMatchObject({
+          daemon: { status: "up", version: "1.4.2", uptime: 7, port: 3737 },
+          backendDiagnostics: { classification },
+          diagnosticSource: "local",
+        });
+      } else {
+        expect(log).toHaveBeenCalledWith("Daemon: up");
+        expect(log).toHaveBeenCalledWith("Diagnostics source: local observation after daemon status request failed.");
+        expect(log).toHaveBeenCalledWith(expect.stringContaining(`Classification: ${classification}`));
+      }
+      expect(JSON.stringify([stdout.mock.calls, log.mock.calls])).not.toContain("private refusal canary");
+      expect(state.ensureDaemon).not.toHaveBeenCalled();
+      expect(state.restartDaemon).not.toHaveBeenCalled();
+      expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    } finally {
+      actualFs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["status", "pool", "stats"])("renders complete safe backend facts for %s failures", async (kind) => {
+    state.authToken = null;
+    const statsModule = await import("../../src/stats.js");
+    vi.mocked(statsModule.collectStats).mockRejectedValueOnce(new statsModule.StatsUnavailableError({
+      ...state.diagnostics, classification: "permission-denied", remediation: "private-action-canary",
+    } as never));
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const args = kind === "pool" ? ["stats", "--pool"] : [kind];
+    expect((await invoke(args))?.message).toBe(kind === "stats" ? "exit:1" : undefined);
+    const text = log.mock.calls.map(call => call.join(" ")).join("\n");
+    for (const label of ["Storage backend:", "Classification:", "Publication:", "TLS:", "Schema:", "Extensions:", "Search:", "Pool:", "Project:", "Machine identity:", "Outbox:", "Action:"]) {
+      expect(text).toContain(label);
+    }
+    expect(text).toContain("permission-denied");
+    expect(text).not.toContain("private-action-canary");
+  });
+
   it.each([["stats"], ["stats", "--json"]])("renders classified statistics failures without payloads %#", async (...args) => {
     const statsModule = await import("../../src/stats.js");
     const diagnostic = { ...state.diagnostics, classification: "permission-denied" };
@@ -1553,7 +1623,7 @@ describe("runCli orchestration actions", () => {
     }
     vi.mocked(statsModule.collectStats).mockRejectedValueOnce(new statsModule.StatsUnavailableError(state.diagnostics as never));
     await invoke(args);
-    expect(log).toHaveBeenCalledWith(expect.stringContaining("Storage:"));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("Storage backend:"));
     expect(state.ensureDaemon).not.toHaveBeenCalled();
   });
 
@@ -1565,7 +1635,7 @@ describe("runCli orchestration actions", () => {
     } } as never);
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     expect(await invoke(["stats", "--pool"])).toBeUndefined();
-    expect(log).toHaveBeenCalledWith("  failed: true");
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("failed: true"));
   });
 
   it.each(["start", "restart"])("runs managed daemon %s with staged PostgreSQL storage", async (action) => {

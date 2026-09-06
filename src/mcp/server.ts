@@ -1,3 +1,4 @@
+import { renderBackendDiagnostics } from "../storage/diagnostic-renderer.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -106,10 +107,10 @@ const LOCAL_TOOLS: Record<string, (args: Record<string, unknown>) => Promise<str
     try { stats = await collectStats(); }
     catch (error) {
       if (!(error instanceof StatsUnavailableError)) throw error;
-      return `Storage: ${error.diagnostics.backend} (${error.diagnostics.classification}). ${error.diagnostics.remediation}`;
+      return renderBackendDiagnostics(error.diagnostics);
     }
     const verbose = args.verbose === true;
-    const lines: string[] = [`Storage: ${stats.backendDiagnostics.backend} (${stats.backendDiagnostics.classification})`, ""];
+    const lines: string[] = [renderBackendDiagnostics(stats.backendDiagnostics), ""];
 
     // Memory section
     lines.push("## 🧠 Memory");

@@ -9,7 +9,7 @@ function snapshot(): BackendDiagnosticSnapshot {
   return {
     backend: "postgresql", classification: "healthy", publication: "ready", tls: "ready",
     schema: "ready", extensions: "ready", search: "ready", pool: { origin: "diagnostic-probe", status: "ready" },
-    identity: { status: "ready" }, outbox: { status: "unverified" }, remediation: "No action required.",
+    project: { scope: "aggregate", status: "ready" }, identity: { status: "ready" }, outbox: { status: "unverified" }, remediation: "No action required.",
     metrics: {
       projects: 2, conversations: 3, compactedConversations: 1, messages: 8, summaries: 2,
       maxDepth: 2, rawTokens: 90, summaryTokens: 10, ratio: 9, promotedCount: 4,
@@ -34,7 +34,7 @@ describe("backend-aware statistics", () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     printStats(result, true);
     expect(log.mock.calls.flat().join("\n")).not.toContain("Per Conversation");
-    expect(log.mock.calls.flat().join("\n")).toContain(`Storage: postgresql (${classification})`);
+    expect(log.mock.calls.flat().join("\n")).toContain(`Classification: ${classification}`);
   });
 
   it.each(["unavailable", "permission-denied", "timeout", "stale-publication"] as const)("preserves %s without substituting empty metrics", async classification => {

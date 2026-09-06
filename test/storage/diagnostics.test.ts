@@ -221,3 +221,54 @@ it('reports daemon origin for a borrowed SQLite pool',async()=>{
   const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:{backend:'sqlite'} as never,collectSqlite:async()=>{}});
   expect(result).toMatchObject({classification:'healthy',pool:{origin:'daemon',status:'ready'}});
 });
+
+describe('selected and aggregate diagnostic identities', () => {
+  it('leaves absent SQLite machine identity not applicable without registration', async () => {
+    const {dependencies,observation}=fixture();
+    observation.config.storage={backend:'sqlite'}; observation.machineId=null;
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,collectSqlite:async()=>{}});
+    expect(result).toMatchObject({classification:'healthy',identity:{status:'not-applicable'},project:{scope:'aggregate',status:'ready'}});
+  });
+  it('publishes selected admitted remote and local identities without paths', async () => {
+    const {dependencies,observation}=fixture(); const id='a'.repeat(64);
+    observation.mapContent=JSON.stringify({[id]:{canonical:'/diagnostic/project',aliases:[],remoteProjectId:machineId}});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,cwd:'/diagnostic/project'});
+    expect(result).toMatchObject({project:{scope:'selected',status:'ready',projectId:machineId,localProjectId:id}});
+    expect(JSON.stringify(result)).not.toContain('/diagnostic/project');
+  });
+  it('keeps unknown requested scope selected and unavailable without IDs', async () => {
+    const {dependencies}=fixture();
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,cwd:'/diagnostic/missing'});
+    expect(result).toMatchObject({classification:'unavailable',project:{scope:'selected',status:'unavailable'}});
+    expect(dependencies.readMetrics).not.toHaveBeenCalled();
+  });
+});
+
+it.each(['sqlite','postgresql'] as const)('rejects unsafe selected %s IDs before reading and without echoing them',async backend=>{
+  const {dependencies,observation}=fixture();
+  if(backend==='sqlite') observation.config.storage={backend:'sqlite'};
+  const collectSqlite=vi.fn(async()=>{});
+  const result=await collectBackendDiagnostics({_dependencies:dependencies,projectId:'/private/secret',collectSqlite});
+  expect(result).toMatchObject({classification:'unavailable',project:{scope:'selected',status:'unavailable'}});
+  expect(JSON.stringify(result)).not.toContain('/private/secret');
+  expect(collectSqlite).not.toHaveBeenCalled();expect(dependencies.readMetrics).not.toHaveBeenCalled();
+});
+it('retains required PostgreSQL machine identity as unverified when absent',async()=>{
+  const {dependencies,observation}=fixture();observation.machineId=null;
+  const result=await collectBackendDiagnostics({_dependencies:dependencies});
+  expect(result).toMatchObject({classification:'unavailable',identity:{status:'unverified'}});
+});
+it('reports a selected observed SQLite project hash without requiring machine registration',async()=>{
+  const {dependencies,observation}=fixture();observation.config.storage={backend:'sqlite'};observation.machineId=null;
+  const id='b'.repeat(64);
+  const result=await collectBackendDiagnostics({_dependencies:dependencies,projectId:id,collectSqlite:async()=>{}});
+  expect(result).toMatchObject({classification:'healthy',project:{scope:'selected',status:'ready',projectId:id,localProjectId:id},identity:{status:'not-applicable'}});
+});
+it('preserves selected scope without identifiers after stale publication and pre-aborted collection',async()=>{
+  const {dependencies,observation}=fixture(); const id='a'.repeat(64);
+  observation.mapContent=JSON.stringify({[id]:{canonical:'/diagnostic/project',aliases:[],remoteProjectId:machineId}});
+  dependencies.observePublication=vi.fn().mockReturnValueOnce(observation).mockReturnValue({...observation,witness:'b'});
+  expect(await collectBackendDiagnostics({_dependencies:dependencies,cwd:'/diagnostic/project'})).toMatchObject({classification:'stale-publication',project:{scope:'selected',status:'unverified'}});
+  const controller=new AbortController();controller.abort();
+  expect(await collectBackendDiagnostics({_dependencies:dependencies,projectId:machineId,signal:controller.signal})).toMatchObject({classification:'timeout',project:{scope:'selected',status:'unverified'}});
+});

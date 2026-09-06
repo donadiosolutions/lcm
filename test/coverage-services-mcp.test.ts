@@ -1,3 +1,4 @@
+import { backendDiagnosticFailure } from "../src/storage/diagnostics.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 interface McpRequest {
@@ -184,7 +185,7 @@ describe("MCP service coverage", () => {
   it.each(["sqlite", "postgresql"] as const)("formats local %s stats without lifecycle or staged rejection", async (backend) => {
     mocks.storageBackend = backend;
     mocks.collectStats.mockReturnValue({
-      backendDiagnostics: { backend: mocks.storageBackend, classification: "healthy", remediation: "No action required." },
+      backendDiagnostics: { ...backendDiagnosticFailure(undefined), backend: mocks.storageBackend, classification: "healthy", remediation: "No action required." },
       projects: 2,
       conversations: 3,
       compactedConversations: 1,
@@ -207,7 +208,7 @@ describe("MCP service coverage", () => {
     mocks.ensureDaemon.mockClear();
     const result = await call("lcm_stats", { verbose: true, ignored: true });
     expect(result.isError).toBeUndefined();
-    expect(result.content[0].text).toContain(`Storage: ${backend} (healthy)`);
+    expect(result.content[0].text).toContain(`Storage backend: ${backend}`);
     expect(mocks.collectStats).toHaveBeenCalledExactlyOnceWith();
     expect(mocks.ensureDaemon).not.toHaveBeenCalled();
     expect(mocks.post).not.toHaveBeenCalled();
@@ -218,7 +219,7 @@ describe("MCP service coverage", () => {
 
   it.each([undefined, []])("formats zero-token, zero-ratio and zero-redaction stats with details %j", async (conversationDetails) => {
     mocks.collectStats.mockReturnValue({
-      backendDiagnostics: { backend: mocks.storageBackend, classification: "healthy", remediation: "No action required." },
+      backendDiagnostics: { ...backendDiagnosticFailure(undefined), backend: mocks.storageBackend, classification: "healthy", remediation: "No action required." },
       projects: 0, conversations: 0, compactedConversations: 0, messages: 0, summaries: 1,
       maxDepth: 0, promotedCount: 0, eventsCaptured: 0, eventsUnprocessed: 0, eventsErrors: 0,
       rawTokens: 0, summaryTokens: 0, ratio: 0, conversationDetails,
@@ -232,7 +233,7 @@ describe("MCP service coverage", () => {
 
   it("omits compression for summary-free stats", async () => {
     mocks.collectStats.mockReturnValue({
-      backendDiagnostics: { backend: mocks.storageBackend, classification: "healthy", remediation: "No action required." },
+      backendDiagnostics: { ...backendDiagnosticFailure(undefined), backend: mocks.storageBackend, classification: "healthy", remediation: "No action required." },
       projects: 0, conversations: 0, compactedConversations: 0, messages: 0, summaries: 0,
       maxDepth: 0, promotedCount: 0, rawTokens: 0, summaryTokens: 0,
       ratio: 0, conversationDetails: [], redactionCounts: { total: 0, builtIn: 0, global: 0, project: 0 },
@@ -244,7 +245,7 @@ describe("MCP service coverage", () => {
 
   it("omits verbose details when disabled and formats a zero conversation ratio", async () => {
     mocks.collectStats.mockReturnValue({
-      backendDiagnostics: { backend: mocks.storageBackend, classification: "healthy", remediation: "No action required." },
+      backendDiagnostics: { ...backendDiagnosticFailure(undefined), backend: mocks.storageBackend, classification: "healthy", remediation: "No action required." },
       projects: 1, conversations: 1, compactedConversations: 1, messages: 1, summaries: 1,
       maxDepth: 1, promotedCount: 0, eventsCaptured: 0, rawTokens: 10, summaryTokens: 5,
       ratio: 2, conversationDetails: [

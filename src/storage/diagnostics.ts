@@ -1,3 +1,4 @@
+import { withDiagnosticSqliteSession } from "../db/diagnostic-sqlite.js";
 import { lstatSync } from "node:fs";
 import { dirname } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -58,6 +59,7 @@ export interface BackendDiagnosticSnapshot {
   extensions: BackendDiagnosticReadiness;
   search: BackendDiagnosticReadiness;
   pool: BackendDiagnosticPool;
+  project: { scope: "aggregate" | "selected"; status: BackendDiagnosticReadiness; projectId?: string; localProjectId?: string };
   identity: { status: BackendDiagnosticReadiness; machineId?: string };
   outbox: BackendDiagnosticOutbox;
   metrics?: PostgreSqlDiagnosticMetrics;
@@ -130,7 +132,7 @@ function emptySnapshot(backend: BackendDiagnosticSnapshot["backend"], classifica
   return {
     backend, classification, publication: "unverified", tls: "unverified", schema: "unverified",
     extensions: "unverified", search: "unverified", pool: { origin: "diagnostic-probe", status: "unverified" },
-    identity: { status: "unverified" }, outbox: { status: "unverified" }, remediation: REMEDIATION[classification],
+    project: { scope: "aggregate", status: "unverified" }, identity: { status: "unverified" }, outbox: { status: "unverified" }, remediation: REMEDIATION[classification],
   };
 }
 /** Failure DTO for an outer publication boundary. Never serializes an error. */
@@ -179,6 +181,8 @@ function safeOutbox(value: EventStats): BackendDiagnosticOutbox {
 }
 /** One optimistic read observation. It never owns publication authority or repairs state. */
 export async function collectBackendDiagnostics(options: CollectBackendDiagnosticOptions = {}): Promise<BackendDiagnosticSnapshot> {
+  const scope = options.cwd !== undefined || options.projectId !== undefined ? "selected" : "aggregate";
+  const scoped = (snapshot: BackendDiagnosticSnapshot): BackendDiagnosticSnapshot => { snapshot.project.scope = scope; return snapshot; };
   const dependencies: BackendDiagnosticDependencies = { observePublication, createRuntime: settings => new PostgreSqlRuntime(settings), verifySchema: verifyPostgreSqlRuntimeSchema, readMetrics: readPostgreSqlDiagnosticMetrics, readOutbox: collectEventStats, ...options._dependencies };
   const duration = Number.isFinite(options._deadlineMs) && options._deadlineMs! > 0 ? Math.min(options._deadlineMs!, BACKEND_DIAGNOSTIC_DEADLINE_MS) : BACKEND_DIAGNOSTIC_DEADLINE_MS;
   const deadline = performance.now() + duration;
@@ -191,12 +195,12 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
     try { void runtime.close().catch(() => undefined); } catch { /* Keep the primary classified outcome. */ }
   };
   let before: BackendDiagnosticObservation;
-  try { before = dependencies.observePublication(options.homeDir); } catch (error) { return backendDiagnosticFailure(error); }
+  try { before = dependencies.observePublication(options.homeDir); } catch (error) { return scoped(backendDiagnosticFailure(error)); }
   const backend = before.config.storage.backend;
   if (options.storageFactory !== undefined && options.storageFactory.backend !== backend) {
-    return backendDiagnosticFailure(new BackendPublicationJournalError("backend-mismatch", "Diagnostic backend changed."), options.storageFactory.backend);
+    return scoped(backendDiagnosticFailure(new BackendPublicationJournalError("backend-mismatch", "Diagnostic backend changed."), options.storageFactory.backend));
   }
-  const timeoutSnapshot = (): BackendDiagnosticSnapshot => emptySnapshot(backend, "timeout");
+  const timeoutSnapshot = (): BackendDiagnosticSnapshot => scoped(emptySnapshot(backend, "timeout"));
   if (options.signal?.aborted || performance.now() >= deadline) return timeoutSnapshot();
   const abort = (): void => { controller.abort(); close(); };
   options.signal?.addEventListener("abort", abort, { once: true });
@@ -205,14 +209,17 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
     controller.signal.addEventListener("abort", () => resolve(timeoutSnapshot()), {once:true});
     timer = setTimeout(abort, Math.max(0, deadline - performance.now()));
   });
-  const work = (async (): Promise<BackendDiagnosticSnapshot> => {
-    const snapshot = emptySnapshot(backend, "unavailable");
+  const work = withDiagnosticSqliteSession(controller.signal, async (): Promise<BackendDiagnosticSnapshot> => {
+    const snapshot = scoped(emptySnapshot(backend, "unavailable"));
     snapshot.publication = "ready";
     if (before.machineId !== null && normalizeUuidV7(before.machineId) === before.machineId) snapshot.identity = { status: "ready", machineId: before.machineId };
+    else if (backend === "sqlite" && before.machineId === null) snapshot.identity = { status: "not-applicable" };
     try {
       const selected = options.cwd === undefined ? undefined : resolveDiagnosticProject(before.mapContent ?? null, options.cwd, backend);
       const selectedProjectId = selected?.projectId ?? options.projectId;
       const localProjectId = selected?.localProjectId ?? (backend === "sqlite" ? options.projectId : undefined);
+      if (selectedProjectId !== undefined && !(backend === "postgresql"
+        ? normalizeUuidV7(selectedProjectId) === selectedProjectId : /^[a-f0-9]{64}$/u.test(selectedProjectId))) throw new Error("Project diagnostic identity is unavailable.");
       if (backend === "postgresql") {
         const config = before.config.storage.postgresql;
         runtime = await dependencies.createRuntime({url:config.url,caFile:config.caFile,poolMax:config.poolMax,connectionTimeoutMs:Math.min(config.connectionTimeoutMs,duration),idleTimeoutMs:config.idleTimeoutMs,statementTimeoutMs:Math.min(config.statementTimeoutMs,duration)});
@@ -242,21 +249,25 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
         }
       }
       if (controller.signal.aborted) return timeoutSnapshot();
+      if (snapshot.schema === "ready") snapshot.project = selectedProjectId === undefined
+        ? { scope: "aggregate", status: "ready" }
+        : { scope: "selected", status: localProjectId === undefined ? "unverified" : "ready", projectId: selectedProjectId, ...(localProjectId === undefined ? {} : { localProjectId }) };
       // A remote UUID cannot be interpreted as a local outbox directory identity.
       if (!(backend === "postgresql" && selectedProjectId !== undefined && localProjectId === undefined)) snapshot.outbox = safeOutbox(await dependencies.readOutbox({homeDir:options.homeDir,signal:controller.signal,projectId:localProjectId,pruneOrphanSidecars:false,timeoutMs:Math.max(1,deadline-performance.now())}));
     } catch (error) {
       snapshot.classification = controller.signal.aborted ? "timeout" : classifyFailure(error);
       delete snapshot.metrics;
+      snapshot.project = { scope, status: "unavailable" };
     }
     try {
       const after = dependencies.observePublication(options.homeDir);
-      if (after.witness !== before.witness) return backendDiagnosticFailure(new BackendPublicationJournalError("unexpected-state", "Diagnostic publication changed."), backend);
-    } catch (error) { return backendDiagnosticFailure(error, backend); }
+      if (after.witness !== before.witness) return scoped(backendDiagnosticFailure(new BackendPublicationJournalError("unexpected-state", "Diagnostic publication changed."), backend));
+    } catch (error) { return scoped(backendDiagnosticFailure(error, backend)); }
     if (controller.signal.aborted || performance.now() >= deadline) return timeoutSnapshot();
     if (snapshot.outbox.status !== "ready" && (snapshot.classification === "healthy" || snapshot.classification === "degraded")) snapshot.classification = "unavailable";
     snapshot.remediation = REMEDIATION[snapshot.classification];
     return snapshot;
-  })();
+  });
   try { return await Promise.race([work, aborted]); }
   finally { clearTimeout(timer!); options.signal?.removeEventListener("abort", abort); controller.abort(); close(); }
 }

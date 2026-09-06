@@ -17,7 +17,6 @@ import {
   type DaemonConfigSnapshotWitness,
 } from "./config.js";
 import { sanitizeError } from "./safe-error.js";
-import { stagedPostgreSqlUnavailablePayload } from "./staged-postgresql.js";
 import { readAuthToken } from "./auth.js";
 import type { ProxyManager } from "./proxy-manager.js";
 import { createCompactHandler } from "./routes/compact.js";
@@ -387,12 +386,6 @@ export function requestCancellation(
   };
 }
 
-function stagedPostgreSqlUnavailableHandler(operation: string): RouteHandler {
-  return async (_req, res) => {
-    sendJson(res, 503, stagedPostgreSqlUnavailablePayload(operation));
-  };
-}
-
 /** Revalidate config/publication state before each route or scheduled scan. */
 function assertDaemonRequestStorageAdmission(
   startupConfig: DaemonConfig,
@@ -608,7 +601,6 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     await settleCleanup(() => invocationCoordinator.shutdown());
     throw error;
   }
-  const sqliteStorage = config.storage.backend === "sqlite";
   let constructedProcessor: PassiveEventProcessor | undefined;
   let constructedWatcher: ReturnType<typeof watchProjectMap> | undefined;
   let constructedIngestInterval: ReturnType<typeof setInterval> | undefined;

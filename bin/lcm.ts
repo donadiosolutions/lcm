@@ -2947,32 +2947,44 @@ export async function runCli(
       const jsonFlag: boolean = opts.json ?? false;
       const { collectStats, StatsUnavailableError } = await import("../src/stats.js");
       const { backendDiagnosticFailure } = await import("../src/storage/diagnostics.js");
+      const { renderBackendDiagnostics } = await import("../src/storage/diagnostic-renderer.js");
+      let observedDaemon: { status: string; version?: string; uptime?: number; port?: number } = { status: "down" };
+      let diagnosticSource: "daemon" | "local" = "local";
       let statusData: {
         daemon: { status?: string; version?: string; uptime?: number; port?: number };
         project?: { messageCount: number; summaryCount: number; promotedCount: number };
         backendDiagnostics?: import("../src/storage/diagnostics.js").BackendDiagnosticSnapshot;
       };
       try {
-        const { client } = await createDaemonReadClientOrExit(preflightSeams, { diagnosticOnly: true });
+        const { client, health, config } = await createDaemonReadClientOrExit(preflightSeams, { diagnosticOnly: true });
+        // Diagnostic-only admission returns only after authenticated health and
+        // runtime identity match. A later backend refusal cannot erase that fact.
+        observedDaemon = { status: "up", version: health!.version, uptime: health!.uptime, port: config.daemon.port };
         statusData = await client.post("/status", { cwd: process.cwd() }, { timeoutMs: 2000 });
         statusData.daemon.status = "up";
+        diagnosticSource = "daemon";
       } catch {
         try {
           const stats = await collectStats({ cwd: process.cwd() });
-          statusData = { daemon: { status: "down" }, backendDiagnostics: stats.backendDiagnostics,
+          statusData = { daemon: observedDaemon, backendDiagnostics: stats.backendDiagnostics,
             project: { messageCount: stats.messages, summaryCount: stats.summaries, promotedCount: stats.promotedCount } };
         } catch (error) {
-          statusData = { daemon: { status: "down" }, backendDiagnostics: error instanceof StatsUnavailableError
+          statusData = { daemon: observedDaemon, backendDiagnostics: error instanceof StatsUnavailableError
             ? error.diagnostics : backendDiagnosticFailure(error) };
         }
       }
-      if (jsonFlag) stdout.write(JSON.stringify(statusData, null, 2) + "\n");
+      if (jsonFlag) stdout.write(JSON.stringify({ ...statusData, diagnosticSource }, null, 2) + "\n");
       else {
         console.log(`Daemon: ${statusData.daemon.status}`);
+        console.log(diagnosticSource === "daemon"
+          ? "Diagnostics source: daemon response."
+          : observedDaemon.status === "up"
+            ? "Diagnostics source: local observation after daemon status request failed."
+            : "Diagnostics source: local observation.");
         if (statusData.daemon.version) console.log(`  Version: ${statusData.daemon.version}`);
         if (statusData.daemon.uptime !== undefined) console.log(`  Uptime: ${statusData.daemon.uptime}s`);
         if (statusData.daemon.port !== undefined) console.log(`  Port: ${statusData.daemon.port}`);
-        if (statusData.backendDiagnostics) console.log(`Storage: ${statusData.backendDiagnostics.backend} (${statusData.backendDiagnostics.classification}). ${statusData.backendDiagnostics.remediation}`);
+        if (statusData.backendDiagnostics) console.log(renderBackendDiagnostics(statusData.backendDiagnostics));
         if (statusData.project) {
           console.log(`Messages: ${statusData.project.messageCount}`);
           console.log(`Summaries: ${statusData.project.summaryCount}`);
@@ -2996,6 +3008,7 @@ export async function runCli(
         printHelp("stats"); exit(0);
       }
 
+      const { renderBackendDiagnostics } = await import("../src/storage/diagnostic-renderer.js");
       if (opts.pool) {
         const { collectStats, StatsUnavailableError } = await import("../src/stats.js");
         const { backendDiagnosticFailure } = await import("../src/storage/diagnostics.js");
@@ -3010,14 +3023,7 @@ export async function runCli(
             ? error.diagnostics : backendDiagnosticFailure(error); }
         }
         if (opts.json) stdout.write(JSON.stringify({ backendDiagnostics }, null, 2) + "\n");
-        else {
-          console.log(`Storage: ${backendDiagnostics.backend} (${backendDiagnostics.classification})`);
-          console.log(`Pool: ${backendDiagnostics.pool.origin} (${backendDiagnostics.pool.status})`);
-          for (const [label, value] of Object.entries(backendDiagnostics.pool)) {
-            if (typeof value === "number" || typeof value === "boolean") console.log(`  ${label}: ${value}`);
-          }
-          console.log(backendDiagnostics.remediation);
-        }
+        else console.log(renderBackendDiagnostics(backendDiagnostics));
         return;
       }
 
@@ -3031,7 +3037,7 @@ export async function runCli(
       } catch (error) {
         const diagnostics = error instanceof StatsUnavailableError ? error.diagnostics : backendDiagnosticFailure(error);
         if (opts.json) stdout.write(JSON.stringify({ backendDiagnostics: diagnostics }, null, 2) + "\n");
-        else console.log(`Storage: ${diagnostics.backend} (${diagnostics.classification}). ${diagnostics.remediation}`);
+        else console.log(renderBackendDiagnostics(diagnostics));
         exit(1);
       }
     });

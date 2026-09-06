@@ -1,3 +1,4 @@
+import { renderBackendDiagnostics } from "../storage/diagnostic-renderer.js";
 import { existsSync, readFileSync, lstatSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join, isAbsolute } from "node:path";
@@ -736,7 +737,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       name: "backend-health", category: "Storage",
       status: backendDiagnostics.classification === "healthy" ? "pass"
         : backendDiagnostics.classification === "degraded" ? "warn" : "fail",
-      message: `Backend: ${backendDiagnostics.backend}; health: ${backendDiagnostics.classification}. ${backendDiagnostics.remediation}`,
+      message: renderBackendDiagnostics(backendDiagnostics),
       backendDiagnostics,
     });
     const config = loadConfig(deps);

@@ -15,7 +15,7 @@ vi.mock("node:child_process", async importOriginal => {
     return child;
   } };
 });
-import { readDiagnosticSqlite } from "../../src/db/diagnostic-sqlite.js";
+import { readDiagnosticSqlite, withDiagnosticSqliteSession } from "../../src/db/diagnostic-sqlite.js";
 
 const roots: string[] = [];
 function fixture() {
@@ -74,6 +74,24 @@ describe("bounded diagnostic SQLite", () => {
     await rejected;
     expect(await exit).toEqual([null, "SIGKILL"]);
     expect(performance.now() - start).toBeLessThan(1000);
+  });
+
+  it("kills native SQLite work in a reused snapshot session at the deadline", async () => {
+    const controller = new AbortController();
+    const request = fixture();
+    const result = withDiagnosticSqliteSession(controller.signal, async () => {
+      expect(await readDiagnosticSqlite({...request,signal:controller.signal,statements:[{sql:"SELECT value FROM counts",mode:"get"}]})).toEqual([{value:42}]);
+      return readDiagnosticSqlite({...request,signal:controller.signal,timeoutMs:200,statements:[{
+        sql:"WITH RECURSIVE x(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM x) SELECT sum(n) FROM x",mode:"get",
+      }]});
+    });
+    const child = children.at(-1)!;
+    const exit = once(child,"exit");
+    const started = performance.now();
+    await expect(result).rejects.toMatchObject({code:"DIAGNOSTIC_SQLITE_TIMEOUT"});
+    expect(performance.now()-started).toBeLessThan(1000);
+    expect(await exit).toEqual([null,"SIGKILL"]);
+    expect(children).toHaveLength(1);
   });
 
   it("inherits authenticated parent descriptors without closing the caller's fd", async () => {

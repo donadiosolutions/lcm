@@ -1,7 +1,7 @@
 import { lstatSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { MAX_PROJECT_METADATA_BYTES } from "../daemon/project.js";
-import { readDiagnosticSqlite } from "./diagnostic-sqlite.js";
+import { readDiagnosticSqlite, withDiagnosticSqliteSession } from "./diagnostic-sqlite.js";
 import { sanitizeHookErrorDiagnostic } from "../hooks/hook-error-diagnostic.js";
 import { eventsDir } from "./events-path.js";
 import { projectsDir } from "../runtime-paths.js";
@@ -324,12 +324,18 @@ function pruneSidecarFiles(
 }
 
 export async function collectEventSidecars(options: EventSidecarScanOptions = {}): Promise<EventSidecarSummary[]> {
+  if (options.pruneOrphanSidecars !== false) return scanEventSidecars(options);
+  const signal = options.signal ?? new AbortController().signal;
+  return withDiagnosticSqliteSession(signal, () => scanEventSidecars({...options, signal}));
+}
+
+async function scanEventSidecars(options: EventSidecarScanOptions): Promise<EventSidecarSummary[]> {
   if (options.projectId !== undefined && !/^[a-f0-9]{64}$/u.test(options.projectId)) {
     throw new Error("invalid sidecar project ID");
   }
   const dir = eventsDir(options.homeDir);
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const maxDbs = options.maxDbs ?? DEFAULT_MAX_DBS;
+  const maxDbs = options.maxDbs ?? (options.pruneOrphanSidecars === false ? Number.MAX_SAFE_INTEGER : DEFAULT_MAX_DBS);
   const pruneOrphans = options.pruneOrphanSidecars ?? true;
   const pruneOlderThanDays = options.pruneOrphanSidecarsOlderThanDays ?? DEFAULT_PRUNE_ORPHAN_SIDECAR_AGE_DAYS;
   const deadline = Date.now() + timeoutMs;
