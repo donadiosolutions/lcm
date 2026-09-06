@@ -63,6 +63,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let brackets = 0;
   let exactFileScheme = false;
   let foundFilePath = false;
+  let filePathBracketDepth = 0;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
@@ -74,6 +75,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       brackets = 0;
       exactFileScheme = false;
       foundFilePath = false;
+      filePathBracketDepth = 0;
       continue;
     }
     if (separator >= 0 && char === "[") {
@@ -81,7 +83,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       continue;
     }
     if (separator >= 0 && char === "]" && brackets > 0) {
+      const closesFilePathWrapper = foundFilePath && brackets === filePathBracketDepth;
       brackets -= 1;
+      if (closesFilePathWrapper) {
+        filePathBracketDepth = brackets;
+        if (chars[index + 1] === "/" || chars[index + 1] === "\\") foundFilePath = false;
+      }
       continue;
     }
     if (separator >= 0 && isNestedFileUrlStart(chars, index)) {
@@ -89,6 +96,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       brackets = 0;
       exactFileScheme = true;
       foundFilePath = false;
+      filePathBracketDepth = 0;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;
@@ -112,6 +120,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       separator = -1;
       exactFileScheme = false;
       foundFilePath = false;
+      filePathBracketDepth = 0;
       continue;
     }
     if (separator >= 0) {
@@ -128,6 +137,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         file[index] = 1;
         fileQuote[index] = schemeQuote;
         foundFilePath = true;
+        filePathBracketDepth = brackets;
       }
       continue;
     }
@@ -137,6 +147,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       authority[index + 2] = 1;
       exactFileScheme = schemeLength === FILE_SCHEME.length && fileSchemeLength === FILE_SCHEME.length;
       foundFilePath = false;
+      filePathBracketDepth = 0;
       continue;
     }
     if (schemeLength === 0) {

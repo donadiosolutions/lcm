@@ -281,6 +281,137 @@ describe("sanitizeError", () => {
 
   it.each([
     [
+      "file://remote.invalid[/Users/canary/one.db]/Users/canary/two.db",
+      "file://remote.invalid[<path>]<path>",
+    ],
+    [
+      "file://remote.invalid[[[/Users/canary/one.db]/Users/canary/two.db]/Users/canary/three.db]" +
+        "/Users/canary/four.db",
+      "file://remote.invalid[[[<path>]<path>]<path>]<path>",
+    ],
+    [
+      "file://remote.invalid[[/Users/canary/one.db]]/Users/canary/two/deeper.db",
+      "file://remote.invalid[[<path>]]<path>",
+    ],
+    [
+      "file://remote.invalid[[[/Users/canary/one.db]]]/Users/canary/two/deeper.db",
+      "file://remote.invalid[[[<path>]]]<path>",
+    ],
+    [
+      "FILE://LOCALHOST[/Users/canary/one.db]/Users/canary/two.db",
+      "FILE://LOCALHOST[<path>]<path>",
+    ],
+    [
+      "file://[/Users/canary/one.db]/Users/canary/two.db",
+      "file://[<path>]<path>",
+    ],
+    [
+      "file://remote.invalid[/C:/Users/canary/one.db]/D:/Users/canary/two.db",
+      "file://remote.invalid[<path>]<path>",
+    ],
+    [
+      "file://remote.invalid[\\C:\\Users\\canary\\one.db]\\D:\\Users\\canary\\two.db",
+      "file://remote.invalid[<path>]<path>",
+    ],
+    [
+      "file://remote.invalid[/Users/canary/one.db]\\\\server\\share\\two.db",
+      "file://remote.invalid[<path>]<path>",
+    ],
+    [
+      "file://remote.invalid[/Users/canary/one.db]/Users/δοκιμή/file[2].db",
+      "file://remote.invalid[<path>]<path>",
+    ],
+    [
+      "file://remote.invalid[/Users/canary/file[1].db]/Users/canary/two.db",
+      "file://remote.invalid[<path>]<path>",
+    ],
+  ] as const)("redacts adjacent post-bracket file paths in one pass: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    [
+      "file://remote.invalid[/Users/canary/one.db]?next=/Users/canary/two.db",
+      "file://remote.invalid[<path>]?next=/Users/canary/two.db",
+    ],
+    [
+      "file://remote.invalid[/Users/canary/one.db]#next=/Users/canary/two.db",
+      "file://remote.invalid[<path>]#next=/Users/canary/two.db",
+    ],
+    [
+      "file://remote.invalid[/Users/canary/one.db]&next=/Users/canary/two.db",
+      "file://remote.invalid[<path>]&next=/Users/canary/two.db",
+    ],
+    [
+      "file://remote.invalid[/Users/canary/one.db]=prefix/Users/canary/two.db",
+      "file://remote.invalid[<path>]=prefix/Users/canary/two.db",
+    ],
+    [
+      "file://remote.invalid[/Users/canary/one.db]x/Users/canary/two.db",
+      "file://remote.invalid[<path>]x/Users/canary/two.db",
+    ],
+    [
+      "file://remote.invalid[/Users/canary/one.db].then/Users/canary/two.db",
+      "file://remote.invalid[<path>].then/Users/canary/two.db",
+    ],
+    [
+      "file://remote.invalid[/Users/canary/one.db], then /Users/canary/two.db",
+      "file://remote.invalid[<path>], then <path>",
+    ],
+    [
+      "'file://remote.invalid[/Users/canary/one.db]/Users/canary/two.db'",
+      "'file://remote.invalid[<path>'",
+    ],
+  ] as const)("preserves post-bracket compatibility boundaries: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
+  });
+
+  it.each([
+    [
+      "file://host[/private]?next=[label]/https://public.test/x",
+      "file://host[<path>]?next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host[/private]#next=[label]/https://public.test/x",
+      "file://host[<path>]#next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host[/private]&next=[label]/https://public.test/x",
+      "file://host[<path>]&next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host[/private]=next=[label]/https://public.test/x",
+      "file://host[<path>]=next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host[/private]x[/label]/https://public.test/x",
+      "file://host[<path>]x[/label]/https://public.test/x",
+    ],
+    [
+      "file://host/private?next=[label]/https://public.test/x",
+      "file://host<path>?next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host/private#next=[label]/https://public.test/x",
+      "file://host<path>#next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host/private&next=[label]/https://public.test/x",
+      "file://host<path>&next=[label]/https://public.test/x",
+    ],
+    [
+      "file://host/private=next=[label]/https://public.test/x",
+      "file://host<path>=next=[label]/https://public.test/x",
+    ],
+  ] as const)("preserves non-file URL tails after unrelated brackets: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
+  });
+
+  it.each([
+    [
       "https://outer.test/x?next=file://host.invalid/Users/canary/private.db",
       "https://outer.test/x?next=file://host.invalid<path>",
     ],

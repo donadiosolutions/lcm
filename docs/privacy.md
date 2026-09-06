@@ -215,7 +215,9 @@ The `Security` section of the doctor output shows:
   until the matching quote or a newline. Empty and root-only file URLs remain
   unchanged. Unmatched or path-wrapping brackets in file URLs do not stop path
   redaction; valid bracketed IPv6 authorities, including zone IDs, remain
-  intact. In unquoted file URLs, whitespace and the existing path
+  intact. When a closing path-wrapping bracket is immediately followed by a
+  slash or backslash path segment, that adjacent segment is also redacted in
+  the same pass. In unquoted file URLs, whitespace and the existing path
   delimiters, including later colons, `?`, and `#`, end the redacted span, so
   text after those delimiters can remain visible. Before the first path
   separator, semicolons, commas, apostrophes, closing parentheses, and closing
