@@ -811,6 +811,20 @@ function instrumentTargetReconciliationCommit(
   };
 }
 
+function findTopologyError(error: unknown): unknown {
+  if (error !== null && typeof error === "object") {
+    if (error instanceof Error && error.name === "PrivateDirectoryTopologyError") return error;
+    if (error instanceof AggregateError) {
+      for (const nested of error.errors) {
+        const found = findTopologyError(nested);
+        if (found !== undefined) return found;
+      }
+    }
+    if ("cause" in error) return findTopologyError(error.cause);
+  }
+  return undefined;
+}
+
 async function importReconciliationWithTransactionMode(
   mode: "missing" | "false",
   rollbackError?: Error,
@@ -1950,6 +1964,12 @@ describe("worktree reconciliation", () => {
       expect(caught).toBeInstanceOf(Error);
       expect(String(caught)).toContain("private directory topology is not trusted");
       expect(String(caught)).not.toContain("no transaction is active");
+      expect(findTopologyError(caught)).toMatchObject({
+        message: "private directory topology is not trusted",
+      });
+      if (caught instanceof AggregateError) {
+        expect(caught.cause).toBe(caught.errors[0]);
+      }
       expect(instrumentation.targetRollbackCount()).toBe(0);
       expect(listWorktreeReconciliationJournals()).toMatchObject([{
         phase: "blocked",
