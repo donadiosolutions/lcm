@@ -324,8 +324,6 @@ function makeTestConvergence(
   return createPublicationConvergence({
     port: 3737,
     identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-    expectedEntrypoint: "/daemon",
-    expectedRuntimeDigest: "runtime",
     deps: {
       now: () => now,
       sleep: async (delayMs: number) => { now += delayMs; },
@@ -417,8 +415,6 @@ describe("runCli registration and help dispatch", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-      expectedEntrypoint: "/daemon",
-      expectedRuntimeDigest: "runtime",
       deps: {
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
@@ -439,8 +435,6 @@ describe("runCli registration and help dispatch", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-      expectedEntrypoint: "/daemon",
-      expectedRuntimeDigest: "runtime",
       deps: {
         now: (() => { let value = 0; return () => value; })(),
         sleep: async () => undefined,
@@ -465,8 +459,6 @@ describe("runCli registration and help dispatch", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-      expectedEntrypoint: "/daemon",
-      expectedRuntimeDigest: "runtime",
       deps: {
         sleep: async () => undefined,
         readToken: () => "token",
@@ -498,8 +490,6 @@ describe("runCli registration and help dispatch", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-      expectedEntrypoint: "/daemon",
-      expectedRuntimeDigest: "runtime",
       deps: {
         now: () => now,
         sleep: async () => { sleeps += 1; now = sleeps === 1 ? 1_990 : 2_000; },

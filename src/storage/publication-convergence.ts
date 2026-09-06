@@ -17,10 +17,10 @@ export type PublicationDaemonHealth = Readonly<{
 
 export type PublicationDaemonIdentity = Readonly<{
   pid: number;
-  version: string | undefined;
+  version: string;
   storageBackend: "sqlite" | "postgresql";
-  entrypoint: string | undefined;
-  runtimeDigest: string | undefined;
+  entrypoint: string;
+  runtimeDigest: string;
 }>;
 
 export type PublicationConvergenceDeps = Readonly<{
@@ -64,16 +64,12 @@ export type PublicationConvergenceDeps = Readonly<{
 export type PublicationConvergence = Readonly<{
   identity: PublicationDaemonIdentity | undefined;
   port: number;
-  expectedRuntimeDigest: string | undefined;
-  expectedEntrypoint: string | undefined;
   deps: PublicationConvergenceDeps;
 }> & { /** @internal Mutable only inside this module. */ deadline?: number };
 
 function healthMatches(
   health: PublicationDaemonHealth | null,
   identity: PublicationDaemonIdentity,
-  expectedRuntimeDigest: string | undefined,
-  expectedEntrypoint: string | undefined,
   platform: NodeJS.Platform,
 ): boolean {
   return health !== null
@@ -81,8 +77,8 @@ function healthMatches(
     && health.pid === identity.pid
     && health.version === identity.version
     && (health.storageBackend ?? "sqlite") === identity.storageBackend
-    && daemonEntrypointMatches(health.entrypoint, expectedEntrypoint, platform)
-    && (expectedRuntimeDigest === undefined || health.runtimeDigest === expectedRuntimeDigest);
+    && daemonEntrypointMatches(health.entrypoint, identity.entrypoint, platform)
+    && health.runtimeDigest === identity.runtimeDigest;
 }
 
 async function authenticatedHealth(
@@ -146,7 +142,7 @@ export async function capturePublicationIdentity(input: Readonly<{
     || health.version !== input.expectedVersion
     || (health.storageBackend ?? "sqlite") !== input.expectedStorageBackend
     || !daemonEntrypointMatches(health.entrypoint, input.expectedEntrypoint, deps.platform ?? process.platform)
-    || (input.expectedRuntimeDigest !== undefined && health.runtimeDigest !== input.expectedRuntimeDigest)
+    || health.runtimeDigest !== input.expectedRuntimeDigest
   ) return undefined;
   return Object.freeze({
     pid: health.pid,
@@ -160,15 +156,11 @@ export async function capturePublicationIdentity(input: Readonly<{
 export function createPublicationConvergence(input: Readonly<{
   port: number;
   identity?: PublicationDaemonIdentity;
-  expectedRuntimeDigest?: string;
-  expectedEntrypoint?: string;
   deps?: PublicationConvergenceDeps;
 }>): PublicationConvergence {
   return {
     identity: input.identity,
     port: input.port,
-    expectedRuntimeDigest: input.expectedRuntimeDigest,
-    expectedEntrypoint: input.expectedEntrypoint,
     deps: input.deps ?? {},
     deadline: undefined,
   };
@@ -206,7 +198,7 @@ async function retryDelay(
   const remainingHealth = deadline - now();
   if (remainingHealth <= 0) return { expired: true };
   const health = await authenticatedHealth(convergence.deps, convergence.port, Math.min(2_000, remainingHealth));
-  if (!healthMatches(health, convergence.identity, convergence.expectedRuntimeDigest, convergence.expectedEntrypoint, convergence.deps.platform ?? process.platform)) return undefined;
+  if (!healthMatches(health, convergence.identity, convergence.deps.platform ?? process.platform)) return undefined;
   if (now() >= deadline) return { expired: true };
   convergence.deadline = deadline;
   const delay = Math.min(PUBLICATION_CONVERGENCE_POLL_MS, Math.max(1, deadline - now()));

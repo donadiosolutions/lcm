@@ -62,18 +62,19 @@ describe("ensureCore", () => {
   });
 
   it("retries each real bootstrap admission edge without replaying settings or daemon effects", async () => {
+    const publicationVersion = PKG_VERSION ?? "test-version";
+    const publicationEntrypoint = PACKAGED_RUNTIME_ENTRYPOINT ?? "/opt/lcm.mjs";
+    const publicationRuntimeDigest = RUNTIME_DIGEST ?? "a".repeat(64);
     let now = 0;
     const convergence = createPublicationConvergence({
       port: 3737,
       identity: {
         pid: process.pid,
-        version: PKG_VERSION,
+        version: publicationVersion,
         storageBackend: "sqlite",
-        entrypoint: PACKAGED_RUNTIME_ENTRYPOINT,
-        runtimeDigest: RUNTIME_DIGEST,
+        entrypoint: publicationEntrypoint,
+        runtimeDigest: publicationRuntimeDigest,
       },
-      expectedEntrypoint: PACKAGED_RUNTIME_ENTRYPOINT,
-      expectedRuntimeDigest: RUNTIME_DIGEST,
       deps: {
         now: () => now,
         sleep: async (ms) => { now += ms; },
@@ -82,9 +83,9 @@ describe("ensureCore", () => {
         processBirth: () => "birth",
         fetch: vi.fn(async () => ({
           ok: true,
-          json: async () => ({ status: "ok", pid: process.pid, version: PKG_VERSION,
-            storageBackend: "sqlite", entrypoint: PACKAGED_RUNTIME_ENTRYPOINT,
-            runtimeDigest: RUNTIME_DIGEST }),
+          json: async () => ({ status: "ok", pid: process.pid, version: publicationVersion,
+            storageBackend: "sqlite", entrypoint: publicationEntrypoint,
+            runtimeDigest: publicationRuntimeDigest }),
         })) as unknown as typeof globalThis.fetch,
         lockPath: "/tmp/bootstrap-publication.lock",
       },

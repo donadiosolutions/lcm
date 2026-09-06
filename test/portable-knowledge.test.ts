@@ -240,8 +240,6 @@ describe("portable-knowledge — export", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-      expectedEntrypoint: "/daemon",
-      expectedRuntimeDigest: "runtime",
       deps: {
         now: (() => { let value = 0; return () => value; })(),
         sleep: async () => undefined,
@@ -282,7 +280,6 @@ describe("portable-knowledge — export", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-      expectedEntrypoint: "/daemon", expectedRuntimeDigest: "runtime",
       deps: {
         now: () => now, sleep: async (delayMs: number) => { now += delayMs; },
         readToken: () => "token",
@@ -325,7 +322,6 @@ describe("portable-knowledge — export", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-      expectedEntrypoint: "/daemon", expectedRuntimeDigest: "runtime",
       deps: {
         now: () => now, sleep: async (delayMs: number) => { now += delayMs; },
         readToken: () => "token",

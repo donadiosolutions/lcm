@@ -45,6 +45,16 @@ describe("publication convergence", () => {
       deps: deps(),
     })).resolves.toBeUndefined();
     await expect(capturePublicationIdentity({
+      port: 3737, expectedVersion: identity.version, expectedStorageBackend: "sqlite",
+      expectedEntrypoint: undefined, expectedRuntimeDigest: identity.runtimeDigest,
+      deps: deps(),
+    })).resolves.toBeUndefined();
+    await expect(capturePublicationIdentity({
+      port: 3737, expectedVersion: identity.version, expectedStorageBackend: "sqlite",
+      expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: undefined,
+      deps: deps(),
+    })).resolves.toBeUndefined();
+    await expect(capturePublicationIdentity({
       port: 3737, expectedVersion: "1.0.0", expectedStorageBackend: "sqlite",
       expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: identity.runtimeDigest,
       deps: deps({ fetch: vi.fn(async () => ({ ok: true, json: async () => "malformed" })) as unknown as typeof globalThis.fetch }),
@@ -127,11 +137,20 @@ describe("publication convergence", () => {
   });
 
   it("retries contention for the pinned owner and preserves the first error at exhaustion", async () => {
+    const capturedIdentity = await capturePublicationIdentity({
+      port: 3737,
+      expectedVersion: identity.version,
+      expectedStorageBackend: identity.storageBackend,
+      expectedEntrypoint: identity.entrypoint,
+      expectedRuntimeDigest: identity.runtimeDigest,
+      deps: deps(),
+    });
+    expect(capturedIdentity).toEqual(identity);
+    if (capturedIdentity === undefined) throw new Error("expected complete publication identity");
     let now = 0;
     const sleeps: number[] = [];
     const convergence = createPublicationConvergence({
-      port: 3737, identity, expectedEntrypoint: identity.entrypoint,
-      expectedRuntimeDigest: identity.runtimeDigest,
+      port: 3737, identity: capturedIdentity,
       deps: deps({ now: () => now, sleep: async (ms) => { sleeps.push(ms); now += ms; } }),
     });
     let attempts = 0;
@@ -152,9 +171,7 @@ describe("publication convergence", () => {
     ];
     const exhausted = createPublicationConvergence({
       port: 3737,
-      identity,
-      expectedEntrypoint: identity.entrypoint,
-      expectedRuntimeDigest: identity.runtimeDigest,
+      identity: capturedIdentity,
       deps: deps({ now: () => exhaustedNow, sleep: async (ms) => { exhaustedNow += ms; } }),
     });
     const exhaustedFirst = exhaustedErrors[0];
@@ -168,31 +185,31 @@ describe("publication convergence", () => {
   });
 
   it("fails closed for foreign owners, missing evidence, and noncontention errors", async () => {
-    const foreign = createPublicationConvergence({ port: 3737, identity, expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: identity.runtimeDigest, deps: deps({
+    const foreign = createPublicationConvergence({ port: 3737, identity, deps: deps({
       readOwner: () => ({ version: 1, pid: 99, processStartTime: "birth", nonce: "b".repeat(32) }),
     }) });
     const contention = new PrivateMutationLockContentionError("busy");
     await expect(withPublicationAdmissionRetry(() => { throw contention; }, foreign)).rejects.toBe(contention);
-    const absent = createPublicationConvergence({ port: 3737, identity, expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: identity.runtimeDigest, deps: deps({ readToken: () => null }) });
+    const absent = createPublicationConvergence({ port: 3737, identity, deps: deps({ readToken: () => null }) });
     await expect(withPublicationAdmissionRetry(() => { throw contention; }, absent)).rejects.toBe(contention);
     const ordinary = new Error("ordinary");
     await expect(withPublicationAdmissionRetry(() => { throw ordinary; }, foreign)).rejects.toBe(ordinary);
     await expect(withPublicationAdmissionRetry(() => "plain", undefined)).resolves.toBe("plain");
-    const birthMismatch = createPublicationConvergence({ port: 3737, identity, expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: identity.runtimeDigest, deps: deps({ processBirth: () => "other" }) });
+    const birthMismatch = createPublicationConvergence({ port: 3737, identity, deps: deps({ processBirth: () => "other" }) });
     await expect(withPublicationAdmissionRetry(() => { throw contention; }, birthMismatch)).rejects.toBe(contention);
-    const birthFailure = createPublicationConvergence({ port: 3737, identity, expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: identity.runtimeDigest, deps: deps({ processBirth: () => { throw new Error("birth"); } }) });
+    const birthFailure = createPublicationConvergence({ port: 3737, identity, deps: deps({ processBirth: () => { throw new Error("birth"); } }) });
     await expect(withPublicationAdmissionRetry(() => { throw contention; }, birthFailure)).rejects.toBe(contention);
-    const malformedOwner = createPublicationConvergence({ port: 3737, identity, expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: identity.runtimeDigest, deps: deps({ readOwner: () => null }) });
+    const malformedOwner = createPublicationConvergence({ port: 3737, identity, deps: deps({ readOwner: () => null }) });
     await expect(withPublicationAdmissionRetry(() => { throw contention; }, malformedOwner)).rejects.toBe(contention);
-    const noLockPath = createPublicationConvergence({ port: 3737, identity, expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: identity.runtimeDigest, deps: deps({ lockPath: undefined, homeDir: undefined }) });
+    const noLockPath = createPublicationConvergence({ port: 3737, identity, deps: deps({ lockPath: undefined, homeDir: undefined }) });
     await expect(withPublicationAdmissionRetry(() => { throw contention; }, noLockPath)).rejects.toBe(contention);
-    const homeDerivedPath = createPublicationConvergence({ port: 3737, identity, expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: identity.runtimeDigest, deps: deps({ lockPath: undefined, homeDir: "/tmp", readOwner: () => null }) });
+    const homeDerivedPath = createPublicationConvergence({ port: 3737, identity, deps: deps({ lockPath: undefined, homeDir: "/tmp", readOwner: () => null }) });
     await expect(withPublicationAdmissionRetry(() => { throw contention; }, homeDerivedPath)).rejects.toBe(contention);
-    const ownerFailure = createPublicationConvergence({ port: 3737, identity, expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: identity.runtimeDigest, deps: deps({ readOwner: () => { throw new Error("owner"); } }) });
+    const ownerFailure = createPublicationConvergence({ port: 3737, identity, deps: deps({ readOwner: () => { throw new Error("owner"); } }) });
     await expect(withPublicationAdmissionRetry(() => { throw contention; }, ownerFailure)).rejects.toBe(contention);
-    const ownerDefault = createPublicationConvergence({ port: 3737, identity, expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: identity.runtimeDigest, deps: deps({ readOwner: undefined, lockPath: "/tmp/nonexistent-publication.lock" }) });
+    const ownerDefault = createPublicationConvergence({ port: 3737, identity, deps: deps({ readOwner: undefined, lockPath: "/tmp/nonexistent-publication.lock" }) });
     await expect(withPublicationAdmissionRetry(() => { throw contention; }, ownerDefault)).rejects.toBe(contention);
-    const expired = createPublicationConvergence({ port: 3737, identity, expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: identity.runtimeDigest, deps: deps({ now: () => 1 }) }) as { deadline?: number };
+    const expired = createPublicationConvergence({ port: 3737, identity, deps: deps({ now: () => 1 }) }) as { deadline?: number };
     expired.deadline = 0;
     expect(expired.deadline).toBe(0);
     await expect(withPublicationAdmissionRetry(() => { throw contention; }, expired as never)).rejects.toBe(contention);
@@ -201,8 +218,6 @@ describe("publication convergence", () => {
     const healthMismatch = createPublicationConvergence({
       port: 3737,
       identity,
-      expectedEntrypoint: identity.entrypoint,
-      expectedRuntimeDigest: identity.runtimeDigest,
       deps: deps({
         fetch: healthFetch(42, { runtimeDigest: "b".repeat(64) }),
         sleep: async (ms) => { sleeps.push(ms); },
@@ -217,8 +232,6 @@ describe("publication convergence", () => {
     const sqliteDefault = createPublicationConvergence({
       port: 3737,
       identity,
-      expectedEntrypoint: identity.entrypoint,
-      expectedRuntimeDigest: identity.runtimeDigest,
       deps: deps({ fetch: healthFetch(42, { storageBackend: undefined }), platform: undefined, sleep: async () => undefined }),
     });
     let sqliteAttempts = 0;
@@ -235,14 +248,24 @@ describe("publication convergence", () => {
     ["storage backend", { storageBackend: "postgresql" }],
     ["entrypoint", { entrypoint: "/different.mjs" }],
     ["runtime digest", { runtimeDigest: "b".repeat(64) }],
+    ["missing entrypoint", { entrypoint: undefined }],
+    ["missing runtime digest", { runtimeDigest: undefined }],
     ["status", { status: "unavailable" }],
   ])("refuses a single %s health mismatch without retry", async (_label, override) => {
+    const capturedIdentity = await capturePublicationIdentity({
+      port: 3737,
+      expectedVersion: identity.version,
+      expectedStorageBackend: identity.storageBackend,
+      expectedEntrypoint: identity.entrypoint,
+      expectedRuntimeDigest: identity.runtimeDigest,
+      deps: deps(),
+    });
+    expect(capturedIdentity).toEqual(identity);
+    if (capturedIdentity === undefined) throw new Error("expected complete publication identity");
     const sleep = vi.fn(async (_ms: number) => undefined);
     const convergence = createPublicationConvergence({
       port: 3737,
-      identity,
-      expectedEntrypoint: identity.entrypoint,
-      expectedRuntimeDigest: identity.runtimeDigest,
+      identity: capturedIdentity,
       deps: deps({ fetch: healthFetch(42, override), sleep }),
     });
     const contention = new PrivateMutationLockContentionError(`mismatch-${String(_label)}`);
@@ -261,8 +284,6 @@ describe("publication convergence", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity,
-      expectedEntrypoint: identity.entrypoint,
-      expectedRuntimeDigest: identity.runtimeDigest,
       deps: deps({ now: () => now, sleep: async (ms) => { sleeps += ms; now += ms; } }),
     });
     now += 100_000;
@@ -283,8 +304,6 @@ describe("publication convergence", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity,
-      expectedEntrypoint: identity.entrypoint,
-      expectedRuntimeDigest: identity.runtimeDigest,
       deps: deps({
         now: () => now,
         sleep: async (ms) => { now += ms; },
@@ -318,8 +337,6 @@ describe("publication convergence", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity,
-      expectedEntrypoint: identity.entrypoint,
-      expectedRuntimeDigest: identity.runtimeDigest,
       deps: deps({
         now: () => now,
         sleep: async (ms) => { now += ms; },
@@ -342,8 +359,6 @@ describe("publication convergence", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity,
-      expectedEntrypoint: identity.entrypoint,
-      expectedRuntimeDigest: identity.runtimeDigest,
       deps: deps({
         now: () => now,
         sleep: async (ms) => { now += ms; },
@@ -370,8 +385,6 @@ describe("publication convergence", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity,
-      expectedEntrypoint: identity.entrypoint,
-      expectedRuntimeDigest: identity.runtimeDigest,
       deps: deps({
         now: () => now,
         processBirth: () => { now = 2_000; return "birth"; },
@@ -392,8 +405,6 @@ describe("publication convergence", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity,
-      expectedEntrypoint: identity.entrypoint,
-      expectedRuntimeDigest: identity.runtimeDigest,
       deps: deps({ now, sleep: async () => undefined }),
     });
     await expect(withPublicationAdmissionRetry(() => { throw contention; }, convergence)).rejects.toBe(contention);
@@ -404,8 +415,6 @@ describe("publication convergence", () => {
     const convergence = createPublicationConvergence({
       port: 3737,
       identity,
-      expectedEntrypoint: identity.entrypoint,
-      expectedRuntimeDigest: identity.runtimeDigest,
       deps: deps({ processBirth: undefined }),
     });
     await expect(withPublicationAdmissionRetry(() => { throw contention; }, convergence)).rejects.toBe(contention);
@@ -417,8 +426,6 @@ describe("publication convergence", () => {
       const convergence = createPublicationConvergence({
         port: 3737,
         identity,
-        expectedEntrypoint: identity.entrypoint,
-        expectedRuntimeDigest: identity.runtimeDigest,
         deps: deps(),
       });
       let attempts = 0;
