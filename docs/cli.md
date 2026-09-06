@@ -190,6 +190,13 @@ A foreign, ambiguous, malformed, stale, missing, or unreadable owner, an
 identity mismatch, a failed authenticated probe, or any error other than lock
 contention propagates unchanged and doctor reports the stage as failed.
 
+Doctor must also resolve and hash its own packaged runtime before it can retry
+publication contention. If that local runtime identity is unavailable, doctor
+does not infer a digest from daemon health or treat the missing value as a
+wildcard; it reports the original contention for the affected stage. Run
+doctor from the installed `lcm.mjs` artifact. If that artifact is unreadable or
+damaged, reinstall LCM and rerun `lcm doctor`.
+
 The retry budget is a single two-second wall-clock window shared by every
 stage of one doctor run, polled at most every 50 milliseconds. Time spent
 inside a refused attempt, the platform process-birth probe, and the

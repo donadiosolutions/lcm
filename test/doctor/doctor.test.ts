@@ -20,6 +20,7 @@ import { ensureDaemon, restartDaemon } from "../../src/daemon/lifecycle.js";
 import { emitDaemonNotice } from "../../src/hooks/daemon-notice.js";
 import { daemonRemediationMarkerPath } from "../../src/daemon/remediation.js";
 import { packageExecutable } from "../../src/runtime-root.js";
+import { RUNTIME_DIGEST } from "../../src/daemon/version.js";
 import {
   clearProjectMapCache,
   hashProjectPath,
@@ -49,6 +50,7 @@ const mockCollectEventStats = vi.mocked(collectEventStats);
 const mockCollectDetailedEventStats = vi.mocked(collectDetailedEventStats);
 let defaultDoctorHome: string;
 const TEST_RUNTIME_ENTRYPOINT = packageExecutable(import.meta.url, 3);
+const EXPECTED_RUNTIME_DIGEST = "a".repeat(64);
 
 beforeEach(() => {
   defaultDoctorHome = mkdtempSync(join(tmpdir(), "lcm-doctor-default-home-"));
@@ -394,7 +396,7 @@ describe("runDoctor project map checks", () => {
     return { home, configPath };
   }
 
-  function authenticatedHealth(overrides: Record<string, unknown> = {}) {
+  function recognizedHealth(overrides: Record<string, unknown> = {}) {
     return {
       ok: true,
       json: async () => ({
@@ -406,6 +408,10 @@ describe("runDoctor project map checks", () => {
         ...overrides,
       }),
     };
+  }
+
+  function authenticatedHealth(overrides: Record<string, unknown> = {}) {
+    return recognizedHealth({ runtimeDigest: EXPECTED_RUNTIME_DIGEST, ...overrides });
   }
 
   function passingProjectMapValidation(home: string) {
@@ -441,11 +447,14 @@ describe("runDoctor project map checks", () => {
         .mockImplementation(() => []));
     }
     const fetch = overrides.fetch === undefined
-      ? vi.fn().mockImplementation(async () => authenticatedHealth())
+      ? vi.fn().mockImplementation(async (_url: string | URL | Request, init?: RequestInit) => (
+        new Headers(init?.headers).has("Authorization") ? authenticatedHealth() : recognizedHealth()
+      ))
       : vi.mocked(overrides.fetch);
     const deps = minimalDeps({
       homedir: home,
       _readDaemonConfigRawSnapshot: undefined,
+      _expectedRuntimeDigestForTesting: EXPECTED_RUNTIME_DIGEST,
       _publicationConvergenceNow: () => clock.now,
       _publicationConvergenceSleep: async (delayMs) => { sleeps.push(delayMs); clock.now += delayMs; },
       readFileSync: (path: string) => path.endsWith("daemon.token")
@@ -563,6 +572,65 @@ describe("runDoctor project map checks", () => {
     }
   });
 
+  it("refuses daemon convergence before owner probing without a local runtime digest", async () => {
+    expect(RUNTIME_DIGEST).toBeUndefined();
+    const { home } = contentionHome("lcm-doctor-missing-runtime-digest-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("original publication lock is busy");
+    const readOwner = vi.fn(readPrivateMutationLockOwner);
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(contention);
+    const { deps, sleeps, fetch, restore } = convergenceDeps(home, {
+      _expectedRuntimeDigestForTesting: undefined,
+      _readPrivateMutationLockOwnerForTesting: readOwner,
+    });
+    try {
+      const results = await runDoctor(deps);
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+      expect(readOwner).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(fetch.mock.calls[0]?.[1]).not.toHaveProperty("headers");
+      expect(sleeps).toEqual([]);
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("original publication lock is busy"),
+      });
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("does not derive a missing local runtime digest from project-map peer health", async () => {
+    const { home } = contentionHome("lcm-doctor-peer-runtime-digest-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("original project-map publication lock is busy");
+    const readOwner = vi.fn(readPrivateMutationLockOwner);
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap")
+      .mockImplementation(() => { throw contention; });
+    const { deps, sleeps, fetch, restore } = convergenceDeps(home, {
+      _expectedRuntimeDigestForTesting: undefined,
+      _readPrivateMutationLockOwnerForTesting: readOwner,
+      fetch: vi.fn()
+        .mockResolvedValueOnce(recognizedHealth({ runtimeDigest: "f".repeat(64) }))
+        .mockImplementation(async () => authenticatedHealth()),
+    }, { projectMap: false });
+    try {
+      const results = await runDoctor(deps);
+      expect(validateProjectMap).toHaveBeenCalledOnce();
+      expect(readOwner).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(sleeps).toEqual([]);
+      expect(results.find((result) => result.name === "project-map")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("original project-map publication lock is busy"),
+      });
+    } finally {
+      validateProjectMap.mockRestore();
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("keeps lifecycle contention fail closed for a foreign daemon owner", async () => {
     const { home } = contentionHome("lcm-doctor-foreign-contention-");
     writeLivePublicationOwner(home);
@@ -570,7 +638,9 @@ describe("runDoctor project map checks", () => {
     vi.mocked(ensureDaemon).mockRejectedValueOnce(contention);
     const foreignPid = process.pid + 1;
     const { deps, sleeps, fetch, restore } = convergenceDeps(home, {
-      fetch: vi.fn().mockImplementation(async () => authenticatedHealth({ pid: foreignPid })),
+      fetch: vi.fn()
+        .mockResolvedValueOnce(recognizedHealth({ pid: foreignPid }))
+        .mockImplementation(async () => authenticatedHealth({ pid: foreignPid })),
     });
     try {
       const results = await runDoctor(deps);
@@ -595,7 +665,9 @@ describe("runDoctor project map checks", () => {
     const contention = new PrivateMutationLockContentionError("publication lock is busy");
     vi.mocked(restartDaemon).mockRejectedValueOnce(contention);
     const { deps, sleeps, restore } = convergenceDeps(home, {
-      fetch: vi.fn().mockImplementation(async () => authenticatedHealth({ version: "0.4.0" })),
+      fetch: vi.fn()
+        .mockResolvedValueOnce(recognizedHealth({ version: "0.4.0" }))
+        .mockImplementation(async () => authenticatedHealth({ version: "0.4.0" })),
     });
     try {
       const results = await runDoctor(deps);
@@ -614,7 +686,8 @@ describe("runDoctor project map checks", () => {
 
   it.each([
     ["entrypoint", { entrypoint: "/foreign/lcm.mjs" }, {}],
-    ["runtime digest", { runtimeDigest: "b".repeat(64) }, { _expectedRuntimeDigestForTesting: "a".repeat(64) }],
+    ["absent runtime digest", { runtimeDigest: undefined }, {}],
+    ["runtime digest", { runtimeDigest: "b".repeat(64) }, {}],
     ["storage backend", { storageBackend: "postgresql" }, {}],
     ["version", { version: "0.4.9" }, {}],
   ] as const)("does not converge when authenticated daemon %s identity differs", async (_label, healthIdentity, seam) => {
@@ -625,7 +698,7 @@ describe("runDoctor project map checks", () => {
     const { deps, sleeps, fetch, restore } = convergenceDeps(home, {
       ...seam,
       fetch: vi.fn()
-        .mockResolvedValueOnce(authenticatedHealth())
+        .mockResolvedValueOnce(recognizedHealth())
         .mockImplementation(async () => authenticatedHealth(healthIdentity)),
     });
     try {
@@ -685,7 +758,7 @@ describe("runDoctor project map checks", () => {
     vi.mocked(ensureDaemon).mockRejectedValueOnce(contention);
     const { deps, sleeps, restore } = convergenceDeps(home, {
       fetch: vi.fn()
-        .mockResolvedValueOnce(authenticatedHealth())
+        .mockResolvedValueOnce(recognizedHealth())
         .mockRejectedValueOnce(new Error("connection reset"))
         .mockImplementation(async () => authenticatedHealth()),
     });
@@ -942,7 +1015,7 @@ describe("runDoctor project map checks", () => {
     let abortElapsed: number | undefined;
     const started = Date.now();
     const fetch = vi.fn()
-      .mockResolvedValueOnce(authenticatedHealth())
+      .mockResolvedValueOnce(recognizedHealth())
       .mockImplementationOnce(async (_url: string | URL | Request, init?: RequestInit) => {
         retrySignal = init?.signal ?? undefined;
         retrySignal?.addEventListener("abort", () => { abortElapsed = Date.now() - started; });
@@ -978,7 +1051,7 @@ describe("runDoctor project map checks", () => {
     const { deps, sleeps, restore } = convergenceDeps(home, {
       platform: "win32",
       fetch: vi.fn()
-        .mockResolvedValueOnce(authenticatedHealth())
+        .mockResolvedValueOnce(recognizedHealth())
         .mockImplementation(async () => authenticatedHealth({ entrypoint: windowsEntrypoint })),
     });
     try {
