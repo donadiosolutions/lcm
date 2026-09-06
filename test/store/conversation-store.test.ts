@@ -1795,6 +1795,93 @@ describe("ConversationStore — withTransaction", () => {
 });
 
 describe("ConversationStore — persistence boundaries", () => {
+  it.each(["UTC", "America/New_York"] as const)(
+    "parses message timestamps as UTC across public reads and search modes in %s",
+    async (timezone) => {
+      const previousTimezone = process.env.TZ;
+      process.env.TZ = timezone;
+      try {
+        const db = makeDb();
+        const store = new ConversationStore(db);
+        const fallbackStore = new ConversationStore(db, { fts5Available: false });
+        const conv = await store.createConversation({ sessionId: "message-timestamp-utc" });
+        const storedTimestamps = [
+          "2024-03-10 02:30:00",
+          "2024-03-10 02:30:00.123",
+          "2024-03-10T02:30:00.000Z",
+          "2024-03-10T02:30:00.456+02:30",
+          "not-a-date",
+        ];
+        const messages = [] as Awaited<ReturnType<typeof store.createMessage>>[];
+
+        for (const [index, createdAt] of storedTimestamps.entries()) {
+          const message = await store.createMessage({
+            conversationId: conv.conversationId,
+            seq: index,
+            role: "user",
+            content: `timestamp-form-${index}`,
+            tokenCount: 1,
+          });
+          db.prepare("UPDATE messages SET created_at = ? WHERE message_id = ?")
+            .run(createdAt, message.messageId);
+          messages.push(message);
+        }
+
+        // Keep expected instants independent from the parser implementation.
+        const expectedMilliseconds: readonly (number | null)[] = [
+          1710037800000,
+          1710037800123,
+          1710037800000,
+          1710028800456,
+          null,
+        ];
+        const assertTimestamp = (actual: Date, expected: number | null): void => {
+          expect(actual).toBeInstanceOf(Date);
+          if (expected === null) {
+            expect(Number.isNaN(actual.getTime())).toBe(true);
+          } else {
+            expect(actual.getTime()).toBe(expected);
+          }
+        };
+
+        for (const [index, message] of messages.entries()) {
+          assertTimestamp((await store.getMessageById(message.messageId))!.createdAt, expectedMilliseconds[index]!);
+          assertTimestamp((await store.getMessages(conv.conversationId))[index]!.createdAt, expectedMilliseconds[index]!);
+          assertTimestamp((await store.getLastMessage(conv.conversationId))!.createdAt, expectedMilliseconds.at(-1)!);
+
+          const fullText = await store.searchMessages({
+            query: `timestamp-form-${index}`,
+            mode: "full_text",
+            conversationId: conv.conversationId,
+          });
+          expect(fullText).toHaveLength(1);
+          expect(fullText[0]!.rank).toBeLessThan(0);
+          assertTimestamp(fullText[0]!.createdAt, expectedMilliseconds[index]!);
+
+          const like = await fallbackStore.searchMessages({
+            query: `timestamp-form-${index}`,
+            mode: "full_text",
+            conversationId: conv.conversationId,
+          });
+          expect(like).toHaveLength(1);
+          expect(like[0]!.rank).toBe(0);
+          assertTimestamp(like[0]!.createdAt, expectedMilliseconds[index]!);
+
+          const regex = await fallbackStore.searchMessages({
+            query: `timestamp-form-${index}`,
+            mode: "regex",
+            conversationId: conv.conversationId,
+          });
+          expect(regex).toHaveLength(1);
+          assertTimestamp(regex[0]!.createdAt, expectedMilliseconds[index]!);
+        }
+      } finally {
+        if (previousTimezone === undefined) delete process.env.TZ;
+        else process.env.TZ = previousTimezone;
+      }
+    },
+  );
+
   it("returns defensive zero counts when a database adapter returns no aggregate row", async () => {
     const db = {
       prepare: () => ({ get: () => undefined }),

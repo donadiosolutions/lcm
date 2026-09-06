@@ -4,6 +4,7 @@ import {
 import {
   chmodSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdtempSync,
   mkdirSync,
@@ -35,6 +36,7 @@ const fsControl = vi.hoisted(() => ({
   fstatHook: undefined as ((path: string, stat: unknown) => unknown) | undefined,
   fstatFdHook: undefined as ((path: string, fd: number, stat: unknown) => void) | undefined,
   closeHook: undefined as ((path: string, fd: number) => void) | undefined,
+  closeAfterHook: undefined as ((path: string, fd: number) => void) | undefined,
   readlinkError: undefined as NodeJS.ErrnoException | undefined,
   readlinkHook: undefined as ((path: string) => string | undefined) | undefined,
   statHook: undefined as ((path: string, stat: unknown) => unknown) | undefined,
@@ -123,8 +125,10 @@ vi.mock("node:fs", async () => {
       return actual.readFileSync(path as never, options as never);
     },
     closeSync: (fd: number): void => {
-      fsControl.closeHook?.(fsControl.fdPaths.get(fd) ?? "", fd);
+      const path = fsControl.fdPaths.get(fd) ?? "";
+      fsControl.closeHook?.(path, fd);
       actual.closeSync(fd);
+      fsControl.closeAfterHook?.(path, fd);
     },
     readlinkSync: (path: string): string => {
       if (fsControl.readlinkError !== undefined) throw fsControl.readlinkError;
@@ -263,6 +267,7 @@ afterEach(() => {
   fsControl.fstatHook = undefined;
   fsControl.fstatFdHook = undefined;
   fsControl.closeHook = undefined;
+  fsControl.closeAfterHook = undefined;
   fsControl.readlinkError = undefined;
   fsControl.readlinkHook = undefined;
   fsControl.statHook = undefined;
@@ -1309,6 +1314,85 @@ describe("runtime home rename failures", () => {
     homeParentControl.unsafeMode = true;
 
     expect(() => bootstrapLcmHome(home)).toThrow("home parent has unsafe writable mode");
+  });
+
+  it.each([
+    { label: "an Error", authenticationError: new Error("synthetic parent authentication failure") as unknown },
+    { label: "undefined", authenticationError: undefined as unknown },
+  ])("preserves $label parent authentication failure identity after cleanup", ({ authenticationError }) => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-parent-auth-"));
+    homes.push(home);
+    const parentPath = dirname(home);
+    let parentFd: number | undefined;
+    let parentCloses = 0;
+    fsControl.openHook = (path, fd) => {
+      if (path === parentPath && parentFd === undefined) parentFd = fd;
+    };
+    fsControl.fstatFdHook = (_path, fd) => {
+      if (fd === parentFd) throw authenticationError;
+    };
+    fsControl.closeHook = (_path, fd) => {
+      if (fd === parentFd) parentCloses += 1;
+    };
+
+    let didThrow = false;
+    let failure: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (error) {
+      didThrow = true;
+      failure = error;
+    }
+
+    expect(didThrow).toBe(true);
+    expect(failure).toBe(authenticationError);
+    expect(parentCloses).toBe(1);
+    expect(parentFd).toBeTypeOf("number");
+    expect(() => fstatSync(parentFd!, { bigint: true })).toThrowError(
+      expect.objectContaining({ code: "EBADF" }),
+    );
+  });
+
+  it("preserves parent authentication and cleanup failures after one genuine close", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-parent-cleanup-"));
+    homes.push(home);
+    const parentPath = dirname(home);
+    const authenticationError = new Error("synthetic parent authentication failure");
+    const cleanupError = Object.assign(new Error("synthetic parent cleanup failure"), { code: "EIO" });
+    let parentFd: number | undefined;
+    let genuineParentCloses = 0;
+    let observedClosedDescriptor = false;
+    fsControl.openHook = (path, fd) => {
+      if (path === parentPath && parentFd === undefined) parentFd = fd;
+    };
+    fsControl.fstatFdHook = (_path, fd) => {
+      if (fd === parentFd) throw authenticationError;
+    };
+    fsControl.closeAfterHook = (_path, fd) => {
+      if (fd !== parentFd) return;
+      genuineParentCloses += 1;
+      expect(() => fstatSync(fd, { bigint: true })).toThrowError(
+        expect.objectContaining({ code: "EBADF" }),
+      );
+      observedClosedDescriptor = true;
+      throw cleanupError;
+    };
+
+    let failure: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (error) {
+      failure = error;
+    } finally {
+      fsControl.closeAfterHook = undefined;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).message).toBe("directory authentication and cleanup failed");
+    expect((failure as AggregateError).errors).toEqual([authenticationError, cleanupError]);
+    expect((failure as AggregateError & { cause?: unknown }).cause).toBe(authenticationError);
+    expect(genuineParentCloses).toBe(1);
+    expect(observedClosedDescriptor).toBe(true);
   });
 
   it("propagates a non-exclusive bootstrap-lock open failure", () => {

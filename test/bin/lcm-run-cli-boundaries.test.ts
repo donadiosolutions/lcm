@@ -570,6 +570,23 @@ describe("runCli identity boundaries", () => {
     await expect(actions.get("store")!("text", { tag: "not-an-array" })).resolves.toBeUndefined();
   });
 
+  it("keeps direct export action defaults and rejects unsupported formats before preparation", async () => {
+    const actions = await captureRunCliActions();
+    const exportAction = actions.get("lcm/export")!;
+    const portable = await import("../../src/portable-knowledge.js");
+
+    await expect(exportAction({ format: undefined })).resolves.toBeUndefined();
+    expect(portable.exportKnowledge).toHaveBeenCalledOnce();
+
+    vi.clearAllMocks();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(exportAction({ format: "yaml" })).rejects.toThrow("exit:1");
+    expect(error).toHaveBeenCalledExactlyOnceWith("Invalid --format: only json is supported.");
+    expect(state.loadConfig).not.toHaveBeenCalled();
+    expect(state.reconcileWorktrees).not.toHaveBeenCalled();
+    expect(portable.exportKnowledge).not.toHaveBeenCalled();
+  });
+
   it("forwards every explicit grep since value through Commander", async () => {
     const cases: Array<{ args: string[]; since: string | undefined }> = [
       { args: ["grep", "query", "--since", ""], since: "" },

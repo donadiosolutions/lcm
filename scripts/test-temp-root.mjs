@@ -18,7 +18,9 @@ function deduplicate(values) {
 }
 
 function isAbsolutePlatformPath(value, platformName) {
-  return platformName === "win32" ? win32.isAbsolute(value) : isAbsolute(value);
+  return platformName === "win32"
+    ? win32.isAbsolute(value) && win32.parse(value).root.length > 1
+    : isAbsolute(value);
 }
 
 function selectedExplicitVariable(environment, explicitVariable) {
@@ -34,8 +36,7 @@ function isValidTemporaryParent(candidate, platformName) {
   return typeof candidate === "string"
     && candidate.length > 0
     && !candidate.includes("\0")
-    && isAbsolutePlatformPath(candidate, platformName)
-    && (platformName !== "win32" || win32.parse(candidate).root.length > 1);
+    && isAbsolutePlatformPath(candidate, platformName);
 }
 
 function selectorInputs(options, environment) {

@@ -428,6 +428,51 @@ describe("test temporary parent selector", () => {
     expect(parseOriginalTemporaryParents(snapshot, "win32")).not.toContain("C:\\WorkerScratch");
   });
 
+  it("filters unqualified Windows parents while capturing the snapshot", () => {
+    const environment: NodeJS.ProcessEnv = {
+      TEMP: "/root-relative",
+      TMP: "C:drive-relative",
+    };
+
+    expect(captureOriginalTemporaryParents(
+      environment,
+      "win32",
+      () => "\\root-relative",
+    )).toEqual([]);
+    expect(environment[LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS]).toBe(
+      JSON.stringify({ version: 1, parents: [] }),
+    );
+  });
+
+  it.each([
+    "\\root-relative",
+    "/root-relative",
+    "C:drive-relative",
+  ])("rejects unqualified Windows snapshot parent %j", (parent) => {
+    expect(serializeOriginalTemporaryParents([parent], "win32")).toBeUndefined();
+    expect(parseOriginalTemporaryParents(JSON.stringify({
+      version: 1,
+      parents: ["C:\\Qualified", parent],
+    }), "win32")).toBeUndefined();
+  });
+
+  it.each([
+    "C:\\Qualified",
+    "C:/Qualified",
+    "\\\\server\\share\\Qualified",
+    "//server/share/Qualified",
+  ])("retains fully qualified Windows snapshot parent %j", (parent) => {
+    const serialized = JSON.stringify({ version: 1, parents: [parent] });
+    expect(serializeOriginalTemporaryParents([parent], "win32")).toBe(serialized);
+    expect(parseOriginalTemporaryParents(serialized, "win32")).toEqual([parent]);
+  });
+
+  it.each(["/tmp", "//tmp"])("retains POSIX snapshot parent %j", (parent) => {
+    const serialized = JSON.stringify({ version: 1, parents: [parent] });
+    expect(serializeOriginalTemporaryParents([parent], "linux")).toBe(serialized);
+    expect(parseOriginalTemporaryParents(serialized, "linux")).toEqual([parent]);
+  });
+
   it.each([
     "",
     "not-json",
@@ -491,5 +536,24 @@ describe("test temporary parent selector", () => {
       },
     })).toEqual(["/valid"]);
     expect(resolved).toEqual(["/valid"]);
+  });
+
+  it("does not resolve unqualified Windows candidate parents", () => {
+    const realpath = vi.fn((path: string) => path);
+    expect(canonicalCandidateParents({
+      platformName: "win32",
+      candidateParents: [
+        "\\root-relative",
+        "/root-relative",
+        "C:drive-relative",
+        "C:\\Qualified",
+        "\\\\server\\share\\Qualified",
+      ],
+      realpath,
+    })).toEqual(["C:\\Qualified", "\\\\server\\share\\Qualified"]);
+    expect(realpath.mock.calls.map(([path]) => path)).toEqual([
+      "C:\\Qualified",
+      "\\\\server\\share\\Qualified",
+    ]);
   });
 });
