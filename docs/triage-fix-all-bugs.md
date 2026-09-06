@@ -18,7 +18,7 @@ change the installed `lcm-memory` skill.
 The coordinator establishes an S0 snapshot before remediation. It obtains two
 independent, complete GitHub inventories and proceeds only when they agree.
 Native issue type, rather than labels, determines membership. The frozen
-inventory is then triaged for reproducibility, priority, duplicates, ownership,
+inventory is then triaged for reproducibility, duplicates, ownership,
 and external blockers. Duplicate adjudication and the triage barrier finish
 before the coordinator invokes
 [procedural development](procedural-development.md) for accepted work.
