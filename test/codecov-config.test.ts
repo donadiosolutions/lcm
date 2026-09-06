@@ -575,6 +575,7 @@ describe("Codecov configuration", () => {
       ["src/mcp/tools/lcm-grep.ts", "unit-mcp"],
       // #863 expand-depth schema remains owned by MCP tools.
       ["src/mcp/tools/lcm-expand.ts", "unit-mcp"],
+      // #972 search cwd client typing remains memory/retrieval-owned.
       ["src/memory/index.ts", "unit-memory-retrieval"],
       // #793 shared search-limit contract remains retrieval-owned.
       ["src/retrieval.ts", "unit-memory-retrieval"],
