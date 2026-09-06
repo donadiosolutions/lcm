@@ -156,6 +156,99 @@ async function withPatchedFsAsync<T>(
   }
 }
 
+type PublicationDirectoryGeneration = {
+  generation: number;
+  directory: string;
+  fd: number;
+  closed: number;
+  fstatPhases: string[];
+};
+
+async function withTrackedPublicationDirectoryGenerations<T>(
+  directories: readonly string[],
+  callback: (tracking: Readonly<{
+    records: PublicationDirectoryGeneration[];
+    active: (directory: string) => PublicationDirectoryGeneration[];
+    beginOperation: (directory: string) => void;
+    setEnabled: (enabled: boolean) => void;
+    setPhase: (directory: string, phase: string) => void;
+  }>) => Promise<T>,
+): Promise<T> {
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+  const originalClose = nodeFs.closeSync as (fd: number) => void;
+  const originalFstat = nodeFs.fstatSync as (...args: unknown[]) => unknown;
+  const trackedDirectories = new Set(directories);
+  const phases = new Map<string, string>();
+  const records: PublicationDirectoryGeneration[] = [];
+  const journalDescriptors: { directory: string; fd: number; closed: boolean }[] = [];
+  const pendingJournalPostFstats = new Map<string, number>();
+  const captureNextJournalAttempt = new Map<string, boolean>();
+  let enabled = true;
+  let nextGeneration = 1;
+  const active = (directory: string): PublicationDirectoryGeneration[] => records.filter(
+    (record) => record.directory === directory && record.closed === 0,
+  );
+
+  await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+    const journalDirectory = directories.find((directory) => path === join(directory, "journal.json"));
+    const captureJournal = journalDirectory !== undefined
+      && captureNextJournalAttempt.get(journalDirectory) === true;
+    if (captureJournal) captureNextJournalAttempt.set(journalDirectory, false);
+    const fd = originalOpen(path, ...args);
+    if (enabled && trackedDirectories.has(path)) {
+      records.push({
+        generation: nextGeneration,
+        directory: path,
+        fd,
+        closed: 0,
+        fstatPhases: [],
+      });
+      nextGeneration += 1;
+    } else if (captureJournal) {
+      journalDescriptors.push({ directory: journalDirectory, fd, closed: false });
+    }
+    return fd;
+  }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+    const record = [...records].reverse().find((candidate) => (
+      candidate.fd === fd && candidate.closed === 0
+    ));
+    const journal = [...journalDescriptors].reverse().find((candidate) => (
+      candidate.fd === fd && !candidate.closed
+    ));
+    originalClose(fd);
+    if (record !== undefined) record.closed += 1;
+    if (journal !== undefined) {
+      journal.closed = true;
+      pendingJournalPostFstats.set(
+        journal.directory,
+        (pendingJournalPostFstats.get(journal.directory) ?? 0) + 1,
+      );
+    }
+  }) as never, async () => withPatchedFsAsync("fstatSync", ((fd: number, ...args: unknown[]) => {
+    const observed = originalFstat(fd, ...args);
+    const record = [...records].reverse().find((candidate) => (
+      candidate.fd === fd && candidate.closed === 0
+    ));
+    if (record !== undefined) {
+      const pendingJournalPost = pendingJournalPostFstats.get(record.directory) ?? 0;
+      if (pendingJournalPost > 0) {
+        record.fstatPhases.push("journal");
+        pendingJournalPostFstats.set(record.directory, pendingJournalPost - 1);
+      } else {
+        record.fstatPhases.push(phases.get(record.directory) ?? "setup");
+      }
+    }
+    return observed;
+  }) as never, async () => callback({
+    records,
+    active,
+    beginOperation: (directory) => captureNextJournalAttempt.set(directory, true),
+    setEnabled: (nextEnabled) => { enabled = nextEnabled; },
+    setPhase: (directory, phase) => phases.set(directory, phase),
+  }))));
+}
+
 async function withTemporaryReboundPublicationMaterial(
   home: string,
   callback: () => unknown | Promise<unknown>,
@@ -432,6 +525,219 @@ describe("BackendPublicationCoordinator", () => {
     expect(opened.length).toBeGreaterThan(0);
     expect(opened.every(({ closed }) => closed === 1)).toBe(true);
     expect(activeDescriptors()).toBe(0);
+  });
+
+  it("shares one live directory generation across journal and material authentication", async () => {
+    const home = makeHome();
+    const otherHome = makeHome();
+    const input = material();
+    const first = makeDriver(input);
+    const second = makeDriver(input);
+    const other = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const otherPublicationDirectory = backendPublicationDirectory(otherHome);
+    const operationGenerations = new Map<string, number>();
+    const liveAcrossAwait = new Set<number>();
+    let currentOperation: Readonly<{ label: string; directory: string }> | undefined;
+
+    await withTrackedPublicationDirectoryGenerations(
+      [publicationDirectory, otherPublicationDirectory],
+      async (tracking) => {
+        const captureOperationGeneration = (): PublicationDirectoryGeneration => {
+          expect(currentOperation).toBeDefined();
+          const active = tracking.active(currentOperation!.directory);
+          expect(active).toHaveLength(1);
+          const operation = active[0]!;
+          const prior = operationGenerations.get(currentOperation!.label);
+          if (prior === undefined) operationGenerations.set(currentOperation!.label, operation.generation);
+          else expect(operation.generation).toBe(prior);
+          return operation;
+        };
+        const instrumentDriver = (fake: ReturnType<typeof makeDriver>): void => {
+          const observe = fake.driver.observeLocalState;
+          fake.driver.observeLocalState = vi.fn(async (...args) => {
+            const operation = captureOperationGeneration();
+            expect(operation.closed).toBe(0);
+            await Promise.resolve();
+            expect(operation.closed).toBe(0);
+            expect(tracking.active(operation.directory)).toContain(operation);
+            liveAcrossAwait.add(operation.generation);
+            return observe(...args);
+          });
+        };
+        const runOperation = async <R>(
+          label: string,
+          directory: string,
+          action: (observer: (event: string) => void) => Promise<R>,
+        ): Promise<R> => {
+          currentOperation = { label, directory };
+          tracking.beginOperation(directory);
+          tracking.setPhase(directory, "operation");
+          try {
+            return await action((event) => {
+              if (event === "before-material-authenticate") {
+                captureOperationGeneration();
+                tracking.setPhase(directory, "material");
+              } else if (event === "after-material-authenticate") {
+                tracking.setPhase(directory, "operation");
+              }
+            });
+          } finally {
+            tracking.setPhase(directory, "setup");
+            currentOperation = undefined;
+          }
+        };
+
+        instrumentDriver(first);
+        instrumentDriver(second);
+        instrumentDriver(other);
+        await runOperation("first-prepare", publicationDirectory, (observer) => (
+          coordinator(home, first.driver, observer).prepare(inputFor(input))
+        ));
+        expect(tracking.active(publicationDirectory)).toHaveLength(0);
+        await runOperation("first-resume", publicationDirectory, (observer) => (
+          coordinator(home, first.driver, observer).resume()
+        ));
+        expect(tracking.active(publicationDirectory)).toHaveLength(0);
+        await runOperation("second-prepare", publicationDirectory, (observer) => (
+          coordinator(home, second.driver, observer).prepare({
+            ...inputFor(input),
+            publicationId: "publication-2",
+          })
+        ));
+        expect(tracking.active(publicationDirectory)).toHaveLength(0);
+        await runOperation("other-prepare", otherPublicationDirectory, (observer) => (
+          coordinator(otherHome, other.driver, observer).prepare(inputFor(input))
+        ));
+        expect(tracking.active(otherPublicationDirectory)).toHaveLength(0);
+
+        const assertionOrder = [
+          "first-resume",
+          "first-prepare",
+          "second-prepare",
+          "other-prepare",
+        ] as const;
+        for (const label of assertionOrder) {
+          const generation = operationGenerations.get(label);
+          expect(generation, label).toBeDefined();
+          const record = tracking.records.find((candidate) => candidate.generation === generation);
+          expect(record, label).toBeDefined();
+          if (label === "first-resume") {
+            expect(record!.fstatPhases, label).toContain("journal");
+          }
+          expect(record!.fstatPhases, label).toContain("material");
+          expect(record!.closed, label).toBe(1);
+          expect(liveAcrossAwait, label).toContain(generation);
+        }
+        expect(operationGenerations.get("first-resume")).not.toBe(
+          operationGenerations.get("first-prepare"),
+        );
+        expect(operationGenerations.get("second-prepare")).not.toBe(
+          operationGenerations.get("first-resume"),
+        );
+        const homeGenerations = new Set(
+          tracking.records
+            .filter((record) => record.directory === publicationDirectory)
+            .map((record) => record.generation),
+        );
+        const otherHomeGenerations = tracking.records
+          .filter((record) => record.directory === otherPublicationDirectory)
+          .map((record) => record.generation);
+        expect(otherHomeGenerations.every((generation) => !homeGenerations.has(generation))).toBe(true);
+        expect(tracking.records.every((record) => record.closed === 1)).toBe(true);
+      },
+    );
+  });
+
+  it("rejects journal parent divergence before publication mutations", async () => {
+    const { home, fake } = await preparedFixture();
+    const publicationDirectory = backendPublicationDirectory(home);
+    const journalPath = backendPublicationJournalPath(home);
+    const journalBefore = readFileSync(journalPath);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; [key: string]: unknown };
+    let armed = false;
+    let injected = false;
+    vi.mocked(fake.driver.observeLocalState).mockClear();
+    vi.mocked(fake.driver.publishProjectMap).mockClear();
+    vi.mocked(fake.driver.publishConfig).mockClear();
+    vi.mocked(fake.driver.restoreConfig).mockClear();
+    vi.mocked(fake.driver.restoreProjectMap).mockClear();
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === journalPath && !injected) armed = true;
+      return fd;
+    }) as never, async () => withPatchedFsAsync("statSync", ((
+      path: string,
+      options?: { bigint?: boolean },
+    ) => {
+      const observed = originalStat(path, options);
+      if (armed && path === publicationDirectory && options?.bigint === true) {
+        armed = false;
+        injected = true;
+        return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver).resume()).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: "backend publication journal parent does not match the authenticated directory",
+      });
+    }));
+
+    expect(injected).toBe(true);
+    expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+    expect(fake.driver.publishProjectMap).not.toHaveBeenCalled();
+    expect(fake.driver.publishConfig).not.toHaveBeenCalled();
+    expect(fake.driver.restoreConfig).not.toHaveBeenCalled();
+    expect(fake.driver.restoreProjectMap).not.toHaveBeenCalled();
+    expect(readFileSync(journalPath)).toEqual(journalBefore);
+  });
+
+  it("rejects a coordinator material rebound before publication mutations", async () => {
+    const { home, fake } = await preparedFixture();
+    const publicationDirectory = backendPublicationDirectory(home);
+    vi.mocked(fake.driver.observeLocalState).mockClear();
+    vi.mocked(fake.driver.publishProjectMap).mockClear();
+    vi.mocked(fake.driver.publishConfig).mockClear();
+    vi.mocked(fake.driver.restoreConfig).mockClear();
+    vi.mocked(fake.driver.restoreProjectMap).mockClear();
+    let observed: Awaited<ReturnType<typeof withTemporaryReboundPublicationMaterial>> | undefined;
+
+    await withTrackedPublicationDirectoryGenerations([publicationDirectory], async (tracking) => {
+      tracking.setEnabled(false);
+      tracking.setPhase(publicationDirectory, "journal");
+      observed = await withTemporaryReboundPublicationMaterial(
+        home,
+        async () => {
+          tracking.setEnabled(true);
+          try {
+            return await coordinator(home, fake.driver).resume();
+          } finally {
+            tracking.setEnabled(false);
+          }
+        },
+      );
+      expect(tracking.records.every((record) => record.closed === 1)).toBe(true);
+    });
+
+    expect(observed).toMatchObject({ injected: true, restored: true });
+    expect(observed?.error).toBeInstanceOf(BackendPublicationJournalError);
+    expect(observed?.error).toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication recovery material parent does not match the authenticated directory",
+    });
+    expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+    expect(fake.driver.publishProjectMap).not.toHaveBeenCalled();
+    expect(fake.driver.publishConfig).not.toHaveBeenCalled();
+    expect(fake.driver.restoreConfig).not.toHaveBeenCalled();
+    expect(fake.driver.restoreProjectMap).not.toHaveBeenCalled();
   });
 
   it("closes the operation witness when awaited driver work rejects", async () => {
