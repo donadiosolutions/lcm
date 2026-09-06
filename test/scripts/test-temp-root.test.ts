@@ -128,6 +128,160 @@ describe("test temporary parent selector", () => {
     })).toThrow(/LCM_TEST_VITEST_RUNTIME_ROOT_PARENT/iu);
   });
 
+  it.each([
+    ["LCM_TEST_VITEST_RUNTIME_ROOT_PARENT", "relative", "linux"],
+    ["LCM_TEST_HARNESS_TMPDIR", "relative", "linux"],
+    ["LCM_TEST_VITEST_RUNTIME_ROOT_PARENT", "C:relative", "win32"],
+    ["LCM_TEST_HARNESS_TMPDIR", "C:relative", "win32"],
+    ["LCM_TEST_VITEST_RUNTIME_ROOT_PARENT", "\\tmp", "win32"],
+    ["LCM_TEST_HARNESS_TMPDIR", "\\tmp", "win32"],
+    ["LCM_TEST_VITEST_RUNTIME_ROOT_PARENT", "/tmp", "win32"],
+    ["LCM_TEST_HARNESS_TMPDIR", "/tmp", "win32"],
+    ["LCM_TEST_VITEST_RUNTIME_ROOT_PARENT", "", "linux"],
+    ["LCM_TEST_HARNESS_TMPDIR", "/bad\0path", "linux"],
+  ])("rejects invalid explicit %s value %j before probing", (variable, value, platformName) => {
+    for (const operation of [selectTestTempParent, createTestTempDirectory]) {
+      const temporaryRoot = vi.fn(() => "/automatic");
+      const realpath = vi.fn((path: string) => path);
+      const markerProbe = vi.fn(absent);
+      const createDirectory = vi.fn(() => "/fallback/lcm-test-root");
+
+      expect(() => operation({
+        environment: { [variable]: value },
+        platformName,
+        candidateParents: ["/fallback"],
+        temporaryRoot,
+        realpath,
+        markerProbe,
+        createDirectory,
+        secureDirectory: vi.fn(),
+      })).toThrow(new RegExp(`${variable}.*absolute`, "iu"));
+      expect(temporaryRoot).not.toHaveBeenCalled();
+      expect(realpath).not.toHaveBeenCalled();
+      expect(markerProbe).not.toHaveBeenCalled();
+      expect(createDirectory).not.toHaveBeenCalled();
+    }
+  });
+
+  it("keeps the selected explicit variable authoritative", () => {
+    expect(() => selectTestTempParent({
+      environment: {
+        LCM_TEST_VITEST_RUNTIME_ROOT_PARENT: "relative",
+        LCM_TEST_HARNESS_TMPDIR: "/valid-harness-parent",
+      },
+      candidateParents: ["/valid-harness-parent"],
+      realpath: vi.fn((path: string) => path),
+      markerProbe: vi.fn(absent),
+    })).toThrow(/LCM_TEST_VITEST_RUNTIME_ROOT_PARENT.*absolute/iu);
+  });
+
+  it("skips relative automatic and seam candidates without probing them", () => {
+    for (const operation of [selectTestTempParent, createTestTempDirectory]) {
+      const realpath = vi.fn((path: string) => path);
+      const createDirectory = vi.fn(() => "/absolute/lcm-test-root");
+      const result = operation({
+        environment: {},
+        candidateParents: ["relative", "/absolute"],
+        realpath,
+        markerProbe: absent,
+        createDirectory,
+        secureDirectory: vi.fn(),
+      });
+
+      if (operation === selectTestTempParent) {
+        expect(result).toBe("/absolute");
+      } else {
+        expect(result).toEqual({ root: "/absolute/lcm-test-root", parent: "/absolute" });
+      }
+      expect(realpath).toHaveBeenCalledTimes(1);
+      expect(realpath).toHaveBeenCalledWith("/absolute");
+    }
+
+    const realpath = vi.fn((path: string) => path);
+    expect(selectTestTempParent({
+      environment: {},
+      temporaryRoot: () => "relative",
+      realpath,
+      markerProbe: absent,
+    })).toBe("/var/tmp");
+    expect(realpath).not.toHaveBeenCalledWith("relative");
+  });
+
+  it("skips Windows root-relative candidates and uses a fully qualified successor", () => {
+    for (const operation of [selectTestTempParent, createTestTempDirectory]) {
+      const realpath = vi.fn((path: string) => path);
+      const markerProbe = vi.fn(absent);
+      const createDirectory = vi.fn(() => "C:\\absolute\\lcm-test-root");
+      const result = operation({
+        environment: {},
+        platformName: "win32",
+        candidateParents: ["\\tmp", "/tmp", "C:\\absolute"],
+        realpath,
+        markerProbe,
+        createDirectory,
+        secureDirectory: vi.fn(),
+      });
+
+      if (operation === selectTestTempParent) {
+        expect(result).toBe("C:\\absolute");
+      } else {
+        expect(result).toEqual({
+          root: "C:\\absolute\\lcm-test-root",
+          parent: "C:\\absolute",
+        });
+      }
+      expect(realpath).toHaveBeenCalledTimes(1);
+      expect(realpath).toHaveBeenCalledWith("C:\\absolute");
+      expect(markerProbe).not.toHaveBeenCalledWith("\\tmp\\.git");
+      expect(markerProbe).not.toHaveBeenCalledWith("\\.git");
+    }
+  });
+
+  it.each([
+    ["C:\\Harness", "win32"],
+    ["C:/Harness", "win32"],
+    ["\\\\server\\share", "win32"],
+    ["/tmp", "linux"],
+  ])("accepts fully qualified %s parent on %s", (parent, platformName) => {
+    const root = platformName === "win32"
+      ? `${parent}\\lcm-test-root`
+      : `${parent}/lcm-test-root`;
+    expect(selectTestTempParent({
+      environment: { LCM_TEST_HARNESS_TMPDIR: parent },
+      platformName,
+      realpath: (path: string) => path,
+      markerProbe: absent,
+    })).toBe(parent);
+    expect(createTestTempDirectory({
+      environment: { LCM_TEST_HARNESS_TMPDIR: parent },
+      platformName,
+      realpath: (path: string) => path,
+      markerProbe: absent,
+      createDirectory: () => root,
+      secureDirectory: vi.fn(),
+    })).toEqual({ root, parent });
+  });
+
+  it("reports all invalid candidates without probing them", () => {
+    for (const operation of [selectTestTempParent, createTestTempDirectory]) {
+      const realpath = vi.fn((path: string) => path);
+      const markerProbe = vi.fn(absent);
+      const createDirectory = vi.fn(() => "/unused/lcm-test-root");
+
+      expect(() => operation({
+        environment: {},
+        candidateParents: ["relative", ""],
+        realpath,
+        markerProbe,
+        createDirectory,
+        secureDirectory: vi.fn(),
+      })).toThrow(/relative \(invalid\).* \(invalid\)/u);
+      expect(realpath).not.toHaveBeenCalled();
+      expect(markerProbe).not.toHaveBeenCalled();
+      expect(createDirectory).not.toHaveBeenCalled();
+    }
+  });
+
   it("keeps nested allocations on the stable handoff parent", () => {
     const createDirectory = vi.fn(() => "/stable/lcm-postgresql-harness-child");
     const result = createTestTempDirectory({
