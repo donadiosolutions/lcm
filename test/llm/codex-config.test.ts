@@ -187,7 +187,13 @@ describe("resolveCodexOpenAIBaseUrl", () => {
       JSON.stringify({ id: 2, result: { config: { openai_base_url: "https://proxy.example/v1/" } } }),
     ]);
     const spawn = spawnFor(child);
-    await expect(resolveCodexOpenAIBaseUrl({ spawn, processBirthTime: () => "birth", env: { CODEX_HOME: "/private/.codex" } }))
+    // Exercise the host-platform fallback while retaining isolated process seams.
+    await expect(resolveCodexOpenAIBaseUrl({
+      spawn,
+      platform: undefined,
+      processBirthTime: () => "birth",
+      env: { CODEX_HOME: "/private/.codex" },
+    }))
       .resolves.toBe("https://proxy.example/v1/responses");
     expect(child.requests).toEqual([
       {
