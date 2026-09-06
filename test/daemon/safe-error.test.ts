@@ -602,6 +602,43 @@ describe("sanitizeError", () => {
     ["file://host.invalid?x=a\\server\\share\\db", "file://host.invalid?x=a<path>"],
     ["file://host.invalid?x=a\\\\server\\share\\db", "file://host.invalid?x=a<path>"],
     ["file://host.invalid?x=1\\/Users/canary/private.db", "file://host.invalid?x=1<path>"],
+    [
+      "file://host.invalid?x=foo/bar\\Users\\canary\\private.db",
+      "file://host.invalid?x=foo/bar<path>",
+    ],
+    [
+      "file://host.invalid?x=a/b\\Users\\canary\\private.db",
+      "file://host.invalid?x=a/b<path>",
+    ],
+    ["file://host.invalid?x=a/\\Users\\canary\\private.db", "file://host.invalid?x=a/<path>"],
+    [
+      "file://host.invalid?x=a/b\\\\server\\share\\private.db",
+      "file://host.invalid?x=a/b<path>",
+    ],
+    [
+      "file://host.invalid#x=a/b\\Users\\canary\\private.db",
+      "file://host.invalid#x=a/b<path>",
+    ],
+    [
+      "file://host.invalid?x=a,b\\Users\\canary\\private.db",
+      "file://host.invalid?x=a,b<path>",
+    ],
+    [
+      "file://host.invalid?x=a;b\\\\server\\share\\db",
+      "file://host.invalid?x=a;b<path>",
+    ],
+    [
+      "file://host.invalid#x=a)b\\Users\\canary\\private.db",
+      "file://host.invalid#x=a)b<path>",
+    ],
+    [
+      "file://host.invalid?x=a}b\\Users\\canary\\private.db",
+      "file://host.invalid?x=a}b<path>",
+    ],
+    [
+      "file://host.invalid#x=a'b\\Users\\canary\\private.db",
+      "file://host.invalid#x=a'b<path>",
+    ],
   ] as const)("retains contextual backslash redaction after a pathless file URL: %#", (input, expected) => {
     const result = sanitizeError(input);
 
@@ -624,7 +661,39 @@ describe("sanitizeError", () => {
     ],
     [
       "file://host.invalid?x=value,\\Users\\canary\\private.db",
-      "file://host.invalid?x=value,\\Users\\canary\\private.db",
+      "file://host.invalid?x=value,<path>",
+    ],
+    [
+      "file://host.invalid?x=foo/bar/baz",
+      "file://host.invalid?x=foo/bar/baz",
+    ],
+    [
+      "file://host.invalid?x=/tmp\\Users\\canary",
+      "file://host.invalid?x=<path>",
+    ],
+    [
+      "err at \\Users\\canary\\private.db now",
+      "err at \\Users\\canary\\private.db now",
+    ],
+    [
+      "file://host.invalid?x=value|\\Users\\canary\\private.db",
+      "file://host.invalid?x=value|\\Users\\canary\\private.db",
+    ],
+    [
+      "file://host.invalid?x=value]\\Users\\canary\\private.db",
+      "file://host.invalid?x=value]\\Users\\canary\\private.db",
+    ],
+    [
+      'file://host.invalid?x=value"\\Users\\canary\\private.db',
+      'file://host.invalid?x=value"\\Users\\canary\\private.db',
+    ],
+    [
+      "file://host.invalid?x=value<\\Users\\canary\\private.db",
+      "file://host.invalid?x=value<\\Users\\canary\\private.db",
+    ],
+    [
+      "file://host.invalid?x=value>\\Users\\canary\\private.db",
+      "file://host.invalid?x=value>\\Users\\canary\\private.db",
     ],
   ] as const)("bounds contextual backslash redaction to the pathless file URL tail: %#", (input, expected) => {
     expect(sanitizeError(input)).toBe(expected);

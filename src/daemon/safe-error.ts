@@ -128,7 +128,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       restartedPathlessFile = true;
       continue;
     }
-    if (restartedPathlessFile && URL_END_DELIMITERS.has(char)) {
+    if (
+      restartedPathlessFile &&
+      URL_END_DELIMITERS.has(char) &&
+      !FILE_URL_AUTHORITY_DELIMITERS.has(char)
+    ) {
       restartedPathlessFile = false;
     }
     // These characters are valid in a file URL authority. Keep classifying
@@ -171,12 +175,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     // Preserve the former file-authority handling for the first backslash in
     // this tail without widening backslash detection in unrelated text.
-    if (restartedPathlessFile && (char === "/" || char === "\\")) {
+    if (restartedPathlessFile && char === "\\") {
       restartedPathlessFile = false;
-      if (char === "\\") {
-        file[index] = 1;
-        continue;
-      }
+      file[index] = 1;
+      continue;
     }
     if (char === ":" && schemeLength > 0 && chars[index + 1] === "/" && chars[index + 2] === "/") {
       restartedPathlessFile = false;
