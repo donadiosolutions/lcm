@@ -346,6 +346,20 @@ window, but only after every acknowledged row has a durable
 `remote_pruned_at` checkpoint. An acknowledged row still awaiting exact remote
 pruning retains the sidecar.
 
+LCM scans and prunes only through an existing owner-controlled events directory
+with mode `0700`. It retains that directory's identity across sidecar health
+reads, recent-error reads, database close, and every database, WAL, or SHM
+removal. If the directory path changes during a scan, LCM reports the current
+sidecar as a scan failure and stops before inspecting or pruning another
+sidecar. A missing, unreadable, or unsafe directory at initial admission is
+treated as having no available sidecars.
+
+These checks close replacement opportunities across asynchronous work and
+between removals. Portable pathname removal still has a narrow interval between
+the final identity check and the individual removal, so this is not an atomic
+guarantee against an external process that can replace entries through a
+writable ancestor.
+
 ### `lcm stats`
 
 A single line is added to the Memory section when events have been captured:

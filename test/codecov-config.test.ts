@@ -129,6 +129,7 @@ const expectedComponents = [
     name: "Unit - Local Persistence",
     // #898 applies required promoted tags before the caller result maximum while retaining local-persistence ownership.
     // #898's guarded dual-JSON eligibility keeps this search in the same owner.
+    // #989 retains event-sidecar parent authentication in this owner.
     paths: ["src/db/", "src/storage/sqlite/", "src/store/"],
   },
   {
@@ -494,7 +495,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(209);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -578,6 +579,8 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
+      // #989 event-sidecar parent authentication stays local-persistence-owned.
+      ["src/db/event-sidecars.ts", "unit-local-persistence"],
       ["src/db/database-parent.ts", "unit-local-persistence"],
       ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
