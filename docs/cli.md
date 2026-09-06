@@ -50,6 +50,10 @@ In `lcm store`, `--tag` and `--tags` are repeatable single-tag aliases. This is
 different from `lcm export --tags`, which remains a comma-separated filter,
 for example `lcm export --tags decision,architecture`.
 
+`lcm export` writes JSON by default. The optional `--format` value accepts
+only `json`; unsupported values are rejected before export work or output
+writes begin.
+
 An unknown command writes an error and the complete command list to the
 terminal, completes both outputs, and then exits with status 1.
 
