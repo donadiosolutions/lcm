@@ -6439,6 +6439,76 @@ describe("worktree reconciliation", () => {
     expect(reconcileWorktrees(main, { dryRun: true }).status).toBe("not-needed");
   });
 
+  it.each([
+    { name: "frozen", wallNow: () => 1_000_000 },
+    { name: "backward", wallNow: () => 999_000 },
+    { name: "forward", wallNow: () => Number.MAX_SAFE_INTEGER },
+  ])("keeps catalogue cache TTL monotonic across a $name wall-clock", ({ wallNow }) => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const identity = { id: hashProjectPath(canonical), canonical };
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [identity.id]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const codexDir = join(home, ".codex");
+    let catalogueWalks = 0;
+    const discoveryObserver = (path: string) => {
+      if (path === join(codexDir, "worktrees")) catalogueWalks += 1;
+    };
+    let monotonicNow = 0;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    let currentWallNow = 1_000_000;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => currentWallNow);
+    try {
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("not-needed");
+      const afterInitial = catalogueWalks;
+      expect(afterInitial).toBeGreaterThan(0);
+
+      monotonicNow = 999;
+      currentWallNow = wallNow();
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("completed");
+      expect(catalogueWalks).toBe(afterInitial);
+
+      monotonicNow = 1_000;
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("completed");
+      const afterRenewal = catalogueWalks;
+      expect(afterRenewal).toBeGreaterThan(afterInitial);
+
+      monotonicNow = 1_999;
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("completed");
+      expect(catalogueWalks).toBe(afterRenewal);
+
+      monotonicNow = 2_000;
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("completed");
+      expect(catalogueWalks).toBeGreaterThan(afterRenewal);
+      expect(performanceNow).toHaveBeenCalled();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
   it("bounds catalogue cache freshness and invalidates on state, identity, and clear", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;

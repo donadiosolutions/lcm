@@ -2699,7 +2699,7 @@ export function ensureWorktreeProjectReconciled(
   opts: {
     /** @internal Override the bounded process-cache lifetime for deterministic tests. */
     readonly _cacheTtlMs?: number;
-    /** @internal Override wall-clock time for deterministic cache tests. */
+    /** @internal Override monotonic elapsed milliseconds for deterministic cache tests. */
     readonly _nowMs?: number;
     /** @internal Override ~/.codex for deterministic catalogue tests. */
     readonly _codexDir?: string;
@@ -2728,7 +2728,7 @@ export function ensureWorktreeProjectReconciled(
     id: hashProjectPath(anchor!.canonical),
     canonical: anchor!.canonical,
   };
-  const now = opts._nowMs ?? Date.now();
+  const now = opts._nowMs ?? performance.now();
   const ttlMs = cacheTtlMs(opts._cacheTtlMs);
   const identityCanonical = resolve(project.canonical);
   const cached = reconciledThisProcess.get(project.id);
