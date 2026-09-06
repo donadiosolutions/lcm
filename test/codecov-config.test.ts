@@ -227,6 +227,8 @@ const expectedComponents = [
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
       // #1044 keeps the existing owner; no taxonomy, status, or policy change.
+      // #1069 preserves completed reconciliation evidence after retained
+      // directory cleanup failures in this existing component.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
@@ -592,6 +594,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],
       // #837 consumer-admission descriptor cleanup remains storage-owned.
+      // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
@@ -606,6 +609,9 @@ describe("Codecov configuration", () => {
       ["src/db/connection.ts", "unit-local-persistence"],
       ["src/db/database-parent.ts", "unit-local-persistence"],
       ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
+      // #1020 keeps message timestamp mapping in the existing local-persistence
+      // component; conversation timestamps remain on their existing mapper.
+      ["src/store/conversation-store.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],
