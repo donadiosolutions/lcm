@@ -157,10 +157,18 @@ export function executeConsumerTopology(scratch, { spawn = spawnSync } = {}) {
     "body-parser",
     "2.3.0",
   );
-  const fastUriManifest = verifyBuildDependencyPath(ajvManifest, "fast-uri", "3.1.5");
+  const expressQsManifest = verifyBuildDependencyPath(expressManifest, "qs", "6.16.0");
+  const bodyParserQsManifest = verifyBuildDependencyPath(
+    bodyParserManifest,
+    "qs",
+    "6.16.0",
+  );
+  const fastUriManifest = verifyBuildDependencyPath(ajvManifest, "fast-uri", "3.1.7");
   console.log(
     `build: sdk-express-body-parser=2.3.0 @ ${bodyParserManifest} `
-    + `sdk-ajv-fast-uri=3.1.5 @ ${fastUriManifest}`,
+    + `sdk-express-qs=6.16.0 @ ${expressQsManifest} `
+    + `sdk-body-parser-qs=6.16.0 @ ${bodyParserQsManifest} `
+    + `sdk-ajv-fast-uri=3.1.7 @ ${fastUriManifest}`,
   );
 
   runPackageManager("pnpm", ["run", "build"], root, spawn, false);

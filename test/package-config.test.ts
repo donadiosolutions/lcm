@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { load as loadYaml } from "js-yaml";
+import { createRequire } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
@@ -9,6 +10,10 @@ import fastUri from "fast-uri";
 import pkg from "../package.json";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
+const repositoryRequire = createRequire(import.meta.url);
+const sdkServer = repositoryRequire.resolve("@modelcontextprotocol/sdk/server/index.js");
+const ajvManifest = createRequire(sdkServer).resolve("ajv/package.json");
+const nestedFastUri = createRequire(ajvManifest)("fast-uri") as typeof fastUri;
 const PACKAGE_INVENTORY_TEST_TIMEOUT_MS = 45_000;
 const PACKAGE_COMMAND_TIMEOUT_MS = 30_000;
 const FRESH_BUILD_TEST_TIMEOUT_MS = 90_000;
@@ -103,7 +108,7 @@ describe("package.json", () => {
     expect(pkg.dependencies).not.toHaveProperty("fast-uri");
     expect(pkg.devDependencies).toHaveProperty("@modelcontextprotocol/sdk", "1.30.0");
     expect(pkg.devDependencies).toHaveProperty("body-parser", "2.3.0");
-    expect(pkg.devDependencies).toHaveProperty("fast-uri", "4.1.2");
+    expect(pkg.devDependencies).toHaveProperty("fast-uri", "4.1.4");
     expect(pkg.dependencies).toHaveProperty("@hono/node-server", "2.0.12");
     expect(pkg.scripts).toHaveProperty(
       "verify:consumer-topology",
@@ -128,6 +133,43 @@ describe("package.json", () => {
     }
     expect(fastUri.resolve(base, legitimateReference)).toBe(
       new URL(legitimateReference, base).href,
+    );
+  });
+  it.each([
+    ["direct", fastUri],
+    ["AJV nested", nestedFastUri],
+  ])("rejects malformed ports through the %s fast-uri seam", (_label, uri) => {
+    expect(() => uri.serialize({
+      scheme: "http",
+      host: "trusted.example",
+      port: "@127.0.0.1:8124",
+      path: "/app",
+    })).toThrow("URI port is malformed.");
+  });
+  it.each([
+    ["direct", fastUri],
+    ["AJV nested", nestedFastUri],
+  ])("keeps bracket-like userinfo out of the host through the %s fast-uri seam", (
+    _label,
+    uri,
+  ) => {
+    const parsed = uri.parse("http://[@127.0.0.1/app");
+    expect(parsed).not.toHaveProperty("error");
+    expect(parsed).toMatchObject({
+      host: "127.0.0.1",
+      userinfo: "[",
+    });
+  });
+  it.each([
+    ["direct", fastUri],
+    ["AJV nested", nestedFastUri],
+  ])("rejects an unclosed bracket in the host through the %s fast-uri seam", (
+    _label,
+    uri,
+  ) => {
+    expect(uri.parse("http://user@[@127.0.0.1:8123/admin")).toHaveProperty(
+      "error",
+      "URI host is malformed.",
     );
   });
   it("does not have pi-ai", () => expect(pkg.dependencies).not.toHaveProperty("@mariozechner/pi-ai"));
@@ -280,13 +322,34 @@ describe("pnpm development configuration", () => {
     expect(pkg).not.toHaveProperty("overrides");
     expect(loadYaml(readFileSync(join(repositoryRoot, "pnpm-workspace.yaml"), "utf8"))).toEqual({
       packages: ["."],
-      overrides: { "read-yaml-file": "2.1.0" },
+      overrides: {
+        "ajv>fast-uri": "3.1.7",
+        qs: "6.16.0",
+        "read-yaml-file": "2.1.0",
+      },
       onlyBuiltDependencies: ["esbuild", "fsevents"],
     });
     expect(pkg.scripts["update:patterns"]).toBe(
       "node --experimental-strip-types scripts/update-gitleaks-patterns.ts",
     );
     expect(existsSync(join(repositoryRoot, "package-lock.json"))).toBe(false);
+  });
+
+  it("locks only the patched fast-uri and qs graph", () => {
+    const lock = loadYaml(
+      readFileSync(join(repositoryRoot, "pnpm-lock.yaml"), "utf8"),
+    ) as { packages: Record<string, unknown> };
+    const packageKeys = Object.keys(lock.packages);
+    expect(packageKeys).toEqual(expect.arrayContaining([
+      "fast-uri@3.1.7",
+      "fast-uri@4.1.4",
+      "qs@6.16.0",
+    ]));
+    expect(packageKeys).not.toEqual(expect.arrayContaining([
+      "fast-uri@3.1.5",
+      "fast-uri@4.1.2",
+      "qs@6.15.2",
+    ]));
   });
 
   it("rejects a mismatched manager before installation without switching versions", () => {
