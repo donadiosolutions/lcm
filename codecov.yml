@@ -39,6 +39,8 @@ component_management:
         # no-follow descriptors and borrowed publication parents.
         # #1041 preserves bootstrap directory authentication errors when
         # descriptor cleanup also fails.
+        # #1062 keeps retained-parent create-if-absent publication within the
+        # existing filesystem-topology owner.
         - "^src/config-manager\\.ts$"
         - "^src/config-projection\\.ts$"
         - "^src/generated-patterns\\.ts$"
@@ -116,6 +118,7 @@ component_management:
         # successful read's sampled parent, and retains failure-path identity.
         # #964 extends that retained metadata lifetime to the path-bound LCM
         # root, projects directory, and project leaf without changing ownership.
+        # #1062 keeps missing promote metadata no-clobber handling route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"

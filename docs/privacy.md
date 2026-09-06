@@ -52,8 +52,14 @@ With the default SQLite backend, all storage is on your machine:
   hierarchy substituted before that phase can be admitted. Pathname operations
   inside the atomic writer also leave a bounded race where a replacement can
   receive a write before the postcondition reports failure. These checks do not
-  claim detection of every transient replacement. A missing-file race has no
-  sampled parent identity and remains outside this guarantee.
+  claim detection of every transient replacement. When `meta.json` is missing,
+  promotion creates it only if the retained project directory still has no
+  destination entry at publication. A restored file or concurrent creation is
+  refused with the existing topology error and is not overwritten. This
+  portable create briefly links the complete private file at both its temporary
+  and final names; a concurrent bounded reader can fail closed during that
+  interval. The earlier missing-file observation is not proof of historical
+  absence and does not provide descriptor-relative pathname mutation.
 - **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
 - **`~/.lcm/daemon.pid`** — Daemon process ID (transient).

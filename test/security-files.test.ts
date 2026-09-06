@@ -16,6 +16,7 @@ import {
   fsyncSync,
   fstatSync,
   openSync,
+  readdirSync,
   linkSync,
   lstatSync,
   realpathSync,
@@ -44,6 +45,8 @@ import {
   openPrivateDirectory,
   openPrivateDirectoryForCreation,
   openPrivateDirectoryIfExists,
+  PrivateDirectoryTopologyError,
+  PrivateFileCollisionError,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
@@ -105,6 +108,175 @@ describe("private filesystem primitives", () => {
       expect(statSync(root).mode & 0o777).toBe(0o700);
       expect(closed).toBe(false);
       expect(assertPrivateDirectoryEntry(parent, root, parent.witness.uid).dev).toBe(parent.witness.dev);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("publishes an absent destination exclusively through a retained parent", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    try {
+      atomicWritePrivateFile(target, "content", {}, parent, { requireAbsent: true });
+
+      expect(readFileSync(target, "utf8")).toBe("content");
+      expect(statSync(target).mode & 0o777).toBe(0o600);
+      expect(fsStatSync(target).nlink).toBe(1);
+      expect(readdirSync(root).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toEqual([]);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("requires a retained parent for exclusive atomic publication", () => {
+    const root = makeRoot();
+    const target = join(root, "metadata.json");
+
+    expect(() => atomicWritePrivateFile(
+      target,
+      "content",
+      {},
+      undefined,
+      { requireAbsent: true },
+    )).toThrow("retained parent");
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("refuses to replace an exclusive destination in a retained parent", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    writeFileSync(target, "winner", { mode: 0o600 });
+    try {
+      expect(() => atomicWritePrivateFile(
+        target,
+        "loser",
+        {},
+        parent,
+        { requireAbsent: true },
+      )).toThrow(PrivateFileCollisionError);
+      expect(readFileSync(target, "utf8")).toBe("winner");
+      expect(readdirSync(root).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toEqual([]);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("keeps destination collision classified when exclusive cleanup also fails", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const cleanupFailure = Object.assign(new Error("cleanup denied"), { code: "EACCES" });
+    writeFileSync(target, "winner", { mode: 0o600 });
+    try {
+      let observed: unknown;
+      try {
+        atomicWritePrivateFile(target, "loser", {
+          remove: () => { throw cleanupFailure; },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        observed = error;
+      }
+      expect(observed).toBeInstanceOf(PrivateFileCollisionError);
+      expect(readFileSync(target, "utf8")).toBe("winner");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("propagates non-collision exclusive link failures and cleans its temp", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const denied = Object.assign(new Error("link denied"), { code: "EACCES" });
+    try {
+      expect(() => atomicWritePrivateFile(target, "content", {
+        link: () => { throw denied; },
+      }, parent, { requireAbsent: true })).toThrow(denied);
+      expect(existsSync(target)).toBe(false);
+      expect(readdirSync(root).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toEqual([]);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("preserves a non-collision link failure when temporary cleanup also fails", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const denied = Object.assign(new Error("link denied"), { code: "EACCES" });
+    try {
+      let observed: unknown;
+      try {
+        atomicWritePrivateFile(target, "content", {
+          link: () => { throw denied; },
+          remove: () => { throw new Error("cleanup denied"); },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        observed = error;
+      }
+      expect(observed).toBe(denied);
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("reports exclusive temporary cleanup failure after publication", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const denied = Object.assign(new Error("cleanup denied"), { code: "EACCES" });
+    try {
+      expect(() => atomicWritePrivateFile(target, "content", {
+        remove: () => { throw denied; },
+      }, parent, { requireAbsent: true })).toThrow(denied);
+      expect(readFileSync(target, "utf8")).toBe("content");
+      expect(fsStatSync(target).nlink).toBe(2);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("keeps exclusive temporary-name collisions ordinary and preserves the owner", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"12".repeat(12)}.tmp`);
+    writeFileSync(tempPath, "concurrent owner", { mode: 0o600 });
+    try {
+      let observed: unknown;
+      try {
+        atomicWritePrivateFile(target, "content", {
+          random: () => Buffer.alloc(12, 0x12),
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        observed = error;
+      }
+      expect(observed).toMatchObject({ code: "EEXIST" });
+      expect(observed).not.toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(readFileSync(tempPath, "utf8")).toBe("concurrent owner");
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("rejects retained-parent drift during exclusive publication", () => {
+    const root = makeRoot();
+    const replacement = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    try {
+      expect(() => atomicWritePrivateFile(target, "content", {
+        link: (from, to) => {
+          linkSync(from, to);
+          rmSync(root, { recursive: true, force: true });
+          symlinkSync(replacement, root);
+        },
+      }, parent, { requireAbsent: true })).toThrow(PrivateDirectoryTopologyError);
+      expect(existsSync(join(replacement, "metadata.json"))).toBe(false);
     } finally {
       parent.close();
     }
@@ -281,6 +453,9 @@ describe("private filesystem primitives", () => {
     const root = makeRoot();
     const originalFstat = fstatSync;
     try {
+      expect(() => openPrivateDirectoryForCreation(root, {
+        expectedUid: Number.NaN,
+      })).toThrow("private directory owner is not trusted");
       expect(() => withPatchedFs(
         "fstatSync",
         ((fd: number, options?: unknown) => {
@@ -303,6 +478,19 @@ describe("private filesystem primitives", () => {
       )).toThrow("private directory owner is not trusted");
     } finally {
       chmodSync(root, 0o700);
+    }
+  });
+
+  it("permits creation admission when process owner lookup is unavailable", () => {
+    const root = makeRoot();
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    try {
+      Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+      const handle = openPrivateDirectoryForCreation(root);
+      handle.close();
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
     }
   });
 

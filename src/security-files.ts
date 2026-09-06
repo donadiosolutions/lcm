@@ -60,6 +60,14 @@ export class PrivateDirectoryTopologyError extends Error {
   }
 }
 
+/** A create-if-absent private publication found an existing destination. */
+export class PrivateFileCollisionError extends PrivateDirectoryTopologyError {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super(message, options);
+    this.name = "PrivateFileCollisionError";
+  }
+}
+
 type BigIntDirectoryStat = Readonly<{
   isDirectory: () => boolean;
   mode: bigint;
@@ -851,6 +859,7 @@ export function atomicWritePrivateFile(
   operations: {
     readonly close?: typeof closeSync;
     readonly fchmod?: typeof fchmodSync;
+    readonly link?: typeof linkSync;
     readonly open?: typeof openSync;
     readonly random?: (size: number) => Buffer;
     readonly remove?: typeof rmSync;
@@ -859,8 +868,90 @@ export function atomicWritePrivateFile(
     readonly write?: typeof writeFileSync;
   } = {},
   parent?: PrivateDirectoryHandle,
+  options: Readonly<{ requireAbsent?: boolean }> = {},
 ): void {
   const directory = dirname(path);
+  if (options.requireAbsent) {
+    if (parent === undefined) {
+      throw new Error("exclusive private publication requires a retained parent");
+    }
+    assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+    const parentIdentity = {
+      dev: BigInt(parent.witness.dev),
+      ino: BigInt(parent.witness.ino),
+    };
+    const tempPath = join(
+      directory,
+      `.${basename(path)}.${(operations.random ?? randomBytes)(12).toString("hex")}.tmp`,
+    );
+    let ownsTempPath = false;
+    let published = false;
+    let tempIdentity: PrivateFileIdentity | undefined;
+    let primaryError: unknown;
+    try {
+      const fd = (operations.open ?? openSync)(tempPath, "wx", PRIVATE_FILE_MODE);
+      ownsTempPath = true;
+      tempIdentity = privateFileIdentity(
+        fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
+        parentIdentity,
+      );
+      try {
+        (operations.write ?? writeFileSync)(fd, content, "utf-8");
+        (operations.fchmod ?? fchmodSync)(fd, PRIVATE_FILE_MODE);
+        (operations.sync ?? fsyncSync)(fd);
+      } finally {
+        (operations.close ?? closeSync)(fd);
+      }
+      try {
+        (operations.link ?? linkSync)(tempPath, path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          throw new PrivateFileCollisionError(
+            "private file was created concurrently",
+            { cause: error },
+          );
+        }
+        throw error;
+      }
+      published = true;
+      const removed = unlinkPrivateFileIfIdentityMatches(
+        tempPath,
+        tempIdentity,
+        (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+        undefined,
+        2n,
+      );
+      if (!removed) {
+        throw new Error("private exclusive publication temp cleanup was not completed");
+      }
+      ownsTempPath = false;
+      assertPrivateFileSingleLink(path, tempIdentity);
+      assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+    } catch (error) {
+      primaryError = error;
+      if (!(error instanceof PrivateDirectoryTopologyError)) {
+        try {
+          assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+        } catch (topologyError) {
+          primaryError = topologyError;
+        }
+      }
+    } finally {
+      if (ownsTempPath && tempIdentity !== undefined) {
+        try {
+          unlinkPrivateFileIfIdentityMatches(
+            tempPath,
+            tempIdentity,
+            (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+            undefined,
+            published ? 2n : 1n,
+          );
+        } catch { /* preserve the exclusive publication failure */ }
+      }
+    }
+    if (primaryError !== undefined) throw primaryError;
+    return;
+  }
   if (parent === undefined) {
     ensurePrivateDirectory(directory);
   } else {

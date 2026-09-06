@@ -38,6 +38,7 @@ const mocks = vi.hoisted(() => ({
   afterMetadataRead: vi.fn(),
   beforeBoundedReader: vi.fn(),
   afterBoundedReader: vi.fn(),
+  metadataWriteOperations: vi.fn(() => ({})),
   afterMetadataWrite: vi.fn(),
 }));
 
@@ -69,17 +70,29 @@ vi.mock("../../../src/security-files.js", async (importOriginal) => {
     },
     readBoundedRegularFileWithStat: (path: string, options: BoundedFileOptions) => {
       mocks.beforeBoundedReader();
-      const result = actual.readBoundedRegularFileWithStat(path, {
-        ...options,
-        _beforeReadForTesting: mocks.beforeMetadataRead,
-      });
+      let result: ReturnType<typeof actual.readBoundedRegularFileWithStat>;
+      try {
+        result = actual.readBoundedRegularFileWithStat(path, {
+          ...options,
+          _beforeReadForTesting: mocks.beforeMetadataRead,
+        });
+      } catch (error) {
+        mocks.afterBoundedReader();
+        throw error;
+      }
       mocks.afterMetadataRead();
       mocks.afterBoundedReader();
       return result;
     },
     atomicWritePrivateFile: (...args: Parameters<typeof actual.atomicWritePrivateFile>) => {
-      actual.atomicWritePrivateFile(...args);
+      const forwarded = [...args];
+      forwarded[2] = {
+        ...(forwarded[2] ?? {}),
+        ...mocks.metadataWriteOperations(),
+      };
+      const result = Reflect.apply(actual.atomicWritePrivateFile, undefined, forwarded);
       mocks.afterMetadataWrite();
+      return result;
     },
   };
 });
@@ -135,6 +148,8 @@ describe("promote metadata files", () => {
     mocks.afterMetadataRead.mockReset();
     mocks.beforeBoundedReader.mockReset();
     mocks.afterBoundedReader.mockReset();
+    mocks.metadataWriteOperations.mockReset();
+    mocks.metadataWriteOperations.mockReturnValue({});
     mocks.afterMetadataWrite.mockReset();
   });
 
@@ -156,7 +171,88 @@ describe("promote metadata files", () => {
     expect(metadata).toMatchObject({ cwd: "/integration/project" });
     expect(metadata.lastPromote).toEqual(expect.any(String));
     expect(lstatSync(metadataPath).mode & 0o777).toBe(0o600);
+    expect(lstatSync(metadataPath).nlink).toBe(1);
     expect(readdirSync(tempDir).filter(name => /^\.meta\.json\..+\.tmp$/u.test(name))).toEqual([]);
+  });
+
+  it("does not overwrite restored metadata after a transient missing-file observation", async () => {
+    const admittedDir = tempDirs[0]!;
+    const displacedDir = `${admittedDir}-displaced`;
+    const replacementDir = `${admittedDir}-replacement`;
+    tempDirs.push(displacedDir, replacementDir);
+    const metadataPath = join(admittedDir, "meta.json");
+    const original = `${JSON.stringify({ retained: "original" }, null, 2)}\n`;
+    writeFileSync(metadataPath, original, { encoding: "utf8", mode: 0o600 });
+    mocks.beforeBoundedReader.mockImplementationOnce(() => {
+      renameSync(admittedDir, displacedDir);
+      mkdirSync(admittedDir, { mode: 0o700 });
+    });
+    mocks.afterBoundedReader.mockImplementationOnce(() => {
+      renameSync(admittedDir, replacementDir);
+      renameSync(displacedDir, admittedDir);
+    });
+
+    await createPromoteHandler(config, makeMockStorageFactory({
+      projectExists: mocks.projectExists,
+      openProject: mocks.openProject,
+      close: mocks.closeFactory,
+    }))({} as never, response, JSON.stringify({ cwd: "/integration/project" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+    expect(readFileSync(metadataPath, "utf8")).toBe(original);
+    expect(readdirSync(admittedDir).filter(
+      name => /^\.meta\.json\..+\.tmp$/u.test(name),
+    )).toEqual([]);
+    expect(readdirSync(replacementDir).filter(
+      name => /^\.meta\.json\..+\.tmp$/u.test(name),
+    )).toEqual([]);
+  });
+
+  it("refuses metadata created after the missing-file observation", async () => {
+    const admittedDir = tempDirs[0]!;
+    const metadataPath = join(admittedDir, "meta.json");
+    const winner = `${JSON.stringify({ retained: "concurrent" }, null, 2)}\n`;
+    mocks.afterBoundedReader.mockImplementationOnce(() => {
+      writeFileSync(metadataPath, winner, { encoding: "utf8", mode: 0o600 });
+    });
+
+    await createPromoteHandler(config, makeMockStorageFactory({
+      projectExists: mocks.projectExists,
+      openProject: mocks.openProject,
+      close: mocks.closeFactory,
+    }))({} as never, response, JSON.stringify({ cwd: "/integration/project" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+    expect(readFileSync(metadataPath, "utf8")).toBe(winner);
+  });
+
+  it("keeps a metadata collision critical when temporary cleanup also fails", async () => {
+    const admittedDir = tempDirs[0]!;
+    const metadataPath = join(admittedDir, "meta.json");
+    const winner = `${JSON.stringify({ retained: "concurrent" }, null, 2)}\n`;
+    mocks.afterBoundedReader.mockImplementationOnce(() => {
+      writeFileSync(metadataPath, winner, { encoding: "utf8", mode: 0o600 });
+    });
+    mocks.metadataWriteOperations.mockReturnValue({
+      remove: () => {
+        throw Object.assign(new Error("cleanup denied"), { code: "EACCES" });
+      },
+    });
+
+    await createPromoteHandler(config, makeMockStorageFactory({
+      projectExists: mocks.projectExists,
+      openProject: mocks.openProject,
+      close: mocks.closeFactory,
+    }))({} as never, response, JSON.stringify({ cwd: "/integration/project" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+    expect(readFileSync(metadataPath, "utf8")).toBe(winner);
   });
 
   it.each(["root", "projects"] as const)(
