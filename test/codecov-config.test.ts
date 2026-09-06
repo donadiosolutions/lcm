@@ -490,7 +490,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(209);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#866/#722/#786/#952/#814/#930/#969 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#866/#722/#786/#952/#814/#882/#930/#969 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -522,7 +522,8 @@ describe("Codecov configuration", () => {
       ["src/stats.ts", "unit-memory-retrieval"],
       ["src/connectors/codex-hooks.ts", "unit-connectors"],
       ["src/connectors/installer.ts", "unit-connectors"],
-      // #881 keeps absent-config journal checksum admission installer-owned.
+      // #881 absent-config journal admission and #882 post-health identity
+      // fencing remain installer-owned.
       ["installer/install.ts", "unit-installation"],
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],

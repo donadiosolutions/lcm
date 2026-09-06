@@ -27,7 +27,9 @@ import {
   mkdirSync as fsMkdirSync,
   mkdtempSync,
   readFileSync as fsReadFileSync,
+  renameSync,
   rmSync as fsRmSync,
+  symlinkSync,
   writeFileSync as fsWriteFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -2052,7 +2054,11 @@ describe("ensureLcmMd", () => {
 });
 
 describe("installer publication admission integration", () => {
-  function rawSnapshot(content: string, rawSha256: string, ino = "2") {
+  const expectedVersion = PKG_VERSION ?? "test-version";
+  const expectedEntrypoint = PACKAGED_RUNTIME_ENTRYPOINT ?? "/opt/lcm.mjs";
+  const expectedRuntimeDigest = RUNTIME_DIGEST ?? "a".repeat(64);
+
+  function rawSnapshot(content: string, rawSha256: string, ino = "2", mtimeMs = 0) {
     return {
       content,
       witness: {
@@ -2061,7 +2067,7 @@ describe("installer publication admission integration", () => {
         byteLength: Buffer.byteLength(content),
         dev: "1",
         ino,
-        mtimeMs: 0,
+        mtimeMs,
       },
     };
   }
@@ -2078,6 +2084,39 @@ describe("installer publication admission integration", () => {
         mtimeMs: null,
       },
     };
+  }
+
+  function healthyFetch(
+    duringFetch?: () => void,
+    duringJson?: () => void,
+  ): typeof globalThis.fetch {
+    return vi.fn(async () => {
+      duringFetch?.();
+      return {
+        ok: true,
+        json: async () => {
+          duringJson?.();
+          return {
+            status: "ok",
+            pid: process.pid,
+            version: expectedVersion,
+            storageBackend: "sqlite",
+            entrypoint: expectedEntrypoint,
+            runtimeDigest: expectedRuntimeDigest,
+          };
+        },
+      };
+    }) as unknown as typeof globalThis.fetch;
+  }
+
+  function healthyFactorySeams(fetch: typeof globalThis.fetch) {
+    return {
+      fetch,
+      readToken: () => "token",
+      _expectedVersionForTesting: expectedVersion,
+      _expectedEntrypointForTesting: expectedEntrypoint,
+      _expectedRuntimeDigestForTesting: expectedRuntimeDigest,
+    } as const;
   }
 
   it("captures configured and default daemon ports through the real factory", async () => {
@@ -2112,6 +2151,263 @@ describe("installer publication admission integration", () => {
           journalChecksumSha256: journalDrift.shift() ?? "journal-b",
         }),
       })).resolves.toMatchObject({ identity: undefined });
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      name: "config bytes",
+      mutate: (configPath: string, _content: string) => {
+        fsWriteFileSync(configPath, '{"daemon":{"port":4747}}', { mode: 0o600 });
+      },
+    },
+    {
+      name: "config inode",
+      mutate: (configPath: string, content: string) => {
+        const replacement = configPath + ".replacement";
+        fsWriteFileSync(replacement, content, { mode: 0o600 });
+        renameSync(replacement, configPath);
+      },
+    },
+    {
+      name: "config presence",
+      mutate: (configPath: string) => fsRmSync(configPath),
+    },
+  ])("discards a healthy identity when $name changes during fetch", async ({ mutate }) => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-post-health-config-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    const content = '{"daemon":{"port":4123}}';
+    fsMkdirSync(root, { mode: 0o700 });
+    fsWriteFileSync(configPath, content, { mode: 0o600 });
+    try {
+      const result = await createInstallerPublicationConvergence(configPath, healthyFactorySeams(
+        healthyFetch(() => mutate(configPath, content)),
+      ));
+      expect(result).toMatchObject({ identity: undefined, port: 4123 });
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("discards a healthy identity when config changes during response JSON parsing", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-post-health-json-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    fsMkdirSync(root, { mode: 0o700 });
+    fsWriteFileSync(configPath, '{"daemon":{"port":4123}}', { mode: 0o600 });
+    try {
+      const result = await createInstallerPublicationConvergence(configPath, healthyFactorySeams(
+        healthyFetch(undefined, () => {
+          fsWriteFileSync(configPath, '{"daemon":{"port":4747}}', { mode: 0o600 });
+        }),
+      ));
+      expect(result).toMatchObject({ identity: undefined, port: 4123 });
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("discards a healthy identity when only config mtime changes", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-post-health-mtime-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    const content = '{"daemon":{"port":4123}}';
+    fsMkdirSync(root, { mode: 0o700 });
+    fsWriteFileSync(configPath, content, { mode: 0o600 });
+    const snapshots = [
+      rawSnapshot(content, "config", "2", 10),
+      rawSnapshot(content, "config", "2", 10),
+      rawSnapshot(content, "config", "2", 11),
+    ];
+    try {
+      const result = await createInstallerPublicationConvergence(configPath, {
+        ...healthyFactorySeams(healthyFetch()),
+        _readDaemonConfigRawSnapshot: () => snapshots.shift()!,
+        _assertBackendPublicationConfigReadAccess: () => ({ journalChecksumSha256: null }),
+      });
+      expect(result).toMatchObject({ identity: undefined, port: 4123 });
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      name: "publication journal changes",
+      admissions: ["journal-a", "journal-a", "journal-b"] as const,
+      failThird: false,
+    },
+    {
+      name: "publication admission fails",
+      admissions: ["journal-a", "journal-a", "journal-a"] as const,
+      failThird: true,
+    },
+  ])("discards a healthy identity when $name after health", async ({ admissions, failThird }) => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-post-health-journal-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    fsMkdirSync(root, { mode: 0o700 });
+    fsWriteFileSync(configPath, '{"daemon":{"port":4123}}', { mode: 0o600 });
+    let admissionIndex = 0;
+    try {
+      const result = await createInstallerPublicationConvergence(configPath, {
+        ...healthyFactorySeams(healthyFetch()),
+        _assertBackendPublicationConfigReadAccess: () => {
+          const index = admissionIndex++;
+          if (failThird && index === 2) throw new Error("publication is nonterminal");
+          return { journalChecksumSha256: admissions[index] ?? admissions.at(-1)! };
+        },
+      });
+      expect(result).toMatchObject({ identity: undefined, port: 4123 });
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      name: "the private root is replaced around the original config inode",
+      mutate: (home: string, root: string, configPath: string) => {
+        const originalRoot = join(home, "original-lcm");
+        renameSync(root, originalRoot);
+        fsMkdirSync(root, { mode: 0o700 });
+        renameSync(join(originalRoot, "config.json"), configPath);
+      },
+    },
+    {
+      name: "the private root becomes a symlink to the renamed original",
+      mutate: (home: string, root: string) => {
+        const originalRoot = join(home, "original-lcm");
+        renameSync(root, originalRoot);
+        symlinkSync(originalRoot, root, "dir");
+      },
+    },
+    {
+      name: "the private root mode becomes unsafe",
+      mutate: (_home: string, root: string) => chmodSync(root, 0o755),
+    },
+  ])("discards a healthy identity when $name", async ({ mutate }) => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-post-health-root-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    fsMkdirSync(root, { mode: 0o700 });
+    fsWriteFileSync(configPath, '{"daemon":{"port":4123}}', { mode: 0o600 });
+    try {
+      const result = await createInstallerPublicationConvergence(configPath, {
+        ...healthyFactorySeams(healthyFetch(() => mutate(home, root, configPath))),
+        _assertBackendPublicationConfigReadAccess: () => ({ journalChecksumSha256: "journal" }),
+      });
+      expect(result).toMatchObject({ identity: undefined, port: 4123 });
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("rechecks the retained root after post-health publication admission", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-post-admission-root-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    fsMkdirSync(root, { mode: 0o700 });
+    fsWriteFileSync(configPath, '{"daemon":{"port":4123}}', { mode: 0o600 });
+    let admissionCount = 0;
+    try {
+      const result = await createInstallerPublicationConvergence(configPath, {
+        ...healthyFactorySeams(healthyFetch()),
+        _assertBackendPublicationConfigReadAccess: () => {
+          admissionCount += 1;
+          if (admissionCount === 3) {
+            const originalRoot = join(home, "original-lcm");
+            renameSync(root, originalRoot);
+            fsMkdirSync(root, { mode: 0o700 });
+            renameSync(join(originalRoot, "config.json"), configPath);
+          }
+          return { journalChecksumSha256: "journal" };
+        },
+      });
+      expect(result).toMatchObject({ identity: undefined, port: 4123 });
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("refreshes legacy-root admission when publication evidence appears during health", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-legacy-publication-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    fsMkdirSync(root, { mode: 0o755 });
+    fsWriteFileSync(configPath, '{"daemon":{"port":4123}}', { mode: 0o600 });
+    try {
+      const result = await createInstallerPublicationConvergence(configPath, healthyFactorySeams(
+        healthyFetch(() => fsMkdirSync(join(root, "backend-publication"), { mode: 0o700 })),
+      ));
+      expect(result).toMatchObject({ identity: undefined, port: 4123 });
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves without health identity when the initial root admission is unsafe", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-unsafe-root-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    fsMkdirSync(root, { mode: 0o755 });
+    fsMkdirSync(join(root, "backend-publication"), { mode: 0o700 });
+    fsWriteFileSync(configPath, '{"daemon":{"port":4123}}', { mode: 0o600 });
+    const fetch = healthyFetch();
+    try {
+      await expect(createInstallerPublicationConvergence(
+        configPath,
+        healthyFactorySeams(fetch),
+      )).resolves.toMatchObject({ identity: undefined, port: 4123 });
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves healthy identity capture for a legacy non-private SQLite root", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-legacy-root-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    fsMkdirSync(root, { mode: 0o755 });
+    fsWriteFileSync(configPath, '{"daemon":{"port":4123}}', { mode: 0o600 });
+    try {
+      const result = await createInstallerPublicationConvergence(
+        configPath,
+        healthyFactorySeams(healthyFetch()),
+      );
+      expect(result.identity).toBeDefined();
+      expect(result.port).toBe(4123);
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps health failures undefined and skips health after pre-health drift", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-health-fallback-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    const content = '{"daemon":{"port":4123}}';
+    fsMkdirSync(root, { mode: 0o700 });
+    fsWriteFileSync(configPath, content, { mode: 0o600 });
+    try {
+      const unavailable = vi.fn(async () => { throw new Error("health unavailable"); }) as unknown as typeof fetch;
+      await expect(createInstallerPublicationConvergence(
+        configPath,
+        healthyFactorySeams(unavailable),
+      )).resolves.toMatchObject({ identity: undefined, port: 4123 });
+
+      const skippedHealth = healthyFetch();
+      const snapshots = [rawSnapshot(content, "before"), rawSnapshot(content, "after")];
+      await expect(createInstallerPublicationConvergence(configPath, {
+        ...healthyFactorySeams(skippedHealth),
+        _readDaemonConfigRawSnapshot: () => snapshots.shift()!,
+        _assertBackendPublicationConfigReadAccess: () => ({ journalChecksumSha256: null }),
+      })).resolves.toMatchObject({ identity: undefined, port: 4123 });
+      expect(skippedHealth).not.toHaveBeenCalled();
     } finally {
       fsRmSync(home, { recursive: true, force: true });
     }
