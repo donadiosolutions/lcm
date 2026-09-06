@@ -239,8 +239,8 @@ before it can retry publication contention. It never derives that expected
 version from daemon health; if the installed version is unavailable or blank,
 doctor reports the original contention for the affected stage.
 
-The retry budget is a single two-second wall-clock window shared by every
-stage of one doctor run, polled at most every 50 milliseconds. Time spent
+The retry budget is a single two-second monotonic elapsed window shared by
+every stage of one doctor run, polled at most every 50 milliseconds. Time spent
 inside a refused attempt, the platform process-birth probe, and the
 authenticated health probe counts against that window. On platforms that need
 an external trusted process-birth helper, its timeout is shortened to the
