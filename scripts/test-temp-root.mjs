@@ -21,6 +21,44 @@ function isAbsolutePlatformPath(value, platformName) {
   return platformName === "win32" ? win32.isAbsolute(value) : isAbsolute(value);
 }
 
+function selectedExplicitVariable(environment, explicitVariable) {
+  return explicitVariable
+    ?? (environment.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT !== undefined
+      ? "LCM_TEST_VITEST_RUNTIME_ROOT_PARENT"
+      : environment.LCM_TEST_HARNESS_TMPDIR !== undefined
+        ? "LCM_TEST_HARNESS_TMPDIR"
+        : undefined);
+}
+
+function isValidTemporaryParent(candidate, platformName) {
+  return typeof candidate === "string"
+    && candidate.length > 0
+    && !candidate.includes("\0")
+    && isAbsolutePlatformPath(candidate, platformName);
+}
+
+function selectorInputs(options, environment) {
+  const platformName = options.platformName ?? platform();
+  const explicitVariable = selectedExplicitVariable(
+    environment,
+    options.explicitVariable,
+  );
+  if (explicitVariable !== undefined
+    && !isValidTemporaryParent(environment[explicitVariable], platformName)) {
+    throw new Error(
+      `${explicitVariable} must name a non-empty absolute temporary parent path without NUL bytes`,
+    );
+  }
+  const candidates = options.candidateParents
+    ?? candidateTemporaryParents(
+      environment,
+      platformName,
+      explicitVariable,
+      options.temporaryRoot ?? tmpdir,
+    );
+  return { candidates, explicitVariable, platformName };
+}
+
 /** Return only platform fallbacks that do not inspect live temp variables. */
 export function nonLivePlatformFallbackParents(
   environment = process.env,
@@ -216,22 +254,14 @@ function selectionError(variable, diagnostics) {
  */
 export function selectTestTempParent(options = {}) {
   const environment = options.environment ?? process.env;
-  const explicitVariable = options.explicitVariable
-    ?? (environment.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT !== undefined
-      ? "LCM_TEST_VITEST_RUNTIME_ROOT_PARENT"
-      : environment.LCM_TEST_HARNESS_TMPDIR !== undefined
-        ? "LCM_TEST_HARNESS_TMPDIR"
-        : undefined);
-  const candidates = options.candidateParents
-      ?? candidateTemporaryParents(
-        environment,
-        options.platformName ?? platform(),
-        explicitVariable,
-        options.temporaryRoot ?? tmpdir,
-      );
+  const { candidates, explicitVariable, platformName } = selectorInputs(
+    options,
+    environment,
+  );
   const diagnostics = [];
   const seen = new Set();
   for (const candidate of candidates) {
+    if (!isValidTemporaryParent(candidate, platformName)) continue;
     const inspected = inspectGitFreeParent(candidate, options);
     if (inspected.parent && seen.has(inspected.parent)) continue;
     if (inspected.parent) seen.add(inspected.parent);
@@ -248,19 +278,10 @@ export function selectTestTempParent(options = {}) {
  */
 export function createTestTempDirectory(options = {}) {
   const environment = options.environment ?? process.env;
-  const explicitVariable = options.explicitVariable
-    ?? (environment.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT !== undefined
-      ? "LCM_TEST_VITEST_RUNTIME_ROOT_PARENT"
-      : environment.LCM_TEST_HARNESS_TMPDIR !== undefined
-        ? "LCM_TEST_HARNESS_TMPDIR"
-        : undefined);
-  const candidates = options.candidateParents
-    ?? candidateTemporaryParents(
-      environment,
-      options.platformName ?? platform(),
-      explicitVariable,
-      options.temporaryRoot ?? tmpdir,
-    );
+  const { candidates, explicitVariable, platformName } = selectorInputs(
+    options,
+    environment,
+  );
   const createDirectory = options.createDirectory ?? mkdtempSync;
   const secureDirectory = options.secureDirectory ?? ((path) => {
     // mkdtemp creates mode 0700 on supported platforms; callers may inject a
@@ -272,6 +293,7 @@ export function createTestTempDirectory(options = {}) {
   const diagnostics = [];
   const seen = new Set();
   for (const candidate of candidates) {
+    if (!isValidTemporaryParent(candidate, platformName)) continue;
     const inspected = inspectGitFreeParent(candidate, options);
     if (inspected.parent && seen.has(inspected.parent)) continue;
     if (inspected.parent) seen.add(inspected.parent);

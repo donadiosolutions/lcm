@@ -101,22 +101,26 @@ the platform fallbacks (`/var/tmp` and `/tmp` on POSIX; the configured Windows
 temporary locations). A marker of any type, including an empty or malformed
 `.git` directory, excludes that parent. For automatic candidates, probe,
 realpath, and creation failures advance to the next finite candidate. An
-explicit `LCM_TEST_VITEST_RUNTIME_ROOT_PARENT` failure is reported clearly and
-never falls back.
+explicit `LCM_TEST_VITEST_RUNTIME_ROOT_PARENT` or
+`LCM_TEST_HARNESS_TMPDIR` must name a non-empty absolute path for the active
+platform. Invalid or relative explicit values are rejected before filesystem
+checks and never fall back. Invalid or relative automatic candidates are
+skipped in favor of the next finite candidate.
 
 Each run owns one mode-0700 root. Forked workers create a home directory and a
 sibling temporary directory below that root before test modules load, and set
 `TMPDIR`, `TMP`, and `TEMP` to the sibling. The PostgreSQL harness uses the
 same selector and passes its selected parent to nested children through the
-development-only `LCM_TEST_HARNESS_TMPDIR` handoff. Before that handoff is
-installed, the Vitest global captures the finite original parent candidates in
-the internal `LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS` snapshot. Nested harness
-authentication uses the selected handoff and that preserved snapshot, so a
-worker's rewritten `TMPDIR`, `TMP`, and `TEMP` cannot replace the parent's
-original authentication boundary. Existing snapshots are preserved verbatim;
-malformed or missing snapshots never trigger a nested recapture and safely
-degrade to the handoff plus platform fallbacks. Cleanup removes only roots
-created by the current run.
+development-only `LCM_TEST_HARNESS_TMPDIR` handoff. Handoff paths are absolute
+so allocation and nested authentication agree even when processes have
+different working directories. Before that handoff is installed, the Vitest
+global captures the finite original parent candidates in the internal
+`LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS` snapshot. Nested harness authentication
+uses the selected handoff and that preserved snapshot, so a worker's rewritten
+`TMPDIR`, `TMP`, and `TEMP` cannot replace the parent's original authentication
+boundary. Existing snapshots are preserved verbatim; malformed or missing
+snapshots never trigger a nested recapture and safely degrade to the handoff
+plus platform fallbacks. Cleanup removes only roots created by the current run.
 
 Vitest config-time roots (`createVitestRunRoot` in `vitest.config.ts` and
 `postgresqlVitestCacheDir` in `vitest.postgresql.config.ts`) are resolved before
