@@ -229,6 +229,13 @@ type RetainedReconciliationTarget = Readonly<{
   events: PrivateDirectoryHandle;
 }>;
 
+type RetainedReconciliationJournalParent = Readonly<{
+  rootPath: string;
+  directoryPath: string;
+  root: PrivateDirectoryHandle;
+  directory: PrivateDirectoryHandle;
+}>;
+
 function closeRetainedChildAndRethrow(
   child: PrivateDirectoryHandle,
   primaryError: unknown,
@@ -304,6 +311,63 @@ function closePrivateDirectoryHandles(
     }
   }
   return errors;
+}
+
+function assertRetainedReconciliationJournalParent(
+  parent: RetainedReconciliationJournalParent,
+): void {
+  assertPrivateDirectoryEntry(parent.root, parent.rootPath, parent.root.witness.uid);
+  assertPrivateDirectoryEntry(
+    parent.directory,
+    parent.directoryPath,
+    parent.directory.witness.uid,
+  );
+}
+
+function preservesReconciliationErrorClassification(error: unknown): boolean {
+  return error instanceof BackendPublicationJournalError
+    || error instanceof PrivateMutationLockContentionError;
+}
+
+function withRetainedReconciliationJournalParent<T>(
+  homeDir: string | undefined,
+  operation: (parent: RetainedReconciliationJournalParent) => T,
+): T {
+  const rootPath = lcmHomeDir(homeDir);
+  const directoryPath = reconciliationDir(homeDir);
+  const handles: PrivateDirectoryHandle[] = [];
+  let result: T | undefined;
+  let operationFailed = false;
+  let primaryError: unknown;
+  try {
+    const root = openPrivateDirectory(rootPath);
+    handles.push(root);
+    const directory = acquireRetainedChild(root, rootPath, directoryPath);
+    handles.push(directory);
+    const retained = { rootPath, directoryPath, root, directory };
+    assertRetainedReconciliationJournalParent(retained);
+    result = operation(retained);
+    assertRetainedReconciliationJournalParent(retained);
+  } catch (error) {
+    operationFailed = true;
+    primaryError = error;
+  }
+  const cleanupErrors = closePrivateDirectoryHandles(handles);
+  if (operationFailed) {
+    if (preservesReconciliationErrorClassification(primaryError)) throw primaryError;
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [primaryError, ...cleanupErrors],
+        `reconciliation journal operation failed: ${String(primaryError)}`,
+        { cause: primaryError },
+      );
+    }
+    throw primaryError;
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "reconciliation journal directory cleanup failed");
+  }
+  return result as T;
 }
 
 function withRetainedReconciliationTarget<T>(
@@ -469,9 +533,13 @@ function readJournal(path: string): ReconciliationJournal | null {
   return value as ReconciliationJournal;
 }
 
-function writeJournal(path: string, journal: ReconciliationJournal): void {
+function writeJournal(
+  path: string,
+  journal: ReconciliationJournal,
+  parent: PrivateDirectoryHandle,
+): void {
   journal.updatedAt = new Date().toISOString();
-  atomicWritePrivateFile(path, `${JSON.stringify(journal, null, 2)}\n`);
+  atomicWritePrivateFile(path, `${JSON.stringify(journal, null, 2)}\n`, {}, parent);
 }
 
 function fingerprint(value: unknown): string {
@@ -2231,9 +2299,40 @@ export function reconcileWorktrees(
   const executeLocked = (
     map: Record<string, ProjectMapEntry>,
     completion: { marked: boolean },
+    retainedJournalParent: RetainedReconciliationJournalParent | undefined,
+    blockedRecording: { attempted: boolean },
   ): WorktreeReconciliationResult => {
+    const assertJournalParent = (): void => {
+      if (retainedJournalParent !== undefined) {
+        assertRetainedReconciliationJournalParent(retainedJournalParent);
+      }
+    };
+    const writeAttemptJournal = (journal: ReconciliationJournal): void => {
+      writeJournal(journalFile, journal, retainedJournalParent!.directory);
+    };
+    const throwAfterBlockedRecording = (
+      primaryError: unknown,
+      record: () => void,
+    ): never => {
+      if (preservesReconciliationErrorClassification(primaryError)) throw primaryError;
+      blockedRecording.attempted = true;
+      try {
+        record();
+      } catch (recordingError) {
+        throw new AggregateError(
+          [primaryError, recordingError],
+          `worktree reconciliation failed and blocked journal could not be recorded: ${String(primaryError)}`,
+          { cause: primaryError },
+        );
+      }
+      throw primaryError;
+    };
+
+    assertJournalParent();
     opts._observer?.("after-map-preflight");
+    assertJournalParent();
     const existingJournal = readJournal(journalFile);
+    assertJournalParent();
     if (
       existingJournal
       && resolve(existingJournal.canonical) !== canonical
@@ -2292,7 +2391,6 @@ export function reconcileWorktrees(
     }
     if (pendingSourceHashes.length === 0) {
       if (!opts.dryRun) {
-        ensurePrivateDirectory(reconciliationDir(opts.homeDir));
         const completed: ReconciliationJournal = existingJournal ?? {
           version: RECONCILIATION_VERSION,
           targetHash,
@@ -2310,7 +2408,7 @@ export function reconcileWorktrees(
         completed.discovery = discovery;
         completed.phase = "completed";
         delete completed.reason;
-        writeJournal(journalFile, completed);
+        writeAttemptJournal(completed);
       }
       return {
         status: sourceHashes.length === 0 ? "not-needed" : "completed",
@@ -2402,8 +2500,7 @@ export function reconcileWorktrees(
         );
       }
     }
-    ensurePrivateDirectory(reconciliationDir(opts.homeDir));
-    writeJournal(journalFile, journal);
+    writeAttemptJournal(journal);
 
     const reconcileRetainedTarget = (
       retainedTarget: RetainedReconciliationTarget,
@@ -2490,7 +2587,7 @@ export function reconcileWorktrees(
         );
         assertTarget();
         journal.phase = "merged";
-        writeJournal(journalFile, journal);
+        writeAttemptJournal(journal);
         observeRetainedReconciliationTarget(
           retainedTarget,
           opts._observer,
@@ -2509,14 +2606,14 @@ export function reconcileWorktrees(
           assertTarget();
         }
         journal.archiveAt ??= (opts.now ?? new Date()).toISOString();
-        writeJournal(journalFile, journal);
+        writeAttemptJournal(journal);
         const now = new Date(journal.archiveAt);
         for (const source of sources) {
           assertTarget();
           archiveSource(source, opts.homeDir, now, (backupPath) => {
             assertTarget();
             journal.backupPaths.push(backupPath);
-            writeJournal(journalFile, journal);
+            writeAttemptJournal(journal);
             assertTarget();
           }, (event, detailPath) => observeRetainedReconciliationTarget(
             retainedTarget,
@@ -2541,7 +2638,7 @@ export function reconcileWorktrees(
         }
         assertTarget();
         journal.phase = "archived";
-        writeJournal(journalFile, journal);
+        writeAttemptJournal(journal);
       }
       observeRetainedReconciliationTarget(
         retainedTarget,
@@ -2577,7 +2674,7 @@ export function reconcileWorktrees(
           onBackupCreated: (backupPath) => {
             assertTarget();
             journal.backupPaths.push(backupPath);
-            writeJournal(journalFile, journal);
+            writeAttemptJournal(journal);
             assertTarget();
           },
           onMapPublished: () => observeRetainedReconciliationTarget(
@@ -2603,7 +2700,7 @@ export function reconcileWorktrees(
         codexFingerprint: discovery.codexFingerprint,
         complete: discovery.complete && publishedMapDiscovery.complete,
       };
-      writeJournal(journalFile, journal);
+      writeAttemptJournal(journal);
       assertTarget();
       return resultFromJournal(journal, journalFile);
     };
@@ -2617,14 +2714,15 @@ export function reconcileWorktrees(
         },
       );
     } catch (error) {
-      if (error instanceof BackendPublicationJournalError) throw error;
       if (!completion.marked) {
-        journal.blockedFrom = journal.phase === "merged" || journal.phase === "archived"
-          ? journal.phase
-          : journal.blockedFrom ?? "planned";
-        journal.phase = "blocked";
-        journal.reason = String(error);
-        writeJournal(journalFile, journal);
+        throwAfterBlockedRecording(error, () => {
+          journal.blockedFrom = journal.phase === "merged" || journal.phase === "archived"
+            ? journal.phase
+            : journal.blockedFrom ?? "planned";
+          journal.phase = "blocked";
+          journal.reason = String(error);
+          writeAttemptJournal(journal);
+        });
       }
       throw error;
     }
@@ -2632,47 +2730,75 @@ export function reconcileWorktrees(
 
   const execute = (map: Record<string, ProjectMapEntry>): WorktreeReconciliationResult => {
     const completion = { marked: false };
-    try {
-      return executeLocked(map, completion);
-    } catch (error) {
-      if (error instanceof BackendPublicationJournalError) throw error;
-      if (opts.dryRun) throw error;
-      if (completion.marked) throw error;
-      const current = readJournal(journalFile);
-      if (current && resolve(current.canonical) !== canonical) throw error;
-      {
-        const now = new Date().toISOString();
-        const blocked: ReconciliationJournal = current ?? {
-          version: RECONCILIATION_VERSION,
-          targetHash,
-          canonical,
-          sourceHashes: [],
-          pendingSourceHashes: [],
-          aliases: [...new Set([
-            canonical,
-            ...(map[targetHash] ? entryPaths(map[targetHash]) : []),
-          ])],
-          ...(map[targetHash]?.remoteProjectId
-            ? { remoteProjectId: map[targetHash].remoteProjectId }
-            : {}),
-          createdAt: now,
-          updatedAt: now,
-          phase: "blocked",
-          blockedFrom: "planned",
-          backupPaths: [],
-        };
-        if (blocked.phase !== "blocked") {
-          blocked.blockedFrom = blocked.phase === "merged" || blocked.phase === "archived"
-            ? blocked.phase
-            : "planned";
+    const blockedRecording = { attempted: false };
+    const executeWithJournalParent = (
+      retainedJournalParent: RetainedReconciliationJournalParent | undefined,
+    ): WorktreeReconciliationResult => {
+      try {
+        return executeLocked(map, completion, retainedJournalParent, blockedRecording);
+      } catch (error) {
+        if (preservesReconciliationErrorClassification(error)) throw error;
+        if (opts.dryRun) throw error;
+        if (completion.marked || blockedRecording.attempted) throw error;
+        blockedRecording.attempted = true;
+        let current: ReconciliationJournal | null;
+        try {
+          assertRetainedReconciliationJournalParent(retainedJournalParent!);
+          current = readJournal(journalFile);
+          assertRetainedReconciliationJournalParent(retainedJournalParent!);
+        } catch (recordingError) {
+          throw new AggregateError(
+            [error, recordingError],
+            `worktree reconciliation failed and blocked journal could not be recorded: ${String(error)}`,
+            { cause: error },
+          );
         }
-        blocked.phase = "blocked";
-        blocked.reason = String(error);
-        ensurePrivateDirectory(reconciliationDir(opts.homeDir));
-        writeJournal(journalFile, blocked);
+        if (current && resolve(current.canonical) !== canonical) throw error;
+        try {
+          const now = new Date().toISOString();
+          const blocked: ReconciliationJournal = current ?? {
+            version: RECONCILIATION_VERSION,
+            targetHash,
+            canonical,
+            sourceHashes: [],
+            pendingSourceHashes: [],
+            aliases: [...new Set([
+              canonical,
+              ...(map[targetHash] ? entryPaths(map[targetHash]) : []),
+            ])],
+            ...(map[targetHash]?.remoteProjectId
+              ? { remoteProjectId: map[targetHash].remoteProjectId }
+              : {}),
+            createdAt: now,
+            updatedAt: now,
+            phase: "blocked",
+            blockedFrom: "planned",
+            backupPaths: [],
+          };
+          if (blocked.phase !== "blocked") {
+            blocked.blockedFrom = blocked.phase === "merged" || blocked.phase === "archived"
+              ? blocked.phase
+              : "planned";
+          }
+          blocked.phase = "blocked";
+          blocked.reason = String(error);
+          writeJournal(journalFile, blocked, retainedJournalParent!.directory);
+        } catch (recordingError) {
+          throw new AggregateError(
+            [error, recordingError],
+            `worktree reconciliation failed and blocked journal could not be recorded: ${String(error)}`,
+            { cause: error },
+          );
+        }
+        throw error;
       }
-      throw error;
-    }
+    };
+
+    if (opts.dryRun) return executeWithJournalParent(undefined);
+    return withRetainedReconciliationJournalParent(
+      opts.homeDir,
+      executeWithJournalParent,
+    );
   };
 
   if (opts.dryRun) return execute(readProjectMapSnapshot(opts.homeDir, opts._publicationLockToken));

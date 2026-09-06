@@ -229,6 +229,7 @@ const expectedComponents = [
       // #1044 keeps the existing owner; no taxonomy, status, or policy change.
       // #1069 preserves completed reconciliation evidence after retained
       // directory cleanup failures in this existing component.
+      // #1059 keeps retained journal-parent publication in this existing owner.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
