@@ -477,7 +477,7 @@ export function prepareInstallConfig(deps: ServiceDeps, path: string): InstallCo
     const read = (): InstallConfigState & { journalChecksum: string | null; witness: ReturnType<typeof readDaemonConfigRawSnapshot>["witness"] } => {
       const snapshot = readSnapshot(path);
       if (snapshot.witness.presence === "absent") {
-        assertReadAccess(path, "sqlite", {
+        const journal = assertReadAccess(path, "sqlite", {
           presence: "absent",
           rawSha256: null,
           byteLength: 0,
@@ -485,7 +485,7 @@ export function prepareInstallConfig(deps: ServiceDeps, path: string): InstallCo
           ino: null,
         });
         assertReadRoot();
-        return { exists: false, content: null, journalChecksum: null, witness: snapshot.witness };
+        return { exists: false, content: null, journalChecksum: journal.journalChecksumSha256, witness: snapshot.witness };
       }
       const stored = parseStoredConfig(snapshot.content);
       const backend = (
