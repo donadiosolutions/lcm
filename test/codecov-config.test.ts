@@ -453,7 +453,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(208);
+    expect(productionFiles).toHaveLength(209);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -483,7 +483,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(208);
+    expect(ownershipCounts.size).toBe(209);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#866/#722/#786/#952/#814 files in their intended components", () => {
@@ -550,6 +550,7 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
+      ["src/db/database-parent.ts", "unit-local-persistence"],
       ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],

@@ -117,7 +117,9 @@ component_management:
     - component_id: "unit-local-persistence"
       name: "Unit - Local Persistence"
       paths:
-        # The #700 SQLite signal fences, #756 SQLite factory-health closed-dominance responsibility, and single-owner cleanup remain local-persistence-owned.
+        # The #700 SQLite signal fences, #756 SQLite factory-health
+        # closed-dominance responsibility, #935 database-parent admission,
+        # and single-owner cleanup remain local-persistence-owned.
         - "src/db/"
         - "src/storage/sqlite/"
         - "src/store/"

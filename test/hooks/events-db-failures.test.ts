@@ -7,17 +7,9 @@ const state = vi.hoisted(() => ({
   versionReads: 0,
 }));
 const closeLcmConnection = vi.hoisted(() => vi.fn());
-const ensurePrivateDirectory = vi.hoisted(() => vi.fn(() => {
+const getLcmConnection = vi.hoisted(() => vi.fn(() => {
   if (state.mode === "directory") throw new Error("private directory repair failed");
-}));
-
-vi.mock("../../src/security-files.js", async (importOriginal) => ({
-  ...await importOriginal<typeof import("../../src/security-files.js")>(),
-  ensurePrivateDirectory,
-}));
-
-vi.mock("../../src/db/connection.js", () => ({
-  getLcmConnection: vi.fn(() => ({
+  return {
     prepare: vi.fn((sql: string) => ({
       get: vi.fn(() => {
         if (state.mode === "constructor") throw "plain constructor failure";
@@ -50,7 +42,11 @@ vi.mock("../../src/db/connection.js", () => ({
         throw new Error("error migration failure");
       }
     }),
-  })),
+  };
+}));
+
+vi.mock("../../src/db/connection.js", () => ({
+  getLcmConnection,
   closeLcmConnection,
   isLcmConnectionOpen: vi.fn().mockReturnValue(false),
 }));
@@ -63,7 +59,7 @@ describe("EventsDb non-Error migration failures", () => {
     state.selectedSql = [];
     state.versionReads = 0;
     closeLcmConnection.mockClear();
-    ensurePrivateDirectory.mockClear();
+    getLcmConnection.mockClear();
     _resetMigratedPathsForTesting();
   });
 
@@ -73,7 +69,7 @@ describe("EventsDb non-Error migration failures", () => {
     expect(closeLcmConnection).toHaveBeenCalled();
   });
 
-  it("propagates private-directory repair failure before opening a connection", () => {
+  it("propagates connection-bound parent admission failure without releasing a lease", () => {
     state.mode = "directory";
     expect(() => new EventsDb("/tmp/lcm-events-directory/test.db"))
       .toThrow("private directory repair failed");

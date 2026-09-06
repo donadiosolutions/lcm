@@ -1332,6 +1332,28 @@ Run `lcm stats --verbose` to see a summary of stale memory candidates across all
 
 Each project's SQLite database lives at `~/.lcm/projects/<sha256-of-project-path>/db.sqlite`. The per-project path is derived automatically from the working directory.
 
+LCM authenticates the immediate parent directory before opening a persistent
+SQLite database, including pooled project databases, hook event sidecars, and
+the standalone hook sequence checkpoint. The parent must be a real directory
+rather than a symbolic link, must be owned by the current user, and must be
+readable so LCM can retain a directory descriptor while it checks the database
+path. An unsafe or replaced parent is refused before LCM creates a database,
+changes permissions, or reuses a pooled connection.
+
+Create-capable opens make missing parent components one at a time and set each
+new component to mode `0700`. They also safely repair an authenticated existing
+database parent to `0700`. Generic existing-only probes validate the parent
+without changing its mode; `EventsDb.openExisting` retains its existing repair
+behavior and tightens its authenticated parent to `0700`. A missing parent in
+an existing-only probe remains a normal not-found result and is not created.
+
+Pre-existing aliases in ancestors above the immediate database parent remain
+supported and are not modified. SQLite itself uses pathnames for its database
+and sidecar files, so LCM checks the retained parent identity at observable
+open, permission, initialization, and pooling boundaries; these checks are not
+a kernel-atomic guarantee against another process substituting a path through
+a writable ancestor between system calls.
+
 ### Inspecting the database
 
 ```bash
