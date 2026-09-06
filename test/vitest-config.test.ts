@@ -555,18 +555,53 @@ describe("Vitest artifact-root configuration", () => {
       junit: join(root, "test-report.junit.xml"),
     });
     const projects = configured.test?.projects ?? [];
+    expect(projects.map((project) => project.test?.name)).toEqual([
+      "unit-parallel",
+      "unit-portable-boundaries",
+      "unit-package",
+      "unit-sqlite-routes",
+      "e2e",
+    ]);
     const parallelProject = projects.find(
       (project) => project.test?.name === "unit-parallel",
+    );
+    const portableBoundaryProject = projects.find(
+      (project) => project.test?.name === "unit-portable-boundaries",
     );
     const packageProject = projects.find(
       (project) => project.test?.include?.includes("test/package-config.test.ts"),
     );
+    const sqliteProject = projects.find(
+      (project) => project.test?.name === "unit-sqlite-routes",
+    );
+    const e2eProject = projects.find((project) => project.test?.name === "e2e");
     expect(parallelProject?.test?.exclude).toContain("test/package-config.test.ts");
+    expect(parallelProject?.test?.exclude).toContain("test/storage/portable-record.test.ts");
+    expect(parallelProject?.test?.exclude).toContain("test/storage/portable-record-stream.test.ts");
+    expect(portableBoundaryProject?.test?.include).toEqual([
+      "test/storage/portable-record.test.ts",
+      "test/storage/portable-record-stream.test.ts",
+    ]);
+    expect(portableBoundaryProject?.test?.exclude).toEqual(["node_modules/**", ".claude/**"]);
+    expect(portableBoundaryProject?.test?.fileParallelism).toBe(false);
     expect(packageProject?.test?.fileParallelism).toBe(false);
+    expect([
+      parallelProject?.test?.sequence?.groupOrder,
+      portableBoundaryProject?.test?.sequence?.groupOrder,
+      packageProject?.test?.sequence?.groupOrder,
+      sqliteProject?.test?.sequence?.groupOrder,
+      e2eProject?.test?.sequence?.groupOrder,
+    ]).toEqual([0, 1, 2, 3, 4]);
     expect(configured.test?.setupFiles).toEqual(["test/setup/isolate-runtime-home.ts"]);
     expect(configured.test?.globalSetup).toEqual(["test/setup/runtime-home-global.ts"]);
     expect(configured.test?.pool).toBe("forks");
     expect(projects.every((project) => project.test?.pool === "forks")).toBe(true);
+    expect(projects.every(
+      (project) => project.test?.globalSetup?.includes("test/setup/runtime-home-global.ts"),
+    )).toBe(true);
+    expect(projects.every(
+      (project) => project.test?.setupFiles?.includes("test/setup/isolate-runtime-home.ts"),
+    )).toBe(true);
     expect(postgresqlConfig.test?.pool).toBe("forks");
     expect(configured.test?.coverage?.thresholds).toMatchObject({
       lines: 100,
@@ -574,6 +609,12 @@ describe("Vitest artifact-root configuration", () => {
       branches: 100,
       statements: 100,
     });
+    expect(configured.test?.coverage?.thresholds?.perFile).toBe(true);
+    expect(configured.test?.coverage?.include).toEqual([
+      "bin/**/*.ts",
+      "installer/**/*.ts",
+      "src/**/*.ts",
+    ]);
     expect(JSON.stringify(configured)).not.toContain("vitest-lcm-cache");
     expect(JSON.stringify(configured)).not.toContain('junit: "test-report.junit.xml"');
     expect(basename(configured.test?.coverage?.reportsDirectory ?? "")).toBe("coverage");

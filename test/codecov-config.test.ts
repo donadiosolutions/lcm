@@ -97,7 +97,8 @@ const expectedComponents = [
       // Monotonic proxy startup polling remains daemon-core-owned.
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
-      // Error sanitization, including #893 adjacent-path redaction, remains daemon-core-owned.
+      // Error sanitization, including #893 adjacent-path and #903 prefixed
+      // nested-file redaction, remains daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -130,6 +131,7 @@ const expectedComponents = [
     name: "Unit - Local Persistence",
     // #898 applies required promoted tags before the caller result maximum while retaining local-persistence ownership.
     // #898's guarded dual-JSON eligibility keeps this search in the same owner.
+    // #989 retains event-sidecar parent authentication in this owner.
     paths: ["src/db/", "src/storage/sqlite/", "src/store/"],
   },
   {
@@ -214,6 +216,8 @@ const expectedComponents = [
     component_id: "unit-project-worktrees",
     name: "Unit - Projects and Worktrees",
     paths: [
+      // #974 keeps target-parent reconciliation hardening in this
+      // existing component.
       "^src/codex-project-resolution\\.ts$",
       "^src/git-project\\.ts$",
       "^src/machine-identity\\.ts$",
@@ -233,7 +237,7 @@ const expectedComponents = [
     name: "Integration - Service Managers and Legacy Migration",
     paths: [
       "^src/daemon/health-observation\\.ts$",
-      // #865 post-start publication convergence remains lifecycle-owned.
+      // #865 convergence and #966 birth-sample budgeting remain lifecycle-owned.
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",
@@ -495,7 +499,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(209);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#1003 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -514,6 +518,8 @@ describe("Codecov configuration", () => {
     // #1003 keeps preliminary metadata admission daemon-core-owned.
     // #947 keeps promote metadata-parent resource handling and fail-closed
     // topology behavior in the existing daemon-routes component.
+    // #948 keeps promote metadata parent-first admission, sampled read binding,
+    // and retained identity revalidation in the daemon-routes component.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     // #814 fresh-root descriptor and pre-handoff content checks remain
     // configuration-security-owned.
@@ -563,15 +569,16 @@ describe("Codecov configuration", () => {
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
       // #885 keeps the shared missing-Codex diagnostic and its resolver
-      // identity handling within the existing LLM component.
+      // identity handling within the existing LLM component. #934 keeps
+      // caller-cancellation handling during resolver teardown in this owner.
       ["src/llm/codex-process.ts", "unit-llm-prompts"],
       ["src/llm/codex-config.ts", "unit-llm-prompts"],
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
       ["src/llm/process-utils.ts", "unit-llm-prompts"],
       // #997 keeps doctor publication retry deadlines monotonic in this owner.
       ["src/doctor/doctor.ts", "unit-diagnostics"],
-      // #944/#950 keep typed daemon-tmp diagnostics and authenticated restart
-      // publication convergence within the existing service-manager component.
+      // #944/#950/#966 keep typed daemon-tmp diagnostics, authenticated restart
+      // convergence, and bounded birth samples in the service-manager component.
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],
@@ -583,6 +590,8 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
+      // #989 event-sidecar parent authentication stays local-persistence-owned.
+      ["src/db/event-sidecars.ts", "unit-local-persistence"],
       // #992 keeps pre-initialization SQLite leaf admission and final
       // opened-identity fencing local-persistence-owned.
       ["src/db/connection.ts", "unit-local-persistence"],

@@ -427,6 +427,132 @@ describe("resolveCodexOpenAIBaseUrl", () => {
     }
   });
 
+  it("rejects an aborted valid endpoint only after KILL settles the owned group", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const forced = childWithForcedGroupCleanup("https://cancelled.example/v1/");
+      const { child, killProcess } = forced;
+      const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+      killProcess.mockImplementationOnce((_pid: number, signal?: NodeJS.Signals | number) => {
+        expect(signal).toBe("SIGTERM");
+        controller.abort("during teardown");
+      });
+      let settled = false;
+      const pending = resolveCodexOpenAIBaseUrl({
+        spawn: spawnFor(child),
+        platform: "linux",
+        processBirthTime: () => "birth",
+        processGroupId: 8124,
+        daemonProcessGroupId: 8122,
+        processGroupIdProbe: () => 8124,
+        isProcessGroupAlive: forced.isGroupAlive,
+        killProcess,
+        timeoutMs: 20_000,
+        daemonInstanceId: "daemon",
+        witnessStore,
+      }, controller.signal);
+      void pending.then(() => { settled = true; }, () => { settled = true; });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(killProcess).toHaveBeenCalledWith(-8124, "SIGTERM");
+      expect(controller.signal.aborted).toBe(true);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(killProcess).not.toHaveBeenCalledWith(-8124, "SIGKILL");
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      expect(killProcess).toHaveBeenCalledWith(-8124, "SIGKILL");
+      expect(witnessStore.remove).toHaveBeenCalledOnce();
+      expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects cancellation after teardown for absent and null endpoint defaults", async () => {
+    vi.useFakeTimers();
+    try {
+      for (const configValue of [undefined, null]) {
+        const controller = new AbortController();
+        const forced = childWithForcedGroupCleanup(configValue);
+        const { child, killProcess } = forced;
+        const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+        killProcess.mockImplementationOnce((_pid: number, signal?: NodeJS.Signals | number) => {
+          expect(signal).toBe("SIGTERM");
+          controller.abort("during teardown");
+        });
+        let settled = false;
+        const pending = resolveCodexOpenAIBaseUrl({
+          spawn: spawnFor(child),
+          platform: "linux",
+          processBirthTime: () => "birth",
+          processGroupId: 8124,
+          daemonProcessGroupId: 8122,
+          processGroupIdProbe: () => 8124,
+          isProcessGroupAlive: forced.isGroupAlive,
+          killProcess,
+          timeoutMs: 20_000,
+          daemonInstanceId: "daemon",
+          witnessStore,
+        }, controller.signal);
+        void pending.then(() => { settled = true; }, () => { settled = true; });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(killProcess).toHaveBeenCalledWith(-8124, "SIGTERM");
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(1_999);
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+        expect(killProcess).toHaveBeenCalledWith(-8124, "SIGKILL");
+        expect(witnessStore.remove).toHaveBeenCalledOnce();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains the witness when cancellation teardown cannot prove settlement", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const forced = childWithForcedGroupCleanup("https://unproven.example/v1/");
+      const { child, isGroupAlive, killProcess } = forced;
+      const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+      killProcess.mockImplementation((_pid: number, signal?: NodeJS.Signals | number) => {
+        if (signal === "SIGTERM") controller.abort("during teardown");
+        // Keep the injected group alive after SIGKILL so settlement stays unproven.
+        if (signal === "SIGKILL") expect(isGroupAlive()).toBe(true);
+      });
+      const pending = resolveCodexOpenAIBaseUrl({
+        spawn: spawnFor(child),
+        platform: "linux",
+        processBirthTime: () => "birth",
+        processGroupId: 8124,
+        daemonProcessGroupId: 8122,
+        processGroupIdProbe: () => 8124,
+        isProcessGroupAlive: forced.isGroupAlive,
+        killProcess,
+        timeoutMs: 20_000,
+        daemonInstanceId: "daemon",
+        witnessStore,
+      }, controller.signal);
+      void pending.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(killProcess).toHaveBeenCalledWith(-8124, "SIGTERM");
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(killProcess).toHaveBeenCalledWith(-8124, "SIGKILL");
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(witnessStore.remove).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      expect(witnessStore.remove).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("preserves absent and null defaults after forced cleanup", async () => {
     vi.useFakeTimers();
     try {

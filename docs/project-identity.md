@@ -177,6 +177,12 @@ lcm project reconcile-worktrees --json
 mutation. It previews the currently discovered sources and status only. A real
 run revalidates that evidence while holding the reconciliation locks and can
 still block if the source state changes or a writer cannot be fenced safely.
+During a real run, LCM retains the authenticated target project and events
+directory chain from before the first target mutation through source archival
+and project-map publication. If that chain is replaced or loses its private
+owner-only mode, reconciliation blocks before the next observable mutation;
+snapshot cleanup also leaves a private residual snapshot rather than removing
+a pathname that may have been rebound.
 
 `lcm doctor` reports completed, partial, and blocked journals without retrying a
 blocked reconciliation while collecting project-sensitive-pattern diagnostics.

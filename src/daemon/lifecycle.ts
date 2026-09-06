@@ -2217,8 +2217,13 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
   const readOwnerProbe: typeof readPrivateMutationLockOwner = opts._readPrivateMutationLockOwnerForTesting
     ?? (testScope !== undefined || hermeticSeams !== undefined ? (() => null) : readPrivateMutationLockOwner);
   const readAdmissionBirth = (pid: number): string | null => {
+    if (opts._abortSignal?.aborted) return null;
+    const remainingMs = deadline - monotonicNow();
+    if (remainingMs < 1) return null;
+    const timeoutMs = Math.min(100, Math.floor(remainingMs / 4));
+    if (timeoutMs < 1) return null;
     try {
-      return processBirthProbe(pid, undefined, { timeoutMs: Math.max(1, deadline - monotonicNow()) });
+      return processBirthProbe(pid, undefined, { timeoutMs });
     } catch {
       return null;
     }
@@ -2492,7 +2497,9 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     if (!processEntrypointMatches(verifiedHealth, expectedEntrypoint, platform, procRoot, realpath)) return null;
     if (!healthRuntimeDigestMatches(verifiedHealth, expectedRuntimeDigest)) return null;
     const birthAfter = witnessEligible
-      ? admissionPins !== undefined ? admissionPins.birthAfter : readAdmissionBirth(verifiedHealth.pid!)
+      ? admissionPins !== undefined
+        ? admissionPins.birthAfter
+        : birthBefore === null ? null : readAdmissionBirth(verifiedHealth.pid!)
       : null;
     const tokenAfter = witnessEligible
       ? admissionPins !== undefined ? admissionPins.tokenAfter : readOwnedToken(tokenPath)
@@ -3236,7 +3243,9 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     }
     const admissionPins = admissionBefore === undefined ? undefined : {
       ...admissionBefore,
-      birthAfter: readAdmissionBirth(authenticated.pid!),
+      birthAfter: admissionBefore.birthBefore === null
+        ? null
+        : readAdmissionBirth(authenticated.pid!),
       tokenAfter: readOwnedToken(tokenPath),
     };
     let finalProbe: SupervisorObservation;
@@ -3389,7 +3398,9 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
             if (authenticated !== null) {
               const admissionPins = admissionBefore === undefined ? undefined : {
                 ...admissionBefore,
-                birthAfter: readAdmissionBirth(authenticated.pid!),
+                birthAfter: admissionBefore.birthBefore === null
+                  ? null
+                  : readAdmissionBirth(authenticated.pid!),
                 tokenAfter: readOwnedToken(tokenPath),
               };
               let finalProbe: SupervisorObservation;

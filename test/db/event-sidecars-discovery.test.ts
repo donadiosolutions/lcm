@@ -85,8 +85,8 @@ describe("event sidecar discovery", () => {
     expect(sidecars).toHaveLength(1);
     expect(scanMocks.open).toHaveBeenCalledOnce();
     expect(scanMocks.open).toHaveBeenCalledWith(path);
-    expect(scanMocks.lstat).toHaveBeenCalledOnce();
-    expect(scanMocks.lstat).toHaveBeenCalledWith(path);
+    const leafStats = scanMocks.lstat.mock.calls.filter(([candidate]) => candidate === path);
+    expect(leafStats).toEqual([[path]]);
   });
 
   it("uses strict fence validation as the safe fallback for an unknown Dirent type", async () => {
@@ -129,7 +129,7 @@ describe("event sidecar discovery", () => {
     expect(sidecars).toHaveLength(1);
     expect(sidecars[0].file).toBe(`${hash}.db`);
     expect(sidecars[0].scanSkipped).toContain("timeout");
-    expect(scanMocks.lstat).not.toHaveBeenCalled();
+    expect(scanMocks.lstat.mock.calls.some(([candidate]) => candidate === path)).toBe(false);
     expect(scanMocks.open).not.toHaveBeenCalled();
   });
 });

@@ -82,7 +82,8 @@ component_management:
         # Monotonic proxy startup polling remains daemon-core-owned.
         - "^src/daemon/proxy-manager\\.ts$"
         - "^src/daemon/remediation\\.ts$"
-        # Error sanitization, including #893 adjacent-path redaction, remains daemon-core-owned.
+        # Error sanitization, including #893 adjacent-path and #903 prefixed
+        # nested-file redaction, remains daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -106,6 +107,8 @@ component_management:
         # preserving ordinary best-effort metadata persistence.
         # #947 keeps direct metadata-parent resource exhaustion best-effort
         # while preserving fail-closed topology handling in the route owner.
+        # #948 admits the promote metadata parent before bounded reads, binds a
+        # successful read's sampled parent, and retains failure-path identity.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -125,7 +128,8 @@ component_management:
       paths:
         # The #779 authenticated Responses terminal gateway, #780 bounded
         # Codex failure classification, #790 endpoint resolver, and #885
-        # missing-Codex diagnostic factory remain LLM-owned.
+        # missing-Codex diagnostic factory remain LLM-owned. #934 keeps
+        # caller-cancellation handling during resolver teardown here.
         - "src/llm/"
         - "src/prompts/"
     - component_id: "unit-local-persistence"
@@ -137,6 +141,7 @@ component_management:
         # #898 applies required promoted tags before the caller result maximum
         # while retaining local-persistence ownership.
         # #898's guarded dual-JSON eligibility keeps this search in the same owner.
+        # #989 retains event-sidecar parent authentication in this owner.
         # #992 keeps pre-initialization SQLite leaf admission and final
         # opened-identity fencing local-persistence-owned.
         - "src/db/"
@@ -217,6 +222,8 @@ component_management:
     - component_id: "unit-project-worktrees"
       name: "Unit - Projects and Worktrees"
       paths:
+        # #974 keeps target-parent reconciliation hardening in this
+        # existing component.
         # #866 export gather and project read preparation remain in this
         # existing component.
         - "^src/codex-project-resolution\\.ts$"
@@ -239,8 +246,9 @@ component_management:
         - "^src/daemon/health-observation\\.ts$"
         # Lifecycle consumes the same canonical #691 entrypoint comparison as the CLI and keeps #804's kernel-cgroup listener witness manager-owned.
         # #865/#950 keep post-start and explicit-restart publication convergence
-        # inside the lifecycle owner, while #944 keeps bounded daemon-tmp retry
-        # guidance within the supervisor/lifecycle boundary; their paired
+        # inside the lifecycle owner, #944 keeps bounded daemon-tmp retry
+        # guidance within the supervisor/lifecycle boundary, and #966 keeps
+        # optional birth-sample budgeting in lifecycle admission. Their paired
         # managed lifecycle tests remain this component's coverage boundary.
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
