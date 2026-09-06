@@ -69,6 +69,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let foundFilePath = false;
   let filePathBracketDepth = 0;
   let restartedPathlessFile = false;
+  let restartedPathlessBrackets = 0;
   let queryOrFragment = false;
 
   for (let index = 0; index < chars.length; index += 1) {
@@ -83,6 +84,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      restartedPathlessBrackets = 0;
       queryOrFragment = false;
       continue;
     }
@@ -101,11 +103,26 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      restartedPathlessBrackets = 0;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = quoteCode(chars[nestedFileSchemeStart - 1]);
       authority[nestedFileSchemeStart + 5] = 1;
       authority[nestedFileSchemeStart + 6] = 1;
+      continue;
+    }
+    if (restartedPathlessFile && char === "[") {
+      restartedPathlessBrackets += 1;
+      schemeLength = 0;
+      fileSchemeLength = 0;
+      schemeQuote = 0;
+      continue;
+    }
+    if (restartedPathlessFile && char === "]" && restartedPathlessBrackets > 0) {
+      restartedPathlessBrackets -= 1;
+      schemeLength = 0;
+      fileSchemeLength = 0;
+      schemeQuote = 0;
       continue;
     }
     if (separator >= 0 && char === "[") {
@@ -140,6 +157,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       fileSchemeLength = 0;
       schemeQuote = 0;
       restartedPathlessFile = true;
+      restartedPathlessBrackets = 0;
       continue;
     }
     if (
@@ -148,6 +166,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       !FILE_URL_AUTHORITY_DELIMITERS.has(char)
     ) {
       restartedPathlessFile = false;
+      restartedPathlessBrackets = 0;
       queryOrFragment = false;
     }
     // Conservatively keep supported punctuation and embedded double quotes in
@@ -168,6 +187,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      restartedPathlessBrackets = 0;
       queryOrFragment = false;
       continue;
     }
@@ -189,16 +209,25 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       }
       continue;
     }
+    if (restartedPathlessFile && restartedPathlessBrackets > 0 && char === "/") {
+      file[index] = 1;
+      schemeLength = 0;
+      fileSchemeLength = 0;
+      schemeQuote = 0;
+      continue;
+    }
     // Preserve the former file-authority handling for the first backslash in
     // this tail without widening backslash detection in unrelated text.
     if (restartedPathlessFile && char === "\\") {
       restartedPathlessFile = false;
+      restartedPathlessBrackets = 0;
       queryOrFragment = false;
       file[index] = 1;
       continue;
     }
     if (char === ":" && schemeLength > 0 && chars[index + 1] === "/" && chars[index + 2] === "/") {
       restartedPathlessFile = false;
+      restartedPathlessBrackets = 0;
       queryOrFragment = false;
       separator = index;
       authority[index + 1] = 1;
