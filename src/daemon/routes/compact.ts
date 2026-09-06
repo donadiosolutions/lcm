@@ -671,7 +671,7 @@ export function createCompactHandler(
         try {
           throwIfAborted(signal);
           const localProjectDir = await withProjectAdmission(() =>
-            ensureProjectDirForIdentity(localIdentity, { writeMetadata: false }));
+            ensureProjectDirForIdentity(localIdentity));
           throwIfAborted(signal);
 
           const scrubber = await ScrubEngine.forProject(

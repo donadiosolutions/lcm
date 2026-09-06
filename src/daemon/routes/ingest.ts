@@ -103,7 +103,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       }
       const scrubber = resolvedMessages.length > 0
         ? await (async () => {
-            ensureProjectDirForIdentity(localIdentity, { writeMetadata: false });
+            ensureProjectDirForIdentity(localIdentity);
             return ScrubEngine.forProject(
               config.security?.sensitivePatterns ?? [],
               paths.dir,

@@ -11,10 +11,12 @@ With the default SQLite backend, all storage is on your machine:
 - **`~/.lcm/projects/{hash}/db.sqlite`** — Conversation messages, summaries, and promoted long-term memory for each project. The hash is a SHA-256 of the project directory path.
 - **`~/.lcm/projects/{hash}/meta.json`** — Local project identity and route
   timestamps. Final successful ingest and compact timestamp updates read at
-  most 1 MiB from an owner-matched, single-link regular file and replace valid
-  metadata atomically with mode `0600`. Missing metadata is created; malformed,
-  oversized, linked, non-regular, or foreign-owned metadata is left unchanged.
-  These checks apply to the final route timestamp update.
+  most 1 MiB from a single-link regular file, require its owner to match when a
+  process user ID is available, and replace valid metadata atomically with mode
+  `0600`. Missing metadata is created. Malformed, oversized, linked, or
+  non-regular metadata is left unchanged, as is owner-mismatched metadata when a
+  process user ID is available. These checks apply to the final route timestamp
+  update.
 - **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
 - **`~/.lcm/daemon.pid`** — Daemon process ID (transient).

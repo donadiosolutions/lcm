@@ -1839,6 +1839,57 @@ describe("compact route coverage", () => {
     expect(body.actionTaken).toBe(false);
   });
 
+  it("publishes project identity before an empty PostgreSQL compact returns", async () => {
+    let metadata: Record<string, unknown> | undefined;
+    state.paths.mockImplementation((cwd: string) => ({
+      id: "local-project-id",
+      dir: "/tmp/project",
+      dbPath: "/tmp/project/lcm.db",
+      metaPath: "/tmp/project/meta.json",
+      canonical: cwd,
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+    }));
+    state.ensureProject.mockImplementation((
+      identity: { canonical: string },
+      options?: { writeMetadata?: boolean },
+    ) => {
+      if (options?.writeMetadata !== false) metadata = { cwd: identity.canonical };
+      return "/tmp/project";
+    });
+    state.tokenCount = 0;
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        caFile: "/ca.pem",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+    const output = response();
+
+    await createCompactHandler(value)(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "postgres-empty-context", cwd: "/tmp" }),
+    );
+
+    expect(output.json()).toMatchObject({
+      actionTaken: false,
+      summary: "No messages to compact.",
+    });
+    expect(metadata).toEqual({ cwd: "/tmp" });
+    expect(state.ensureProject).toHaveBeenCalledOnce();
+    expect(state.ensureProject).toHaveBeenCalledWith(expect.objectContaining({
+      id: "local-project-id",
+      canonical: "/tmp",
+    }));
+    expect(state.writeFileSync).not.toHaveBeenCalled();
+  });
+
   it("publishes bounded private metadata after compaction", async () => {
     state.metaText = JSON.stringify({ retained: true, lastIngest: "old" });
 
@@ -1847,7 +1898,6 @@ describe("compact route coverage", () => {
     expect(body).toMatchObject({ actionTaken: false });
     expect(state.ensureProject).toHaveBeenCalledWith(
       expect.objectContaining({ id: "pid", canonical: "/tmp" }),
-      { writeMetadata: false },
     );
     expect(state.openMetadataDirectory).toHaveBeenCalledWith("/tmp/project", {
       expectedUid: process.getuid?.(),

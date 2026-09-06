@@ -294,7 +294,6 @@ describe("ingest persistence boundaries", () => {
 
     expect(mocks.ensureProjectForIdentity).toHaveBeenCalledWith(
       expect.objectContaining({ id: "pid", canonical: "/ok" }),
-      { writeMetadata: false },
     );
     expect(mocks.readMetadata).toHaveBeenCalledWith("/lcm/projects/pid/meta.json", {
       allowedRoot: "/lcm/projects/pid",
@@ -534,6 +533,52 @@ describe("ingest persistence boundaries", () => {
       .toBeLessThan(mocks.getConnection.mock.invocationCallOrder[0]);
   });
 
+  it("keeps PostgreSQL project identity after final publication fails and retry is a no-op", async () => {
+    let metadata: Record<string, unknown> | undefined;
+    mocks.ensureProjectForIdentity.mockImplementation((
+      identity: { id: string; canonical: string },
+      options?: { writeMetadata?: boolean },
+    ) => {
+      if (options?.writeMetadata !== false) metadata = { cwd: identity.canonical };
+      return `/lcm/projects/${identity.id}`;
+    });
+    mocks.writeMetadata.mockImplementationOnce(() => {
+      expect(metadata).toEqual({ cwd: "/ok" });
+      throw new Error("atomic publication failed");
+    });
+    const factory = await createStorageBackendFactory(postgresqlConfig.storage);
+    const handler = createIngestHandler(postgresqlConfig, factory);
+
+    await handler({} as never, response, JSON.stringify({
+      session_id: "postgresql-publication-retry",
+      cwd: "/ok",
+      messages: [validMessage],
+    }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      ingested: 1,
+      totalTokens: 7,
+    });
+    expect(metadata).toEqual({ cwd: "/ok" });
+
+    mocks.sessionGet.mockReturnValue({ message_count: 1 });
+    await handler({} as never, response, JSON.stringify({
+      session_id: "postgresql-publication-retry",
+      cwd: "/ok",
+      messages: [validMessage],
+    }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      ingested: 0,
+      totalTokens: 0,
+    });
+    expect(metadata).toEqual({ cwd: "/ok" });
+    expect(mocks.ensureProjectForIdentity.mock.calls).toEqual([
+      [{ id: "pid", canonical: "/ok" }],
+      [{ id: "pid", canonical: "/ok" }],
+    ]);
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+  });
+
   it("keeps successful SQLite identity ahead of local persistence setup", async () => {
     const handler = createIngestHandler(config);
     await handler({} as never, response, JSON.stringify({
@@ -603,9 +648,7 @@ describe("ingest persistence boundaries", () => {
       remoteProjectId: preflight.remoteProjectId,
     };
     expect(mocks.pathsForIdentity).toHaveBeenCalledWith(localIdentity);
-    expect(mocks.ensureProjectForIdentity).toHaveBeenCalledWith(localIdentity, {
-      writeMetadata: false,
-    });
+    expect(mocks.ensureProjectForIdentity).toHaveBeenCalledWith(localIdentity);
     expect(mocks.forProject).toHaveBeenCalledWith(
       config.security.sensitivePatterns,
       `/lcm/projects/${preflight.localProjectId}`,
