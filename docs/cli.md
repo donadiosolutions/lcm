@@ -96,7 +96,9 @@ store before the final maximum is applied. Episodic results concatenate
 messages first and then summaries, so messages can fill the maximum before a
 summary appears. `--tag <tag>` filters promoted entries by all supplied tags;
 episodic history remains unfiltered. Use `--layer promoted` for tag-only
-recall. Omitted or empty tags do not filter either layer. Values outside this
+recall. All required promoted tags are applied before the caller's result
+maximum, so the maximum counts eligible records. Omitted or empty tags do not
+filter either layer. Values outside this
 range or that are not integers are rejected by the daemon with HTTP 400
 (`invalid limit`).
 

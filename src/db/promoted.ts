@@ -260,13 +260,15 @@ export class PromotedStore {
     }
 
     const sanitized = terms.map((term) => `"${term}"`).join(" OR ");
+    const needsTagFilter = Boolean(filterTags?.length);
+    if (needsTagFilter && limit === 0) return [];
 
     const projectFilter = projectId ? "AND p.project_id = ?" : "";
     const queryParams: (string | number)[] = [sanitized];
     if (projectId) queryParams.push(projectId);
-    queryParams.push(limit);
+    if (!needsTagFilter) queryParams.push(limit);
 
-    const rows = this.db.prepare(
+    const statement = this.db.prepare(
       `SELECT p.id, p.content, p.tags, p.project_id, p.session_id, p.confidence, p.created_at, rank
        FROM promoted_fts fts
        JOIN promoted p ON p.rowid = fts.rowid
@@ -274,24 +276,40 @@ export class PromotedStore {
          AND p.archived_at IS NULL
          ${projectFilter}
        ORDER BY rank, p.confidence DESC, p.created_at ASC
-       LIMIT ?`
-    ).all(...queryParams) as Array<PromotedRow & { rank: number }>;
+       ${needsTagFilter ? "" : "LIMIT ?"}`
+    );
 
-    let results = rows.map((r) => ({
-      id: r.id,
-      content: r.content,
-      tags: parsePromotedTags(r.tags),
-      projectId: r.project_id,
-      sessionId: r.session_id,
-      confidence: r.confidence,
-      createdAt: r.created_at,
-      rank: r.rank,
-    }));
+    const toSearchResult = (row: PromotedRow & { rank: number }): SearchResult | undefined => {
+      const tags = parsePromotedTags(row.tags);
+      if (needsTagFilter && !filterTags!.every((tag) => tags.includes(tag))) return undefined;
+      return {
+        id: row.id,
+        content: row.content,
+        tags,
+        projectId: row.project_id,
+        sessionId: row.session_id,
+        confidence: row.confidence,
+        createdAt: row.created_at,
+        rank: row.rank,
+      };
+    };
 
-    if (filterTags && filterTags.length > 0) {
-      results = results.filter((r) => filterTags.every((t) => r.tags.includes(t)));
+    if (needsTagFilter && typeof statement.iterate === "function") {
+      const results: SearchResult[] = [];
+      for (const row of statement.iterate(...queryParams) as Iterable<PromotedRow & { rank: number }>) {
+        const result = toSearchResult(row);
+        if (result) results.push(result);
+        if (limit >= 0 && results.length >= limit) break;
+      }
+      return results;
     }
 
+    const rows = statement.all(...queryParams) as Array<PromotedRow & { rank: number }>;
+    const results = rows.flatMap((row) => {
+      const result = toSearchResult(row);
+      return result ? [result] : [];
+    });
+    if (needsTagFilter) return limit < 0 ? results : results.slice(0, limit);
     return results;
   }
 
