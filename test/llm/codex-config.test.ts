@@ -1,9 +1,10 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   __codexConfigTestUtils,
-  resolveCodexOpenAIBaseUrl,
+  type CodexConfigDeps,
+  resolveCodexOpenAIBaseUrl as resolveCodexOpenAIBaseUrlWithHostDefaults,
 } from "../../src/llm/codex-config.js";
 
 type FakeChild = EventEmitter & {
@@ -70,6 +71,27 @@ function spawnFor(child: FakeChild) {
   return vi.fn(() => child) as never;
 }
 
+function isolatedProcessOptions(): CodexConfigDeps {
+  return {
+    platform: "linux",
+    daemonProcessGroupId: 8100,
+    killProcess: vi.fn(),
+    isProcessGroupAlive: () => false,
+    processGroupIdProbe: pid => pid,
+    processBirthTime: pid => `birth-${pid}`,
+  };
+}
+
+function resolveCodexOpenAIBaseUrl(
+  options: CodexConfigDeps = {},
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  return resolveCodexOpenAIBaseUrlWithHostDefaults({
+    ...isolatedProcessOptions(),
+    ...options,
+  }, signal);
+}
+
 function hangingChild(): FakeChild {
   const child = new EventEmitter() as FakeChild;
   child.stdin = new PassThrough();
@@ -109,7 +131,23 @@ function childWithForcedGroupCleanup(configValue: unknown): {
   return { child, isGroupAlive: () => groupAlive, killProcess };
 }
 
+let hostProcessKill: ReturnType<typeof vi.spyOn>;
+
 describe("resolveCodexOpenAIBaseUrl", () => {
+  beforeEach(() => {
+    hostProcessKill = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("unexpected host process signal"), { code: "ESRCH" });
+    });
+  });
+
+  afterEach(() => {
+    try {
+      expect(hostProcessKill).not.toHaveBeenCalled();
+    } finally {
+      hostProcessKill.mockRestore();
+    }
+  });
+
   it("covers strict framing and URL normalization edges", () => {
     const utils = __codexConfigTestUtils;
     expect(utils.normalizeConfiguredUrl(undefined)).toBeUndefined();
@@ -188,7 +226,10 @@ describe("resolveCodexOpenAIBaseUrl", () => {
     vi.resetModules();
     try {
       const module = await import("../../src/llm/codex-config.js");
-      await expect(module.resolveCodexOpenAIBaseUrl({ processBirthTime: () => "birth" })).resolves.toBeUndefined();
+      await expect(module.resolveCodexOpenAIBaseUrl({
+        ...isolatedProcessOptions(),
+        processBirthTime: () => "birth",
+      })).resolves.toBeUndefined();
     } finally {
       vi.doUnmock("node:child_process");
       vi.resetModules();
@@ -496,6 +537,7 @@ describe("resolveCodexOpenAIBaseUrl", () => {
       platform: "linux",
       processGroupId: 8123,
       daemonProcessGroupId: 8122,
+      processGroupIdProbe: () => 8123,
       isProcessGroupAlive: () => false,
       killProcess,
     }, controller.signal);
@@ -767,7 +809,8 @@ describe("resolveCodexOpenAIBaseUrl", () => {
     ]);
     const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
     await expect(resolveCodexOpenAIBaseUrl({
-      spawn: spawnFor(child), daemonInstanceId: "daemon", witnessStore,
+      spawn: spawnFor(child), platform: "win32", processBirthTime: undefined,
+      daemonInstanceId: "daemon", witnessStore,
     })).resolves.toBeUndefined();
     expect(witnessStore.add).toHaveBeenCalledOnce();
   });
