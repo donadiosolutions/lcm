@@ -275,8 +275,11 @@ The `Security` section of the doctor output shows:
   which is redacted in the same pass. A public URL glued directly after the
   closing quote or bracket without whitespace may be conservatively redacted:
   `'file://host'['/private']https://pub.test/x` becomes
-  `'file://host'['<path>']https:<path>`. Separating the following public URL with
-  whitespace preserves it byte-for-byte. A quoted path can contain spaces; redaction
+  `'file://host'['<path>']https:<path>`. If that glued URL is followed by a
+  Windows drive path, the URL and drive path are redacted separately, as in
+  `https:<path>\<path>`. Conservative redaction can also extend through unspaced
+  query-tail continuations. Separating the following public URL with whitespace
+  preserves it byte-for-byte. A quoted path can contain spaces; redaction
   continues to that matching quote, a newline, or EOF. Empty and root-only file
   URLs remain unchanged. Unspaced text after an apparent pathless closing apostrophe can be
   treated as continuing authority text, so an eventual path can cause

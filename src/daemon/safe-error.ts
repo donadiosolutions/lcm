@@ -331,6 +331,7 @@ function scanAbsolutePath(
       index += 1;
       continue;
     }
+    if (!windows && char === "\\" && (isUncPathStart(chars, index) || isWindowsDrivePathStart(chars, index + 1))) break;
     if (char === "(" && sawPathCharacter) {
       parentheses += 1;
       sawNonSeparator = true;

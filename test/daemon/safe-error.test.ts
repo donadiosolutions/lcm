@@ -435,6 +435,9 @@ describe("sanitizeError", () => {
     ["'file://host'['/private']\\D:\\SECRET", "'file://host'['<path>']<path>"],
     ["'file://host'['/private'https://h)/Users/SECRET", "'file://host'['<path>'https:<path>)<path>"],
     ["'file://host'['/private']https://h;/Users/SECRET", "'file://host'['<path>']https:<path>;<path>"],
+    ["'file://host'['/private']https://h\\D:\\SECRET", "'file://host'['<path>']https:<path>\\<path>"],
+    ["'file://host'['/private']https://pub.test/x\\C:\\Users\\SECRET", "'file://host'['<path>']https:<path>\\<path>"],
+    ['"file://host["/private"]https://h\\D:\\SECRET', '"file://host["<path>"]https:<path>\\<path>'],
   ] as const)("redacts later paths after a bracketed path quote on the first pass: %#", (input, expected) => {
     const result = sanitizeError(input);
 
@@ -446,10 +449,19 @@ describe("sanitizeError", () => {
     ["'file://host'['/private']https://pub.test/x", "'file://host'['<path>']https:<path>"],
     ["'file://host'['/private'] https://pub.test/x", "'file://host'['<path>'] https://pub.test/x"],
     ["'file://host'['/private'] at https://pub.test/x", "'file://host'['<path>'] at https://pub.test/x"],
+    ["'file://host'['/private'] https://h\\D:\\SECRET", "'file://host'['<path>'] https://h\\<path>"],
+    ["'file://host'['/private'] https://[fe80::1]/pub", "'file://host'['<path>'] https://[fe80::1]/pub"],
   ] as const)("preserves public URLs after a bracketed path quote when separated by whitespace: %#", (input, expected) => {
     const result = sanitizeError(input);
 
     expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it("redacts a Windows drive following a bare POSIX path separately on the first pass", () => {
+    const result = sanitizeError("/private\\D:\\SECRET");
+
+    expect(result).toBe("<path>\\<path>");
     expect(sanitizeError(result)).toBe(result);
   });
 
