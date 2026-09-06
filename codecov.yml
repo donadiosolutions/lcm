@@ -11,6 +11,7 @@ component_management:
         # in Unit - CLI, including export admission failures and sensitive output.
         # #1081 keeps unsupported export-format admission CLI-owned.
         # #978 keeps compact replacement runtime-digest admission CLI-owned.
+        # #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
