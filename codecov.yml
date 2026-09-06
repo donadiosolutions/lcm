@@ -110,6 +110,8 @@ component_management:
         # while preserving fail-closed topology handling in the route owner.
         # #948 admits the promote metadata parent before bounded reads, binds a
         # successful read's sampled parent, and retains failure-path identity.
+        # #964 extends that retained metadata lifetime to the path-bound LCM
+        # root, projects directory, and project leaf without changing ownership.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"

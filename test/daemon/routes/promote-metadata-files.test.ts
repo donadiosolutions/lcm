@@ -7,6 +7,7 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -37,6 +38,7 @@ const mocks = vi.hoisted(() => ({
   afterMetadataRead: vi.fn(),
   beforeBoundedReader: vi.fn(),
   afterBoundedReader: vi.fn(),
+  afterMetadataWrite: vi.fn(),
 }));
 
 vi.mock("../../../src/daemon/project.js", () => ({
@@ -75,6 +77,10 @@ vi.mock("../../../src/security-files.js", async (importOriginal) => {
       mocks.afterBoundedReader();
       return result;
     },
+    atomicWritePrivateFile: (...args: Parameters<typeof actual.atomicWritePrivateFile>) => {
+      actual.atomicWritePrivateFile(...args);
+      mocks.afterMetadataWrite();
+    },
   };
 });
 
@@ -83,6 +89,7 @@ import { createPromoteHandler } from "../../../src/daemon/routes/promote.js";
 const config = loadDaemonConfig("/tmp/promote-metadata-files");
 const response = {} as never;
 const tempDirs: string[] = [];
+const fixtureRoots: string[] = [];
 
 function resetProject(tempDir: string): void {
   const paths = {
@@ -108,7 +115,10 @@ function resetProject(tempDir: string): void {
 describe("promote metadata files", () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockClear();
-    const tempDir = mkdtempSync(join(tmpdir(), "lcm-promote-metadata-"));
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "lcm-promote-metadata-"));
+    fixtureRoots.push(fixtureRoot);
+    const tempDir = join(fixtureRoot, ".lcm", "projects", "metadata-project");
+    mkdirSync(tempDir, { recursive: true, mode: 0o700 });
     tempDirs.push(tempDir);
     resetProject(tempDir);
     mocks.projectIdentity.mockImplementation((cwd: string) => ({
@@ -125,10 +135,12 @@ describe("promote metadata files", () => {
     mocks.afterMetadataRead.mockReset();
     mocks.beforeBoundedReader.mockReset();
     mocks.afterBoundedReader.mockReset();
+    mocks.afterMetadataWrite.mockReset();
   });
 
   afterEach(() => {
-    for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+    tempDirs.splice(0);
+    for (const dir of fixtureRoots.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
   it("creates private metadata with canonical identity and no temporary residue", async () => {
@@ -146,6 +158,54 @@ describe("promote metadata files", () => {
     expect(lstatSync(metadataPath).mode & 0o777).toBe(0o600);
     expect(readdirSync(tempDir).filter(name => /^\.meta\.json\..+\.tmp$/u.test(name))).toEqual([]);
   });
+
+  it.each(["root", "projects"] as const)(
+    "refuses a preexisting %s symlink instead of publishing through it",
+    async (component) => {
+      const projectDir = tempDirs[0]!;
+      const projectsDir = join(projectDir, "..");
+      const rootDir = join(projectsDir, "..");
+      const fixtureRoot = fixtureRoots[0]!;
+      const alternateRoot = join(fixtureRoot, "alternate-root");
+      const alternateProjects = join(alternateRoot, "projects");
+      const alternateProject = join(alternateProjects, "metadata-project");
+      mkdirSync(alternateProject, { recursive: true, mode: 0o700 });
+      const originalMetadata = join(projectDir, "meta.json");
+      const alternateMetadata = join(alternateProject, "meta.json");
+      const ancestor = component === "root" ? rootDir : projectsDir;
+      const displacedAncestor = `${ancestor}-original`;
+      const displacedMetadata = component === "root"
+        ? join(displacedAncestor, "projects", "metadata-project", "meta.json")
+        : join(displacedAncestor, "metadata-project", "meta.json");
+      const original = JSON.stringify({ retained: "original" });
+      writeFileSync(originalMetadata, original, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      writeFileSync(alternateMetadata, JSON.stringify({ retained: "alternate" }), {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+
+      renameSync(ancestor, displacedAncestor);
+      symlinkSync(component === "root" ? alternateRoot : alternateProjects, ancestor);
+
+      await createPromoteHandler(config, makeMockStorageFactory({
+        projectExists: mocks.projectExists,
+        openProject: mocks.openProject,
+        close: mocks.closeFactory,
+      }))({} as never, response, JSON.stringify({ cwd: "/integration/project" }));
+
+      expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+        error: "project directory topology changed before metadata publication",
+      });
+      expect(readFileSync(displacedMetadata, "utf8")).toBe(original);
+      expect(readFileSync(alternateMetadata, "utf8")).toBe(JSON.stringify({ retained: "alternate" }));
+      expect(readdirSync(alternateProject).filter(
+        name => /^\.meta\.json\..+\.tmp$/u.test(name),
+      )).toEqual([]);
+    },
+  );
 
   it("tightens a benign legacy metadata mode while retaining unrelated keys", async () => {
     const tempDir = tempDirs[0]!;
@@ -174,7 +234,7 @@ describe("promote metadata files", () => {
 
   it.each([
     ["during", mocks.beforeMetadataRead, "project directory topology changed before metadata publication"],
-    ["after", mocks.afterMetadataRead, "private directory topology is not trusted"],
+    ["after", mocks.afterMetadataRead, "project directory topology changed before metadata publication"],
   ])("fails closed when the metadata parent is replaced %s a bounded read", async (
     _when,
     replaceParent,
@@ -242,5 +302,79 @@ describe("promote metadata files", () => {
     expect(readFileSync(replacementMetadataPath, "utf8")).toBe(replacement);
     expect(readdirSync(admittedDir).filter(name => /^\.meta\.json\..+\.tmp$/u.test(name))).toEqual([]);
     expect(readdirSync(replacementDir).filter(name => /^\.meta\.json\..+\.tmp$/u.test(name))).toEqual([]);
+  });
+
+  it.each([
+    ["root", "during", mocks.beforeMetadataRead],
+    ["root", "before publication", mocks.afterMetadataRead],
+    ["projects", "during", mocks.beforeMetadataRead],
+    ["projects", "before publication", mocks.afterMetadataRead],
+  ] as const)(
+    "fails closed when the %s entry is renamed and replaced %s metadata processing",
+    async (component, _when, replaceAncestor) => {
+      const projectDir = tempDirs[0]!;
+      const projectsDir = join(projectDir, "..");
+      const rootDir = join(projectsDir, "..");
+      const ancestor = component === "root" ? rootDir : projectsDir;
+      const displacedAncestor = `${ancestor}-displaced`;
+      const displacedProject = component === "root"
+        ? join(displacedAncestor, "projects", "metadata-project")
+        : join(displacedAncestor, "metadata-project");
+      const metadataPath = join(projectDir, "meta.json");
+      const original = JSON.stringify({ retained: "original" });
+      writeFileSync(metadataPath, original, { encoding: "utf8", mode: 0o600 });
+      replaceAncestor.mockImplementationOnce(() => {
+        renameSync(ancestor, displacedAncestor);
+        symlinkSync(displacedAncestor, ancestor);
+      });
+
+      await createPromoteHandler(config, makeMockStorageFactory({
+        projectExists: mocks.projectExists,
+        openProject: mocks.openProject,
+        close: mocks.closeFactory,
+      }))({} as never, response, JSON.stringify({ cwd: "/integration/project" }));
+
+      expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+        error: "project directory topology changed before metadata publication",
+      });
+      expect(readFileSync(join(displacedProject, "meta.json"), "utf8")).toBe(original);
+      expect(readdirSync(displacedProject).filter(
+        name => /^\.meta\.json\..+\.tmp$/u.test(name),
+      )).toEqual([]);
+    },
+  );
+
+  it("reports post-publication projects drift after the authenticated leaf was updated", async () => {
+    const projectDir = tempDirs[0]!;
+    const projectsDir = join(projectDir, "..");
+    const displacedProjects = `${projectsDir}-postwrite`;
+    const metadataPath = join(projectDir, "meta.json");
+    writeFileSync(metadataPath, JSON.stringify({ retained: "original" }), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    mocks.afterMetadataWrite.mockImplementationOnce(() => {
+      renameSync(projectsDir, displacedProjects);
+      symlinkSync(displacedProjects, projectsDir);
+    });
+
+    await createPromoteHandler(config, makeMockStorageFactory({
+      projectExists: mocks.projectExists,
+      openProject: mocks.openProject,
+      close: mocks.closeFactory,
+    }))({} as never, response, JSON.stringify({ cwd: "/integration/project" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+    const updated = JSON.parse(readFileSync(
+      join(displacedProjects, "metadata-project", "meta.json"),
+      "utf8",
+    )) as Record<string, unknown>;
+    expect(updated).toMatchObject({
+      retained: "original",
+      cwd: "/integration/project",
+      lastPromote: expect.any(String),
+    });
   });
 });
