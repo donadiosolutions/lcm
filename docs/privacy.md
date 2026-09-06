@@ -227,16 +227,20 @@ The `Security` section of the doctor output shows:
   its matching quote still terminates the URL, while an apostrophe inside an
   unquoted or double-quoted authority remains authority text. Double quotes
   remain hard boundaries for quoted or structured text. Ordinary HTTP and
-  HTTPS URLs retain their authorities, slashes, and paths. In an exact
+  HTTPS URLs retain their authorities, slashes, and paths. In an unquoted exact
   `file://` URL with no path, a `?` or `#` outside still-open brackets ends the
-  file URL authority classification. A nested non-file URL after that boundary
-  remains intact, while standalone POSIX, Windows, and UNC paths are still
-  redacted by their ordinary detection. A nested exact `file://` path is also
-  still redacted. When an exact case-insensitive `file://` literal begins
-  immediately after `?`, `#`, `&`, or `=` inside any URL, LCM redacts that
-  nested file URL path while preserving the outer URL text. This bounded rule
-  does not parse general query values or decode escaped schemes. There are no
-  configuration options for this defense-in-depth behavior.
+  file URL authority classification. Following text is classified from fresh
+  state: a nested non-file URL remains intact, while standalone POSIX, Windows,
+  UNC, and the first backslash-based path retain redaction. A recognizable
+  nested exact `file://` path is also redacted, including after ordinary query
+  value prefix text. Outer-quoted pathless file URLs retain their conservative
+  file-path classification through `?` and `#`, so a nested non-file URL in
+  that quoted span may still be redacted as a path. When an exact
+  case-insensitive `file://` literal begins immediately after `?`, `#`, `&`, or
+  `=` inside any URL, LCM redacts that nested file URL path while preserving the
+  outer URL text. This bounded rule does not parse general query values or
+  decode escaped schemes. There are no configuration options for this
+  defense-in-depth behavior.
 - Hook project paths retain leading and trailing whitespace. Directories whose names differ only by that whitespace remain separate LCM projects.
 - Hook errors are attached to a project sidecar only when the reported working directory is an existing directory. Invalid paths are recorded in the bounded fallback log without creating project metadata.
 - `lcm stats` and verbose `lcm doctor` remove terminal control sequences and line breaks from persisted text before displaying it. SQLite content is not modified by display sanitization.

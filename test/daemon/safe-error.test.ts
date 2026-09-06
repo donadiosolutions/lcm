@@ -515,7 +515,7 @@ describe("sanitizeError", () => {
       "file://host.invalid?x=https://example.test/p, /Users/canary/private.db",
       "file://host.invalid?x=https://example.test/p, <path>",
     ],
-  ] as const)("preserves nested non-file URLs after pathless file URL delimiters: %#", (input, expected) => {
+  ] as const)("preserves nested non-file URLs after unquoted pathless file URL delimiters: %#", (input, expected) => {
     const result = sanitizeError(input);
 
     expect(result).toBe(expected);
@@ -564,11 +564,70 @@ describe("sanitizeError", () => {
       "file://host.invalid?FiLe:///Users/canary/private.db",
       "file://host.invalid?FiLe://<path>",
     ],
-  ] as const)("redacts paths after pathless file URL delimiters: %#", (input, expected) => {
+  ] as const)("redacts paths after unquoted pathless file URL delimiters: %#", (input, expected) => {
     const result = sanitizeError(input);
 
     expect(result).toBe(expected);
     expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    [
+      "'file://host.invalid?x=/Users/canary/My Files/x'",
+      "'file://host.invalid?x=<path>'",
+    ],
+    [
+      "'file://host.invalid#x=/Users/canary/My Files/x'",
+      "'file://host.invalid#x=<path>'",
+    ],
+    [
+      '\"file://host.invalid?x=/Users/canary/My Files/x\"',
+      '\"file://host.invalid?x=<path>\"',
+    ],
+    [
+      "'file://host.invalid?x=https://example.test/p'",
+      "'file://host.invalid?x=https:<path>'",
+    ],
+    [
+      "'file://a.invalid?x=/Users/c/My F/x' file://b.invalid?y=https://e.test/p",
+      "'file://a.invalid?x=<path>' file://b.invalid?y=https://e.test/p",
+    ],
+  ] as const)("retains conservative outer-quoted pathless file URL handling: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
+  });
+
+  it.each([
+    ["file://host.invalid?x=\\Users\\canary\\private.db", "file://host.invalid?x=<path>"],
+    ["file://host.invalid#x=\\Users\\canary\\private.db", "file://host.invalid#x=<path>"],
+    ["file://host.invalid?x=a\\server\\share\\db", "file://host.invalid?x=a<path>"],
+    ["file://host.invalid?x=a\\\\server\\share\\db", "file://host.invalid?x=a<path>"],
+    ["file://host.invalid?x=1\\/Users/canary/private.db", "file://host.invalid?x=1<path>"],
+  ] as const)("retains contextual backslash redaction after a pathless file URL: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    [
+      "file://host.invalid?x=https://example.test/a\\server\\share\\db",
+      "file://host.invalid?x=https://example.test/a\\server\\share\\db",
+    ],
+    [
+      "file://host.invalid#x=profile://remote.invalid\\Users\\canary\\private.db",
+      "file://host.invalid#x=profile://remote.invalid\\Users\\canary\\private.db",
+    ],
+    [
+      "file://host.invalid?x=value then \\Users\\canary\\private.db",
+      "file://host.invalid?x=value then \\Users\\canary\\private.db",
+    ],
+    [
+      "file://host.invalid?x=value,\\Users\\canary\\private.db",
+      "file://host.invalid?x=value,\\Users\\canary\\private.db",
+    ],
+  ] as const)("bounds contextual backslash redaction to the pathless file URL tail: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
   });
 
   // Bug #903 retains broader arbitrary-prefix semantics. These rows pin the
