@@ -562,7 +562,8 @@ describe("Codecov configuration", () => {
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
       // #885 keeps the shared missing-Codex diagnostic and its resolver
-      // identity handling within the existing LLM component.
+      // identity handling within the existing LLM component. #934 keeps
+      // caller-cancellation handling during resolver teardown in this owner.
       ["src/llm/codex-process.ts", "unit-llm-prompts"],
       ["src/llm/codex-config.ts", "unit-llm-prompts"],
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],

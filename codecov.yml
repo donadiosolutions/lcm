@@ -125,7 +125,8 @@ component_management:
       paths:
         # The #779 authenticated Responses terminal gateway, #780 bounded
         # Codex failure classification, #790 endpoint resolver, and #885
-        # missing-Codex diagnostic factory remain LLM-owned.
+        # missing-Codex diagnostic factory remain LLM-owned. #934 keeps
+        # caller-cancellation handling during resolver teardown here.
         - "src/llm/"
         - "src/prompts/"
     - component_id: "unit-local-persistence"

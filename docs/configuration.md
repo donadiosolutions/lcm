@@ -1098,7 +1098,9 @@ preserved. The resolver never logs or persists the surrounding Codex
 configuration, endpoint contents, or authentication data.
 Once the endpoint has been validated and the one-shot app-server has provably
 settled, that endpoint remains authoritative regardless of its exit status or
-signal.
+child termination signal. A caller `AbortSignal` cancellation that arrives
+during this owned teardown still rejects with `AbortError` after settlement and
+discards the validated endpoint.
 When resolution fails, is aborted, or times out, LCM removes the published
 process witness after the child and its owned process group are proven settled.
 If settlement cannot be proven, LCM retains the witness for reconciliation and
