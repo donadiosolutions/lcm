@@ -429,6 +429,31 @@ describe("sanitizeError", () => {
   });
 
   it.each([
+    ["'file://host'['/private']https://h]/Users/SECRET", "'file://host'['<path>']https:<path>]<path>"],
+    ["'file://host'['/private']\\Users\\SECRET", "'file://host'['<path>']<path>"],
+    ['"file://host["/private"]\\Users\\SECRET', '"file://host["<path>"]<path>'],
+    ["'file://host'['/private']\\D:\\SECRET", "'file://host'['<path>']<path>"],
+    ["'file://host'['/private'https://h)/Users/SECRET", "'file://host'['<path>'https:<path>)<path>"],
+    ["'file://host'['/private']https://h;/Users/SECRET", "'file://host'['<path>']https:<path>;<path>"],
+  ] as const)("redacts later paths after a bracketed path quote on the first pass: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["'file://host'['/private']https://pub.test/x", "'file://host'['<path>']https:<path>"],
+    ["'file://host'['/private'] https://pub.test/x", "'file://host'['<path>'] https://pub.test/x"],
+    ["'file://host'['/private'] at https://pub.test/x", "'file://host'['<path>'] at https://pub.test/x"],
+  ] as const)("preserves public URLs after a bracketed path quote when separated by whitespace: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
     [
       "file://remote.invalid[/Users/canary/one.db]/Users/canary/two.db",
       "file://remote.invalid[<path>]<path>",

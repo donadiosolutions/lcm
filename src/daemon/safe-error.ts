@@ -69,6 +69,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let foundFilePath = false;
   let filePathBracketDepth = 0;
   let restartedPathlessFile = false;
+  let quotedPathEnded = false;
   let queryOrFragment = false;
 
   for (let index = 0; index < chars.length; index += 1) {
@@ -83,6 +84,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      quotedPathEnded = false;
       queryOrFragment = false;
       continue;
     }
@@ -165,12 +167,18 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         quoteCode(char) === schemeQuote &&
         (char === '"' || isFileUrlLiteral(chars, index + 1))
       );
-    // A matching path quote ends redaction even inside an open bracket. End
-    // URL classification there too so it cannot hide a later standalone path.
     const closesQuotedFilePath = foundFilePath && schemeQuote !== 0 && quoteCode(char) === schemeQuote;
+    if (separator >= 0 && brackets > 0 && closesQuotedFilePath && URL_END_DELIMITERS.has(char)) {
+      // The quoted path ended. Keep URL and wrapper state so an adjacent
+      // separator after the wrapper still restarts a file path, but stop
+      // claiming later slashes as this URL authority.
+      quotedPathEnded = true;
+      schemeQuote = 0;
+      continue;
+    }
     if (
       separator >= 0 &&
-      (brackets === 0 || closesQuotedFilePath) &&
+      brackets === 0 &&
       URL_END_DELIMITERS.has(char) &&
       !fileAuthorityDelimiter
     ) {
@@ -186,7 +194,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       continue;
     }
     if (separator >= 0) {
-      if (char === "/") authority[index] = 1;
+      if (char === "/" && !quotedPathEnded) authority[index] = 1;
       if (
         exactFileScheme &&
         !foundFilePath &&
