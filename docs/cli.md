@@ -298,6 +298,11 @@ probe owns and closes its own resources, while a daemon's shared pool stays
 open. `lcm stats --pool` reports safe pool counts and whether they came from
 the daemon or a diagnostic probe. PostgreSQL observations include configured
 maximum, total, idle, and waiting connections and the observed failure latch.
+Daemon pool counts are observed independently before the remote probe starts.
+They may remain available when that probe times out or fails, provided the
+publication and configuration still authenticate. A ready pool observation
+means its counts were available; it does not establish remote backend health.
+The snapshot retains its failure classification and recovery action.
 Unavailable counts are omitted rather than reported as zero.
 
 Numeric statistics such as token totals, compression, recall counters, and

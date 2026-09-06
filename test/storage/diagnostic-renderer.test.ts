@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { backendDiagnosticFailure } from "../../src/storage/diagnostics.js";
+import { backendDiagnosticFailure, collectBackendDiagnostics, type BackendDiagnosticRuntime } from "../../src/storage/diagnostics.js";
 import { renderBackendDiagnostics } from "../../src/storage/diagnostic-renderer.js";
+
+import { parseDaemonConfig } from "../../src/daemon/config.js";
 
 const uuid = "01912345-1234-7123-8123-123456789abc";
 const hash = "a".repeat(64);
@@ -20,6 +22,48 @@ describe("safe common diagnostic text", () => {
     expect(text).toContain("configured max: 8; total: 3; idle: 2; waiting: 1; failed: false");
     expect(text).toContain("quarantined: 0");
     expect(text).not.toContain("PRIVATE_ACTION");
+  });
+  it.each([
+    { phase: "acquisition", classification: "timeout", failed: true, action: "Check backend connectivity, then run `lcm doctor` again." },
+    { phase: "acquisition", classification: "unavailable", failed: false, action: "Run `lcm doctor` and review the storage configuration." },
+    { phase: "health", classification: "timeout", failed: false, action: "Check backend connectivity, then run `lcm doctor` again." },
+    { phase: "health", classification: "unavailable", failed: true, action: "Run `lcm doctor` and review the storage configuration." },
+  ] as const)("renders retained daemon pool during $phase $classification without promoting backend health", async ({ phase, classification, failed, action }) => {
+    const secret = "postgresql://role:password@private.example/db\nPRIVATE_DETAIL";
+    const config = parseDaemonConfig("{}");
+    config.storage = { backend: "postgresql", postgresql: {
+      url: secret, poolMax: 8, connectionTimeoutMs: 10000,
+      idleTimeoutMs: 30000, statementTimeoutMs: 60000,
+    } };
+    const fail = async (): Promise<never> => {
+      if (classification === "timeout") return new Promise(() => {});
+      throw new Error(secret);
+    };
+    const runtime: BackendDiagnosticRuntime = {
+      query: fail, health: fail, close: async () => {},
+      poolDiagnostics: () => ({ configuredMax: 1, total: 0, idle: 0, waiting: 0, failed: false }),
+    };
+    const snapshot = await collectBackendDiagnostics({
+      _deadlineMs: 10,
+      storageFactory: {
+        backend: "postgresql",
+        getDiagnosticPool: () => ({ configuredMax: 8, total: 4, idle: 2, waiting: 1, failed, rawError: secret }),
+      } as never,
+      _dependencies: {
+        observePublication: () => ({ config, witness: "stable", machineId: uuid, mapContent: null }),
+        createRuntime: phase === "acquisition" ? fail : () => runtime,
+      },
+    });
+    const text = renderBackendDiagnostics(snapshot);
+    expect(text).toContain(`Classification: ${classification}`);
+    expect(text).toContain("Pool: ready; origin: daemon");
+    expect(text).toContain(`Pool counts: configured max: 8; total: 4; idle: 2; waiting: 1; failed: ${failed}`);
+    expect(text).toContain("TLS: unverified");
+    expect(text).toContain("Schema: unverified");
+    expect(text).toContain(`Action: ${action}`);
+    expect(text).not.toMatch(/Classification: (healthy|degraded)|No action required/);
+    expect(text).not.toMatch(/PRIVATE_DETAIL|postgresql:\/\/|rawError|private\.example/);
+    expect(JSON.stringify(snapshot)).not.toMatch(/PRIVATE_DETAIL|postgresql:\/\/|rawError|private\.example/);
   });
   it("renders SQLite hash identity, absent optional values and aggregate scope explicitly", () => {
     const snapshot = backendDiagnosticFailure(undefined,"sqlite");

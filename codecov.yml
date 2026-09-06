@@ -250,6 +250,7 @@ component_management:
       name: "Unit - Diagnostics"
       paths:
         - "^src/diagnose\\.ts$"
+        # #619 retains authenticated daemon pool observations across probe failures.
         - "^src/storage/diagnostics\\.ts$"
         - "^src/storage/diagnostic-renderer\\.ts$"
         - "^src/storage/diagnostic-project\\.ts$"

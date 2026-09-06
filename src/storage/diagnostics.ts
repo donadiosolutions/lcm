@@ -200,18 +200,45 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
   if (options.storageFactory !== undefined && options.storageFactory.backend !== backend) {
     return scoped(backendDiagnosticFailure(new BackendPublicationJournalError("backend-mismatch", "Diagnostic backend changed."), options.storageFactory.backend));
   }
-  const timeoutSnapshot = (): BackendDiagnosticSnapshot => scoped(emptySnapshot(backend, "timeout"));
+  // Borrowed pool counters are local observations, independent of a new remote
+  // probe succeeding or acquiring a connection. Capture them before any await.
+  let borrowedPool: BackendDiagnosticPool | undefined;
+  if (backend === "postgresql" && options.storageFactory !== undefined) {
+    const factory = options.storageFactory as StorageBackendFactory & {
+      getDiagnosticPool?: () => ReturnType<BackendDiagnosticRuntime["poolDiagnostics"]> | undefined;
+    };
+    try { borrowedPool = safePool(factory.getDiagnosticPool?.(), "daemon"); }
+    catch { borrowedPool = { origin: "daemon", status: "unverified" }; }
+  }
+  const timeoutSnapshot = (): BackendDiagnosticSnapshot => {
+    const snapshot = scoped(emptySnapshot(backend, "timeout"));
+    if (borrowedPool !== undefined) {
+      // A timed-out remote probe cannot authenticate publication for the local
+      // facts. Recheck the bounded synchronous witness before returning them.
+      try {
+        if (dependencies.observePublication(options.homeDir).witness !== before.witness) {
+          return scoped(backendDiagnosticFailure(new BackendPublicationJournalError("unexpected-state", "Diagnostic publication changed."), backend));
+        }
+      } catch (error) { return scoped(backendDiagnosticFailure(error, backend)); }
+      snapshot.publication = "ready";
+      snapshot.pool = borrowedPool;
+    }
+    return snapshot;
+  };
   if (options.signal?.aborted || performance.now() >= deadline) return timeoutSnapshot();
   const abort = (): void => { controller.abort(); close(); };
   options.signal?.addEventListener("abort", abort, { once: true });
   let timer: ReturnType<typeof setTimeout>;
+  let onTimeout: () => void;
   const aborted = new Promise<BackendDiagnosticSnapshot>(resolve => {
-    controller.signal.addEventListener("abort", () => resolve(timeoutSnapshot()), {once:true});
+    onTimeout = () => resolve(timeoutSnapshot());
+    controller.signal.addEventListener("abort", onTimeout, {once:true});
     timer = setTimeout(abort, Math.max(0, deadline - performance.now()));
   });
   const work = withDiagnosticSqliteSession(controller.signal, async (): Promise<BackendDiagnosticSnapshot> => {
     const snapshot = scoped(emptySnapshot(backend, "unavailable"));
     snapshot.publication = "ready";
+    if (borrowedPool !== undefined) snapshot.pool = borrowedPool;
     if (before.machineId !== null && normalizeUuidV7(before.machineId) === before.machineId) snapshot.identity = { status: "ready", machineId: before.machineId };
     else if (backend === "sqlite" && before.machineId === null) snapshot.identity = { status: "not-applicable" };
     try {
@@ -229,8 +256,7 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
         snapshot.tls = health.tls === true ? "ready" : "unavailable";
         snapshot.extensions = health.extensions === undefined ? "unverified" : areRequiredPostgreSqlExtensionsReady(health.extensions) ? "ready" : "unavailable";
         snapshot.search = health.searchConfiguration === undefined ? "unverified" : health.searchConfiguration.ready ? "ready" : "unavailable";
-        const daemonPool = options.storageFactory as (StorageBackendFactory & { getDiagnosticPool?: () => ReturnType<BackendDiagnosticRuntime["poolDiagnostics"]> | undefined }) | undefined;
-        snapshot.pool = daemonPool === undefined ? safePool(runtime.poolDiagnostics(), "diagnostic-probe") : safePool(daemonPool.getDiagnosticPool?.(), "daemon");
+        snapshot.pool = borrowedPool ?? safePool(runtime.poolDiagnostics(), "diagnostic-probe");
         if (health.status !== "healthy" && health.status !== "degraded") throw health.error;
         const metrics = await dependencies.readMetrics(runtime, controller.signal, selectedProjectId);
         if (controller.signal.aborted) return timeoutSnapshot();
@@ -269,5 +295,10 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
     return snapshot;
   });
   try { return await Promise.race([work, aborted]); }
-  finally { clearTimeout(timer!); options.signal?.removeEventListener("abort", abort); controller.abort(); close(); }
+  finally {
+    clearTimeout(timer!);
+    options.signal?.removeEventListener("abort", abort);
+    controller.signal.removeEventListener("abort", onTimeout!);
+    controller.abort(); close();
+  }
 }

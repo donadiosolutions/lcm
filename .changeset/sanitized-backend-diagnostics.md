@@ -9,3 +9,5 @@ Make doctor observational throughout: it no longer starts or restarts the daemon
 Show the same complete, safe readiness fields and fixed next actions across diagnostic text output, including failure snapshots. Distinguish aggregate and selected project scope with admitted UUIDs/local hashes, keep unknown selections unavailable, and report absent SQLite machine identity as not applicable without requiring registration.
 
 Reuse one bounded SQLite diagnostic child across projects and sidecars, preserving the whole-snapshot deadline. Keep an authenticated daemon reported as up when its status request fails, and identify the subsequent local diagnostic observation.
+
+Preserve independently observed daemon pool counts and the failure latch when the remote diagnostic probe times out or fails, after reauthenticating publication and configuration. Keep the backend failure classification and recovery action distinct from pool-count availability.

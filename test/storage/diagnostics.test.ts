@@ -272,3 +272,67 @@ it('preserves selected scope without identifiers after stale publication and pre
   const controller=new AbortController();controller.abort();
   expect(await collectBackendDiagnostics({_dependencies:dependencies,projectId:machineId,signal:controller.signal})).toMatchObject({classification:'timeout',project:{scope:'selected',status:'unverified'}});
 });
+
+
+describe('independent borrowed daemon pool observation', () => {
+  const pool = {configuredMax:8,total:4,idle:2,waiting:1,failed:true};
+  it.each(['acquisition-stall','health-stall','acquisition-failure','health-failure'] as const)('retains authenticated pool counters during %s', async mode => {
+    const {dependencies,runtime}=fixture();
+    const getDiagnosticPool=vi.fn(()=>pool); const close=vi.fn();
+    if (mode==='acquisition-stall') dependencies.createRuntime=vi.fn(()=>new Promise(()=>{}));
+    if (mode==='health-stall') runtime.health=vi.fn(()=>new Promise(()=>{}));
+    if (mode==='acquisition-failure') dependencies.createRuntime=vi.fn(()=>{throw new Error('private connection');});
+    if (mode==='health-failure') runtime.health=vi.fn(async()=>{throw new Error('private connection');});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,_deadlineMs:10,
+      storageFactory:{backend:'postgresql',getDiagnosticPool,close} as never});
+    expect(result).toMatchObject({classification:mode.endsWith('stall')?'timeout':'unavailable',
+      pool:{origin:'daemon',status:'ready',...pool}});
+    expect(result.metrics).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain('private');
+    expect(getDiagnosticPool).toHaveBeenCalledOnce();
+    expect(getDiagnosticPool.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(dependencies.createRuntime).mock.invocationCallOrder[0]);
+    expect(dependencies.observePublication).toHaveBeenCalledTimes(2);
+    expect(close).not.toHaveBeenCalled();
+  });
+  it.each(['changed','refused'] as const)('discards the borrowed pool when publication is %s at timeout', async mode => {
+    const {dependencies,observation,runtime}=fixture();
+    runtime.health=()=>new Promise(()=>{});
+    dependencies.observePublication=vi.fn().mockReturnValueOnce(observation).mockImplementation(()=>{
+      if(mode==='refused') throw new BackendPublicationJournalError('unexpected-state','private authority');
+      return {...observation,witness:'changed'};
+    });
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,_deadlineMs:10,
+      storageFactory:{backend:'postgresql',getDiagnosticPool:()=>pool} as never});
+    expect(result).toMatchObject({classification:'stale-publication',publication:'unavailable',pool:{status:'unverified'}});
+    expect(result.pool.total).toBeUndefined();
+    expect(result.metrics).toBeUndefined();
+  });
+  it('does not inspect an incompatible factory pool', async()=>{
+    const {dependencies}=fixture(); const getDiagnosticPool=vi.fn(()=>pool);
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,
+      storageFactory:{backend:'sqlite',getDiagnosticPool} as never});
+    expect(result).toMatchObject({classification:'stale-publication',pool:{status:'unverified'}});
+    expect(getDiagnosticPool).not.toHaveBeenCalled();
+  });
+  it('does not retain a borrowed pool after ordinary failed-probe publication drift', async()=>{
+    const {dependencies,observation,runtime}=fixture();
+    runtime.health=async()=>{throw new Error('private connection');};
+    dependencies.observePublication=vi.fn().mockReturnValueOnce(observation).mockReturnValue({...observation,witness:'changed'});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,
+      storageFactory:{backend:'postgresql',getDiagnosticPool:()=>pool} as never});
+    expect(result).toMatchObject({classification:'stale-publication',pool:{status:'unverified'}});
+    expect(result.pool.total).toBeUndefined();
+  });
+});
+
+it.each(['absent','throws','invalid'] as const)('keeps unavailable borrowed telemetry honest when getter is %s', async mode=>{
+  const {dependencies,runtime}=fixture();runtime.health=()=>new Promise(()=>{});
+  const factory={backend:'postgresql', ...(mode==='absent'?{}:{getDiagnosticPool:()=>{
+    if(mode==='throws') throw new Error('private pool');
+    return {configuredMax:8,total:NaN,idle:0,waiting:0,failed:false};
+  }})} as never;
+  const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:factory,_deadlineMs:10});
+  expect(result).toMatchObject({classification:'timeout',pool:{origin:'daemon',status:'unverified'}});
+  expect(result.pool.total).toBeUndefined();
+  expect(JSON.stringify(result)).not.toContain('private');
+});

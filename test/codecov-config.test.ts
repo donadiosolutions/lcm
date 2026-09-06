@@ -603,6 +603,7 @@ describe("Codecov configuration", () => {
       ["src/db/event-sidecars.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"],
+      // #619 retained daemon pool observations stay diagnostics-owned.
       ["src/storage/diagnostics.ts", "unit-diagnostics"],
       ["src/storage/diagnostic-renderer.ts", "unit-diagnostics"],
       ["src/storage/diagnostic-project.ts", "unit-diagnostics"],
