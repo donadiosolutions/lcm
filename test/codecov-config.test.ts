@@ -94,6 +94,7 @@ const expectedComponents = [
       "^src/daemon/orientation\\.ts$",
       "^src/daemon/project-queue\\.ts$",
       "^src/daemon/project\\.ts$",
+      // Monotonic proxy startup polling remains daemon-core-owned.
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
       // Error sanitization, including #893 adjacent-path redaction, remains daemon-core-owned.
