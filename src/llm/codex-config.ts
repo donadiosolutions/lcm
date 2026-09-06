@@ -4,6 +4,7 @@ import { DEFAULT_LLM_REQUEST_TIMEOUT_MS } from "../daemon/config.js";
 import { createAbortError, throwIfAborted } from "../daemon/cancellation.js";
 import {
   createOwnedProcessTeardown,
+  createFriendlyMissingCodexError,
   normalizeProcessBirthTime,
   type ProviderProcessWitness,
   type ProviderProcessWitnessStore,
@@ -126,6 +127,7 @@ export async function resolveCodexOpenAIBaseUrl(
   throwIfAborted(signal);
   const spawn = options.spawn ?? defaultSpawn;
   const timeoutMs = options.timeoutMs ?? DEFAULT_LLM_REQUEST_TIMEOUT_MS;
+  const missingExecutableError = createFriendlyMissingCodexError();
   let child: ChildProcessWithoutNullStreams;
   try {
     child = spawn("codex", [...CODEX_APP_SERVER_ARGS], {
@@ -133,7 +135,10 @@ export async function resolveCodexOpenAIBaseUrl(
       env: options.env ?? process.env,
       detached: (options.platform ?? process.platform) !== "win32",
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && (error as { code?: unknown }).code === "ENOENT") {
+      throw missingExecutableError;
+    }
     throw resolutionError();
   }
 
@@ -209,7 +214,12 @@ export async function resolveCodexOpenAIBaseUrl(
         timedOut = true;
         settle(resolutionError());
       }, timeoutMs);
-      child.once("error", () => settle(resolutionError()));
+      child.once("error", (error: unknown) => {
+        const reason = error instanceof Error && (error as { code?: unknown }).code === "ENOENT"
+          ? missingExecutableError
+          : resolutionError();
+        settle(reason);
+      });
       child.stdin.on("error", () => settle(resolutionError()));
       void (async () => {
         try {
@@ -267,6 +277,7 @@ export async function resolveCodexOpenAIBaseUrl(
     const reason = aborted ? "abort" : timedOut ? "timeout" : "close";
     teardownSettled = await teardown.terminate(reason);
     if (aborted) throw createAbortError(signal?.reason);
+    if (error === missingExecutableError) throw missingExecutableError;
     throw resolutionError();
   } finally {
     if (timeoutTimer !== undefined) (options.clearTimeout ?? clearTimeout)(timeoutTimer);

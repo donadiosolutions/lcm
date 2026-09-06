@@ -110,6 +110,12 @@ function childWithForcedGroupCleanup(configValue: unknown): {
 }
 
 describe("resolveCodexOpenAIBaseUrl", () => {
+  const missingCodexMessage = [
+    "Codex CLI is not installed or not on PATH.",
+    "Install it first, for example: npm install -g @openai/codex",
+    "Then run lcm again.",
+  ].join("\n");
+
   it("covers strict framing and URL normalization edges", () => {
     const utils = __codexConfigTestUtils;
     expect(utils.normalizeConfiguredUrl(undefined)).toBeUndefined();
@@ -193,6 +199,116 @@ describe("resolveCodexOpenAIBaseUrl", () => {
       vi.doUnmock("node:child_process");
       vi.resetModules();
     }
+  });
+
+  it("returns the friendly diagnostic for a synchronous missing Codex spawn", async () => {
+    const missing = Object.assign(new Error("spawn codex ENOENT secret"), { code: "ENOENT" });
+    await expect(resolveCodexOpenAIBaseUrl({
+      spawn: vi.fn(() => { throw missing; }) as never,
+    })).rejects.toMatchObject({ message: missingCodexMessage });
+  });
+
+  it("keeps non-Error ENOENT-shaped spawn failures generic", async () => {
+    await expect(resolveCodexOpenAIBaseUrl({
+      spawn: vi.fn(() => { throw { code: "ENOENT" }; }) as never,
+    })).rejects.toThrow("codex endpoint resolution failed");
+    const child = hangingChild();
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+    });
+    child.emit("error", { code: "ENOENT" });
+    await expect(pending).rejects.toThrow("codex endpoint resolution failed");
+  });
+
+  it("returns the friendly diagnostic for an asynchronous missing Codex spawn", async () => {
+    const child = hangingChild();
+    const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/witness" };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      daemonInstanceId: "daemon",
+      witnessStore,
+    });
+    child.emit("error", Object.assign(new Error("spawn codex ENOENT secret"), { code: "ENOENT" }));
+    await expect(pending).rejects.toMatchObject({ message: missingCodexMessage });
+    expect(witnessStore.add).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledOnce();
+    expect(witnessStore.remove).toHaveBeenCalledWith(witnessStore.add.mock.calls[0]?.[0]);
+  });
+
+  it("preserves a generic protocol winner when a late child ENOENT arrives", async () => {
+    const child = hangingChild();
+    child.kill.mockImplementation(() => {
+      child.emit("error", Object.assign(new Error("late spawn ENOENT secret"), { code: "ENOENT" }));
+      child.emit("close", null);
+      return true;
+    });
+    child.stdin.write = () => {
+      throw Object.assign(new Error("protocol ENOENT secret"), { code: "ENOENT" });
+    };
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+    });
+    await expect(pending).rejects.toThrow("codex endpoint resolution failed");
+  });
+
+  it("preserves a timeout winner when a late child ENOENT arrives", async () => {
+    const child = hangingChild();
+    child.kill.mockImplementation(() => {
+      child.emit("error", Object.assign(new Error("late spawn ENOENT secret"), { code: "ENOENT" }));
+      child.emit("close", null);
+      return true;
+    });
+    let timeout: (() => void) | undefined;
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+      timeoutMs: 10,
+      setTimeout: vi.fn((callback: () => void) => {
+        timeout = callback;
+        return 1 as never;
+      }) as never,
+      clearTimeout: vi.fn(),
+    });
+    await vi.waitFor(() => expect(timeout).toBeTypeOf("function"));
+    timeout?.();
+    await expect(pending).rejects.toThrow("codex endpoint resolution failed");
+  });
+
+  it("lets abort win when it arrives during missing Codex teardown", async () => {
+    const controller = new AbortController();
+    const child = hangingChild();
+    child.kill.mockImplementation(() => {
+      controller.abort("during teardown");
+      child.emit("close", null);
+      return true;
+    });
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+    }, controller.signal);
+    child.emit("error", Object.assign(new Error("spawn codex ENOENT secret"), { code: "ENOENT" }));
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("keeps abort precedence when a late missing Codex error follows cancellation", async () => {
+    const controller = new AbortController();
+    const child = hangingChild();
+    const pending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(child),
+      platform: "win32",
+      processBirthTime: () => "birth",
+    }, controller.signal);
+    controller.abort("cancelled");
+    child.emit("error", Object.assign(new Error("late spawn codex ENOENT secret"), { code: "ENOENT" }));
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
   });
 
   it("returns undefined when the merged config has no override", async () => {
@@ -409,6 +525,30 @@ describe("resolveCodexOpenAIBaseUrl", () => {
     const pending = resolveCodexOpenAIBaseUrl({ spawn: spawnFor(child), processBirthTime: () => "birth" });
     child.stdin.emit("error", Object.assign(new Error("EPIPE secret"), { code: "EPIPE" }));
     await expect(pending).rejects.toThrow("codex endpoint resolution failed");
+  });
+
+  it("keeps ENOENT-shaped stdin and protocol failures generic", async () => {
+    const stdinFailure = hangingChild();
+    const stdinPending = resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(stdinFailure),
+      platform: "win32",
+      processBirthTime: () => "birth",
+    });
+    stdinFailure.stdin.emit("error", Object.assign(new Error("stdin ENOENT secret"), { code: "ENOENT" }));
+    await expect(stdinPending).rejects.toThrow("codex endpoint resolution failed");
+
+    const protocolFailure = hangingChild();
+    protocolFailure.stdout = {
+      async *[Symbol.asyncIterator]() {
+        throw Object.assign(new Error("protocol ENOENT secret"), { code: "ENOENT" });
+      },
+    } as never;
+    await expect(resolveCodexOpenAIBaseUrl({
+      spawn: spawnFor(protocolFailure),
+      platform: "win32",
+      processBirthTime: () => "birth",
+    }))
+      .rejects.toThrow("codex endpoint resolution failed");
   });
 
   it("fails closed when config/read framing throws asynchronously", async () => {
