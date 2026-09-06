@@ -28,6 +28,7 @@ const options: Parameters<MemoryApi["search"]>[1] = {
   projectId: "project",
   layers: ["promoted"],
   cwd: "/tmp/project",
+  tags: ["decision"],
 };
 
 void created.search("query", options);

@@ -84,6 +84,7 @@ type DescriptorProbeOptions = Readonly<{
   readonly openErrorCode?: "EACCES" | "ENOTDIR" | "ELOOP";
   readonly openFailure?: Readonly<{ path: string; error: NodeJS.ErrnoException }>;
   readonly realpathFailure?: Readonly<{ path: string; error: NodeJS.ErrnoException }>;
+  readonly closeFailure?: Readonly<{ path: string; error: Error }>;
   readonly validationFailure?: boolean;
 }>;
 
@@ -95,6 +96,7 @@ async function observeConsumerDescriptorLifetimes(
   options: DescriptorProbeOptions = {},
 ): Promise<Readonly<{
   readonly injected: boolean;
+  readonly closeFailureInjected: boolean;
   readonly unrelatedDelegated: boolean;
   readonly error: unknown;
   readonly lifetimes: readonly DescriptorLifetime[];
@@ -109,6 +111,7 @@ async function observeConsumerDescriptorLifetimes(
   const lifetimes: DescriptorLifetime[] = [];
   let nextId = 0;
   let injected = false;
+  let closeFailureInjected = false;
   let unrelatedDelegated = false;
   let error: unknown;
   const targetPaths = new Set([root, publication]);
@@ -140,6 +143,14 @@ async function observeConsumerDescriptorLifetimes(
       if (lifetime !== undefined) {
         lifetime.closed = true;
         live.delete(fd);
+      }
+      if (
+        options.closeFailure !== undefined
+        && lifetime?.path === options.closeFailure.path
+        && !closeFailureInjected
+      ) {
+        closeFailureInjected = true;
+        throw options.closeFailure.error;
       }
       return result;
     }) as never;
@@ -179,7 +190,7 @@ async function observeConsumerDescriptorLifetimes(
     syncBuiltinESMExports();
     for (const lifetime of outstanding) originalClose(lifetime.fd);
   }
-  return { injected, unrelatedDelegated, error, lifetimes };
+  return { injected, closeFailureInjected, unrelatedDelegated, error, lifetimes };
 }
 
 afterEach(() => {
@@ -297,6 +308,31 @@ describe("backend publication consumer admission", () => {
       expect.objectContaining({ closed: true }),
     ]);
     expect(observed.lifetimes.filter(({ path }) => path === backendPublicationDirectory(home))).toEqual([]);
+  });
+
+  it("fails closed when root authentication and descriptor cleanup both fail", async () => {
+    const home = makeHome();
+    const root = join(home, ".lcm");
+    const authenticationFailure = new Error("injected root authentication failure") as NodeJS.ErrnoException;
+    authenticationFailure.code = "ENOENT";
+    const cleanupFailure = new Error("injected root descriptor cleanup failure");
+    const observed = await observeConsumerDescriptorLifetimes(home, () => {
+      const handle = openBackendPublicationReadRoot(home);
+      handle?.close();
+    }, {
+      realpathFailure: { path: root, error: authenticationFailure },
+      closeFailure: { path: root, error: cleanupFailure },
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(observed.closeFailureInjected).toBe(true);
+    expect(observed.error).toMatchObject({
+      name: "BackendPublicationJournalError",
+      reason: "unsafe-storage",
+    });
+    expect(observed.lifetimes.filter(({ path }) => path === root)).toEqual([
+      expect.objectContaining({ closed: true }),
+    ]);
   });
 
   it.each([

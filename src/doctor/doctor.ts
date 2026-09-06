@@ -265,7 +265,7 @@ const PUBLICATION_CONVERGENCE_POLL_MS = 50;
  */
 type ConvergenceDaemonIdentity = Readonly<{
   pid: number;
-  version: string | undefined;
+  version: string;
   storageBackend: "sqlite" | "postgresql";
   entrypoint: string | undefined;
   runtimeDigest: string;
@@ -311,6 +311,8 @@ function expectedConvergenceIdentity(
 ): ConvergenceDaemonIdentity | undefined {
   if (
     initialHealthPid === undefined
+    || expectedVersion === undefined
+    || expectedVersion.trim() === ""
     || expectedRuntimeDigest === undefined
     || (config.storageBackend !== "sqlite" && config.storageBackend !== "postgresql")
   ) return undefined;
