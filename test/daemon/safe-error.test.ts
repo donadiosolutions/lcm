@@ -867,6 +867,33 @@ describe("sanitizeError", () => {
   });
 
   it.each([
+    ['file://host"name/Users/canary/private.db', 'file://host"name<path>'],
+    ['file://host"name\\Users\\canary\\private.db', 'file://host"name<path>'],
+    ['file://host"name/C:/Users/canary/private.db', 'file://host"name<path>'],
+    ['FILE://host"name/Users/canary/private.db', 'FILE://host"name<path>'],
+    ['file://host"name"part/Users/canary/private.db', 'file://host"name"part<path>'],
+    [
+      '\'file://host"name/Users/canary/My Files/private.db\'',
+      '\'file://host"name<path>\'',
+    ],
+    ['file://host"name/b', 'file://host"name<path>'],
+    ['file://host"name/', 'file://host"name/'],
+    [
+      'https://outer.test/x?next=file://host"name/path',
+      'https://outer.test/x?next=file://host"name<path>',
+    ],
+    [
+      'file://host"na?x=/Users/canary/private.db',
+      'file://host"na?x=<path>',
+    ],
+  ] as const)("redacts embedded double quotes within file URL authorities: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
     ["xfile:///Users/canary/private.db", "xfile://<path>"],
     ["profile://localhost/Users/canary/private.db", "profile://localhost<path>"],
     ["xfile://remote.invalid/Users/canary/private.db", "xfile://remote.invalid/Users/canary/private.db"],
@@ -936,7 +963,11 @@ describe("sanitizeError", () => {
     ],
     [
       'file://host"name/Users/canary/private.db',
-      'file://host"name/Users/canary/private.db',
+      'file://host"name<path>',
+    ],
+    [
+      '"file://host"name/Users/canary/private.db"',
+      '"file://host"name/Users/canary/private.db"',
     ],
     [
       "https://host;name/Users/canary/private.db",

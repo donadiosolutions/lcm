@@ -82,8 +82,9 @@ component_management:
         # Monotonic proxy startup polling remains daemon-core-owned.
         - "^src/daemon/proxy-manager\\.ts$"
         - "^src/daemon/remediation\\.ts$"
-        # Error sanitization, including #893 adjacent-path and #903 prefixed
-        # nested-file redaction, remains daemon-core-owned.
+        # Error sanitization, including #893 adjacent-path, #903 prefixed
+        # nested-file, and #924 embedded-quote file-authority redaction, remains
+        # daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -156,6 +157,8 @@ component_management:
         # across journal, evidence, and terminal recovery-material reads.
         # #844 extends the coordinator's locked evidence/material reads with
         # one operation-scoped directory witness and a fail-closed return check.
+        # #942 binds every coordinator checkpoint read and write boundary to
+        # that retained operation-scoped directory witness.
         # #837 retains consumer-admission descriptor cleanup in this owner.
         # #906 keeps bounded publication-convergence probe expiry and error
         # selection in this storage-abstractions owner.

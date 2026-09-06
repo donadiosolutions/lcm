@@ -303,6 +303,23 @@ async function withTemporaryReboundPublicationMaterial(
   return { injected, restored, error };
 }
 
+function rebindPublicationDirectoryWithEvidence(home: string): Readonly<{
+  originalDirectory: string;
+  journal: Buffer | undefined;
+}> {
+  const directory = backendPublicationDirectory(home);
+  const originalDirectory = `${directory}.checkpoint-original`;
+  const journalPath = backendPublicationJournalPath(home);
+  const journal = existsSync(journalPath) ? readFileSync(journalPath) : undefined;
+  renameSync(directory, originalDirectory);
+  mkdirSync(directory, { mode: 0o700 });
+  for (const name of ["journal.json", "publication-1.material"]) {
+    const source = join(originalDirectory, name);
+    if (existsSync(source)) writeFileSync(join(directory, name), readFileSync(source), { mode: 0o600 });
+  }
+  return { originalDirectory, journal };
+}
+
 function inputFor(materialInput: BackendPublicationRecoveryMaterial) {
   return {
     publicationId: "publication-1",
@@ -514,6 +531,180 @@ async function expectMaterialReadFailure(
 }
 
 describe("BackendPublicationCoordinator", () => {
+  it.each([
+    { boundary: "before-journal-read", operation: "prepare" },
+    { boundary: "before-journal-write", operation: "prepare" },
+    { boundary: "after-material-authenticate", operation: "prepare-post-auth" },
+    { boundary: "before-journal-read", operation: "resume" },
+    { boundary: "before-journal-write", operation: "abort" },
+    { boundary: "before-journal-read", operation: "recover" },
+    { boundary: "before-journal-write", operation: "awaited-local" },
+  ] as const)(
+    "rejects a $operation directory rebind at $boundary before checkpoint mutation",
+    async ({ boundary, operation }) => {
+      let home: string;
+      let fake: ReturnType<typeof makeDriver>;
+      if (operation === "prepare" || operation === "prepare-post-auth") {
+        home = makeHome();
+        fake = makeDriver(material());
+      } else if (operation === "resume" || operation === "abort") {
+        ({ home, fake } = await preparedFixture());
+      } else if (operation === "recover") {
+        ({ home, fake } = await coordinatorDriftFixture("preparing"));
+      } else {
+        ({ home, fake } = await coordinatorDriftFixture("guarded"));
+      }
+      const mutationsBefore = [...fake.calls];
+      const observationsBefore = vi.mocked(fake.driver.observeLocalState).mock.calls.length;
+      let rebound: ReturnType<typeof rebindPublicationDirectoryWithEvidence> | undefined;
+      const active = coordinator(home, fake.driver, (event) => {
+        if (rebound === undefined && event === boundary) {
+          rebound = rebindPublicationDirectoryWithEvidence(home);
+        }
+      });
+
+      const action = operation === "prepare" || operation === "prepare-post-auth"
+        ? active.prepare(inputFor(material()))
+        : operation === "abort"
+          ? active.abort()
+          : operation === "recover"
+            ? active.recoverPending()
+            : active.resume();
+      await expect(action).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: "backend publication directory changed during journal checkpoint: private directory changed during validation",
+      });
+
+      expect(rebound).toBeDefined();
+      const replacementJournalPath = backendPublicationJournalPath(home);
+      const originalJournalPath = join(rebound!.originalDirectory, "journal.json");
+      if (rebound!.journal === undefined) {
+        expect(existsSync(originalJournalPath)).toBe(false);
+        expect(existsSync(replacementJournalPath)).toBe(false);
+      } else {
+        expect(readFileSync(originalJournalPath)).toEqual(rebound!.journal);
+        expect(readFileSync(replacementJournalPath)).toEqual(rebound!.journal);
+      }
+      expect(fake.calls).toEqual(mutationsBefore);
+      expect(vi.mocked(fake.driver.observeLocalState).mock.calls.length).toBe(
+        observationsBefore + (operation === "awaited-local" ? 1 : operation.startsWith("prepare") ? 1 : 0),
+      );
+    },
+  );
+
+  it.each(["dev", "ino"] as const)(
+    "binds a checkpoint CAS read to the retained directory parent %s",
+    async (field) => {
+    const { home, fake } = await preparedFixture();
+    const directory = backendPublicationDirectory(home);
+    const journalPath = backendPublicationJournalPath(home);
+    const journalBefore = readFileSync(journalPath);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; ino: bigint; [key: string]: unknown };
+    let journalOpens = 0;
+    let injected = false;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === journalPath) journalOpens += 1;
+      return fd;
+    }) as never, async () => withPatchedFsAsync("statSync", ((
+      path: string,
+      options?: { bigint?: boolean },
+    ) => {
+      const observed = originalStat(path, options);
+      if (!injected && journalOpens === 2 && path === directory && options?.bigint === true) {
+        injected = true;
+        return { ...observed, [field]: observed[field] + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver).resume()).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: "backend publication journal parent does not match the retained checkpoint directory",
+      });
+    }));
+
+    expect(injected).toBe(true);
+    expect(readFileSync(journalPath)).toEqual(journalBefore);
+    expect(fake.calls).toEqual([]);
+    },
+  );
+
+  it.each(["dev", "ino", "gid"] as const)(
+    "rejects coherent checkpoint %s drift from the retained witness",
+    async (field) => {
+    const { home, fake } = await preparedFixture();
+    const directory = backendPublicationDirectory(home);
+    const journalPath = backendPublicationJournalPath(home);
+    const journalBefore = readFileSync(journalPath);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalFstat = nodeFs.fstatSync as (
+      fd: number,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; ino: bigint; mode: bigint; uid: bigint; gid: bigint; [key: string]: unknown };
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; ino: bigint; mode: bigint; uid: bigint; gid: bigint; [key: string]: unknown };
+    let directoryOpens = 0;
+    let operationFd: number | undefined;
+    let driftActive = false;
+    let descriptorInjected = false;
+    let pathInjected = false;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === directory) {
+        directoryOpens += 1;
+        if (directoryOpens === 2) operationFd = fd;
+      }
+      return fd;
+    }) as never, async () => withPatchedFsAsync("fstatSync", ((
+      fd: number,
+      options?: { bigint?: boolean },
+    ) => {
+      const observed = originalFstat(fd, options);
+      if (driftActive && fd === operationFd && options?.bigint === true) {
+        descriptorInjected = true;
+        return Object.assign(observed, { [field]: observed[field] + 1n });
+      }
+      return observed;
+    }) as never, async () => withPatchedFsAsync("statSync", ((
+      path: string,
+      options?: { bigint?: boolean },
+    ) => {
+      const observed = originalStat(path, options);
+      if (driftActive && path === directory && options?.bigint === true) {
+        pathInjected = true;
+        return Object.assign(observed, { [field]: observed[field] + 1n });
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver, (event) => {
+        if (event === "before-journal-read") driftActive = true;
+      }).resume()).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: "backend publication directory changed during journal checkpoint: private directory identity changed",
+      });
+    })));
+
+    expect(operationFd).toBeDefined();
+    expect(descriptorInjected).toBe(true);
+    expect(pathInjected).toBe(true);
+    expect(readFileSync(journalPath)).toEqual(journalBefore);
+    expect(fake.calls).toEqual([]);
+    },
+  );
+
   it("rejects material whose parent identity diverges from the coordinator witness", async () => {
     const home = makeHome();
     const input = material();

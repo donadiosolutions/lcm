@@ -1985,42 +1985,59 @@ export async function withBackendPublicationPermit<T>(
 
 function writeJournal(
   journal: BackendPublicationJournal,
+  directoryHandle: BackendPublicationDirectoryHandle,
   homeDir: string | undefined,
   observer: BackendPublicationObserver,
   expectedChecksum?: string,
 ): void {
-  ensurePublicationDirectory(homeDir);
+  const directory = backendPublicationDirectory(homeDir);
   const path = backendPublicationJournalPath(homeDir);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
   observer("before-journal-read", path);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
   const current = (() => {
     try {
-      const raw = readBoundedRegularFileWithStat(path, {
-        allowedRoot: backendPublicationDirectory(homeDir),
+      const observed = readBoundedRegularFileWithStat(path, {
+        allowedRoot: directory,
         maxBytes: MAX_JOURNAL_BYTES,
         expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
         allowedModes: [0o600],
         requireSingleLink: true,
-      }).content;
-      return { raw, journal: parseJournal(raw) };
+      });
+      if (
+        observed.parentDev !== directoryHandle.witness.dev
+        || observed.parentIno !== directoryHandle.witness.ino
+      ) {
+        return fail(
+          "unsafe-storage",
+          "backend publication journal parent does not match the retained checkpoint directory",
+        );
+      }
+      return observed.content;
     } catch (error) {
       if (isMissing(error)) return null;
       throw error;
     }
   })();
-  if (expectedChecksum !== undefined && (current === null || current.journal.checksumSha256 !== expectedChecksum)) {
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
+  const parsed = current === null ? null : parseJournal(current);
+  if (expectedChecksum !== undefined && (parsed === null || parsed.checksumSha256 !== expectedChecksum)) {
     return fail("unexpected-state", "backend publication journal changed before update");
   }
-  if (expectedChecksum === undefined && current !== null) {
+  if (expectedChecksum === undefined && parsed !== null) {
     return fail("unresolved-publication", "backend publication journal already exists");
   }
   observer("before-journal-write", path);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
   // The checksum check is journal-protocol admission under its lock; the
   // generic durable helper performs unconditional publication when present.
   atomicWritePrivateFileDurable(path, journalContent(journal), {
     requireAbsent: expectedChecksum === undefined,
     maxExistingBytes: MAX_JOURNAL_BYTES,
   });
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
   observer("after-journal-write", path);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
 }
 
 function archiveTerminalJournal(
@@ -2239,6 +2256,30 @@ function assertBackendPublicationMaterialDirectory(
   }
 }
 
+function assertBackendPublicationCheckpointDirectory(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+): void {
+  try {
+    const observed = assertPrivateDirectory(
+      directoryHandle,
+      backendPublicationDirectory(homeDir),
+    );
+    if (
+      observed.dev !== directoryHandle.witness.dev
+      || observed.ino !== directoryHandle.witness.ino
+      || observed.gid !== directoryHandle.witness.gid
+    ) {
+      throw new Error("private directory identity changed");
+    }
+  } catch (error) {
+    return fail(
+      "unsafe-storage",
+      `backend publication directory changed during journal checkpoint: ${(error as Error).message}`,
+    );
+  }
+}
+
 function authenticateMaterial(
   homeDir: string | undefined,
   journal: BackendPublicationJournal,
@@ -2327,6 +2368,7 @@ function prospectiveJournal(
 function transition(
   journal: BackendPublicationJournal,
   phase: BackendPublicationPhase,
+  directoryHandle: BackendPublicationDirectoryHandle,
   homeDir: string | undefined,
   observer: BackendPublicationObserver,
   updates: Partial<Pick<BackendPublicationJournal, "publishedConfigSha256" | "publishedProjectMapSha256" | "projects" | "recoveryReference" | "sourceState" | "targetState">> = {},
@@ -2337,7 +2379,7 @@ function transition(
     updatedAt: new Date().toISOString(),
     ...updates,
   });
-  writeJournal(next, homeDir, observer, journal.checksumSha256);
+  writeJournal(next, directoryHandle, homeDir, observer, journal.checksumSha256);
   return next;
 }
 
@@ -2409,7 +2451,7 @@ export class BackendPublicationCoordinator {
       });
       assertStateShape(observed, "observed");
       const preparing = prospectiveJournal(validated, observed, targetState, "preparing", null);
-      writeJournal(preparing, this.#homeDir, this.#observer, existing?.checksumSha256);
+      writeJournal(preparing, directoryHandle, this.#homeDir, this.#observer, existing?.checksumSha256);
       this.#observer("before-material-seal", materialPath(this.#homeDir, validated.publicationId));
       const reference = sealMaterial(this.#homeDir, validated.publicationId, validated.material);
       this.#observer("after-material-seal", materialPath(this.#homeDir, validated.publicationId));
@@ -2420,6 +2462,7 @@ export class BackendPublicationCoordinator {
       const prepared = transition(
         preparing,
         "prepared",
+        directoryHandle,
         this.#homeDir,
         this.#observer,
         { recoveryReference: reference },
@@ -2519,12 +2562,15 @@ export class BackendPublicationCoordinator {
     });
   }
 
-  async #acquireAll(journal: BackendPublicationJournal): Promise<BackendPublicationJournal> {
+  async #acquireAll(
+    journal: BackendPublicationJournal,
+    directoryHandle: BackendPublicationDirectoryHandle,
+  ): Promise<BackendPublicationJournal> {
     if (
       this.#driver.acquireRemoteGuard === undefined
       || this.#driver.readRemoteGuard === undefined
     ) {
-      return transition(journal, "guarded", this.#homeDir, this.#observer);
+      return transition(journal, "guarded", directoryHandle, this.#homeDir, this.#observer);
     }
     let current = journal;
     for (let index = 0; index < current.projects.length; index += 1) {
@@ -2537,15 +2583,19 @@ export class BackendPublicationCoordinator {
       if (fence === null || !activeFence(fence)) return fail("unexpected-state", "remote guard is not active after acquisition");
       assertFence(fence, current, project);
       const projects = current.projects.map((entry, entryIndex) => entryIndex === index ? { ...entry, fence } : entry);
-      current = transition(current, "acquiring", this.#homeDir, this.#observer, { projects });
+      current = transition(current, "acquiring", directoryHandle, this.#homeDir, this.#observer, { projects });
     }
-    return transition(current, "guarded", this.#homeDir, this.#observer);
+    return transition(current, "guarded", directoryHandle, this.#homeDir, this.#observer);
   }
 
-  async #releaseAll(journal: BackendPublicationJournal, aborting: boolean): Promise<BackendPublicationJournal> {
+  async #releaseAll(
+    journal: BackendPublicationJournal,
+    aborting: boolean,
+    directoryHandle: BackendPublicationDirectoryHandle,
+  ): Promise<BackendPublicationJournal> {
     const phase = aborting ? "abort-releasing" : "releasing" as const;
     let current = aborting
-      ? transition(journal, phase, this.#homeDir, this.#observer)
+      ? transition(journal, phase, directoryHandle, this.#homeDir, this.#observer)
       : journal;
     if (
       this.#driver.releaseRemoteGuard === undefined
@@ -2553,7 +2603,7 @@ export class BackendPublicationCoordinator {
     ) {
       return aborting
         ? current
-        : transition(current, "released", this.#homeDir, this.#observer);
+        : transition(current, "released", directoryHandle, this.#homeDir, this.#observer);
     }
     for (let index = 0; index < current.projects.length; index += 1) {
       let project = current.projects[index]!;
@@ -2570,7 +2620,7 @@ export class BackendPublicationCoordinator {
         if (authoritative.releasedAt !== null || authoritative.databaseExpired) {
           return fail("unexpected-state", "remote release fence successor is not active");
         }
-        current = transition(current, phase, this.#homeDir, this.#observer, {
+        current = transition(current, phase, directoryHandle, this.#homeDir, this.#observer, {
           projects: current.projects.map((entry, entryIndex) => entryIndex === index ? { ...entry, fence: authoritative } : entry),
         });
         project = current.projects[index]!;
@@ -2590,7 +2640,7 @@ export class BackendPublicationCoordinator {
           if (!sameFenceIdentity(persisted, authoritative) || BigInt(authoritative.fencingToken) <= BigInt(persisted.fencingToken)) {
             return fail("unexpected-state", "remote release reacquisition did not advance the fence");
           }
-          current = transition(current, phase, this.#homeDir, this.#observer, {
+          current = transition(current, phase, directoryHandle, this.#homeDir, this.#observer, {
             projects: current.projects.map((entry, entryIndex) => entryIndex === index ? { ...entry, fence: authoritative } : entry),
           });
           project = current.projects[index]!;
@@ -2606,13 +2656,13 @@ export class BackendPublicationCoordinator {
       if (!sameFenceIdentity(persisted, authoritative) || BigInt(authoritative.fencingToken) < BigInt(persisted.fencingToken)) {
         return fail("unexpected-state", "remote release fence generation changed");
       }
-      current = transition(current, phase, this.#homeDir, this.#observer, {
+      current = transition(current, phase, directoryHandle, this.#homeDir, this.#observer, {
         projects: current.projects.map((entry, entryIndex) => entryIndex === index ? { ...entry, fence: authoritative } : entry),
       });
     }
     return aborting
-      ? transition(current, "abort-releasing", this.#homeDir, this.#observer)
-      : transition(current, "released", this.#homeDir, this.#observer);
+      ? transition(current, "abort-releasing", directoryHandle, this.#homeDir, this.#observer)
+      : transition(current, "released", directoryHandle, this.#homeDir, this.#observer);
   }
 
   async #publishMap(
@@ -2622,20 +2672,20 @@ export class BackendPublicationCoordinator {
     const context = await this.#materialContext(journal, directoryHandle);
     const observed = await this.#observe(context);
     if (logicalWitnessMatches(observed.projectMap, journal.targetState.projectMap)) {
-      return transition(journal, "map-published", this.#homeDir, this.#observer, {
+      return transition(journal, "map-published", directoryHandle, this.#homeDir, this.#observer, {
         publishedProjectMapSha256: journal.intendedProjectMapSha256,
         targetState: { ...journal.targetState, projectMap: observed.projectMap },
       });
     }
     if (journal.phase === "map-publishing" && mutationWitnessMatches(observed.projectMap, journal.targetState.projectMap)) {
-      return transition(journal, "map-published", this.#homeDir, this.#observer, {
+      return transition(journal, "map-published", directoryHandle, this.#homeDir, this.#observer, {
         publishedProjectMapSha256: journal.intendedProjectMapSha256,
         targetState: { ...journal.targetState, projectMap: observed.projectMap },
       });
     }
     assertLogicalWitness(observed.projectMap, journal.sourceState.projectMap, "source project map");
     const publishing = journal.phase === "guarded"
-      ? transition(journal, "map-publishing", this.#homeDir, this.#observer)
+      ? transition(journal, "map-publishing", directoryHandle, this.#homeDir, this.#observer)
       : journal;
     await this.#mutate(
       { ...context, journal: publishing },
@@ -2646,7 +2696,7 @@ export class BackendPublicationCoordinator {
     );
     const after = await this.#observe({ ...context, journal: publishing });
     assertContentWitness(after.projectMap, journal.targetState.projectMap, "published project map");
-    return transition(publishing, "map-published", this.#homeDir, this.#observer, {
+    return transition(publishing, "map-published", directoryHandle, this.#homeDir, this.#observer, {
       publishedProjectMapSha256: journal.intendedProjectMapSha256,
       targetState: { ...journal.targetState, projectMap: after.projectMap },
     });
@@ -2659,20 +2709,20 @@ export class BackendPublicationCoordinator {
     const context = await this.#materialContext(journal, directoryHandle);
     const observed = await this.#observe(context);
     if (logicalWitnessMatches(observed.config, journal.targetState.config)) {
-      return transition(journal, "config-published", this.#homeDir, this.#observer, {
+      return transition(journal, "config-published", directoryHandle, this.#homeDir, this.#observer, {
         publishedConfigSha256: journal.intendedConfigSha256,
         targetState: { ...journal.targetState, config: observed.config },
       });
     }
     if (journal.phase === "config-publishing" && mutationWitnessMatches(observed.config, journal.targetState.config)) {
-      return transition(journal, "config-published", this.#homeDir, this.#observer, {
+      return transition(journal, "config-published", directoryHandle, this.#homeDir, this.#observer, {
         publishedConfigSha256: journal.intendedConfigSha256,
         targetState: { ...journal.targetState, config: observed.config },
       });
     }
     assertLogicalWitness(observed.config, journal.sourceState.config, "source config");
     const publishing = journal.phase === "map-published"
-      ? transition(journal, "config-publishing", this.#homeDir, this.#observer)
+      ? transition(journal, "config-publishing", directoryHandle, this.#homeDir, this.#observer)
       : journal;
     await this.#mutate(
       { ...context, journal: publishing },
@@ -2683,7 +2733,7 @@ export class BackendPublicationCoordinator {
     );
     const after = await this.#observe({ ...context, journal: publishing });
     assertContentWitness(after.config, journal.targetState.config, "published config");
-    return transition(publishing, "config-published", this.#homeDir, this.#observer, {
+    return transition(publishing, "config-published", directoryHandle, this.#homeDir, this.#observer, {
       publishedConfigSha256: journal.intendedConfigSha256,
       targetState: { ...journal.targetState, config: after.config },
     });
@@ -2696,7 +2746,7 @@ export class BackendPublicationCoordinator {
     const context = await this.#materialContext(journal, directoryHandle);
     const observed = await this.#observe(context);
     if (journal.phase === "config-restoring" && mutationWitnessMatches(observed.config, journal.sourceState.config)) {
-      return transition(journal, "map-restoring", this.#homeDir, this.#observer, {
+      return transition(journal, "map-restoring", directoryHandle, this.#homeDir, this.#observer, {
         sourceState: { ...journal.sourceState, config: observed.config },
       });
     }
@@ -2705,7 +2755,7 @@ export class BackendPublicationCoordinator {
         assertLogicalWitness(observed.config, journal.targetState.config, "config before restore");
       }
       const restoring = journal.phase === "aborting"
-        ? transition(journal, "config-restoring", this.#homeDir, this.#observer)
+        ? transition(journal, "config-restoring", directoryHandle, this.#homeDir, this.#observer)
         : journal;
       await this.#mutate(
         { ...context, journal: restoring },
@@ -2716,9 +2766,9 @@ export class BackendPublicationCoordinator {
       );
       const after = await this.#observe({ ...context, journal: restoring });
       assertContentWitness(after.config, journal.sourceState.config, "restored config");
-      return transition(restoring, "map-restoring", this.#homeDir, this.#observer);
+      return transition(restoring, "map-restoring", directoryHandle, this.#homeDir, this.#observer);
     }
-    return transition(journal, "map-restoring", this.#homeDir, this.#observer);
+    return transition(journal, "map-restoring", directoryHandle, this.#homeDir, this.#observer);
   }
 
   async #restoreMap(
@@ -2728,7 +2778,7 @@ export class BackendPublicationCoordinator {
     const context = await this.#materialContext(journal, directoryHandle);
     const observed = await this.#observe(context);
     if (journal.phase === "map-restoring" && mutationWitnessMatches(observed.projectMap, journal.sourceState.projectMap)) {
-      return transition(journal, "abort-releasing", this.#homeDir, this.#observer, {
+      return transition(journal, "abort-releasing", directoryHandle, this.#homeDir, this.#observer, {
         sourceState: { ...journal.sourceState, projectMap: observed.projectMap },
       });
     }
@@ -2747,7 +2797,7 @@ export class BackendPublicationCoordinator {
       const after = await this.#observe({ ...context, journal: restoring });
       assertContentWitness(after.projectMap, journal.sourceState.projectMap, "restored project map");
     }
-    return transition(journal, "abort-releasing", this.#homeDir, this.#observer);
+    return transition(journal, "abort-releasing", directoryHandle, this.#homeDir, this.#observer);
   }
 
   async #cleanupMaterial(
@@ -2790,14 +2840,25 @@ export class BackendPublicationCoordinator {
     }
     if (journal.phase === "preparing") {
       const authenticated = authenticateMaterial(this.#homeDir, journal, directoryHandle, true);
-      journal = transition(journal, "prepared", this.#homeDir, this.#observer, { recoveryReference: authenticated.reference });
+      journal = transition(
+        journal,
+        "prepared",
+        directoryHandle,
+        this.#homeDir,
+        this.#observer,
+        { recoveryReference: authenticated.reference },
+      );
     }
-    if (journal.phase === "prepared") journal = transition(journal, "acquiring", this.#homeDir, this.#observer);
-    if (journal.phase === "acquiring") journal = await this.#acquireAll(journal);
+    if (journal.phase === "prepared") {
+      journal = transition(journal, "acquiring", directoryHandle, this.#homeDir, this.#observer);
+    }
+    if (journal.phase === "acquiring") journal = await this.#acquireAll(journal, directoryHandle);
     if (journal.phase === "guarded" || journal.phase === "map-publishing") journal = await this.#publishMap(journal, directoryHandle);
     if (journal.phase === "map-published" || journal.phase === "config-publishing") journal = await this.#publishConfig(journal, directoryHandle);
-    if (journal.phase === "config-published") journal = transition(journal, "releasing", this.#homeDir, this.#observer);
-    if (journal.phase === "releasing") journal = await this.#releaseAll(journal, false);
+    if (journal.phase === "config-published") {
+      journal = transition(journal, "releasing", directoryHandle, this.#homeDir, this.#observer);
+    }
+    if (journal.phase === "releasing") journal = await this.#releaseAll(journal, false, directoryHandle);
     // All valid forward phases above converge on released: a recovered
     // released journal skips the release call, while every earlier phase
     // advances through it. Finalize that invariant directly so an
@@ -2806,7 +2867,7 @@ export class BackendPublicationCoordinator {
     this.#observer("before-finalize", context.recoveryReference.relativePath);
     if (this.#driver.retainCompletedMaterial !== undefined) await this.#driver.retainCompletedMaterial(context);
     this.#observer("after-finalize", context.recoveryReference.relativePath);
-    journal = transition(journal, "completed", this.#homeDir, this.#observer);
+    journal = transition(journal, "completed", directoryHandle, this.#homeDir, this.#observer);
     return journal;
   }
 
@@ -2815,21 +2876,23 @@ export class BackendPublicationCoordinator {
     if (journal === null) return fail("publication-evidence-missing", "backend publication journal is missing");
     if (journal.phase === "completed" || journal.phase === "aborted") return journal;
     if (journal.phase === "abort-releasing") {
-      journal = await this.#releaseAll(journal, true);
+      journal = await this.#releaseAll(journal, true, directoryHandle);
     } else {
       if (journal.phase === "preparing" && journal.recoveryReference === null) {
         try {
           const authenticated = authenticateMaterial(this.#homeDir, journal, directoryHandle, true);
-          journal = transition(journal, "prepared", this.#homeDir, this.#observer, {
+          journal = transition(journal, "prepared", directoryHandle, this.#homeDir, this.#observer, {
             recoveryReference: authenticated.reference,
           });
         } catch (error) {
-          if (isMissing(error)) return transition(journal, "aborted", this.#homeDir, this.#observer);
+          if (isMissing(error)) {
+            return transition(journal, "aborted", directoryHandle, this.#homeDir, this.#observer);
+          }
           throw error;
         }
       }
       if (!["aborting", "config-restoring", "map-restoring"].includes(journal.phase)) {
-        journal = transition(journal, "aborting", this.#homeDir, this.#observer);
+        journal = transition(journal, "aborting", directoryHandle, this.#homeDir, this.#observer);
       }
       if (journal.phase === "aborting" || journal.phase === "config-restoring") {
         journal = await this.#restoreConfig(journal, directoryHandle);
@@ -2839,9 +2902,9 @@ export class BackendPublicationCoordinator {
       // already at that checkpoint. Continue the abort state machine
       // unconditionally so an unknown intermediate cannot be reported as safe.
       journal = await this.#restoreMap(journal, directoryHandle);
-      journal = await this.#releaseAll(journal, true);
+      journal = await this.#releaseAll(journal, true, directoryHandle);
     }
     await this.#cleanupMaterial(journal, directoryHandle);
-    return transition(journal, "aborted", this.#homeDir, this.#observer);
+    return transition(journal, "aborted", directoryHandle, this.#homeDir, this.#observer);
   }
 }
