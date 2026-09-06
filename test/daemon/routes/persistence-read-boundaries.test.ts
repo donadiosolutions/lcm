@@ -235,6 +235,29 @@ describe("persistence read route boundaries", () => {
     });
   });
 
+  it("sanitizes adjacent post-bracket paths in describe read errors", async () => {
+    mocks.describe.mockRejectedValueOnce(
+      new Error("read failed for file://host.invalid[/Users/canary/one.db]/Users/canary/two.db"),
+    );
+    await invoke(createDescribeHandler(config), { nodeId: "n", cwd: "/ok" });
+    expectLast(200, {
+      node: null,
+      error: "read failed for file://host.invalid[<path>]<path>",
+    });
+  });
+
+  it("sanitizes adjacent post-bracket paths in expand read errors", async () => {
+    mocks.expand.mockRejectedValueOnce(
+      new Error("expand failed for file://host.invalid[/Users/canary/one.db]/Users/canary/two.db"),
+    );
+    await invoke(createExpandHandler(config), { nodeId: "n", cwd: "/ok" });
+    expect(mocks.expand).toHaveBeenCalled();
+    expectLast(200, {
+      expanded: null,
+      error: "expand failed for file://host.invalid[<path>]<path>",
+    });
+  });
+
   it("uses the injected backend without consulting a local SQLite path", async () => {
     mocks.exists.mockReturnValue(false);
     mocks.projectExists.mockResolvedValue(true);

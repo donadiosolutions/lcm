@@ -82,6 +82,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     if (separator >= 0 && char === "]" && brackets > 0) {
       brackets -= 1;
+      if (chars[index + 1] === "/" || chars[index + 1] === "\\") foundFilePath = false;
       continue;
     }
     if (separator >= 0 && isNestedFileUrlStart(chars, index)) {
