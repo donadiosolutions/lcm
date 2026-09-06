@@ -2782,9 +2782,11 @@ describe("worktree reconciliation", () => {
           const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
             phase: string;
             sourceHashes: string[];
+            pendingSourceHashes: string[];
           };
           expect(journal.phase).toBe("completed");
           expect(journal.sourceHashes).toEqual([sourceHash]);
+          expect(journal.pendingSourceHashes).toEqual([]);
           throw new Error("injected stale-completed precompletion failure");
         },
       })).toThrow("injected stale-completed precompletion failure");
@@ -2793,11 +2795,13 @@ describe("worktree reconciliation", () => {
         blockedFrom?: string;
         reason?: string;
         sourceHashes: string[];
+        pendingSourceHashes: string[];
       };
       expect(journal.phase).toBe("blocked");
       expect(journal.blockedFrom).toBe("planned");
       expect(journal.reason).toContain("injected stale-completed precompletion failure");
       expect(journal.sourceHashes).toEqual([sourceHash]);
+      expect(journal.pendingSourceHashes).toEqual([]);
       expect(listProjectMapEntries()).toHaveProperty(sourceBHash);
       expect(existsSync(join(home, ".lcm", "projects", sourceBHash, "db.sqlite"))).toBe(true);
     } finally {
