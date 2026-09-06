@@ -36,6 +36,7 @@ import { readBoundedRegularFile, OWNER_ONLY_FILE_MODES } from "../security-files
 import { normalizeUuidV7 } from "../machine-identity.js";
 import { managedDaemonPath } from "../daemon/managed-path.js";
 import { daemonEntrypointMatches } from "../daemon/lifecycle-scope.js";
+import { mapDaemonRefusalToRemediation } from "../daemon/remediation.js";
 import { RUNTIME_DIGEST } from "../daemon/version.js";
 import {
   ConfigValidationError,
@@ -821,7 +822,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         }
       } catch {
         results.push({ name: "daemon", category: "Daemon", status: "fail",
-          message: "Daemon health is unavailable or timed out. Run: lcm daemon start --detach" });
+          message: `Daemon health is unavailable or timed out. ${mapDaemonRefusalToRemediation("ambiguous").message}` });
       }
     }
 

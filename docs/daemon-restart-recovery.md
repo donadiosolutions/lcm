@@ -123,6 +123,14 @@ authenticated health, then reports findings and operator commands. It does not
 start or restart the daemon, repair a service registration, clear notices, or
 write settings. A stale, unavailable, or unverified daemon remains unchanged.
 
+This inspection is invoked with `lcm doctor` and adds no new configuration options.
+Stale-configuration recovery uses the existing daemon port, storage backend,
+runtime/entrypoint, state paths, and user manager configuration. Doctor reports
+what it can verify from the current installation; it does not apply configuration
+changes or replace a stale service. Keep the intended configuration in place
+before requesting an explicit restart, which validates that configuration and
+the service identity before replacement.
+
 After a configuration or package change, use one explicit
 `lcm daemon restart` to request authenticated managed-service replacement.
 For stale Claude Code hooks or MCP settings, run `lcm install`; for another

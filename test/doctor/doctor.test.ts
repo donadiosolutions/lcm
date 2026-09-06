@@ -1682,6 +1682,11 @@ describe("doctor authenticated daemon identity", () => {
     const results = await pending;
     expect(signal?.aborted).toBe(true);
     expect(results.find(r => r.name === "daemon")).toMatchObject({ status: "fail", message: expect.stringContaining("timed out") });
+    const message = results.find(r => r.name === "daemon")?.message;
+    expect(message).toContain("run 'lcm daemon restart' or 'lcm doctor'");
+    expect(message).not.toMatch(/--detach|--foreground|\b(?:kill|pkill)\b/u);
+    expect(ensureDaemon).not.toHaveBeenCalled();
+    expect(restartDaemon).not.toHaveBeenCalled();
   });
 
   it("reports a verified daemon backlog even when optional sidecar metadata counts are absent", async () => {
