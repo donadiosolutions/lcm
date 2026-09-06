@@ -239,9 +239,10 @@ component_management:
         - "^src/daemon/health-observation\\.ts$"
         # Lifecycle consumes the same canonical #691 entrypoint comparison as the CLI and keeps #804's kernel-cgroup listener witness manager-owned.
         # #865 keeps post-start publication convergence inside the lifecycle
-        # owner, while #944 keeps bounded daemon-tmp retry guidance within the
-        # supervisor/lifecycle boundary; their paired managed lifecycle tests
-        # remain this component's coverage boundary.
+        # owner, #944 keeps bounded daemon-tmp retry guidance within the
+        # supervisor/lifecycle boundary, and #966 keeps optional birth-sample
+        # budgeting in lifecycle admission. Their paired managed lifecycle
+        # tests remain this component's coverage boundary.
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"
