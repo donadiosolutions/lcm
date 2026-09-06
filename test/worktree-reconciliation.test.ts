@@ -23,6 +23,10 @@ import {
   closeLcmConnection,
   getPoolStats,
 } from "../src/db/connection.js";
+import {
+  PrivateMutationLockContentionError,
+  processStartTime,
+} from "../src/private-mutation-lock.js";
 import { clearGitProjectAnchorCache, resolveGitProjectAnchor } from "../src/git-project.js";
 import {
   clearProjectMapCache,
@@ -213,6 +217,40 @@ function makeDatabase(path: string, sessionId: string, content: string, projectI
   ).run();
   runLcmMigrations(db);
   db.close();
+}
+
+function makeReconciliationLockFixture(home: string): {
+  readonly main: string;
+  readonly lock: string;
+} {
+  const { main, linked } = makeRepository(home);
+  const canonical = resolveGitProjectAnchor(main)!.canonical;
+  const targetHash = hashProjectPath(canonical);
+  const sourceHash = hashProjectPath(linked);
+  writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+    [targetHash]: { canonical, aliases: [] },
+    [sourceHash]: { canonical: linked, aliases: [] },
+  }, null, 2)}\n`);
+  clearProjectMapCache();
+  makeDatabase(
+    join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+    "monotonic-lock-wait",
+    "content",
+    sourceHash,
+  );
+  const reconciliationRoot = join(home, ".lcm", "reconciliations");
+  makePrivateFixtureDirectory(reconciliationRoot, { recursive: true });
+  const lock = join(reconciliationRoot, `${targetHash}.lock`);
+  const processBirth = processStartTime(process.pid);
+  if (processBirth === null) throw new Error("test process birth time is unavailable");
+  writePrivateFixtureFile(lock, `${JSON.stringify({
+    version: 1,
+    pid: process.pid,
+    processStartTime: processBirth,
+    nonce: "a".repeat(32),
+    createdAtMs: 1,
+  })}\n`);
+  return { main, lock };
 }
 
 function removeLegacyMainMetadataColumns(db: DatabaseSync): void {
@@ -5211,6 +5249,109 @@ describe("worktree reconciliation", () => {
       _lockRetryDelayMs: 10,
     }).status).toBe("completed");
     expect(holder.exitCode === 0 || holder.exitCode === null).toBe(true);
+  });
+
+  it.each([
+    { name: "frozen", nextWallNow: () => 1_000 },
+    { name: "backward", nextWallNow: () => 1 },
+    { name: "forward", nextWallNow: () => Number.MAX_SAFE_INTEGER },
+  ])("keeps reconciliation lock waits monotonic across a $name wall-clock", ({ nextWallNow }) => {
+    const { main } = makeReconciliationLockFixture(home);
+    let monotonicNow = 0;
+    let wallNow = 1_000;
+    const waits: number[] = [];
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const atomicsWait = vi.spyOn(Atomics, "wait").mockImplementation((_array, _index, _value, timeout) => {
+      waits.push(timeout ?? 0);
+      if (waits.length > 10) throw new Error("reconciliation retry guard exceeded");
+      wallNow = nextWallNow();
+      monotonicNow += timeout ?? 0;
+      return "timed-out";
+    });
+    try {
+      expect(() => reconcileWorktrees(main, {
+        _lockWaitMs: 125,
+        _lockRetryDelayMs: 50,
+      })).toThrow(PrivateMutationLockContentionError);
+      expect(waits).toEqual([50, 50, 25]);
+      expect(performanceNow).toHaveBeenCalled();
+      expect(dateNow).toHaveBeenCalled();
+    } finally {
+      atomicsWait.mockRestore();
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("caps reconciliation retry waits and floors the final millisecond", () => {
+    const { main } = makeReconciliationLockFixture(home);
+    let monotonicNow = 0;
+    const waits: number[] = [];
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const atomicsWait = vi.spyOn(Atomics, "wait").mockImplementation((_array, _index, _value, timeout) => {
+      waits.push(timeout ?? 0);
+      if (waits.length > 10) throw new Error("reconciliation retry guard exceeded");
+      monotonicNow += waits.length === 1 ? 1.5 : timeout ?? 0;
+      return "timed-out";
+    });
+    try {
+      expect(() => reconcileWorktrees(main, {
+        _lockWaitMs: 2,
+        _lockRetryDelayMs: 50,
+      })).toThrow(PrivateMutationLockContentionError);
+      expect(waits).toEqual([2, 1]);
+    } finally {
+      atomicsWait.mockRestore();
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("tries immediately when the reconciliation lock budget is zero", () => {
+    const { main } = makeReconciliationLockFixture(home);
+    const performanceNow = vi.spyOn(performance, "now").mockReturnValue(0);
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const atomicsWait = vi.spyOn(Atomics, "wait").mockImplementation(() => {
+      throw new Error("zero-budget reconciliation must not wait");
+    });
+    try {
+      expect(() => reconcileWorktrees(main, { _lockWaitMs: 0 })).toThrow(
+        PrivateMutationLockContentionError,
+      );
+      expect(atomicsWait).not.toHaveBeenCalled();
+    } finally {
+      atomicsWait.mockRestore();
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("succeeds after a monotonic retry even when the wall clock jumps forward", () => {
+    const { main, lock } = makeReconciliationLockFixture(home);
+    let monotonicNow = 0;
+    let waits = 0;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockReturnValueOnce(1_000)
+      .mockReturnValue(Number.MAX_SAFE_INTEGER);
+    const atomicsWait = vi.spyOn(Atomics, "wait").mockImplementation((_array, _index, _value, timeout) => {
+      waits += 1;
+      rmSync(lock);
+      monotonicNow += timeout ?? 0;
+      return "timed-out";
+    });
+    try {
+      expect(reconcileWorktrees(main, {
+        _lockWaitMs: 100,
+        _lockRetryDelayMs: 50,
+      }).status).toBe("completed");
+      expect(waits).toBe(1);
+    } finally {
+      atomicsWait.mockRestore();
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
   });
 
   it("holds the project-map mutation fence from preflight through publication", () => {
