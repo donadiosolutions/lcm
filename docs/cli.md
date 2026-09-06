@@ -231,6 +231,15 @@ the active publication has settled, rerun `lcm install` manually. This drift
 refusal is not retried automatically, and rerunning the installer does not imply
 that unrelated installation failures have resolved.
 
+Before `lcm install` reuses a healthy daemon identity for those retries, it
+revalidates the complete configuration snapshot and terminal publication
+journal after the authenticated health response and its JSON body have been
+read. A private canonical `.lcm` root is retained across that exchange and its
+exact directory entry is checked again around the final reads. If any of that
+evidence changes, the captured identity is discarded; rerun `lcm install` once
+publication settles if lock contention remains. A legacy non-private SQLite
+root without publication evidence keeps its existing read compatibility.
+
 ## Daemon-dependent resilience
 
 `lcm doctor` limits the complete daemon health exchange to two seconds. The
