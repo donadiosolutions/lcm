@@ -6,6 +6,10 @@ import { defineConfig, type UserConfig } from "vitest/config";
 const sqliteRouteTests = ["test/daemon/routes/**/*.test.ts"];
 const worktreeReconciliationTests = ["test/worktree-reconciliation.test.ts"];
 const serialSqliteTests = [...sqliteRouteTests, ...worktreeReconciliationTests];
+const portableBoundaryTests = [
+  "test/storage/portable-record.test.ts",
+  "test/storage/portable-record-stream.test.ts",
+];
 const packageConfigTests = ["test/package-config.test.ts"];
 const e2eTests = ["test/e2e/**/*.test.ts"];
 const runtimeHomeSetup = ["test/setup/isolate-runtime-home.ts"];
@@ -186,6 +190,7 @@ export function createVitestConfiguration(root: string): UserConfig {
             include: ["test/**/*.test.ts"],
             exclude: [
               ...serialSqliteTests,
+              ...portableBoundaryTests,
               ...packageConfigTests,
               ...e2eTests,
               "node_modules/**",
@@ -198,6 +203,23 @@ export function createVitestConfiguration(root: string): UserConfig {
         },
         {
           test: {
+            name: "unit-portable-boundaries",
+            pool: "forks",
+            globalSetup: runtimeHomeGlobalSetup,
+            setupFiles: runtimeHomeSetup,
+            include: portableBoundaryTests,
+            exclude: ["node_modules/**", ".claude/**"],
+            sequence: {
+              groupOrder: 1,
+            },
+            // Vitest 4.1.10 maps fileParallelism:false to maxWorkers:1. Keep
+            // the memory-heavy boundary files in their own ordered phase so
+            // they cannot overlap with ordinary unit workers or each other.
+            fileParallelism: false,
+          },
+        },
+        {
+          test: {
             name: "unit-package",
             pool: "forks",
             globalSetup: runtimeHomeGlobalSetup,
@@ -205,7 +227,7 @@ export function createVitestConfiguration(root: string): UserConfig {
             include: packageConfigTests,
             exclude: ["node_modules/**", ".claude/**"],
             sequence: {
-              groupOrder: 1,
+              groupOrder: 2,
             },
             // Package inventory tests run pnpm build and mutate dist. Keep them
             // out of the parallel unit pool so they cannot race other tests.
@@ -221,7 +243,7 @@ export function createVitestConfiguration(root: string): UserConfig {
             include: serialSqliteTests,
             exclude: ["node_modules/**", ".claude/**"],
             sequence: {
-              groupOrder: 2,
+              groupOrder: 3,
             },
             // Route handler and worktree reconciliation tests repeatedly open and migrate
             // project SQLite DBs. Keep this group serial and ordered after the parallel
@@ -238,7 +260,7 @@ export function createVitestConfiguration(root: string): UserConfig {
             include: e2eTests,
             exclude: ["node_modules/**", ".claude/**"],
             sequence: {
-              groupOrder: 3,
+              groupOrder: 4,
             },
             // E2E tests spin up real daemons backed by SQLite — must run
             // sequentially to avoid concurrent write conflicts.

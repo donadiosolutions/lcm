@@ -134,6 +134,16 @@ directory and therefore does not sweep pre-existing orphans in the ambient
 temporary root. On a host with a valid ambient `.git`, tests no longer share
 that repository identity.
 
+The two large portable-record boundary test files run in the ordered
+`unit-portable-boundaries` Vitest project after the ordinary unit project. The
+project uses `fileParallelism: false`, so Vitest admits one worker for the
+128 MiB record and 144 MiB batch fixtures even when the command enables more
+workers for other projects. This prevents those two memory-heavy files from
+overlapping with each other or with ordinary unit workers while preserving
+their exact limits and deadlines. Serial admission does not reduce the bytes
+allocated by an individual test and cannot guarantee immunity from external
+CPU or memory starvation.
+
 The consumer verifier builds through pnpm, then uses npm to pack and install
 ordinary and conflicting consumers outside the repository configuration tree.
 It verifies the package that npm users receive, including the Node CLI and
