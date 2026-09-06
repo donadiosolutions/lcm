@@ -470,6 +470,33 @@ describe("sanitizeError", () => {
     expect(sanitizeError(result)).toBe(result);
   });
 
+  it.each([
+    ["'file://host'name/a'/C:\\Users\\SECRET\\private.db", "'file://host'name<path>'<path>"],
+    ["'file://host'name/a'/c:\\Users\\SECRET\\private.db", "'file://host'name<path>'<path>"],
+    ['"file://host\'name/a"/C:\\Users\\SECRET\\private.db', '"file://host\'name<path>"<path>'],
+    ['"file://host\'name/a"/c:\\Users\\SECRET\\private.db', '"file://host\'name<path>"<path>'],
+    ["/C:\\Users\\SECRET", "<path>"],
+    ["/c:\\Users\\SECRET", "<path>"],
+    ["/private/C:\\Users\\SECRET", "<path>"],
+  ] as const)("redacts slash-prefixed Windows drives completely on the first pass: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["/AB:\\literal", "<path>:\\literal"],
+    ["/1:\\literal", "<path>:\\literal"],
+    ["/C:note\\literal", "<path>:note\\literal"],
+    ["/C:/public", "<path>:<path>"],
+  ] as const)("preserves non-drive colon boundaries after a POSIX span: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
   it("redacts a Windows drive following a bare POSIX path separately on the first pass", () => {
     const result = sanitizeError("/private\\D:\\SECRET");
 
