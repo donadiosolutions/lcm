@@ -210,6 +210,13 @@ A foreign, ambiguous, malformed, stale, missing, or unreadable owner, an
 identity mismatch, a failed authenticated probe, or any error other than lock
 contention propagates unchanged and doctor reports the stage as failed.
 
+Doctor must also resolve and hash its own packaged runtime before it can retry
+publication contention. If that local runtime identity is unavailable, doctor
+does not infer a digest from daemon health or treat the missing value as a
+wildcard; it reports the original contention for the affected stage. Run
+doctor from the installed `lcm.mjs` artifact. If that artifact is unreadable or
+damaged, reinstall LCM and rerun `lcm doctor`.
+
 The retry budget is a single two-second wall-clock window shared by every
 stage of one doctor run, polled at most every 50 milliseconds. Time spent
 inside a refused attempt, the platform process-birth probe, and the
@@ -235,6 +242,21 @@ and polls every 50 milliseconds. Bootstrap-lock retries remain unchanged and
 may add a bounded overshoot of up to one second when both locks contend.
 Identity, token, process-birth, health, entrypoint, version, backend, or
 runtime-digest mismatches fail closed with the original typed contention error.
+
+Lock-free configuration preparation also rejects a configuration or
+publication journal that changes between its two authenticated snapshots. Once
+the active publication has settled, rerun `lcm install` manually. This drift
+refusal is not retried automatically, and rerunning the installer does not imply
+that unrelated installation failures have resolved.
+
+Before `lcm install` reuses a healthy daemon identity for those retries, it
+revalidates the complete configuration snapshot and terminal publication
+journal after the authenticated health response and its JSON body have been
+read. A private canonical `.lcm` root is retained across that exchange and its
+exact directory entry is checked again around the final reads. If any of that
+evidence changes, the captured identity is discarded; rerun `lcm install` once
+publication settles if lock contention remains. A legacy non-private SQLite
+root without publication evidence keeps its existing read compatibility.
 
 ## Daemon-dependent resilience
 

@@ -15,6 +15,8 @@ component_management:
     - component_id: "unit-installation"
       name: "Unit - Installation"
       paths:
+        # #881 keeps absent-config journal checksum admission installer-owned;
+        # #882 keeps post-health installer identity fencing in this owner.
         - "installer/"
         - "src/installer/"
         - "^src/bootstrap\\.ts$"
@@ -121,8 +123,11 @@ component_management:
     - component_id: "unit-local-persistence"
       name: "Unit - Local Persistence"
       paths:
-        # The #700 SQLite signal fences, #756 SQLite factory-health closed-dominance responsibility, and single-owner cleanup remain local-persistence-owned.
-        # #898 applies required promoted tags before the caller result maximum while retaining local-persistence ownership.
+        # The #700 SQLite signal fences, #756 SQLite factory-health
+        # closed-dominance responsibility, #935 database-parent admission,
+        # and single-owner cleanup remain local-persistence-owned.
+        # #898 applies required promoted tags before the caller result maximum
+        # while retaining local-persistence ownership.
         # #898's guarded dual-JSON eligibility keeps this search in the same owner.
         - "src/db/"
         - "src/storage/sqlite/"
@@ -176,10 +181,11 @@ component_management:
     - component_id: "unit-memory-retrieval"
       name: "Unit - Memory and Retrieval"
       paths:
-        # The #709 SearchResult compatibility bridge, #793 search-limit contract,
-        # retrieval contract, and #971 compact cwd client contract remain
-        # memory/retrieval-owned. #866 stats publication retries and fail-closed
-        # journal errors, plus #973 project database admission, stay in this owner.
+        # The #709 SearchResult compatibility bridge, #793 search-limit and
+        # retrieval contracts, plus #971 compact cwd and #972 search cwd client
+        # contracts remain memory/retrieval-owned. #866 stats publication retries
+        # and fail-closed journal errors, plus #973 project database admission,
+        # stay in this owner.
         - "src/memory/"
         - "^src/expansion\\.ts$"
         - "^src/retrieval\\.ts$"

@@ -9,7 +9,15 @@ import {
   type EventRow,
   type HealthStats,
 } from "../../src/hooks/events-db.js";
-import { chmodSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
@@ -25,16 +33,16 @@ import {
 const DURABLE_SEQUENCE_STRESS_TIMEOUT_MS = 30_000;
 
 const fsState = vi.hoisted(() => ({
-  chmodError: undefined as NodeJS.ErrnoException | undefined,
+  fchmodError: undefined as NodeJS.ErrnoException | undefined,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
-    chmodSync: (...args: Parameters<typeof actual.chmodSync>) => {
-      if (fsState.chmodError) throw fsState.chmodError;
-      return actual.chmodSync(...args);
+    fchmodSync: (...args: Parameters<typeof actual.fchmodSync>) => {
+      if (fsState.fchmodError) throw fsState.fchmodError;
+      return actual.fchmodSync(...args);
     },
   };
 });
@@ -78,7 +86,7 @@ describe("EventsDb", () => {
   }
 
   beforeEach(() => {
-    fsState.chmodError = undefined;
+    fsState.fchmodError = undefined;
     machineIdentityState.fail = false;
     _resetMigratedPathsForTesting();
     dir = mkdtempSync(join(tmpdir(), "events-db-test-"));
@@ -93,6 +101,37 @@ describe("EventsDb", () => {
     const db = new EventsDb(dbPath);
     // Should not throw
     db.close();
+  });
+
+  it("rejects a symlink sidecar parent before changing its target", () => {
+    const target = join(dir, "target");
+    const linkedParent = join(dir, "linked-parent");
+    mkdirSync(target, { mode: 0o755 });
+    chmodSync(target, 0o755);
+    symlinkSync(target, linkedParent);
+    const linkedDbPath = join(linkedParent, "events.db");
+
+    expect(() => new EventsDb(linkedDbPath)).toThrow();
+    expect(statSync(target).mode & 0o777).toBe(0o755);
+    expect(existsSync(join(target, "events.db"))).toBe(false);
+    expect(isLcmConnectionOpen(linkedDbPath)).toBe(false);
+  });
+
+  it("rejects a symlink sidecar parent during an existing-only open", () => {
+    const target = join(dir, "existing-target");
+    const linkedParent = join(dir, "existing-linked-parent");
+    mkdirSync(target, { mode: 0o700 });
+    const targetDbPath = join(target, "events.db");
+    new DatabaseSync(targetDbPath).close();
+    const leafMode = statSync(targetDbPath).mode & 0o777;
+    chmodSync(target, 0o755);
+    symlinkSync(target, linkedParent);
+    const linkedDbPath = join(linkedParent, "events.db");
+
+    expect(() => EventsDb.openExisting(linkedDbPath)).toThrow();
+    expect(statSync(target).mode & 0o777).toBe(0o755);
+    expect(statSync(targetDbPath).mode & 0o777).toBe(leafMode);
+    expect(isLcmConnectionOpen(linkedDbPath)).toBe(false);
   });
 
   it("repairs broadened sidecar-directory permissions before reusing a pooled connection", () => {
@@ -129,29 +168,17 @@ describe("EventsDb", () => {
     expect(existsSync(missingParent)).toBe(false);
   });
 
-  it("swallows ENOENT while repairing an existing sidecar parent", () => {
+  it("rejects a descriptor tightening failure before taking a pooled lease", () => {
     const initial = new EventsDb(dbPath);
-    fsState.chmodError = Object.assign(new Error("injected missing parent"), { code: "ENOENT" });
+    chmodSync(dir, 0o777);
+    fsState.fchmodError = Object.assign(new Error("injected fchmod failure"), { code: "EACCES" });
     try {
-      const existing = EventsDb.openExisting(dbPath);
-      expect(existing).not.toBeNull();
-      existing?.close();
-    } finally {
-      fsState.chmodError = undefined;
-      initial.close();
-      closeLcmConnection(dbPath);
-    }
-  });
-
-  it("closes the reused connection and rethrows non-ENOENT parent chmod errors", () => {
-    const initial = new EventsDb(dbPath);
-    fsState.chmodError = Object.assign(new Error("injected chmod failure"), { code: "EACCES" });
-    try {
-      expect(() => EventsDb.openExisting(dbPath)).toThrow("injected chmod failure");
+      expect(() => EventsDb.openExisting(dbPath)).toThrow("injected fchmod failure");
+      expect(statSync(dir).mode & 0o777).toBe(0o777);
       expect(getPoolStats().connections.find(({ path }) => path === dbPath))
         .toMatchObject({ refs: 1 });
     } finally {
-      fsState.chmodError = undefined;
+      fsState.fchmodError = undefined;
       initial.close();
       closeLcmConnection(dbPath);
     }

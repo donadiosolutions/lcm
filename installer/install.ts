@@ -6,6 +6,7 @@ import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncRetur
 import { ensureCore } from "../src/bootstrap.js";
 import { bootstrapLcmHome, lcmHomeDir } from "../src/runtime-paths.js";
 import {
+  assertPrivateDirectoryEntry,
   atomicWritePrivateFile,
   atomicWritePrivateFileDurable,
   OWNER_ONLY_FILE_MODES,
@@ -30,6 +31,7 @@ import {
   assertBackendPublicationConfigMutation,
   assertBackendPublicationConsumerAccess,
   backendPublicationHomeForConfigPath,
+  openBackendPublicationReadRoot,
   withBackendPublicationConfigLock,
   withBackendPublicationReadRoot,
   type BackendPublicationLockToken,
@@ -314,58 +316,104 @@ export async function createInstallerPublicationConvergence(
 ): Promise<PublicationConvergence> {
   let port = DEFAULT_DAEMON_PORT;
   let backend: "sqlite" | "postgresql" = "sqlite";
-  let configAuthenticated = false;
+  let authenticated: Readonly<{
+    witness: DaemonConfigRawSnapshot["witness"];
+    journalChecksumSha256: string | null;
+  }> | undefined;
   const readSnapshot = seams._readDaemonConfigRawSnapshot ?? readDaemonConfigRawSnapshot;
   const assertReadAccess = seams._assertBackendPublicationConfigReadAccess
     ?? assertBackendPublicationConfigReadAccess;
-  try {
-    const snapshot = readSnapshot(configPath);
-    if (snapshot.witness.presence === "absent") throw new Error("configuration is absent");
-    const stored = parseStoredConfig(snapshot.content);
-    const daemon = stored.daemon as { port?: unknown } | undefined;
-    if (typeof daemon?.port === "number" && Number.isInteger(daemon.port)) port = daemon.port;
-    const storage = stored.storage as { backend?: unknown } | undefined;
-    if (storage?.backend === "postgresql") backend = "postgresql";
-    const witness = {
-      presence: snapshot.witness.presence,
-      rawSha256: snapshot.witness.rawSha256,
-      byteLength: snapshot.witness.byteLength,
-      dev: snapshot.witness.dev,
-      ino: snapshot.witness.ino,
-    } as const;
-    const firstJournal = assertReadAccess(configPath, backend, witness);
-    const second = readSnapshot(configPath);
-    if (!daemonConfigSnapshotWitnessEqual(snapshot.witness, second.witness)) throw new Error("configuration changed");
-    const secondJournal = assertReadAccess(configPath, backend, {
-      presence: second.witness.presence,
-      rawSha256: second.witness.rawSha256,
-      byteLength: second.witness.byteLength,
-      dev: second.witness.dev,
-      ino: second.witness.ino,
-    });
-    if (firstJournal.journalChecksumSha256 !== secondJournal.journalChecksumSha256) throw new Error("publication changed");
-    configAuthenticated = true;
-  } catch {
-    // Missing, malformed, or unstable config cannot authenticate a daemon.
-  }
   const homeDir = backendPublicationHomeForConfigPath(configPath);
   const expectedVersion = seams._expectedVersionForTesting ?? PKG_VERSION;
   const expectedEntrypoint = seams._expectedEntrypointForTesting ?? PACKAGED_RUNTIME_ENTRYPOINT;
   const expectedRuntimeDigest = seams._expectedRuntimeDigestForTesting ?? RUNTIME_DIGEST;
-  const identity = homeDir === undefined || !configAuthenticated ? undefined : await capturePublicationIdentity({
-    port,
-    expectedVersion,
-    expectedStorageBackend: backend,
-    expectedEntrypoint,
-    expectedRuntimeDigest,
-    deps: {
-      ...seams,
-      homeDir,
-      lockPath: join(homeDir, ".lcm.backend-publication.lock"),
-      fetch: seams.fetch ?? globalThis.fetch,
-      readToken: seams.readToken ?? (() => readAuthToken(daemonTokenPath(homeDir))),
-    },
-  });
+  let rootHandle: ReturnType<typeof openBackendPublicationReadRoot>;
+  let identity: PublicationConvergence["identity"];
+  const assertReadRoot = (canonicalHomeDir: string): void => {
+    rootHandle ??= openBackendPublicationReadRoot(canonicalHomeDir);
+    if (rootHandle !== undefined) {
+      assertPrivateDirectoryEntry(rootHandle, join(canonicalHomeDir, ".lcm"), rootHandle.witness.uid);
+    }
+  };
+  try {
+    try {
+      const snapshot = readSnapshot(configPath);
+      if (snapshot.witness.presence === "absent") throw new Error("configuration is absent");
+      const stored = parseStoredConfig(snapshot.content);
+      const daemon = stored.daemon as { port?: unknown } | undefined;
+      if (typeof daemon?.port === "number" && Number.isInteger(daemon.port)) port = daemon.port;
+      const storage = stored.storage as { backend?: unknown } | undefined;
+      if (storage?.backend === "postgresql") backend = "postgresql";
+      if (homeDir !== undefined) rootHandle = openBackendPublicationReadRoot(homeDir);
+      const witness = {
+        presence: snapshot.witness.presence,
+        rawSha256: snapshot.witness.rawSha256,
+        byteLength: snapshot.witness.byteLength,
+        dev: snapshot.witness.dev,
+        ino: snapshot.witness.ino,
+      } as const;
+      const firstJournal = assertReadAccess(configPath, backend, witness);
+      const second = readSnapshot(configPath);
+      if (!daemonConfigSnapshotWitnessEqual(snapshot.witness, second.witness)) throw new Error("configuration changed");
+      const secondJournal = assertReadAccess(configPath, backend, {
+        presence: second.witness.presence,
+        rawSha256: second.witness.rawSha256,
+        byteLength: second.witness.byteLength,
+        dev: second.witness.dev,
+        ino: second.witness.ino,
+      });
+      if (firstJournal.journalChecksumSha256 !== secondJournal.journalChecksumSha256) {
+        throw new Error("publication changed");
+      }
+      authenticated = {
+        witness: snapshot.witness,
+        journalChecksumSha256: secondJournal.journalChecksumSha256,
+      };
+    } catch {
+      // Missing, malformed, or unstable config cannot authenticate a daemon.
+    }
+    if (homeDir !== undefined && authenticated !== undefined) {
+      const captured = await capturePublicationIdentity({
+        port,
+        expectedVersion,
+        expectedStorageBackend: backend,
+        expectedEntrypoint,
+        expectedRuntimeDigest,
+        deps: {
+          ...seams,
+          homeDir,
+          lockPath: join(homeDir, ".lcm.backend-publication.lock"),
+          fetch: seams.fetch ?? globalThis.fetch,
+          readToken: seams.readToken ?? (() => readAuthToken(daemonTokenPath(homeDir))),
+        },
+      });
+      if (captured !== undefined) {
+        try {
+          assertReadRoot(homeDir);
+          const current = readSnapshot(configPath);
+          if (!daemonConfigSnapshotWitnessEqual(authenticated.witness, current.witness)) {
+            throw new Error("configuration changed");
+          }
+          const currentJournal = assertReadAccess(configPath, backend, {
+            presence: current.witness.presence,
+            rawSha256: current.witness.rawSha256,
+            byteLength: current.witness.byteLength,
+            dev: current.witness.dev,
+            ino: current.witness.ino,
+          });
+          if (currentJournal.journalChecksumSha256 !== authenticated.journalChecksumSha256) {
+            throw new Error("publication changed");
+          }
+          assertReadRoot(homeDir);
+          identity = captured;
+        } catch {
+          // Health captured across changed config or publication state is not reusable.
+        }
+      }
+    }
+  } finally {
+    rootHandle?.close();
+  }
   return createPublicationConvergence({
     port,
     identity,
@@ -477,7 +525,7 @@ export function prepareInstallConfig(deps: ServiceDeps, path: string): InstallCo
     const read = (): InstallConfigState & { journalChecksum: string | null; witness: ReturnType<typeof readDaemonConfigRawSnapshot>["witness"] } => {
       const snapshot = readSnapshot(path);
       if (snapshot.witness.presence === "absent") {
-        assertReadAccess(path, "sqlite", {
+        const journal = assertReadAccess(path, "sqlite", {
           presence: "absent",
           rawSha256: null,
           byteLength: 0,
@@ -485,7 +533,7 @@ export function prepareInstallConfig(deps: ServiceDeps, path: string): InstallCo
           ino: null,
         });
         assertReadRoot();
-        return { exists: false, content: null, journalChecksum: null, witness: snapshot.witness };
+        return { exists: false, content: null, journalChecksum: journal.journalChecksumSha256, witness: snapshot.witness };
       }
       const stored = parseStoredConfig(snapshot.content);
       const backend = (

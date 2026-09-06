@@ -458,7 +458,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(208);
+    expect(productionFiles).toHaveLength(209);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -488,10 +488,10 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(208);
+    expect(ownershipCounts.size).toBe(209);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#866/#722/#786/#952/#814/#930/#969 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#864/#866/#722/#786/#952/#814/#882/#930/#969 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -524,6 +524,8 @@ describe("Codecov configuration", () => {
       ["src/stats.ts", "unit-memory-retrieval"],
       ["src/connectors/codex-hooks.ts", "unit-connectors"],
       ["src/connectors/installer.ts", "unit-connectors"],
+      // #881 absent-config journal admission and #882 post-health identity
+      // fencing remain installer-owned.
       ["installer/install.ts", "unit-installation"],
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
@@ -565,6 +567,7 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
+      ["src/db/database-parent.ts", "unit-local-persistence"],
       ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
@@ -574,6 +577,7 @@ describe("Codecov configuration", () => {
       ["src/mcp/tools/lcm-grep.ts", "unit-mcp"],
       // #863 expand-depth schema remains owned by MCP tools.
       ["src/mcp/tools/lcm-expand.ts", "unit-mcp"],
+      // #972 search cwd client typing remains memory/retrieval-owned.
       ["src/memory/index.ts", "unit-memory-retrieval"],
       // #793 shared search-limit contract remains retrieval-owned.
       ["src/retrieval.ts", "unit-memory-retrieval"],
