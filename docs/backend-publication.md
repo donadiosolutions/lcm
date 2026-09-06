@@ -124,15 +124,21 @@ directory witness. Removing the directory or rebinding its pathname to another
 inode during admission is unsafe storage, not absent evidence.
 
 Coordinator operations use the same private publication-directory descriptor
-for their locked journal evidence reads and recovery-material authentication,
-including reads that happen after awaited driver work. The descriptor is
-revalidated before a successful operation return and is always closed when the
-operation settles. A directory identity or security drift is reported as
+for their locked journal evidence reads, checkpoint compare-and-swap reads,
+and recovery-material authentication, including checkpoints issued after
+awaited driver work. Each checkpoint revalidates that retained identity before
+and after its observer boundaries and durable publication, and binds a present
+journal's observed parent device/inode to the same descriptor. The descriptor
+is revalidated before a successful operation return and is always closed when
+the operation settles. A directory identity or security drift is reported as
 unsafe storage; the preparing and abort-releasing missing-material recovery
 shortcuts remain limited to a genuine missing material file while the retained
-directory remains authenticated. This binding covers coordinator evidence and
-material reads and the final identity check; checkpoint writes and cleanup
-mutations remain path-addressed.
+directory remains authenticated.
+
+Checkpoint publication still uses the pathname-based durable writer, and
+archive and material-cleanup mutations remain path-addressed. These checks do
+not provide descriptor-relative mutation or prevent a same-UID substitution
+after the generic writer's final pathname check.
 
 The implementation persists exactly these 16 phase literals:
 

@@ -141,7 +141,8 @@ const expectedComponents = [
       // #906 keeps bounded publication-convergence probe expiry and error
       // selection in this storage-abstractions owner.
       "^src/storage/backend\\.ts$",
-      // #844 keeps coordinator directory-witness authentication in this owner.
+      // #844 and #942 keep coordinator evidence, material, and checkpoint
+      // directory-witness authentication in this owner.
       "^src/storage/backend-publication\\.ts$",
       // #910 keeps shared publication retry deadlines monotonic in this owner.
       "^src/storage/publication-convergence\\.ts$",
