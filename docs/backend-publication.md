@@ -356,6 +356,13 @@ open flags where the platform provides them. Configuration reads and writes
 are bounded and descriptor-aware; a config symlink, non-regular file, or
 oversized file is rejected before mutation.
 
+If a bootstrap directory fails authentication after its descriptor is opened,
+LCM attempts to close that descriptor once. A successful close preserves the
+original authentication error. If the close also fails, the reported error
+preserves both failures and identifies the authentication error as its cause,
+so operators can diagnose the rejected directory without losing cleanup
+evidence.
+
 Read-only publication probes distinguish an absent root at the initial open
 from an authentication failure after that root was opened. The former remains
 compatible with legacy SQLite installations and is rechecked at later

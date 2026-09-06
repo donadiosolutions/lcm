@@ -37,6 +37,8 @@ component_management:
         # pre-handoff content within this configuration-security boundary.
         # #828 authenticates project-directory topology with retained
         # no-follow descriptors and borrowed publication parents.
+        # #1041 preserves bootstrap directory authentication errors when
+        # descriptor cleanup also fails.
         - "^src/config-manager\\.ts$"
         - "^src/config-projection\\.ts$"
         - "^src/generated-patterns\\.ts$"
