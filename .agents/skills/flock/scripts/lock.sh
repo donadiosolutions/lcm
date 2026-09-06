@@ -11,13 +11,17 @@ lock() {
         printf 'Current Codex thread UUID is unavailable in CODEX_THREAD_ID.\n' >&2
         return 2
     fi
-    if [ -e /dev/fd/9 ]; then
+    if [ -L /proc/self/fd/9 ]; then
         printf 'Descriptor 9 is already open; use a dedicated shell for this lock.\n' >&2
         return 2
     fi
     runtime=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
     if ! [[ $runtime = /* && -d $runtime && -O $runtime ]]; then
         printf 'A local, user-owned runtime directory is required.\n' >&2
+        return 2
+    fi
+    if [ "$(stat -Lc '%a' -- "$runtime")" != 700 ]; then
+        printf 'The shared runtime directory must have mode 700.\n' >&2
         return 2
     fi
     directory=$runtime/codex-locks

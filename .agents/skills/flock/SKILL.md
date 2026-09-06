@@ -28,7 +28,8 @@ The helper automatically reads and validates `CODEX_THREAD_ID`, generates an
 ISO-8601 timestamp with timezone offset, and hashes the exact resource bytes
 with SHA-256. Files live in `$XDG_RUNTIME_DIR/codex-locks/` (fallback:
 `/run/user/$(id -u)/codex-locks/`), with directory mode 700 and new files mode 600.
-All cooperating threads must use the same local runtime directory.
+The runtime directory must be user-owned with mode 700. All cooperating threads
+must use the same local runtime directory.
 
 If the environment lacks the UUID, obtain the current thread's canonical UUID
 from the collaboration surface and export it internally as `CODEX_THREAD_ID`.
