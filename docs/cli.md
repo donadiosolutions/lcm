@@ -230,6 +230,7 @@ publication journal that changes between its two authenticated snapshots. Once
 the active publication has settled, rerun `lcm install` manually. This drift
 refusal is not retried automatically, and rerunning the installer does not imply
 that unrelated installation failures have resolved.
+The refusal is reported as a stable diagnostic so you can rerun once concurrent publication activity has settled.
 
 Before `lcm install` reuses a healthy daemon identity for those retries, it
 revalidates the complete configuration snapshot and terminal publication
