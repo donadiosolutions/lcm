@@ -429,10 +429,12 @@ The check is deliberately short-lived around each operation; it is not held
 across network calls, request bodies, model work, daemon spawning, or unrelated
 health waits.
 
-When directory authentication rejects a consumer admission, LCM releases the
-temporary root and publication descriptors acquired for that check before
-returning the original refusal. The rejection remains fail-closed; releasing
-those resources does not repair or change the publication state.
+When directory authentication rejects a consumer admission, LCM attempts to
+release the temporary root and publication descriptors acquired for that
+check. If cleanup succeeds, LCM returns the original authentication refusal.
+If cleanup also fails, the reported error preserves both failures and records
+the authentication failure as its cause. The rejection remains fail-closed;
+releasing those resources does not repair or change the publication state.
 
 - **Daemon and health:** an unresolved or inconsistent publication returns a
   sanitized HTTP `503` with `status: "blocked"` and no filesystem, SQL, URL,

@@ -689,6 +689,146 @@ describe("private filesystem primitives", () => {
     expect(() => syncPrivateDirectory(path, { expectedUid })).not.toThrow();
   });
 
+  it.each([
+    ["strict", openPrivateDirectory, new Error("strict authentication failed")],
+    ["creation", openPrivateDirectoryForCreation, { code: 123 }],
+    ["optional", openPrivateDirectoryIfExists, undefined],
+  ] as const)("preserves the exact %s directory authentication failure after cleanup", (
+    _label,
+    openDirectory,
+    authenticationFailure,
+  ) => {
+    const root = makeRoot();
+    chmodSync(root, 0o700);
+    const originalClose = closeSync;
+    let closeCalls = 0;
+    let caught: unknown = Symbol("did not throw");
+
+    withPatchedFs(
+      "fstatSync",
+      (() => { throw authenticationFailure; }) as typeof fstatSync,
+      () => withPatchedFs(
+        "closeSync",
+        ((fd: number) => {
+          closeCalls += 1;
+          originalClose(fd);
+        }) as typeof closeSync,
+        () => {
+          try {
+            openDirectory(root);
+          } catch (error) {
+            caught = error;
+          }
+        },
+      ),
+    );
+
+    expect(caught).toBe(authenticationFailure);
+    expect(closeCalls).toBe(1);
+  });
+
+  it.each([
+    ["strict", openPrivateDirectory, new Error("strict authentication failed")],
+    ["creation", openPrivateDirectoryForCreation, { code: 123 }],
+    ["optional", openPrivateDirectoryIfExists, undefined],
+  ] as const)("reports both %s directory authentication and cleanup failures", (
+    _label,
+    openDirectory,
+    authenticationFailure,
+  ) => {
+    const root = makeRoot();
+    chmodSync(root, 0o700);
+    const originalClose = closeSync;
+    const cleanupFailure = new Error("descriptor cleanup failed");
+    let closeCalls = 0;
+    let caught: unknown = Symbol("did not throw");
+
+    withPatchedFs(
+      "fstatSync",
+      (() => { throw authenticationFailure; }) as typeof fstatSync,
+      () => withPatchedFs(
+        "closeSync",
+        ((fd: number) => {
+          closeCalls += 1;
+          originalClose(fd);
+          throw cleanupFailure;
+        }) as typeof closeSync,
+        () => {
+          try {
+            openDirectory(root);
+          } catch (error) {
+            caught = error;
+          }
+        },
+      ),
+    );
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    const aggregate = caught as AggregateError;
+    expect(aggregate.message).toBe("private directory authentication and cleanup failed");
+    expect(aggregate.errors).toHaveLength(2);
+    expect(aggregate.errors[0]).toBe(authenticationFailure);
+    expect(aggregate.errors[1]).toBe(cleanupFailure);
+    expect(Object.hasOwn(aggregate, "cause")).toBe(true);
+    expect(aggregate.cause).toBe(authenticationFailure);
+    expect(closeCalls).toBe(1);
+  });
+
+  it("returns undefined only when an optional directory is absent before acquisition", () => {
+    const root = makeRoot();
+    const initialAbsence = Object.assign(new Error("initial absence"), { code: "ENOENT" });
+
+    expect(withPatchedFs(
+      "openSync",
+      (() => { throw initialAbsence; }) as typeof openSync,
+      () => openPrivateDirectoryIfExists(root),
+    )).toBeUndefined();
+  });
+
+  it.each([false, true])("throws post-acquisition optional-directory ENOENT (cleanup failure: %s)", (
+    cleanupFails,
+  ) => {
+    const root = makeRoot();
+    chmodSync(root, 0o700);
+    const authenticationFailure = Object.assign(new Error("post-acquisition absence"), { code: "ENOENT" });
+    const cleanupFailure = new Error("descriptor cleanup failed");
+    const originalClose = closeSync;
+    let closeCalls = 0;
+    let caught: unknown = Symbol("did not throw");
+
+    withPatchedFs(
+      "realpathSync",
+      (() => { throw authenticationFailure; }) as typeof realpathSync,
+      () => withPatchedFs(
+        "closeSync",
+        ((fd: number) => {
+          closeCalls += 1;
+          originalClose(fd);
+          if (cleanupFails) throw cleanupFailure;
+        }) as typeof closeSync,
+        () => {
+          try {
+            openPrivateDirectoryIfExists(root);
+          } catch (error) {
+            caught = error;
+          }
+        },
+      ),
+    );
+
+    if (cleanupFails) {
+      expect(caught).toBeInstanceOf(AggregateError);
+      const aggregate = caught as AggregateError;
+      expect(aggregate.errors).toHaveLength(2);
+      expect(aggregate.errors[0]).toBe(authenticationFailure);
+      expect(aggregate.errors[1]).toBe(cleanupFailure);
+      expect(aggregate.cause).toBe(authenticationFailure);
+    } else {
+      expect(caught).toBe(authenticationFailure);
+    }
+    expect(closeCalls).toBe(1);
+  });
+
   it.each([undefined, { code: 123 }])("preserves optional directory-open failures without a string code: %j", (failure) => {
     const root = makeRoot();
     let caught: unknown = Symbol("did not throw");
