@@ -136,6 +136,41 @@ syntax keeps each endpoint's existing error behavior. In particular,
 `/recent` now rejects a non-object body instead of treating some primitives as
 an empty request.
 
+### HTTP `POST /search`
+
+The daemon's `/search` endpoint searches episodic and promoted memory for a
+project. Send a JSON object with an existing absolute project directory as
+`cwd`, the search `query`, and any optional search parameters:
+
+```json
+{
+  "cwd": "/workspace/project",
+  "query": "authentication decision",
+  "limit": 10,
+  "layers": ["episodic", "promoted"],
+  "projectId": "legacy-project-id",
+  "threshold": 0.7
+}
+```
+
+The daemon validates `cwd` and uses it to select project storage. There is no
+implicit working-directory fallback. The legacy `projectId` and `threshold`
+options are accepted and forwarded to the daemon, but `projectId` does not
+select a project and `threshold` does not filter by similarity. Omit `cwd` to
+preserve the legacy empty-result response (`{ "episodic": [], "promoted": [] }`).
+
+The package root exposes the same request through `memory.search`:
+
+```js
+import { memory } from "@donadiosolutions/lcm";
+
+const result = await memory.search("authentication decision", {
+  cwd: "/workspace/project",
+  layers: ["episodic", "promoted"],
+  limit: 10,
+});
+```
+
 ### HTTP `POST /recent`
 
 The daemon's `/recent` endpoint returns recent summaries for a project. Send a

@@ -68,6 +68,22 @@ function assertProjectTopology(
   assertPrivateDirectoryEntry(leaf, leafPath, leaf.witness.uid);
 }
 
+function closeProjectChildAndRethrow(
+  child: PrivateDirectoryHandle | undefined,
+  primaryError: unknown,
+): never {
+  try {
+    child?.close();
+  } catch (cleanupError) {
+    throw new AggregateError(
+      [primaryError, cleanupError],
+      "project child admission and cleanup failed",
+      { cause: primaryError },
+    );
+  }
+  throw primaryError;
+}
+
 function acquireProjectChild(
   parent: PrivateDirectoryHandle,
   parentPath: string,
@@ -81,8 +97,7 @@ function acquireProjectChild(
       assertPrivateDirectoryEntry(existing, childPath, expectedUid);
       return existing;
     } catch (error) {
-      existing.close();
-      throw error;
+      closeProjectChildAndRethrow(existing, error);
     }
   }
 
@@ -105,8 +120,7 @@ function acquireProjectChild(
     assertPrivateDirectoryEntry(child, childPath, expectedUid);
     return child;
   } catch (error) {
-    child?.close();
-    throw error;
+    closeProjectChildAndRethrow(child, error);
   }
 }
 

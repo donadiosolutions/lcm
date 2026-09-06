@@ -846,6 +846,11 @@ an owner-read-stripping umask can prevent that descriptor from being opened and
 fails closed with `EACCES`. Restore a usable umask and remove only the
 untrusted child after confirming its ownership before retrying.
 
+If project-directory admission or permission tightening fails, LCM retains
+that failure as the cause while it closes acquired directory handles. When the
+same child handle also fails to close, the reported error attaches both
+failures and LCM still attempts to close retained ancestor handles.
+
 The admission and metadata publication checks provide a bounded observed
 topology guarantee: they reject unsafe state observed at each boundary,
 including symlinks and replaced device/inode identities. Portable pathname
@@ -1022,6 +1027,14 @@ without enabling Codex strict configuration validation. This keeps unrelated,
 forward-compatible fields in the user's Codex configuration from becoming fatal
 to compaction while still applying the requested controls to the spawned
 summarizer.
+
+When Codex compaction cannot start because the `codex` executable is missing or
+cannot be found on `PATH`, LCM reports that directly and includes an example
+installation command. Install the Codex CLI (for example, with
+`npm install -g @openai/codex`) and make sure the directory containing the
+executable is on the environment `PATH` used by the LCM daemon, then retry the
+compaction. Other endpoint-discovery and protocol failures keep the generic
+safe diagnostic so provider output and local paths are not exposed.
 
 `llm.maxConcurrency` controls the number of manual compact requests that may be
 in flight at once. It defaults to `1` and accepts only integer values from `1`

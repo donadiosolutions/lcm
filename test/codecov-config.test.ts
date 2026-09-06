@@ -183,7 +183,8 @@ const expectedComponents = [
     component_id: "unit-memory-retrieval",
     name: "Unit - Memory and Retrieval",
     paths: [
-      // The #971 compact cwd client contract remains memory/retrieval-owned.
+      // The #971 compact cwd client contract and #973 stats database admission
+      // remain memory/retrieval-owned.
       "src/memory/",
       "^src/expansion\\.ts$",
       "^src/retrieval\\.ts$",
@@ -490,7 +491,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(209);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#930/#969 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -519,11 +520,13 @@ describe("Codecov configuration", () => {
       ["src/sensitive.ts", "unit-configuration-security"],
       ["src/project-map.ts", "unit-project-worktrees"],
       ["src/portable-knowledge.ts", "unit-project-worktrees"],
-      // #866 stats config retries and journal failures retain this owner.
+      // #866 stats config retries and journal failures, plus #973 project
+      // database admission, retain this owner.
       ["src/stats.ts", "unit-memory-retrieval"],
       ["src/connectors/codex-hooks.ts", "unit-connectors"],
       ["src/connectors/installer.ts", "unit-connectors"],
-      // #881 keeps absent-config journal checksum admission installer-owned.
+      // #881 absent-config journal admission and #882 post-health identity
+      // fencing remain installer-owned.
       ["installer/install.ts", "unit-installation"],
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
@@ -549,6 +552,8 @@ describe("Codecov configuration", () => {
       ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
+      // #885 keeps the shared missing-Codex diagnostic and its resolver
+      // identity handling within the existing LLM component.
       ["src/llm/codex-process.ts", "unit-llm-prompts"],
       ["src/llm/codex-config.ts", "unit-llm-prompts"],
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
@@ -575,6 +580,7 @@ describe("Codecov configuration", () => {
       ["src/mcp/tools/lcm-grep.ts", "unit-mcp"],
       // #863 expand-depth schema remains owned by MCP tools.
       ["src/mcp/tools/lcm-expand.ts", "unit-mcp"],
+      // #972 search cwd client typing remains memory/retrieval-owned.
       ["src/memory/index.ts", "unit-memory-retrieval"],
       // #793 shared search-limit contract remains retrieval-owned.
       ["src/retrieval.ts", "unit-memory-retrieval"],

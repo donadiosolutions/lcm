@@ -15,7 +15,8 @@ component_management:
     - component_id: "unit-installation"
       name: "Unit - Installation"
       paths:
-        # #881 keeps absent-config journal checksum admission installer-owned.
+        # #881 keeps absent-config journal checksum admission installer-owned;
+        # #882 keeps post-health installer identity fencing in this owner.
         - "installer/"
         - "src/installer/"
         - "^src/bootstrap\\.ts$"
@@ -117,7 +118,8 @@ component_management:
       name: "Unit - LLM, Responses, and Prompts"
       paths:
         # The #779 authenticated Responses terminal gateway, #780 bounded
-        # Codex failure classification, and #790 endpoint resolver remain LLM-owned.
+        # Codex failure classification, #790 endpoint resolver, and #885
+        # missing-Codex diagnostic factory remain LLM-owned.
         - "src/llm/"
         - "src/prompts/"
     - component_id: "unit-local-persistence"
@@ -181,10 +183,11 @@ component_management:
     - component_id: "unit-memory-retrieval"
       name: "Unit - Memory and Retrieval"
       paths:
-        # The #709 SearchResult compatibility bridge, #793 search-limit contract,
-        # retrieval contract, and #971 compact cwd client contract remain
-        # memory/retrieval-owned. #866 stats
-        # publication retries and fail-closed journal errors stay in this owner.
+        # The #709 SearchResult compatibility bridge, #793 search-limit and
+        # retrieval contracts, plus #971 compact cwd and #972 search cwd client
+        # contracts remain memory/retrieval-owned. #866 stats publication retries
+        # and fail-closed journal errors, plus #973 project database admission,
+        # stay in this owner.
         - "src/memory/"
         - "^src/expansion\\.ts$"
         - "^src/retrieval\\.ts$"

@@ -1305,6 +1305,41 @@ describe("createCodexProcessSummarizer", () => {
     );
   });
 
+  it("preserves the resolver missing Codex diagnostic through the summarizer seam", async () => {
+    const actualConfig = await vi.importActual<typeof import("../../src/llm/codex-config.js")>("../../src/llm/codex-config.js");
+    const resolverChild = makeHangingChild();
+    resolverChild.kill.mockImplementation(() => {
+      resolverChild.emit("close", null);
+      return true;
+    });
+    const resolverSpawn = vi.fn(() => {
+      setImmediate(() => resolverChild.emit("error", Object.assign(new Error("spawn codex ENOENT secret"), { code: "ENOENT" })));
+      return resolverChild;
+    });
+    const execSpawn = vi.fn() as unknown as SpawnFn;
+    const createGateway = vi.fn();
+    const rmSync = vi.fn() as unknown as RmSyncFn;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), { spawn: execSpawn, rmSync }),
+      _createGateway: createGateway,
+      _resolveConfig: (signal, timeoutMs) => actualConfig.resolveCodexOpenAIBaseUrl({
+        spawn: resolverSpawn as never,
+        platform: "win32",
+        processBirthTime: () => "birth",
+        timeoutMs,
+      }, signal),
+    });
+
+    await expect(summarizer("text", false)).rejects.toMatchObject({ message: [
+      "Codex CLI is not installed or not on PATH.",
+      "Install it first, for example: npm install -g @openai/codex",
+      "Then run lcm again.",
+    ].join("\n") });
+    expect(createGateway).not.toHaveBeenCalled();
+    expect(execSpawn).not.toHaveBeenCalled();
+    expect(rmSync).toHaveBeenCalledOnce();
+  });
+
   it("rejects on non-zero exit", async () => {
     const child = makeChild(1, "boom");
     const spawn = vi.fn().mockReturnValue(child);

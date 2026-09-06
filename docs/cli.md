@@ -93,6 +93,24 @@ rejected export admission exits unsuccessfully, including with `--output` or
 `--all`. An `--all` export may have already written earlier projects when a
 later project fails; those outputs remain, and no successful total is printed.
 
+The local `lcm stats` project-database scan authenticates the LCM state root,
+the `projects` directory, and each project directory as owner-held directories
+with exact mode `0700`. It opens only an existing regular `db.sqlite`; a missing
+state root or `projects` directory returns empty project statistics, and a
+missing project database is skipped without creating it. An authenticated
+legacy database may be migrated before its statistics are read. Busy, locked,
+or malformed project databases remain best-effort skips. Unsafe state or
+projects topology, a project replaced after enumeration, and an unsafe or
+replaced database leaf abort the scan with a path-free remediation message. A
+project that is already a symlink when enumeration begins is excluded.
+
+This boundary starts at the `.lcm` state root; operating-system directories
+above it are outside the project-statistics admission policy. The portable
+SQLite API opens a pathname rather than a retained file descriptor, so the
+scan checks directory and database identity before and after opening but cannot
+eliminate a same-account swap-and-restore race. Event statistics use their own
+storage scan and are outside this project-database no-creation guarantee.
+
 `lcm search <query> --limit <n>` accepts a positive integer from 1 through
 1000 and defaults to 5. The limit is a maximum applied independently to each
 selected layer. Episodic candidate recall grows to at least 50 records per
@@ -230,6 +248,16 @@ publication journal that changes between its two authenticated snapshots. Once
 the active publication has settled, rerun `lcm install` manually. This drift
 refusal is not retried automatically, and rerunning the installer does not imply
 that unrelated installation failures have resolved.
+The refusal is reported as a stable diagnostic so you can rerun once concurrent publication activity has settled.
+
+Before `lcm install` reuses a healthy daemon identity for those retries, it
+revalidates the complete configuration snapshot and terminal publication
+journal after the authenticated health response and its JSON body have been
+read. A private canonical `.lcm` root is retained across that exchange and its
+exact directory entry is checked again around the final reads. If any of that
+evidence changes, the captured identity is discarded; rerun `lcm install` once
+publication settles if lock contention remains. A legacy non-private SQLite
+root without publication evidence keeps its existing read compatibility.
 
 ## Daemon-dependent resilience
 
