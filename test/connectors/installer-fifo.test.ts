@@ -202,9 +202,9 @@ function runChild({
     const killForFailure = (error: Error, timeout: boolean): void => {
       if (settled) return;
       setFailure(error, timeout);
+      armCloseGrace();
       if (child.exitCode !== null || child.signalCode !== null) return;
       killQuietly(child);
-      armCloseGrace();
     };
 
     const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
@@ -365,6 +365,133 @@ afterEach(async () => {
 });
 
 describe("connector installer child ownership", () => {
+  it("settles an error after an exited child reports an exit code without close", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let run: Promise<ChildResult> | undefined;
+    let settled = false;
+    const child = new FakeChild();
+    const originalError = new Error("original exit-code failure");
+    child.exitCode = 7;
+    try {
+      run = runChild({
+        source: "",
+        closeGraceMs: 5,
+        spawnFactory: () => child.asChildProcess(),
+      });
+      run.then(() => { settled = true; });
+      child.emit("error", originalError);
+      child.emit("exit", 11, "SIGTERM");
+
+      await vi.advanceTimersByTimeAsync(5);
+      await Promise.resolve();
+      expect(activeChildren.has(child.asChildProcess())).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(CLOSE_GRACE_MS);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(settled).toBe(true);
+      expect(child.killCalls).toBe(0);
+      expect(child.disconnectCalls).toBe(0);
+      expect(activeChildren.has(child.asChildProcess())).toBe(false);
+      expect(child.listenerCount("close")).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+
+      const result = await run;
+      expect(result).toMatchObject({ outcome: "error", code: 7, signal: null });
+      expect(result.error).toBe(originalError);
+    } finally {
+      if (run !== undefined) {
+        child.emit("close", 7, null);
+        await vi.runAllTimersAsync();
+        await run;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("settles an error after an exited child reports a signal without close", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let run: Promise<ChildResult> | undefined;
+    let settled = false;
+    const child = new FakeChild();
+    const originalError = new Error("original signal failure");
+    child.signalCode = "SIGTERM";
+    try {
+      run = runChild({
+        source: "",
+        closeGraceMs: 5,
+        spawnFactory: () => child.asChildProcess(),
+      });
+      run.then(() => { settled = true; });
+      child.emit("error", originalError);
+      child.emit("exit", 11, null);
+
+      await vi.advanceTimersByTimeAsync(5);
+      await Promise.resolve();
+      expect(activeChildren.has(child.asChildProcess())).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(CLOSE_GRACE_MS);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(settled).toBe(true);
+      expect(child.killCalls).toBe(0);
+      expect(child.disconnectCalls).toBe(0);
+      expect(activeChildren.has(child.asChildProcess())).toBe(false);
+      expect(child.listenerCount("close")).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+
+      const result = await run;
+      expect(result).toMatchObject({ outcome: "error", code: null, signal: "SIGTERM" });
+      expect(result.error).toBe(originalError);
+    } finally {
+      if (run !== undefined) {
+        child.emit("close", null, "SIGTERM");
+        await vi.runAllTimersAsync();
+        await run;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves an already-exited failure when close arrives before grace", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let run: Promise<ChildResult> | undefined;
+    let settled = false;
+    const child = new FakeChild();
+    const originalError = new Error("close-before-grace failure");
+    child.exitCode = 13;
+    try {
+      run = runChild({
+        source: "",
+        closeGraceMs: 5,
+        spawnFactory: () => child.asChildProcess(),
+      });
+      run.then(() => { settled = true; });
+      child.emit("error", originalError);
+      child.emit("exit", 17, "SIGTERM");
+      child.emit("close", 13, null);
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(true);
+      expect(child.killCalls).toBe(0);
+      expect(child.disconnectCalls).toBe(0);
+      expect(activeChildren.has(child.asChildProcess())).toBe(false);
+      expect(child.listenerCount("close")).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+
+      const result = await run;
+      expect(result).toMatchObject({ outcome: "error", code: 13, signal: null });
+      expect(result.error).toBe(originalError);
+    } finally {
+      if (run !== undefined) {
+        child.emit("close", 13, null);
+        await vi.runAllTimersAsync();
+        await run;
+      }
+      vi.useRealTimers();
+    }
+  });
+
   it("retains ownership until the final reap completes after exit without close", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     let run: Promise<ChildResult> | undefined;
