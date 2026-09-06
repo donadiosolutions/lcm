@@ -455,6 +455,27 @@ describe("runCli registration and help dispatch", () => {
     expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps nested connector installation on ordinary migration", async () => {
+    state.createInstallerPublicationConvergence.mockImplementation(() => {
+      throw new Error("nested connector install must not create convergence");
+    });
+    const migrate = vi.fn();
+
+    expect(await invoke(["connectors", "install", "codex"], {
+      migrate,
+      sleep: async (_delayMs: number) => undefined,
+    })).toBeUndefined();
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.installConnector).toHaveBeenCalledWith(
+      "codex",
+      undefined,
+      process.cwd(),
+      { persistTransport: false, queryCodexMcp: false },
+    );
+    expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
+  });
+
   it("reuses the preAction convergence for config reads and prints once", async () => {
     const convergence = createPublicationConvergence({
       port: 3737,
@@ -1260,6 +1281,7 @@ describe("runCli daemon-backed and utility actions", () => {
     for (const args of pureCases) await invoke(args, { migrate, sleep });
 
     expect(migrate).not.toHaveBeenCalled();
+    expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
   });
 
   it("keeps mutation and unclassified actions on the migration path", async () => {

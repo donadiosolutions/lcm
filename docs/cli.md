@@ -200,8 +200,10 @@ daemon token or starting the health exchange. The final wait is likewise
 shortened to whatever remains. Once the window is spent no further retries
 occur in that run. This is what prevents a healthy managed daemon's short
 background publication reconciliation immediately after `lcm install` from
-failing the next `lcm doctor` or `lcm connectors install codex`; it does not
-wait for a stuck or foreign lock holder.
+failing the next `lcm doctor`; `lcm connectors install codex` retains the
+ordinary root-migration path and connector-owned verification, without the
+top-level installer's publication-convergence retry. The retry does not wait
+for a stuck or foreign lock holder.
 
 `lcm install` uses the same bounded publication admission for its preflight
 migration and each installer lock-taking stage, including daemon lifecycle
