@@ -138,6 +138,7 @@ component_management:
         # #898 applies required promoted tags before the caller result maximum
         # while retaining local-persistence ownership.
         # #898's guarded dual-JSON eligibility keeps this search in the same owner.
+        # #989 retains event-sidecar parent authentication in this owner.
         # #992 keeps pre-initialization SQLite leaf admission and final
         # opened-identity fencing local-persistence-owned.
         - "src/db/"
