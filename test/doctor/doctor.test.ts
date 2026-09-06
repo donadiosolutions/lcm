@@ -1006,6 +1006,86 @@ describe("runDoctor project map checks", () => {
     }
   });
 
+  it("continues convergence after a forward wall-clock correction", async () => {
+    const { home } = contentionHome("lcm-doctor-forward-wall-correction-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("publication lock is busy");
+    const wallOrigin = 1_700_000_000_000;
+    let wallNow = wallOrigin;
+    let monotonicNow = 100.5;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const { deps, sleeps, restore } = convergenceDeps(home, {
+      _publicationConvergenceNow: undefined,
+      _betweenConvergenceAttemptsForTesting: () => {
+        wallNow = wallOrigin + 60_000;
+      },
+      _publicationConvergenceSleep: async (delayMs) => {
+        sleeps.push(delayMs);
+        monotonicNow += delayMs;
+      },
+    }, { projectMap: false });
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap")
+      .mockImplementationOnce(() => { throw contention; })
+      .mockImplementationOnce(() => passingProjectMapValidation(home));
+    try {
+      const results = await runDoctor(deps);
+      expect(validateProjectMap).toHaveBeenCalledTimes(2);
+      expect(sleeps).toEqual([50]);
+      expect(monotonicNow).toBe(150.5);
+      expect(results.find((result) => result.name === "project-map")?.status).toBe("pass");
+    } finally {
+      validateProjectMap.mockRestore();
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("expires convergence after 2000 monotonic milliseconds despite a backward wall-clock correction", async () => {
+    const { home } = contentionHome("lcm-doctor-backward-wall-correction-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("original publication lock is busy");
+    const wallOrigin = 1_700_000_000_000;
+    let wallNow = wallOrigin;
+    let monotonicNow = 100.5;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const { deps, sleeps, restore } = convergenceDeps(home, {
+      _publicationConvergenceNow: undefined,
+      _betweenConvergenceAttemptsForTesting: () => {
+        wallNow = wallOrigin - 60_000;
+      },
+      _publicationConvergenceSleep: async (delayMs) => {
+        sleeps.push(delayMs);
+        monotonicNow += delayMs;
+      },
+    }, { projectMap: false });
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap")
+      .mockImplementation((..._args) => {
+        if (validateProjectMap.mock.calls.length <= 40) throw contention;
+        return passingProjectMapValidation(home);
+      });
+    try {
+      const results = await runDoctor(deps);
+      expect(validateProjectMap).toHaveBeenCalledTimes(40);
+      expect(sleeps).toHaveLength(40);
+      expect(sleeps.every(delay => delay === 50)).toBe(true);
+      expect(monotonicNow).toBe(2_100.5);
+      expect(results.find((result) => result.name === "project-map")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("original publication lock is busy"),
+      });
+    } finally {
+      validateProjectMap.mockRestore();
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("bounds the authenticated retry probe to the remaining shared budget", async () => {
     vi.useFakeTimers();
     const { home } = contentionHome("lcm-doctor-probe-budget-");
