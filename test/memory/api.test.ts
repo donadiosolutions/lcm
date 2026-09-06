@@ -38,6 +38,37 @@ describe("createMemoryApi", () => {
     expect(mockPost).toHaveBeenLastCalledWith("/search", { query: "legacy", layers: ["semantic"] });
   });
 
+  it("forwards populated tags and cwd unchanged", async () => {
+    const mockPost = vi.fn().mockResolvedValue({ episodic: [], promoted: [] });
+    const api = createMemoryApi({ post: mockPost, health: vi.fn() } as any);
+    await api.search("tagged", {
+      cwd: "/workspace/project",
+      tags: ["decision", "project:lcm"],
+    });
+    expect(mockPost).toHaveBeenCalledWith("/search", {
+      query: "tagged",
+      cwd: "/workspace/project",
+      tags: ["decision", "project:lcm"],
+    });
+  });
+
+  it("forwards an empty tags array unchanged", async () => {
+    const mockPost = vi.fn().mockResolvedValue({ episodic: [], promoted: [] });
+    const api = createMemoryApi({ post: mockPost, health: vi.fn() } as any);
+    await api.search("untagged", { tags: [] });
+    expect(mockPost).toHaveBeenCalledWith("/search", {
+      query: "untagged",
+      tags: [],
+    });
+  });
+
+  it("omits tags when the caller does not provide them", async () => {
+    const mockPost = vi.fn().mockResolvedValue({ episodic: [], promoted: [] });
+    const api = createMemoryApi({ post: mockPost, health: vi.fn() } as any);
+    await api.search("unfiltered");
+    expect(mockPost).toHaveBeenCalledWith("/search", { query: "unfiltered" });
+  });
+
   it("compact forwards an explicit cwd and preserves the daemon response", async () => {
     const response = { summary: "Compacted" };
     const mockPost = vi.fn().mockResolvedValue(response);
