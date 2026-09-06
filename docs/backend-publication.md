@@ -343,7 +343,11 @@ the exact authenticated child has been admitted.
 Only lock-acquisition callbacks are retried; writes, prompts, skill changes,
 and daemon startup remain outside those callbacks and therefore run once. A
 foreign, malformed, stale, or unverifiable owner, or any identity drift,
-preserves the original typed contention failure and fails closed.
+preserves the original typed contention failure and fails closed. A bounded
+process-birth or authenticated-health probe that settles failed at or after
+the armed deadline also preserves that original error without another wait;
+the same failed evidence while time remains reports the later contention, and
+admission stays fail-closed in both cases.
 
 The terminal journal deliberately does not rehash mutable `~/.lcm/` content on
 later startups. Normal database, daemon, transcript, and configuration writes
@@ -431,7 +435,9 @@ those resources does not repair or change the publication state.
 
 - **Daemon and health:** an unresolved or inconsistent publication returns a
   sanitized HTTP `503` with `status: "blocked"` and no filesystem, SQL, URL,
-  credential, or raw driver detail. A valid terminal PostgreSQL witness still
+  credential, or raw driver detail. A bounded birth or health probe that
+  expires while evidence is settling preserves the original typed contention;
+  admission remains fail-closed, and a valid terminal PostgreSQL witness still
   requires runtime readiness and project identity before a route opens storage.
 - **MCP:** startup and each routed request authenticate a fresh publication
   witness. A blocked request is reported as `lcm error: backend publication
