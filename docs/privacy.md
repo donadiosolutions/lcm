@@ -256,11 +256,15 @@ The `Security` section of the doctor output shows:
   separator, semicolons, commas, apostrophes, closing parentheses, and closing
   braces remain part of an exact `file://` authority; after the path begins,
   those characters retain their existing path and prose delimiter behavior.
-  A quote immediately before the `file` scheme establishes a quote boundary:
-  its matching quote still terminates the URL, while an apostrophe inside an
-  unquoted or double-quoted authority remains authority text. Double quotes
-  remain hard boundaries for quoted or structured text. Ordinary HTTP and
-  HTTPS URLs retain their authorities, slashes, and paths. In an unquoted exact
+  A quote immediately before the `file` scheme establishes a quote boundary,
+  and its matching quote still terminates the URL. Before the first path
+  separator, an apostrophe inside an unquoted or double-quoted authority, or a
+  double quote inside an unquoted or apostrophe-quoted authority, remains
+  conservatively classified as authority text so a following local path is
+  redacted. Quotes after a file URL path begins, double quotes in non-file URLs
+  or structured text, and ordinary quoted local paths retain their existing
+  boundaries. Ordinary HTTP and HTTPS URLs retain their authorities, slashes,
+  and paths. In an unquoted exact
   `file://` URL with no path, a `?` or `#` outside still-open brackets ends the
   file URL authority classification. Following text is classified from fresh
   state: a nested non-file URL remains intact, while standalone POSIX, Windows,

@@ -97,8 +97,9 @@ const expectedComponents = [
       // Monotonic proxy startup polling remains daemon-core-owned.
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
-      // Error sanitization, including #893 adjacent-path and #903 prefixed
-      // nested-file redaction, remains daemon-core-owned.
+      // Error sanitization, including #893 adjacent-path, #903 prefixed
+      // nested-file, and #924 embedded-quote file-authority redaction, remains
+      // daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
