@@ -319,6 +319,10 @@ function scanAbsolutePath(
       index += 1;
       continue;
     }
+    if (windows && char === ":" && chars[index + 1] === "\\" && isWindowsDrivePathStart(chars, index - 1)) {
+      index += 1;
+      continue;
+    }
     if (char === "/" || (windows && char === "\\")) {
       sawPathCharacter = true;
       index += 1;

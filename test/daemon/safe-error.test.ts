@@ -458,6 +458,18 @@ describe("sanitizeError", () => {
     expect(sanitizeError(result)).toBe(result);
   });
 
+  it.each([
+    ["/p\\D:\\E:\\SECRET", "<path>\\<path>"],
+    ["ENOENT: /private\\C:\\Users\\E:\\SECRET", "ENOENT: <path>\\<path>"],
+    ["'file://host'['/private']https://h\\D:\\E:\\SECRET", "'file://host'['<path>']https:<path>\\<path>"],
+    ["D:\\E:\\SECRET", "<path>"],
+  ] as const)("redacts nested Windows drives completely on the first pass: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
   it("redacts a Windows drive following a bare POSIX path separately on the first pass", () => {
     const result = sanitizeError("/private\\D:\\SECRET");
 
