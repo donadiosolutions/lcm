@@ -310,6 +310,7 @@ function withRetainedReconciliationTarget<T>(
   targetHash: string,
   homeDir: string | undefined,
   operation: (target: RetainedReconciliationTarget) => T,
+  onCompleted: () => void,
 ): T {
   const rootPath = lcmHomeDir(homeDir);
   const projectsPath = projectsDir(homeDir);
@@ -340,6 +341,7 @@ function withRetainedReconciliationTarget<T>(
     assertRetainedReconciliationTarget(retained);
     result = operation(retained);
     assertRetainedReconciliationTarget(retained);
+    onCompleted();
   } catch (error) {
     primaryError = error;
   }
@@ -2226,7 +2228,10 @@ export function reconcileWorktrees(
       return resultFromJournal(fastJournal, journalFile);
     }
   }
-  const executeLocked = (map: Record<string, ProjectMapEntry>): WorktreeReconciliationResult => {
+  const executeLocked = (
+    map: Record<string, ProjectMapEntry>,
+    completion: { marked: boolean },
+  ): WorktreeReconciliationResult => {
     opts._observer?.("after-map-preflight");
     const existingJournal = readJournal(journalFile);
     if (
@@ -2607,25 +2612,32 @@ export function reconcileWorktrees(
         targetHash,
         opts.homeDir,
         reconcileRetainedTarget,
+        () => {
+          completion.marked = true;
+        },
       );
     } catch (error) {
       if (error instanceof BackendPublicationJournalError) throw error;
-      journal.blockedFrom = journal.phase === "merged" || journal.phase === "archived"
-        ? journal.phase
-        : journal.blockedFrom ?? "planned";
-      journal.phase = "blocked";
-      journal.reason = String(error);
-      writeJournal(journalFile, journal);
+      if (!completion.marked) {
+        journal.blockedFrom = journal.phase === "merged" || journal.phase === "archived"
+          ? journal.phase
+          : journal.blockedFrom ?? "planned";
+        journal.phase = "blocked";
+        journal.reason = String(error);
+        writeJournal(journalFile, journal);
+      }
       throw error;
     }
   };
 
   const execute = (map: Record<string, ProjectMapEntry>): WorktreeReconciliationResult => {
+    const completion = { marked: false };
     try {
-      return executeLocked(map);
+      return executeLocked(map, completion);
     } catch (error) {
       if (error instanceof BackendPublicationJournalError) throw error;
       if (opts.dryRun) throw error;
+      if (completion.marked) throw error;
       const current = readJournal(journalFile);
       if (current && resolve(current.canonical) !== canonical) throw error;
       {

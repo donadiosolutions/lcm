@@ -184,6 +184,13 @@ owner-only mode, reconciliation blocks before the next observable mutation;
 snapshot cleanup also leaves a private residual snapshot rather than removing
 a pathname that may have been rebound.
 
+If a retained target directory handle fails while closing after the journal has
+been durably marked completed and the final target validation has passed, LCM
+still reports the cleanup error and closes every handle, while preserving the
+completed journal and its folded map and archived-source evidence. A later run
+can therefore discover and enqueue newly eligible work. Cleanup failures before
+that completion boundary remain blocked and retain their failure reason.
+
 `lcm doctor` reports completed, partial, and blocked journals without retrying a
 blocked reconciliation while collecting project-sensitive-pattern diagnostics.
 
