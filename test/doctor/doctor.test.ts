@@ -2854,6 +2854,7 @@ describe("runDoctor configuration validation", () => {
     try {
       const results = await runDoctor(minimalDeps({
         fetch,
+        _expectedRuntimeDigestForTesting: EXPECTED_RUNTIME_DIGEST,
         readFileSync: (path: string) => {
           if (path.endsWith("config.json")) {
             return JSON.stringify({ storage: { backend: "postgresql" } });
