@@ -102,6 +102,36 @@ describe("search route validation boundaries", () => {
     });
   });
 
+  it.each(routeConfigs)("preserves messages-first episodic ordering at every limit under %s", async (_backend, routeConfig) => {
+    const messages = [
+      { messageId: 1, conversationId: 2, role: "user", snippet: "older-message-1", createdAt: new Date("2025-01-02") },
+      { messageId: 2, conversationId: 2, role: "user", snippet: "older-message-2", createdAt: new Date("2025-01-01") },
+    ];
+    const summaries = [
+      { summaryId: "newer-summary-1", conversationId: 2, kind: "leaf", snippet: "newer-summary-1", createdAt: new Date("2025-01-04") },
+      { summaryId: "newer-summary-2", conversationId: 2, kind: "leaf", snippet: "newer-summary-2", createdAt: new Date("2025-01-03") },
+    ];
+    const expectedByLimit = [
+      [messages[0]],
+      [messages[0], messages[1]],
+      [messages[0], messages[1], summaries[0]],
+      [messages[0], messages[1], summaries[0], summaries[1]],
+    ];
+
+    for (const [index, expected] of expectedByLimit.entries()) {
+      mocks.grep.mockClear();
+      mocks.sendJson.mockClear();
+      mocks.grep.mockResolvedValue({ messages, summaries, totalMatches: 4 });
+
+      await invoke({ query: "q", limit: index + 1, cwd: "/project" }, routeConfig);
+
+      expect(mocks.sendJson).toHaveBeenLastCalledWith(response, 200, {
+        episodic: expected,
+        promoted: [],
+      });
+    }
+  });
+
   it.each(routeConfigs)("forwards the candidate floor under %s", async (_backend, routeConfig) => {
     for (const [requested, expectedGrepLimit, expectedPromotedLimit] of [
       [undefined, 50, 5],
