@@ -23,7 +23,7 @@ With the default SQLite backend, all storage is on your machine:
   is never replaced by import, including malformed files and dangling symbolic
   links. Import still completes when such an entry is preserved, but malformed
   or dangling metadata is not automatically repaired and may keep the project
-  from being discovered by `lcm export-knowledge --all` until you correct or
+  from being discovered by `lcm export --all` until you correct or
   remove that entry.
 - **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
