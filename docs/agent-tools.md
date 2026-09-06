@@ -140,6 +140,21 @@ For a valid limit, a missing or invalid `cwd` retains the existing empty 200
 response. Successful project requests return `{ "summaries": [...] }`; the
 daemon client rejects non-2xx responses, including an invalid-limit response.
 
+The package root exposes the same request through `memory.recent`:
+
+```js
+import { memory } from "@donadiosolutions/lcm";
+
+const result = await memory.recent("/path/to/project", 5);
+```
+
+The first argument is an absolute project directory and is sent as `cwd`. If
+you have an older call that supplied a project hash as `projectId`, migrate it
+to the corresponding project directory; hashes are not interpreted as paths
+and no ambient working-directory fallback is used. Once a project is admitted,
+existing storage responses remain observable, including HTTP 409 identity
+configuration failures and HTTP 503 PostgreSQL storage failures.
+
 ### lcm_describe
 
 Inspect metadata and lineage of a memory node without expanding content. Returns depth, token count, parent/child links, and whether the node was promoted to long-term memory.

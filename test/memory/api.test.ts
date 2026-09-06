@@ -46,10 +46,28 @@ describe("createMemoryApi", () => {
     expect(mockPost).toHaveBeenCalledWith("/compact", expect.objectContaining({ session_id: "sess-1" }));
   });
 
-  it("recent calls POST /recent", async () => {
-    const mockPost = vi.fn().mockResolvedValue({ summaries: [] });
+  it("recent posts an absolute cwd with the default limit", async () => {
+    const response = { summaries: [{ summary_id: "s1" }] };
+    const mockPost = vi.fn().mockResolvedValue(response);
     const api = createMemoryApi({ post: mockPost, health: vi.fn() } as any);
-    await api.recent("project-hash-123");
-    expect(mockPost).toHaveBeenCalledWith("/recent", expect.objectContaining({ projectId: "project-hash-123" }));
+    const result = await api.recent("/workspace/project");
+    expect(mockPost).toHaveBeenCalledWith("/recent", { cwd: "/workspace/project", limit: 5 });
+    expect(result).toBe(response);
+  });
+
+  it("recent posts an explicit limit without changing the result", async () => {
+    const response = { summaries: [{ summary_id: "s2" }] };
+    const mockPost = vi.fn().mockResolvedValue(response);
+    const api = createMemoryApi({ post: mockPost, health: vi.fn() } as any);
+    const result = await api.recent("/workspace/project", 12);
+    expect(mockPost).toHaveBeenCalledWith("/recent", { cwd: "/workspace/project", limit: 12 });
+    expect(result).toBe(response);
+  });
+
+  it("recent forwards daemon rejections", async () => {
+    const rejection = new Error("invalid limit");
+    const mockPost = vi.fn().mockRejectedValue(rejection);
+    const api = createMemoryApi({ post: mockPost, health: vi.fn() } as any);
+    await expect(api.recent("/workspace/project", 0)).rejects.toBe(rejection);
   });
 });

@@ -10,7 +10,7 @@ export type MemoryApi = {
   store: (text: string, tags: string[], metadata?: Record<string, unknown>) => Promise<void>;
   search: (query: string, options?: { limit?: number; threshold?: number; projectId?: string; layers?: SearchLayerInput[] }) => Promise<SearchResult>;
   compact: (sessionId: string, transcriptPath: string) => Promise<{ summary: string }>;
-  recent: (projectId: string, limit?: number) => Promise<{ summaries: any[] }>;
+  recent: (cwd: string, limit?: number) => Promise<{ summaries: any[] }>;
 };
 
 export function createMemoryApi(client: DaemonClient): MemoryApi {
@@ -24,8 +24,8 @@ export function createMemoryApi(client: DaemonClient): MemoryApi {
     async compact(sessionId, transcriptPath) {
       return client.post("/compact", { session_id: sessionId, transcript_path: transcriptPath });
     },
-    async recent(projectId, limit = 5) {
-      return client.post("/recent", { projectId, limit });
+    async recent(cwd, limit = 5) {
+      return client.post("/recent", { cwd, limit });
     },
   };
 }
