@@ -673,10 +673,11 @@ When summaries are too compressed for a task, agents use `lcm_expand` to recover
 
 ### How it works
 
-1. Agent calls `lcm_expand` with a `nodeId` (summary ID) and optional `depth`.
-2. lcm traverses the DAG from the given node, following parent links down to source messages.
-3. Source message content is assembled and returned to the agent (capped by `LCM_MAX_EXPAND_TOKENS`).
-4. The agent receives the full decompressed content for the requested depth.
+1. An agent calls the daemon-backed `lcm_expand` MCP tool or `lcm expand <nodeId>` CLI command. Both use `POST /expand` with a `nodeId` and an optional positive-integer `depth` (default: `1`; no maximum).
+2. LCM descends child links from the requested node for the requested number of levels. The response contains child and descendant summaries as snippets of up to 200 characters, together with `citedIds`. Results are accumulated for the requested levels rather than returned as a nested tree.
+3. This HTTP surface does not request raw source messages and does not pass a token cap, so `LCM_MAX_EXPAND_TOKENS` does not apply to it. A leaf therefore contributes no source-message content.
+
+The separate `buildExpansionToolDefinition` helper is an unregistered TypeBox tool definition and is not used by the shipped MCP server. If an integration registers that helper, it supports an explicit `tokenCap` and optional `includeMessages`, resolving the cap against the configured `maxExpandTokens` value (including `LCM_MAX_EXPAND_TOKENS`).
 
 For broader recall, agents can first use `lcm_grep` or `lcm_search` to find relevant summary IDs, then call `lcm_expand` on the results that need more detail.
 
