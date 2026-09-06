@@ -39,6 +39,35 @@ function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T)
   }
 }
 
+function captureThrown(callback: () => unknown): unknown {
+  let didThrow = false;
+  let thrown: unknown = Symbol("not thrown");
+  try {
+    callback();
+  } catch (error) {
+    didThrow = true;
+    thrown = error;
+  }
+  expect(didThrow).toBe(true);
+  return thrown;
+}
+
+function trackedDirectoryHandle(
+  path: string,
+  handle: securityFiles.PrivateDirectoryHandle,
+  closeCounts: Map<string, number>,
+  closeFailures: Map<string, unknown> = new Map(),
+): securityFiles.PrivateDirectoryHandle {
+  return {
+    ...handle,
+    close: () => {
+      closeCounts.set(path, (closeCounts.get(path) ?? 0) + 1);
+      handle.close();
+      if (closeFailures.has(path)) throw closeFailures.get(path);
+    },
+  };
+}
+
 describe("secure project-root handoff", () => {
   let previousHome: string | undefined;
   let home: string;
@@ -269,12 +298,15 @@ describe("secure project-root handoff", () => {
 
   it("fails closed when created-child descriptor opening returns EACCES", () => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const openError = Object.assign(new Error("owner-read-stripping umask"), { code: "EACCES" });
     const openSpy = vi.spyOn(securityFiles, "openPrivateDirectoryForCreation").mockImplementation(() => {
-      throw Object.assign(new Error("owner-read-stripping umask"), { code: "EACCES" });
+      throw openError;
     });
     try {
-      expect(() => ensureProjectDirForIdentity({ id: "a".repeat(64), canonical: "/project" }, { writeMetadata: false }))
-        .toThrow("owner-read-stripping umask");
+      expect(captureThrown(() => ensureProjectDirForIdentity(
+        { id: "a".repeat(64), canonical: "/project" },
+        { writeMetadata: false },
+      ))).toBe(openError);
     } finally {
       openSpy.mockRestore();
     }
@@ -402,13 +434,16 @@ describe("secure project-root handoff", () => {
     const creationSpy = vi.spyOn(securityFiles, "openPrivateDirectoryForCreation").mockImplementation((path, options) =>
       wrap(path, originalOpenCreation(path, options)));
     const originalEntry = securityFiles.assertPrivateDirectoryEntry;
+    const admissionError = new Error("existing child authentication failed");
     const entrySpy = vi.spyOn(securityFiles, "assertPrivateDirectoryEntry").mockImplementation((handle, path, uid) => {
-      if (path === join(projects, id)) throw new Error("existing child authentication failed");
+      if (path === join(projects, id)) throw admissionError;
       return originalEntry(handle, path, uid);
     });
     try {
-      expect(() => ensureProjectDirForIdentity({ id, canonical: "/project" }, { writeMetadata: false }))
-        .toThrow("existing child authentication failed");
+      expect(captureThrown(() => ensureProjectDirForIdentity(
+        { id, canonical: "/project" },
+        { writeMetadata: false },
+      ))).toBe(admissionError);
       expect(closeCounts.get(join(home, ".lcm"))).toBe(1);
       expect(closeCounts.get(projects)).toBe(1);
       expect(closeCounts.get(join(projects, id))).toBe(1);
@@ -471,13 +506,16 @@ describe("secure project-root handoff", () => {
     const creationSpy = vi.spyOn(securityFiles, "openPrivateDirectoryForCreation").mockImplementation((path, options) =>
       wrap(path, originalOpenCreation(path, options)));
     const originalEntry = securityFiles.assertPrivateDirectoryEntry;
+    const admissionError = new Error("created child authentication failed");
     const entrySpy = vi.spyOn(securityFiles, "assertPrivateDirectoryEntry").mockImplementation((handle, path, uid) => {
-      if (path === leafPath && existsSync(leafPath)) throw new Error("created child authentication failed");
+      if (path === leafPath && existsSync(leafPath)) throw admissionError;
       return originalEntry(handle, path, uid);
     });
     try {
-      expect(() => ensureProjectDirForIdentity({ id, canonical: "/project" }, { writeMetadata: false }))
-        .toThrow("created child authentication failed");
+      expect(captureThrown(() => ensureProjectDirForIdentity(
+        { id, canonical: "/project" },
+        { writeMetadata: false },
+      ))).toBe(admissionError);
       expect(closeCounts.get(rootPath)).toBe(1);
       expect(closeCounts.get(projectsPath)).toBe(1);
       expect(closeCounts.get(leafPath)).toBe(1);
@@ -485,6 +523,373 @@ describe("secure project-root handoff", () => {
       entrySpy.mockRestore();
       creationSpy.mockRestore();
       optionalSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("aggregates existing-child admission and cleanup failures before metadata", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const projectsPath = join(rootPath, "projects");
+    const id = "d".repeat(64);
+    const leafPath = join(projectsPath, id);
+    mkdirSync(leafPath, { recursive: true, mode: 0o700 });
+    const admissionError = new Error("existing leaf admission failed");
+    const childCloseError = new Error("existing leaf close failed");
+    const closeCounts = new Map<string, number>();
+    const closeFailures = new Map<string, unknown>([[leafPath, childCloseError]]);
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalProbe = securityFiles.openPrivateDirectoryIfExists;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) =>
+      trackedDirectoryHandle(path, originalOpen(path, options), closeCounts, closeFailures));
+    const probeSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      const handle = originalProbe(path, options);
+      return handle === undefined
+        ? undefined
+        : trackedDirectoryHandle(path, handle, closeCounts, closeFailures);
+    });
+    const originalEntry = securityFiles.assertPrivateDirectoryEntry;
+    const entrySpy = vi.spyOn(securityFiles, "assertPrivateDirectoryEntry").mockImplementation((handle, path, uid) => {
+      if (path === leafPath) throw admissionError;
+      return originalEntry(handle, path, uid);
+    });
+    const metadataSpy = vi.spyOn(securityFiles, "atomicWritePrivateFile");
+    try {
+      const thrown = captureThrown(() => ensureProjectDirForIdentity({ id, canonical: "/project" }));
+      expect(thrown).toBeInstanceOf(AggregateError);
+      const aggregate = thrown as AggregateError;
+      expect(aggregate.message).toBe("project child admission and cleanup failed");
+      expect(aggregate.errors).toHaveLength(2);
+      expect(aggregate.errors[0]).toBe(admissionError);
+      expect(aggregate.errors[1]).toBe(childCloseError);
+      expect(aggregate.cause).toBe(admissionError);
+      expect(closeCounts.get(leafPath)).toBe(1);
+      expect(closeCounts.get(projectsPath)).toBe(1);
+      expect(closeCounts.get(rootPath)).toBe(1);
+      expect(metadataSpy).not.toHaveBeenCalled();
+    } finally {
+      metadataSpy.mockRestore();
+      entrySpy.mockRestore();
+      probeSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("aggregates created-child fchmod and cleanup failures", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const projectsPath = join(rootPath, "projects");
+    const id = "e".repeat(64);
+    const leafPath = join(projectsPath, id);
+    const chmodError = Object.assign(new Error("leaf fchmod failed"), { code: "EIO" });
+    const childCloseError = new Error("created leaf close failed");
+    const closeCounts = new Map<string, number>();
+    const closeFailures = new Map<string, unknown>([[leafPath, childCloseError]]);
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalProbe = securityFiles.openPrivateDirectoryIfExists;
+    const originalCreation = securityFiles.openPrivateDirectoryForCreation;
+    const originalFchmod = fchmodSync;
+    let leafFd: number | undefined;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) =>
+      trackedDirectoryHandle(path, originalOpen(path, options), closeCounts, closeFailures));
+    const probeSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      const handle = originalProbe(path, options);
+      return handle === undefined
+        ? undefined
+        : trackedDirectoryHandle(path, handle, closeCounts, closeFailures);
+    });
+    const creationSpy = vi.spyOn(securityFiles, "openPrivateDirectoryForCreation").mockImplementation((path, options) => {
+      const handle = originalCreation(path, options);
+      if (path === leafPath) leafFd = handle.fd;
+      return trackedDirectoryHandle(path, handle, closeCounts, closeFailures);
+    });
+    try {
+      const thrown = withPatchedFs("fchmodSync", ((fd: number, mode: number) => {
+        if (fd === leafFd) throw chmodError;
+        return originalFchmod(fd, mode);
+      }) as typeof fchmodSync, () => captureThrown(() => ensureProjectDirForIdentity(
+        { id, canonical: "/project" },
+        { writeMetadata: false },
+      )));
+      expect(thrown).toBeInstanceOf(AggregateError);
+      const aggregate = thrown as AggregateError;
+      expect(aggregate.errors).toHaveLength(2);
+      expect(aggregate.errors[0]).toBe(chmodError);
+      expect(aggregate.errors[1]).toBe(childCloseError);
+      expect(aggregate.cause).toBe(chmodError);
+      expect(closeCounts.get(leafPath)).toBe(1);
+      expect(closeCounts.get(projectsPath)).toBe(1);
+      expect(closeCounts.get(rootPath)).toBe(1);
+    } finally {
+      creationSpy.mockRestore();
+      probeSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("aggregates EEXIST admission and cleanup failures without fchmod", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const projectsPath = join(rootPath, "projects");
+    const id = "f".repeat(64);
+    const leafPath = join(projectsPath, id);
+    mkdirSync(leafPath, { recursive: true, mode: 0o700 });
+    const admissionError = new Error("EEXIST leaf admission failed");
+    const childCloseError = new Error("EEXIST leaf close failed");
+    const closeCounts = new Map<string, number>();
+    const closeFailures = new Map<string, unknown>([[leafPath, childCloseError]]);
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalProbe = securityFiles.openPrivateDirectoryIfExists;
+    const originalMkdir = mkdirSync;
+    const originalFchmod = fchmodSync;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) =>
+      trackedDirectoryHandle(path, originalOpen(path, options), closeCounts, closeFailures));
+    const probeSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      if (path === leafPath) return undefined;
+      const handle = originalProbe(path, options);
+      return handle === undefined
+        ? undefined
+        : trackedDirectoryHandle(path, handle, closeCounts, closeFailures);
+    });
+    const originalEntry = securityFiles.assertPrivateDirectoryEntry;
+    const entrySpy = vi.spyOn(securityFiles, "assertPrivateDirectoryEntry").mockImplementation((handle, path, uid) => {
+      if (path === leafPath) throw admissionError;
+      return originalEntry(handle, path, uid);
+    });
+    const metadataSpy = vi.spyOn(securityFiles, "atomicWritePrivateFile");
+    let fchmodCalls = 0;
+    try {
+      const thrown = withPatchedFs("mkdirSync", ((path: string, options: Parameters<typeof mkdirSync>[1]) => {
+        if (path === leafPath) throw Object.assign(new Error("already exists"), { code: "EEXIST" });
+        return originalMkdir(path, options);
+      }) as typeof mkdirSync, () => withPatchedFs("fchmodSync", ((...args: Parameters<typeof fchmodSync>) => {
+        fchmodCalls++;
+        return originalFchmod(...args);
+      }) as typeof fchmodSync, () => captureThrown(() => ensureProjectDirForIdentity({ id, canonical: "/project" }))));
+      expect(thrown).toBeInstanceOf(AggregateError);
+      const aggregate = thrown as AggregateError;
+      expect(aggregate.errors).toHaveLength(2);
+      expect(aggregate.errors[0]).toBe(admissionError);
+      expect(aggregate.errors[1]).toBe(childCloseError);
+      expect(aggregate.cause).toBe(admissionError);
+      expect(fchmodCalls).toBe(0);
+      expect(closeCounts.get(leafPath)).toBe(1);
+      expect(closeCounts.get(projectsPath)).toBe(1);
+      expect(closeCounts.get(rootPath)).toBe(1);
+      expect(metadataSpy).not.toHaveBeenCalled();
+    } finally {
+      metadataSpy.mockRestore();
+      entrySpy.mockRestore();
+      probeSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("closes only the root after projects-child admission and cleanup fail", () => {
+    mkdirSync(join(home, ".lcm", "projects"), { recursive: true, mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const projectsPath = join(rootPath, "projects");
+    const id = "1".repeat(64);
+    const admissionError = new Error("projects admission failed");
+    const childCloseError = new Error("projects close failed");
+    const closeCounts = new Map<string, number>();
+    const closeFailures = new Map<string, unknown>([[projectsPath, childCloseError]]);
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalProbe = securityFiles.openPrivateDirectoryIfExists;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) =>
+      trackedDirectoryHandle(path, originalOpen(path, options), closeCounts, closeFailures));
+    const probeSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      const handle = originalProbe(path, options);
+      return handle === undefined
+        ? undefined
+        : trackedDirectoryHandle(path, handle, closeCounts, closeFailures);
+    });
+    const originalEntry = securityFiles.assertPrivateDirectoryEntry;
+    const entrySpy = vi.spyOn(securityFiles, "assertPrivateDirectoryEntry").mockImplementation((handle, path, uid) => {
+      if (path === projectsPath) throw admissionError;
+      return originalEntry(handle, path, uid);
+    });
+    const creationSpy = vi.spyOn(securityFiles, "openPrivateDirectoryForCreation");
+    try {
+      const thrown = captureThrown(() => ensureProjectDirForIdentity(
+        { id, canonical: "/project" },
+        { writeMetadata: false },
+      ));
+      expect(thrown).toBeInstanceOf(AggregateError);
+      const aggregate = thrown as AggregateError;
+      expect(aggregate.errors).toHaveLength(2);
+      expect(aggregate.errors[0]).toBe(admissionError);
+      expect(aggregate.errors[1]).toBe(childCloseError);
+      expect(aggregate.cause).toBe(admissionError);
+      expect(closeCounts.get(projectsPath)).toBe(1);
+      expect(closeCounts.get(rootPath)).toBe(1);
+      expect(closeCounts.has(join(projectsPath, id))).toBe(false);
+      expect(creationSpy).not.toHaveBeenCalled();
+    } finally {
+      creationSpy.mockRestore();
+      entrySpy.mockRestore();
+      probeSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("retains nested aggregate identities across child and ancestor cleanup failures", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const projectsPath = join(rootPath, "projects");
+    const id = "2".repeat(64);
+    const leafPath = join(projectsPath, id);
+    mkdirSync(leafPath, { recursive: true, mode: 0o700 });
+    const admissionError = new AggregateError([new Error("original detail")], "original aggregate");
+    const childCloseError = new Error("leaf close failed");
+    const ancestorCloseError = new Error("projects close failed");
+    const closeCounts = new Map<string, number>();
+    const closeFailures = new Map<string, unknown>([
+      [leafPath, childCloseError],
+      [projectsPath, ancestorCloseError],
+    ]);
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalProbe = securityFiles.openPrivateDirectoryIfExists;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) =>
+      trackedDirectoryHandle(path, originalOpen(path, options), closeCounts, closeFailures));
+    const probeSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      const handle = originalProbe(path, options);
+      return handle === undefined
+        ? undefined
+        : trackedDirectoryHandle(path, handle, closeCounts, closeFailures);
+    });
+    const originalEntry = securityFiles.assertPrivateDirectoryEntry;
+    const entrySpy = vi.spyOn(securityFiles, "assertPrivateDirectoryEntry").mockImplementation((handle, path, uid) => {
+      if (path === leafPath) throw admissionError;
+      return originalEntry(handle, path, uid);
+    });
+    try {
+      const thrown = captureThrown(() => ensureProjectDirForIdentity(
+        { id, canonical: "/project" },
+        { writeMetadata: false },
+      ));
+      expect(thrown).toBeInstanceOf(AggregateError);
+      const outer = thrown as AggregateError;
+      expect(outer.message).toBe("project directory operation and cleanup failed");
+      expect(outer.errors).toHaveLength(2);
+      expect(outer.errors[1]).toBe(ancestorCloseError);
+      expect(outer.cause).toBe(outer.errors[0]);
+      const inner = outer.errors[0] as AggregateError;
+      expect(inner).toBeInstanceOf(AggregateError);
+      expect(inner.message).toBe("project child admission and cleanup failed");
+      expect(inner.errors).toHaveLength(2);
+      expect(inner.errors[0]).toBe(admissionError);
+      expect(inner.errors[1]).toBe(childCloseError);
+      expect(inner.cause).toBe(admissionError);
+      expect(closeCounts.get(leafPath)).toBe(1);
+      expect(closeCounts.get(projectsPath)).toBe(1);
+      expect(closeCounts.get(rootPath)).toBe(1);
+    } finally {
+      entrySpy.mockRestore();
+      probeSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    ["successful cleanup", false],
+    ["failed cleanup", true],
+  ] as const)("preserves an undefined child admission failure with %s", (_label, failChildClose) => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const projectsPath = join(rootPath, "projects");
+    const id = "3".repeat(64);
+    const leafPath = join(projectsPath, id);
+    mkdirSync(leafPath, { recursive: true, mode: 0o700 });
+    const childCloseError = new Error("leaf close failed");
+    const closeCounts = new Map<string, number>();
+    const closeFailures = failChildClose
+      ? new Map<string, unknown>([[leafPath, childCloseError]])
+      : new Map<string, unknown>();
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalProbe = securityFiles.openPrivateDirectoryIfExists;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) =>
+      trackedDirectoryHandle(path, originalOpen(path, options), closeCounts, closeFailures));
+    const probeSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      const handle = originalProbe(path, options);
+      return handle === undefined
+        ? undefined
+        : trackedDirectoryHandle(path, handle, closeCounts, closeFailures);
+    });
+    const originalEntry = securityFiles.assertPrivateDirectoryEntry;
+    const entrySpy = vi.spyOn(securityFiles, "assertPrivateDirectoryEntry").mockImplementation((handle, path, uid) => {
+      if (path === leafPath) throw undefined;
+      return originalEntry(handle, path, uid);
+    });
+    try {
+      const thrown = captureThrown(() => ensureProjectDirForIdentity(
+        { id, canonical: "/project" },
+        { writeMetadata: false },
+      ));
+      if (failChildClose) {
+        expect(thrown).toBeInstanceOf(AggregateError);
+        const aggregate = thrown as AggregateError;
+        expect(aggregate.errors).toHaveLength(2);
+        expect(aggregate.errors[0]).toBeUndefined();
+        expect(aggregate.errors[1]).toBe(childCloseError);
+        expect(Object.hasOwn(aggregate, "cause")).toBe(true);
+        expect(aggregate.cause).toBeUndefined();
+      } else {
+        expect(thrown).toBeUndefined();
+      }
+      expect(closeCounts.get(leafPath)).toBe(1);
+      expect(closeCounts.get(projectsPath)).toBe(1);
+      expect(closeCounts.get(rootPath)).toBe(1);
+    } finally {
+      entrySpy.mockRestore();
+      probeSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("retains an undefined child failure when ancestor cleanup also fails", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const rootPath = join(home, ".lcm");
+    const projectsPath = join(rootPath, "projects");
+    const id = "4".repeat(64);
+    const leafPath = join(projectsPath, id);
+    mkdirSync(leafPath, { recursive: true, mode: 0o700 });
+    const ancestorCloseError = new Error("projects close failed");
+    const closeCounts = new Map<string, number>();
+    const closeFailures = new Map<string, unknown>([[projectsPath, ancestorCloseError]]);
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalProbe = securityFiles.openPrivateDirectoryIfExists;
+    const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) =>
+      trackedDirectoryHandle(path, originalOpen(path, options), closeCounts, closeFailures));
+    const probeSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
+      const handle = originalProbe(path, options);
+      return handle === undefined
+        ? undefined
+        : trackedDirectoryHandle(path, handle, closeCounts, closeFailures);
+    });
+    const originalEntry = securityFiles.assertPrivateDirectoryEntry;
+    const entrySpy = vi.spyOn(securityFiles, "assertPrivateDirectoryEntry").mockImplementation((handle, path, uid) => {
+      if (path === leafPath) throw undefined;
+      return originalEntry(handle, path, uid);
+    });
+    try {
+      const thrown = captureThrown(() => ensureProjectDirForIdentity(
+        { id, canonical: "/project" },
+        { writeMetadata: false },
+      ));
+      expect(thrown).toBeInstanceOf(AggregateError);
+      const aggregate = thrown as AggregateError;
+      expect(aggregate.errors).toHaveLength(2);
+      expect(aggregate.errors[0]).toBeUndefined();
+      expect(aggregate.errors[1]).toBe(ancestorCloseError);
+      expect(Object.hasOwn(aggregate, "cause")).toBe(true);
+      expect(aggregate.cause).toBeUndefined();
+      expect(closeCounts.get(leafPath)).toBe(1);
+      expect(closeCounts.get(projectsPath)).toBe(1);
+      expect(closeCounts.get(rootPath)).toBe(1);
+    } finally {
+      entrySpy.mockRestore();
+      probeSpy.mockRestore();
       openSpy.mockRestore();
     }
   });
