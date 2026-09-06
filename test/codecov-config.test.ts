@@ -533,6 +533,8 @@ describe("Codecov configuration", () => {
       ["src/config-manager.ts", "unit-configuration-security"],
       ["src/private-mutation-lock.ts", "unit-configuration-security"],
       ["src/home-parent-auth.ts", "unit-configuration-security"],
+      // #1041 preserves bootstrap directory authentication errors when
+      // descriptor cleanup also fails in this existing owner.
       ["src/runtime-paths.ts", "unit-configuration-security"],
       ["src/security-files.ts", "unit-configuration-security"],
       ["src/sensitive.ts", "unit-configuration-security"],
