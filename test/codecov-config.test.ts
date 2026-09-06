@@ -562,6 +562,8 @@ describe("Codecov configuration", () => {
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
       ["src/llm/process-utils.ts", "unit-llm-prompts"],
       ["src/doctor/doctor.ts", "unit-diagnostics"],
+      // #944 keeps typed supervisor daemon-tmp diagnostic propagation within
+      // the existing service-manager component.
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],

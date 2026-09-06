@@ -39,6 +39,8 @@ import {
   createSupervisorSpec,
   isSupervisorPreflightUnavailableReason,
   managedLaunchEnvironment,
+  SUPERVISOR_DAEMON_TEMP_CREATION_WARNING,
+  SupervisorDaemonTempCreationError,
   type LegacySystemdUnit,
   type Supervisor,
   type SupervisorKind,
@@ -2918,13 +2920,19 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
       started = recreateRegisteredJob
         ? await supervisor.stopAndStart(launchSpec, managerOperation)
         : await supervisor.start(launchSpec, managerOperation);
-    } catch {
+    } catch (error) {
       // A settled manager mutation that throws may have raced a concurrent
       // winner.  The supervisor owns its own absent-proof cleanup; lifecycle
       // must not issue a second stop against unresolved manager state.
       managedOperationOwned = false;
       managedOperationAmbiguous = true;
-      return refusalResult("startup-failure", "managed daemon supervisor start failed", { spawned: false });
+      return refusalResult(
+        "startup-failure",
+        error instanceof SupervisorDaemonTempCreationError
+          ? SUPERVISOR_DAEMON_TEMP_CREATION_WARNING
+          : "managed daemon supervisor start failed",
+        { spawned: false },
+      );
     }
     let second: SupervisorObservation;
     try {
@@ -4082,8 +4090,13 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
       }
       try {
         return await stopStartAndEnsure();
-      } catch {
-        return restartRefusal("startup-failure", "managed daemon supervisor stale configuration repair failed");
+      } catch (error) {
+        return restartRefusal(
+          "startup-failure",
+          error instanceof SupervisorDaemonTempCreationError
+            ? SUPERVISOR_DAEMON_TEMP_CREATION_WARNING
+            : "managed daemon supervisor stale configuration repair failed",
+        );
       }
     }
     if (observation.kind === "absent") {
@@ -4098,10 +4111,12 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
       if (legacyMigration.kind === "migrated") {
         try {
           return await startStableAndEnsure(legacyMigration.stoppedPid);
-        } catch {
+        } catch (error) {
           return restartRefusal(
             "startup-failure",
-            "stable daemon start failed after authenticated legacy migration",
+            error instanceof SupervisorDaemonTempCreationError
+              ? SUPERVISOR_DAEMON_TEMP_CREATION_WARNING
+              : "stable daemon start failed after authenticated legacy migration",
             { stoppedPid: legacyMigration.stoppedPid },
           );
         }
@@ -4197,8 +4212,14 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
 
     try {
       return await stopStartAndEnsure();
-    } catch {
-      return restartRefusal("startup-failure", "managed daemon supervisor stop/start failed", { pid: managerPid });
+    } catch (error) {
+      return restartRefusal(
+        "startup-failure",
+        error instanceof SupervisorDaemonTempCreationError
+          ? SUPERVISOR_DAEMON_TEMP_CREATION_WARNING
+          : "managed daemon supervisor stop/start failed",
+        { pid: managerPid },
+      );
     }
   }
 
