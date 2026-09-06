@@ -1,13 +1,14 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createDaemon, type DaemonInstance } from "../../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
-import { projectDbPath } from "../../../src/daemon/project.js";
+import { projectDbPath, projectPaths } from "../../../src/daemon/project.js";
 import { closeLcmConnection, getLcmConnection } from "../../../src/db/connection.js";
 
 const tempDirs: string[] = [];
+const projectDirs: string[] = [];
 
 describe("POST /ingest", () => {
   let daemon: DaemonInstance | undefined;
@@ -18,6 +19,9 @@ describe("POST /ingest", () => {
       daemon = undefined;
     }
     for (const dir of tempDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    for (const dir of projectDirs.splice(0)) {
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -42,6 +46,52 @@ describe("POST /ingest", () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ingested: 2, totalTokens: 2 });
+  });
+
+  it("publishes final ingest metadata atomically with private mode", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-metadata-"));
+    tempDirs.push(tempDir);
+    const paths = projectPaths(tempDir);
+    projectDirs.push(paths.dir);
+
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const endpoint = `http://127.0.0.1:${daemon.address().port}/ingest`;
+    const first = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "metadata-first",
+        cwd: tempDir,
+        messages: [{ role: "user", content: "first", tokenCount: 1 }],
+      }),
+    });
+    expect(first.status).toBe(200);
+    const created = JSON.parse(readFileSync(paths.metaPath, "utf8")) as Record<string, unknown>;
+    expect(created).toMatchObject({ cwd: paths.canonical, lastIngest: expect.any(String) });
+    expect(lstatSync(paths.metaPath).mode & 0o777).toBe(0o600);
+
+    const oldTimestamp = "1970-01-01T00:00:00.000Z";
+    writeFileSync(paths.metaPath, JSON.stringify({
+      retained: "value",
+      cwd: "/old",
+      lastIngest: oldTimestamp,
+    }), "utf8");
+    chmodSync(paths.metaPath, 0o644);
+    const second = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "metadata-second",
+        cwd: tempDir,
+        messages: [{ role: "assistant", content: "second", tokenCount: 1 }],
+      }),
+    });
+    expect(second.status).toBe(200);
+    const replaced = JSON.parse(readFileSync(paths.metaPath, "utf8")) as Record<string, unknown>;
+    expect(replaced).toMatchObject({ retained: "value", cwd: paths.canonical });
+    expect(Date.parse(String(replaced.lastIngest))).toBeGreaterThan(Date.parse(oldTimestamp));
+    expect(lstatSync(paths.metaPath).mode & 0o777).toBe(0o600);
+    expect(readdirSync(paths.dir).filter(name => /^\.meta\.json\..+\.tmp$/u.test(name))).toEqual([]);
   });
 
   it("accepts tool messages in structured ingestion mode", async () => {

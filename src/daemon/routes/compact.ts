@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   ConfigValidationError,
@@ -11,10 +11,17 @@ import {
   type LlmRequestPolicy,
 } from "../config.js";
 import {
+  MAX_PROJECT_METADATA_BYTES,
   projectIdentity,
   ensureProjectDirForIdentity,
   isSafeTranscriptPath,
 } from "../project.js";
+import {
+  atomicWritePrivateFile,
+  openPrivateDirectory,
+  readBoundedRegularFile,
+  type PrivateDirectoryHandle,
+} from "../../security-files.js";
 import { enqueue } from "../project-queue.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler, RoutePublicationAdmission } from "../server.js";
@@ -281,6 +288,17 @@ function sendCancellationIfWritable(res: { headersSent?: boolean; writableEnded?
 
 function isInvocationCancellation(error: unknown): boolean {
   return error instanceof InvocationCoordinatorError && error.code === "cancelled";
+}
+
+function errorCode(error: unknown): string | undefined {
+  return error !== null && typeof error === "object" && "code" in error
+    && typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
+
+function isCriticalMetadataError(error: unknown): boolean {
+  return error instanceof BackendPublicationJournalError || isAbortError(error);
 }
 
 
@@ -653,7 +671,7 @@ export function createCompactHandler(
         try {
           throwIfAborted(signal);
           const localProjectDir = await withProjectAdmission(() =>
-            ensureProjectDirForIdentity(localIdentity));
+            ensureProjectDirForIdentity(localIdentity, { writeMetadata: false }));
           throwIfAborted(signal);
 
           const scrubber = await ScrubEngine.forProject(
@@ -757,15 +775,54 @@ export function createCompactHandler(
           try {
             await withCommitAdmission(() => withProjectAdmission(() => {
               const metaPath = join(localProjectDir, "meta.json");
+              const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
               let meta: Record<string, unknown> = {};
               try {
-                meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+                const parsed: unknown = JSON.parse(readBoundedRegularFile(metaPath, {
+                  allowedRoot: localProjectDir,
+                  maxBytes: MAX_PROJECT_METADATA_BYTES,
+                  expectedUid,
+                  requireSingleLink: true,
+                }));
+                if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+                  throw new Error("invalid project metadata");
+                }
+                meta = parsed as Record<string, unknown>;
               } catch (error) {
-                if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+                if (errorCode(error) !== "ENOENT") throw error;
               }
               meta.cwd = localIdentity.canonical;
               meta.lastCompact = new Date().toISOString();
-              writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
+              const serialized = JSON.stringify(meta, null, 2) + "\n";
+              if (Buffer.byteLength(serialized, "utf8") > MAX_PROJECT_METADATA_BYTES) {
+                throw new Error("project metadata exceeds size limit");
+              }
+              const parent: PrivateDirectoryHandle = openPrivateDirectory(localProjectDir, { expectedUid });
+              let primaryError: unknown;
+              let hasPrimaryError = false;
+              try {
+                atomicWritePrivateFile(metaPath, serialized, {}, parent);
+              } catch (error) {
+                hasPrimaryError = true;
+                primaryError = error;
+              } finally {
+                try {
+                  parent.close();
+                } catch (error) {
+                  if (hasPrimaryError) {
+                    if (!isCriticalMetadataError(primaryError)) {
+                      throw new AggregateError(
+                        [primaryError, error],
+                        "project metadata publication and directory cleanup failed",
+                        { cause: primaryError },
+                      );
+                    }
+                  } else {
+                    throw error;
+                  }
+                }
+              }
+              if (hasPrimaryError) throw primaryError;
             }));
           } catch (error) {
             if (error instanceof BackendPublicationJournalError) throw error;

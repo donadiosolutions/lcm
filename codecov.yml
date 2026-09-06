@@ -92,6 +92,7 @@ component_management:
         # #705 prompt-search surfacing-log failures, #709 search and grep routes,
         # #710 grep mode, #792 session filtering, #793 search-limit validation,
         # #794 grep-since validation, #825 bounded atomic promotion metadata,
+        # #888 bounded atomic ingest and compact metadata timestamps,
         # #862 recent limit validation, #863 expand depth validation, #930
         # expand body-shape validation, #969 route body-shape validation, and #864
         # episodic search candidate recall,

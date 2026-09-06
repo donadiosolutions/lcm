@@ -1,11 +1,18 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import type { DaemonConfig } from "../config.js";
 import {
+  MAX_PROJECT_METADATA_BYTES,
   projectPathsForIdentity,
   ensureProjectDirForIdentity,
   isSafeTranscriptPath,
   projectIdentity,
 } from "../project.js";
+import {
+  atomicWritePrivateFile,
+  openPrivateDirectory,
+  readBoundedRegularFile,
+  type PrivateDirectoryHandle,
+} from "../../security-files.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { ParsedMessage } from "../../transcript.js";
@@ -27,6 +34,13 @@ function isParsedMessage(value: unknown): value is ParsedMessage {
     typeof message.content === "string" &&
     typeof message.tokenCount === "number"
   );
+}
+
+function errorCode(error: unknown): string | undefined {
+  return error !== null && typeof error === "object" && "code" in error
+    && typeof error.code === "string"
+    ? error.code
+    : undefined;
 }
 
 function resolveMessages(input: { client?: unknown; messages?: unknown; provider?: unknown; transcript_path?: string }, cwd: string): ParsedMessage[] {
@@ -89,7 +103,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       }
       const scrubber = resolvedMessages.length > 0
         ? await (async () => {
-            ensureProjectDirForIdentity(localIdentity);
+            ensureProjectDirForIdentity(localIdentity, { writeMetadata: false });
             return ScrubEngine.forProject(
               config.security?.sensitivePatterns ?? [],
               paths.dir,
@@ -158,15 +172,51 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       // Update meta.json with lastIngest timestamp
       try {
         const metaPath = paths.metaPath;
+        const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
         let meta: Record<string, unknown> = {};
         try {
-          meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+          const parsed: unknown = JSON.parse(readBoundedRegularFile(metaPath, {
+            allowedRoot: paths.dir,
+            maxBytes: MAX_PROJECT_METADATA_BYTES,
+            expectedUid,
+            requireSingleLink: true,
+          }));
+          if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new Error("invalid project metadata");
+          }
+          meta = parsed as Record<string, unknown>;
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          if (errorCode(error) !== "ENOENT") throw error;
         }
         meta.cwd = paths.canonical;
         meta.lastIngest = new Date().toISOString();
-        writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
+        const serialized = JSON.stringify(meta, null, 2) + "\n";
+        if (Buffer.byteLength(serialized, "utf8") > MAX_PROJECT_METADATA_BYTES) {
+          throw new Error("project metadata exceeds size limit");
+        }
+        const parent: PrivateDirectoryHandle = openPrivateDirectory(paths.dir, { expectedUid });
+        let primaryError: unknown;
+        let hasPrimaryError = false;
+        try {
+          atomicWritePrivateFile(metaPath, serialized, {}, parent);
+        } catch (error) {
+          hasPrimaryError = true;
+          primaryError = error;
+        } finally {
+          try {
+            parent.close();
+          } catch (error) {
+            if (hasPrimaryError) {
+              throw new AggregateError(
+                [primaryError, error],
+                "project metadata publication and directory cleanup failed",
+                { cause: primaryError },
+              );
+            }
+            throw error;
+          }
+        }
+        if (hasPrimaryError) throw primaryError;
       } catch {
         // non-fatal: meta.json update failure shouldn't fail the ingest
       }
