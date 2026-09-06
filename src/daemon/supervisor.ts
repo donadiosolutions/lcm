@@ -729,11 +729,12 @@ class SupervisorCommandError extends Error {
   }
 }
 
-class SupervisorDaemonTempCreationError extends Error {
+export const SUPERVISOR_DAEMON_TEMP_CREATION_WARNING =
+  "newly created daemon temp directory lacked required owner permissions, was removed, and retry should use an owner-preserving umask such as 0077";
+
+export class SupervisorDaemonTempCreationError extends Error {
   constructor() {
-    super(
-      "newly created daemon temp directory lacked required owner permissions, was removed, and retry should use an owner-preserving umask such as 0077",
-    );
+    super(SUPERVISOR_DAEMON_TEMP_CREATION_WARNING);
     this.name = "SupervisorDaemonTempCreationError";
   }
 }
