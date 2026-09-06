@@ -846,6 +846,11 @@ an owner-read-stripping umask can prevent that descriptor from being opened and
 fails closed with `EACCES`. Restore a usable umask and remove only the
 untrusted child after confirming its ownership before retrying.
 
+If project-directory admission or permission tightening fails, LCM retains
+that failure as the cause while it closes acquired directory handles. When the
+same child handle also fails to close, the reported error attaches both
+failures and LCM still attempts to close retained ancestor handles.
+
 The admission and metadata publication checks provide a bounded observed
 topology guarantee: they reject unsafe state observed at each boundary,
 including symlinks and replaced device/inode identities. Portable pathname
