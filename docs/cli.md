@@ -269,9 +269,15 @@ best-effort basis. Metadata is bounded to 1 MiB and published atomically with
 0600 permissions, including when tightening a legacy file that was more
 permissive. Invalid, unreadable, or untrusted metadata is left unchanged and
 does not undo promoted memories; promotion counts and results are independent
-of this metadata update. `--dry-run` never writes metadata. On platforms with a
-POSIX UID, the existing metadata file must be owned by the current UID; where
-UIDs are unavailable, that ownership check is skipped.
+of this metadata update. If reopening the authenticated metadata parent fails
+directly because the process or system file-descriptor limit is exhausted
+(`EMFILE` or `ENFILE`), or because the target filesystem has no space
+(`ENOSPC`), LCM skips the metadata update and returns the completed promotion
+result. Parent absence, symlink loops, non-directory components, ownership or
+mode rejection, and other topology failures remain fail-closed and return an
+error. `--dry-run` never writes metadata. On platforms with a POSIX UID, the
+existing metadata file must be owned by the current UID; where UIDs are
+unavailable, that ownership check is skipped.
 
 `lcm compact --all` reports each SQLite project that it cannot open, migrate, or
 scan as a failure in the Compact phase while continuing with readable projects.
