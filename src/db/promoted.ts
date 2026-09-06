@@ -194,10 +194,29 @@ export function parsePromotedMetadata(serialized: string): JsonObject {
 }
 
 export class PromotedStore {
+  private jsonTagFilterAvailable: boolean | undefined;
+
   constructor(
     private db: DatabaseSync,
     private readonly fts5Available = true,
   ) {}
+
+  private hasJsonTagFilterSupport(): boolean {
+    if (this.jsonTagFilterAvailable !== undefined) return this.jsonTagFilterAvailable;
+    try {
+      const result = this.db.prepare(
+        `SELECT json_valid('[') AS bad_valid,
+                json_type('[]') AS json_kind,
+                (SELECT type FROM json_each('["x"]') LIMIT 1) AS each_type`
+      ).get() as { bad_valid?: number; json_kind?: string; each_type?: string } | undefined;
+      this.jsonTagFilterAvailable = result?.bad_valid === 0
+        && result.json_kind === "array"
+        && result.each_type === "text";
+    } catch {
+      this.jsonTagFilterAvailable = false;
+    }
+    return this.jsonTagFilterAvailable;
+  }
 
   insert(params: InsertParams): string {
     const id = randomUUID();
@@ -262,11 +281,36 @@ export class PromotedStore {
     const sanitized = terms.map((term) => `"${term}"`).join(" OR ");
     const needsTagFilter = Boolean(filterTags?.length);
     if (needsTagFilter && limit === 0) return [];
+    const serializedFilterTags = needsTagFilter ? JSON.stringify(filterTags) : undefined;
+    const useNativeTagFilter = needsTagFilter
+      && serializedFilterTags !== undefined
+      && this.hasJsonTagFilterSupport();
 
     const projectFilter = projectId ? "AND p.project_id = ?" : "";
+    // JSON1 handles application-written JSON text, including escaped NUL and
+    // surrogate code units. Physically invalid UTF-8 cast from BLOB is outside
+    // SQLite's TEXT contract and remains excluded by this type guard.
+    const tagFilter = useNativeTagFilter ? `
+         AND CASE WHEN typeof(p.tags) = 'text'
+              THEN CASE WHEN json_valid(p.tags) = 1
+                   THEN CASE WHEN json_type(p.tags) = 'array'
+                        THEN NOT EXISTS (
+                               SELECT 1 FROM json_each(p.tags) AS stored
+                               WHERE stored.type <> 'text')
+                             AND NOT EXISTS (
+                               SELECT 1 FROM json_each(?) AS required
+                               WHERE required.type <> 'text'
+                                  OR NOT EXISTS (
+                                       SELECT 1 FROM json_each(p.tags) AS stored
+                                       WHERE stored.type = 'text'
+                                         AND stored.value = required.value))
+                        ELSE 0 END
+                   ELSE 0 END
+              ELSE 0 END` : "";
     const queryParams: (string | number)[] = [sanitized];
     if (projectId) queryParams.push(projectId);
-    if (!needsTagFilter) queryParams.push(limit);
+    if (useNativeTagFilter) queryParams.push(serializedFilterTags!);
+    if (!needsTagFilter || useNativeTagFilter) queryParams.push(limit);
 
     const statement = this.db.prepare(
       `SELECT p.id, p.content, p.tags, p.project_id, p.session_id, p.confidence, p.created_at, rank
@@ -275,8 +319,9 @@ export class PromotedStore {
        WHERE promoted_fts MATCH ?
          AND p.archived_at IS NULL
          ${projectFilter}
+         ${tagFilter}
        ORDER BY rank, p.confidence DESC, p.created_at ASC
-       ${needsTagFilter ? "" : "LIMIT ?"}`
+       ${!needsTagFilter || useNativeTagFilter ? "LIMIT ?" : ""}`
     );
 
     const toSearchResult = (row: PromotedRow & { rank: number }): SearchResult | undefined => {
@@ -294,7 +339,7 @@ export class PromotedStore {
       };
     };
 
-    if (needsTagFilter && typeof statement.iterate === "function") {
+    if (needsTagFilter && !useNativeTagFilter && typeof statement.iterate === "function") {
       const results: SearchResult[] = [];
       for (const row of statement.iterate(...queryParams) as Iterable<PromotedRow & { rank: number }>) {
         const result = toSearchResult(row);
