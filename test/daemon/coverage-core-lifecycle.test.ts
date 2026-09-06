@@ -671,10 +671,13 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "20"); ensureAuthToken(join(dir, "daemon.token"));
     proc(root, 10, "Uid:\t1000\nPPid:\t1\n", "systemd --user");
     proc(root, 20, "Uid:\t1000\nPPid:\t10\n", "node lcm daemon start --foreground");
+    // observeHttpHealth owns a real wall-clock deadline independent of
+    // _monotonicNowOverride, so pin its nested clock for this 1 ms fixture.
+    vi.spyOn(performance, "now").mockReturnValue(0);
     const result = await ensureDaemon({
       port: 13, pidFilePath: pidPath, spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
       _procRoot: root, _uid: 1000, _isProcessAliveOverride: () => true, _fetchOverride: fetchHealthy(20) as never,
-      _listeningPortsOverride: () => [13], _monotonicNowOverride: () => 0, expectedVersion: "1",
+      _listeningPortsOverride: () => [13], _monotonicNowOverride: () => 0, _skipSpawn: true, expectedVersion: "1",
       _supervisorOverride: unavailableSupervisor(),
     });
     expect(result.connected).toBe(true); expect(result.warning).toBeUndefined();
