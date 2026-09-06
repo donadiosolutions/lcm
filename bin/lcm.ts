@@ -78,6 +78,7 @@ import type {
 } from "../src/storage/postgresql/passive-event-repository.js";
 import { CONNECTOR_TRANSPORTS } from "../src/connectors/types.js";
 import { createAbortError, isAbortError, throwIfAborted } from "../src/daemon/cancellation.js";
+import { SUPERVISOR_DAEMON_TEMP_CREATION_WARNING } from "../src/daemon/supervisor.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -1986,6 +1987,7 @@ export function writeCliError(value: string): void {
 type LifecycleResultWithRefusal = Readonly<{
   connected?: boolean;
   refusalReason?: unknown;
+  warning?: unknown;
 }>;
 
 function daemonRefusalReason(
@@ -2010,7 +2012,10 @@ function daemonUnavailableMessage(
   result: LifecycleResultWithRefusal | undefined,
   fallback: DaemonRefusalReason,
 ): string {
-  return mapDaemonRefusalToRemediation(daemonRefusalReason(result, fallback)).message;
+  const message = mapDaemonRefusalToRemediation(daemonRefusalReason(result, fallback)).message;
+  return result?.warning === SUPERVISOR_DAEMON_TEMP_CREATION_WARNING
+    ? `${message} ${SUPERVISOR_DAEMON_TEMP_CREATION_WARNING}`
+    : message;
 }
 
 function clearDaemonRemediationMarker(): void {

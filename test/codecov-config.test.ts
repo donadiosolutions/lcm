@@ -224,10 +224,14 @@ const expectedComponents = [
       "^src/git-project\\.ts$",
       "^src/machine-identity\\.ts$",
       "^src/portable-knowledge\\.ts$",
+      // #1049 keeps project metadata owner and single-link admission in this
+      // existing component; no taxonomy, status, or policy change.
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
       // #1044 keeps the existing owner; no taxonomy, status, or policy change.
       // #1048 keeps target metadata leaf authentication in this owner.
+      // #1069 preserves completed reconciliation evidence after retained
+      // directory cleanup failures in this existing component.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
@@ -503,7 +507,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(209);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#964 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -533,13 +537,17 @@ describe("Codecov configuration", () => {
       // #866 export admission failures and sensitive result emission stay CLI-owned.
       // #1081 keeps unsupported export-format admission CLI-owned.
       // #978 keeps compact replacement runtime-digest admission CLI-owned.
+      // #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
       ["src/private-mutation-lock.ts", "unit-configuration-security"],
       ["src/home-parent-auth.ts", "unit-configuration-security"],
+      // #1041 preserves bootstrap directory authentication errors when
+      // descriptor cleanup also fails in this existing owner.
       ["src/runtime-paths.ts", "unit-configuration-security"],
       ["src/security-files.ts", "unit-configuration-security"],
       ["src/sensitive.ts", "unit-configuration-security"],
+      // #1049 keeps project metadata owner and single-link admission here.
       ["src/project-map.ts", "unit-project-worktrees"],
       // #889 keeps private import metadata publication in this owner.
       ["src/portable-knowledge.ts", "unit-project-worktrees"],
@@ -590,6 +598,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],
       // #837 consumer-admission descriptor cleanup remains storage-owned.
+      // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
@@ -604,6 +613,9 @@ describe("Codecov configuration", () => {
       ["src/db/connection.ts", "unit-local-persistence"],
       ["src/db/database-parent.ts", "unit-local-persistence"],
       ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
+      // #1020 keeps message timestamp mapping in the existing local-persistence
+      // component; conversation timestamps remain on their existing mapper.
+      ["src/store/conversation-store.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],

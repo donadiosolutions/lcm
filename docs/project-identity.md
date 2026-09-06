@@ -79,6 +79,23 @@ The database and passive-learning sidecar remain under:
 ~/.lcm/events/<local-hash>.db
 ```
 
+## Metadata-backed map discovery
+
+When a project hash is absent from `~/.lcm/map.json`, project listing and
+identity resolution can recover its canonical path from
+`~/.lcm/projects/<local-hash>/meta.json`. LCM accepts this metadata only from a
+regular file with one hard link. On platforms that expose the effective user
+ID, the file must also belong to that user. Ownership and link-count checks
+happen before LCM consumes the file contents.
+
+Foreign-owner and multiply linked metadata is silently omitted from discovery;
+unrelated valid projects are still discovered, and existing map entries remain
+unchanged. LCM does not repair rejected metadata automatically. If a legitimate
+project is missing, restore an owner-local, single-link `meta.json` from trusted
+project state and rerun the project command. Avoid sharing the file or its
+`cwd` value in diagnostics unless needed, because local paths can identify
+users, organizations, and repositories; see [Privacy and data handling](privacy.md).
+
 PostgreSQL adds an explicit identity layer. A registered machine has a UUIDv7,
 and a local project may be bound to a PostgreSQL project UUIDv7. The binding
 lets two machines—or two unrelated paths—address the same remote project
@@ -197,6 +214,13 @@ and project-map publication. If that chain is replaced or loses its private
 owner-only mode, reconciliation blocks before the next observable mutation;
 snapshot cleanup also leaves a private residual snapshot rather than removing
 a pathname that may have been rebound.
+
+If a retained target directory handle fails while closing after the journal has
+been durably marked completed and the final target validation has passed, LCM
+still reports the cleanup error and closes every handle, while preserving the
+completed journal and its folded map and archived-source evidence. A later run
+can therefore discover and enqueue newly eligible work. Cleanup failures before
+that completion boundary remain blocked and retain their failure reason.
 
 `lcm doctor` reports completed, partial, and blocked journals without retrying a
 blocked reconciliation while collecting project-sensitive-pattern diagnostics.

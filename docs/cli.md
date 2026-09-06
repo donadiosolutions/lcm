@@ -357,6 +357,17 @@ the exact LCM service, and waits for authenticated health before returning.
 After changing configuration, run the restart command once; do not start a
 second daemon to work around a health failure.
 
+When a failed start or restart reports a newly created daemon temporary
+directory with clipped owner permissions, the CLI retains the mapped recovery
+command and the trusted lifecycle guidance on one line:
+
+```text
+lcm daemon unavailable (startup-failure); run 'lcm daemon restart' or 'lcm doctor'. newly created daemon temp directory lacked required owner permissions, was removed, and retry should use an owner-preserving umask such as 0077
+```
+
+Follow the [managed-daemon temporary-storage recovery](daemon-temporary-storage.md)
+steps before retrying under an owner-preserving umask such as `0077`.
+
 Linux uses the current user's `systemd --user` manager and macOS uses the
 current user's `launchd` agent. Both integrations are deliberately one-shot:
 LCM does not request automatic restart (`Restart=`) or a launchd `KeepAlive`

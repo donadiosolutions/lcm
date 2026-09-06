@@ -190,6 +190,66 @@ describe("PostgreSQL harness utilities", () => {
     }
   });
 
+  it.each(["\\RootRelative", "/RootRelative"])(
+    "rejects root-relative Windows handoff %j",
+    (handoff) => {
+      const source = `${handoff}\\lcm-postgresql-harness-root-relative`;
+      const record = { Mounts: [{
+        Destination: "/run/lcm-harness",
+        Type: "bind",
+        RW: false,
+        Source: source,
+      }] };
+      expect(harnessDirectoryFromRecord(record, {
+        environment: { LCM_TEST_HARNESS_TMPDIR: handoff },
+        platformName: "win32",
+        realpath: (path: string) => path,
+      })).toBeUndefined();
+    },
+  );
+
+  it.each(["\\RootRelative", "/RootRelative", "C:DriveRelative"])(
+    "treats snapshot with unqualified Windows parent %j as absent",
+    (invalidParent) => {
+      const mount = (source: string) => ({ Mounts: [{
+        Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+      }] });
+      const environment = {
+        LCM_TEST_HARNESS_TMPDIR: "E:\\SelectedHandoff",
+        LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS: JSON.stringify({
+          version: 1,
+          parents: ["C:\\OriginalTemp", invalidParent],
+        }),
+        SystemRoot: "C:\\Windows",
+        TEMP: "D:\\WorkerScratch",
+        TMP: "D:\\WorkerScratch",
+      };
+      const realpath = (path: string) => path;
+
+      for (const source of [
+        `${invalidParent}\\lcm-postgresql-harness-invalid`,
+        "C:\\OriginalTemp\\lcm-postgresql-harness-original",
+        "D:\\WorkerScratch\\lcm-postgresql-harness-live",
+      ]) {
+        expect(harnessDirectoryFromRecord(mount(source), {
+          environment,
+          platformName: "win32",
+          realpath,
+        })).toBeUndefined();
+      }
+      for (const source of [
+        "E:\\SelectedHandoff\\lcm-postgresql-harness-selected",
+        "C:\\Windows\\Temp\\lcm-postgresql-harness-fallback",
+      ]) {
+        expect(harnessDirectoryFromRecord(mount(source), {
+          environment,
+          platformName: "win32",
+          realpath,
+        })).toBe(source);
+      }
+    },
+  );
+
   it("requires the selected handoff when Windows snapshot is missing", () => {
     const mount = (source: string) => ({ Mounts: [{
       Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,

@@ -81,12 +81,21 @@ integration files run only through `pnpm run test:postgresql`; see
 [PostgreSQL development](../src/storage/postgresql/reference/postgresql-development.md)
 for the isolated container prerequisites and lifecycle.
 
-## Coordinated Bug campaigns
+## Coordinated GitHub work
 
-Use the repository's [triage-fix-all-bugs skill](triage-fix-all-bugs.md) to
-coordinate triage, independent reviews, and merges for all currently open native
-GitHub Bug issues. The guide explains invocation, prerequisites, progress reports,
-and how follow-up Bugs remain outside the campaign's frozen scope.
+Use the repository's [triage-fix-all-bugs skill](triage-fix-all-bugs.md) for an
+S0-frozen campaign covering every currently open native GitHub Bug issue. It
+performs inventory agreement, duplicate adjudication, and triage before handing
+accepted work to [procedural development](procedural-development.md).
+
+Use [procedural development](procedural-development.md) for a direct GitHub
+issue or a bounded inventory supplied by a caller. It defines the shared role
+defaults, override rules, exact-SHA reviews, and candidate-round outcomes.
+
+Use [implement-epic](implement-epic.md) for a GitHub Epic and its recursively
+planned descendants. It preserves issue bodies, records checkpoint comments, and
+schedules ready work without treating accepted prerequisites or external blockers
+as completion.
 
 ## Codex Responses gateway fixtures
 
@@ -125,8 +134,11 @@ global captures the finite original parent candidates in the internal
 uses the selected handoff and that preserved snapshot, so a worker's rewritten
 `TMPDIR`, `TMP`, and `TEMP` cannot replace the parent's original authentication
 boundary. Existing snapshots are preserved verbatim; malformed or missing
-snapshots never trigger a nested recapture and safely degrade to the handoff
-plus platform fallbacks. Cleanup removes only roots created by the current run.
+snapshots never trigger a nested recapture. Windows snapshot and authentication
+parents have the same fully qualified drive or UNC-share requirement. A
+snapshot containing any invalid parent is treated as absent in full and safely
+degrades to the handoff plus platform fallbacks. Cleanup removes only roots
+created by the current run.
 
 Vitest config-time roots (`createVitestRunRoot` in `vitest.config.ts` and
 `postgresqlVitestCacheDir` in `vitest.postgresql.config.ts`) are resolved before
