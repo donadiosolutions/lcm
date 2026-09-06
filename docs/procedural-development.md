@@ -68,7 +68,7 @@ P0 and P1 findings always block delivery. An accepted P2 blocks before three
 completed rounds; after the third completed candidate round it is deferred to a
 linked follow-up and does not cause escalation solely because of its severity.
 The owner adjudicates P3 findings. Before the pull request is opened, the
-coordinator creates an actionable issue for every deferred P2, with the source
+owner creates an actionable issue for every deferred P2, with the source
 item and review evidence. Its PR link may remain pending until publication, which
 must fill that link before merge.
 

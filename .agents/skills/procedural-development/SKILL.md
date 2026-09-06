@@ -55,9 +55,11 @@ implementation findings for owners, take over implementation, or replace a
 reviewer. Owners coordinate their item through verified resolution; implementers
 work in their assigned workspace; reviewers remain read-only.
 
-The root reads [coordination and recovery](references/coordination.md). Each owner
-and its leaves read [delivery and review](references/delivery.md), with only the
-applicable role instructions assigned in self-contained dispatch briefs.
+The root reads both [coordination and recovery](references/coordination.md) and
+[delivery and review](references/delivery.md), including owner dispatch, publication
+payloads and the final live-head merge guard. Each owner and its leaves read the
+delivery reference, with only applicable role instructions assigned in
+self-contained dispatch briefs.
 
 ## Run handoff
 

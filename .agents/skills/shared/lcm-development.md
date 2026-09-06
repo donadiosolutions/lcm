@@ -10,7 +10,8 @@ applicable `AGENTS.local.md`. For a non-primary local worktree, find the primary
 with `git worktree list --porcelain` and read its local instructions. Use the
 available `lcm-memory` skill for project context. Never copy/commit local rules.
 
-The root executes pushes, PR creation and merge commits; owners supply evidence
+The root executes pushes, PR creation and merge commits only (no squash or rebase
+merge); owners supply evidence
 and remain responsible through verified source resolution. Preserve signed commits
 when required, DCO signoff, PR template/assignment, relevant local tests, required
 exact-head CI with full 100% coverage, review-thread handling, docs and Changesets.

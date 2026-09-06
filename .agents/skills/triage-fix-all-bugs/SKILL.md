@@ -35,7 +35,9 @@ Before work, read repository/local instructions and
 [LCM integration](../shared/lcm-development.md), and use `lcm-memory` for context.
 Read [procedural-development](../procedural-development/SKILL.md) and its
 [coordination contract](../procedural-development/references/coordination.md)
-for routing preflight, root boundaries, events and recovery. Apply those to triage
+as well as its [delivery reference](../procedural-development/references/delivery.md)
+for routing preflight, root boundaries, publication/merge duties, events and recovery.
+Apply those to triage
 too, without starting remediation. Read [inventory and triage](references/triage.md)
 and [campaign accounting](references/coordination.md) in full. Give triage workers
 the relevant instructions, issue, frozen inventory and evidence.
