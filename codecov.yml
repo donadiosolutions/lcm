@@ -9,6 +9,7 @@ component_management:
         # Keep the #691 routing, #734 healthy-daemon store routing, #726/#742
         # hook entrypoints, and #866 publication-converged CLI reads exclusively
         # in Unit - CLI, including export admission failures and sensitive output.
+        # #1081 keeps unsupported export-format admission CLI-owned.
         # #978 keeps compact replacement runtime-digest admission CLI-owned.
         - "bin/"
         - "src/cli/"

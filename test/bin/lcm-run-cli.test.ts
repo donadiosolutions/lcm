@@ -1734,6 +1734,61 @@ describe("runCli orchestration actions", () => {
     );
   });
 
+  it.each(["yaml", "", "JSON", " json ", "json\u0000"])(
+    "rejects unsupported export format %j before export effects",
+    async format => {
+      const portable = await import("../../src/portable-knowledge.js");
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+      const result = await invoke(["export", "--format", format, "--all", "--output", "kept.json"]);
+
+      expect(result?.message).toBe("exit:1");
+      expect(error).toHaveBeenCalledExactlyOnceWith("Invalid --format: only json is supported.");
+      expect(log).not.toHaveBeenCalled();
+      expect(stdout).not.toHaveBeenCalled();
+      expect(state.loadConfig).not.toHaveBeenCalled();
+      expect(state.reconcileWorktrees).not.toHaveBeenCalled();
+      expect(portable.exportKnowledge).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects an unsupported export format before PostgreSQL preparation", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    state.storageBackend = "postgresql";
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await invoke(["export", "--format", "yaml"]);
+
+    expect(result?.message).toBe("exit:1");
+    expect(error).toHaveBeenCalledExactlyOnceWith("Invalid --format: only json is supported.");
+    expect(state.loadConfig).not.toHaveBeenCalled();
+    expect(portable.exportKnowledge).not.toHaveBeenCalled();
+  });
+
+  it("keeps export help ahead of format validation", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await invoke(["export", "--format", "yaml", "--help"]);
+
+    expect(result?.message).toBe("exit:0");
+    expect(state.printHelp).toHaveBeenCalledExactlyOnceWith("export");
+    expect(error).not.toHaveBeenCalled();
+    expect(state.loadConfig).not.toHaveBeenCalled();
+    expect(portable.exportKnowledge).not.toHaveBeenCalled();
+  });
+
+  it.each([["export"], ["export", "--format", "json"]])(
+    "accepts the %s export format path",
+    async (...args) => {
+      const portable = await import("../../src/portable-knowledge.js");
+      await expect(invoke(args)).resolves.toBeUndefined();
+      expect(portable.exportKnowledge).toHaveBeenCalledOnce();
+    },
+  );
+
   it.each([
     ["compact", "--dry-run"],
     ["import", "--dry-run"],

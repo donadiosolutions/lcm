@@ -3941,13 +3941,19 @@ export async function runCli(
     .option("--tags <tags>", "Only export entries matching these comma-separated tags")
     .option("--since <date>", "Only export entries created on or after this ISO date (e.g. 2026-01-01)")
     .option("--output <file>", "Write output to file instead of stdout")
-    .option("--format <format>", "Output format: json (default)", "json")
+    .option("--format <format>", "Output format: json only (default)", "json")
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("export"); exit(0);
+      }
+
+      const format = opts.format ?? "json";
+      if (format !== "json") {
+        console.error("Invalid --format: only json is supported.");
+        exit(1);
       }
 
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
