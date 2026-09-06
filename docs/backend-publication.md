@@ -225,17 +225,21 @@ The internal coordinator exposes `prepare`, `resume`, `abort`, and
 to the permit object and revoked when their callback ends, so an inherited
 asynchronous callback cannot reuse authority after a phase change or release.
 
-If a process dies at any checkpoint, the journal and material are recovery
-evidence. Do not edit, delete, rename, or bulk-clean the directory. The current
-command surface does not provide a general journal-editing command. Run
-`lcm doctor`, preserve its sanitized output, and let the owning publication
-recovery flow resume or abort the authenticated journal; rerun `lcm doctor`
-after the flow reaches a terminal state. Once the journal is terminal, restart
-the daemon to reload the selected backend. To roll back an active selection,
-publish a new authenticated publication targeting SQLite and restart; do not
-edit `config.json` or `map.json` independently. An ambiguous filesystem or
-database result is intentionally retained for inspection rather than silently
-repaired.
+If a process dies at any checkpoint, a present journal and its material are
+recovery evidence. Do not edit, delete, rename, or bulk-clean the directory.
+The current command surface does not provide a general journal-editing command.
+When an authenticated journal exists, run `lcm doctor`, preserve its sanitized
+output, and let the owning publication recovery flow resume or abort that
+journal; rerun `lcm doctor` after the flow reaches a terminal state. Once the
+journal is terminal, restart the daemon to reload the selected backend. To roll
+back an active selection, publish a new authenticated publication targeting
+SQLite and restart; do not edit `config.json` or `map.json` independently.
+
+When `~/.lcm/backend-publication/` exists without `journal.json`, including a
+private directory that is genuinely empty, follow [Journal-less publication
+evidence](#journal-less-publication-evidence). Do not try to resume or abort
+that state. An ambiguous filesystem or database result is intentionally
+retained for inspection rather than silently repaired.
 
 Consumers accept only an authenticated terminal journal with matching
 configuration, project-map, target-backend, recovery-material, and remote-fence
@@ -247,6 +251,51 @@ evidence. Legacy SQLite compatibility applies only when the directory is
 confirmed absent at both the initial journal probe and the admission decision
 boundary. Preserve an empty or incomplete directory for diagnosis instead of
 deleting it to regain SQLite compatibility.
+
+### Journal-less publication evidence
+
+An existing private publication directory is evidence even when it is empty.
+If that directory has no `journal.json`, consumers and `lcm doctor` treat the
+state as incomplete publication evidence and keep admission blocked. The
+doctor diagnostic authenticates the blocked admission but does not prove
+interruption provenance, authorize removal, repair evidence, or provide a
+journal-less resume or abort. The diagnostic alone does not establish that
+this is the state: the same `publication-evidence-missing` reason can describe
+other missing-evidence conditions. Confirm this case with a non-mutating
+listing of the publication directory, observing that the directory exists and
+`journal.json` is absent.
+
+The internal coordinator cannot repair this state. Its `recoverPending()` scan
+returns `null` when no journal exists, meaning that it found no pending work;
+it does not repair the directory and does not throw for this condition. The
+`resume()` and `abort()` state machines require a journal and throw
+`publication-evidence-missing` when it is missing. These are activation-flow
+seams, not operator commands or safe absence probes; the coordinator's lock
+prologue can create the publication directory while it opens it. The unrelated
+`lcm machine recover` command recovers a PostgreSQL machine identity, not
+backend-publication evidence.
+
+Run `lcm doctor` and retain its sanitized diagnostic, then preserve the entire
+publication directory unchanged. Stop automated recovery attempts and file a
+[Question using the repository support form](https://github.com/donadiosolutions/lcm/issues/new?template=question.yml)
+with the following bounded, redacted context:
+
+- LCM version and operating system.
+- The exact sanitized `lcm doctor` diagnostic.
+- The operation that was interrupted and when it was observed.
+- A link or reference to issue #838 for the journal-less publication-evidence
+  case.
+
+Put these facts in the form's `Context` field. Do not include secrets,
+`journal.json`, material, `config.json`, `map.json`, fenced-lease rows, or
+other state dumps. There is no supported automatic or standalone CLI recovery
+for a journal-less publication directory. A maintainer must establish the
+interruption provenance and provide case-specific, evidence-safe recovery
+guidance before any mutation. Do not remove the directory, fabricate a
+journal, edit backend state, or restart the daemon as a bypass. Resume the
+ordinary doctor/retry sequence only after evidence has been safely restored or
+resolved and a valid terminal publication, or a legitimately absent directory,
+has been re-established through the supported owning flow.
 
 ## Hard limits and rejection behavior
 
@@ -496,10 +545,15 @@ The safe operator sequence is therefore:
 2. Run `lcm doctor` and preserve its sanitized output. If the sidecar error log
    is unavailable, inspect the fixed-diagnostic record in
    `~/.lcm/logs/events.log`.
-3. Resolve the authenticated publication through its owning recovery or
-   publication flow; only that owner may complete or abort the evidence.
+3. If an authenticated `journal.json` is present, resolve the publication
+   through its owning recovery or publication flow; only that owner may
+   complete or abort the evidence. If the publication directory exists without
+   `journal.json`, including when it is empty, stop and follow [Journal-less
+   publication evidence](#journal-less-publication-evidence). The doctor
+   diagnostic alone does not choose between these cases.
 4. Rerun `lcm doctor`, then retry the hook or restart the managed daemon after
-   the publication reaches a terminal state. A structured PostToolUse
+   the publication reaches a terminal state or a legitimately absent directory
+   has been re-established by its owning flow. A structured PostToolUse
    `systemMessage` is an admission refusal to act on, not proof that selected
    state was accepted.
 
