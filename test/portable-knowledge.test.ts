@@ -1,4 +1,18 @@
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -734,7 +748,7 @@ describe("portable-knowledge — import", () => {
     db.close();
   });
 
-  it("writes meta.json on import so the project is visible to export --all", async () => {
+  it("privately writes meta.json on import so the project is visible to export --all", async () => {
     const baseDir = makeTempDir();
     const cwd = makeTempDir();
 
@@ -749,16 +763,21 @@ describe("portable-knowledge — import", () => {
       },
     ]);
 
-    await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir });
+    const originalUmask = process.umask(0o022);
+    try {
+      await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir });
+    } finally {
+      process.umask(originalUmask);
+    }
 
     // meta.json must exist so export --all can discover this project
     const projId = toProjectId(cwd);
     const metaPath = join(baseDir, "projects", projId, "meta.json");
     expect(existsSync(metaPath)).toBe(true);
 
-    const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-    expect(meta.cwd).toBe(cwd);
-    expect(readFileSync(metaPath, "utf-8").endsWith("\n")).toBe(true);
+    expect(readFileSync(metaPath, "utf-8")).toBe(`{\n  "cwd": ${JSON.stringify(cwd)}\n}\n`);
+    expect(statSync(metaPath).mode & 0o777).toBe(0o600);
+    expect(statSync(join(baseDir, "projects", projId)).mode & 0o777).toBe(0o700);
 
     // Verify the round-trip: export using the same project directory enumeration
     // that `lcm export --all` uses (scan projects/ for meta.json files).
@@ -796,16 +815,83 @@ describe("portable-knowledge — import", () => {
     expect(JSON.parse(readFileSync(metaPath, "utf-8"))).toEqual({ cwd });
   });
 
-  it("preserves an existing meta.json", async () => {
+  it("preserves existing meta.json bytes and mode", async () => {
     const baseDir = makeTempDir();
     const cwd = makeTempDir();
     const { projDir } = seedProject(baseDir, cwd, []);
     const metaPath = join(projDir, "meta.json");
-    writeFileSync(metaPath, JSON.stringify({ cwd, marker: "keep" }));
+    const existing = `${JSON.stringify({ cwd, marker: "keep malformed bytes" })}\ntrailing`;
+    writeFileSync(metaPath, existing);
+    chmodSync(metaPath, 0o640);
 
     await importKnowledge(cwd, makeDoc([]), { _lcmBaseDir: baseDir });
 
-    expect(JSON.parse(readFileSync(metaPath, "utf-8"))).toEqual({ cwd, marker: "keep" });
+    expect(readFileSync(metaPath, "utf-8")).toBe(existing);
+    expect(statSync(metaPath).mode & 0o777).toBe(0o640);
+  });
+
+  it("leaves a legacy fixed metadata temp file untouched", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const projDir = join(baseDir, "projects", toProjectId(cwd));
+    mkdirSync(projDir, { recursive: true, mode: 0o700 });
+    const legacyTempPath = join(projDir, "meta.json.tmp");
+    const sentinel = "legacy temporary metadata owner\n";
+    writeFileSync(legacyTempPath, sentinel, { mode: 0o600 });
+    const preservedTime = new Date("2000-01-02T03:04:05.000Z");
+    utimesSync(legacyTempPath, preservedTime, preservedTime);
+    const beforeMtimeMs = statSync(legacyTempPath).mtimeMs;
+
+    await importKnowledge(cwd, makeDoc([]), { _lcmBaseDir: baseDir });
+
+    expect(readFileSync(legacyTempPath, "utf-8")).toBe(sentinel);
+    expect(statSync(legacyTempPath).mtimeMs).toBe(beforeMtimeMs);
+  });
+
+  it("leaves a legacy fixed metadata temp symlink and its target untouched", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const projDir = join(baseDir, "projects", toProjectId(cwd));
+    mkdirSync(projDir, { recursive: true, mode: 0o700 });
+    const externalTarget = join(makeTempDir(), "external-target");
+    const sentinel = "external private fixture\n";
+    writeFileSync(externalTarget, sentinel, { mode: 0o600 });
+    const preservedTime = new Date("2001-02-03T04:05:06.000Z");
+    utimesSync(externalTarget, preservedTime, preservedTime);
+    const beforeMtimeMs = statSync(externalTarget).mtimeMs;
+    const legacyTempPath = join(projDir, "meta.json.tmp");
+    symlinkSync(externalTarget, legacyTempPath);
+
+    await importKnowledge(cwd, makeDoc([]), { _lcmBaseDir: baseDir });
+
+    expect(existsSync(legacyTempPath)).toBe(true);
+    expect(lstatSync(legacyTempPath).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(legacyTempPath)).toBe(externalTarget);
+    expect(readFileSync(externalTarget, "utf-8")).toBe(sentinel);
+    expect(statSync(externalTarget).mtimeMs).toBe(beforeMtimeMs);
+  });
+
+  it("preserves a dangling meta.json symlink and completes the import", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const projDir = join(baseDir, "projects", toProjectId(cwd));
+    mkdirSync(projDir, { recursive: true, mode: 0o700 });
+    const metaPath = join(projDir, "meta.json");
+    const danglingTarget = join(makeTempDir(), "missing-meta-target");
+    symlinkSync(danglingTarget, metaPath);
+    expect(existsSync(metaPath)).toBe(false);
+
+    const result = await importKnowledge(cwd, makeDoc([]), { _lcmBaseDir: baseDir });
+
+    expect(result).toEqual({
+      total: 0,
+      imported: 0,
+      skipped: 0,
+      dryRun: false,
+    });
+    expect(lstatSync(metaPath).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(metaPath)).toBe(danglingTarget);
+    expect(existsSync(danglingTarget)).toBe(false);
   });
 
   it.each([
