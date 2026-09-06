@@ -229,6 +229,8 @@ const expectedComponents = [
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
       // #1044 keeps the existing owner; no taxonomy, status, or policy change.
+      // #1069 preserves completed reconciliation evidence after retained
+      // directory cleanup failures in this existing component.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
@@ -534,10 +536,13 @@ describe("Codecov configuration", () => {
       // #866 export admission failures and sensitive result emission stay CLI-owned.
       // #1081 keeps unsupported export-format admission CLI-owned.
       // #978 keeps compact replacement runtime-digest admission CLI-owned.
+      // #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
       ["src/private-mutation-lock.ts", "unit-configuration-security"],
       ["src/home-parent-auth.ts", "unit-configuration-security"],
+      // #1041 preserves bootstrap directory authentication errors when
+      // descriptor cleanup also fails in this existing owner.
       ["src/runtime-paths.ts", "unit-configuration-security"],
       ["src/security-files.ts", "unit-configuration-security"],
       ["src/sensitive.ts", "unit-configuration-security"],
@@ -591,6 +596,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],
       // #837 consumer-admission descriptor cleanup remains storage-owned.
+      // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
@@ -605,6 +611,9 @@ describe("Codecov configuration", () => {
       ["src/db/connection.ts", "unit-local-persistence"],
       ["src/db/database-parent.ts", "unit-local-persistence"],
       ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
+      // #1020 keeps message timestamp mapping in the existing local-persistence
+      // component; conversation timestamps remain on their existing mapper.
+      ["src/store/conversation-store.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],
