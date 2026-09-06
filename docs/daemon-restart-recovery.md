@@ -204,12 +204,14 @@ LCM also treats descriptor cleanup as part of PID-evidence authentication. If
 closing the descriptor fails, the evidence is unsafe and migration stops before
 discovery, exact stop, unlink, or stable startup.
 
-If `daemon.pid` is already missing, LCM first performs the same bounded,
-strict legacy-unit discovery. A discovered historical unit cannot be
-authenticated without its PID evidence, so LCM preserves it and refuses a
-stable start. Normal absent startup continues only when discovery proves that
-no historical candidate exists. Unavailable or failed discovery also refuses
-rather than assuming absence.
+If `daemon.pid` is directly absent while its parent state directory retains
+the same identity, LCM first performs the same bounded, strict legacy-unit
+discovery. An access error, parent change, or disappearance during a bounded
+read is unsafe evidence rather than absence. A discovered historical unit
+cannot be authenticated without its PID evidence, so LCM preserves it and
+refuses a stable start. Normal absent startup continues only when discovery
+proves that no historical candidate exists. Unavailable or failed discovery
+also refuses rather than assuming absence.
 
 Ambiguous, replaced, symlinked, hardlinked, malformed, unauthorized, or
 otherwise incomplete evidence is left untouched. LCM refuses multiple or

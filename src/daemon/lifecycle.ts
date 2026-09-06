@@ -14,6 +14,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   unlinkSync,
   writeFileSync,
   writeSync,
@@ -801,9 +802,32 @@ type LegacyPidFileEvidence =
   | Readonly<{ kind: "present"; pid: number; device: number; inode: number }>;
 
 function readLegacyPidFileEvidence(path: string): LegacyPidFileEvidence {
+  const parentPath = dirname(path);
+  let parentBefore: ReturnType<typeof statSync>;
+  try {
+    parentBefore = statSync(parentPath);
+    if (!parentBefore.isDirectory()) return { kind: "unsafe" };
+  } catch {
+    return { kind: "unsafe" };
+  }
+  try {
+    lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { kind: "unsafe" };
+    try {
+      const parentAfter = statSync(parentPath);
+      return parentAfter.isDirectory()
+        && parentAfter.dev === parentBefore.dev
+        && parentAfter.ino === parentBefore.ino
+        ? { kind: "missing" }
+        : { kind: "unsafe" };
+    } catch {
+      return { kind: "unsafe" };
+    }
+  }
   try {
     const result = readBoundedRegularFileWithStat(path, {
-      allowedRoot: dirname(path),
+      allowedRoot: parentPath,
       maxBytes: 64,
       requireSingleLink: true,
     });
@@ -812,12 +836,10 @@ function readLegacyPidFileEvidence(path: string): LegacyPidFileEvidence {
     return /^[1-9][0-9]*$/u.test(value) && Number.isSafeInteger(pid) && pid > 0
       ? { kind: "present", pid, device: result.dev, inode: result.ino }
       : { kind: "unsafe" };
-  } catch (error) {
-    // A pathname that vanishes during validation remains missing evidence;
-    // after an exact legacy stop, that absence can complete migration.
-    return (error as NodeJS.ErrnoException).code === "ENOENT"
-      ? { kind: "missing" }
-      : { kind: "unsafe" };
+  } catch {
+    // Only the pre-open lstat above can prove direct leaf absence. Once the
+    // bounded read starts, ENOENT can also mean an unsafe path replacement.
+    return { kind: "unsafe" };
   }
 }
 
