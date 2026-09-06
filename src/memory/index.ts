@@ -8,7 +8,7 @@ export type SearchResult = {
 
 export type MemoryApi = {
   store: (text: string, tags: string[], metadata?: Record<string, unknown>) => Promise<void>;
-  search: (query: string, options?: { limit?: number; threshold?: number; projectId?: string; layers?: SearchLayerInput[]; cwd?: string }) => Promise<SearchResult>;
+  search: (query: string, options?: { limit?: number; threshold?: number; projectId?: string; layers?: SearchLayerInput[]; cwd?: string; tags?: string[] }) => Promise<SearchResult>;
   compact: (sessionId: string, transcriptPath: string, cwd?: string) => Promise<{ summary: string }>;
   recent: (cwd: string, limit?: number) => Promise<{ summaries: any[] }>;
 };

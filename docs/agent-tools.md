@@ -165,6 +165,7 @@ project. Send a JSON object with an existing absolute project directory as
   "query": "authentication decision",
   "limit": 10,
   "layers": ["episodic", "promoted"],
+  "tags": ["decision", "project:lcm"],
   "projectId": "legacy-project-id",
   "threshold": 0.7
 }
@@ -175,6 +176,10 @@ implicit working-directory fallback. The legacy `projectId` and `threshold`
 options are accepted and forwarded to the daemon, but `projectId` does not
 select a project and `threshold` does not filter by similarity. Omit `cwd` to
 preserve the legacy empty-result response (`{ "episodic": [], "promoted": [] }`).
+When provided, `tags` filters promoted entries by all supplied tags; episodic
+history remains unfiltered. All required promoted tags are applied before the
+caller’s result maximum, so the maximum counts eligible records. Omitted or
+empty `tags` arrays do not filter either layer.
 
 The package root exposes the same request through `memory.search`:
 
@@ -185,6 +190,7 @@ const result = await memory.search("authentication decision", {
   cwd: "/workspace/project",
   layers: ["episodic", "promoted"],
   limit: 10,
+  tags: ["decision", "project:lcm"],
 });
 ```
 
