@@ -600,6 +600,59 @@ describe("runDoctor project map checks", () => {
     }
   });
 
+  it.each([
+    ["missing", undefined, undefined, false],
+    ["unreadable", undefined, undefined, true],
+    ["empty", "", "", false],
+    ["whitespace-only", " \t", " \t", false],
+  ] as const)("refuses daemon convergence before owner probing with a %s local version", async (
+    _label,
+    localVersion,
+    daemonVersion,
+    packageUnreadable,
+  ) => {
+    const { home } = contentionHome("lcm-doctor-missing-version-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("original publication lock is busy");
+    const readOwner = vi.fn(readPrivateMutationLockOwner);
+    const baseReadFile = minimalDeps().readFileSync;
+    const fetch = vi.fn().mockImplementation(async (
+      _url: string | URL | Request,
+      init?: RequestInit,
+    ) => new Headers(init?.headers).has("Authorization")
+      ? authenticatedHealth({ version: daemonVersion })
+      : recognizedHealth({ version: daemonVersion }));
+    vi.mocked(ensureDaemon).mockRejectedValueOnce(contention);
+    const { deps, sleeps, restore } = convergenceDeps(home, {
+      _readPrivateMutationLockOwnerForTesting: readOwner,
+      fetch,
+      readFileSync: (path, encoding) => {
+        if (path.endsWith("daemon.token")) return "doctor-token";
+        if (path.endsWith("package.json")) {
+          if (packageUnreadable) throw new Error("package metadata is unreadable");
+          return JSON.stringify(localVersion === undefined ? {} : { version: localVersion });
+        }
+        return baseReadFile(path, encoding);
+      },
+    });
+    try {
+      const results = await runDoctor(deps);
+      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
+      expect(vi.mocked(restartDaemon)).not.toHaveBeenCalled();
+      expect(readOwner).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(new Headers(fetch.mock.calls[0]?.[1]?.headers).has("Authorization")).toBe(false);
+      expect(sleeps).toEqual([]);
+      expect(results.find((result) => result.name === "daemon")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("original publication lock is busy"),
+      });
+    } finally {
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("does not derive a missing local runtime digest from project-map peer health", async () => {
     const { home } = contentionHome("lcm-doctor-peer-runtime-digest-");
     writeLivePublicationOwner(home);
@@ -619,6 +672,43 @@ describe("runDoctor project map checks", () => {
       expect(validateProjectMap).toHaveBeenCalledOnce();
       expect(readOwner).not.toHaveBeenCalled();
       expect(fetch).toHaveBeenCalledOnce();
+      expect(sleeps).toEqual([]);
+      expect(results.find((result) => result.name === "project-map")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("original project-map publication lock is busy"),
+      });
+    } finally {
+      validateProjectMap.mockRestore();
+      restore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("does not derive a missing local version from project-map peer health", async () => {
+    const { home } = contentionHome("lcm-doctor-peer-version-");
+    writeLivePublicationOwner(home);
+    const contention = new PrivateMutationLockContentionError("original project-map publication lock is busy");
+    const readOwner = vi.fn(readPrivateMutationLockOwner);
+    const baseReadFile = minimalDeps().readFileSync;
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap")
+      .mockImplementationOnce(() => { throw contention; })
+      .mockImplementation(() => passingProjectMapValidation(home));
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(recognizedHealth({ version: "9.9.9" }))
+      .mockImplementation(async () => authenticatedHealth({ version: undefined }));
+    const { deps, sleeps, restore } = convergenceDeps(home, {
+      _readPrivateMutationLockOwnerForTesting: readOwner,
+      fetch,
+      readFileSync: (path, encoding) => path.endsWith("package.json")
+        ? JSON.stringify({})
+        : baseReadFile(path, encoding),
+    }, { projectMap: false });
+    try {
+      const results = await runDoctor(deps);
+      expect(validateProjectMap).toHaveBeenCalledOnce();
+      expect(readOwner).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(new Headers(fetch.mock.calls[0]?.[1]?.headers).has("Authorization")).toBe(false);
       expect(sleeps).toEqual([]);
       expect(results.find((result) => result.name === "project-map")).toMatchObject({
         status: "fail",
@@ -690,6 +780,7 @@ describe("runDoctor project map checks", () => {
     ["runtime digest", { runtimeDigest: "b".repeat(64) }, {}],
     ["storage backend", { storageBackend: "postgresql" }, {}],
     ["version", { version: "0.4.9" }, {}],
+    ["absent version", { version: undefined }, {}],
   ] as const)("does not converge when authenticated daemon %s identity differs", async (_label, healthIdentity, seam) => {
     const { home } = contentionHome("lcm-doctor-identity-contention-");
     writeLivePublicationOwner(home);
