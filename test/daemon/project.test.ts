@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { chmodSync, existsSync, fchmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, fchmodSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, resolve } from "node:path";
@@ -948,16 +948,40 @@ describe("secure project-root handoff", () => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });
     const rootPath = join(home, ".lcm");
     const closeError = new Error("root close failed");
+    const capturedHandles: securityFiles.PrivateDirectoryHandle[] = [];
     const originalOpen = securityFiles.openPrivateDirectory;
     const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) => {
       const handle = originalOpen(path, options);
-      return path === rootPath ? { ...handle, close: () => { throw closeError; } } : handle;
+      if (path === rootPath) capturedHandles.push(handle);
+      return path === rootPath
+        ? {
+          ...handle,
+          close: () => {
+            handle.close();
+            throw closeError;
+          },
+        }
+        : handle;
     });
     try {
       expect(() => ensureProjectDirForIdentity({ id: "7".repeat(64), canonical: "/project" }, { writeMetadata: false }))
         .toThrow(closeError);
+      expect(capturedHandles).toHaveLength(1);
+      for (const handle of capturedHandles) {
+        let fstatError: unknown;
+        try {
+          fstatSync(handle.fd);
+        } catch (error) {
+          fstatError = error;
+        }
+        expect(fstatError).toMatchObject({ code: "EBADF" });
+      }
     } finally {
-      openSpy.mockRestore();
+      try {
+        for (const handle of capturedHandles) handle.close();
+      } finally {
+        openSpy.mockRestore();
+      }
     }
   });
 
@@ -966,22 +990,55 @@ describe("secure project-root handoff", () => {
     const rootPath = join(home, ".lcm");
     mkdirSync(join(rootPath, "projects"), { mode: 0o700 });
     const closeError = new Error("directory close failed");
+    const capturedHandles: securityFiles.PrivateDirectoryHandle[] = [];
     const originalOpen = securityFiles.openPrivateDirectory;
     const originalOpenIfExists = securityFiles.openPrivateDirectoryIfExists;
     const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) => {
       const handle = originalOpen(path, options);
-      return path === rootPath ? { ...handle, close: () => { throw closeError; } } : handle;
+      if (path === rootPath) capturedHandles.push(handle);
+      return path === rootPath
+        ? {
+          ...handle,
+          close: () => {
+            handle.close();
+            throw closeError;
+          },
+        }
+        : handle;
     });
     const optionalSpy = vi.spyOn(securityFiles, "openPrivateDirectoryIfExists").mockImplementation((path, options) => {
       const handle = originalOpenIfExists(path, options);
-      return handle === undefined ? handle : { ...handle, close: () => { throw closeError; } };
+      if (handle !== undefined) capturedHandles.push(handle);
+      return handle === undefined
+        ? handle
+        : {
+          ...handle,
+          close: () => {
+            handle.close();
+            throw closeError;
+          },
+        };
     });
     try {
       expect(() => ensureProjectDirForIdentity({ id: "9".repeat(64), canonical: "/project" }, { writeMetadata: false }))
         .toThrow(AggregateError);
+      expect(capturedHandles).toHaveLength(2);
+      for (const handle of capturedHandles) {
+        let fstatError: unknown;
+        try {
+          fstatSync(handle.fd);
+        } catch (error) {
+          fstatError = error;
+        }
+        expect(fstatError).toMatchObject({ code: "EBADF" });
+      }
     } finally {
-      optionalSpy.mockRestore();
-      openSpy.mockRestore();
+      try {
+        for (const handle of capturedHandles) handle.close();
+      } finally {
+        optionalSpy.mockRestore();
+        openSpy.mockRestore();
+      }
     }
   });
 
@@ -992,16 +1049,40 @@ describe("secure project-root handoff", () => {
     const leaf = join(projects, "8".repeat(64));
     mkdirSync(leaf, { recursive: true, mode: 0o755 });
     const closeError = new Error("root close failed");
+    const capturedHandles: securityFiles.PrivateDirectoryHandle[] = [];
     const originalOpen = securityFiles.openPrivateDirectory;
     const openSpy = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((path, options) => {
       const handle = originalOpen(path, options);
-      return path === rootPath ? { ...handle, close: () => { throw closeError; } } : handle;
+      if (path === rootPath) capturedHandles.push(handle);
+      return path === rootPath
+        ? {
+          ...handle,
+          close: () => {
+            handle.close();
+            throw closeError;
+          },
+        }
+        : handle;
     });
     try {
       expect(() => ensureProjectDirForIdentity({ id: "8".repeat(64), canonical: "/project" }, { writeMetadata: false }))
         .toThrow(AggregateError);
+      expect(capturedHandles).toHaveLength(1);
+      for (const handle of capturedHandles) {
+        let fstatError: unknown;
+        try {
+          fstatSync(handle.fd);
+        } catch (error) {
+          fstatError = error;
+        }
+        expect(fstatError).toMatchObject({ code: "EBADF" });
+      }
     } finally {
-      openSpy.mockRestore();
+      try {
+        for (const handle of capturedHandles) handle.close();
+      } finally {
+        openSpy.mockRestore();
+      }
     }
   });
 
