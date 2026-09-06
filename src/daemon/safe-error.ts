@@ -94,7 +94,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           isFileUrlLiteral(chars, index + 1)
         ? index + 1
         : -1;
-    if (separator >= 0 && nestedFileSchemeStart >= 0) {
+    if ((separator >= 0 || restartedPathlessFile) && nestedFileSchemeStart >= 0) {
       separator = nestedFileSchemeStart + 4;
       brackets = 0;
       exactFileScheme = true;
@@ -140,7 +140,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       fileSchemeLength = 0;
       schemeQuote = 0;
       restartedPathlessFile = true;
-      queryOrFragment = false;
       continue;
     }
     if (
@@ -149,6 +148,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       !FILE_URL_AUTHORITY_DELIMITERS.has(char)
     ) {
       restartedPathlessFile = false;
+      queryOrFragment = false;
     }
     // These characters are valid in a file URL authority. Keep classifying
     // until the first path separator, except when one closes a quote that
@@ -193,11 +193,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     // this tail without widening backslash detection in unrelated text.
     if (restartedPathlessFile && char === "\\") {
       restartedPathlessFile = false;
+      queryOrFragment = false;
       file[index] = 1;
       continue;
     }
     if (char === ":" && schemeLength > 0 && chars[index + 1] === "/" && chars[index + 2] === "/") {
       restartedPathlessFile = false;
+      queryOrFragment = false;
       separator = index;
       authority[index + 1] = 1;
       authority[index + 2] = 1;

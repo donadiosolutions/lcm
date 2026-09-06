@@ -580,6 +580,14 @@ describe("sanitizeError", () => {
       "file://host.invalid#next=profile://remote.invalid/Users/canary/private.db",
     ],
     [
+      "file://host.invalid?next=xfile://remote.invalid/Users/canary/private.db",
+      "file://host.invalid?next=xfile://remote.invalid/Users/canary/private.db",
+    ],
+    [
+      "file://host.invalid#next=xfile://remote.invalid/Users/canary/private.db",
+      "file://host.invalid#next=xfile://remote.invalid/Users/canary/private.db",
+    ],
+    [
       "file://host.invalid?x=https://example.test/p, /Users/canary/private.db",
       "file://host.invalid?x=https://example.test/p, <path>",
     ],
@@ -781,6 +789,14 @@ describe("sanitizeError", () => {
     [
       "file://host.invalid?next=1file://host.invalid/Users/canary/private.db",
       "file://host.invalid?next=1file://host.invalid<path>",
+    ],
+    [
+      "file://outer.invalid?q=prefix-file://host.invalid/Users/canary/private.db",
+      "file://outer.invalid?q=prefix-file://host.invalid<path>",
+    ],
+    [
+      "file://outer.invalid#q=prefix-file://host.invalid/Users/canary/private.db",
+      "file://outer.invalid#q=prefix-file://host.invalid<path>",
     ],
   ] as const)("redacts newly recognized file URL paths after a pathless reset: %#", (input, expected) => {
     const result = sanitizeError(input);
