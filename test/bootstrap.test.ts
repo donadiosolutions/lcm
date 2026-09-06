@@ -72,8 +72,6 @@ describe("ensureCore", () => {
         entrypoint: PACKAGED_RUNTIME_ENTRYPOINT,
         runtimeDigest: RUNTIME_DIGEST,
       },
-      expectedEntrypoint: PACKAGED_RUNTIME_ENTRYPOINT,
-      expectedRuntimeDigest: RUNTIME_DIGEST,
       deps: {
         now: () => now,
         sleep: async (ms) => { now += ms; },

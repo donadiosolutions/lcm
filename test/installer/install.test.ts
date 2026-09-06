@@ -2241,8 +2241,6 @@ describe("installer publication admission integration", () => {
         entrypoint: "/opt/lcm.mjs",
         runtimeDigest: "a".repeat(64),
       },
-      expectedEntrypoint: "/opt/lcm.mjs",
-      expectedRuntimeDigest: "a".repeat(64),
       deps: {
         now: () => now,
         sleep: async (ms) => { sleeps.push(ms); now += ms; },

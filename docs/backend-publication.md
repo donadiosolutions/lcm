@@ -45,8 +45,11 @@ bounded 2-second convergence window only for the exact authenticated child
 admitted by that lifecycle operation (including an authorized manager
 replacement). The window polls every 50 ms and rechecks the lock owner,
 process birth, token, and health identity without replaying startup or taking
-the publication lock across a wait. A token rotation, PID or birth mismatch,
-changed runtime/version/backend/entrypoint, missing or malformed owner,
+the publication lock across a wait. The initially authenticated daemon identity
+is the sole source for the retry's version, backend, entrypoint, and runtime
+digest expectations; none of those fields can be omitted from a captured
+identity. A token rotation, PID or birth mismatch, changed
+runtime/version/backend/entrypoint, missing or malformed owner,
 unknown publication home, health failure, timeout, cancellation, or any other
 non-contention error fails closed. Cancellation after contention rethrows the
 original typed contention error. Platforms where process birth cannot be

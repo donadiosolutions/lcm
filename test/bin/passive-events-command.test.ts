@@ -291,8 +291,6 @@ describe("lcm events staged PostgreSQL operator commands", () => {
     state.factory.mockResolvedValue(createPublicationConvergence({
       port: 3737,
       identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
-      expectedEntrypoint: "/daemon",
-      expectedRuntimeDigest: "runtime",
       deps: {
         now: () => now,
         sleep: async (delayMs: number) => { now += delayMs; },

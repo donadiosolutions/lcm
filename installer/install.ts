@@ -369,8 +369,6 @@ export async function createInstallerPublicationConvergence(
   return createPublicationConvergence({
     port,
     identity,
-    expectedEntrypoint,
-    expectedRuntimeDigest,
     deps: {
       ...seams,
       homeDir,
