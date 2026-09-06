@@ -184,6 +184,159 @@ describe("publication convergence", () => {
     expect(exhaustedNow).toBe(2_000);
   });
 
+  it("keeps the default retry window bounded across a backward wall-clock step", async () => {
+    let monotonicNow = 100;
+    let wallNow = 10_000;
+    let sleepCount = 0;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const contention = new PrivateMutationLockContentionError("backward wall step");
+    try {
+      const convergence = createPublicationConvergence({
+        port: 3737,
+        identity,
+        deps: deps({
+          sleep: async (delayMs) => {
+            sleepCount += 1;
+            if (sleepCount === 1) wallNow = 0;
+            monotonicNow += delayMs;
+            wallNow += delayMs;
+          },
+        }),
+      });
+      let attempts = 0;
+      await expect(withPublicationAdmissionRetry(() => {
+        attempts += 1;
+        if (attempts > 45) throw new Error("retry window did not expire");
+        throw contention;
+      }, convergence)).rejects.toBe(contention);
+      expect(attempts).toBe(40);
+      expect(sleepCount).toBe(40);
+      expect(dateNow).not.toHaveBeenCalled();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("does not reject the second attempt after a forward wall-clock step", async () => {
+    let monotonicNow = 100;
+    let wallNow = 10_000;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const contention = new PrivateMutationLockContentionError("forward wall step");
+    try {
+      const sleep = vi.fn(async (delayMs: number) => {
+        monotonicNow += delayMs;
+        wallNow = Number.MAX_SAFE_INTEGER;
+      });
+      const convergence = createPublicationConvergence({
+        port: 3737,
+        identity,
+        deps: deps({ sleep }),
+      });
+      let attempts = 0;
+      await expect(withPublicationAdmissionRetry(() => {
+        attempts += 1;
+        if (attempts === 1) throw contention;
+        return "second attempt";
+      }, convergence)).resolves.toBe("second attempt");
+      expect(attempts).toBe(2);
+      expect(sleep).toHaveBeenCalledOnce();
+      expect(dateNow).not.toHaveBeenCalled();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("charges birth and health probe time to the default monotonic window", async () => {
+    let monotonicNow = 100;
+    let wallNow = 1_000;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const contention = new PrivateMutationLockContentionError("probe cost");
+    try {
+      const processBirth = vi.fn(() => {
+        monotonicNow = 2_050;
+        return "birth";
+      });
+      const fetch = vi.fn(async () => {
+        monotonicNow = 2_110;
+        return {
+          ok: true,
+          json: async () => ({
+            status: "ok", pid: identity.pid, version: identity.version,
+            storageBackend: identity.storageBackend, entrypoint: identity.entrypoint,
+            runtimeDigest: identity.runtimeDigest,
+          }),
+        };
+      }) as unknown as typeof globalThis.fetch;
+      const sleep = vi.fn(async (_delayMs: number) => undefined);
+      const convergence = createPublicationConvergence({
+        port: 3737,
+        identity,
+        deps: deps({ processBirth, fetch, sleep }),
+      });
+      let attempts = 0;
+      await expect(withPublicationAdmissionRetry(() => {
+        attempts += 1;
+        if (attempts > 2) throw new Error("probe budget did not expire");
+        throw contention;
+      }, convergence)).rejects.toBe(contention);
+      expect(attempts).toBe(1);
+      expect(processBirth).toHaveBeenCalledOnce();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(sleep).not.toHaveBeenCalled();
+      expect(dateNow).not.toHaveBeenCalled();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("floors a fractional default birth budget and preserves the first error", async () => {
+    let monotonicNow = 100;
+    let wallNow = 1_000;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const first = new PrivateMutationLockContentionError("first fractional error");
+    const second = new PrivateMutationLockContentionError("second fractional error");
+    try {
+      const processBirth = vi.fn(() => "birth");
+      const fetch = vi.fn(async () => ({
+        ok: true,
+        json: async () => ({
+          status: "ok", pid: identity.pid, version: identity.version,
+          storageBackend: identity.storageBackend, entrypoint: identity.entrypoint,
+          runtimeDigest: identity.runtimeDigest,
+        }),
+      })) as unknown as typeof globalThis.fetch;
+      const sleep = vi.fn(async () => {
+        if (sleep.mock.calls.length === 1) monotonicNow = 2_099.5;
+        else wallNow = Number.MAX_SAFE_INTEGER;
+      });
+      const convergence = createPublicationConvergence({
+        port: 3737,
+        identity,
+        deps: deps({ processBirth, fetch, sleep }),
+      });
+      let attempts = 0;
+      await expect(withPublicationAdmissionRetry(() => {
+        attempts += 1;
+        throw attempts === 1 ? first : second;
+      }, convergence)).rejects.toBe(first);
+      expect(attempts).toBe(2);
+      expect(processBirth).toHaveBeenCalledOnce();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(sleep).toHaveBeenCalledOnce();
+      expect(dateNow).not.toHaveBeenCalled();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
   it("fails closed for foreign owners, missing evidence, and noncontention errors", async () => {
     const foreign = createPublicationConvergence({ port: 3737, identity, deps: deps({
       readOwner: () => ({ version: 1, pid: 99, processStartTime: "birth", nonce: "b".repeat(32) }),

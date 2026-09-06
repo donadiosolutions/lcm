@@ -24,6 +24,7 @@ export type PublicationDaemonIdentity = Readonly<{
 }>;
 
 export type PublicationConvergenceDeps = Readonly<{
+  /** Monotonic elapsed milliseconds used for publication retry deadlines. */
   now?: () => number;
   sleep?: (delayMs: number) => Promise<void>;
   fetch?: typeof globalThis.fetch;
@@ -175,7 +176,7 @@ async function retryDelay(
   error: unknown,
 ): Promise<number | { expired: true } | undefined> {
   if (!(error instanceof PrivateMutationLockContentionError) || convergence.identity === undefined) return undefined;
-  const now = convergence.deps.now ?? Date.now;
+  const now = convergence.deps.now ?? performance.now.bind(performance);
   const existingDeadline = currentDeadline(convergence);
   if (existingDeadline !== undefined && now() >= existingDeadline) return { expired: true };
   const ownerReader = convergence.deps.readOwner ?? readPrivateMutationLockOwner;
@@ -186,7 +187,7 @@ async function retryDelay(
   try { owner = ownerReader(lockPath, "backend publication"); } catch { return undefined; }
   if (owner === null || owner.pid !== convergence.identity.pid || owner.processStartTime === null) return undefined;
   const deadline = existingDeadline ?? now() + PUBLICATION_CONVERGENCE_MS;
-  const remainingBirth = deadline - now();
+  const remainingBirth = Math.floor(deadline - now());
   if (remainingBirth <= 0) return { expired: true };
   let birth: string | null;
   try {
@@ -210,10 +211,11 @@ export async function withPublicationAdmissionRetry<T>(
   convergence: PublicationConvergence | undefined,
 ): Promise<T> {
   if (convergence === undefined) return await run();
+  const now = convergence.deps.now ?? performance.now.bind(performance);
   let firstContention: PrivateMutationLockContentionError | undefined;
   while (true) {
     const deadline = currentDeadline(convergence);
-    if (firstContention !== undefined && deadline !== undefined && (convergence.deps.now ?? Date.now)() >= deadline) throw firstContention;
+    if (firstContention !== undefined && deadline !== undefined && now() >= deadline) throw firstContention;
     try {
       return await run();
     } catch (error) {
