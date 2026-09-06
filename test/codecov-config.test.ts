@@ -127,6 +127,8 @@ const expectedComponents = [
   {
     component_id: "unit-local-persistence",
     name: "Unit - Local Persistence",
+    // #898 applies required promoted tags before the caller result maximum while retaining local-persistence ownership.
+    // #898's guarded dual-JSON eligibility keeps this search in the same owner.
     paths: ["src/db/", "src/storage/sqlite/", "src/store/"],
   },
   {

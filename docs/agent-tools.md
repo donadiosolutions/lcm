@@ -61,6 +61,8 @@ Tags apply only to promoted memories, which are the tagged search records.
 Episodic messages and summaries remain searchable without a tag predicate. Use
 `layers: ["promoted"]` when you want tag-only recall; omitted or empty tags do
 not filter either layer.
+For promoted searches, all required tags are applied before the caller's result
+maximum, so the maximum counts eligible records.
 
 The deprecated `semantic` layer name remains accepted as a compatibility input
 and is normalized to `promoted`, but it is not advertised.

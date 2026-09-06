@@ -122,6 +122,8 @@ component_management:
       name: "Unit - Local Persistence"
       paths:
         # The #700 SQLite signal fences, #756 SQLite factory-health closed-dominance responsibility, and single-owner cleanup remain local-persistence-owned.
+        # #898 applies required promoted tags before the caller result maximum while retaining local-persistence ownership.
+        # #898's guarded dual-JSON eligibility keeps this search in the same owner.
         - "src/db/"
         - "src/storage/sqlite/"
         - "src/store/"
