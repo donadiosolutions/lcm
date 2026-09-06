@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
+  constants,
   existsSync,
   linkSync,
   lstatSync,
@@ -56,11 +57,14 @@ const legacyPidFileFault = vi.hoisted(() => ({
     | "replacement"
     | "unsafe"
     | "close-error"
+    | "hardlink-on-open"
+    | "after-stop-validation-missing"
     | "former-cleanup-replacement"
     | "former-cleanup-symlink"
     | "former-cleanup-hardlink"
     | undefined,
   openCalls: 0,
+  openFlags: [] as Array<number | string>,
   closeErrorDescriptor: undefined as number | undefined,
   closeAttempts: 0,
   formerCleanupDescriptor: undefined as number | undefined,
@@ -70,7 +74,9 @@ const legacyTokenFileFault = vi.hoisted(() => ({
   path: undefined as string | undefined,
   code: "ENOENT" as "ENOENT" | "EACCES",
   openCalls: 0,
+  openFlags: [] as Array<number | string>,
   countOnly: false,
+  hardlinkOnOpen: false,
 }));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -79,6 +85,10 @@ vi.mock("node:fs", async (importOriginal) => {
     openSync: (...args: Parameters<typeof actual.openSync>) => {
       if (legacyPidFileFault.path !== undefined && String(args[0]) === legacyPidFileFault.path) {
         legacyPidFileFault.openCalls += 1;
+        legacyPidFileFault.openFlags.push(args[1]);
+        if (legacyPidFileFault.openCalls === 1 && legacyPidFileFault.mode === "hardlink-on-open") {
+          actual.linkSync(legacyPidFileFault.path, `${legacyPidFileFault.path}.alias`);
+        }
         if (legacyPidFileFault.openCalls === 2 && legacyPidFileFault.mode === "missing") {
           const error = new Error("PID file disappeared") as NodeJS.ErrnoException;
           error.code = "ENOENT";
@@ -92,6 +102,10 @@ vi.mock("node:fs", async (importOriginal) => {
       }
       if (legacyTokenFileFault.path !== undefined && String(args[0]) === legacyTokenFileFault.path) {
         legacyTokenFileFault.openCalls += 1;
+        legacyTokenFileFault.openFlags.push(args[1]);
+        if (legacyTokenFileFault.openCalls === 1 && legacyTokenFileFault.hardlinkOnOpen) {
+          actual.linkSync(legacyTokenFileFault.path, `${legacyTokenFileFault.path}.alias`);
+        }
         if (!legacyTokenFileFault.countOnly && legacyTokenFileFault.openCalls === 2) {
           const error = new Error("token evidence disappeared") as NodeJS.ErrnoException;
           error.code = legacyTokenFileFault.code;
@@ -116,6 +130,20 @@ vi.mock("node:fs", async (importOriginal) => {
         legacyPidFileFault.formerCleanupDescriptor = descriptor;
       }
       return descriptor;
+    },
+    statSync: (...args: Parameters<typeof actual.statSync>) => {
+      if (
+        legacyPidFileFault.path !== undefined
+        && String(args[0]) === legacyPidFileFault.path
+        && legacyPidFileFault.mode === "after-stop-validation-missing"
+        && legacyPidFileFault.openCalls === 4
+      ) {
+        actual.unlinkSync(legacyPidFileFault.path);
+        const error = new Error("PID file disappeared during validation") as NodeJS.ErrnoException;
+        error.code = "ENOENT";
+        throw error;
+      }
+      return actual.statSync(...args);
     },
     closeSync: (...args: Parameters<typeof actual.closeSync>) => {
       if (args[0] === legacyPidFileFault.closeErrorDescriptor) {
@@ -168,6 +196,7 @@ afterEach(() => {
   legacyPidFileFault.path = undefined;
   legacyPidFileFault.mode = undefined;
   legacyPidFileFault.openCalls = 0;
+  legacyPidFileFault.openFlags = [];
   legacyPidFileFault.closeErrorDescriptor = undefined;
   legacyPidFileFault.closeAttempts = 0;
   legacyPidFileFault.formerCleanupDescriptor = undefined;
@@ -175,7 +204,9 @@ afterEach(() => {
   legacyTokenFileFault.path = undefined;
   legacyTokenFileFault.code = "ENOENT";
   legacyTokenFileFault.openCalls = 0;
+  legacyTokenFileFault.openFlags = [];
   legacyTokenFileFault.countOnly = false;
+  legacyTokenFileFault.hardlinkOnOpen = false;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -397,8 +428,8 @@ function legacyManagerState(
 }
 
 type LegacyFixtureConfig = Readonly<{
-  pidState?: "valid" | "missing" | "malformed" | "symlink" | "directory" | "unsafe-number";
-  tokenState?: "valid" | "missing" | "symlink" | "empty";
+  pidState?: "valid" | "missing" | "malformed" | "symlink" | "directory" | "unsafe-number" | "boundary" | "oversized" | "hardlink";
+  tokenState?: "valid" | "missing" | "symlink" | "empty" | "boundary" | "oversized" | "hardlink";
   tokenInvalidAfterInitialRead?: boolean;
   tokenErrorAfterInitialRead?: boolean;
   discoveries?: readonly LegacyDiscovery[];
@@ -418,6 +449,7 @@ type LegacyFixtureConfig = Readonly<{
   environment?: NodeJS.ProcessEnv;
   formerCleanupMutation?: "replacement" | "symlink" | "hardlink";
   pidCloseError?: boolean;
+  pidValidationMissingAfterStop?: boolean;
   useProcListener?: boolean;
   abortSignal?: AbortSignal;
   abortController?: AbortController;
@@ -440,6 +472,9 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
   const pidPath = join(dir, "daemon.pid");
   const pidState = config.pidState ?? "valid";
   if (pidState === "valid") writePid(dir, 4242);
+  if (pidState === "boundary") writeFileSync(pidPath, "4242".padEnd(64, " "), { mode: 0o600 });
+  if (pidState === "oversized") writeFileSync(pidPath, "4242".padEnd(65, " "), { mode: 0o600 });
+  if (pidState === "hardlink") writePid(dir, 4242);
   if (pidState === "malformed") writeFileSync(pidPath, "not-a-pid", { mode: 0o600 });
   if (pidState === "directory") mkdirSync(pidPath);
   if (pidState === "unsafe-number") writeFileSync(pidPath, "9007199254740992", { mode: 0o600 });
@@ -451,6 +486,9 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
   const tokenPath = join(dir, "daemon.token");
   const tokenState = config.tokenState ?? "valid";
   if (tokenState === "valid") writeFileSync(tokenPath, "legacy-token", { mode: 0o600 });
+  if (tokenState === "boundary") writeFileSync(tokenPath, "legacy-token".padEnd(4_096, " "), { mode: 0o600 });
+  if (tokenState === "oversized") writeFileSync(tokenPath, "legacy-token".padEnd(4_097, " "), { mode: 0o600 });
+  if (tokenState === "hardlink") writeFileSync(tokenPath, "legacy-token", { mode: 0o600 });
   if (tokenState === "empty") writeFileSync(tokenPath, "", { mode: 0o600 });
   if (tokenState === "symlink") {
     const external = join(root("issue-600-legacy-token-external-"), "daemon.token");
@@ -500,20 +538,25 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
   }) as unknown as FetchOverride;
   const ensure = vi.fn(async () => ({ connected: true, port: 19_999, spawned: true, startMethod: "systemd-user" as const }));
   const kill = vi.fn();
+  legacyPidFileFault.path = pidPath;
+  legacyTokenFileFault.path = tokenPath;
+  legacyTokenFileFault.countOnly = true;
+  if (pidState === "hardlink") legacyPidFileFault.mode = "hardlink-on-open";
+  if (tokenState === "hardlink") legacyTokenFileFault.hardlinkOnOpen = true;
   if (config.useProcListener) writeProcListenerEvidence(procRoot, 4242, 19_999);
   if (config.stopBehavior === "leave-pid") legacyPidFileFault.path = pidPath;
   if (config.pidCloseError === true) {
-    legacyPidFileFault.path = pidPath;
     legacyPidFileFault.mode = "close-error";
-    legacyTokenFileFault.path = tokenPath;
-    legacyTokenFileFault.countOnly = true;
+  }
+  if (config.pidValidationMissingAfterStop === true) {
+    legacyPidFileFault.mode = "after-stop-validation-missing";
   }
   if (config.formerCleanupMutation !== undefined) {
     legacyPidFileFault.path = pidPath;
     legacyPidFileFault.mode = `former-cleanup-${config.formerCleanupMutation}`;
   }
   if (config.tokenInvalidAfterInitialRead || config.tokenErrorAfterInitialRead) {
-    legacyTokenFileFault.path = tokenPath;
+    legacyTokenFileFault.countOnly = false;
     legacyTokenFileFault.code = config.tokenErrorAfterInitialRead ? "EACCES" : "ENOENT";
   }
   const preStopClock = { expired: false };
@@ -2145,6 +2188,75 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     expect(fixture.kill).not.toHaveBeenCalled();
     expect(legacyPidFileFault.unlinkCalls).toBe(0);
     expect(readFileSync(fixture.pidPath, "utf-8")).toBe("4242");
+  });
+
+  it("opens boundary-sized legacy evidence without following or blocking", async () => {
+    const fixture = await runLegacyFixture({
+      pidState: "boundary",
+      tokenState: "boundary",
+    });
+    const expectedFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+    expect(fixture.result).toMatchObject({
+      connected: true,
+      restarted: true,
+      stoppedPid: 4242,
+    });
+    expect(legacyPidFileFault.openFlags).toEqual(Array(4).fill(expectedFlags));
+    expect(legacyTokenFileFault.openFlags).toEqual(Array(2).fill(expectedFlags));
+  });
+
+  it("refuses a 65-byte PID before discovery, authentication, or mutation", async () => {
+    const fixture = await runLegacyFixture({ pidState: "oversized" });
+    expect(fixture.result).toMatchObject({
+      restarted: false,
+      refusalReason: "ambiguous",
+    });
+    expect(fixture.fetch).not.toHaveBeenCalled();
+    expect(fixture.supervisor.discoverLegacySystemdUnits).not.toHaveBeenCalled();
+    expect(fixture.supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
+    expect(fixture.supervisor.start).not.toHaveBeenCalled();
+    expect(fixture.ensure).not.toHaveBeenCalled();
+  });
+
+  it("refuses a 4097-byte token before authenticated diagnostics or mutation", async () => {
+    const fixture = await runLegacyFixture({ tokenState: "oversized" });
+    expect(fixture.result).toMatchObject({
+      restarted: false,
+      refusalReason: "response-auth-failure",
+    });
+    expect(fixture.fetch).toHaveBeenCalledOnce();
+    expect(fixture.fetch.mock.calls[0]?.[1]?.headers).toBeUndefined();
+    expect(fixture.supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
+    expect(fixture.supervisor.start).not.toHaveBeenCalled();
+    expect(fixture.ensure).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["PID", { pidState: "hardlink" as const }, "ambiguous", 0],
+    ["token", { tokenState: "hardlink" as const }, "response-auth-failure", 1],
+  ])("refuses multiply-linked legacy %s evidence", async (_name, config, refusalReason, fetchCalls) => {
+    const fixture = await runLegacyFixture(config);
+    expect(fixture.result).toMatchObject({ restarted: false, refusalReason });
+    expect(fixture.fetch).toHaveBeenCalledTimes(fetchCalls);
+    expect(fixture.supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
+    expect(fixture.supervisor.start).not.toHaveBeenCalled();
+    expect(fixture.ensure).not.toHaveBeenCalled();
+  });
+
+  it("accepts PID pathname disappearance during post-stop descriptor validation", async () => {
+    const fixture = await runLegacyFixture({
+      stopBehavior: "leave-pid",
+      pidValidationMissingAfterStop: true,
+    });
+    expect(fixture.result).toMatchObject({
+      connected: true,
+      restarted: true,
+      stoppedPid: 4242,
+    });
+    expect(fixture.supervisor.stopLegacySystemdUnit).toHaveBeenCalledOnce();
+    expect(fixture.supervisor.start).toHaveBeenCalledOnce();
+    expect(fixture.ensure).toHaveBeenCalledOnce();
+    expect(existsSync(fixture.pidPath)).toBe(false);
   });
 
   it("preserves normal absent startup when missing PID evidence has no legacy candidates", async () => {

@@ -240,7 +240,8 @@ const expectedComponents = [
     name: "Integration - Service Managers and Legacy Migration",
     paths: [
       "^src/daemon/health-observation\\.ts$",
-      // #865 convergence and #966 birth-sample budgeting remain lifecycle-owned.
+      // #865/#966 convergence and birth budgeting remain lifecycle-owned;
+      // #1073 bounds legacy PID/token evidence within that same owner.
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",

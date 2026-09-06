@@ -162,6 +162,12 @@ old unit once, but only when all of these independent checks agree:
 - a fresh discovery immediately before mutation still identifies the same
   single unit.
 
+Legacy migration reads at most 64 raw bytes from `daemon.pid` and 4,096 raw
+bytes from `daemon.token`, before trimming whitespace. LCM opens each leaf
+without following symlinks and in nonblocking mode. Oversized files, FIFOs,
+other non-regular leaves, and multiply-linked files are unsafe evidence, so
+migration refuses them without waiting for a FIFO writer.
+
 Discovery enumerates all systemd user services before applying the strict
 historical-name filter, so `reloading`, `refreshing`, `activating`,
 `deactivating`, `maintenance`, inactive, failed, and future manager states

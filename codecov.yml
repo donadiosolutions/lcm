@@ -256,8 +256,9 @@ component_management:
         # #865/#950 keep post-start and explicit-restart publication convergence
         # inside the lifecycle owner, #944 keeps bounded daemon-tmp retry
         # guidance within the supervisor/lifecycle boundary, and #966 keeps
-        # optional birth-sample budgeting in lifecycle admission. Their paired
-        # managed lifecycle tests remain this component's coverage boundary.
+        # optional birth-sample budgeting in lifecycle admission. #1073 keeps
+        # bounded legacy PID/token evidence in the same lifecycle owner. Their
+        # paired managed lifecycle tests remain this component's coverage boundary.
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"

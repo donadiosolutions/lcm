@@ -801,29 +801,24 @@ type LegacyPidFileEvidence =
   | Readonly<{ kind: "present"; pid: number; device: number; inode: number }>;
 
 function readLegacyPidFileEvidence(path: string): LegacyPidFileEvidence {
-  let descriptor: number | undefined;
-  let evidence: LegacyPidFileEvidence;
   try {
-    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const stats = fstatSync(descriptor);
-    if (!stats.isFile() || stats.nlink !== 1) {
-      evidence = { kind: "unsafe" };
-    } else {
-      const value = readFileSync(descriptor, "utf-8").trim();
-      const pid = Number(value);
-      evidence = /^[1-9][0-9]*$/u.test(value) && Number.isSafeInteger(pid) && pid > 0
-        ? { kind: "present", pid, device: stats.dev, inode: stats.ino }
-        : { kind: "unsafe" };
-    }
+    const result = readBoundedRegularFileWithStat(path, {
+      allowedRoot: dirname(path),
+      maxBytes: 64,
+      requireSingleLink: true,
+    });
+    const value = result.content.trim();
+    const pid = Number(value);
+    return /^[1-9][0-9]*$/u.test(value) && Number.isSafeInteger(pid) && pid > 0
+      ? { kind: "present", pid, device: result.dev, inode: result.ino }
+      : { kind: "unsafe" };
   } catch (error) {
-    evidence = (error as NodeJS.ErrnoException).code === "ENOENT"
+    // A pathname that vanishes during validation remains missing evidence;
+    // after an exact legacy stop, that absence can complete migration.
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
       ? { kind: "missing" }
       : { kind: "unsafe" };
   }
-  if (descriptor !== undefined) {
-    try { closeSync(descriptor); } catch { return { kind: "unsafe" }; }
-  }
-  return evidence;
 }
 
 type LegacyTokenEvidence =
@@ -833,7 +828,11 @@ type LegacyTokenEvidence =
 
 function readLegacyTokenEvidence(path: string): LegacyTokenEvidence {
   try {
-    const token = readRegularFileNoFollow(path).trim();
+    const token = readBoundedRegularFileWithStat(path, {
+      allowedRoot: dirname(path),
+      maxBytes: 4_096,
+      requireSingleLink: true,
+    }).content.trim();
     return token.length === 0 ? { kind: "unsafe" } : { kind: "present", token };
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "ENOENT"
