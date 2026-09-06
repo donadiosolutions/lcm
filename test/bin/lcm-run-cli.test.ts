@@ -6,6 +6,7 @@ import { PrivateMutationLockContentionError } from "../../src/private-mutation-l
 import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 import { createPublicationConvergence } from "../../src/storage/publication-convergence.js";
+import { readBoundedRegularFile } from "../../src/security-files.js";
 
 const FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC =
   "lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.";
@@ -909,6 +910,58 @@ describe("runCli registration and help dispatch", () => {
     expect(rendered).not.toContain("/tmp/private");
     expect(rendered).not.toContain("https://user:password");
     expect(rendered).not.toContain("\\u001b");
+  });
+
+  it("renders the installer snapshot drift throw as one fixed diagnostic", async () => {
+    const installer = await vi.importActual<typeof import("../../installer/install.js")>("../../installer/install.js");
+    const home = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-installer-drift-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    const content = '{"daemon":{}}';
+    actualFs.mkdirSync(root, { mode: 0o700 });
+    actualFs.writeFileSync(configPath, content, { mode: 0o600 });
+    const readSnapshot = vi.fn()
+      .mockReturnValueOnce({
+        content,
+        witness: { presence: "present", rawSha256: "a", byteLength: Buffer.byteLength(content), dev: "1", ino: "2", mtimeMs: 0 },
+      })
+      .mockReturnValueOnce({
+        content,
+        witness: { presence: "present", rawSha256: "b", byteLength: Buffer.byteLength(content), dev: "1", ino: "2", mtimeMs: 0 },
+      });
+    const deps = {
+      spawnSync: vi.fn(),
+      readFileSync: vi.fn(),
+      writeFileSync: vi.fn(),
+      mkdirSync: vi.fn(),
+      existsSync: actualFs.existsSync,
+      promptUser: vi.fn(),
+      ensureLcmHome: vi.fn(),
+      readBoundedRegularFile,
+      _forceLockFreePublicationReadForTesting: true,
+      _readDaemonConfigRawSnapshot: readSnapshot,
+      _assertBackendPublicationConfigReadAccess: vi.fn(() => ({ journalChecksumSha256: null })),
+    } satisfies import("../../installer/install.js").ServiceDeps;
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      let thrown: unknown;
+      try {
+        installer.prepareInstallConfig(deps, configPath);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(BackendPublicationJournalError);
+      expect(readSnapshot).toHaveBeenCalledTimes(2);
+      expect(deps.writeFileSync).not.toHaveBeenCalled();
+      expect(() => handleCliError(thrown)).toThrow("exit:1");
+      expect(diagnostic).toHaveBeenCalledTimes(1);
+      expect(diagnostic).toHaveBeenCalledWith(FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC);
+      const rendered = JSON.stringify(diagnostic.mock.calls);
+      expect(rendered).not.toContain("configuration changed during lock-free publication admission");
+      expect(rendered).not.toContain("BackendPublicationJournalError");
+    } finally {
+      actualFs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("waits for the stdin timeout when a pipe never closes", async () => {

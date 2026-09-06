@@ -2469,8 +2469,19 @@ describe("installer publication admission integration", () => {
         .mockReturnValueOnce(rawSnapshot(sqliteContent, "b")),
     } satisfies ServiceDeps;
     try {
-      expect(() => prepareInstallConfig(baseDeps, configPath))
-        .toThrow("configuration changed during lock-free publication admission");
+      let thrown: unknown;
+      try {
+        prepareInstallConfig(baseDeps, configPath);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(backendPublication.BackendPublicationJournalError);
+      expect(thrown).toMatchObject({
+        reason: "unexpected-state",
+        message: "configuration changed during lock-free publication admission",
+      });
+      expect(baseDeps._readDaemonConfigRawSnapshot).toHaveBeenCalledTimes(2);
+      expect(baseDeps.writeFileSync).not.toHaveBeenCalled();
 
       const postgresContent = '{"storage":{"backend":"postgresql"}}';
       fsWriteFileSync(configPath, postgresContent, { mode: 0o600 });
@@ -2480,6 +2491,52 @@ describe("installer publication admission integration", () => {
         _assertBackendPublicationConfigReadAccess: vi.fn(() => ({ journalChecksumSha256: "journal" })),
       } satisfies ServiceDeps;
       expect(prepareInstallConfig(postgresDeps, configPath)).toEqual({ exists: true, content: postgresContent });
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a lock-free config presence flip with distinct admission witnesses", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-presence-flip-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    const content = '{"daemon":{}}';
+    fsMkdirSync(root, { mode: 0o700 });
+    fsWriteFileSync(configPath, content, { mode: 0o600 });
+    const readSnapshot = vi.fn()
+      .mockReturnValueOnce(absentRawSnapshot())
+      .mockReturnValueOnce(rawSnapshot(content, "present"));
+    const admissions = vi.fn(() => ({ journalChecksumSha256: null }));
+    const deps = {
+      ...makeDeps(),
+      ensureLcmHome: vi.fn(),
+      readBoundedRegularFile,
+      _forceLockFreePublicationReadForTesting: true,
+      _readDaemonConfigRawSnapshot: readSnapshot,
+      _assertBackendPublicationConfigReadAccess: admissions,
+    } satisfies ServiceDeps;
+    try {
+      let thrown: unknown;
+      try {
+        prepareInstallConfig(deps, configPath);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(backendPublication.BackendPublicationJournalError);
+      expect(thrown).toMatchObject({
+        reason: "unexpected-state",
+        message: "configuration changed during lock-free publication admission",
+      });
+      expect(readSnapshot).toHaveBeenCalledTimes(2);
+      expect(admissions).toHaveBeenCalledTimes(2);
+      const admissionWitnesses = admissions.mock.calls.map(([path, backend, witness]) => {
+        expect(path).toBe(configPath);
+        expect(backend).toBe("sqlite");
+        return witness.presence;
+      });
+      expect(admissionWitnesses).toEqual(["absent", "present"]);
+      expect(new Set(admissionWitnesses).size).toBe(2);
+      expect(deps.writeFileSync).not.toHaveBeenCalled();
     } finally {
       fsRmSync(home, { recursive: true, force: true });
     }
@@ -2500,22 +2557,34 @@ describe("installer publication admission integration", () => {
       .mockReturnValueOnce({ journalChecksumSha256: checksums[0] })
       .mockReturnValueOnce({ journalChecksumSha256: checksums[1] });
     const readSnapshot = vi.fn(() => absentRawSnapshot());
-    const inspect = () => prepareInstallConfig({
+    const deps = {
       ...makeDeps(),
       ensureLcmHome: vi.fn(),
       readBoundedRegularFile,
       _forceLockFreePublicationReadForTesting: true,
       _readDaemonConfigRawSnapshot: readSnapshot,
       _assertBackendPublicationConfigReadAccess: admissions,
-    }, configPath);
+    } satisfies ServiceDeps;
+    const inspect = () => prepareInstallConfig(deps, configPath);
     try {
       if (rejects) {
-        expect(inspect).toThrow("configuration changed during lock-free publication admission");
+        let thrown: unknown;
+        try {
+          inspect();
+        } catch (error) {
+          thrown = error;
+        }
+        expect(thrown).toBeInstanceOf(backendPublication.BackendPublicationJournalError);
+        expect(thrown).toMatchObject({
+          reason: "unexpected-state",
+          message: "configuration changed during lock-free publication admission",
+        });
       } else {
         expect(inspect()).toEqual({ exists: false, content: null });
       }
       expect(readSnapshot).toHaveBeenCalledTimes(2);
       expect(admissions).toHaveBeenCalledTimes(2);
+      expect(deps.writeFileSync).not.toHaveBeenCalled();
     } finally {
       fsRmSync(home, { recursive: true, force: true });
     }
@@ -2530,29 +2599,41 @@ describe("installer publication admission integration", () => {
     const admissions: Array<string | null> = [];
     let snapshotCalls = 0;
     let secondChecksum: string | undefined;
+    const deps = {
+      ...makeDeps(),
+      ensureLcmHome: vi.fn(),
+      readBoundedRegularFile,
+      _forceLockFreePublicationReadForTesting: true,
+      _readDaemonConfigRawSnapshot: () => {
+        snapshotCalls += 1;
+        if (snapshotCalls === 2) {
+          secondChecksum = writeAbortedTerminalPublicationJournal(home, "terminal-publication-b");
+        }
+        return absentRawSnapshot();
+      },
+      _assertBackendPublicationConfigReadAccess: (...args: Parameters<typeof backendPublication.assertBackendPublicationConfigReadAccess>) => {
+        const admission = backendPublication.assertBackendPublicationConfigReadAccess(...args);
+        admissions.push(admission.journalChecksumSha256);
+        return admission;
+      },
+    } satisfies ServiceDeps;
     try {
-      expect(() => prepareInstallConfig({
-        ...makeDeps(),
-        ensureLcmHome: vi.fn(),
-        readBoundedRegularFile,
-        _forceLockFreePublicationReadForTesting: true,
-        _readDaemonConfigRawSnapshot: () => {
-          snapshotCalls += 1;
-          if (snapshotCalls === 2) {
-            secondChecksum = writeAbortedTerminalPublicationJournal(home, "terminal-publication-b");
-          }
-          return absentRawSnapshot();
-        },
-        _assertBackendPublicationConfigReadAccess: (...args) => {
-          const admission = backendPublication.assertBackendPublicationConfigReadAccess(...args);
-          admissions.push(admission.journalChecksumSha256);
-          return admission;
-        },
-      }, configPath)).toThrow("configuration changed during lock-free publication admission");
+      let thrown: unknown;
+      try {
+        prepareInstallConfig(deps, configPath);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(backendPublication.BackendPublicationJournalError);
+      expect(thrown).toMatchObject({
+        reason: "unexpected-state",
+        message: "configuration changed during lock-free publication admission",
+      });
       expect(snapshotCalls).toBe(2);
       expect(admissions).toEqual([firstChecksum, secondChecksum]);
       expect(secondChecksum).toBeDefined();
       expect(secondChecksum).not.toBe(firstChecksum);
+      expect(deps.writeFileSync).not.toHaveBeenCalled();
     } finally {
       fsRmSync(home, { recursive: true, force: true });
     }
