@@ -583,6 +583,9 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
+      // #992 keeps pre-initialization SQLite leaf admission and final
+      // opened-identity fencing local-persistence-owned.
+      ["src/db/connection.ts", "unit-local-persistence"],
       ["src/db/database-parent.ts", "unit-local-persistence"],
       ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
