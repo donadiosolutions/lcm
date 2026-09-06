@@ -73,8 +73,10 @@ malformed, policy-rejected, or concurrently replaced project metadata does not
 fail the status request: the JSON response keeps `lastIngest`, `lastCompact`,
 and `lastPromote` as `null`, and the human-readable output omits those null
 timestamps. Policy rejection includes metadata that exceeds 1 MiB or is not a
-single owner-held regular file at the expected project metadata path. Daemon
-details and available project counts are still reported.
+single-link regular file at the expected project metadata path. On platforms
+with a numeric UID, the file must also be owned by the current UID; where UIDs
+are unavailable, that ownership check is skipped. Daemon details and available
+project counts are still reported.
 
 When `--since` is supplied, its value is forwarded to the daemon exactly as
 provided. An empty or whitespace-only value is therefore invalid and returns
