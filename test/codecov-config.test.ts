@@ -97,8 +97,9 @@ const expectedComponents = [
       // Monotonic proxy startup polling remains daemon-core-owned.
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
-      // Error sanitization, including #893 adjacent-path redaction and #925
-      // quoted-apostrophe authority retention, remains daemon-core-owned.
+      // Error sanitization, including #893 adjacent-path, #903 prefixed
+      // nested-file, and #925 quoted-apostrophe authority redaction, remains
+      // daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -216,6 +217,8 @@ const expectedComponents = [
     component_id: "unit-project-worktrees",
     name: "Unit - Projects and Worktrees",
     paths: [
+      // #974 keeps target-parent reconciliation hardening in this
+      // existing component.
       "^src/codex-project-resolution\\.ts$",
       "^src/git-project\\.ts$",
       "^src/machine-identity\\.ts$",
@@ -516,6 +519,8 @@ describe("Codecov configuration", () => {
     // #1003 keeps preliminary metadata admission daemon-core-owned.
     // #947 keeps promote metadata-parent resource handling and fail-closed
     // topology behavior in the existing daemon-routes component.
+    // #948 keeps promote metadata parent-first admission, sampled read binding,
+    // and retained identity revalidation in the daemon-routes component.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     // #814 fresh-root descriptor and pre-handoff content checks remain
     // configuration-security-owned.

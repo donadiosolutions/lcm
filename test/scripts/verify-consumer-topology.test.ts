@@ -634,6 +634,10 @@ describe("consumer package manager boundary", () => {
     const module = await import(scriptPath);
     const scratch = isolatedRoot("verify-managers-");
     const commands: Array<{ command: string; args: string[]; cwd: string; env?: NodeJS.ProcessEnv }> = [];
+    const logs: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((...values: unknown[]) => {
+      logs.push(values.join(" "));
+    });
     try {
       module.executeConsumerTopology(scratch, {
         spawn: (command: string, args: string[], options: { cwd: string; env?: NodeJS.ProcessEnv }) => {
@@ -671,7 +675,10 @@ describe("consumer package manager boundary", () => {
         .toBe(true);
       expect(packageCommands.slice(2).every(({ cwd }) => isStrictDescendant(scratch, cwd))).toBe(true);
       expect(commands.filter(({ command }) => command === process.execPath)).toHaveLength(4);
+      expect(logs).toContainEqual(expect.stringContaining("sdk-express-qs=6.16.0"));
+      expect(logs).toContainEqual(expect.stringContaining("sdk-body-parser-qs=6.16.0"));
     } finally {
+      log.mockRestore();
       rmSync(scratch, { recursive: true, force: true });
     }
   });

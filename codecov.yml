@@ -82,8 +82,9 @@ component_management:
         # Monotonic proxy startup polling remains daemon-core-owned.
         - "^src/daemon/proxy-manager\\.ts$"
         - "^src/daemon/remediation\\.ts$"
-        # Error sanitization, including #893 adjacent-path redaction and #925
-        # quoted-apostrophe authority retention, remains daemon-core-owned.
+        # Error sanitization, including #893 adjacent-path, #903 prefixed
+        # nested-file, and #925 quoted-apostrophe authority redaction, remains
+        # daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -107,6 +108,8 @@ component_management:
         # preserving ordinary best-effort metadata persistence.
         # #947 keeps direct metadata-parent resource exhaustion best-effort
         # while preserving fail-closed topology handling in the route owner.
+        # #948 admits the promote metadata parent before bounded reads, binds a
+        # successful read's sampled parent, and retains failure-path identity.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -220,6 +223,8 @@ component_management:
     - component_id: "unit-project-worktrees"
       name: "Unit - Projects and Worktrees"
       paths:
+        # #974 keeps target-parent reconciliation hardening in this
+        # existing component.
         # #866 export gather and project read preparation remain in this
         # existing component.
         - "^src/codex-project-resolution\\.ts$"

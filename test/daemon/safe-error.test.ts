@@ -593,6 +593,74 @@ describe("sanitizeError", () => {
       'https://outer.test/x?next="file://host\'name/My Files/private.db"',
       'https://outer.test/x?next="file://host\'name<path>"',
     ],
+    [
+      "https://outer.test/x?next=prefix-file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x?next=prefix-file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=[a=b]file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x?q=[a=b]file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=(file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x?q=(file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=1file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x?q=1file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x#q=1file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x#q=1file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=(FiLe://host.invalid/Users/canary/private.db",
+      "https://outer.test/x?q=(FiLe://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=1FILE://HOST.INVALID/Users/canary/private.db",
+      "https://outer.test/x?q=1FILE://HOST.INVALID<path>",
+    ],
+    [
+      "https://outer.test/x?q=1file:///Users/canary/private.db",
+      "https://outer.test/x?q=1file://<path>",
+    ],
+    [
+      "https://outer.test/x?q=1file://localhost/Users/canary/private.db",
+      "https://outer.test/x?q=1file://localhost<path>",
+    ],
+    [
+      "https://outer.test/x?q=1file://[fe80::1%25eth0]/Users/canary/private.db",
+      "https://outer.test/x?q=1file://[fe80::1%25eth0]<path>",
+    ],
+    [
+      "https://outer.test/x?q=1file://host.invalid/C:\\Users\\canary\\private.db",
+      "https://outer.test/x?q=1file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=1'file://host.invalid/Users/canary/My Files/x'",
+      "https://outer.test/x?q=1'file://host.invalid<path>'",
+    ],
+    [
+      "https://outer.test/x?a=1file://one.invalid/Users/canary/one.db&b=(file://two.invalid/Users/canary/two.db",
+      "https://outer.test/x?a=1file://one.invalid<path>&b=(file://two.invalid<path>",
+    ],
+    [
+      "file://outer.invalid/Users/canary/outer.db?q=1file://inner.invalid/Users/canary/inner.db",
+      "file://outer.invalid<path>?q=1file://inner.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=0123456789012345678901234567890123456789012345678901234567890123file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x?q=0123456789012345678901234567890123456789012345678901234567890123file://host.invalid<path>",
+    ],
+    [
+      "https://a.test/x?z=1 then https://outer.test/y?q=(file://host.invalid/Users/canary/private.db",
+      "https://a.test/x?z=1 then https://outer.test/y?q=(file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=1file://host.invalid/Users/canary/private.db https://b.test/y?z=1",
+      "https://outer.test/x?q=1file://host.invalid<path> https://b.test/y?z=1",
+    ],
   ] as const)("redacts nested file URL paths: %#", (input, expected) => {
     const result = sanitizeError(input);
 
@@ -616,6 +684,14 @@ describe("sanitizeError", () => {
     [
       "file://host.invalid#next=profile://remote.invalid/Users/canary/private.db",
       "file://host.invalid#next=profile://remote.invalid/Users/canary/private.db",
+    ],
+    [
+      "file://host.invalid?next=xfile://remote.invalid/Users/canary/private.db",
+      "file://host.invalid?next=xfile://remote.invalid/Users/canary/private.db",
+    ],
+    [
+      "file://host.invalid#next=xfile://remote.invalid/Users/canary/private.db",
+      "file://host.invalid#next=xfile://remote.invalid/Users/canary/private.db",
     ],
     [
       "file://host.invalid?x=https://example.test/p, /Users/canary/private.db",
@@ -820,6 +896,14 @@ describe("sanitizeError", () => {
       "file://host.invalid?next=1file://host.invalid/Users/canary/private.db",
       "file://host.invalid?next=1file://host.invalid<path>",
     ],
+    [
+      "file://outer.invalid?q=prefix-file://host.invalid/Users/canary/private.db",
+      "file://outer.invalid?q=prefix-file://host.invalid<path>",
+    ],
+    [
+      "file://outer.invalid#q=prefix-file://host.invalid/Users/canary/private.db",
+      "file://outer.invalid#q=prefix-file://host.invalid<path>",
+    ],
   ] as const)("redacts newly recognized file URL paths after a pathless reset: %#", (input, expected) => {
     const result = sanitizeError(input);
 
@@ -849,26 +933,10 @@ describe("sanitizeError", () => {
       "https://outer.test/x?next=xfile://remote.invalid/Users/canary/private.db",
     ],
     [
-      "https://outer.test/x?next=prefix-file://host.invalid/Users/canary/private.db",
-      "https://outer.test/x?next=prefix-file://host.invalid/Users/canary/private.db",
-    ],
-    [
       "https://outer.test/x?next=file%3A%2F%2Fhost.invalid%2FUsers%2Fcanary%2Fprivate.db",
       "https://outer.test/x?next=file%3A%2F%2Fhost.invalid%2FUsers%2Fcanary%2Fprivate.db",
     ],
     ["https://outer.test/a/b/c?d=e#f", "https://outer.test/a/b/c?d=e#f"],
-    [
-      "https://outer.test/x?q=[a=b]file://host.invalid/Users/canary/private.db",
-      "https://outer.test/x?q=[a=b]file://host.invalid/Users/canary/private.db",
-    ],
-    [
-      "https://outer.test/x?q=(file://host.invalid/Users/canary/private.db",
-      "https://outer.test/x?q=(file://host.invalid/Users/canary/private.db",
-    ],
-    [
-      "https://outer.test/x?q=1file://host.invalid/Users/canary/private.db",
-      "https://outer.test/x?q=1file://host.invalid/Users/canary/private.db",
-    ],
     [
       "https://outer.test/x/file://host.invalid/Users/canary/private.db",
       "https://outer.test/x/file://host.invalid/Users/canary/private.db",
@@ -895,6 +963,10 @@ describe("sanitizeError", () => {
     [
       "profile://remote.invalid/Users/canary/private.db",
       "profile://remote.invalid/Users/canary/private.db",
+    ],
+    [
+      "prefix-file://host.invalid/Users/canary/private.db",
+      "prefix-file://host.invalid/Users/canary/private.db",
     ],
     ["file://", "file://"],
     ["file://localhost", "file://localhost"],
