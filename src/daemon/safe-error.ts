@@ -41,14 +41,18 @@ function quoteFromCode(code: number): string | undefined {
 
 function isNestedFileUrlStart(chars: readonly string[], index: number): boolean {
   if (!NESTED_FILE_URL_DELIMITERS.has(chars[index])) return false;
+  return isFileUrlLiteral(chars, index + 1);
+}
+
+function isFileUrlLiteral(chars: readonly string[], index: number): boolean {
   return (
-    chars[index + 1]?.toLowerCase() === "f" &&
-    chars[index + 2]?.toLowerCase() === "i" &&
-    chars[index + 3]?.toLowerCase() === "l" &&
-    chars[index + 4]?.toLowerCase() === "e" &&
-    chars[index + 5] === ":" &&
-    chars[index + 6] === "/" &&
-    chars[index + 7] === "/"
+    chars[index]?.toLowerCase() === "f" &&
+    chars[index + 1]?.toLowerCase() === "i" &&
+    chars[index + 2]?.toLowerCase() === "l" &&
+    chars[index + 3]?.toLowerCase() === "e" &&
+    chars[index + 4] === ":" &&
+    chars[index + 5] === "/" &&
+    chars[index + 6] === "/"
   );
 }
 
@@ -65,6 +69,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let foundFilePath = false;
   let filePathBracketDepth = 0;
   let restartedPathlessFile = false;
+  let queryOrFragment = false;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
@@ -78,6 +83,29 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      queryOrFragment = false;
+      continue;
+    }
+    if (separator >= 0 && (char === "?" || char === "#")) queryOrFragment = true;
+    const nestedFileSchemeStart = isNestedFileUrlStart(chars, index)
+      ? index + 1
+      : queryOrFragment &&
+          !URL_SCHEME_START_PATTERN.test(char) &&
+          isFileUrlLiteral(chars, index + 1)
+        ? index + 1
+        : -1;
+    if ((separator >= 0 || restartedPathlessFile) && nestedFileSchemeStart >= 0) {
+      separator = nestedFileSchemeStart + 4;
+      brackets = 0;
+      exactFileScheme = true;
+      foundFilePath = false;
+      filePathBracketDepth = 0;
+      restartedPathlessFile = false;
+      schemeLength = 0;
+      fileSchemeLength = 0;
+      schemeQuote = quoteCode(chars[nestedFileSchemeStart - 1]);
+      authority[nestedFileSchemeStart + 5] = 1;
+      authority[nestedFileSchemeStart + 6] = 1;
       continue;
     }
     if (separator >= 0 && char === "[") {
@@ -91,20 +119,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         filePathBracketDepth = brackets;
         if (chars[index + 1] === "/" || chars[index + 1] === "\\") foundFilePath = false;
       }
-      continue;
-    }
-    if (separator >= 0 && isNestedFileUrlStart(chars, index)) {
-      separator = index + 5;
-      brackets = 0;
-      exactFileScheme = true;
-      foundFilePath = false;
-      filePathBracketDepth = 0;
-      restartedPathlessFile = false;
-      schemeLength = 0;
-      fileSchemeLength = 0;
-      schemeQuote = 0;
-      authority[index + 6] = 1;
-      authority[index + 7] = 1;
       continue;
     }
     if (
@@ -134,6 +148,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       !FILE_URL_AUTHORITY_DELIMITERS.has(char)
     ) {
       restartedPathlessFile = false;
+      queryOrFragment = false;
     }
     // These characters are valid in a file URL authority. Keep classifying
     // until the first path separator, except when one closes a quote that
@@ -153,6 +168,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      queryOrFragment = false;
       continue;
     }
     if (separator >= 0) {
@@ -177,11 +193,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     // this tail without widening backslash detection in unrelated text.
     if (restartedPathlessFile && char === "\\") {
       restartedPathlessFile = false;
+      queryOrFragment = false;
       file[index] = 1;
       continue;
     }
     if (char === ":" && schemeLength > 0 && chars[index + 1] === "/" && chars[index + 2] === "/") {
       restartedPathlessFile = false;
+      queryOrFragment = false;
       separator = index;
       authority[index + 1] = 1;
       authority[index + 2] = 1;
