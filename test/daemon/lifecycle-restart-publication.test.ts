@@ -32,6 +32,8 @@ const publicationFsFault = vi.hoisted(() => ({
   tokenPath: undefined as string | undefined,
   rotateTokenOnSecondOpen: false,
   tokenOpens: 0,
+  uidMismatchPath: undefined as string | undefined,
+  descriptorPaths: new Map<number, string>(),
 }));
 
 const boundedReadCalls = vi.hoisted(() => [] as Array<{
@@ -66,6 +68,16 @@ vi.mock("../../src/security-files.js", async (importOriginal) => {
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
+  const withMismatchedUid = <T extends object>(stat: T): T => new Proxy(stat, {
+    get(target, property) {
+      if (property === "uid") {
+        const uid = Reflect.get(target, property, target) as number | bigint;
+        return typeof uid === "bigint" ? uid + 1n : uid + 1;
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
   return {
     ...actual,
     openSync: (...args: Parameters<typeof actual.openSync>) => {
@@ -77,6 +89,9 @@ vi.mock("node:fs", async (importOriginal) => {
         }
       }
       const descriptor = actual.openSync(...args);
+      if (path === publicationFsFault.uidMismatchPath) {
+        publicationFsFault.descriptorPaths.set(descriptor, path);
+      }
       if (path === publicationFsFault.pidPath) {
         publicationFsFault.pidOpens += 1;
         if (publicationFsFault.replaceStateAfterPidOpen && publicationFsFault.pidOpens === 1) {
@@ -92,6 +107,16 @@ vi.mock("node:fs", async (importOriginal) => {
       }
       return descriptor;
     },
+    fstatSync: (...args: Parameters<typeof actual.fstatSync>) => {
+      const stat = actual.fstatSync(...args);
+      return publicationFsFault.descriptorPaths.has(args[0]) ? withMismatchedUid(stat) : stat;
+    },
+    statSync: (...args: Parameters<typeof actual.statSync>) => {
+      const stat = actual.statSync(...args);
+      return String(args[0]) === publicationFsFault.uidMismatchPath
+        ? withMismatchedUid(stat)
+        : stat;
+    },
   };
 });
 
@@ -106,6 +131,8 @@ afterEach(() => {
   publicationFsFault.tokenPath = undefined;
   publicationFsFault.rotateTokenOnSecondOpen = false;
   publicationFsFault.tokenOpens = 0;
+  publicationFsFault.uidMismatchPath = undefined;
+  publicationFsFault.descriptorPaths.clear();
   boundedReadCalls.splice(0);
   boundedReadFault.afterPath = undefined;
   boundedReadFault.afterRead = undefined;
@@ -1094,6 +1121,121 @@ describe("restart publication assertion convergence", () => {
     }
 
     expect(fetch).toHaveBeenCalledTimes(3);
+    expect(boundedReadCalls).not.toHaveLength(0);
+    expect(boundedReadCalls.every(call => call.options.expectedUid === process.getuid?.())).toBe(true);
+  });
+
+  it.each([
+    ["PID", "pid", 0],
+    ["token", "token", 1],
+  ] as const)("refuses injected production %s descriptor UID mismatch", async (_name, leaf, fetchCalls) => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-950-production-uid-"));
+    roots.push(root);
+    const stateDir = join(root, ".lcm");
+    mkdirSync(stateDir, { mode: 0o700 });
+    const pidPath = join(stateDir, "daemon.pid");
+    const tokenPath = join(stateDir, "daemon.token");
+    writeFileSync(pidPath, "111", { mode: 0o600 });
+    writeFileSync(tokenPath, "production-token", { mode: 0o600 });
+    publicationFsFault.uidMismatchPath = leaf === "pid" ? pidPath : tokenPath;
+    const fetch = vi.fn(async () => response(health(111, "1.0.0", "sqlite")));
+    const ensure = vi.fn();
+    const kill = vi.fn();
+    const contention = new PrivateMutationLockContentionError(`${leaf} UID mismatch`);
+    const originalEntrypoint = process.argv[1];
+    process.argv[1] = "/opt/test-runner.mjs";
+    try {
+      await expect(restartDaemon({
+        port: 43_950,
+        pidFilePath: pidPath,
+        spawnTimeoutMs: 100,
+        expectedEntrypoint: "/opt/lcm.mjs",
+        _fetchOverride: fetch,
+        _isProcessAliveOverride: () => true,
+        _processStartTimeForTesting: () => "birth-111",
+        _readPrivateMutationLockOwnerForTesting: () => null,
+        _killOverride: kill,
+        _ensureDaemonOverride: ensure,
+        _assertBackendPublication: () => { throw contention; },
+      })).rejects.toBe(contention);
+    } finally {
+      process.argv[1] = originalEntrypoint;
+    }
+
+    expect(fetch).toHaveBeenCalledTimes(fetchCalls);
+    expect(ensure).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("preserves an explicitly injected production UID including zero", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-950-explicit-uid-"));
+    roots.push(root);
+    const stateDir = join(root, ".lcm");
+    mkdirSync(stateDir, { mode: 0o700 });
+    const pidPath = join(stateDir, "daemon.pid");
+    writeFileSync(pidPath, "111", { mode: 0o600 });
+    writeFileSync(join(stateDir, "daemon.token"), "production-token", { mode: 0o600 });
+    publicationFsFault.uidMismatchPath = pidPath;
+    const contention = new PrivateMutationLockContentionError("explicit UID contention");
+    const originalEntrypoint = process.argv[1];
+    process.argv[1] = "/opt/test-runner.mjs";
+    try {
+      await expect(restartDaemon({
+        port: 43_950,
+        pidFilePath: pidPath,
+        spawnTimeoutMs: 100,
+        expectedEntrypoint: "/opt/lcm.mjs",
+        _uid: 0,
+        _isProcessAliveOverride: () => true,
+        _processStartTimeForTesting: () => "birth-111",
+        _assertBackendPublication: () => { throw contention; },
+      })).rejects.toBe(contention);
+    } finally {
+      process.argv[1] = originalEntrypoint;
+    }
+
+    expect(boundedReadCalls[0]?.options.expectedUid).toBe(0);
+  });
+
+  it("retains production capture compatibility when process.getuid is unavailable", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-950-no-getuid-"));
+    roots.push(root);
+    const stateDir = join(root, ".lcm");
+    mkdirSync(stateDir, { mode: 0o700 });
+    const pidPath = join(stateDir, "daemon.pid");
+    writeFileSync(pidPath, "111", { mode: 0o600 });
+    writeFileSync(join(stateDir, "daemon.token"), "production-token", { mode: 0o600 });
+    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/stats/pool")) return response({ totalConnections: 0 });
+      return response(init?.headers === undefined
+        ? health(111, "1.0.0", "sqlite")
+        : health(111, "1.0.0", "sqlite", "/opt/lcm.mjs", "a".repeat(64)));
+    });
+    const contention = new PrivateMutationLockContentionError("no getuid contention");
+    const originalEntrypoint = process.argv[1];
+    const getuidDescriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    process.argv[1] = "/opt/test-runner.mjs";
+    Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+    try {
+      await expect(restartDaemon({
+        port: 43_950,
+        pidFilePath: pidPath,
+        spawnTimeoutMs: 100,
+        expectedEntrypoint: "/opt/lcm.mjs",
+        _fetchOverride: fetch,
+        _isProcessAliveOverride: () => true,
+        _processStartTimeForTesting: () => "birth-111",
+        _readPrivateMutationLockOwnerForTesting: () => null,
+        _assertBackendPublication: () => { throw contention; },
+      })).rejects.toBe(contention);
+    } finally {
+      if (getuidDescriptor !== undefined) Object.defineProperty(process, "getuid", getuidDescriptor);
+      process.argv[1] = originalEntrypoint;
+    }
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(boundedReadCalls).not.toHaveLength(0);
+    expect(boundedReadCalls.every(call => call.options.expectedUid === undefined)).toBe(true);
   });
 
   it("treats a missing canonical production token as failed capture", async () => {

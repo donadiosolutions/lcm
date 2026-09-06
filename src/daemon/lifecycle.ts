@@ -1723,6 +1723,7 @@ async function captureLifecyclePublicationEvidence(
   ) return undefined;
 
   const dependencies = resolveLifecycleDependencies(opts);
+  const publicationExpectedUid = dependencies.uid ?? process.getuid?.();
   const now = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
   const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
@@ -1752,7 +1753,7 @@ async function captureLifecyclePublicationEvidence(
   const firstPidEvidence = readPublicationPidEvidence(
     opts.pidFilePath,
     scopedState,
-    dependencies.uid,
+    publicationExpectedUid,
   );
   const pid = publicationPidMatchesMode(firstPidEvidence, mode);
   if (pid === null || !Number.isSafeInteger(pid) || pid <= 0 || !dependencies.isProcessAlive(pid)) {
@@ -1785,7 +1786,7 @@ async function captureLifecyclePublicationEvidence(
     )
   ) return undefined;
 
-  const tokenBefore = readPublicationToken(tokenPath, scopedState, dependencies.uid);
+  const tokenBefore = readPublicationToken(tokenPath, scopedState, publicationExpectedUid);
   if (tokenBefore === null) return undefined;
   const authenticatedHealth = await checkDaemonDiagnostics(
     opts.port,
@@ -1795,7 +1796,7 @@ async function captureLifecyclePublicationEvidence(
     publicHealth,
     publicStorageBackend,
     () => {
-      const token = readPublicationToken(tokenPath, scopedState, dependencies.uid);
+      const token = readPublicationToken(tokenPath, scopedState, publicationExpectedUid);
       return token === tokenBefore ? token : null;
     },
   );
@@ -1825,10 +1826,10 @@ async function captureLifecyclePublicationEvidence(
   const secondPidEvidence = readPublicationPidEvidence(
     opts.pidFilePath,
     scopedState,
-    dependencies.uid,
+    publicationExpectedUid,
   );
   if (!samePublicationPidAuthority(firstPidEvidence, secondPidEvidence, mode, pid)) return undefined;
-  const tokenAfter = readPublicationToken(tokenPath, scopedState, dependencies.uid);
+  const tokenAfter = readPublicationToken(tokenPath, scopedState, publicationExpectedUid);
   const birthAfter = readBirth(pid);
   if (
     tokenAfter !== tokenBefore
@@ -1846,7 +1847,7 @@ async function captureLifecyclePublicationEvidence(
     birth: birthBefore,
     token: tokenBefore,
     readToken: () => {
-      const token = readPublicationToken(tokenPath, scopedState, dependencies.uid);
+      const token = readPublicationToken(tokenPath, scopedState, publicationExpectedUid);
       return token === tokenBefore ? token : null;
     },
     processBirth,
