@@ -39,6 +39,11 @@ const MIGRATION_MANIFEST = [
     filename: "0005_summary_context_integrity.sql",
     sha256: "e16cb52a34bd06c0226e2dcff0273982eea975c394b1d7fa2cf6c8bcab1c2b3f",
   },
+  {
+    id: "0006_transfer_ledger",
+    filename: "0006_transfer_ledger.sql",
+    sha256: "81fed3ac0a6059b6e2a536647a5ab5d8673322b7ba5804a60b068b927367983a",
+  },
 ] as const;
 
 type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
@@ -519,11 +524,117 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       "summary_parents|summary_parents_enforce_dag_integrity",
     ],
   };
+  const transferColumns = [
+    "transfer_runs|run_id",
+    "transfer_runs|target_generation",
+    "transfer_runs|project_id",
+    "transfer_runs|manifest_bytes",
+    "transfer_runs|manifest_sha256",
+    "transfer_runs|schema_sha256",
+    "transfer_runs|project_sha256",
+    "transfer_runs|source_sha256",
+    "transfer_runs|source_witness_sha256",
+    "transfer_runs|state",
+    "transfer_runs|current_domain",
+    "transfer_runs|checkpoint_bytes",
+    "transfer_runs|checkpoint_sha256",
+    "transfer_runs|created_at",
+    "transfer_batches|run_id",
+    "transfer_batches|domain",
+    "transfer_batches|prior_checkpoint_sha256",
+    "transfer_batches|batch_sha256",
+    "transfer_batches|checkpoint_bytes",
+    "transfer_batches|checkpoint_sha256",
+    "transfer_batches|first_ordinal",
+    "transfer_batches|next_ordinal",
+    "transfer_identities|run_id",
+    "transfer_identities|domain",
+    "transfer_identities|identity_sha256",
+    "transfer_identities|ordinal",
+    "transfer_identities|native_key",
+    "transfer_identities|record_sha256",
+  ];
+  const transferTables = [
+    "transfer_runs",
+    "transfer_batches",
+    "transfer_identities",
+  ];
+  const transferLedger: PostgreSqlSchemaSnapshot = {
+    ...summaryContextIntegrity,
+    migrationId: "0006_transfer_ledger",
+    tableIdentities: [...summaryContextIntegrity.tableIdentities, ...transferTables],
+    ordinaryColumnIdentities: [...summaryContextIntegrity.ordinaryColumnIdentities, ...transferColumns],
+    columnAclIdentities: [...summaryContextIntegrity.columnAclIdentities, ...transferColumns],
+    relationAclIdentities: [
+      ...summaryContextIntegrity.relationAclIdentities,
+      ...transferTables.map((name) => `table|${name}`),
+    ],
+    managedObjectIdentities: [
+      ...summaryContextIntegrity.managedObjectIdentities,
+      ...transferTables.map((name) => `table|${name}`),
+    ],
+    indexNames: [
+      ...summaryContextIntegrity.indexNames,
+      "transfer_runs_pkey",
+      "transfer_runs_generation_project_key",
+      "transfer_batches_pkey",
+      "transfer_batches_checkpoint_key",
+      "transfer_identities_pkey",
+      "transfer_identities_ordinal_key",
+    ],
+    constraintIdentities: [
+      ...summaryContextIntegrity.constraintIdentities,
+      "transfer_runs|transfer_runs_run_id_check",
+      "transfer_runs|transfer_runs_target_generation_check",
+      "transfer_runs|transfer_runs_project_id_fkey",
+      "transfer_runs|transfer_runs_manifest_sha256_check",
+      "transfer_runs|transfer_runs_schema_sha256_check",
+      "transfer_runs|transfer_runs_project_sha256_check",
+      "transfer_runs|transfer_runs_source_sha256_check",
+      "transfer_runs|transfer_runs_source_witness_sha256_check",
+      "transfer_runs|transfer_runs_state_check",
+      "transfer_runs|transfer_runs_current_domain_check",
+      "transfer_runs|transfer_runs_checkpoint_sha256_check",
+      "transfer_runs|transfer_runs_generation_project_key",
+      "transfer_runs|transfer_runs_checkpoint_pair",
+      "transfer_runs|transfer_runs_pkey",
+      "transfer_batches|transfer_batches_run_id_fkey",
+      "transfer_batches|transfer_batches_domain_check",
+      "transfer_batches|transfer_batches_prior_checkpoint_sha256_check",
+      "transfer_batches|transfer_batches_batch_sha256_check",
+      "transfer_batches|transfer_batches_checkpoint_sha256_check",
+      "transfer_batches|transfer_batches_first_ordinal_check",
+      "transfer_batches|transfer_batches_next_ordinal_check",
+      "transfer_batches|transfer_batches_checkpoint_key",
+      "transfer_batches|transfer_batches_pkey",
+      "transfer_identities|transfer_identities_run_id_fkey",
+      "transfer_identities|transfer_identities_domain_check",
+      "transfer_identities|transfer_identities_identity_sha256_check",
+      "transfer_identities|transfer_identities_ordinal_check",
+      "transfer_identities|transfer_identities_record_sha256_check",
+      "transfer_identities|transfer_identities_ordinal_key",
+      "transfer_identities|transfer_identities_pkey",
+    ],
+    definitionHashes: {
+      ...summaryContextIntegrity.definitionHashes,
+      index: "368fe168efeefb5d5f0d4aeff12bc82d7c821dbc96be3e4669bb9cc133ef7534",
+      trigger: "ab34552f4ae69dbd972264066f812027f0bdb0d4494f39a909d5c3c1e141484e",
+      constraint: "02cc3b15aae2f0cc9b9de547b6dd0c5d9a1ceff97c2b9387b6d85ef6d4477b23",
+      generatedColumn: "8d9c9ede1e990727ce8612ea7212fe7fe91f53d8dc3fa24f2de378cbbf4f4921",
+      columnAcl: "9ac43f5234bbe3ceca8f6a75b9f62ace547ccbd72ba63da16cd0bb580f235899",
+      identitySequence: "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
+      table: "78d9632759ec8ca03727808dee165201a47ee4ee8e85cff082c8a3f8f182d628",
+      relationAcl: "57f9a963c63a46cbd310f8cc683524b2e710797924c3cb3bf935f5d9bb13afe4",
+      ordinaryColumn: "89dfba418076ede4ffbf90fe7402393dd3958a29f010bb9c947992839812a6b1",
+      rewriteRule: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    },
+  };
   return [
     baseline,
     machineIdentity,
     machineDisplayName,
     summaryContextIntegrity,
+    transferLedger,
   ];
 }
 
@@ -1953,6 +2064,13 @@ export async function runPostgreSqlMigrations(
                      AND (
                        (
                          acl_relations.object_identity OPERATOR(pg_catalog.=)
+                           ANY (ARRAY['table|transfer_runs', 'table|transfer_batches',
+                             'table|transfer_identities']::pg_catalog.text[])
+                         AND privilege.privilege_type OPERATOR(pg_catalog.=)
+                           ANY (ARRAY['SELECT', 'INSERT']::pg_catalog.text[])
+                       )
+                       OR (
+                         acl_relations.object_identity OPERATOR(pg_catalog.=)
                            'table|machines'
                          AND privilege.privilege_type OPERATOR(pg_catalog.=) 'SELECT'
                        )
@@ -2094,6 +2212,53 @@ export async function runPostgreSqlMigrations(
                           AND privilege.is_grantable OPERATOR(pg_catalog.=) false
                           AND (
                             (
+                              privilege.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                              AND (
+                              (relation.relname OPERATOR(pg_catalog.=) 'conversations'
+                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['bootstrapped_at', 'created_at', 'updated_at']::pg_catalog.text[]))
+                              OR
+                              (relation.relname OPERATOR(pg_catalog.=) 'messages'
+                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['created_at']::pg_catalog.text[]))
+                              OR
+                              (relation.relname OPERATOR(pg_catalog.=) 'message_parts'
+                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['part_id', 'is_ignored', 'is_synthetic', 'tool_status', 'tool_error', 'tool_title', 'patch_hash', 'patch_files', 'file_mime', 'file_name', 'file_url', 'subtask_prompt', 'subtask_desc', 'subtask_agent', 'step_reason', 'step_cost', 'step_tokens_in', 'step_tokens_out', 'snapshot_hash', 'compaction_auto']::pg_catalog.text[]))
+                              OR
+                              (relation.relname OPERATOR(pg_catalog.=) 'large_files'
+                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['created_at']::pg_catalog.text[]))
+                              OR
+                              (relation.relname OPERATOR(pg_catalog.=) 'summaries'
+                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['created_at']::pg_catalog.text[]))
+                              OR
+                              (relation.relname OPERATOR(pg_catalog.=) 'context_items'
+                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['created_at']::pg_catalog.text[]))
+                              OR
+                              (relation.relname OPERATOR(pg_catalog.=) 'promoted_memories'
+                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['memory_id', 'created_at', 'archived_at']::pg_catalog.text[]))
+                              OR
+                              (relation.relname OPERATOR(pg_catalog.=) 'recall_surfacing'
+                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['surfaced_at']::pg_catalog.text[]))
+                              OR
+                              (relation.relname OPERATOR(pg_catalog.=) 'session_ingest_log'
+                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['completed_at']::pg_catalog.text[]))
+                              OR
+                              (relation.relname OPERATOR(pg_catalog.=) 'session_instructions'
+                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['updated_at']::pg_catalog.text[]))
+                              OR
+                              (relation.relname OPERATOR(pg_catalog.=) 'ingest_checkpoints'
+                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['last_source_ordinal', 'imported_count', 'skipped_count', 'quarantined_count', 'revision', 'checkpoint', 'updated_at']::pg_catalog.text[]))
+                              OR
+                              (relation.relname OPERATOR(pg_catalog.=) 'passive_event_inbox'
+                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['status', 'received_at', 'next_attempt_at', 'applied_at', 'quarantined_at', 'quarantine_reason']::pg_catalog.text[]))
+                              )
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=) 'transfer_runs'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (ARRAY['state', 'current_domain', 'checkpoint_bytes',
+                                  'checkpoint_sha256']::pg_catalog.text[])
+                              AND privilege.privilege_type OPERATOR(pg_catalog.=) 'UPDATE'
+                            )
+                            OR (
                               relation.relname OPERATOR(pg_catalog.=) 'machines'
                               AND (
                                 (

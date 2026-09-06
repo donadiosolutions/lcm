@@ -191,7 +191,7 @@ async function ingestSessionList(
     if (options.dryRun) {
       if (options.verbose) {
         const replayNote = options.replay ? " (would compact)" : "";
-        console.log(`  [dry-run] ${sessionId}${replayNote}`);
+        console.error(`  [dry-run] ${sessionId}${replayNote}`);
       }
       result.imported++;
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
@@ -208,7 +208,7 @@ async function ingestSessionList(
       });
       if (res.ingested === 0 && res.totalTokens === 0) {
         result.skippedEmpty++;
-        if (options.verbose) console.log(`  \u23ed\ufe0f ${sessionId}: empty or already ingested`);
+        if (options.verbose) console.error(`  \u23ed\ufe0f ${sessionId}: empty or already ingested`);
       } else {
         result.imported++;
         result.totalMessages += res.ingested;
@@ -217,7 +217,7 @@ async function ingestSessionList(
         if (!options.replay) {
           result.totalTokens += res.totalTokens;
         }
-        if (options.verbose) console.log(`  \u2705 ${sessionId}: ${res.ingested} messages (${formatNumber(res.totalTokens)} tokens)`);
+        if (options.verbose) console.error(`  \u2705 ${sessionId}: ${res.ingested} messages (${formatNumber(res.totalTokens)} tokens)`);
       }
 
       // Replay: compact immediately after every session (even already-ingested ones)
@@ -253,31 +253,29 @@ async function ingestSessionList(
             const ctx = hadPrevious ? ' (with prior context)' : '';
             if (typeof compactRes.tokensBefore === 'number' && typeof compactRes.tokensAfter === 'number' && compactRes.tokensAfter < compactRes.tokensBefore) {
               const ratio = formatRatio(compactRes.tokensBefore, compactRes.tokensAfter);
-              console.log(`  \ud83e\udde0 ${sessionId}: ${formatNumber(compactRes.tokensBefore)} \u2192 ${formatNumber(compactRes.tokensAfter)}  (${ratio}\u00d7)${ctx}`);
+              console.error(`  \ud83e\udde0 ${sessionId}: ${formatNumber(compactRes.tokensBefore)} \u2192 ${formatNumber(compactRes.tokensAfter)}  (${ratio}\u00d7)${ctx}`);
             } else {
-              console.log(`  \ud83e\udde0 ${sessionId}: compacted${ctx}`);
+              console.error(`  \ud83e\udde0 ${sessionId}: compacted${ctx}`);
             }
           }
-        } catch (err) {
+        } catch {
           // Non-fatal: import succeeded; compact failure breaks the chain at this link.
           previousSummaries.delete(replayKey);
           // Always warn on chain breakage so users know the DAG is incomplete,
           // regardless of whether --verbose was passed.
-          const message = err instanceof Error ? err.message : "unknown error";
           console.error(
-            `  \u26a0\ufe0f [replay] compact failed for session ${sanitizeTerminalText(sessionId)}: ${sanitizeTerminalText(message)}`,
+            `  \u26a0\ufe0f [replay] compact failed for session ${sanitizeTerminalText(sessionId)}: compaction failed`,
           );
           // Fall back to ingest's totalTokens so they aren't silently lost.
           result.totalTokens += res.totalTokens;
         }
       }
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
-    } catch (err) {
+    } catch {
       result.failed++;
       if (options.replay) previousSummaries.delete(replayKey); // chain broken for this project/client
       if (options.verbose) {
-        const message = err instanceof Error ? err.message : "failed";
-        console.log(`  \u274c ${sanitizeTerminalText(sessionId)}: ${sanitizeTerminalText(message)}`);
+        console.error(`  \u274c ${sanitizeTerminalText(sessionId)}: ingest failed`);
       }
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
     }
@@ -393,7 +391,7 @@ export async function importSessions(
         if (resolution.status === "ambiguous") result.ambiguous! += 1;
         else result.unresolved! += 1;
         if (options.verbose) {
-          console.log(`  \u23ed\ufe0f ${session.sessionId}: ${resolution.reason}`);
+          console.error(`  \u23ed\ufe0f ${session.sessionId}: ${resolution.reason}`);
         }
         continue;
       }

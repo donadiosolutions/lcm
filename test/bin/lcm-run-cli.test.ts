@@ -46,7 +46,7 @@ const state = vi.hoisted(() => ({
   installResult: { path: "/connector", requiresRestart: false } as Record<string, unknown>,
   removeResult: true,
   batchResult: { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/project"] },
-  importResult: { imported: 1, skipped: 0 },
+  importResult: { imported: 1, skipped: 0, failed: 0 },
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
   provider: "openai",
   authToken: "test-token" as string | null,
@@ -73,6 +73,9 @@ const state = vi.hoisted(() => ({
   packageVersion: "1.4.0" as unknown,
   packageFileReads: 0,
   storageBackend: "sqlite" as "sqlite" | "postgresql",
+  publicationAllowed: false,
+  cliProjects: [] as Array<{ id: string; canonical: string; aliases: string[] }>,
+  listCliProjects: vi.fn(async () => state.cliProjects),
   packagedRuntimeEntrypoint: "/daemon" as string | undefined,
   runtimeDigest: "runtime" as string | undefined,
   provisionResult: {
@@ -151,7 +154,7 @@ vi.mock("../../src/storage/backend-publication.js", async importOriginal => {
   return {
     ...actual,
     assertBackendPublicationConsumerAccess: vi.fn(({ backend }: { readonly backend?: string }) => {
-      if (backend === "postgresql") {
+      if (backend === "postgresql" && !state.publicationAllowed) {
         throw new actual.BackendPublicationJournalError(
           "publication-evidence-missing",
           "test publication admission blocked",
@@ -289,6 +292,7 @@ vi.mock("../../src/portable-knowledge.js", () => ({
   exportKnowledge: vi.fn(async () => { if (state.exportError) throw state.exportError; return state.portableResult; }),
   importKnowledge: vi.fn(async () => { if (state.importKnowledgeError) throw state.importKnowledgeError; return state.portableResult; }),
 }));
+vi.mock("../../src/cli-storage.js", () => ({ listCliProjects: state.listCliProjects }));
 vi.mock("../../src/worktree-reconciliation.js", () => ({
   reconcileWorktrees: state.reconcileWorktrees,
 }));
@@ -381,6 +385,7 @@ beforeEach(() => {
   state.configSetError = undefined;
   state.exportError = undefined;
   state.importKnowledgeError = undefined;
+  state.importResult = { imported: 1, skipped: 0, failed: 0 };
   state.portableResult = { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false };
   state.daemonPort = 3737;
   state.batchProgressLast = true;
@@ -392,6 +397,10 @@ beforeEach(() => {
   state.runtimePidPath = "/lcm/daemon.pid";
   state.runtimeTokenPath = "/lcm/daemon.token";
   state.storageBackend = "sqlite";
+  state.publicationAllowed = false;
+  state.cliProjects = [];
+  state.listCliProjects.mockReset();
+  state.listCliProjects.mockImplementation(async () => state.cliProjects);
   state.packagedRuntimeEntrypoint = "/daemon";
   state.runtimeDigest = "runtime";
   state.provisionResult = {
@@ -654,7 +663,7 @@ describe("runCli registration and help dispatch", () => {
     const convergence = makeTestConvergence();
     state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
     const portable = await import("../../src/portable-knowledge.js");
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     await invoke(["export", "--output", "out.json"]);
 
@@ -671,6 +680,7 @@ describe("runCli registration and help dispatch", () => {
     state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
     state.entries = [{ name: "project", isDirectory: () => true }];
     state.fileText = JSON.stringify({ cwd: "/project" });
+    state.cliProjects = [{ id: "project", canonical: "/project", aliases: [] }];
     const portable = await import("../../src/portable-knowledge.js");
 
     await invoke(["export", "--all"]);
@@ -694,6 +704,7 @@ describe("runCli registration and help dispatch", () => {
       state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
       state.entries = [{ name: "project", isDirectory: () => true }];
       state.fileText = JSON.stringify({ cwd: "/project" });
+      state.cliProjects = [{ id: "project", canonical: "/project", aliases: [] }];
       state.exportError = failure;
       const portable = await import("../../src/portable-knowledge.js");
       const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
@@ -715,12 +726,13 @@ describe("runCli registration and help dispatch", () => {
       expect(stderr).not.toHaveBeenCalled();
     });
 
-    it("fails reconciliation before exporting or claiming a total", async () => {
+    it("fails binding enumeration before exporting or claiming a total", async () => {
       const failure = makeError();
       state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
       state.entries = [{ name: "project", isDirectory: () => true }];
       state.fileText = JSON.stringify({ cwd: "/project" });
-      state.reconcileWorktrees.mockImplementation(() => { throw failure; });
+      state.cliProjects = [{ id: "project", canonical: "/project", aliases: [] }];
+      state.listCliProjects.mockRejectedValue(failure);
       const portable = await import("../../src/portable-knowledge.js");
       const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
       const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
@@ -734,14 +746,14 @@ describe("runCli registration and help dispatch", () => {
           failure instanceof BackendPublicationJournalError
             ? FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC : failure.message,
         );
-        expect(state.reconcileWorktrees.mock.calls.length).toBe(
+        expect(state.listCliProjects.mock.calls.length).toBe(
           failure instanceof PrivateMutationLockContentionError ? 40 : 1,
         );
         expect(portable.exportKnowledge).not.toHaveBeenCalled();
         expect(log).not.toHaveBeenCalled();
         expect(stderr).not.toHaveBeenCalled();
       } finally {
-        state.reconcileWorktrees.mockImplementation(path => ({ targetHash: path, canonical: path }));
+        state.listCliProjects.mockImplementation(async () => state.cliProjects);
       }
     });
 
@@ -753,9 +765,10 @@ describe("runCli registration and help dispatch", () => {
         { name: "second", isDirectory: () => true },
       ];
       state.fileText = JSON.stringify({ cwd: "/candidate" });
-      state.reconcileWorktrees
-        .mockReturnValueOnce({ targetHash: "first", canonical: "/first" })
-        .mockReturnValueOnce({ targetHash: "second", canonical: "/second" });
+      state.cliProjects = [
+        { id: "first", canonical: "/first", aliases: [] },
+        { id: "second", canonical: "/second", aliases: [] },
+      ];
       const portable = await import("../../src/portable-knowledge.js");
       vi.mocked(portable.exportKnowledge)
         .mockResolvedValueOnce(state.portableResult)
@@ -767,9 +780,10 @@ describe("runCli registration and help dispatch", () => {
 
       expect(result).toBe(failure);
       expect(() => handleCliError(result)).toThrow("exit:1");
-      expect(diagnostic).toHaveBeenCalledOnce();
+      expect(diagnostic).toHaveBeenCalledTimes(2);
       expect(portable.exportKnowledge).toHaveBeenCalledTimes(2);
-      expect(log).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("/first: 1 entries"));
+      expect(diagnostic).toHaveBeenCalledWith(expect.stringContaining("/first: 1 entries"));
+      expect(log).not.toHaveBeenCalled();
     });
   });
 
@@ -876,7 +890,7 @@ describe("runCli registration and help dispatch", () => {
     expect(() => writeCliOutput("out")).not.toThrow();
     expect(() => writeCliError("err")).not.toThrow();
     expect(consoleError).toHaveBeenCalledTimes(4);
-    expect(consoleError).toHaveBeenNthCalledWith(1, genericError);
+    expect(consoleError).toHaveBeenNthCalledWith(1, "LCM command failed. Check the command inputs and selected storage configuration.");
     expect(consoleError).toHaveBeenNthCalledWith(2, configError.message);
     expect(consoleError).toHaveBeenNthCalledWith(3, backendError.message);
     expect(consoleError).toHaveBeenNthCalledWith(4, contentionError.message);
@@ -891,6 +905,22 @@ describe("runCli registration and help dispatch", () => {
     expect(runner).not.toHaveBeenCalled();
     runMainIfInvoked("/missing/lcm.js", "/missing/lcm.js", runner);
     expect(runner).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    new Error("postgresql://SECRET_CANARY:password@host/db SELECT private_rows", {
+      cause: new Error("SECRET_CANARY nested driver error"),
+    }),
+    { message: "SECRET_CANARY", sql: "SELECT private_rows", connection: "postgresql://SECRET_CANARY" },
+    "SECRET_CANARY untyped failure",
+  ])("sanitizes arbitrary top-level failure %# without emitting driver details", failure => {
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    expect(() => handleCliError(failure)).toThrow("exit:1");
+    expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
+      "LCM command failed. Check the command inputs and selected storage configuration.",
+    );
+    expect(stdout).not.toHaveBeenCalled();
   });
 
   it("routes executable failures to the supplied top-level handler", async () => {
@@ -1514,7 +1544,7 @@ describe("runCli daemon-backed and utility actions", () => {
     state.storageBackend = "postgresql";
     state.authToken = null;
 
-    await expect(runCli(["node", "lcm", ...args])).rejects.toBeInstanceOf(BackendPublicationJournalError);
+    await expect(runCli(["node", "lcm", ...args])).rejects.toBeInstanceOf(args[0] === "stats" ? StorageBackendUnavailableError : BackendPublicationJournalError);
     expect(state.ensureDaemon).not.toHaveBeenCalled();
     expect(state.health).not.toHaveBeenCalled();
     expect(state.get).not.toHaveBeenCalled();
@@ -1711,7 +1741,7 @@ describe("runCli orchestration actions", () => {
 
   it("validates and imports portable knowledge", async () => {
     state.fileText = JSON.stringify({ version: 1, entries: [{ id: "one" }] });
-    expect((await invoke(["import-knowledge", "input.json", "--dry-run"]))?.message).toBe("exit:0");
+    expect(await invoke(["import-knowledge", "input.json", "--dry-run"])).toBeUndefined();
     expect(await invoke(["import-knowledge", "input.json", "--confidence", "0.5"])).toBeUndefined();
   });
 
@@ -2661,12 +2691,13 @@ describe("runCli failure and alternate presentation branches", () => {
     expect((await invoke(["import-knowledge", "x"]))?.message).toBe("exit:1");
   });
 
-  it("walks metadata-backed projects for compact, import, promote, and export", async () => {
+  it("exports authenticated bindings without reconciling metadata-backed projects", async () => {
     state.entries = [
       { name: "file", isDirectory: () => false },
       { name: "project", isDirectory: () => true },
     ];
     state.fileText = JSON.stringify({ cwd: "/project" });
+    state.cliProjects = [{ id: "project", canonical: "/project", aliases: [] }];
     state.post
       .mockResolvedValueOnce({ processed: 2, promoted: 2 })
       .mockResolvedValueOnce({ processed: 2, promoted: 2, conversations: 2, errors: 0, skipped: 0 });
@@ -2676,76 +2707,51 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(await invoke(["promote", "--all", "--verbose", "--dry-run"])).toBeUndefined();
     expect(state.reconcileWorktrees).not.toHaveBeenCalled();
     expect(await invoke(["export", "--all"])).toBeUndefined();
-    expect(state.reconcileWorktrees).toHaveBeenCalledOnce();
-    expect(state.reconcileWorktrees).toHaveBeenCalledWith("/project");
+    expect(state.listCliProjects).toHaveBeenCalledOnce();
+    expect(state.reconcileWorktrees).not.toHaveBeenCalled();
   });
 
-  it("deduplicates export-all candidates by their reconciled project identity", async () => {
+  it("exports each canonical binding once despite multiple aliases", async () => {
     const portable = await import("../../src/portable-knowledge.js");
-    state.entries = [
-      { name: "canonical", isDirectory: () => true },
-      { name: "legacy", isDirectory: () => true },
-    ];
-    state.fileText = JSON.stringify({ cwd: "/linked-worktree" });
-    state.reconcileWorktrees.mockReturnValue({
-      targetHash: "canonical-hash",
-      canonical: "/primary",
-    });
-
+    state.cliProjects = [{ id: "canonical", canonical: "/primary", aliases: ["/primary", "/linked-worktree"] }];
     expect(await invoke(["export", "--all"])).toBeUndefined();
-
-    expect(state.reconcileWorktrees).toHaveBeenCalledTimes(2);
-    expect(portable.exportKnowledge).toHaveBeenCalledOnce();
-    expect(portable.exportKnowledge).toHaveBeenCalledWith(
-      "/primary",
-      expect.objectContaining({ output: expect.stringContaining("lcm-export-") }),
+    expect(state.reconcileWorktrees).not.toHaveBeenCalled();
+    expect(portable.exportKnowledge).toHaveBeenCalledExactlyOnceWith(
+      "/primary", expect.objectContaining({ output: expect.stringContaining("lcm-export-") }),
     );
   });
 
-  it("warns and skips export-all candidates that cannot be reconciled", async () => {
-    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
-    state.entries = [
-      { name: "error", isDirectory: () => true },
-      { name: "primitive", isDirectory: () => true },
-    ];
-    state.fileText = JSON.stringify({ cwd: "/unavailable" });
-    state.reconcileWorktrees
-      .mockImplementationOnce(() => { throw new Error("map changed"); })
-      .mockImplementationOnce(() => { throw "source vanished"; });
-
-    expect(await invoke(["export", "--all"])).toBeUndefined();
-
-    expect(state.reconcileWorktrees).toHaveBeenCalledTimes(2);
-    expect(stderr).toHaveBeenCalledWith(
-      "  Warning: could not reconcile /unavailable: map changed\n",
-    );
-    expect(stderr).toHaveBeenCalledWith(
-      "  Warning: could not reconcile /unavailable: source vanished\n",
-    );
+  it("fails binding discovery instead of silently skipping unavailable projects", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    state.listCliProjects.mockRejectedValue(new Error("map changed"));
+    expect(await invoke(["export", "--all"])).toBeInstanceOf(Error);
+    expect(portable.exportKnowledge).not.toHaveBeenCalled();
+    expect(state.reconcileWorktrees).not.toHaveBeenCalled();
   });
 
-  it("keeps ordinary export failures as per-project warnings", async () => {
-    state.exportError = new Error("export failed");
-    state.entries = [{ name: "project", isDirectory: () => true }];
-    state.fileText = JSON.stringify({ cwd: "/project" });
+  it("marks ordinary export-all failures unsuccessful with a sanitized diagnostic", async () => {
+    state.exportError = new Error("SECRET_CANARY export failed");
+    state.cliProjects = [{ id: "project", canonical: "/project", aliases: [] }];
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
-
-    expect(await invoke(["export", "--all"])).toBeUndefined();
-
-    expect(stderr).toHaveBeenCalledExactlyOnceWith("  Warning: export failed\n");
-    expect(log).toHaveBeenCalledExactlyOnceWith("\n  Total: 0 entries exported");
+    expect((await invoke(["export", "--all"]))?.message).toBe("exit:1");
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("Export failed"));
+    expect(stderr.mock.calls.flat().join(" ")).not.toContain("SECRET_CANARY");
+    expect(log).not.toHaveBeenCalled();
   });
 
   it("renders TTY summaries for compact and import", async () => {
-    const descriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+    const descriptor = Object.getOwnPropertyDescriptor(process.stderr, "isTTY");
+    Object.defineProperty(process.stderr, "isTTY", { configurable: true, value: true });
     try {
       expect(await invoke(["compact", "--no-promote"])).toBeUndefined();
       expect(await invoke(["import"])).toBeUndefined();
+      const summary = await import("../../src/import-summary.js");
+      expect(summary.printCodexResolutionSummary).toHaveBeenCalledWith(state.importResult, console.error);
+      expect(summary.printImportSummary).not.toHaveBeenCalled();
     } finally {
-      if (descriptor) Object.defineProperty(process.stdout, "isTTY", descriptor);
-      else Reflect.deleteProperty(process.stdout, "isTTY");
+      if (descriptor) Object.defineProperty(process.stderr, "isTTY", descriptor);
+      else Reflect.deleteProperty(process.stderr, "isTTY");
     }
   });
 
@@ -2765,7 +2771,7 @@ describe("runCli failure and alternate presentation branches", () => {
     state.post.mockRejectedValueOnce("promote failed");
     expect(await invoke(["promote", "--verbose"])).toBeUndefined();
     state.exportError = new Error("export failed");
-    expect(await invoke(["export"])).toBeUndefined();
+    expect((await invoke(["export"]))?.message).toBe("exit:1");
   });
 
   it("retries automatic promotion once after daemon transport recovery with a fresh client", async () => {
@@ -2933,5 +2939,140 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(await invoke(["promote", "--verbose"])).toBeUndefined();
     state.post.mockRejectedValueOnce(new Error("failed"));
     expect(await invoke(["promote"])).toBeUndefined();
+  });
+});
+
+describe("selected-backend operational CLI acceptance", () => {
+  it("routes configured PostgreSQL search to the matching daemon", async () => {
+    state.storageBackend = "postgresql";
+    state.publicationAllowed = true;
+    state.health.mockResolvedValue({ status: "ok", storageBackend: "postgresql" });
+    expect(await invoke(["search", "selected backend"])).toBeUndefined();
+    expect(state.ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({ expectedStorageBackend: "postgresql" }));
+    expect(state.post).toHaveBeenCalledWith("/search", expect.objectContaining({ query: "selected backend" }));
+  });
+
+  it("fails unavailable selected PostgreSQL daemon without a SQLite retry", async () => {
+    state.storageBackend = "postgresql";
+    state.publicationAllowed = true;
+    state.health.mockResolvedValue({ status: "ok", storageBackend: "postgresql" });
+    state.ensureDaemon.mockResolvedValue({ connected: false, spawned: false, restartedForParent: false, pid: undefined });
+    expect((await invoke(["search", "selected backend"]))?.message).toBe("exit:1");
+    expect(state.ensureDaemon).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ expectedStorageBackend: "postgresql" }));
+    expect(state.post).not.toHaveBeenCalled();
+  });
+
+  it("keeps PostgreSQL pool stats disabled before daemon activity", async () => {
+    state.authToken = null;
+    state.storageBackend = "postgresql";
+    state.publicationAllowed = true;
+    expect(await invoke(["stats", "--pool"])).toBeInstanceOf(StorageBackendUnavailableError);
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.health).not.toHaveBeenCalled();
+    expect(state.get).not.toHaveBeenCalled();
+  });
+
+  it("dispatches PostgreSQL knowledge transfer for authenticated canonical bindings", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    state.storageBackend = "postgresql";
+    state.publicationAllowed = true;
+    state.cliProjects = [{ id: "remote-id", canonical: "/bound/project", aliases: ["/bound/worktree"] }];
+    state.fileText = JSON.stringify({ version: 1, entries: [] });
+    expect(await invoke(["export", "--all"])).toBeUndefined();
+    expect(portable.exportKnowledge).toHaveBeenCalledWith("/bound/project", expect.any(Object));
+    expect(await invoke(["import-knowledge", "input.json"])).toBeUndefined();
+    expect(portable.importKnowledge).toHaveBeenCalledOnce();
+    expect(state.reconcileWorktrees).not.toHaveBeenCalled();
+  });
+
+  it("returns failure if native transcript import has any failed source", async () => {
+    state.importResult = { imported: 1, skipped: 0, failed: 1 };
+    expect((await invoke(["import"]))?.message).toBe("exit:1");
+  });
+
+  it("keeps successful knowledge import status on stderr", async () => {
+    state.fileText = JSON.stringify({ version: 1, entries: [] });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    expect(await invoke(["import-knowledge", "input.json"])).toBeUndefined();
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("Imported 1 entries"));
+    expect(stdout).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it("sanitizes knowledge input read failures", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    state.readError = new Error("SECRET_CANARY private input path");
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect((await invoke(["import-knowledge", "input.json"]))?.message).toBe("exit:1");
+    expect(error).toHaveBeenCalled();
+    expect(error.mock.calls.flat().join(" ")).not.toContain("SECRET_CANARY");
+    expect(portable.importKnowledge).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite colliding project slugs and fails a partial export", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    state.cliProjects = [
+      { id: "first", canonical: "/same-name", aliases: [] },
+      { id: "second", canonical: "/same/name", aliases: [] },
+      { id: "third", canonical: "/third", aliases: [] },
+    ];
+    vi.mocked(portable.exportKnowledge)
+      .mockResolvedValueOnce(state.portableResult)
+      .mockRejectedValueOnce(new Error("SECRET_CANARY unavailable"))
+      .mockResolvedValueOnce(state.portableResult);
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    expect((await invoke(["export", "--all"]))?.message).toBe("exit:1");
+    expect(portable.exportKnowledge).toHaveBeenCalledTimes(3);
+    const outputs = vi.mocked(portable.exportKnowledge).mock.calls.map(call => call[1]?.output);
+    expect(outputs.every(output => typeof output === "string" && output.endsWith(".json"))).toBe(true);
+    expect(new Set(outputs).size).toBe(3);
+    expect([...stderr.mock.calls, ...error.mock.calls].flat().join(" ")).not.toContain("SECRET_CANARY");
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("Total: 2 entries exported"));
+    expect(stdout).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it("validates dry-run knowledge through the importer before claiming success", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    state.fileText = JSON.stringify({ version: 1, entries: [{ id: "bad" }] });
+    state.importKnowledgeError = new Error("SECRET_CANARY rejected document");
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    expect((await invoke(["import-knowledge", "input.json", "--dry-run"]))?.message).toBe("exit:1");
+    expect(portable.importKnowledge).toHaveBeenCalledWith(expect.any(String), expect.any(Object), expect.objectContaining({ dryRun: true }));
+    expect(error.mock.calls.flat().join(" ")).not.toContain("SECRET_CANARY");
+    expect(stdout).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it("refuses a shared output file for all projects before any export", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    const result = await invoke(["export", "--all", "--output", "shared.json"]);
+    expect(result?.message === "exit:1" || process.exitCode === 1).toBe(true);
+    expect(portable.exportKnowledge).not.toHaveBeenCalled();
+    expect(state.listCliProjects).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("reports sanitized export failure with nonzero status, all=%s", async all => {
+    state.cliProjects = [{ id: "one", canonical: "/project", aliases: [] }];
+    state.entries = [{ name: "project", isDirectory: () => true }];
+    state.fileText = JSON.stringify({ cwd: "/project" });
+    state.cliProjects = [{ id: "project", canonical: "/project", aliases: [] }];
+    state.exportError = new Error("SECRET_CANARY postgresql://user:password@host/db");
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const result = await invoke(all ? ["export", "--all"] : ["export"]);
+    expect(result?.message === "exit:1" || process.exitCode === 1).toBe(true);
+    expect([...stderr.mock.calls, ...error.mock.calls].flat().join(" ")).not.toContain("SECRET_CANARY");
+    expect(stdout).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
   });
 });

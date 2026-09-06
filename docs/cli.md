@@ -16,6 +16,35 @@ lcm project link --help
 lcm connectors install --help
 ```
 
+Storage-backed commands use the backend selected in the authenticated LCM
+configuration. SQLite remains the default. With `storage.backend` set to
+`postgresql`, reads, writes, native session import, compaction, and promoted
+knowledge transfer use that PostgreSQL database. Each selected project must
+already be linked to a registered remote project and the local machine must
+be registered. Missing bindings or database failures stop the operation;
+commands never fall back to a local SQLite database. Backend selection applies
+to the configured home and daemon, rather than individual projects.
+
+`lcm export --all` and `lcm compact --all` enumerate authenticated locally known
+project paths and bindings, including bindings that have no SQLite database or
+`meta.json`. Aliases of the same selected project are processed once. This does
+not enumerate every project hosted by the PostgreSQL server. An unbound local
+project requires `lcm project create` or `lcm project link <project-id>` before
+it can be selected with PostgreSQL.
+
+`lcm export` without `--output` writes only the version-1 promoted-knowledge
+JSON document to stdout. Progress and status messages go to stderr. With
+`--all`, one file is written per project using a path-derived unique suffix;
+`--all --output <file>` is rejected because one file cannot represent multiple
+project exports. Any project failure makes the command exit with status 1,
+including partial exports; files already completed remain available. Successful
+commands exit with status 0. Native session import also exits with status 1
+when any session fails.
+
+`lcm sensitive purge` currently refuses PostgreSQL explicitly before deleting
+local data. Local statistics and `stats --pool` retain an explicit PostgreSQL
+refusal until the backend-aware diagnostics increment is installed.
+
 Connector installation manages one complete transport bundle per agent:
 
 ```bash
@@ -108,7 +137,7 @@ lock-acquisition callback is preserved only if that callback admitted at least
 one retry; otherwise, the current contention is reported. Exhausted or
 rejected export admission exits unsuccessfully, including with `--output` or
 `--all`. An `--all` export may have already written earlier projects when a
-later project fails; those outputs remain, and no successful total is printed.
+later project fails; those outputs remain, and the command exits with status 1.
 
 The local `lcm stats` project-database scan authenticates the LCM state root,
 the `projects` directory, and each project directory as owner-held directories
@@ -326,11 +355,11 @@ error. `--dry-run` never writes metadata. On platforms with a POSIX UID, the
 existing metadata file must be owned by the current UID; where UIDs are
 unavailable, that ownership check is skipped.
 
-`lcm compact --all` reports each SQLite project that it cannot open, migrate, or
+`lcm compact --all` reports each selected project that it cannot open, prepare, or
 scan as a failure in the Compact phase while continuing with readable projects.
 These failures produce a nonzero exit status and are not reported as “Nothing to
 compact.” A failed scan does not mark any session as processed. Back up the
-reported project database, resolve the SQLite or schema error, and rerun the
+reported project database, resolve its storage or schema error, and rerun the
 command; the still-eligible sessions will be discovered again.
 
 ### Managed-daemon recovery
@@ -459,7 +488,13 @@ sequential. Compacted projects are promoted in deterministic discovery order.
 
 `--dry-run` validates configuration and discovery, but does not start the
 daemon, register an invocation lease, dispatch compact/provider work, write
-summaries, or promote anything.
+summaries, or promote anything. SQLite preview discovery opens only existing
+authenticated database files and does not run schema migrations or change
+`PRAGMA user_version`. A missing database is not created. A schema that cannot
+be read is reported as a discovery failure. Unresolved legacy worktree identities
+with a separate database are refused explicitly; preview never merges or
+removes that data. Resolve the normal worktree reconciliation first, or use the
+recovery/migration owner when native archive facts require it.
 
 Every non-hook manual compact is bound to an authenticated daemon invocation.
 The lease is refreshed while work runs. A heartbeat failure, transport

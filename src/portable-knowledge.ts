@@ -13,28 +13,14 @@
  * Deduplication is performed on import via deduplicateAndInsert().
  */
 
-import { existsSync, writeFileSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
-
-import { parsePromotedTags, PromotedStore } from "./db/promoted.js";
-import { runLcmMigrations } from "./db/migration.js";
+import { serializePromotedMetadata } from "./db/promoted.js";
 import { deduplicateAndInsert } from "./promotion/dedup.js";
 import { ScrubEngine } from "./scrub.js";
-import { getLcmConnection, closeLcmConnection } from "./db/connection.js";
-import { lcmHomeDir } from "./runtime-paths.js";
-import { resolveProjectIdentity } from "./project-map.js";
-import { loadDaemonConfig } from "./daemon/config.js";
-import { configPath } from "./runtime-paths.js";
-import { selectStorageBackendForConfig } from "./storage/backend.js";
-import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
-import {
-  withPublicationAdmissionRetry,
-  type PublicationConvergence,
-} from "./storage/publication-convergence.js";
-import { atomicWritePrivateFileExclusive } from "./security-files.js";
+import { withCliProjectStorage } from "./cli-storage.js";
+import type { JsonObject, ProjectStorage } from "./storage/contracts.js";
+import type { PublicationConvergence } from "./storage/publication-convergence.js";
 
 export const EXPORT_VERSION = 1;
 
@@ -51,37 +37,6 @@ export interface ExportDocument {
   exportedAt: string;
   projectCwd: string;
   entries: ExportEntry[];
-}
-
-// ─── Internal helpers (accept optional baseDir for testing) ──────────────────
-
-function canonicalizeCwd(cwd: string): string {
-  try { return realpathSync(cwd); } catch { return cwd; }
-}
-
-function resolveProjectId(cwd: string): string {
-  return createHash("sha256").update(canonicalizeCwd(cwd)).digest("hex");
-}
-
-function resolveProjectDir(cwd: string, baseDir: string): string {
-  return join(baseDir, "projects", resolveProjectId(cwd));
-}
-
-function defaultBaseDir(): string {
-  return lcmHomeDir();
-}
-
-function resolvePortableProject(cwd: string, baseDir: string): { id: string; canonical: string; dir: string; dbPath: string } {
-  if (baseDir === defaultBaseDir()) {
-    ensureWorktreeProjectReconciled(cwd);
-    const identity = resolveProjectIdentity(cwd);
-    const dir = join(baseDir, "projects", identity.id);
-    return { id: identity.id, canonical: identity.canonical, dir, dbPath: join(dir, "db.sqlite") };
-  }
-  const canonical = canonicalizeCwd(cwd);
-  const id = resolveProjectId(cwd);
-  const dir = resolveProjectDir(cwd, baseDir);
-  return { id, canonical, dir, dbPath: join(dir, "db.sqlite") };
 }
 
 // ─── Export ──────────────────────────────────────────────────────────────────
@@ -119,61 +74,36 @@ async function gatherExport(
   cwd: string,
   opts: ExportOptions,
 ): Promise<GatheredExport> {
-  const configFile = configPath();
-  const config = loadDaemonConfig(configFile);
-  selectStorageBackendForConfig(configFile, config.storage);
-  const baseDir = opts._lcmBaseDir ?? defaultBaseDir();
-  const project = resolvePortableProject(cwd, baseDir);
-  const dbPath = project.dbPath;
-
-  if (!existsSync(dbPath)) {
-    throw new Error(`No Long Context Manager (LCM) database found for project: ${cwd}`);
-  }
-
-  const db = getLcmConnection(dbPath);
-  let entries: ExportEntry[];
-  try {
-    runLcmMigrations(db);
-
-    const store = new PromotedStore(db);
-    const rows = store.getAll({
-      projectId: project.id,
+  return withCliProjectStorage(cwd, {
+    create: false,
+    _lcmBaseDir: opts._lcmBaseDir,
+    _publicationConvergence: opts._publicationConvergence,
+  }, async ({ storage, project, config }) => {
+    const rows = await storage.promotedMemory.getAll({
+      sourceProjectId: project.id,
       since: opts.since,
       tags: opts.tags,
     });
-
-    let scrubber: ScrubEngine | null = null;
-    if (!opts.skipScrub) {
-      const globalPatterns = opts._globalPatterns
-        ?? config.security.sensitivePatterns;
-      scrubber = await ScrubEngine.forProject(globalPatterns, project.dir);
-    }
-
-    entries = rows.map((r) => {
-      let content = r.content;
-      if (scrubber) content = scrubber.scrub(content);
-      return {
-        content,
-        tags: parsePromotedTags(r.tags).map((tag) => scrubber ? scrubber.scrub(tag) : tag),
-        confidence: r.confidence,
-        createdAt: r.created_at,
-        sessionId: null,
-      };
-    });
-  } finally {
-    closeLcmConnection(dbPath, db);
-  }
-
-  const document: ExportDocument = {
-    version: EXPORT_VERSION,
-    exportedAt: new Date().toISOString(),
-    projectCwd: project.canonical,
-    entries,
-  };
-  return {
-    document,
-    result: { exported: entries.length, projectCwd: project.canonical },
-  };
+    const scrubber = opts.skipScrub ? null : await ScrubEngine.forProject(
+      opts._globalPatterns ?? config.security.sensitivePatterns, project.dir,
+    );
+    const entries = rows.map((row): ExportEntry => ({
+      content: scrubber ? scrubber.scrub(row.content) : row.content,
+      tags: row.tags.map((tag) => scrubber ? scrubber.scrub(tag) : tag),
+      confidence: row.confidence,
+      createdAt: row.createdAt,
+      sessionId: null,
+    }));
+    return {
+      document: {
+        version: EXPORT_VERSION,
+        exportedAt: new Date().toISOString(),
+        projectCwd: project.canonical,
+        entries,
+      },
+      result: { exported: entries.length, projectCwd: project.canonical },
+    };
+  });
 }
 
 function persistExport(document: ExportDocument, output: string | undefined): void {
@@ -186,12 +116,7 @@ export async function exportKnowledge(
   cwd: string,
   opts: ExportOptions = {},
 ): Promise<ExportResult> {
-  const gathered = opts._publicationConvergence === undefined
-    ? await gatherExport(cwd, opts)
-    : await withPublicationAdmissionRetry(
-      () => gatherExport(cwd, opts),
-      opts._publicationConvergence,
-    );
+  const gathered = await gatherExport(cwd, opts);
   persistExport(gathered.document, opts.output);
   return gathered.result;
 }
@@ -216,7 +141,7 @@ export interface ImportResult {
   imported: number;
   skipped: number;
   dryRun: boolean;
-  /** Error messages from entries that failed deduplication/insert. */
+  /** Sanitized validation errors for entries skipped before storage work. */
   errors?: string[];
 }
 
@@ -225,89 +150,128 @@ const DEFAULT_DEDUP_THRESHOLDS = {
   dedupCandidateLimit: 100,
 };
 
+// Namespaced local metadata is intentionally absent from the version 1 document.
+const IMPORT_DIGESTS = "lcm.portableKnowledge.v1.entryDigests";
+
+function retryDigests(metadata: JsonObject): string[] {
+  const value = metadata[IMPORT_DIGESTS];
+  return Array.isArray(value)
+    ? value.filter((digest): digest is string => typeof digest === "string" && /^[a-f0-9]{64}$/.test(digest))
+    : [];
+}
+
+type PreparedEntry = { entry: ExportEntry; digest: string; confidence: number };
+
+function prepareEntries(doc: ExportDocument, opts: ImportOptions): { entries: PreparedEntry[]; errors: string[] } {
+  if (!doc || typeof doc !== "object") throw new Error("Invalid knowledge document");
+  if (doc.version !== EXPORT_VERSION) throw new Error(`Unsupported export version (expected ${EXPORT_VERSION})`);
+  if (typeof doc.projectCwd !== "string" || typeof doc.exportedAt !== "string" || !Array.isArray(doc.entries)) {
+    throw new Error("Invalid knowledge document");
+  }
+  if (opts.confidence !== undefined && (!Number.isFinite(opts.confidence) || opts.confidence < 0 || opts.confidence > 1)) {
+    throw new Error("Invalid import confidence");
+  }
+  const entries: PreparedEntry[] = [];
+  const errors: string[] = [];
+  for (let ordinal = 0; ordinal < doc.entries.length; ordinal++) {
+    try {
+      const source = doc.entries[ordinal];
+      const entry: ExportEntry = {
+        content: source.content, tags: source.tags, confidence: source.confidence,
+        createdAt: source.createdAt, sessionId: source.sessionId,
+      };
+      const confidence = opts.confidence ?? entry.confidence;
+      if (typeof entry.content !== "string" || entry.content.length === 0 || !Array.isArray(entry.tags)
+        || !entry.tags.every((tag) => typeof tag === "string")
+        || !Number.isFinite(entry.confidence) || !Number.isFinite(confidence) || confidence < 0 || confidence > 1
+        || typeof entry.createdAt !== "string" || !Number.isFinite(Date.parse(entry.createdAt))
+        || (entry.sessionId !== null && typeof entry.sessionId !== "string")) {
+        throw new Error("Invalid entry");
+      }
+      // Shared JSON validation also rejects NUL/unpaired surrogates before PG SQL.
+      serializePromotedMetadata({ content: entry.content, tags: entry.tags, sessionId: entry.sessionId });
+      const digest = createHash("sha256").update(JSON.stringify([
+        EXPORT_VERSION, doc.projectCwd, ordinal, entry.content, entry.tags,
+        entry.confidence, entry.createdAt, entry.sessionId,
+      ])).digest("hex");
+      entries.push({ entry, confidence, digest });
+    } catch {
+      errors.push(`Invalid knowledge entry at index ${ordinal}`);
+    }
+  }
+  return { entries, errors };
+}
+
 export async function importKnowledge(
   cwd: string,
   doc: ExportDocument,
   opts: ImportOptions = {},
 ): Promise<ImportResult> {
-  const configFile = configPath();
-  const config = loadDaemonConfig(configFile);
-  selectStorageBackendForConfig(configFile, config.storage);
-  if (doc.version !== EXPORT_VERSION) {
-    throw new Error(`Unsupported export version: ${doc.version} (expected ${EXPORT_VERSION})`);
-  }
-
+  const prepared = prepareEntries(doc, opts);
   if (opts.dryRun) {
     return {
       total: doc.entries.length,
       imported: 0,
-      skipped: 0,
+      skipped: prepared.errors.length,
       dryRun: true,
+      ...(prepared.errors.length ? { errors: prepared.errors } : {}),
     };
   }
-
-  const baseDir = opts._lcmBaseDir ?? defaultBaseDir();
-  const project = resolvePortableProject(cwd, baseDir);
-  const projDir = project.dir;
-  const dbPath = project.dbPath;
-
-  // Ensure project dir + DB exist
-  mkdirSync(projDir, { recursive: true });
-
-  const globalPatterns = opts._globalPatterns
-    ?? config.security.sensitivePatterns;
-  const scrubber = await ScrubEngine.forProject(globalPatterns, projDir);
-  const db = getLcmConnection(dbPath);
-
-  let imported = 0;
-  let skipped = 0;
-  const errors: string[] = [];
-
-  try {
-    runLcmMigrations(db);
-
-    const store = new PromotedStore(db);
-
-    for (const entry of doc.entries) {
-      const confidence = opts.confidence !== undefined ? opts.confidence : entry.confidence;
-      try {
-        await deduplicateAndInsert({
-          store,
-          content: scrubber.scrub(entry.content),
-          tags: entry.tags.map((tag) => scrubber.scrub(tag)),
-          projectId: project.id,
-          sessionId: entry.sessionId ?? undefined,
-          depth: 0,
-          confidence,
-          thresholds: DEFAULT_DEDUP_THRESHOLDS,
-        });
-        imported++;
-      } catch (e) {
-        skipped++;
-        errors.push(e instanceof Error ? e.message : String(e));
-      }
+  let scrubber: ScrubEngine;
+  return withCliProjectStorage(cwd, {
+    create: true,
+    _lcmBaseDir: opts._lcmBaseDir,
+    prepare: async ({ project, config }) => {
+      scrubber = await ScrubEngine.forProject(opts._globalPatterns ?? config.security.sensitivePatterns, project.dir);
+    },
+  }, async ({ storage, project }) => storage.transaction(async (repositories) => {
+    // One scan per transaction, indexed before any deduplication changes rows.
+    const rows = await repositories.promotedMemory.getAll({ sourceProjectId: project.id });
+    const metadataById = new Map(rows.map((row) => [row.id, row.metadata]));
+    const importedDigests = new Set(rows.flatMap((row) => retryDigests(row.metadata)));
+    let imported = 0;
+    let skipped = prepared.errors.length;
+    for (const { entry, digest, confidence } of prepared.entries) {
+      if (importedDigests.has(digest)) { skipped++; continue; }
+      const collapsed: JsonObject[] = [];
+      // Dedup receives the already scoped repositories; it must not BEGIN again.
+      const transaction: ProjectStorage["transaction"] = async (callback) => callback({
+        ...repositories,
+        promotedMemory: new Proxy(repositories.promotedMemory, {
+          get(target, property) {
+            if (property === "archive") return async (id: string) => {
+              // Every active candidate came from the initial scan or this loop.
+              collapsed.push(metadataById.get(id)!);
+              await target.archive(id);
+            };
+            const method = Reflect.get(target, property) as (...args: unknown[]) => unknown;
+            return method.bind(target);
+          },
+        }),
+      });
+      const id = await deduplicateAndInsert({
+        transaction,
+        content: scrubber.scrub(entry.content),
+        tags: entry.tags.map((tag) => scrubber.scrub(tag)),
+        sourceProjectId: project.id,
+        sessionId: entry.sessionId ?? undefined,
+        depth: 0, confidence, thresholds: DEFAULT_DEDUP_THRESHOLDS,
+      });
+      const canonical = metadataById.get(id) ?? {};
+      const digests = [...new Set([...collapsed.flatMap(retryDigests), ...retryDigests(canonical), digest])];
+      // Retain metadata from collapsed rows; canonical values win key conflicts.
+      const metadata: JsonObject = Object.assign(Object.create(null) as JsonObject, ...collapsed, canonical, { [IMPORT_DIGESTS]: digests });
+      await repositories.promotedMemory.update(id, { metadata });
+      metadataById.set(id, metadata);
+      for (const key of digests) importedDigests.add(key);
+      imported++;
     }
-  } finally {
-    closeLcmConnection(dbPath, db);
-  }
-
-  // Write meta.json if it doesn't already exist so this project is visible
-  // to `lcm export --all` (which enumerates projects by scanning for meta.json).
-  // Publish atomically and exclusively so concurrent importers cannot replace
-  // an existing project identity.
-  const metaPath = join(projDir, "meta.json");
-  if (!existsSync(metaPath)) {
-    atomicWritePrivateFileExclusive(
-      metaPath,
-      JSON.stringify({ cwd: project.canonical }, null, 2) + "\n",
-    );
-  }
-
-  return {
-    total: doc.entries.length,
-    imported,
-    skipped,
-    dryRun: false,
-    ...(errors.length > 0 ? { errors } : {}),
-  };
+    return {
+      total: doc.entries.length,
+      imported,
+      skipped,
+      dryRun: false,
+      ...(prepared.errors.length ? { errors: prepared.errors } : {}),
+    };
+  }));
 }

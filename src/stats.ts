@@ -509,6 +509,7 @@ export async function collectStats(): Promise<OverallStats> {
     const configFile = defaultConfigPath();
     const config = loadDaemonConfig(configFile);
     selectStorageBackendForConfig(configFile, config.storage);
+    if (config.storage.backend === "postgresql") throw new StorageBackendUnavailableError(config.storage.backend);
   } catch (error) {
     if (error instanceof BackendPublicationJournalError
       || error instanceof StorageBackendUnavailableError

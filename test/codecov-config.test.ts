@@ -41,7 +41,7 @@ const expectedComponents = [
   {
     component_id: "unit-cli",
     name: "Unit - CLI",
-    paths: ["bin/", "src/cli/", "^src/cli-help\\.ts$"],
+    paths: ["bin/", "src/cli/", "^src/cli-help\\.ts$", "^src/cli-storage\\.ts$"],
   },
   {
     component_id: "unit-installation",
@@ -156,6 +156,8 @@ const expectedComponents = [
       "^src/storage/index\\.ts$",
       "^src/storage/portable-record\\.ts$",
       "^src/storage/portable-record-stream\\.ts$",
+      "^src/storage/portable-transfer\\.ts$",
+      "^src/storage/portable-index\\.ts$",
       "^src/storage/postgresql/project-storage\\.ts$",
     ],
   },
@@ -258,7 +260,17 @@ const expectedComponents = [
       "^src/storage/postgresql/factory\\.ts$",
       "^src/storage/postgresql/index\\.ts$",
       "^src/storage/postgresql/runtime\\.ts$",
+      "^src/storage/postgresql/snapshot-session\\.ts$",
       "^src/storage/postgresql\\.ts$",
+    ],
+  },
+  {
+    component_id: "integration-postgresql-portable",
+    name: "Integration - PostgreSQL Portable Transfer",
+    paths: [
+      "^src/storage/postgresql/portable-source\\.ts$",
+      "^src/storage/postgresql/portable-destination\\.ts$",
+      "^src/storage/postgresql/portable-mapping\\.ts$",
     ],
   },
   {
@@ -437,7 +449,7 @@ function forbiddenKeysIn(value: unknown, location = "config"): string[] {
 }
 
 describe("Codecov configuration", () => {
-  test("matches the literal 30-component ownership contract", () => {
+  test("matches the literal 31-component ownership contract", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -459,7 +471,7 @@ describe("Codecov configuration", () => {
     const componentNames = components.map((component) => component.name);
     const ownershipPaths = components.flatMap((component) => component.paths);
 
-    expect(components).toHaveLength(30);
+    expect(components).toHaveLength(31);
     expect(new Set(componentIds).size).toBe(componentIds.length);
     expect(new Set(componentNames).size).toBe(componentNames.length);
     expect(new Set(ownershipPaths).size).toBe(ownershipPaths.length);
@@ -468,7 +480,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(209);
+    expect(productionFiles).toHaveLength(222);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -498,7 +510,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(209);
+    expect(ownershipCounts.size).toBe(222);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#964 files in their intended components", () => {

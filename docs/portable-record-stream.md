@@ -297,12 +297,12 @@ primitive.
   durable resume/checkpoint acknowledgement, and migration-specific recovery.
   It may map the portable checkpoint digest into its migration evidence but
   does not replace this contract.
-- **#618** owns ordinary CLI import/export routing and any bridge from the
-  existing promoted-memory-only export format. This issue does not activate
-  those commands.
-- **#626** owns the PostgreSQL/backend reader and snapshot lifecycle that
-  supplies this seam. It must use the published negotiation and source duties;
-  it does not add another wire format.
+- **#618** owns CLI routing, the separate promoted-knowledge transfer contract,
+  production SQLite/PostgreSQL canonical readers and writers, durable ordinary
+  transfer receipts and the bounded runner. See [Canonical backend transfer](portable-transfer.md).
+- **#626** owns rollback orchestration, verified fresh-generation publication
+  and recovery archive materialization. It consumes the production adapters
+  and does not add another wire format.
 
 These boundaries are staged work. Publishing this compatibility contract does
 not claim that migration, cutover, PostgreSQL routing, CLI import/export, or

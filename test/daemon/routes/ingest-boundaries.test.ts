@@ -5,6 +5,10 @@ import { createStorageBackendFactory } from "../../../src/storage/index.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 
 const mocks = vi.hoisted(() => ({
+  nativeAvailable: vi.fn(() => true),
+  nativeBackfill: vi.fn(async () => undefined),
+  closeQuarantine: vi.fn(async () => undefined),
+  loadPatterns: vi.fn(async () => []),
   exists: vi.fn(() => true),
   read: vi.fn(() => "{}"),
   write: vi.fn(),
@@ -120,6 +124,8 @@ vi.mock("../../../src/storage/index.js", () => ({
       };
       return {
         ...repositories,
+        projectId: "pid",
+        ...(mocks.nativeAvailable() ? { nativeTranscripts: { machineId: "local", repository: {} } } : {}),
         transaction: (operation: (value: typeof repositories) => Promise<unknown>) =>
           mocks.transaction(() => operation(repositories)),
         close: async () => { mocks.closeConnection(); },
@@ -132,7 +138,17 @@ vi.mock("../../../src/transcript-provider.js", () => ({
   normalizeTranscriptClient: mocks.normalize,
   parseTranscriptForClient: mocks.parse,
 }));
-vi.mock("../../../src/scrub.js", () => ({ ScrubEngine: { forProject: mocks.forProject } }));
+vi.mock("../../../src/scrub.js", () => ({ ScrubEngine: { forProject: mocks.forProject, loadProjectPatterns: mocks.loadPatterns } }));
+vi.mock("../../../src/storage/native-transcript-ingest.js", () => ({
+  CLAUDE_NATIVE_TRANSCRIPT_FORMAT: { clientName: "claude-code" },
+  CODEX_NATIVE_TRANSCRIPT_FORMAT: { clientName: "codex" },
+  createExactNativeTranscriptMessageResolver: () => ({}),
+  createFileNativeTranscriptSource: () => ({}),
+  runNativeTranscriptBackfill: mocks.nativeBackfill,
+}));
+vi.mock("../../../src/storage/local-transcript-quarantine.js", () => ({
+  openLocalTranscriptQuarantine: () => ({ close: mocks.closeQuarantine }),
+}));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
 vi.mock("../../../src/hooks/hook-errors.js", () => ({ safeLogError: mocks.logError }));
 
@@ -195,6 +211,41 @@ describe("ingest persistence boundaries", () => {
       dbPath: `/lcm/projects/${identity.id}/db.sqlite`,
       metaPath: `/lcm/projects/${identity.id}/meta.json`,
     }));
+  });
+
+  it("uses default native patterns when no security configuration is supplied", async () => {
+    mocks.parse.mockReturnValueOnce([validMessage]);
+    await createIngestHandler({ ...config, security: undefined })({} as never, response,
+      JSON.stringify({ session_id: "native-defaults", cwd: "/ok", transcript_path: "/safe" }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
+  });
+
+  it("refuses native imports when the selected backend has no native capability", async () => {
+    mocks.nativeAvailable.mockReturnValueOnce(false);
+    mocks.parse.mockReturnValueOnce([validMessage]);
+    await createIngestHandler(config)({} as never, response, JSON.stringify({ session_id: "native", cwd: "/ok", transcript_path: "/safe" }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed", code: "INGEST_FAILED" });
+    expect(mocks.createBulk).not.toHaveBeenCalled();
+  });
+
+  it("does not acknowledge raw backfill failure and preserves it if cleanup also fails", async () => {
+    const failure = new Error("raw persistence failure");
+    mocks.nativeBackfill.mockRejectedValueOnce(failure);
+    mocks.closeQuarantine.mockRejectedValueOnce(new Error("cleanup failure"));
+    mocks.parse.mockReturnValueOnce([validMessage]);
+    await createIngestHandler(config)({} as never, response, JSON.stringify({ session_id: "native", cwd: "/ok", transcript_path: "/safe" }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed", code: "INGEST_FAILED" });
+    expect(mocks.logError).toHaveBeenLastCalledWith("ingest", failure, { cwd: "/ok", sessionId: "native" });
+  });
+
+  it("archives metadata-only input and fails a successful backfill whose cleanup fails", async () => {
+    mocks.parse.mockReturnValue([]);
+    mocks.closeQuarantine.mockRejectedValueOnce(new Error("cleanup failure"));
+    await createIngestHandler(config)({} as never, response, JSON.stringify({ session_id: "native", cwd: "/ok", transcript_path: "/safe" }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed", code: "INGEST_FAILED" });
+    expect(mocks.createBulk).not.toHaveBeenCalled();
+    await createIngestHandler(config)({} as never, response, JSON.stringify({ session_id: "native", cwd: "/ok", transcript_path: "/safe" }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 0, totalTokens: 0 });
   });
 
   it("validates required fields and typed cwd failures", async () => {
@@ -599,6 +650,7 @@ describe("ingest persistence boundaries", () => {
     const admission = vi.fn(async (operation: (token: object) => Promise<unknown>) => operation({}));
     const signal = new AbortController().signal;
     const handler = createIngestHandler(postgresqlConfig);
+    mocks.exists.mockReturnValueOnce(false);
 
     await handler({} as never, response, JSON.stringify({
       session_id: "postgresql-empty",

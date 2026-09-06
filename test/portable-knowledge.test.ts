@@ -247,9 +247,9 @@ describe("portable-knowledge — export", () => {
     const cwd = makeTempDir();
     const outFile = join(makeTempDir(), "retried.json");
     seedProject(baseDir, cwd, [{ content: "Retried entry", tags: ["note"] }]);
-    const migration = await import("../src/db/migration.js");
+    const { SqliteStorageBackendFactory } = await import("../src/storage/sqlite/factory.js");
     const contention = new (await import("../src/private-mutation-lock.js")).PrivateMutationLockContentionError("busy");
-    const runMigration = vi.spyOn(migration, "runLcmMigrations");
+    const runMigration = vi.spyOn(SqliteStorageBackendFactory.prototype, "openExistingProject");
     runMigration.mockImplementationOnce(() => { throw contention; });
     const convergence = createPublicationConvergence({
       port: 3737,
@@ -286,9 +286,9 @@ describe("portable-knowledge — export", () => {
     const baseDir = makeTempDir();
     const cwd = makeTempDir();
     seedProject(baseDir, cwd, [{ content: "stdout retry", tags: ["note"] }]);
-    const migration = await import("../src/db/migration.js");
+    const { SqliteStorageBackendFactory } = await import("../src/storage/sqlite/factory.js");
     const contention = new (await import("../src/private-mutation-lock.js")).PrivateMutationLockContentionError("busy");
-    const runMigration = vi.spyOn(migration, "runLcmMigrations");
+    const runMigration = vi.spyOn(SqliteStorageBackendFactory.prototype, "openExistingProject");
     runMigration.mockImplementationOnce(() => { throw contention; });
     let now = 0;
     const convergence = createPublicationConvergence({
@@ -328,10 +328,10 @@ describe("portable-knowledge — export", () => {
     const outFile = join(makeTempDir(), "existing.json");
     writeFileSync(outFile, "previous export");
     seedProject(baseDir, cwd, [{ content: "blocked entry", tags: ["note"] }]);
-    const migration = await import("../src/db/migration.js");
+    const { SqliteStorageBackendFactory } = await import("../src/storage/sqlite/factory.js");
     const { PrivateMutationLockContentionError } = await import("../src/private-mutation-lock.js");
     const contention = new PrivateMutationLockContentionError("publication busy");
-    const runMigration = vi.spyOn(migration, "runLcmMigrations").mockImplementation(() => { throw contention; });
+    const runMigration = vi.spyOn(SqliteStorageBackendFactory.prototype, "openExistingProject").mockImplementation(() => { throw contention; });
     let now = 0;
     const convergence = createPublicationConvergence({
       port: 3737,
@@ -486,7 +486,7 @@ describe("portable-knowledge — export", () => {
     const cwd = makeTempDir();
     await expect(
       exportKnowledge(cwd, { skipScrub: true, _lcmBaseDir: baseDir }),
-    ).rejects.toThrow("No Long Context Manager (LCM) database found");
+    ).rejects.toThrow("No LCM storage found");
   });
 
   it("export document has the correct shape", async () => {
@@ -555,6 +555,133 @@ describe("portable-knowledge — import", () => {
     const rows = store.getAll({ projectId: projId });
     expect(rows.length).toBeGreaterThanOrEqual(1);
     db.close();
+  });
+
+  it("retries a document after scrub patterns change without new rows", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const doc = makeDoc([{ content: "knowledge SECRETWORD details", tags: ["note"], confidence: 0.8, createdAt: "2026-01-01T00:00:00Z", sessionId: null }]);
+    await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir, _globalPatterns: [] });
+    const retry = await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir, _globalPatterns: ["SECRETWORD"] });
+    expect(retry).toMatchObject({ imported: 0, skipped: 1 });
+    const db = new DatabaseSync(join(baseDir, "projects", toProjectId(cwd), "db.sqlite"));
+    try { expect(new PromotedStore(db).getAll()).toHaveLength(1); } finally { db.close(); }
+  });
+
+  it("rolls back the whole document when a later insert fails", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const { dbPath } = seedProject(baseDir, cwd, []);
+    const db = new DatabaseSync(dbPath);
+    db.exec("CREATE TRIGGER reject_import BEFORE INSERT ON promoted WHEN NEW.content = 'rejected second entry' BEGIN SELECT RAISE(ABORT, 'postgresql://CANARY:secret@host/db SQL'); END");
+    const doc = makeDoc([
+      { content: "accepted first entry", tags: [], confidence: 1, createdAt: "2026-01-01", sessionId: null },
+      { content: "rejected second entry", tags: [], confidence: 1, createdAt: "2026-01-01", sessionId: null },
+    ]);
+    try {
+      const failure = await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir }).then(
+        () => { throw new Error("Import unexpectedly succeeded"); },
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(Error);
+      expect(String(failure)).not.toMatch(/CANARY|secret|postgresql:\/\/|SQL/);
+      expect(failure).not.toHaveProperty("cause");
+      expect(new PromotedStore(db).getAll()).toHaveLength(0);
+      db.exec("DROP TRIGGER reject_import");
+      await expect(importKnowledge(cwd, doc, { _lcmBaseDir: baseDir })).resolves.toMatchObject({ imported: 2 });
+      expect(new PromotedStore(db).getAll()).toHaveLength(2);
+    } finally { db.close(); }
+  });
+
+  it("skips invalid entries before SQL while committing valid entries", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const doc = makeDoc([
+      { content: "bad\0value", tags: [], confidence: 1, createdAt: "2026-01-01", sessionId: null },
+      { content: "valid entry", tags: [], confidence: 1, createdAt: "2026-01-01", sessionId: null },
+    ]);
+    expect(await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir })).toMatchObject({ imported: 1, skipped: 1 });
+  });
+
+  it("preserves metadata and retry identities when duplicate rows collapse", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const doc = makeDoc([
+      { content: "first imported note", tags: ["first"], confidence: 0.8, createdAt: "2026-01-01", sessionId: null },
+      { content: "second imported note", tags: ["second"], confidence: 0.9, createdAt: "2026-01-01", sessionId: "source-session" },
+    ]);
+    await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir });
+    const db = new DatabaseSync(join(baseDir, "projects", toProjectId(cwd), "db.sqlite"));
+    try {
+      const store = new PromotedStore(db);
+      const rows = store.getAll();
+      store.update(rows[0].id, { metadata: { ...JSON.parse(rows[0].metadata), canonicalNote: "keep", ...JSON.parse('{"__proto__":{"preserved":"metadata"}}') } });
+      store.update(rows[1].id, { metadata: { ...JSON.parse(rows[1].metadata), collapsedNote: "retain" } });
+      const search = vi.spyOn(PromotedStore.prototype, "search").mockImplementation(() => rows.map((row) => ({
+        id: row.id, content: row.content, tags: JSON.parse(row.tags), projectId: row.project_id,
+        sessionId: row.session_id, confidence: row.confidence, createdAt: row.created_at, rank: -20,
+      })));
+      const merge = makeDoc([{ content: "combined note", tags: ["combined"], confidence: 1, createdAt: "2026-01-01", sessionId: null }]);
+      await importKnowledge(cwd, merge, { _lcmBaseDir: baseDir });
+      search.mockRestore();
+      expect(store.getAll()).toHaveLength(1);
+      const metadata = JSON.parse(store.getAll()[0].metadata);
+      expect(metadata).toMatchObject({ canonicalNote: "keep", collapsedNote: "retain" });
+      expect(Object.hasOwn(metadata, "__proto__")).toBe(true);
+      expect(metadata["__proto__"]).toEqual({ preserved: "metadata" });
+      expect(await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir, _globalPatterns: ["imported"] })).toMatchObject({ imported: 0, skipped: 2 });
+      expect(await importKnowledge(cwd, merge, { _lcmBaseDir: baseDir })).toMatchObject({ imported: 0, skipped: 1 });
+    } finally { db.close(); }
+  });
+
+  it("indexes many source entries deduplicated into one memory for retry", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const search = vi.spyOn(PromotedStore.prototype, "search").mockImplementation(function (this: PromotedStore) {
+      return this.getAll().map((row) => ({
+        id: row.id, content: row.content, tags: JSON.parse(row.tags), projectId: row.project_id,
+        sessionId: row.session_id, confidence: row.confidence, createdAt: row.created_at, rank: -20,
+      }));
+    });
+    const doc = makeDoc(Array.from({ length: 40 }, (_, ordinal) => ({
+      content: "duplicate common content", tags: [`source-${ordinal}`], confidence: 0.8,
+      createdAt: "2026-01-01", sessionId: null,
+    })));
+    expect(await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir })).toMatchObject({ imported: 40, skipped: 0 });
+    search.mockRestore();
+    const db = new DatabaseSync(join(baseDir, "projects", toProjectId(cwd), "db.sqlite"));
+    try {
+      const rows = new PromotedStore(db).getAll();
+      expect(rows).toHaveLength(1);
+      expect(JSON.parse(rows[0].tags)).toHaveLength(40);
+    } finally { db.close(); }
+    expect(await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir, _globalPatterns: ["common"] }))
+      .toMatchObject({ imported: 0, skipped: 40 });
+  });
+
+  it.each([null, {}, { version: 1 }, { version: 1, projectCwd: "source", exportedAt: "now", entries: {} }])(
+    "rejects malformed documents without creating project storage: %j", async (document) => {
+      const baseDir = makeTempDir();
+      await expect(importKnowledge("/missing", document as ExportDocument, { _lcmBaseDir: baseDir })).rejects.toThrow();
+      expect(existsSync(join(baseDir, "projects"))).toBe(false);
+    },
+  );
+
+  it.each([NaN, Infinity, -0.1, 1.1])("rejects invalid confidence override %s without storage", async (confidence) => {
+    const baseDir = makeTempDir();
+    await expect(importKnowledge("/missing", makeDoc([]), { confidence, _lcmBaseDir: baseDir })).rejects.toThrow("Invalid import confidence");
+    expect(existsSync(join(baseDir, "projects"))).toBe(false);
+  });
+
+  it.each([
+    { content: 1 }, { content: "" }, { tags: [1] }, { tags: null }, { confidence: NaN }, { confidence: 2 },
+    { createdAt: "invalid-date" }, { sessionId: 1 }, { content: "\ud800" },
+  ])("classifies invalid entry before dry-run storage: %j", async (invalid) => {
+    const baseDir = makeTempDir();
+    const entry = { content: "valid", tags: [], confidence: 1, createdAt: "2026-01-01", sessionId: null, ...invalid };
+    expect(await importKnowledge("/missing", makeDoc([entry as ExportDocument["entries"][number]]), { dryRun: true, _lcmBaseDir: baseDir }))
+      .toMatchObject({ total: 1, imported: 0, skipped: 1, errors: ["Invalid knowledge entry at index 0"] });
+    expect(existsSync(join(baseDir, "projects"))).toBe(false);
   });
 
   it("imports alias-invoked knowledge into the canonical project", async () => {
@@ -897,7 +1024,7 @@ describe("portable-knowledge — import", () => {
   it.each([
     ["Error objects", new Error("failed entry"), "failed entry"],
     ["non-Error values", "plain failure", "plain failure"],
-  ])("records %s thrown while importing an entry", async (_label, thrown, message) => {
+  ])("records %s thrown while importing an entry", async (_label, thrown, _message) => {
     const baseDir = makeTempDir();
     const cwd = makeTempDir();
     const entry = {
@@ -910,6 +1037,6 @@ describe("portable-knowledge — import", () => {
 
     const result = await importKnowledge(cwd, makeDoc([entry]), { _lcmBaseDir: baseDir });
 
-    expect(result).toMatchObject({ total: 1, imported: 0, skipped: 1, errors: [message] });
+    expect(result).toMatchObject({ total: 1, imported: 0, skipped: 1, errors: ["Invalid knowledge entry at index 0"] });
   });
 });

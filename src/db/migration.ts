@@ -744,6 +744,62 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at);
   `);
 
+  // Active native ingest is separate from immutable portable recovery archives.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS runtime_native_transcripts (
+      transcript_id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      machine_id TEXT NOT NULL,
+      client_name TEXT NOT NULL,
+      format_name TEXT NOT NULL,
+      format_version TEXT NOT NULL,
+      native_session_id TEXT NOT NULL,
+      source_locator TEXT NOT NULL,
+      source_ordinal INTEGER NOT NULL CHECK(source_ordinal >= 0),
+      observed_at TEXT NOT NULL,
+      ingested_at TEXT NOT NULL,
+      scrubber_version TEXT NOT NULL,
+      content_sha256 TEXT NOT NULL,
+      ingest_key TEXT NOT NULL,
+      native_payload TEXT NOT NULL CHECK(json_valid(native_payload)),
+      UNIQUE(project_id, machine_id, ingest_key),
+      UNIQUE(project_id, transcript_id)
+    );
+    CREATE INDEX IF NOT EXISTS runtime_native_source_idx
+      ON runtime_native_transcripts(project_id, machine_id, client_name, source_locator, source_ordinal);
+    CREATE INDEX IF NOT EXISTS runtime_native_session_idx
+      ON runtime_native_transcripts(project_id, native_session_id, observed_at, transcript_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS runtime_native_message_identity_idx
+      ON messages(conversation_id, message_id);
+    CREATE TABLE IF NOT EXISTS runtime_native_transcript_messages (
+      project_id TEXT NOT NULL,
+      transcript_id TEXT NOT NULL,
+      conversation_id INTEGER NOT NULL,
+      message_id INTEGER NOT NULL,
+      source_ordinal INTEGER NOT NULL CHECK(source_ordinal BETWEEN 0 AND 2147483647),
+      PRIMARY KEY(project_id, transcript_id, source_ordinal),
+      UNIQUE(project_id, transcript_id, message_id),
+      FOREIGN KEY(conversation_id, message_id)
+        REFERENCES messages(conversation_id, message_id) ON DELETE RESTRICT,
+      FOREIGN KEY(project_id, transcript_id)
+        REFERENCES runtime_native_transcripts(project_id, transcript_id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS runtime_native_ingest_checkpoints (
+      project_id TEXT NOT NULL,
+      machine_id TEXT NOT NULL,
+      client_name TEXT NOT NULL,
+      source_locator TEXT NOT NULL,
+      revision INTEGER NOT NULL CHECK(revision >= 0),
+      last_source_ordinal INTEGER NOT NULL CHECK(last_source_ordinal >= 0),
+      imported_count INTEGER NOT NULL CHECK(imported_count >= 0),
+      skipped_count INTEGER NOT NULL CHECK(skipped_count >= 0),
+      quarantined_count INTEGER NOT NULL CHECK(quarantined_count >= 0),
+      checkpoint TEXT NOT NULL CHECK(json_valid(checkpoint)),
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(project_id, machine_id, client_name, source_locator)
+    );
+  `);
+
   // Forward-compatible conversations migration for existing DBs.
   const conversationColumns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{
     name?: string;

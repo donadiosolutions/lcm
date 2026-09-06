@@ -13,6 +13,7 @@ component_management:
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
+        - "^src/cli-storage\\.ts$"
     - component_id: "unit-installation"
       name: "Unit - Installation"
       paths:
@@ -178,6 +179,9 @@ component_management:
         - "^src/storage/portable-record\\.ts$"
         # The #763 manifest and #816 checkpoint negative-zero taxonomies remain storage-abstractions-owned.
         - "^src/storage/portable-record-stream\\.ts$"
+        # #618 shared canonical transfer and bounded validation index.
+        - "^src/storage/portable-transfer\\.ts$"
+        - "^src/storage/portable-index\\.ts$"
         - "^src/storage/postgresql/project-storage\\.ts$"
     - component_id: "unit-migration-cutover"
       name: "Unit - Migration and Cutover"
@@ -272,7 +276,14 @@ component_management:
         - "^src/storage/postgresql/factory\\.ts$"
         - "^src/storage/postgresql/index\\.ts$"
         - "^src/storage/postgresql/runtime\\.ts$"
+        - "^src/storage/postgresql/snapshot-session\\.ts$"
         - "^src/storage/postgresql\\.ts$"
+    - component_id: "integration-postgresql-portable"
+      name: "Integration - PostgreSQL Portable Transfer"
+      paths:
+        - "^src/storage/postgresql/portable-source\\.ts$"
+        - "^src/storage/postgresql/portable-destination\\.ts$"
+        - "^src/storage/postgresql/portable-mapping\\.ts$"
     - component_id: "integration-postgresql-schema"
       name: "Integration - PostgreSQL Schema"
       paths:

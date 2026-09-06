@@ -102,7 +102,7 @@ applies to the minimized request sent outside the machine.
 
 The daemon's PostgreSQL project routes store scrubbed messages, summaries,
 promoted memories, and related repository data only after local validation and
-redaction. The PostgreSQL native-transcript repository stores only client-native JSON
+redaction. Both SQLite and PostgreSQL native-transcript repositories store only client-native JSON
 records that passed local decoding, scrubbing, residual-secret validation, and
 canonicalization. For the explicit embedded and backfill APIs, an accepted
 sanitized native record must also fit the same inclusive 10 MiB limit in
@@ -113,8 +113,10 @@ produce only bounded metadata in private local quarantine stores separated by
 project and transcript client. The client identity exists only in the opaque
 database namespace, not in quarantine rows, so identical Claude and Codex
 metadata cannot deduplicate across clients.
-Native-transcript daemon and CLI routing is not active; explicit backfill and
-adapter use are documented in
+`lcm import` and transcript-path daemon ingestion run this native backfill
+after storing parsed messages. Native failure fails the import; retry resumes
+native checkpoints even if the parsed messages already exist. Structured
+`messages` requests retain their existing parsed-message behavior. Details are in
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md).
 
 ## Secret redaction

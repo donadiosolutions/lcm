@@ -1249,6 +1249,8 @@ function shouldUsePublicationConvergence(actionCommand: Command): boolean {
 }
 
 type DaemonClientOptions = {
+  /** Temporary guard for the SQLite-only pool diagnostic. */
+  requireSqlite?: boolean;
   readonly preflightStorage?: boolean;
   readonly rootBootstrapComplete?: boolean;
 };
@@ -2032,6 +2034,7 @@ async function createDaemonClientOrExitWithConfig(
 
   const configFile = defaultConfigPath();
   const config = loadDaemonConfig(configFile);
+  if (options.requireSqlite && config.storage.backend === "postgresql") throw new StorageBackendUnavailableError("postgresql");
   if (options.preflightStorage !== false) selectStorageBackendForConfig(configFile, config.storage);
   const port = config.daemon?.port ?? 3737;
   const pidFilePath = daemonPidPath();
@@ -2075,6 +2078,7 @@ async function createDaemonReadClientOrExit(
   const configPath = defaultConfigPath();
   try {
     const first = readDaemonConfigSnapshot(configPath);
+    if (options.requireSqlite && first.config.storage.backend === "postgresql") throw new StorageBackendUnavailableError("postgresql");
     const tokenPath = daemonTokenPath();
     const { readAuthToken } = await import("../src/daemon/auth.js");
     const token = readAuthToken(tokenPath);
@@ -2109,7 +2113,8 @@ async function createDaemonReadClientOrExit(
         }
       }
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof StorageBackendUnavailableError) throw error;
     // Any snapshot, token, health, or witness failure falls back to the
     // existing authenticated migration and lifecycle path below.
   }
@@ -2551,13 +2556,13 @@ export async function runCli(
 
         const { NinjaRenderer } = await import("../src/cli/pipeline-runner.js");
         const { makeProgressState } = await import("../src/cli/progress-state.js");
-        const isTTY = process.stdout.isTTY ?? false;
-        const renderOpts = { isTTY, width: process.stdout.columns ?? 80, color: isTTY, verbose };
+        const isTTY = process.stderr.isTTY ?? false;
+        const renderOpts = { isTTY, width: process.stderr.columns ?? 80, color: isTTY, verbose };
         const compactState = makeProgressState({ phases: [
           { name: "Compact", status: "active" },
           ...(!noPromote ? [{ name: "Promote", status: "pending" } as const] : []),
         ], dryRun });
-        const compactRenderer = new NinjaRenderer({ state: compactState, renderOpts, handleSignals: false });
+        const compactRenderer = new NinjaRenderer({ state: compactState, renderOpts, handleSignals: false, output: process.stderr });
         signalHandlers.bindRenderer(compactState);
         compactRenderer.start();
         try {
@@ -2644,7 +2649,7 @@ export async function runCli(
             for (const promoteCwd of compactedProjects) {
               if (signalHandlers.draining) break;
               compactState.currentProject = sanitizeTerminalText(promoteCwd);
-              if (!isTTY || verbose) console.log(`  promoting: ${sanitizeTerminalText(promoteCwd)}...`);
+              if (!isTTY || verbose) console.error(`  promoting: ${sanitizeTerminalText(promoteCwd)}...`);
               try {
                 const promotionBody = {
                   cwd: promoteCwd,
@@ -3033,7 +3038,7 @@ export async function runCli(
 
       if (opts.pool) {
         const jsonFlag: boolean = opts.json ?? false;
-        const { client } = await createDaemonReadClientOrExit(preflightSeams);
+        const { client } = await createDaemonReadClientOrExit(preflightSeams, { requireSqlite: true });
 
         let poolData: any = null;
         try {
@@ -3778,20 +3783,20 @@ export async function runCli(
         sessionCount += findAllCodexTranscripts().length;
       }
 
-      const isTTY = process.stdout.isTTY ?? false;
-      const renderOpts = { isTTY, width: process.stdout.columns ?? 80, color: isTTY, verbose };
+      const isTTY = process.stderr.isTTY ?? false;
+      const renderOpts = { isTTY, width: process.stderr.columns ?? 80, color: isTTY, verbose };
       const state = makeProgressState({
         phases: [{ name: "Import", status: "active" }],
         total: sessionCount,
         dryRun,
       });
-      const renderer = new NinjaRenderer({ state, renderOpts });
+      const renderer = new NinjaRenderer({ state, renderOpts, output: process.stderr });
 
       const providerLabel =
         provider === "codex" ? "Codex CLI" :
         provider === "all"   ? "Claude Code + Codex CLI" :
                                "Claude Code";
-      console.log(`\n  Importing ${providerLabel} sessions${all ? " (all projects)" : ""}...\n`);
+      console.error(`\n  Importing ${providerLabel} sessions${all ? " (all projects)" : ""}...\n`);
       renderer.start();
 
       const client = new DaemonClient(`http://127.0.0.1:${port}`);
@@ -3809,13 +3814,14 @@ export async function runCli(
         state.phases[0].status = "done";
         renderer.printSummary();
         const { printCodexResolutionSummary } = await import("../src/import-summary.js");
-        printCodexResolutionSummary(result);
+        printCodexResolutionSummary(result, console.error);
       } else {
         const { printImportSummary } = await import("../src/import-summary.js");
-        if (dryRun) console.log("  [dry-run] No changes written.\n");
-        printImportSummary(result, { replay });
-        console.log();
+        if (dryRun) console.error("  [dry-run] No changes written.\n");
+        printImportSummary(result, { replay, log: console.error });
+        console.error();
       }
+      if (result.failed > 0) exit(1);
     });
 
   // ─── promote ───────────────────────────────────────────────────────────────
@@ -3957,9 +3963,7 @@ export async function runCli(
         selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
       });
       const { exportKnowledge } = await import("../src/portable-knowledge.js");
-      const { homedir } = await import("node:os");
       const { join } = await import("node:path");
-      const { existsSync, readdirSync, readFileSync } = await import("node:fs");
 
       const tags: string[] | undefined = opts.tags
         ? (opts.tags as string).split(",").map((t: string) => t.trim()).filter(Boolean)
@@ -3970,43 +3974,26 @@ export async function runCli(
 
       let cwds: string[] = [];
       if (all) {
-        const { reconcileWorktrees } = await import("../src/worktree-reconciliation.js");
-        const projectsDir = lcmProjectsDir();
-        const candidates: string[] = [];
-        if (existsSync(projectsDir)) {
-          for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
-            if (!entry.isDirectory()) continue;
-            const metaPath = join(projectsDir, entry.name, "meta.json");
-            if (!existsSync(metaPath)) continue;
-            try {
-              const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-              if (typeof meta.cwd === "string" && meta.cwd) candidates.push(meta.cwd);
-            } catch { /* skip */ }
-          }
+        if (output !== undefined) {
+          console.error("  --all cannot use one --output file; omit --output to write one file per project.");
+          exit(1);
         }
-        const reconciled = new Map<string, string>();
-        for (const candidate of candidates) {
-          try {
-            const result = await runWithPublicationRetry(() => reconcileWorktrees(candidate));
-            reconciled.set(result.targetHash, result.canonical);
-          } catch (err) {
-            if (err instanceof PrivateMutationLockContentionError || err instanceof BackendPublicationJournalError) throw err;
-            const message = err instanceof Error ? err.message : String(err);
-            process.stderr.write(`  Warning: could not reconcile ${candidate}: ${message}\n`);
-          }
-        }
-        cwds = [...reconciled.values()];
+        const { listCliProjects } = await import("../src/cli-storage.js");
+        cwds = (await runWithPublicationRetry(() => listCliProjects())).map(project => project.canonical);
       } else {
         cwds.push(process.cwd());
       }
 
       let total = 0;
+      let failures = 0;
       for (const cwd of cwds) {
         let outFile: string | undefined = output;
         if (all && output === undefined) {
           // When --all and no --output, generate filenames automatically
           const slug = cwd.replace(/[^a-zA-Z0-9]/g, "-").replace(/-+/g, "-").slice(-40);
-          outFile = join(process.cwd(), `lcm-export-${slug}.json`);
+          const { createHash } = await import("node:crypto");
+          const suffix = createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+          outFile = join(process.cwd(), `lcm-export-${slug}-${suffix}.json`);
         }
         try {
           const exportOptions = {
@@ -4018,17 +4005,19 @@ export async function runCli(
           const result = await exportKnowledge(cwd, exportOptions);
           total += result.exported;
           if (all) {
-            console.log(`  ${cwd}: ${result.exported} entries → ${outFile}`);
+            console.error(`  ${cwd}: ${result.exported} entries → ${outFile}`);
           } else if (outFile) {
-            console.log(`  Exported ${result.exported} entries to ${outFile}`);
+            console.error(`  Exported ${result.exported} entries to ${outFile}`);
           }
         } catch (err: any) {
           if (err instanceof PrivateMutationLockContentionError || err instanceof BackendPublicationJournalError) throw err;
-          process.stderr.write(`  Warning: ${err.message}\n`);
+          failures++;
+          process.stderr.write("  Export failed for a selected project. Check its storage binding and retry.\n");
         }
       }
 
-      if (all) console.log(`\n  Total: ${total} entries exported`);
+      if (all) console.error(`\n  Total: ${total} entries exported`);
+      if (failures > 0) exit(1);
     });
 
   // ─── import-knowledge ──────────────────────────────────────────────────────
@@ -4067,7 +4056,7 @@ export async function runCli(
       try {
         raw = readFileSync(file, "utf-8");
       } catch (err: any) {
-        console.error(`  Cannot read file: ${err.message}`);
+        console.error("  Cannot read the knowledge export file.");
         exit(1);
       }
 
@@ -4086,21 +4075,15 @@ export async function runCli(
 
       const cwd = process.cwd();
 
-      if (dryRun) {
-        console.log(`\n  [dry-run] Would import ${doc.entries.length} entries into ${cwd}`);
-        console.log("  No changes written.\n");
-        exit(0);
-      }
-
       try {
         const result = await importKnowledge(cwd, doc, { merge: true, dryRun, confidence });
         if (result.dryRun) {
-          console.log(`\n  [dry-run] Would import ${result.total} entries. No changes written.\n`);
+          console.error(`\n  [dry-run] Would import ${result.total} entries. No changes written.\n`);
         } else {
-          console.log(`\n  Imported ${result.imported} entries (${result.skipped} skipped) into ${cwd}\n`);
+          console.error(`\n  Imported ${result.imported} entries (${result.skipped} skipped) into ${cwd}\n`);
         }
       } catch (err: any) {
-        console.error(`  Import failed: ${err.message}`);
+        console.error("  Knowledge import failed. Check the document and selected storage, then retry.");
         exit(1);
       }
     });
@@ -4158,7 +4141,7 @@ export function handleCliError(err: unknown): never {
       || err instanceof BootstrapLockContentionError
       || err instanceof PrivateMutationLockContentionError
       ? err.message
-      : err,
+      : "LCM command failed. Check the command inputs and selected storage configuration.",
   );
   return exit(1);
 }

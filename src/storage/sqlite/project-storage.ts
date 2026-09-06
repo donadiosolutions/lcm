@@ -1,3 +1,4 @@
+import { SqliteNativeTranscriptRepository } from "./native-transcript-repository.js";
 import type { DatabaseSync } from "node:sqlite";
 import { closeLcmConnection } from "../../db/connection.js";
 import type {
@@ -14,10 +15,12 @@ import {
   createSqliteRepositories,
   createSqliteRepositoryStores,
   type SqliteRepositoryStores,
+  type RepositoryInvoker,
 } from "./repositories.js";
 
 export class SqliteProjectStorage implements ProjectStorage {
   readonly backend = "sqlite" as const;
+  readonly nativeTranscripts: NonNullable<ProjectStorage["nativeTranscripts"]>;
   readonly conversations: ProjectRepositories["conversations"];
   readonly summaries: ProjectRepositories["summaries"];
   readonly context: ProjectRepositories["context"];
@@ -43,16 +46,17 @@ export class SqliteProjectStorage implements ProjectStorage {
     this.stores = createSqliteRepositoryStores(db, {
       fts5Available: capabilities.nativeFullTextSearch === "available",
     });
-    const repositories = createSqliteRepositories(
-      this.stores,
-      this.projectId,
-      async (domain, operation, callback, atomic) => {
-        this.assertOpen(domain, operation);
-        return atomic
-          ? this.executor.runAtomic(domain, operation, callback)
-          : this.executor.run(domain, operation, callback);
-      },
-    );
+    const invoke: RepositoryInvoker = async (domain, operation, callback, atomic) => {
+      this.assertOpen(domain, operation);
+      return atomic
+        ? this.executor.runAtomic(domain, operation, callback)
+        : this.executor.run(domain, operation, callback);
+    };
+    this.nativeTranscripts = Object.freeze({
+      machineId: "local",
+      repository: new SqliteNativeTranscriptRepository(db, projectId, invoke),
+    });
+    const repositories = createSqliteRepositories(this.stores, this.projectId, invoke);
     this.conversations = repositories.conversations;
     this.summaries = repositories.summaries;
     this.context = repositories.context;

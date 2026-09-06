@@ -280,7 +280,7 @@ describe("importSessions", () => {
     const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(projectDir, "session-1.jsonl"), "");
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const onProgress = vi.fn();
     const result = await importSessions(makeMockClient(async () => ({})), {
       cwd, _claudeProjectsDir: claudeProjectsDir, dryRun: true, replay: true, verbose: true, onProgress,
@@ -296,7 +296,7 @@ describe("importSessions", () => {
     const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(projectDir, "session.jsonl"), "");
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     await importSessions(makeMockClient(async () => ({})), {
       cwd, _claudeProjectsDir: claudeProjectsDir, dryRun: true, verbose: true,
     });
@@ -352,7 +352,7 @@ describe("importSessions", () => {
     db.exec("CREATE TABLE session_ingest_log (session_id TEXT PRIMARY KEY)");
     db.prepare("INSERT INTO session_ingest_log(session_id) VALUES (?)").run(sessionId);
     db.close();
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const onProgress = vi.fn();
     const client = makeMockClient(async () => ({ ingested: 0, totalTokens: 0 }));
     const result = await importSessions(client, {
@@ -391,7 +391,7 @@ describe("importSessions", () => {
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(projectDir, "empty.jsonl"), "");
     writeFileSync(join(projectDir, "success.jsonl"), "");
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const client = makeMockClient(async (_path, body) => (body as { session_id: string }).session_id === "empty"
       ? { ingested: 0, totalTokens: 0 }
       : { ingested: 2, totalTokens: 100 });
@@ -407,7 +407,7 @@ describe("importSessions", () => {
     const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
     mkdirSync(projectDir, { recursive: true });
     for (const id of ["a", "b", "c", "d"]) writeFileSync(join(projectDir, `${id}.jsonl`), "");
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const responses: Record<string, object> = {
       a: { latestSummaryContent: "a", tokensBefore: 100, tokensAfter: 10 },
       b: { latestSummaryContent: "b", tokensAfter: 10 },
@@ -429,7 +429,7 @@ describe("importSessions", () => {
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(projectDir, "compact-fail.jsonl"), "");
     writeFileSync(join(projectDir, "ingest-fail.jsonl"), "");
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const client = makeMockClient(async (path, body) => {
       const id = (body as { session_id: string }).session_id;
@@ -439,22 +439,22 @@ describe("importSessions", () => {
     });
     const result = await importSessions(client, { cwd, _claudeProjectsDir: claudeProjectsDir, replay: true, verbose: true });
     expect(result.failed).toBe(1);
-    expect(error).toHaveBeenCalledWith(expect.stringContaining("unknown error"));
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("compaction failed"));
     expect(log).toHaveBeenCalledWith(expect.stringContaining("failed"));
   });
 
-  it("prints Error details for verbose ingest failures", async () => {
+  it("keeps verbose diagnostics on stderr without storage error details", async () => {
     const claudeProjectsDir = makeTmpDir();
     const cwd = "/failure/error";
     const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(projectDir, "session.jsonl"), "");
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     await importSessions(makeMockClient(async () => { throw new Error("specific\u001b[31m\nfailure"); }), {
       cwd, _claudeProjectsDir: claudeProjectsDir, verbose: true,
     });
-    expect(log).toHaveBeenCalledWith(expect.stringContaining("specific failure"));
-    expect(log.mock.calls.flat().join("\n")).not.toContain("\u001b");
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("ingest failed"));
+    expect(log.mock.calls.flat().join("\n")).not.toContain("specific");
   });
 
   it("imports when the ingest database is missing or malformed", async () => {
@@ -1550,7 +1550,7 @@ describe("importSessions — provider: codex", () => {
       join(archived, "unresolved.jsonl"),
       makeCodexSessionMetaLine("unresolved", join(codexDir, "deleted", "project")),
     );
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     const result = await importSessions(
       makeMockClient(async () => ({ ingested: 1, totalTokens: 1 })),

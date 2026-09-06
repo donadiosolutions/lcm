@@ -66,6 +66,7 @@ vi.mock("../../src/runtime-paths.js", async importOriginal => {
 
 afterEach(() => {
   state.afterHealth = undefined;
+  vi.unstubAllEnvs();
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
   if (originalUserProfile === undefined) delete process.env.USERPROFILE;
@@ -136,6 +137,7 @@ describe("runCli healthy-daemon reads during publication", () => {
     writeFileSync(tokenPath, "test-token", { mode: 0o600 });
     state.afterHealth = () => {
       state.afterHealth = undefined;
+  vi.unstubAllEnvs();
       writeFileSync(configPath, JSON.stringify({ storage: { backend: "postgresql" } }), { mode: 0o600 });
     };
 
@@ -147,4 +149,27 @@ describe("runCli healthy-daemon reads during publication", () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+  it("refuses configured PostgreSQL pool stats from the snapshot before daemon health", async () => {
+    const home=mkdtempSync(join(tmpdir(),"lcm-cli-pool-pg-"));
+    const root=join(home,".lcm");
+    process.env.HOME=home;
+    process.env.USERPROFILE=home;
+    mkdirSync(root,{mode:0o700});
+    const ca=join(root,"ca.crt");
+    writeFileSync(ca,"trusted-ca",{mode:0o600});
+    writeFileSync(join(root,"config.json"),JSON.stringify({storage:{backend:"postgresql"}}),{mode:0o600});
+    writeFileSync(join(root,"daemon.token"),"test-token",{mode:0o600});
+    vi.stubEnv("LCM_POSTGRES_URL","postgresql://user:password@db.example.com/lcm");
+    vi.stubEnv("LCM_POSTGRES_CA_FILE",ca);
+    vi.stubEnv("LCM_POSTGRES_MIGRATION_ROLE","lcm_test_migrator");
+    const health=vi.fn();
+    state.afterHealth=health;
+    try {
+      const {runCli}=await import("../../bin/lcm.js");
+      await expect(runCli(["node","lcm","stats","--pool"]))
+        .rejects.toMatchObject({name:"StorageBackendUnavailableError"});
+      expect(health).not.toHaveBeenCalled();
+    } finally {rmSync(home,{recursive:true,force:true});}
+  });
+
 });

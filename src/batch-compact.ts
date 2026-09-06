@@ -1,7 +1,5 @@
-import { readdirSync, readFileSync, existsSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { runLcmMigrations } from "./db/migration.js";
-import { closeLcmConnection, getLcmConnection } from "./db/connection.js";
+import { resolve } from "node:path";
+import { closeLcmConnection, getExistingLcmConnection } from "./db/connection.js";
 import {
   progressCurrentSession,
   type ProgressCurrentSession,
@@ -10,11 +8,16 @@ import {
 } from "./cli/progress-state.js";
 import { DaemonClient } from "./daemon/client.js";
 import { isDaemonTransportFailure } from "./daemon/http-url.js";
-import { configPath, projectsDir as lcmProjectsDir } from "./runtime-paths.js";
-import { normalizeProjectPath, projectMapPathsForHash } from "./project-map.js";
+import { configPath } from "./runtime-paths.js";
+import { normalizeProjectPath, resolveExistingProjectIdentity } from "./project-map.js";
 import { loadDaemonConfig, type LlmApiMode, type LlmInvocationRequestPolicy, type LlmReasoningEffort, type LlmRetryPolicy } from "./daemon/config.js";
 import { MANUAL_COMPACT_FRESH_TAIL_COUNT } from "./compaction.js";
-import { selectStorageBackendForConfig } from "./storage/backend.js";
+import { assertStorageBackendPublication, selectStorageBackendForConfig } from "./storage/backend.js";
+import { withBackendPublicationConsumerLockAsync } from "./storage/backend-publication.js";
+import { projectPathsForIdentity } from "./daemon/project.js";
+import { CliProjectStorageMissingError, listCliProjects, withCliProjectStorage } from "./cli-storage.js";
+import type { ProjectRepositories } from "./storage/contracts.js";
+import { createSqliteRepositories, createSqliteRepositoryStores } from "./storage/sqlite/repositories.js";
 
 export interface UncompactedConversation {
   projectDir: string;
@@ -157,45 +160,7 @@ export function formatLlmDiagnostic(input: {
   return parts.join(" · ");
 }
 
-/** Find conversations eligible for compaction, above the token threshold. */
-function projectMatchesCwdFilter(projectHash: string, cwd: string, cwdFilter?: string): boolean {
-  if (!cwdFilter) return true;
-  const lexicalFilter = resolve(cwdFilter);
-  if (resolve(cwd) === lexicalFilter) return true;
-  try {
-    if (projectMapPathsForHash(projectHash).includes(lexicalFilter)) return true;
-  } catch {
-    // Fall back to the metadata cwd while map.json is being edited.
-  }
-  const normalizedFilter = normalizeProjectPath(cwdFilter);
-  if (normalizeProjectPath(cwd) === normalizedFilter) return true;
-  return false;
-}
-
-function metadataFailureMatchesCwdFilter(projectHash: string, cwdFilter?: string): boolean {
-  if (!cwdFilter) return true;
-  try {
-    return projectMapPathsForHash(projectHash).includes(resolve(cwdFilter));
-  } catch {
-    return false;
-  }
-}
-
-function hasReplayCondensationCandidate(db: ReturnType<typeof getLcmConnection>, conversationId: number): boolean {
-  const items = db.prepare(`
-    SELECT
-      ci.ordinal,
-      ci.item_type,
-      s.depth,
-      CASE
-        WHEN s.token_count > 0 THEN s.token_count
-        ELSE CAST((COALESCE(length(s.content), 0) + 3) / 4 AS INTEGER)
-      END AS token_count
-    FROM context_items ci
-    LEFT JOIN summaries s ON s.summary_id = ci.summary_id
-    WHERE ci.conversation_id = ?
-    ORDER BY ci.ordinal
-  `).all(conversationId) as unknown as ReplayContextRow[];
+function hasReplayCondensationCandidate(items: readonly ReplayContextRow[]): boolean {
   const rawOrdinals = items
     .filter((item) => item.item_type === "message")
     .map((item) => item.ordinal);
@@ -231,105 +196,126 @@ function hasReplayCondensationCandidate(db: ReturnType<typeof getLcmConnection>,
   return false;
 }
 
-function discoverUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): UncompactedDiscovery {
-  const baseDir = lcmProjectsDir();
-  if (!existsSync(baseDir)) return { conversations: [], failures: [] };
+type CompactRepositories = Pick<ProjectRepositories, "conversations" | "summaries" | "context">;
 
+async function discoverProject(
+  storage: CompactRepositories,
+  project: { canonical: string; dir: string },
+  minTokens: number,
+  replay: boolean,
+): Promise<UncompactedConversation[]> {
+  const candidates: UncompactedConversation[] = [];
+  for (const conversation of await storage.conversations.listConversations()) {
+    const conversationId = conversation.conversationId;
+    let messages = 0;
+    let tokens = 0;
+    let afterSeq: number | undefined;
+    // Count through bounded pages; compaction discovery never needs the full
+    // transcript resident in memory at once.
+    while (true) {
+      const page = await storage.conversations.getMessages(conversationId, { afterSeq, limit: 500 });
+      messages += page.length;
+      tokens += page.reduce((total, message) => total + message.tokenCount, 0);
+      if (page.length < 500) break;
+      afterSeq = page[page.length - 1]!.seq;
+    }
+    if (messages === 0 || tokens < minTokens) continue;
+    const summaries = await storage.summaries.getSummariesByConversation(conversationId);
+    if (!replay && summaries.length > 0) continue;
+    const context = await storage.context.getContextItems(conversationId);
+    const rawCount = context.filter(item => item.itemType === "message").length;
+    if (rawCount <= MANUAL_COMPACT_FRESH_TAIL_COUNT) {
+      if (!replay) continue;
+      const byId = new Map(summaries.map(summary => [summary.summaryId, summary]));
+      const items: ReplayContextRow[] = context.map(item => {
+        const summary = item.summaryId === null ? undefined : byId.get(item.summaryId);
+        return {
+          ordinal: item.ordinal,
+          item_type: item.itemType,
+          depth: summary?.depth ?? null,
+          token_count: summary === undefined ? 0 : summary.tokenCount > 0
+            ? summary.tokenCount : Math.ceil([...summary.content].length / 4),
+        };
+      });
+      if (!hasReplayCondensationCandidate(items)) continue;
+    }
+    candidates.push({
+      projectDir: project.dir,
+      cwd: project.canonical,
+      conversationId,
+      sessionId: conversation.sessionId,
+      messages,
+      tokens,
+    });
+  }
+  return candidates.sort((left, right) => right.tokens - left.tokens || left.conversationId - right.conversationId);
+}
+
+/** Preview repository composition deliberately bypasses factory migrations. */
+async function discoverSqlitePreview(
+  project: { id: string; canonical: string },
+  minTokens: number,
+  replay: boolean,
+): Promise<UncompactedConversation[]> {
+  const config = loadDaemonConfig(configPath());
+  return withBackendPublicationConsumerLockAsync(undefined, async token => {
+    if (config.storage.backend !== "sqlite") throw new Error("storage selection changed");
+    assertStorageBackendPublication(config.storage, token);
+    const identity = resolveExistingProjectIdentity(project.canonical, token);
+    if (identity === null || identity.id !== project.id) throw new Error("project binding changed");
+    const paths = projectPathsForIdentity(identity);
+    const db = getExistingLcmConnection(paths.dbPath);
+    if (db === null) return [];
+    try {
+      const repositories = createSqliteRepositories(
+        createSqliteRepositoryStores(db),
+        identity.id,
+        async (_domain, _operation, callback) => callback(),
+      );
+      return await discoverProject(repositories, paths, minTokens, replay);
+    } finally {
+      closeLcmConnection(paths.dbPath, db);
+    }
+  });
+}
+
+async function discoverUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): Promise<UncompactedDiscovery> {
   const conversations: UncompactedConversation[] = [];
   const failures: ProjectScanFailure[] = [];
-
-  for (const entry of readdirSync(baseDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const projDir = join(baseDir, entry.name);
-    const dbPath = join(projDir, "db.sqlite");
-    if (!existsSync(dbPath)) continue;
-
-    const metaPath = join(projDir, "meta.json");
-    if (!existsSync(metaPath)) {
-      if (metadataFailureMatchesCwdFilter(entry.name, cwdFilter)) {
-        failures.push({ target: entry.name, message: "project metadata is missing" });
-      }
-      continue;
-    }
-    let metadata: unknown;
+  let projects: Awaited<ReturnType<typeof listCliProjects>>;
+  let filterCanonical: string | undefined;
+  try {
+    projects = await listCliProjects();
+    filterCanonical = cwdFilter === undefined ? undefined
+      : resolveExistingProjectIdentity(cwdFilter)?.canonical ?? normalizeProjectPath(cwdFilter);
+  } catch {
+    return { conversations, failures: [{ target: cwdFilter ?? "projects", message: "project discovery failed" }] };
+  }
+  for (const project of projects) {
+    if (cwdFilter !== undefined
+      && project.canonical !== filterCanonical
+      && !project.aliases.includes(resolve(cwdFilter))) continue;
     try {
-      metadata = JSON.parse(readFileSync(metaPath, "utf-8")) as unknown;
-    } catch {
-      if (metadataFailureMatchesCwdFilter(entry.name, cwdFilter)) {
-        failures.push({ target: entry.name, message: "project metadata is unreadable or malformed" });
-      }
-      continue;
-    }
-    const cwd = Object(metadata).cwd as unknown;
-    if (typeof cwd !== "string" || cwd.trim().length === 0) {
-      if (metadataFailureMatchesCwdFilter(entry.name, cwdFilter)) {
-        failures.push({ target: entry.name, message: "project metadata cwd must be a non-empty string" });
-      }
-      continue;
-    }
-    if (!projectMatchesCwdFilter(entry.name, cwd, cwdFilter)) continue;
-
-    try {
-      const db = getLcmConnection(dbPath);
-      try {
-        if (!readOnly) runLcmMigrations(db);
-        const rows = db.prepare(`
-        SELECT
-          c.conversation_id,
-          c.session_id,
-          COALESCE(m.msg_count, 0) as messages,
-          COALESCE(m.raw_tokens, 0) as tokens,
-          COALESCE(ci.raw_context_count, 0) as raw_context_messages,
-          COALESCE(s.sum_count, 0) as summaries
-        FROM conversations c
-        LEFT JOIN (
-          SELECT conversation_id, COUNT(*) as msg_count, SUM(token_count) as raw_tokens
-          FROM messages GROUP BY conversation_id
-        ) m ON m.conversation_id = c.conversation_id
-        LEFT JOIN (
-          SELECT conversation_id, COUNT(*) as raw_context_count
-          FROM context_items WHERE item_type = 'message' GROUP BY conversation_id
-        ) ci ON ci.conversation_id = c.conversation_id
-        LEFT JOIN (
-          SELECT conversation_id, COUNT(*) as sum_count
-          FROM summaries GROUP BY conversation_id
-        ) s ON s.conversation_id = c.conversation_id
-        WHERE COALESCE(m.msg_count, 0) > 0
-          AND (? OR COALESCE(s.sum_count, 0) = 0)
-          AND COALESCE(m.raw_tokens, 0) >= ?
-        ORDER BY COALESCE(m.raw_tokens, 0) DESC
-        `).all(replay ? 1 : 0, minTokens) as { conversation_id: number; session_id: string; messages: number; tokens: number; raw_context_messages: number; summaries: number }[];
-
-        for (const row of rows) {
-          const hasRawWork = row.raw_context_messages > MANUAL_COMPACT_FRESH_TAIL_COUNT;
-          if (!hasRawWork && !(replay && hasReplayCondensationCandidate(db, row.conversation_id))) continue;
-          conversations.push({
-            projectDir: projDir,
-            cwd,
-            conversationId: row.conversation_id,
-            sessionId: row.session_id,
-            messages: row.messages,
-            tokens: row.tokens,
-          });
-        }
-      } finally {
-        closeLcmConnection(dbPath, db);
-      }
+      const config = loadDaemonConfig(configPath());
+      const selected = selectStorageBackendForConfig(configPath(), config.storage);
+      const found = readOnly && selected.backend === "sqlite"
+        ? await discoverSqlitePreview(project, minTokens, replay)
+        : await withCliProjectStorage(project.canonical, {}, async ({ storage, project: opened }) =>
+          discoverProject(storage, opened, minTokens, replay));
+      conversations.push(...found);
     } catch (error) {
-      failures.push({
-        target: cwd,
-        message: String(error).replace(/^Error:\s*/, ""),
-      });
+      if (error instanceof CliProjectStorageMissingError) continue;
+      failures.push({ target: project.canonical, message: "project storage discovery failed" });
     }
   }
-
   return { conversations, failures };
 }
 
-export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): UncompactedConversation[] {
+/** Find conversations eligible for compaction, above the token threshold. */
+export async function findUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): Promise<UncompactedConversation[]> {
   const configFile = configPath();
   selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
-  return discoverUncompacted(minTokens, readOnly, cwdFilter, replay).conversations;
+  return (await discoverUncompacted(minTokens, readOnly, cwdFilter, replay)).conversations;
 }
 
 /** Compact all uncompacted conversations above threshold via the daemon. */
@@ -359,7 +345,7 @@ export async function batchCompact(opts: {
   const config = loadDaemonConfig(configFile);
   selectStorageBackendForConfig(configFile, config.storage);
   const maxConcurrency = opts.replay ? 1 : opts.maxConcurrency ?? config.llm.maxConcurrency;
-  const discovery = discoverUncompacted(opts.minTokens, opts.dryRun, opts.cwd, opts.replay);
+  const discovery = await discoverUncompacted(opts.minTokens, opts.dryRun, opts.cwd, opts.replay);
   const conversations = discovery.conversations;
   const onProgress = opts.onProgress;
   const phaseErrors: ProgressPhaseError[] = discovery.failures.map(failure => ({
@@ -375,7 +361,7 @@ export async function batchCompact(opts: {
   }
 
   if (conversations.length === 0 && phaseErrors.length === 0) {
-    console.log("Nothing to compact — no sessions are currently eligible.");
+    console.error("Nothing to compact — no sessions are currently eligible.");
     return { compacted: 0, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [] };
   }
 
@@ -395,7 +381,7 @@ export async function batchCompact(opts: {
   }
 
   const totalTokens = conversations.reduce((s, c) => s + c.tokens, 0);
-  console.log(`Found ${conversations.length} uncompacted conversation${conversations.length > 1 ? "s" : ""} (${(totalTokens / 1000).toFixed(1)}k tokens)\n`);
+  console.error(`Found ${conversations.length} uncompacted conversation${conversations.length > 1 ? "s" : ""} (${(totalTokens / 1000).toFixed(1)}k tokens)\n`);
 
   let compacted = 0;
   let unchanged = 0;
@@ -485,9 +471,9 @@ export async function batchCompact(opts: {
       const activePatch = progressActivePatch();
 
       if ("error" in result) {
-        const errMsg = result.error instanceof Error ? result.error.message : "unknown error";
+        const errMsg = result.error instanceof Error ? "compaction request failed" : "unknown error";
         if (isDaemonTransportFailure(result.error)) opts.onTransportFailure?.(result.error);
-        console.log(`${label} FAILED (${errMsg})`);
+        console.error(`${label} FAILED (${errMsg})`);
         progressErrors.push({ sessionId: conv.sessionId, message: errMsg });
         onProgress?.({
           ...activePatch,
@@ -501,7 +487,7 @@ export async function batchCompact(opts: {
       const data = result.value;
       if (!opts.dryRun && !isCompactResponse(data)) {
         const errMsg = "malformed compact response";
-        console.log(`${label} FAILED (${errMsg})`);
+        console.error(`${label} FAILED (${errMsg})`);
         progressErrors.push({ sessionId: conv.sessionId, message: errMsg });
         onProgress?.({
           ...activePatch,
@@ -512,13 +498,13 @@ export async function batchCompact(opts: {
         return;
       }
       if (opts.dryRun) {
-        console.log(`  [dry-run] would compact: ${label}`);
+        console.error(`  [dry-run] would compact: ${label}`);
         completedCount++;
         onProgress?.({ ...activePatch, completed: completedCount });
       } else if (data?.skipped) {
         skipped++;
         completedCount++;
-        console.log(`${label} skipped (already in progress)`);
+        console.error(`${label} skipped (already in progress)`);
         onProgress?.({
           ...activePatch,
           completed: completedCount,
@@ -530,7 +516,7 @@ export async function batchCompact(opts: {
         const tokensBefore = data.tokensBefore ?? conv.tokens;
         const tokensAfter = data.tokensAfter ?? tokensBefore;
         const summary = data.summary?.trim() || "No compaction needed.";
-        console.log(`${label} unchanged (${summary})`);
+        console.error(`${label} unchanged (${summary})`);
         onProgress?.({
           ...activePatch,
           completed: completedCount,
@@ -541,9 +527,9 @@ export async function batchCompact(opts: {
         const tokensAfter = data.tokensAfter ?? tokensBefore;
         if (opts.verbose && tokensBefore > 0) {
           const pct = Math.round((1 - tokensAfter / tokensBefore) * 100);
-          console.log(`${label} done  (${(tokensBefore / 1000).toFixed(1)}k → ${(tokensAfter / 1000).toFixed(1)}k tokens, ${pct}% reduction)`);
+          console.error(`${label} done  (${(tokensBefore / 1000).toFixed(1)}k → ${(tokensAfter / 1000).toFixed(1)}k tokens, ${pct}% reduction)`);
         } else {
-          console.log(`${label} done`);
+          console.error(`${label} done`);
         }
         compacted++;
         completedCount++;
@@ -578,9 +564,9 @@ export async function batchCompact(opts: {
     if (tokensIn > 0) {
       const freed = tokensIn - tokensOut;
       const pct = Math.round((freed / tokensIn) * 100);
-      console.log(`\nBatch compact complete. ${compacted} session${compacted !== 1 ? "s" : ""} compacted, ${(tokensIn / 1000).toFixed(1)}k → ${(tokensOut / 1000).toFixed(1)}k tokens (${pct}% reduction, ${(freed / 1000).toFixed(1)}k freed)`);
+      console.error(`\nBatch compact complete. ${compacted} session${compacted !== 1 ? "s" : ""} compacted, ${(tokensIn / 1000).toFixed(1)}k → ${(tokensOut / 1000).toFixed(1)}k tokens (${pct}% reduction, ${(freed / 1000).toFixed(1)}k freed)`);
     } else {
-      console.log("\nBatch compact complete.");
+      console.error("\nBatch compact complete.");
     }
   }
 

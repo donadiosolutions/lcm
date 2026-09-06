@@ -326,6 +326,20 @@ describe("stats service coverage", () => {
     }
   });
 
+  it("explicitly refuses admitted PostgreSQL before reading local databases", async () => {
+    const config = await import("../src/daemon/config.js");
+    const readConfig = config.loadDaemonConfig;
+    const load = vi.spyOn(config, "loadDaemonConfig").mockImplementation((path) => {
+      const value = readConfig(path);
+      return {...value, storage: {...value.storage, backend: "postgresql"}};
+    });
+    try {
+      await expect(collectStats()).rejects.toBeInstanceOf(StorageBackendUnavailableError);
+      expect(mocks.collectEvents).not.toHaveBeenCalled();
+      expect(mocks.migrate).not.toHaveBeenCalled();
+    } finally {load.mockRestore();}
+  });
+
   it("rethrows unavailable PostgreSQL selection before an empty aggregate", async () => {
     mocks.storageUnavailable = true;
     mocks.baseExists = false;

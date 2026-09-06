@@ -10,6 +10,7 @@ import type {
   PostgreSqlTransactionOptions,
   PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
+import { PostgreSqlSnapshotSession, type PostgreSqlSnapshotOptions } from "./snapshot-session.js";
 import { buildPostgreSqlClientConfig } from "./client-config.js";
 import {
   isPostgreSqlConnectionError,
@@ -262,6 +263,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
   private closed = false;
   private closePromise: Promise<void> | undefined;
   private poolFailed = false;
+  private readonly snapshots = new Set<PostgreSqlSnapshotSession>();
 
   constructor(
     private readonly settings: PostgreSqlConnectionSettings,
@@ -290,6 +292,49 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       );
     }
     return this.queryDirect(config, options);
+  }
+
+  /** Open after factory/schema/project admission; never changes mutation mode. */
+  async openReadOnlySnapshot(
+    input: PostgreSqlSnapshotOptions,
+  ): Promise<PostgreSqlSnapshotSession> {
+    const context = { ...input, domain: "transaction", operation: "snapshot" } as const;
+    const projectIds = normalizedProjectScope(context);
+    if (projectIds.length !== 1) throw transactionScopeError(context);
+    const options = { projectId: projectIds[0]!, signal: input.signal };
+    this.assertOpen(context);
+    const client = await this.acquire(context).catch((error: unknown): never => {
+      throw normalizePostgreSqlError(error, context);
+    });
+    let session: PostgreSqlSnapshotSession | undefined;
+    const admitted = new Set(projectIds);
+    try {
+      this.assertOpen(context);
+    } catch (error) {
+      try {
+        client.release(true);
+      } finally {
+        throw error;
+      }
+    }
+    session = await PostgreSqlSnapshotSession.open({
+      query: <R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
+        config: QueryConfig<I>, queryOptions: PostgreSqlQueryOptions,
+      ) => this.queryClient<R, I>(
+        client, config, snapshotScopedQueryOptions(queryOptions, admitted, options.projectId),
+      ),
+      rollback: async () => { await client.query("ROLLBACK"); },
+      release: (destroy) => {
+        if (session) this.snapshots.delete(session);
+        client.release(destroy);
+      },
+    }, options);
+    if (this.closed) {
+      await session.close();
+      this.assertOpen(context);
+    }
+    this.snapshots.add(session);
+    return session;
   }
 
   backendPublicationGuard(): PostgreSqlBackendPublicationGuard {
@@ -822,7 +867,8 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
-    this.closePromise = this.pool.end().catch((error: unknown): never => {
+    this.closePromise = Promise.allSettled([...this.snapshots].map((session) => session.close()))
+      .then(() => this.pool.end()).catch((error: unknown): never => {
       this.closePromise = undefined;
       throw normalizePostgreSqlError(error, { domain: "factory", operation: "close" });
     });

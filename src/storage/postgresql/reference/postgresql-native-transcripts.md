@@ -2,10 +2,33 @@
 
 LCM can persist queryable, client-native transcript records in PostgreSQL
 without sending the original, unsanitized record to the database. This
-repository is available for explicit backfill and adapter conformance, but it
-is not yet selected by normal daemon or CLI ingestion. PostgreSQL daemon/CLI
-activation remains tracked by issue #224, and the broader migration and
+repository is selected by `lcm import` and daemon ingestion with a
+`transcript_path`. SQLite uses the same backfill pipeline and stores active
+native records in the selected project database. The broader migration and
 cutover remains tracked by issue #92.
+
+## Importing native sessions
+
+Use the existing `lcm import` client, project, and replay options. No additional
+native flag is required. PostgreSQL requires the restricted
+`postgresql-runtime-transcript-grants.sql` grant script described in
+[configuration](../../../../docs/configuration.md). SQLite remains the default
+without machine registration; its active native rows use a local machine
+sentinel. That sentinel does not establish a registered PostgreSQL identity.
+
+The parsed messages are committed first, then native records, exact links,
+and each durable checkpoint are committed together in bounded batches. If
+native storage or exact message linkage fails, the import reports failure.
+Retry the same import: existing parsed messages are retained and the native
+backfill resumes or validates and rescans its source. No complete-import
+acknowledgement is sent after a failed backfill. Quarantined records retain
+only local metadata and advance the validated backfill checkpoint.
+
+A structured `messages` request stores parsed messages only; when both
+`messages` and `transcript_path` are supplied, `messages` takes precedence.
+Metadata-only native files still enter native storage without creating a
+parsed conversation. SQLite canonical recovery archives are distinct from
+these active runtime records and remain immutable until migration activation.
 
 ## What “raw transcript” means
 
@@ -30,8 +53,8 @@ provides the bounded filesystem source,
 `createExactNativeTranscriptMessageResolver(conversations)` provides exact
 conversation/message lookup, and `createNativeTranscriptMessageMapper()`
 provides the built-in Claude/Codex mapper. Callers may inject a mapper, while
-the exact resolver is required. These are programmatic APIs, not daemon routes
-or CLI commands.
+the exact resolver is required. The daemon uses these same programmatic APIs
+for native imports.
 
 `runNativeTranscriptBackfill()` snapshots and validates its complete caller
 configuration before opening the source. Format fields, pattern arrays,
@@ -75,7 +98,8 @@ For every accepted record, PostgreSQL retains:
 - the client, format name, and format version;
 - the native session ID;
 - the registered machine and bound project IDs;
-- the client-root-relative source locator and source ordinal;
+- the source locator and zero-based source ordinal (daemon imports use the
+  SHA-256 of the validated canonical source path as an opaque locator);
 - the observed and ingested timestamps;
 - the scrubber version, sanitized-content SHA-256 digest, and deterministic
   ingest key; and
@@ -83,7 +107,7 @@ For every accepted record, PostgreSQL retains:
 
 `observedAt` is the client-originated time when local ingestion observes the
 sanitized native record. The #86 PostgreSQL repository validates that value and
-writes it into both `observed_at` and `ingested_at`. For this staged repository,
+writes it into both `observed_at` and `ingested_at`. For this repository,
 `ingestedAt` is therefore the durable acceptance time carried from that local
 observation, not PostgreSQL `statement_timestamp()`. The two columns use one
 clock, so a remote server clock that leads or lags the client cannot reject the
@@ -103,10 +127,10 @@ source ordinal, and links are otherwise exact.
 Programmatic callers use `NativeTranscriptRepository.ingestBatch()`,
 `getById()`, `listByNativeSession()`, `listBySource()`, `listByMessage()`, and
 `getCheckpoint()`. PostgreSQL callers construct
-`PostgreSqlNativeTranscriptRepository` explicitly during this staged phase;
-the repository is not part of `ProjectStorage`.
+`PostgreSqlNativeTranscriptRepository` directly or use the native capability
+provided by their admitted `ProjectStorage`.
 
-The installed package exposes only this staged adapter through the
+The installed package exposes the explicit native adapter through the
 `@donadiosolutions/lcm/storage/native-transcripts` subpath. For example:
 
 ```ts
@@ -147,7 +171,7 @@ nonnegative safe-integer limit.
 
 LCM recursively scrubs every string key and value using the bundled Gitleaks
 rules and built-in patterns plus the effective global and project patterns
-supplied by the embedded caller. The staged programmatic API does not load
+supplied by the embedded caller. The embedded programmatic API does not load
 configuration or project files implicitly. Before calling
 `createNativeTranscriptScrubber()` or `runNativeTranscriptBackfill()`, load
 global `security.sensitivePatterns` into `globalPatterns` and the project's
