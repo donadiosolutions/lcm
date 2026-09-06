@@ -64,6 +64,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let exactFileScheme = false;
   let foundFilePath = false;
   let filePathBracketDepth = 0;
+  let restartedPathlessFile = false;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
@@ -76,6 +77,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       exactFileScheme = false;
       foundFilePath = false;
       filePathBracketDepth = 0;
+      restartedPathlessFile = false;
       continue;
     }
     if (separator >= 0 && char === "[") {
@@ -97,12 +99,41 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       exactFileScheme = true;
       foundFilePath = false;
       filePathBracketDepth = 0;
+      restartedPathlessFile = false;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;
       authority[index + 6] = 1;
       authority[index + 7] = 1;
       continue;
+    }
+    if (
+      separator >= 0 &&
+      exactFileScheme &&
+      !foundFilePath &&
+      brackets === 0 &&
+      schemeQuote === 0 &&
+      (char === "?" || char === "#")
+    ) {
+      // An unquoted pathless file URL has finished its authority. Scan the
+      // query or fragment from fresh state so nested URLs and standalone paths
+      // retain their own classification.
+      separator = -1;
+      exactFileScheme = false;
+      foundFilePath = false;
+      filePathBracketDepth = 0;
+      schemeLength = 0;
+      fileSchemeLength = 0;
+      schemeQuote = 0;
+      restartedPathlessFile = true;
+      continue;
+    }
+    if (
+      restartedPathlessFile &&
+      URL_END_DELIMITERS.has(char) &&
+      !FILE_URL_AUTHORITY_DELIMITERS.has(char)
+    ) {
+      restartedPathlessFile = false;
     }
     // These characters are valid in a file URL authority. Keep classifying
     // until the first path separator, except when one closes a quote that
@@ -121,6 +152,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       exactFileScheme = false;
       foundFilePath = false;
       filePathBracketDepth = 0;
+      restartedPathlessFile = false;
       continue;
     }
     if (separator >= 0) {
@@ -141,7 +173,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       }
       continue;
     }
+    // Preserve the former file-authority handling for the first backslash in
+    // this tail without widening backslash detection in unrelated text.
+    if (restartedPathlessFile && char === "\\") {
+      restartedPathlessFile = false;
+      file[index] = 1;
+      continue;
+    }
     if (char === ":" && schemeLength > 0 && chars[index + 1] === "/" && chars[index + 2] === "/") {
+      restartedPathlessFile = false;
       separator = index;
       authority[index + 1] = 1;
       authority[index + 2] = 1;
