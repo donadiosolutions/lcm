@@ -149,6 +149,7 @@ component_management:
         # selection in this storage-abstractions owner.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
+        # #910 keeps shared publication retry deadlines monotonic in this owner.
         - "^src/storage/publication-convergence\\.ts$"
         - "^src/storage/capabilities\\.ts$"
         - "^src/storage/contracts\\.ts$"

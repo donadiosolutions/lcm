@@ -337,7 +337,9 @@ hashes, ownership, and modes are rechecked at each non-terminal boundary.
 During `lcm install`, publication-lock admission is bounded and authenticated
 against the managed daemon already serving the configured home. The preflight
 migration, root preparation, absent-config creation, backend selection, and
-installer publication assertions share one lazily armed two-second window.
+installer publication assertions share one lazily armed two-second monotonic
+elapsed window. Wall-clock corrections do not extend or shorten this
+publication retry duration.
 Lifecycle startup uses its own post-start child convergence window only after
 the exact authenticated child has been admitted.
 Only lock-acquisition callbacks are retried; writes, prompts, skill changes,

@@ -140,6 +140,7 @@ const expectedComponents = [
       "^src/storage/backend\\.ts$",
       // #844 keeps coordinator directory-witness authentication in this owner.
       "^src/storage/backend-publication\\.ts$",
+      // #910 keeps shared publication retry deadlines monotonic in this owner.
       "^src/storage/publication-convergence\\.ts$",
       "^src/storage/capabilities\\.ts$",
       "^src/storage/contracts\\.ts$",
