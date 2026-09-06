@@ -95,7 +95,24 @@ nonempty strings without NUL characters, and the identifier is looked up byte
 for byte without trimming or coercion. The `restore` flow has separate
 historical-context behavior and is unaffected by this filter.
 
-**Returns:** Array of matches with content snippet, type (message or summary), and session ID.
+**Returns:** A JSON object with separate `messages` and `summaries` arrays and
+`totalMatches`, equal to the number of hits in those arrays
+(`messages.length + summaries.length`). Message hits contain `messageId`,
+`conversationId`, `role`, `snippet`, and `createdAt`; summary hits contain
+`summaryId`, `conversationId`, `kind`, `snippet`, and `createdAt`. The
+`conversationId` on each hit is the numeric internal conversation identity.
+On the wire, `createdAt` is an ISO 8601 UTC string. Each hit may also include
+an optional numeric `rank`; it is a backend relevance value without a uniform
+meaning across search modes or hit types. The input `sessionId` is a string
+filter resolved to a conversation and is not returned on hits, and neither hit
+type has a `type` field.
+
+A successful search with no matches, including an unknown `sessionId`, returns
+`{ "messages": [], "summaries": [], "totalMatches": 0 }`. If `cwd` is
+missing or invalid, the project is unavailable, or an unclassified error is
+encountered, the HTTP fallback may instead return the legacy
+`{ "matches": [] }` body. Validation and storage-admission failures retain
+their error responses, so an empty body does not represent every failure.
 
 **Examples:**
 
