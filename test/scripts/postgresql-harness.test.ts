@@ -144,6 +144,117 @@ describe("PostgreSQL harness utilities", () => {
     })).toBeUndefined();
   });
 
+  it("authenticates every retained Windows parent and the selected handoff", () => {
+    const mount = (source: string) => ({ Mounts: [{
+      Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+    }] });
+    const environment = {
+      LCM_TEST_HARNESS_TMPDIR: "E:\\SelectedHandoff",
+      LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS: JSON.stringify({
+        version: 1,
+        parents: ["C:\\OriginalTemp", "D:\\OriginalTmp", "E:\\InjectedRoot"],
+      }),
+      TEMP: "C:\\WorkerScratch",
+      TMP: "C:\\WorkerScratch",
+    };
+    const realpath = (path: string) => path;
+    const accepted = [
+      "C:\\OriginalTemp\\lcm-postgresql-harness-original-temp",
+      "D:\\OriginalTmp\\lcm-postgresql-harness-original-tmp",
+      "E:\\InjectedRoot\\lcm-postgresql-harness-injected-root",
+      "E:\\SelectedHandoff\\lcm-postgresql-harness-selected-handoff",
+    ];
+    for (const source of accepted) {
+      expect(harnessDirectoryFromRecord(mount(source), {
+        environment,
+        realpath,
+        platformName: "win32",
+      })).toBe(source);
+    }
+    expect(harnessDirectoryFromRecord(
+      mount("c:\\originaltemp\\lcm-postgresql-harness-case-variant"),
+      { environment, realpath, platformName: "win32" },
+    )).toBe("c:\\originaltemp\\lcm-postgresql-harness-case-variant");
+
+    const rejected = [
+      "C:\\WorkerScratch\\lcm-postgresql-harness-worker",
+      "C:\\Windows\\lcm-postgresql-harness-system-root",
+      "D:\\Other\\lcm-postgresql-harness-unrelated",
+    ];
+    for (const source of rejected) {
+      expect(harnessDirectoryFromRecord(mount(source), {
+        environment,
+        realpath,
+        platformName: "win32",
+      })).toBeUndefined();
+    }
+  });
+
+  it("requires the selected handoff when Windows snapshot is missing", () => {
+    const mount = (source: string) => ({ Mounts: [{
+      Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+    }] });
+    const environment = {
+      LCM_TEST_HARNESS_TMPDIR: "E:\\SelectedHandoff",
+      TEMP: "C:\\OriginalTemp",
+      TMP: "D:\\OriginalTmp",
+    };
+    const realpath = (path: string) => path;
+    expect(harnessDirectoryFromRecord(
+      mount("E:\\SelectedHandoff\\lcm-postgresql-harness-selected"),
+      { environment, realpath, platformName: "win32" },
+    )).toBe("E:\\SelectedHandoff\\lcm-postgresql-harness-selected");
+    for (const source of [
+      "C:\\OriginalTemp\\lcm-postgresql-harness-original-temp",
+      "D:\\OriginalTmp\\lcm-postgresql-harness-original-tmp",
+      "C:\\WorkerScratch\\lcm-postgresql-harness-worker",
+      "C:\\Windows\\Temp\\lcm-postgresql-harness-fallback",
+    ]) {
+      expect(harnessDirectoryFromRecord(mount(source), {
+        environment: { ...environment, TEMP: "C:\\WorkerScratch", TMP: "C:\\WorkerScratch" },
+        realpath,
+        platformName: "win32",
+      })).toBeUndefined();
+    }
+  });
+
+  it.each([
+    [undefined, "C:\\Windows\\Temp\\lcm-postgresql-harness-fallback", "C:\\Windows\\Temp\\lcm-postgresql-harness-fallback"],
+    [JSON.stringify({ version: 1, parents: [] }), "C:\\Windows\\Temp\\lcm-postgresql-harness-fallback", undefined],
+  ])("distinguishes missing and valid-empty Windows snapshots", (snapshot, fallback, expected) => {
+    const mount = (source: string) => ({ Mounts: [{
+      Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+    }] });
+    const environment = {
+      LCM_TEST_HARNESS_TMPDIR: "E:\\SelectedHandoff",
+      LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS: snapshot,
+      SystemRoot: "C:\\Windows",
+      TEMP: "C:\\WorkerScratch",
+      TMP: "C:\\WorkerScratch",
+    };
+    const realpath = (path: string) => path;
+    expect(harnessDirectoryFromRecord(mount(fallback), {
+      environment,
+      realpath,
+      platformName: "win32",
+    })).toBe(expected);
+    expect(harnessDirectoryFromRecord(
+      mount("E:\\SelectedHandoff\\lcm-postgresql-harness-selected"),
+      { environment, realpath, platformName: "win32" },
+    )).toBe("E:\\SelectedHandoff\\lcm-postgresql-harness-selected");
+    for (const source of [
+      "C:\\OriginalTemp\\lcm-postgresql-harness-original-temp",
+      "D:\\OriginalTmp\\lcm-postgresql-harness-original-tmp",
+      "C:\\WorkerScratch\\lcm-postgresql-harness-worker",
+    ]) {
+      expect(harnessDirectoryFromRecord(mount(source), {
+        environment,
+        realpath,
+        platformName: "win32",
+      })).toBeUndefined();
+    }
+  });
+
   it("uses platform fallbacks for a missing snapshot and preserves native Windows paths", () => {
     const mount = (source: string) => ({ Mounts: [{
       Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,

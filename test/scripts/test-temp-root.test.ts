@@ -397,6 +397,37 @@ describe("test temporary parent selector", () => {
     expect(environment[LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS]).toBe(snapshot);
   });
 
+  it("captures native Windows TEMP and TMP parents before live rewrites", () => {
+    const environment: NodeJS.ProcessEnv = {
+      TEMP: "C:\\OriginalTemp",
+      TMP: "D:\\OriginalTmp",
+    };
+    const temporaryRoot = vi.fn(() => "E:\\InjectedRoot");
+    const captured = captureOriginalTemporaryParents(environment, "win32", temporaryRoot);
+    const snapshot = environment[LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS];
+
+    expect(captured).toEqual(["E:\\InjectedRoot", "C:\\OriginalTemp", "D:\\OriginalTmp"]);
+    expect(snapshot).toBe(JSON.stringify({
+      version: 1,
+      parents: ["E:\\InjectedRoot", "C:\\OriginalTemp", "D:\\OriginalTmp"],
+    }));
+
+    environment.TEMP = "C:\\WorkerScratch";
+    environment.TMP = "C:\\WorkerScratch";
+    const recapture = captureOriginalTemporaryParents(environment, "win32", () => {
+      throw new Error("an existing snapshot must not recapture live Windows roots");
+    });
+
+    expect(recapture).toBeUndefined();
+    expect(environment[LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS]).toBe(snapshot);
+    expect(parseOriginalTemporaryParents(snapshot, "win32")).toEqual([
+      "E:\\InjectedRoot",
+      "C:\\OriginalTemp",
+      "D:\\OriginalTmp",
+    ]);
+    expect(parseOriginalTemporaryParents(snapshot, "win32")).not.toContain("C:\\WorkerScratch");
+  });
+
   it.each([
     "",
     "not-json",
