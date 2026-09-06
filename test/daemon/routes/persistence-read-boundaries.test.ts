@@ -235,6 +235,33 @@ describe("persistence read route boundaries", () => {
     });
   });
 
+  it("preserves adjacent nested file URL schemes in describe wire errors", async () => {
+    mocks.describe.mockRejectedValueOnce(
+      new Error(
+        "read failed for https://outer.test/x?q=file://h.invalid/Users/a-file://h2.invalid/Users/b",
+      ),
+    );
+    await invoke(createDescribeHandler(config), { nodeId: "n", cwd: "/ok" });
+    expectLast(200, {
+      node: null,
+      error: "read failed for https://outer.test/x?q=file://h.invalid<path>file://h2.invalid<path>",
+    });
+  });
+
+  it("preserves adjacent nested file URL schemes in expand wire errors", async () => {
+    mocks.expand.mockRejectedValueOnce(
+      new Error(
+        "expand failed for https://outer.test/x?q=file://h.invalid/Users/a-file://h2.invalid/Users/b",
+      ),
+    );
+    await invoke(createExpandHandler(config), { nodeId: "n", cwd: "/ok" });
+    expect(mocks.expand).toHaveBeenCalled();
+    expectLast(200, {
+      expanded: null,
+      error: "expand failed for https://outer.test/x?q=file://h.invalid<path>file://h2.invalid<path>",
+    });
+  });
+
   it("sanitizes adjacent post-bracket paths in describe read errors", async () => {
     mocks.describe.mockRejectedValueOnce(
       new Error("read failed for file://host.invalid[/Users/canary/one.db]/Users/canary/two.db"),
