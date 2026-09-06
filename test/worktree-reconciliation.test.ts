@@ -4,6 +4,8 @@ import {
   chmodSync as fsChmodSync,
   existsSync,
   cpSync,
+  fstatSync,
+  linkSync,
   mkdirSync as fsMkdirSync,
   mkdtempSync,
   readFileSync,
@@ -15,6 +17,7 @@ import {
   writeFileSync as fsWriteFileSync,
 } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -47,6 +50,7 @@ import { recoverMachineIdentity } from "../src/machine-identity.js";
 import type { ResolvedStorageConfig } from "../src/daemon/config.js";
 import { EventsDb } from "../src/hooks/events-db.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
+import * as securityFiles from "../src/security-files.js";
 
 const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
   backend: "postgresql",
@@ -87,6 +91,19 @@ function makePrivateFixtureDirectory(
 function writePrivateFixtureFile(path: string, content: string): void {
   fsWriteFileSync(path, content, { mode: PRIVATE_FILE_MODE });
   fsChmodSync(path, PRIVATE_FILE_MODE);
+}
+
+function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T): T {
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const original = nodeFs[name];
+  nodeFs[name] = replacement;
+  syncBuiltinESMExports();
+  try {
+    return callback();
+  } finally {
+    nodeFs[name] = original;
+    syncBuiltinESMExports();
+  }
 }
 
 type IsolatedDirectoryFaults = Readonly<{
@@ -2064,6 +2081,103 @@ describe("worktree reconciliation", () => {
     expect(reconcileWorktrees(linked).status).toBe("completed");
     expect(readFileSync(metaPath, "utf8")).toBe(metadata);
   }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it.each([
+    {
+      fault: "hard-linked",
+      storedCwd: "canonical",
+      expectedMessage: "file has multiple hard links",
+    },
+    {
+      fault: "hard-linked",
+      storedCwd: "stale",
+      expectedMessage: "file has multiple hard links",
+    },
+    {
+      fault: "foreign-owned",
+      storedCwd: "canonical",
+      expectedMessage: "file owner is not trusted",
+    },
+    {
+      fault: "foreign-owned",
+      storedCwd: "stale",
+      expectedMessage: "file owner is not trusted",
+    },
+  ] as const)(
+    "rejects $fault target metadata with a $storedCwd cwd before parsing or publication",
+    ({ fault, storedCwd, expectedMessage }) => {
+      const { main, linked } = makeRepository(home);
+      const canonical = resolveGitProjectAnchor(main)!.canonical;
+      const targetHash = hashProjectPath(canonical);
+      const sourceHash = hashProjectPath(linked);
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+        [targetHash]: { canonical, aliases: [] },
+        [sourceHash]: { canonical: linked, aliases: [] },
+      }, null, 2)}\n`);
+      clearProjectMapCache();
+      const targetDir = join(home, ".lcm", "projects", targetHash);
+      const sourceDir = join(home, ".lcm", "projects", sourceHash);
+      makePrivateFixtureDirectory(targetDir, { recursive: true });
+      const metaPath = join(targetDir, "meta.json");
+      const metadata = `${JSON.stringify({
+        cwd: storedCwd === "canonical" ? canonical : linked,
+        attackerValue: "must-not-be-read",
+      })}\n`;
+      writePrivateFixtureFile(metaPath, metadata);
+      makeDatabase(
+        join(sourceDir, "db.sqlite"),
+        `metadata-${fault}-${storedCwd}`,
+        "content",
+        sourceHash,
+      );
+      const externalLink = join(home, `external-${storedCwd}-metadata.json`);
+      if (fault === "hard-linked") linkSync(metaPath, externalLink);
+      const before = statSync(metaPath);
+      expect(before.nlink).toBe(fault === "hard-linked" ? 2 : 1);
+
+      const parseSpy = vi.spyOn(JSON, "parse");
+      const writeSpy = vi.spyOn(securityFiles, "atomicWritePrivateFile");
+      try {
+        const reconcile = () => reconcileWorktrees(linked);
+        if (fault === "foreign-owned") {
+          const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+          const originalFstat = nodeFs.fstatSync as typeof fstatSync;
+          expect(() => withPatchedFs("fstatSync", ((fd: number, options?: unknown) => {
+            const observed = originalFstat(fd, options as never);
+            if (observed.dev !== before.dev || observed.ino !== before.ino) return observed;
+            const foreign = Object.create(observed) as typeof observed;
+            Object.defineProperty(foreign, "uid", { value: before.uid + 1 });
+            return foreign;
+          }) as typeof fstatSync, reconcile)).toThrow(expectedMessage);
+        } else {
+          expect(reconcile).toThrow(expectedMessage);
+        }
+        expect(parseSpy.mock.calls.some(([content]) => content === metadata)).toBe(false);
+        expect(writeSpy.mock.calls.some(([path]) => path === metaPath)).toBe(false);
+      } finally {
+        writeSpy.mockRestore();
+        parseSpy.mockRestore();
+      }
+
+      const after = statSync(metaPath);
+      expect(readFileSync(metaPath, "utf8")).toBe(metadata);
+      expect(after.ino).toBe(before.ino);
+      expect(after.nlink).toBe(before.nlink);
+      if (fault === "hard-linked") {
+        expect(readFileSync(externalLink, "utf8")).toBe(metadata);
+        expect(statSync(externalLink).ino).toBe(before.ino);
+      }
+      expect(existsSync(sourceDir)).toBe(true);
+      expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+      expect(listWorktreeReconciliationJournals()).toMatchObject([{
+        phase: "blocked",
+        blockedFrom: "planned",
+        reason: expect.stringContaining(expectedMessage),
+      }]);
+      expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    },
+    FULL_SUITE_PROCESS_TEST_TIMEOUT_MS,
+  );
 
   it("rejects target replacement before publishing patterns or metadata", () => {
     const { main, linked } = makeRepository(home);

@@ -227,6 +227,7 @@ const expectedComponents = [
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
       // #1044 keeps the existing owner; no taxonomy, status, or policy change.
+      // #1048 keeps target metadata leaf authentication in this owner.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },

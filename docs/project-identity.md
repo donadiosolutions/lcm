@@ -139,6 +139,20 @@ operator-visible result, and LCM does not publish a partially reconciled map.
 After the conflict is corrected, rerun reconciliation; the durable journal and
 merge markers continue from the verified state.
 
+The canonical target's `meta.json` is a separate leaf-file trust boundary. LCM
+refuses to parse or reuse it when its owner differs from the admitted project
+directory owner (`file owner is not trusted`) or when it has more than one hard
+link (`file has multiple hard links`). A deliberate user-created hard link also
+blocks reconciliation by design. Preserve the refused inode for inspection,
+then copy its verified content into a newly created owner-only temporary file in
+the target directory and atomically replace the `meta.json` directory entry.
+Copying over the existing hard-linked path does not break the link and does not
+repair the refusal. Rerun `lcm project reconcile-worktrees` after replacement;
+`lcm doctor` reports the blocked journal but does not retry it. Target database
+or pattern merges may already have completed before this late metadata check,
+so a journal blocked from the planned phase does not promise rollback; the
+durable merge markers make the explicit retry resumable.
+
 Reconciliation also fingerprints every mapped path so a repaired or remounted
 worktree invalidates a completed discovery result. An `ENOTDIR` observation for
 an unrelated map entry is recorded as stable unavailable evidence instead of
