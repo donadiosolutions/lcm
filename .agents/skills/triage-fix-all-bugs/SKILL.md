@@ -47,6 +47,12 @@ payloads. Do not treat this entrypoint as a replacement for the applicable phase
   Park externally blocked work and promptly refill slots with actionable Bugs.
   Parking alone is not terminal. Avoid obvious overlap where practical; do not
   acquire exclusive source-file locks or delay ready merges for convenience.
+- **Only exclusive resource:** every role treats only `lcm-daemon-update` as
+  exclusive, using the repository [flock skill](../flock/SKILL.md). Only the root
+  may acquire it for main LCM installation and daemon management. Do not create
+  additional workflow locks or resource reservations for files, worktrees, tests,
+  databases, review, publication, or merges; use isolated worker fixtures and
+  best-effort scheduling. This does not disable LCM's internal correctness locks.
 - **Exact candidate:** commit and freeze each candidate SHA. GLM and Grok review
   independently; Opus reviews second using both reports; the owner adjudicates.
   Freeze implementation while reports are being gathered. Every head change
@@ -108,9 +114,12 @@ mistaken for the already-fixed originating Bug. If a follow-up is later fixed,
 record the fixing SHA and verified resolution instead of leaving stale work open.
 
 Establish the run's root as the Environment Coordinator before any global LCM
-mutation. If another coordinator holds that responsibility, arrange an explicit
-handoff; do not seize its lock or let subagents replace the global installation.
-The root follows the repository's exact artifact installation and health workflow.
+mutation. Use `$flock lcm-daemon-update` through the repository
+[flock skill](../flock/SKILL.md), following the acquisition, contention, and
+release procedure in [LCM ownership](references/coordination.md#lcm-ownership).
+If another coordinator holds that responsibility, arrange an explicit handoff;
+responsibility alone does not establish lock ownership. The root follows the
+repository's exact artifact installation and health workflow while holding the lock.
 
 Use supported subagent mechanisms, within the runtime's depth and capacity limits.
 The logical hierarchy is root → bug owner → implementers/reviewers. If the surface

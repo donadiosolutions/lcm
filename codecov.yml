@@ -9,7 +9,9 @@ component_management:
         # Keep the #691 routing, #734 healthy-daemon store routing, #726/#742
         # hook entrypoints, and #866 publication-converged CLI reads exclusively
         # in Unit - CLI, including export admission failures and sensitive output.
+        # #1081 keeps unsupported export-format admission CLI-owned.
         # #978 keeps compact replacement runtime-digest admission CLI-owned.
+        # #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
@@ -67,8 +69,8 @@ component_management:
       name: "Unit - Daemon Core"
       paths:
         # Keep the #691/#700 response fences, #701 terminal factory-close retry,
-        # runtime identity, #825 bounded project metadata, and #1003
-        # owner/single-link preliminary metadata admission here.
+        # runtime identity, #825 bounded project metadata, #1003 owner/single-link
+        # admission, and #1050 bounded preliminary serialization here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
@@ -238,6 +240,7 @@ component_management:
         - "^src/portable-knowledge\\.ts$"
         - "^src/project-map\\.ts$"
         - "^src/worktree-reconciliation-fence\\.ts$"
+        # #1044 keeps the existing owner; no taxonomy, status, or policy change.
         # #1069 preserves completed reconciliation evidence after retained
         # directory cleanup failures in this existing component.
         - "^src/worktree-reconciliation\\.ts$"

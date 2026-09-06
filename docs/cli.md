@@ -50,6 +50,10 @@ In `lcm store`, `--tag` and `--tags` are repeatable single-tag aliases. This is
 different from `lcm export --tags`, which remains a comma-separated filter,
 for example `lcm export --tags decision,architecture`.
 
+`lcm export` writes JSON by default. The optional `--format` value accepts
+only `json`; unsupported values are rejected before export work or output
+writes begin.
+
 An unknown command writes an error and the complete command list to the
 terminal, completes both outputs, and then exits with status 1.
 
@@ -109,6 +113,10 @@ one retry; otherwise, the current contention is reported. Exhausted or
 rejected export admission exits unsuccessfully, including with `--output` or
 `--all`. An `--all` export may have already written earlier projects when a
 later project fails; those outputs remain, and no successful total is printed.
+
+The process-local catalogue discovery cache uses a monotonic elapsed-time TTL
+capped at 1,000 milliseconds; wall-clock corrections do not extend or shorten
+it, and identity and state guards still invalidate stale entries.
 
 The local `lcm stats` project-database scan authenticates the LCM state root,
 the `projects` directory, and each project directory as owner-held directories
@@ -348,6 +356,17 @@ validates the effective configuration, asks the host service manager to replace
 the exact LCM service, and waits for authenticated health before returning.
 After changing configuration, run the restart command once; do not start a
 second daemon to work around a health failure.
+
+When a failed start or restart reports a newly created daemon temporary
+directory with clipped owner permissions, the CLI retains the mapped recovery
+command and the trusted lifecycle guidance on one line:
+
+```text
+lcm daemon unavailable (startup-failure); run 'lcm daemon restart' or 'lcm doctor'. newly created daemon temp directory lacked required owner permissions, was removed, and retry should use an owner-preserving umask such as 0077
+```
+
+Follow the [managed-daemon temporary-storage recovery](daemon-temporary-storage.md)
+steps before retrying under an owner-preserving umask such as `0077`.
 
 Linux uses the current user's `systemd --user` manager and macOS uses the
 current user's `launchd` agent. Both integrations are deliberately one-shot:

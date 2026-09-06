@@ -18,8 +18,8 @@ When this creation error reaches the managed daemon lifecycle, its refusal
 contains the fixed retry guidance above for initial starts, stale-registration
 repairs, authenticated legacy migrations, and ordinary managed restarts. Other
 supervisor failures retain a generic warning; their error text is not exposed.
-The ordinary CLI failure renderer does not currently display this lifecycle
-warning. That separate CLI reporting gap is tracked independently.
+The ordinary CLI failure renderer includes this exact trusted warning after its
+mapped refusal remediation and does not expose other lifecycle warning values.
 
 An existing leaf is accepted only when it is a directory owned by the current
 user, has exactly the private mode (including special bits), is not a symbolic

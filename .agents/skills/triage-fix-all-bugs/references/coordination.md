@@ -58,15 +58,51 @@ No bug owner, reviewer, implementer, triage worker, duplicate adjudicator, or ot
 Whenever a merge advances the default branch HEAD and therefore publishes a new LCM HEAD, the root coordinator must:
 
 1. observe the current new default-branch HEAD;
-2. install that exact version using the repository's prescribed installation procedure;
+2. acquire `lcm-daemon-update` as described below, then re-read the current default-branch HEAD and install that exact version using the repository's prescribed installation procedure;
 3. verify the main LCM daemon is running;
-4. verify the daemon is healthy before returning to normal orchestration.
+4. verify the installed artifact identity and daemon health, record the evidence, then release the lock before returning to normal orchestration.
 
 If multiple merges occur before the coordinator processes an LCM update, converge directly to the current default-branch HEAD rather than intentionally installing obsolete intermediate versions.
 
-The root coordinator is the sole owner of any exclusive coordination primitive required specifically for the main LCM daemon.
+Use the repository [flock skill](../../flock/SKILL.md) with exactly the resource
+name `lcm-daemon-update`. This is the **only exclusive resource in this workflow,
+for every role**, across cooperating tasks on the same host. No additional
+workflow locks or reservations may serialize source files, worktrees, tests,
+databases, reviews, publication, or merges. Preserve LCM's internal correctness
+locks and use isolated fixtures for worker tests.
 
-It must hold **no other exclusive locks**.
+Before any global installation, daemon mutation, or recovery, the root acquires
+this resource in a dedicated Bash shell, starting at the repository root:
+
+```bash
+source .agents/skills/flock/scripts/lock.sh
+lock 'lcm-daemon-update' || exit "$?"
+# Run the prescribed artifact installation and health workflow in this shell.
+# Record exact installed SHA, artifact identity, and health/test evidence.
+exec 9>&-
+```
+
+Follow that skill's UUID and shared runtime-directory rules.
+Keep this same shell alive, with descriptor 9 open, through the entire protected
+operation, including required installation, connector, test, and health checks.
+For multiple tool calls, retain one live interactive shell session; acquisition
+in a completed one-shot call does not protect subsequent calls. Close descriptor
+9 in background children that must outlive the operation, including a daemon
+launched directly from this shell, so they cannot retain ownership after release.
+
+On exit status 75, report the observed holder metadata and defer only the LCM
+update. Continue unrelated campaign work; retry acquisition after release or an
+explicit coordinator handoff. Never delete or replace the lockfile, steal the
+lock, kill its holder, or treat stale metadata as ownership. Other acquisition
+errors also prohibit the mutation until resolved. A handoff requires the old
+holder to release and the new root to acquire successfully.
+
+Release with `exec 9>&-` or shell exit when the protected operation finishes or
+aborts, preserving failure evidence and pending recovery work on failure. Hold
+no lock while idle or waiting for unrelated workers, reviews, or CI. After a
+lost shell or resumed task, reacquire before further mutation and reconcile the
+installed state; a run-record entry is not proof of a live lock. Read-only health
+checks do not require exclusive ownership; any repair they trigger does.
 
 ## LCM health invariant
 

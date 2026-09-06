@@ -125,8 +125,11 @@ global captures the finite original parent candidates in the internal
 uses the selected handoff and that preserved snapshot, so a worker's rewritten
 `TMPDIR`, `TMP`, and `TEMP` cannot replace the parent's original authentication
 boundary. Existing snapshots are preserved verbatim; malformed or missing
-snapshots never trigger a nested recapture and safely degrade to the handoff
-plus platform fallbacks. Cleanup removes only roots created by the current run.
+snapshots never trigger a nested recapture. Windows snapshot and authentication
+parents have the same fully qualified drive or UNC-share requirement. A
+snapshot containing any invalid parent is treated as absent in full and safely
+degrades to the handoff plus platform fallbacks. Cleanup removes only roots
+created by the current run.
 
 Vitest config-time roots (`createVitestRunRoot` in `vitest.config.ts` and
 `postgresqlVitestCacheDir` in `vitest.postgresql.config.ts`) are resolved before

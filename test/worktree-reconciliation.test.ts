@@ -2747,6 +2747,64 @@ describe("worktree reconciliation", () => {
     }
   }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
+  it("blocks new work when a stale completed journal is observed before discovery", async () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    makePrivateFixtureDirectory(join(home, ".lcm", "projects", sourceHash), { recursive: true });
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const isolated = await importReconciliationWithDirectoryFaults({ targetDir });
+    try {
+      expect(isolated.module.reconcileWorktrees(main).status).toBe("completed");
+      const linkedB = join(home, "linked-b");
+      git(main, "worktree", "add", "-qb", "linked-b", linkedB);
+      const sourceBHash = hashProjectPath(linkedB);
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+        [targetHash]: listProjectMapEntries()[targetHash],
+        [sourceBHash]: { canonical: linkedB, aliases: [] },
+      }, null, 2)}\n`);
+      clearProjectMapCache();
+      makeDatabase(
+        join(home, ".lcm", "projects", sourceBHash, "db.sqlite"),
+        "early-stale-completed-failure",
+        "content",
+        sourceBHash,
+      );
+      const journalPath = join(home, ".lcm", "reconciliations", `${targetHash}.json`);
+      expect(() => isolated.module.reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event !== "after-map-preflight") return;
+          const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+            phase: string;
+            sourceHashes: string[];
+          };
+          expect(journal.phase).toBe("completed");
+          expect(journal.sourceHashes).toEqual([sourceHash]);
+          throw new Error("injected stale-completed precompletion failure");
+        },
+      })).toThrow("injected stale-completed precompletion failure");
+      const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+        phase: string;
+        blockedFrom?: string;
+        reason?: string;
+        sourceHashes: string[];
+      };
+      expect(journal.phase).toBe("blocked");
+      expect(journal.blockedFrom).toBe("planned");
+      expect(journal.reason).toContain("injected stale-completed precompletion failure");
+      expect(journal.sourceHashes).toEqual([sourceHash]);
+      expect(listProjectMapEntries()).toHaveProperty(sourceBHash);
+      expect(existsSync(join(home, ".lcm", "projects", sourceBHash, "db.sqlite"))).toBe(true);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
   it("closes an existing target handle when its post-open entry check detects drift", async () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
@@ -6536,6 +6594,76 @@ describe("worktree reconciliation", () => {
     }, null, 2)}\n`);
     clearProjectMapCache();
     expect(reconcileWorktrees(main, { dryRun: true }).status).toBe("not-needed");
+  });
+
+  it.each([
+    { name: "frozen", wallNow: () => 1_000_000 },
+    { name: "backward", wallNow: () => 999_000 },
+    { name: "forward", wallNow: () => Number.MAX_SAFE_INTEGER },
+  ])("keeps catalogue cache TTL monotonic across a $name wall-clock", ({ wallNow }) => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const identity = { id: hashProjectPath(canonical), canonical };
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [identity.id]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const codexDir = join(home, ".codex");
+    let catalogueWalks = 0;
+    const discoveryObserver = (path: string) => {
+      if (path === join(codexDir, "worktrees")) catalogueWalks += 1;
+    };
+    let monotonicNow = 0;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    let currentWallNow = 1_000_000;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => currentWallNow);
+    try {
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("not-needed");
+      const afterInitial = catalogueWalks;
+      expect(afterInitial).toBeGreaterThan(0);
+
+      monotonicNow = 999;
+      currentWallNow = wallNow();
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("completed");
+      expect(catalogueWalks).toBe(afterInitial);
+
+      monotonicNow = 1_000;
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("completed");
+      const afterRenewal = catalogueWalks;
+      expect(afterRenewal).toBeGreaterThan(afterInitial);
+
+      monotonicNow = 1_999;
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("completed");
+      expect(catalogueWalks).toBe(afterRenewal);
+
+      monotonicNow = 2_000;
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("completed");
+      expect(catalogueWalks).toBeGreaterThan(afterRenewal);
+      expect(performanceNow).toHaveBeenCalled();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
   });
 
   it("bounds catalogue cache freshness and invalidates on state, identity, and clear", () => {

@@ -78,6 +78,7 @@ import type {
 } from "../src/storage/postgresql/passive-event-repository.js";
 import { CONNECTOR_TRANSPORTS } from "../src/connectors/types.js";
 import { createAbortError, isAbortError, throwIfAborted } from "../src/daemon/cancellation.js";
+import { SUPERVISOR_DAEMON_TEMP_CREATION_WARNING } from "../src/daemon/supervisor.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -1986,6 +1987,7 @@ export function writeCliError(value: string): void {
 type LifecycleResultWithRefusal = Readonly<{
   connected?: boolean;
   refusalReason?: unknown;
+  warning?: unknown;
 }>;
 
 function daemonRefusalReason(
@@ -2010,7 +2012,10 @@ function daemonUnavailableMessage(
   result: LifecycleResultWithRefusal | undefined,
   fallback: DaemonRefusalReason,
 ): string {
-  return mapDaemonRefusalToRemediation(daemonRefusalReason(result, fallback)).message;
+  const message = mapDaemonRefusalToRemediation(daemonRefusalReason(result, fallback)).message;
+  return result?.warning === SUPERVISOR_DAEMON_TEMP_CREATION_WARNING
+    ? `${message} ${SUPERVISOR_DAEMON_TEMP_CREATION_WARNING}`
+    : message;
 }
 
 function clearDaemonRemediationMarker(): void {
@@ -3941,13 +3946,19 @@ export async function runCli(
     .option("--tags <tags>", "Only export entries matching these comma-separated tags")
     .option("--since <date>", "Only export entries created on or after this ISO date (e.g. 2026-01-01)")
     .option("--output <file>", "Write output to file instead of stdout")
-    .option("--format <format>", "Output format: json (default)", "json")
+    .option("--format <format>", "Output format: json only (default)", "json")
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("export"); exit(0);
+      }
+
+      const format = opts.format ?? "json";
+      if (format !== "json") {
+        console.error("Invalid --format: only json is supported.");
+        exit(1);
       }
 
       const { loadDaemonConfig } = await import("../src/daemon/config.js");

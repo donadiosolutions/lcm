@@ -17,9 +17,17 @@ With the default SQLite backend, all storage is on your machine:
   parsed or rewritten. Missing metadata is created; malformed or non-object
   metadata is rebuilt; valid metadata with the current project path is left
   unchanged; and valid metadata with a different path is replaced atomically
-  with mode `0600`. If metadata restored as another user blocks initialization,
-  correct its ownership or remove `meta.json`; missing metadata is regenerated
-  on the next initialization. Separately, final successful ingest and compact
+  with mode `0600`. The serialized UTF-8 representation, including indentation
+  and its terminating newline, must also fit within 1 MiB. If publication would
+  exceed that limit, LCM reports `project metadata exceeds size limit` before
+  writing and preserves an existing `meta.json` unchanged.
+
+  To recover, inspect `~/.lcm/projects/{hash}/meta.json` and reduce optional
+  metadata until the serialized file fits. You can instead back up and remove
+  only `meta.json` so LCM regenerates it on the next initialization; the project
+  history in `db.sqlite` is preserved. If metadata restored as another user
+  blocks initialization, correct its ownership or use the same metadata-only
+  recovery. Separately, final successful ingest and compact
   timestamp updates use the same size, regular-file, and single-link checks as
   a best-effort write, and require a matching owner when the process user ID is
   available. Malformed, oversized, linked, non-regular, or owner-mismatched

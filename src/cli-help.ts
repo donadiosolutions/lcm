@@ -392,13 +392,13 @@ const HELP: Record<string, CommandHelp> = {
 
   export: {
     summary: "Export promoted knowledge to a portable JSON file (secrets scrubbed).",
-    usage: "lcm export [--all] [--tags <tags>] [--since <date>] [--output <file>]",
+    usage: "lcm export [--all] [--tags <tags>] [--since <date>] [--output <file>] [--format <format>]",
     options: [
       ["--all", "Export all projects (one file per project, auto-named)"],
       ["--tags <tags>", "Only export entries that have all these comma-separated tags"],
       ["--since <date>", "Only export entries created on or after this ISO date (e.g. 2026-01-01)"],
       ["--output <file>", "Write output to file instead of stdout"],
-      ["--format <format>", "Output format: json (default)"],
+      ["--format <format>", "Output format: json only (default)"],
     ],
     examples: [
       ["lcm export", "Print current project knowledge to stdout"],
@@ -407,7 +407,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm export --tags decision,architecture", "Only export entries tagged with both tags"],
       ["lcm export --all", "Export all projects to auto-named JSON files"],
     ],
-    notes: "Secrets are automatically scrubbed using the project's sensitive patterns before export. The JSON format is: { version, exportedAt, projectCwd, entries: [{content, tags, confidence, createdAt, sessionId}] }.",
+    notes: "Secrets are automatically scrubbed using the project's sensitive patterns before export. Only the json format is supported; other --format values are rejected before export work starts. The JSON format is: { version, exportedAt, projectCwd, entries: [{content, tags, confidence, createdAt, sessionId}] }.",
   },
 
   "import-knowledge": {

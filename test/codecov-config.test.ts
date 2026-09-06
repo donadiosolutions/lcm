@@ -226,6 +226,7 @@ const expectedComponents = [
       "^src/portable-knowledge\\.ts$",
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
+      // #1044 keeps the existing owner; no taxonomy, status, or policy change.
       // #1069 preserves completed reconciliation evidence after retained
       // directory cleanup failures in this existing component.
       "^src/worktree-reconciliation\\.ts$",
@@ -520,6 +521,7 @@ describe("Codecov configuration", () => {
     // #888 keeps private final ingest and compact metadata writes route-owned.
     // #890 keeps bounded best-effort status metadata reads route-owned.
     // #1003 keeps preliminary metadata admission daemon-core-owned.
+    // #1050 keeps bounded preliminary metadata serialization there too.
     // #947 keeps promote metadata-parent resource handling and fail-closed
     // topology behavior in the existing daemon-routes component.
     // #948 keeps promote metadata parent-first admission, sampled read binding,
@@ -530,7 +532,9 @@ describe("Codecov configuration", () => {
     // configuration-security-owned.
     const expectedOwners = [
       // #866 export admission failures and sensitive result emission stay CLI-owned.
+      // #1081 keeps unsupported export-format admission CLI-owned.
       // #978 keeps compact replacement runtime-digest admission CLI-owned.
+      // #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
       ["src/private-mutation-lock.ts", "unit-configuration-security"],
