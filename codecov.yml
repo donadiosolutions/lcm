@@ -220,6 +220,7 @@ component_management:
         - "^src/codex-project-resolution\\.ts$"
         - "^src/git-project\\.ts$"
         - "^src/machine-identity\\.ts$"
+        # #889 keeps private import metadata publication in this owner.
         - "^src/portable-knowledge\\.ts$"
         - "^src/project-map\\.ts$"
         - "^src/worktree-reconciliation-fence\\.ts$"

@@ -528,6 +528,7 @@ describe("Codecov configuration", () => {
       ["src/security-files.ts", "unit-configuration-security"],
       ["src/sensitive.ts", "unit-configuration-security"],
       ["src/project-map.ts", "unit-project-worktrees"],
+      // #889 keeps private import metadata publication in this owner.
       ["src/portable-knowledge.ts", "unit-project-worktrees"],
       // #866 stats config retries and journal failures, plus #973 project
       // database admission, retain this owner.
