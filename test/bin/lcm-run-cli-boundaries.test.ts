@@ -238,7 +238,10 @@ vi.mock("../../src/stats.js", () => ({ collectStats: vi.fn(() => ({})), printSta
 vi.mock("../../src/doctor/doctor.js", () => ({ runDoctor: vi.fn(async () => []), printResults: vi.fn() }));
 vi.mock("../../src/diagnose.js", () => ({ diagnose: vi.fn(async () => ({})), formatDiagnoseResult: vi.fn(() => "ok") }));
 vi.mock("../../src/sensitive.js", () => ({ handleSensitive: vi.fn(async () => ({ stdout: "", exitCode: 0 })) }));
-vi.mock("../../installer/install.js", () => ({ install: vi.fn(async () => undefined) }));
+vi.mock("../../installer/install.js", () => ({
+  install: vi.fn(async () => undefined),
+  createInstallerPublicationConvergence: vi.fn(async () => undefined),
+}));
 vi.mock("../../installer/uninstall.js", () => ({ uninstall: vi.fn(async () => undefined) }));
 vi.mock("../../installer/dry-run-deps.js", () => ({ DryRunServiceDeps: class {} }));
 

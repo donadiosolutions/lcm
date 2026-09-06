@@ -4093,25 +4093,10 @@ export async function runCli(
     const action = actionCommand.name();
     const usePublicationConvergence = shouldUsePublicationConvergence(actionCommand);
     if (usePublicationConvergence) {
-      let withPublicationAdmissionRetry: typeof import("../src/storage/publication-convergence.js").withPublicationAdmissionRetry | undefined;
-      const installer = await import("../installer/install.js");
-      const factory = Object.prototype.hasOwnProperty.call(installer, "createInstallerPublicationConvergence")
-        ? installer.createInstallerPublicationConvergence
-        : undefined;
-      if (factory !== undefined) {
-        publicationConvergence ??= await factory();
-        withPublicationAdmissionRetry = (await import("../src/storage/publication-convergence.js")).withPublicationAdmissionRetry;
-        const admission = withPublicationAdmissionRetry;
-        publicationAdmissionRetry = (run) => admission(run, publicationConvergence);
-      }
-      if (withPublicationAdmissionRetry === undefined) {
-        await migrateLegacyHomeWithRetry({
-          migrate,
-          sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
-          attempt: preflightSeams?.attempt,
-        });
-        return;
-      }
+      const { createInstallerPublicationConvergence } = await import("../installer/install.js");
+      publicationConvergence ??= await createInstallerPublicationConvergence();
+      const { withPublicationAdmissionRetry } = await import("../src/storage/publication-convergence.js");
+      publicationAdmissionRetry = (run) => withPublicationAdmissionRetry(run, publicationConvergence);
       await withPublicationAdmissionRetry(() => migrateLegacyHomeWithRetry({
         migrate,
         sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,

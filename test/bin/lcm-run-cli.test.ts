@@ -432,6 +432,13 @@ describe("runCli registration and help dispatch", () => {
     expect(state.install).toHaveBeenCalledWith(undefined, convergence);
   });
 
+  it("forwards an undefined convergence to top-level install", async () => {
+    await invoke(["install"]);
+
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+    expect(state.install).toHaveBeenCalledWith(undefined, undefined);
+  });
+
   it("retries top-level doctor migration through the shared convergence", async () => {
     const convergence = createPublicationConvergence({
       port: 3737,
