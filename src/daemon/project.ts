@@ -427,7 +427,11 @@ export const ensureProjectDirForIdentity = (
       }
       if (result === undefined) {
         assertProjectTopology(rootHandle, rootPath, projectsHandle, projectsPath, leafHandle, dir);
-        atomicWritePrivateFile(metaPath, JSON.stringify(meta, null, 2) + "\n", {}, leafHandle);
+        const serialized = JSON.stringify(meta, null, 2) + "\n";
+        if (Buffer.byteLength(serialized, "utf8") > MAX_PROJECT_METADATA_BYTES) {
+          throw new Error("project metadata exceeds size limit");
+        }
+        atomicWritePrivateFile(metaPath, serialized, {}, leafHandle);
         assertProjectTopology(rootHandle, rootPath, projectsHandle, projectsPath, leafHandle, dir);
         result = dir;
       }
