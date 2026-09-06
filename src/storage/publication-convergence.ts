@@ -192,14 +192,14 @@ async function retryDelay(
   try {
     birth = (convergence.deps.processBirth ?? processStartTime)(owner.pid, undefined, { timeoutMs: remainingBirth });
   } catch {
-    return undefined;
+    return now() >= deadline ? { expired: true } : undefined;
   }
-  if (birth !== owner.processStartTime) return undefined;
+  if (birth !== owner.processStartTime) return now() >= deadline ? { expired: true } : undefined;
   const remainingHealth = deadline - now();
   if (remainingHealth <= 0) return { expired: true };
   const health = await authenticatedHealth(convergence.deps, convergence.port, Math.min(2_000, remainingHealth));
-  if (!healthMatches(health, convergence.identity, convergence.deps.platform ?? process.platform)) return undefined;
   if (now() >= deadline) return { expired: true };
+  if (!healthMatches(health, convergence.identity, convergence.deps.platform ?? process.platform)) return undefined;
   convergence.deadline = deadline;
   const delay = Math.min(PUBLICATION_CONVERGENCE_POLL_MS, Math.max(1, deadline - now()));
   return delay;

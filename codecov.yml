@@ -143,6 +143,8 @@ component_management:
         # #844 extends the coordinator's locked evidence/material reads with
         # one operation-scoped directory witness and a fail-closed return check.
         # #837 retains consumer-admission descriptor cleanup in this owner.
+        # #906 keeps bounded publication-convergence probe expiry and error
+        # selection in this storage-abstractions owner.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
         - "^src/storage/publication-convergence\\.ts$"

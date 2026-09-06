@@ -343,7 +343,10 @@ the exact authenticated child has been admitted.
 Only lock-acquisition callbacks are retried; writes, prompts, skill changes,
 and daemon startup remain outside those callbacks and therefore run once. A
 foreign, malformed, stale, or unverifiable owner, or any identity drift,
-preserves the original typed contention failure and fails closed.
+fails closed. A bounded process-birth or authenticated-health probe that
+settles failed at or after the armed deadline preserves the original
+contention without another wait; the same failed evidence while time remains
+reports the later contention, and admission stays fail-closed in both cases.
 
 The terminal journal deliberately does not rehash mutable `~/.lcm/` content on
 later startups. Normal database, daemon, transcript, and configuration writes
