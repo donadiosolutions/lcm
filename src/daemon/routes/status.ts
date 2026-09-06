@@ -1,6 +1,8 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
+import { dirname } from "node:path";
+import { readBoundedRegularFile } from "../../security-files.js";
 import type { DaemonConfig } from "../config.js";
-import { projectDbPath, projectMetaPath } from "../project.js";
+import { MAX_PROJECT_METADATA_BYTES, projectDbPath, projectMetaPath } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { PKG_VERSION } from "../server.js";
@@ -72,15 +74,19 @@ export function createStatusHandler(config: DaemonConfig, startTime: number, act
       let lastPromote: string | null = null;
 
       const metaPath = projectMetaPath(cwd);
-      if (existsSync(metaPath)) {
-        try {
-          const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-          lastIngest = meta.lastIngest ?? null;
-          lastCompact = meta.lastCompact ?? null;
-          lastPromote = meta.lastPromote ?? null;
-        } catch {
-          // If meta.json parse fails, keep timestamps as null
-        }
+      try {
+        const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+        const meta = JSON.parse(readBoundedRegularFile(metaPath, {
+          allowedRoot: dirname(metaPath),
+          maxBytes: MAX_PROJECT_METADATA_BYTES,
+          expectedUid,
+          requireSingleLink: true,
+        }));
+        lastIngest = meta.lastIngest ?? null;
+        lastCompact = meta.lastCompact ?? null;
+        lastPromote = meta.lastPromote ?? null;
+      } catch {
+        // Missing, malformed, rejected, or concurrently replaced metadata is best-effort.
       }
 
       sendJson(res, 200, {
