@@ -412,16 +412,32 @@ describe("sanitizeError", () => {
 
   it.each([
     [
+      "https://outer.test/x?file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x?file://host.invalid<path>",
+    ],
+    [
       "https://outer.test/x?next=file://host.invalid/Users/canary/private.db",
       "https://outer.test/x?next=file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x#file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x#file://host.invalid<path>",
     ],
     [
       "https://outer.test/x#next=file://host.invalid/Users/canary/private.db",
       "https://outer.test/x#next=file://host.invalid<path>",
     ],
     [
+      "https://outer.test/x&file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x&file://host.invalid<path>",
+    ],
+    [
       "https://outer.test/x&next=file://host.invalid/Users/canary/private.db",
       "https://outer.test/x&next=file://host.invalid<path>",
+    ],
+    [
+      "https://outer.test/x=file://host.invalid/Users/canary/private.db",
+      "https://outer.test/x=file://host.invalid<path>",
     ],
     [
       "https://outer.test/x=next=file://host.invalid/Users/canary/private.db",
