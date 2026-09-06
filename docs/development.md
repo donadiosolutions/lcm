@@ -81,12 +81,21 @@ integration files run only through `pnpm run test:postgresql`; see
 [PostgreSQL development](../src/storage/postgresql/reference/postgresql-development.md)
 for the isolated container prerequisites and lifecycle.
 
-## Coordinated Bug campaigns
+## Coordinated GitHub work
 
-Use the repository's [triage-fix-all-bugs skill](triage-fix-all-bugs.md) to
-coordinate triage, independent reviews, and merges for all currently open native
-GitHub Bug issues. The guide explains invocation, prerequisites, progress reports,
-and how follow-up Bugs remain outside the campaign's frozen scope.
+Use the repository's [triage-fix-all-bugs skill](triage-fix-all-bugs.md) for an
+S0-frozen campaign covering every currently open native GitHub Bug issue. It
+performs inventory agreement, duplicate adjudication, and triage before handing
+accepted work to [procedural development](procedural-development.md).
+
+Use [procedural development](procedural-development.md) for a direct GitHub
+issue or a bounded inventory supplied by a caller. It defines the shared role
+defaults, override rules, exact-SHA reviews, and candidate-round outcomes.
+
+Use [implement-epic](implement-epic.md) for a GitHub Epic and its recursively
+planned descendants. It preserves issue bodies, records checkpoint comments, and
+schedules ready work without treating accepted prerequisites or external blockers
+as completion.
 
 ## Codex Responses gateway fixtures
 
