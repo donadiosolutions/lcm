@@ -7,7 +7,7 @@ description: Use when cooperating Codex threads need exclusive ownership of a na
 
 **The caller names the resource. The skill handles everything else.**
 
-Invoke with exactly one resource name: `$flock lcm-daemon`. Other examples:
+Invoke with exactly one resource name: `$flock lcm-daemon-update`. Other examples:
 `$flock git-worktree-499`, `$flock deployment-production`, `$flock gpu-b300-0`,
 or `$flock powerhome/lcm:worktree-499`. Quote names containing spaces.
 
@@ -20,7 +20,7 @@ skill's helper:
 
 ```sh
 source .agents/skills/flock/scripts/lock.sh
-lock 'lcm-daemon' || exit "$?"
+lock 'lcm-daemon-update' || exit "$?"
 # Perform the protected work here, while this shell still owns descriptor 9.
 ```
 
@@ -38,7 +38,9 @@ supply its own UUID. If neither source exposes it, stop without acquiring.
 
 The helper opens without truncation, attempts exclusive nonblocking `flock`,
 rejects pre-existing symlink or non-regular lockfiles, then replaces metadata
-through the locked descriptor only after acquisition:
+only after acquisition by reopening `/proc/self/fd/9` for truncation and output.
+This separate open targets the inode held by descriptor 9, even if the original
+lockfile path is replaced:
 
 ```text
 thread=0199b4ef-dfde-7a81-b33e-c439d91932d8
