@@ -116,7 +116,8 @@ component_management:
       name: "Unit - LLM, Responses, and Prompts"
       paths:
         # The #779 authenticated Responses terminal gateway, #780 bounded
-        # Codex failure classification, and #790 endpoint resolver remain LLM-owned.
+        # Codex failure classification, #790 endpoint resolver, and #885
+        # missing-Codex diagnostic factory remain LLM-owned.
         - "src/llm/"
         - "src/prompts/"
     - component_id: "unit-local-persistence"

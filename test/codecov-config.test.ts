@@ -548,6 +548,8 @@ describe("Codecov configuration", () => {
       ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
+      // #885 keeps the shared missing-Codex diagnostic and its resolver
+      // identity handling within the existing LLM component.
       ["src/llm/codex-process.ts", "unit-llm-prompts"],
       ["src/llm/codex-config.ts", "unit-llm-prompts"],
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
