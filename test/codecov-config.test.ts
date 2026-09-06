@@ -226,6 +226,8 @@ const expectedComponents = [
       "^src/portable-knowledge\\.ts$",
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
+      // #1069 preserves completed reconciliation evidence after retained
+      // directory cleanup failures in this existing component.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
