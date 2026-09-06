@@ -398,6 +398,8 @@ export const ensureProjectDirForIdentity = (
         content = readBoundedRegularFile(metaPath, {
           allowedRoot: dir,
           maxBytes: MAX_PROJECT_METADATA_BYTES,
+          expectedUid,
+          requireSingleLink: true,
         });
       } catch (error) {
         if (errorCode(error) !== "ENOENT") throw error;

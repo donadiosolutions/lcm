@@ -96,9 +96,11 @@ take up to two seconds. After the first qualifying contention, retries share a
 single two-second monotonic elapsed deadline and poll at most every 50
 milliseconds; time spent in process-birth and health checks counts against that
 deadline. Wall-clock corrections do not extend or shorten this retry duration.
-Bootstrap migration attempts and worktree-reconciliation lock loops have their
-own existing bounds, and ordinary command I/O plus an in-flight attempt can
-extend total command time. Missing, foreign, malformed, stale, or unhealthy
+Bootstrap migration attempts have their own existing bounds. Worktree
+reconciliation lock acquisition uses a five-second monotonic retry window and
+polls at most every 50 milliseconds; wall-clock corrections do not extend or
+shorten that window. Ordinary command I/O plus an in-flight attempt can extend
+total command time. Missing, foreign, malformed, stale, or unhealthy
 publication evidence still fails closed and exits with status 1. Before the
 retry deadline's expiry is recognized, a refusal reports the current typed
 contention; after recognized expiry, the first contention for the current
@@ -237,8 +239,8 @@ before it can retry publication contention. It never derives that expected
 version from daemon health; if the installed version is unavailable or blank,
 doctor reports the original contention for the affected stage.
 
-The retry budget is a single two-second wall-clock window shared by every
-stage of one doctor run, polled at most every 50 milliseconds. Time spent
+The retry budget is a single two-second monotonic elapsed window shared by
+every stage of one doctor run, polled at most every 50 milliseconds. Time spent
 inside a refused attempt, the platform process-birth probe, and the
 authenticated health probe counts against that window. On platforms that need
 an external trusted process-birth helper, its timeout is shortened to the
@@ -477,4 +479,7 @@ If cancellation cannot prove that the managed daemon and its owned provider
 work disappeared, LCM does not signal an unknown process or claim success. It
 stays in draining state, reports the missing proof, and fails closed. This also
 applies when a managed restart cannot prove old-instance disappearance and
-replacement identity.
+replacement identity. Replacement proof requires the packaged runtime digest
+of the invoking CLI to exactly match the new daemon. When that digest is
+unavailable, including source-style CLI execution without packaged build
+metadata, the drain remains unproved and reports the missing identity proof.

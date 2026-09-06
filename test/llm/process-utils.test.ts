@@ -1657,33 +1657,52 @@ describe("owned process lifecycle utilities", () => {
     process.env.HOME = root;
     try {
       mkdirSync(join(root, ".lcm"), { recursive: true, mode: 0o700 });
+      // Path-less store: sole cover of the store default-path branch (src:671).
       const store = createProviderProcessWitnessStore({ daemonInstanceId: "daemon-default" });
-      const entry = {
+      expect(store.path).toBe(join(root, ".lcm", "daemon-runtime.json"));
+      const retained = {
         daemonInstanceId: "daemon-default",
         providerId: "claude-process",
-        pid: 17,
+        pid: 4101,
         pgid: null,
         processStartTime: null,
       } as const;
-      store.add(entry);
-      expect(store.path).toContain("daemon-runtime.json");
-      expect(readProviderProcessWitnesses({ _getUid: () => undefined })).toMatchObject({
-        available: true,
-        providers: [entry],
-      });
-      const reusedEntry = {
+      const stale = {
         daemonInstanceId: "daemon-default",
         providerId: "default-reconcile",
-        pid: process.pid,
+        pid: 4102,
         pgid: null,
         processStartTime: "old-process-birth",
       } as const;
-      store.add(reusedEntry);
-      expect(reconcileProviderProcessWitnesses({ daemonInstanceId: "daemon-default" })).toEqual({
+      store.add(retained);
+      store.add(stale);
+      // Path-less read: sole cover of the read default-path branch (src:555).
+      expect(readProviderProcessWitnesses({ _getUid: () => undefined })).toMatchObject({
         available: true,
-        providers: [entry],
+        providers: [retained, stale],
       });
-      store.remove(entry);
+      // Liveness and birth arrive only through seams; no host process is signaled.
+      const killProcess = vi.fn();
+      const processBirthTime = vi.fn(() => "new-process-birth");
+      // Path-less reconcile: sole cover of the reconcile default-path branch (src:750).
+      expect(reconcileProviderProcessWitnesses({
+        daemonInstanceId: "daemon-default",
+        killProcess,
+        processBirthTime,
+      })).toEqual({ available: true, providers: [retained] });
+      // Both rows are live; the stale row dies by birth mismatch, not by ESRCH.
+      expect(killProcess.mock.calls).toEqual([[retained.pid, 0], [stale.pid, 0]]);
+      expect(processBirthTime.mock.calls).toEqual([[stale.pid]]);
+      // Persisted readback: canonical reader plus the document actually on disk.
+      expect(readProviderProcessWitnesses({ _getUid: () => undefined })).toMatchObject({
+        available: true,
+        providers: [retained],
+      });
+      expect(JSON.parse(readFileSync(store.path, "utf8")) as unknown).toEqual({
+        version: 2,
+        daemonInstances: ["daemon-default"],
+        providers: [retained],
+      });
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;

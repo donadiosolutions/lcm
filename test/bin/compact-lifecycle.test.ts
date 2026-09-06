@@ -468,6 +468,167 @@ describe("compact invocation lifecycle", () => {
     expect(health).toHaveBeenCalledTimes(2);
   });
 
+  it("requires an exact nonempty invoking digest for replacement identity", async () => {
+    const cases = [
+      {
+        name: "omitted expected digest",
+        expectedRuntimeDigest: undefined,
+        replacementRuntimeDigest: "other-runtime",
+        replacementVerified: false,
+        diagnostic: "expected runtime digest is unavailable; cannot verify replacement identity",
+      },
+      {
+        name: "empty expected digest",
+        expectedRuntimeDigest: "",
+        replacementRuntimeDigest: "new-runtime",
+        replacementVerified: false,
+        diagnostic: "expected runtime digest is unavailable; cannot verify replacement identity",
+      },
+      {
+        name: "missing replacement digest",
+        expectedRuntimeDigest: "new-runtime",
+        replacementRuntimeDigest: undefined,
+        replacementVerified: false,
+        diagnostic: "replacement daemon runtime digest does not match the invoking CLI",
+      },
+      {
+        name: "mismatched replacement digest",
+        expectedRuntimeDigest: "new-runtime",
+        replacementRuntimeDigest: "other-runtime",
+        replacementVerified: false,
+        diagnostic: "replacement daemon runtime digest does not match the invoking CLI",
+      },
+      {
+        name: "matching replacement digest",
+        expectedRuntimeDigest: "new-runtime",
+        replacementRuntimeDigest: "new-runtime",
+        replacementVerified: true,
+        diagnostic: undefined,
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const oldHealth = {
+        status: "healthy" as const,
+        version: "1.4.2",
+        storageBackend: "sqlite" as const,
+        daemonInstanceId,
+        runtimeDigest: "old-runtime",
+        pid: 9,
+        uptime: 1,
+      };
+      const replacementHealth = {
+        ...oldHealth,
+        daemonInstanceId: "33333333-3333-4333-8333-333333333333",
+        runtimeDigest: testCase.replacementRuntimeDigest,
+      };
+      const health = vi.fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(replacementHealth);
+      const result = await cancelAndDrainCompactInvocation({
+        lifecycle: {
+          started: () => true,
+          stopHeartbeat: vi.fn(),
+          target: { invocationId, command: "compact" as const, daemonInstanceId },
+        } as never,
+        createFreshClient: () => ({
+          cancelInvocation: vi.fn(async () => response("cancelling", 1)),
+          health,
+        }),
+        originalHealth: oldHealth,
+        health,
+        restart: async () => ({
+          connected: true,
+          restarted: true,
+          stoppedPid: 9,
+          pid: 10,
+          warning: "restart warning must not replace identity diagnostics",
+        }),
+        proveOldInstanceGone: async () => true,
+        proveProviderWitnessGone: async () => true,
+        expectedRuntimeDigest: testCase.expectedRuntimeDigest,
+        expectedStorageBackend: "sqlite",
+        awaitLocalWork: async () => undefined,
+        timeoutMs: 100,
+      });
+
+      expect(result, testCase.name).toMatchObject({
+        daemonZero: testCase.replacementVerified,
+        replacementVerified: testCase.replacementVerified,
+      });
+      if (testCase.diagnostic !== undefined) {
+        expect(result.diagnostic, testCase.name).toBe(testCase.diagnostic);
+      }
+    }
+  });
+
+  it("preserves digest diagnostics across both retained restart paths", async () => {
+    const oldHealth = {
+      status: "healthy" as const,
+      version: "1.4.2",
+      storageBackend: "sqlite" as const,
+      daemonInstanceId,
+      runtimeDigest: "old-runtime",
+      pid: 9,
+      uptime: 1,
+    };
+    const cases = [
+      {
+        name: "settled restart",
+        expectedRuntimeDigest: undefined,
+        replacementRuntimeDigest: "other-runtime",
+        session: {
+          restartAttempted: true,
+          restart: { connected: true, restarted: true, stoppedPid: 9, pid: 10 },
+        },
+        diagnostic: "expected runtime digest is unavailable; cannot verify replacement identity",
+      },
+      {
+        name: "pending restart",
+        expectedRuntimeDigest: "new-runtime",
+        replacementRuntimeDigest: undefined,
+        session: {
+          restartAttempted: true,
+          restartPromise: Promise.resolve({ connected: true, restarted: true, stoppedPid: 9, pid: 10 }),
+        },
+        diagnostic: "replacement daemon runtime digest does not match the invoking CLI",
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const health = vi.fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({
+          ...oldHealth,
+          daemonInstanceId: "33333333-3333-4333-8333-333333333333",
+          runtimeDigest: testCase.replacementRuntimeDigest,
+        });
+      const result = await cancelAndDrainCompactInvocation({
+        lifecycle: {
+          started: () => true,
+          stopHeartbeat: vi.fn(),
+          target: { invocationId, command: "compact" as const, daemonInstanceId },
+        } as never,
+        createFreshClient: () => ({
+          cancelInvocation: vi.fn(async () => response("cancelling", 1)),
+          health,
+        }),
+        originalHealth: oldHealth,
+        health,
+        proveOldInstanceGone: async () => true,
+        proveProviderWitnessGone: async () => true,
+        expectedRuntimeDigest: testCase.expectedRuntimeDigest,
+        expectedStorageBackend: "sqlite",
+        awaitLocalWork: async () => undefined,
+        session: testCase.session,
+        timeoutMs: 100,
+      });
+
+      expect(result.diagnostic, testCase.name).toBe(testCase.diagnostic);
+      expect(result.replacementVerified, testCase.name).toBe(false);
+    }
+  });
+
   it("stays unproved when managed restart cannot prove provider disappearance", async () => {
     const oldHealth = {
       status: "healthy",
@@ -634,6 +795,7 @@ describe("compact invocation lifecycle", () => {
     const replacementHealth = {
       ...oldHealth,
       daemonInstanceId: "33333333-3333-4333-8333-333333333333",
+      runtimeDigest: "new-runtime",
       pid: 10,
     };
     let resolveRestart!: (value: CompactManagedRestartResult) => void;
@@ -661,6 +823,7 @@ describe("compact invocation lifecycle", () => {
       restart,
       proveOldInstanceGone: async () => true,
       proveProviderWitnessGone: async () => true,
+      expectedRuntimeDigest: "new-runtime",
       awaitLocalWork: async () => undefined,
       session,
       timeoutMs: 5,
@@ -677,6 +840,7 @@ describe("compact invocation lifecycle", () => {
       restart,
       proveOldInstanceGone: async () => true,
       proveProviderWitnessGone: async () => true,
+      expectedRuntimeDigest: "new-runtime",
       awaitLocalWork: async () => undefined,
       session,
       timeoutMs: 100,
@@ -874,6 +1038,7 @@ describe("compact invocation lifecycle", () => {
       version: "1.4.2",
       storageBackend: "sqlite" as const,
       daemonInstanceId: "33333333-3333-4333-8333-333333333333",
+      runtimeDigest: "new-runtime",
     };
     const health = vi.fn()
       .mockResolvedValueOnce(null)
@@ -900,6 +1065,7 @@ describe("compact invocation lifecycle", () => {
       restart,
       proveOldInstanceGone,
       proveProviderWitnessGone,
+      expectedRuntimeDigest: "new-runtime",
       timeoutMs: 100,
     } as never);
 

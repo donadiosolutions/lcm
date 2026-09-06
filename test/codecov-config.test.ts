@@ -94,6 +94,7 @@ const expectedComponents = [
       "^src/daemon/orientation\\.ts$",
       "^src/daemon/project-queue\\.ts$",
       "^src/daemon/project\\.ts$",
+      // Monotonic proxy startup polling remains daemon-core-owned.
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
       // Error sanitization, including #893 adjacent-path redaction, remains daemon-core-owned.
@@ -495,7 +496,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(209);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -511,6 +512,7 @@ describe("Codecov configuration", () => {
     // validation in their existing route and daemon-events components.
     // #888 keeps private final ingest and compact metadata writes route-owned.
     // #890 keeps bounded best-effort status metadata reads route-owned.
+    // #1003 keeps preliminary metadata admission daemon-core-owned.
     // #947 keeps promote metadata-parent resource handling and fail-closed
     // topology behavior in the existing daemon-routes component.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
@@ -518,6 +520,7 @@ describe("Codecov configuration", () => {
     // configuration-security-owned.
     const expectedOwners = [
       // #866 export admission failures and sensitive result emission stay CLI-owned.
+      // #978 keeps compact replacement runtime-digest admission CLI-owned.
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
       ["src/private-mutation-lock.ts", "unit-configuration-security"],
@@ -565,6 +568,7 @@ describe("Codecov configuration", () => {
       ["src/llm/codex-config.ts", "unit-llm-prompts"],
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
       ["src/llm/process-utils.ts", "unit-llm-prompts"],
+      // #997 keeps doctor publication retry deadlines monotonic in this owner.
       ["src/doctor/doctor.ts", "unit-diagnostics"],
       // #944 keeps typed supervisor daemon-tmp diagnostic propagation within
       // the existing service-manager component.
