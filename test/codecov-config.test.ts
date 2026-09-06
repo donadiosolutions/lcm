@@ -580,8 +580,8 @@ describe("Codecov configuration", () => {
       ["src/llm/process-utils.ts", "unit-llm-prompts"],
       // #997 keeps doctor publication retry deadlines monotonic in this owner.
       ["src/doctor/doctor.ts", "unit-diagnostics"],
-      // #944 keeps typed supervisor daemon-tmp diagnostic propagation within
-      // the existing service-manager component.
+      // #944/#950/#966 keep typed daemon-tmp diagnostics, authenticated restart
+      // convergence, and bounded birth samples in the service-manager component.
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],
