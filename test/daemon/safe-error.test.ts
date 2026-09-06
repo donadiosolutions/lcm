@@ -496,6 +496,105 @@ describe("sanitizeError", () => {
 
   it.each([
     [
+      "file://host.invalid?x=https://example.test/p",
+      "file://host.invalid?x=https://example.test/p",
+    ],
+    [
+      "file://host.invalid#x=https://example.test/p",
+      "file://host.invalid#x=https://example.test/p",
+    ],
+    [
+      "file://host.invalid?next=profile://remote.invalid/Users/canary/private.db",
+      "file://host.invalid?next=profile://remote.invalid/Users/canary/private.db",
+    ],
+    [
+      "file://host.invalid#next=profile://remote.invalid/Users/canary/private.db",
+      "file://host.invalid#next=profile://remote.invalid/Users/canary/private.db",
+    ],
+    [
+      "file://host.invalid?x=https://example.test/p, /Users/canary/private.db",
+      "file://host.invalid?x=https://example.test/p, <path>",
+    ],
+  ] as const)("preserves nested non-file URLs after pathless file URL delimiters: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["file://host.invalid?x=/Users/canary/private.db", "file://host.invalid?x=<path>"],
+    ["file://host.invalid?/Users/canary/private.db", "file://host.invalid?<path>"],
+    ["file://host.invalid#/Users/canary/private.db", "file://host.invalid#<path>"],
+    [
+      "file://host.invalid?x=y#z=/Users/canary/private.db",
+      "file://host.invalid?x=y#z=<path>",
+    ],
+    ["file://localhost?/Users/canary/private.db", "file://localhost?<path>"],
+    [
+      "file://[fe80::1%25eth0]?x=/Users/canary/private.db",
+      "file://[fe80::1%25eth0]?x=<path>",
+    ],
+    ["file://host.invalid?x=[/Users/canary/private.db]", "file://host.invalid?x=[<path>]"],
+    [
+      "file://remote.invalid[<path>]?next=/Users/canary/two.db",
+      "file://remote.invalid[<path>]?next=<path>",
+    ],
+    [
+      "file://host.invalid?x=C:\\Users\\canary\\private.db",
+      "file://host.invalid?x=<path>",
+    ],
+    [
+      "file://host.invalid?x=\\\\server\\share\\private.db",
+      "file://host.invalid?x=<path>",
+    ],
+    [
+      "file://host.invalid?x='/Users/canary/My Files/x'",
+      "file://host.invalid?x='<path>'",
+    ],
+    [
+      "file://host.invalid?file:///Users/canary/private.db",
+      "file://host.invalid?file://<path>",
+    ],
+    [
+      "file://host.invalid#file:///Users/canary/private.db",
+      "file://host.invalid#file://<path>",
+    ],
+    [
+      "file://host.invalid?FiLe:///Users/canary/private.db",
+      "file://host.invalid?FiLe://<path>",
+    ],
+  ] as const)("redacts paths after pathless file URL delimiters: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  // Bug #903 retains broader arbitrary-prefix semantics. These rows pin the
+  // safer file-URL recognition that follows the bounded pathless reset here.
+  it.each([
+    [
+      "file://host.invalid?q=(file://host.invalid/Users/canary/private.db",
+      "file://host.invalid?q=(file://host.invalid<path>",
+    ],
+    [
+      "file://host.invalid?q=[a=b]file://host.invalid/Users/canary/private.db",
+      "file://host.invalid?q=[a=b]file://host.invalid<path>",
+    ],
+    [
+      "file://host.invalid?next=1file://host.invalid/Users/canary/private.db",
+      "file://host.invalid?next=1file://host.invalid<path>",
+    ],
+  ] as const)("redacts newly recognized file URL paths after a pathless reset: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    [
       "https://outer.test/x?next=/Users/canary/private.db",
       "https://outer.test/x?next=/Users/canary/private.db",
     ],
@@ -540,7 +639,9 @@ describe("sanitizeError", () => {
       "https://outer.test/x/file://host.invalid/Users/canary/private.db",
       "https://outer.test/x/file://host.invalid/Users/canary/private.db",
     ],
-    ["file://host.invalid?x=https://y.test/p", "file://host.invalid?x=https:<path>"],
+    ["file://host.invalid&x=https://y.test/p", "file://host.invalid&x=https:<path>"],
+    ["file://host.invalid=x=https://y.test/p", "file://host.invalid=x=https:<path>"],
+    ["file://host.invalid[?x=https://y.test/p", "file://host.invalid[?x=https:<path>"],
     [
       "https://outer.test/x?next=file://host.invalid",
       "https://outer.test/x?next=file://host.invalid",

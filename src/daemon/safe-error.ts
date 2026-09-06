@@ -104,6 +104,25 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       authority[index + 7] = 1;
       continue;
     }
+    if (
+      separator >= 0 &&
+      exactFileScheme &&
+      !foundFilePath &&
+      brackets === 0 &&
+      (char === "?" || char === "#")
+    ) {
+      // A pathless file URL has finished its authority. Scan the query or
+      // fragment from fresh state so nested URLs and standalone paths retain
+      // their own classification.
+      separator = -1;
+      exactFileScheme = false;
+      foundFilePath = false;
+      filePathBracketDepth = 0;
+      schemeLength = 0;
+      fileSchemeLength = 0;
+      schemeQuote = 0;
+      continue;
+    }
     // These characters are valid in a file URL authority. Keep classifying
     // until the first path separator, except when one closes a quote that
     // immediately preceded the scheme. Once a path starts, all URL-ending
