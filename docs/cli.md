@@ -110,6 +110,10 @@ rejected export admission exits unsuccessfully, including with `--output` or
 `--all`. An `--all` export may have already written earlier projects when a
 later project fails; those outputs remain, and no successful total is printed.
 
+The process-local catalogue discovery cache uses a monotonic elapsed-time TTL
+capped at 1,000 milliseconds; wall-clock corrections do not extend or shorten
+it, and identity and state guards still invalidate stale entries.
+
 The local `lcm stats` project-database scan authenticates the LCM state root,
 the `projects` directory, and each project directory as owner-held directories
 with exact mode `0700`. It opens only an existing regular `db.sqlite`; a missing
