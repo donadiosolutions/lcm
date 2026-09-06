@@ -82,6 +82,7 @@ import {
   readPrivateMutationLockOwner,
   PrivateMutationLockContentionError,
 } from "../private-mutation-lock.js";
+import { readBoundedRegularFileWithStat } from "../security-files.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
@@ -1612,8 +1613,29 @@ function publicationCaptureScopedState(
 function readPublicationPidEvidence(
   pidPath: string,
   scopedState: ScopedStateAccess | undefined,
+  expectedUid: number | undefined,
 ): LegacyPidFileEvidence {
-  const evidence = readLegacyPidFileEvidence(pidPath);
+  if (scopedState !== undefined && !scopedStateAccessOwnsExactPaths(scopedState)) {
+    return { kind: "unsafe" };
+  }
+  let evidence: LegacyPidFileEvidence;
+  try {
+    const result = readBoundedRegularFileWithStat(pidPath, {
+      allowedRoot: dirname(pidPath),
+      maxBytes: 64,
+      expectedUid,
+      requireSingleLink: true,
+    });
+    const value = result.content.trim();
+    const pid = Number(value);
+    evidence = /^[1-9][0-9]*$/u.test(value) && Number.isSafeInteger(pid) && pid > 0
+      ? { kind: "present", pid, device: result.dev, inode: result.ino }
+      : { kind: "unsafe" };
+  } catch (error) {
+    evidence = (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { kind: "missing" }
+      : { kind: "unsafe" };
+  }
   return scopedState !== undefined && !scopedStateAccessOwnsExactPaths(scopedState)
     ? { kind: "unsafe" }
     : evidence;
@@ -1622,14 +1644,23 @@ function readPublicationPidEvidence(
 function readPublicationToken(
   tokenPath: string,
   scopedState: ScopedStateAccess | undefined,
+  expectedUid: number | undefined,
 ): string | null {
+  if (scopedState !== undefined && !scopedStateAccessOwnsExactPaths(scopedState)) return null;
+  let token: string | null;
   try {
-    if (scopedState !== undefined) return readScopedAuthToken(scopedState);
-    const evidence = readLegacyTokenEvidence(tokenPath);
-    return evidence.kind === "present" ? evidence.token : null;
+    token = readBoundedRegularFileWithStat(tokenPath, {
+      allowedRoot: dirname(tokenPath),
+      maxBytes: 4_096,
+      expectedUid,
+      requireSingleLink: true,
+    }).content.trim() || null;
   } catch {
-    return null;
+    token = null;
   }
+  return scopedState !== undefined && !scopedStateAccessOwnsExactPaths(scopedState)
+    ? null
+    : token;
 }
 
 function publicationPidMatchesMode(
@@ -1718,7 +1749,11 @@ async function captureLifecyclePublicationEvidence(
     }
   };
 
-  const firstPidEvidence = readPublicationPidEvidence(opts.pidFilePath, scopedState);
+  const firstPidEvidence = readPublicationPidEvidence(
+    opts.pidFilePath,
+    scopedState,
+    dependencies.uid,
+  );
   const pid = publicationPidMatchesMode(firstPidEvidence, mode);
   if (pid === null || !Number.isSafeInteger(pid) || pid <= 0 || !dependencies.isProcessAlive(pid)) {
     return undefined;
@@ -1750,7 +1785,7 @@ async function captureLifecyclePublicationEvidence(
     )
   ) return undefined;
 
-  const tokenBefore = readPublicationToken(tokenPath, scopedState);
+  const tokenBefore = readPublicationToken(tokenPath, scopedState, dependencies.uid);
   if (tokenBefore === null) return undefined;
   const authenticatedHealth = await checkDaemonDiagnostics(
     opts.port,
@@ -1760,7 +1795,7 @@ async function captureLifecyclePublicationEvidence(
     publicHealth,
     publicStorageBackend,
     () => {
-      const token = readPublicationToken(tokenPath, scopedState);
+      const token = readPublicationToken(tokenPath, scopedState, dependencies.uid);
       return token === tokenBefore ? token : null;
     },
   );
@@ -1787,9 +1822,13 @@ async function captureLifecyclePublicationEvidence(
     && authenticatedHealth.runtimeDigest !== expectedRuntimeDigest
   ) return undefined;
 
-  const secondPidEvidence = readPublicationPidEvidence(opts.pidFilePath, scopedState);
+  const secondPidEvidence = readPublicationPidEvidence(
+    opts.pidFilePath,
+    scopedState,
+    dependencies.uid,
+  );
   if (!samePublicationPidAuthority(firstPidEvidence, secondPidEvidence, mode, pid)) return undefined;
-  const tokenAfter = readPublicationToken(tokenPath, scopedState);
+  const tokenAfter = readPublicationToken(tokenPath, scopedState, dependencies.uid);
   const birthAfter = readBirth(pid);
   if (
     tokenAfter !== tokenBefore
@@ -1807,7 +1846,7 @@ async function captureLifecyclePublicationEvidence(
     birth: birthBefore,
     token: tokenBefore,
     readToken: () => {
-      const token = readPublicationToken(tokenPath, scopedState);
+      const token = readPublicationToken(tokenPath, scopedState, dependencies.uid);
       return token === tokenBefore ? token : null;
     },
     processBirth,
@@ -1967,7 +2006,10 @@ function restartPublicationWrapper(
           return await step();
         });
       } catch (retryError) {
-        if (opts._abortSignal?.aborted || now() >= deadline) throw budget.firstContention;
+        if (
+          opts._abortSignal?.aborted
+          || (retryError instanceof PrivateMutationLockContentionError && now() >= deadline)
+        ) throw budget.firstContention;
         throw retryError;
       } finally {
         const elapsed = Math.max(0, now() - startedAt);

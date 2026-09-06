@@ -485,8 +485,11 @@ may wait up to two seconds for the authenticated current daemon's publication
 sweep and up to another two seconds shared by the replacement's initial and
 final assertions. Manager stop/start and daemon admission time do not consume
 these retry windows, so the maximum added contention wait is approximately four
-seconds. Each restart and ensure operation still runs once; only the blocked
-publication assertion is retried.
+seconds. The replacement daemon's existing final-admission wait has its own
+independent two-second allowance, so a restart can spend approximately six
+seconds waiting if all three windows encounter contention. Each restart and
+ensure operation still runs once; only the blocked publication assertion is
+retried.
 
 The wait remains fail-closed. The current daemon must have a canonical owned
 PID and token, matching public and authenticated health, stable process-birth
@@ -499,6 +502,11 @@ missing, health is unavailable or staged, the current daemon's owned PID is
 absent, or any PID, token, birth, owner, entrypoint, or runtime field changes.
 Lock-owner metadata only checks the independently authenticated PID; it never
 supplies restart authority.
+
+If identity capture is refused or a retry allowance expires, LCM preserves the
+original typed publication-contention error and the restart command fails. An
+ordinary publication error observed on a later assertion remains the reported
+failure even when the contention allowance has just expired.
 
 When directory authentication rejects a consumer admission, LCM attempts to
 release the temporary root and publication descriptors acquired for that

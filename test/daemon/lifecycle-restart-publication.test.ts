@@ -34,6 +34,36 @@ const publicationFsFault = vi.hoisted(() => ({
   tokenOpens: 0,
 }));
 
+const boundedReadCalls = vi.hoisted(() => [] as Array<{
+  path: string;
+  options: {
+    allowedRoot: string;
+    maxBytes: number;
+    expectedUid?: number;
+    requireSingleLink?: boolean;
+  };
+}>);
+const boundedReadFault = vi.hoisted(() => ({
+  afterPath: undefined as string | undefined,
+  afterRead: undefined as (() => void) | undefined,
+}));
+
+vi.mock("../../src/security-files.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/security-files.js")>();
+  return {
+    ...actual,
+    readBoundedRegularFileWithStat: (
+      path: string,
+      options: Parameters<typeof actual.readBoundedRegularFileWithStat>[1],
+    ) => {
+      boundedReadCalls.push({ path, options });
+      const result = actual.readBoundedRegularFileWithStat(path, options);
+      if (path === boundedReadFault.afterPath) boundedReadFault.afterRead?.();
+      return result;
+    },
+  };
+});
+
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
@@ -76,6 +106,9 @@ afterEach(() => {
   publicationFsFault.tokenPath = undefined;
   publicationFsFault.rotateTokenOnSecondOpen = false;
   publicationFsFault.tokenOpens = 0;
+  boundedReadCalls.splice(0);
+  boundedReadFault.afterPath = undefined;
+  boundedReadFault.afterRead = undefined;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -110,7 +143,7 @@ function fixture(): {
     credentialDir,
     procRoot,
     platform: "linux",
-    uid: 1000,
+    uid: typeof process.getuid === "function" ? process.getuid() : 0,
     environment: {},
     fetch: vi.fn(),
     spawn: vi.fn() as never,
@@ -185,6 +218,122 @@ function scopedOptions(f: ReturnType<typeof fixture>): RestartDaemonOptions {
 }
 
 describe("restart publication assertion convergence", () => {
+  it("uses bounded owned-state readers for publication capture", async () => {
+    const f = fixture();
+    writeFileSync(f.pidPath, "111", { mode: 0o600 });
+    writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
+    f.seams.isProcessAlive = vi.fn(() => true);
+    f.seams.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/stats/pool")) return response({ totalConnections: 0 });
+      return response(init?.headers === undefined
+        ? health(111, "1.0.0", "sqlite")
+        : health(111, "1.0.0", "sqlite", "/opt/lcm.mjs", "a".repeat(64)));
+    }) as never;
+    const contention = new PrivateMutationLockContentionError("bounded reader contention");
+
+    await expect(restartDaemon(options(f, {
+      _processStartTimeForTesting: () => "birth-111",
+      _readPrivateMutationLockOwnerForTesting: () => ({
+        version: 1,
+        pid: 999,
+        processStartTime: "birth-999",
+        nonce: "9".repeat(32),
+      }),
+      _assertBackendPublication: () => { throw contention; },
+    }))).rejects.toBe(contention);
+
+    expect(boundedReadCalls).toHaveLength(5);
+    expect(boundedReadCalls.filter(call => call.path === f.pidPath)).toHaveLength(2);
+    expect(boundedReadCalls.filter(call => call.path === f.tokenPath)).toHaveLength(3);
+    expect(boundedReadCalls).toEqual(expect.arrayContaining([
+      {
+        path: f.pidPath,
+        options: {
+          allowedRoot: dirname(f.pidPath),
+          maxBytes: 64,
+          expectedUid: f.seams.uid,
+          requireSingleLink: true,
+        },
+      },
+      {
+        path: f.tokenPath,
+        options: {
+          allowedRoot: dirname(f.pidPath),
+          maxBytes: 4_096,
+          expectedUid: f.seams.uid,
+          requireSingleLink: true,
+        },
+      },
+    ]));
+  });
+
+  it.each([
+    ["oversized PID", "pid", "1".repeat(65), 0],
+    ["oversized token", "token", "x".repeat(4_097), 1],
+    ["empty token", "token", "", 1],
+  ] as const)("refuses %s capture without starting manager work", async (_name, leaf, content, fetchCalls) => {
+    const f = fixture();
+    writeFileSync(f.pidPath, leaf === "pid" ? content : "111", { mode: 0o600 });
+    writeFileSync(f.tokenPath, leaf === "token" ? content : "current-token", { mode: 0o600 });
+    f.seams.isProcessAlive = vi.fn(() => true);
+    f.seams.fetch = vi.fn(async () => response(health(111, "1.0.0", "sqlite"))) as never;
+    const ensure = vi.fn();
+    const contention = new PrivateMutationLockContentionError(`${_name} contention`);
+
+    await expect(restartDaemon(options(f, {
+      _ensureDaemonOverride: ensure,
+      _processStartTimeForTesting: () => "birth-111",
+      _assertBackendPublication: () => { throw contention; },
+    }))).rejects.toBe(contention);
+
+    expect(f.seams.fetch).toHaveBeenCalledTimes(fetchCalls);
+    expect(ensure).not.toHaveBeenCalled();
+    expect(f.seams.killProcess).not.toHaveBeenCalled();
+  });
+
+  it.each(["pid", "token"] as const)("refuses a non-regular production %s leaf", async (leaf) => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-950-special-leaf-"));
+    roots.push(root);
+    const stateDir = join(root, ".lcm");
+    mkdirSync(stateDir, { mode: 0o700 });
+    const pidPath = join(stateDir, "daemon.pid");
+    const tokenPath = join(stateDir, "daemon.token");
+    if (leaf === "pid") {
+      mkdirSync(pidPath);
+      writeFileSync(tokenPath, "current-token", { mode: 0o600 });
+    } else {
+      writeFileSync(pidPath, "111", { mode: 0o600 });
+      mkdirSync(tokenPath);
+    }
+    const fetch = vi.fn(async () => response(health(111, "1.0.0", "sqlite")));
+    const ensure = vi.fn();
+    const kill = vi.fn();
+    const contention = new PrivateMutationLockContentionError(`special ${leaf} contention`);
+    const originalEntrypoint = process.argv[1];
+    process.argv[1] = "/opt/test-runner.mjs";
+    try {
+      await expect(restartDaemon({
+        port: 43_950,
+        pidFilePath: pidPath,
+        spawnTimeoutMs: 100,
+        expectedEntrypoint: "/opt/lcm.mjs",
+        _fetchOverride: fetch,
+        _isProcessAliveOverride: () => true,
+        _processStartTimeForTesting: () => "birth-111",
+        _killOverride: kill,
+        _ensureDaemonOverride: ensure,
+        _uid: typeof process.getuid === "function" ? process.getuid() : 0,
+        _assertBackendPublication: () => { throw contention; },
+      })).rejects.toBe(contention);
+    } finally {
+      process.argv[1] = originalEntrypoint;
+    }
+
+    expect(fetch).toHaveBeenCalledTimes(leaf === "pid" ? 0 : 1);
+    expect(ensure).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
   it("propagates ordinary outer publication errors without capture", async () => {
     const f = fixture();
     const failure = new Error("ordinary publication failure");
@@ -197,6 +346,44 @@ describe("restart publication assertion convergence", () => {
 
     expect(f.seams.fetch).not.toHaveBeenCalled();
     expect(f.seams.isProcessAlive).not.toHaveBeenCalled();
+  });
+
+  it("preserves an ordinary second assertion error after the retry deadline", async () => {
+    const f = fixture();
+    writeFileSync(f.pidPath, "111", { mode: 0o600 });
+    writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
+    let now = 0;
+    let assertions = 0;
+    f.seams.isProcessAlive = vi.fn(() => true);
+    f.seams.sleep = vi.fn(async () => { now = 50; });
+    f.seams.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/stats/pool")) return response({ totalConnections: 0 });
+      return response(init?.headers === undefined
+        ? health(111, "1.0.0", "sqlite")
+        : health(111, "1.0.0", "sqlite", "/opt/lcm.mjs", "a".repeat(64)));
+    }) as never;
+    const contention = new PrivateMutationLockContentionError("first contention");
+    const ordinary = new Error("ordinary assertion failure");
+
+    await expect(restartDaemon(options(f, {
+      _monotonicNowOverride: () => now,
+      _processStartTimeForTesting: () => "birth-111",
+      _readPrivateMutationLockOwnerForTesting: () => ({
+        version: 1,
+        pid: 111,
+        processStartTime: "birth-111",
+        nonce: "a".repeat(32),
+      }),
+      _assertBackendPublication: () => {
+        assertions += 1;
+        if (assertions === 1) throw contention;
+        now = 2_000;
+        throw ordinary;
+      },
+    }))).rejects.toBe(ordinary);
+
+    expect(assertions).toBe(2);
+    expect(f.seams.killProcess).not.toHaveBeenCalled();
   });
 
   it("does not add capture probes when restart assertions are uncontended", async () => {
@@ -620,6 +807,67 @@ describe("restart publication assertion convergence", () => {
 
     expect(f.seams.fetch).not.toHaveBeenCalled();
     expect(f.seams.isProcessAlive).not.toHaveBeenCalled();
+  });
+
+  it("declines when scoped state ownership changes before the PID read", async () => {
+    const f = fixture();
+    writeFileSync(f.pidPath, "111", { mode: 0o600 });
+    writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
+    let clockReads = 0;
+    const restartOptions = options(f, {
+      _processStartTimeForTesting: vi.fn(),
+      _assertBackendPublication: () => {
+        throw new PrivateMutationLockContentionError("pre-PID state drift");
+      },
+    });
+    Object.defineProperty(restartOptions, "_monotonicNowOverride", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        clockReads += 1;
+        if (clockReads === 2) {
+          renameSync(f.seams.stateDir, `${f.seams.stateDir}.pre-pid`);
+          mkdirSync(f.seams.stateDir, { mode: 0o700 });
+        }
+        return () => 0;
+      },
+    });
+
+    await expect(restartDaemon(restartOptions)).rejects.toBeInstanceOf(
+      PrivateMutationLockContentionError,
+    );
+
+    expect(boundedReadCalls).toHaveLength(0);
+    expect(f.seams.fetch).not.toHaveBeenCalled();
+  });
+
+  it.each(["before", "after"] as const)("declines scoped state drift %s token read", async (when) => {
+    const f = fixture();
+    writeFileSync(f.pidPath, "111", { mode: 0o600 });
+    writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
+    f.seams.isProcessAlive = vi.fn(() => true);
+    const replaceState = (): void => {
+      renameSync(f.seams.stateDir, `${f.seams.stateDir}.${when}-token`);
+      mkdirSync(f.seams.stateDir, { mode: 0o700 });
+      writeFileSync(f.pidPath, "111", { mode: 0o600 });
+      writeFileSync(f.tokenPath, "replacement-token", { mode: 0o600 });
+    };
+    f.seams.fetch = vi.fn(async () => {
+      if (when === "before") replaceState();
+      return response(health(111, "1.0.0", "sqlite"));
+    }) as never;
+    if (when === "after") {
+      boundedReadFault.afterPath = f.tokenPath;
+      boundedReadFault.afterRead = replaceState;
+    }
+    const contention = new PrivateMutationLockContentionError(`${when} token state drift`);
+
+    await expect(restartDaemon(options(f, {
+      _processStartTimeForTesting: () => "birth-111",
+      _assertBackendPublication: () => { throw contention; },
+    }))).rejects.toBe(contention);
+
+    expect(f.seams.killProcess).not.toHaveBeenCalled();
   });
 
   it.each([
