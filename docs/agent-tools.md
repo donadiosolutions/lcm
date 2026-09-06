@@ -155,6 +155,30 @@ and no ambient working-directory fallback is used. Once a project is admitted,
 existing storage responses remain observable, including HTTP 409 identity
 configuration failures and HTTP 503 PostgreSQL storage failures.
 
+### HTTP `POST /compact`
+
+The daemon's `/compact` endpoint compacts a session transcript for a project.
+The package root exposes it through `memory.compact`:
+
+```js
+import { memory } from "@donadiosolutions/lcm";
+
+const result = await memory.compact(
+  "session-id",
+  "/path/to/transcript.jsonl",
+  "/path/to/project",
+);
+```
+
+`memory.compact(sessionId, transcriptPath, cwd)` sends `session_id`,
+`transcript_path`, and `cwd` to the daemon. The third `cwd` argument is
+optional and defaults to the caller's current working directory when the
+method is invoked. Supply an explicit absolute project directory when the
+transcript is stored elsewhere or the caller's working directory is not the
+project being compacted. Existing two-argument calls continue to work with
+that invocation-time default. The daemon validates the project directory and
+continues to return its existing compaction response or admission error.
+
 ### lcm_describe
 
 Inspect metadata and lineage of a memory node without expanding content. Returns depth, token count, parent/child links, and whether the node was promoted to long-term memory.

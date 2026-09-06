@@ -180,6 +180,7 @@ const expectedComponents = [
     component_id: "unit-memory-retrieval",
     name: "Unit - Memory and Retrieval",
     paths: [
+      // The #971 compact cwd client contract remains memory/retrieval-owned.
       "src/memory/",
       "^src/expansion\\.ts$",
       "^src/retrieval\\.ts$",
