@@ -121,6 +121,19 @@ normalized to `both`, but it is not advertised. The package
 `SearchResult.promoted` property matches the daemon's existing runtime
 response; the previously published `semantic` property was never populated.
 
+### Daemon JSON request bodies
+
+The `/describe`, `/expand`, `/grep`, `/recent`, `/search`, `/store`, `/ingest`,
+`/restore`, `/promote`, `/status`, `/session-complete`, `/promote-events`,
+`/promote-events/notify`, and `/review-stale` daemon endpoints require a JSON
+object as the top-level request body. Top-level `null`, arrays, strings,
+numbers, and booleans receive HTTP 400 with
+`{ "error": "invalid request body" }` before route storage or processing
+effects. An empty body keeps its existing `{}` fallback, and malformed JSON
+syntax keeps each endpoint's existing error behavior. In particular,
+`/recent` now rejects a non-object body instead of treating some primitives as
+an empty request.
+
 ### HTTP `POST /recent`
 
 The daemon's `/recent` endpoint returns recent summaries for a project. Send a
@@ -186,10 +199,8 @@ Decompress a summary node into its full source content by traversing the DAG. Us
 `depth` defaults to `1` and must be a positive integer. Malformed explicit
 values receive HTTP 400 (`invalid depth`) before `cwd` validation or project
 admission. There is no upper bound beyond the positive-integer requirement.
-The direct daemon request body must be a JSON object. Top-level `null`, arrays,
-and other JSON primitives receive HTTP 400 (`invalid request body`) before
-`cwd` validation or project admission. Malformed JSON syntax keeps the
-existing server error behavior.
+The direct daemon request also follows the shared JSON-object body contract
+above.
 
 **Examples:**
 

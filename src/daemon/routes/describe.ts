@@ -13,6 +13,10 @@ import {
 export function createDescribeHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      sendJson(res, 400, { error: "invalid request body" });
+      return;
+    }
     const { nodeId } = input;
 
     if (!nodeId) {

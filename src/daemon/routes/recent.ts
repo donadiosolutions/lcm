@@ -19,6 +19,10 @@ function sqliteTimestamp(date: Date): string {
 export function createRecentHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      sendJson(res, 400, { error: "invalid request body" });
+      return;
+    }
     const { limit = DEFAULT_RECENT_LIMIT } = input;
 
     if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > MAX_RECENT_LIMIT) {
