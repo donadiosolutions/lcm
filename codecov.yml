@@ -13,6 +13,7 @@ component_management:
         # #1088 keeps unsupported connector-list-format admission CLI-owned.
         # #978 keeps compact replacement runtime-digest admission CLI-owned.
         # #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
+        # #1201 keeps diagnostic-only identity admission CLI-owned.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
@@ -56,6 +57,8 @@ component_management:
         - "^src/legacy-names\\.ts$"
         - "^src/private-mutation-lock\\.ts$"
         - "^src/runtime-paths\\.ts$"
+        # #1195 keeps strict moduleAssetUrl resource resolution in this
+        # existing configuration-security owner.
         - "^src/runtime-root\\.ts$"
         - "^src/scrub\\.ts$"
         - "^src/secret-key\\.ts$"
@@ -76,7 +79,9 @@ component_management:
       name: "Unit - Hooks"
       paths:
         # Includes native adapters and the #726/#737 publication-diagnostic flow.
+        # Claude's bounded session-completion acknowledgment remains hook-owned.
         - "src/hooks/"
+    # #1201 keeps process-only observation, its parser/client, and route allowlist here.
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
@@ -131,6 +136,8 @@ component_management:
         # #964 extends that retained metadata lifetime to the path-bound LCM
         # root, projects directory, and project leaf without changing ownership.
         # #1062 keeps missing promote metadata no-clobber handling route-owned.
+        # #1158 keeps PostgreSQL passive promotion route behavior route-owned;
+        # deduplication implementation remains in unit-promotion below.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -269,7 +276,8 @@ component_management:
     - component_id: "unit-promotion"
       name: "Unit - Promotion"
       paths:
-        # #1153 rank-independent exact deduplication remains promotion-owned.
+        # #1153 exact-content identity and #1158 owner-scope selection remain
+        # owned by the deduplication helper; no component boundary changed.
         - "src/promotion/"
     - component_id: "unit-project-worktrees"
       name: "Unit - Projects and Worktrees"
@@ -300,6 +308,7 @@ component_management:
         # #1087 bounds canonical metadata publication in this existing owner.
         # #1091 preserves completion evidence across publication failures here.
         - "^src/worktree-reconciliation\\.ts$"
+    # #1201 keeps doctor identity observation and unverified queue readiness here.
     - component_id: "unit-diagnostics"
       name: "Unit - Diagnostics"
       paths:
@@ -353,6 +362,8 @@ component_management:
       name: "Integration - PostgreSQL Schema"
       paths:
         - "^src/storage/postgresql/extensions\\.ts$"
+        # #1195 keeps packaged SQL loading and checksum verification in
+        # the existing PostgreSQL schema owner.
         - "^src/storage/postgresql/migrations\\.ts$"
         - "^src/storage/postgresql/provisioning\\.ts$"
         - "^src/storage/postgresql/runtime-readiness\\.ts$"

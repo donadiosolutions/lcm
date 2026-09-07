@@ -268,10 +268,10 @@ closed if that lock is held by another operation.
 
 Doctor's map validation and worktree inspection are observational. It reports
 invalid or ambiguous mappings without normalization, duplicate removal, or
-reconciliation writes. Existing-daemon health is bounded and authenticated;
-readiness is not inferred from public liveness. Missing installed version or
-packaged runtime digest, mismatched identity, and unreadable credentials leave
-managed-daemon readiness unverified. Run doctor from the installed `lcm.mjs`
+reconciliation writes. Existing-daemon identity observation is bounded and
+authenticated; it does not probe active storage readiness. Missing installed
+version or packaged runtime digest, mismatched identity, and unreadable
+credentials leave managed-daemon identity unverified. Run doctor from the installed `lcm.mjs`
 artifact; reinstall LCM if that artifact is unreadable or damaged.
 
 Doctor does not acquire publication mutation locks, wait for a lock holder to
@@ -425,8 +425,8 @@ filesystem authority. Event scans likewise preserve existing sidecars and
 report skipped or failed observations without pruning them.
 
 `lcm status` reports verified daemon details, available numeric project counts,
-and the same backend diagnostic snapshot. If authenticated daemon health is
-available but its status request fails, the daemon remains reported as up and
+and the same backend diagnostic snapshot. If authenticated daemon identity is
+verified but its status request fails, the daemon remains reported as up and
 the command performs a fresh local diagnostic observation. The output identifies
 that fallback; backend readiness can change between the two observations.
 It omits the former `lastIngest`,
@@ -435,9 +435,27 @@ the diagnostic allowlist. A missing or unreadable project has no numeric
 project object, so an unavailable observation cannot be confused with an
 observed empty database.
 
+`lcm status`, `lcm stats --pool`, and `lcm doctor` authenticate an existing
+daemon through the internal `GET /health/observe` endpoint. It reports process
+identity with `observation: "identity-only"` and `storage.status: "unverified"`;
+it never opens project storage or runs the active readiness probe. Diagnostics
+require the exact installed version, backend, entrypoint, runtime digest, and
+unchanged configuration witness. An old daemon without this endpoint, malformed
+response, missing credentials, or mismatched identity refuses observation;
+there is no retry through active `/health` or automatic lifecycle repair.
+Status and pool statistics retain their local diagnostic fallback. Status JSON
+identifies its source with `diagnosticSource: "daemon"` or `"local"`.
+
+Doctor reports verified daemon identity separately from its backend diagnostic
+snapshot. That snapshot describes observed read availability and schema state;
+it cannot establish write readiness. Even if both checks pass, active storage
+readiness remains unprobed. A pending passive queue warns that queue draining is
+unverified, preserving backlog counts and remediation guidance. Use the explicit
+managed lifecycle commands when active readiness or restart is needed.
+
 ## Daemon-dependent resilience
 
-`lcm doctor` limits the complete daemon health exchange to two seconds. The
+`lcm doctor` limits the complete daemon identity observation exchange to two seconds. The
 deadline covers both the HTTP response and parsing its JSON body, so an
 unresponsive or partially responding local daemon cannot hold up the remaining
 diagnostics.

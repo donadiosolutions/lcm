@@ -286,6 +286,8 @@ describe("home parent authentication", () => {
     expect(dirname(home)).toBe(tmpdir());
     const root = join(home, ".lcm");
     fs.mkdirSync(root, { mode: 0o755 });
+    fs.chmodSync(root, 0o755);
+    expect(fs.statSync(root).mode & 0o777).toBe(0o755);
     expect(() => classifyHomeParent(observation(65534), { rootPresent: true, witnessRoot: home }))
       .toThrow("private directory mode");
 

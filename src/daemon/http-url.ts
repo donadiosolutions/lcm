@@ -14,6 +14,7 @@ const DAEMON_PATHS = new Set([
   "/expand",
   "/grep",
   "/health",
+  "/health/observe",
   "/ingest",
   "/invocation-control",
   "/promote",

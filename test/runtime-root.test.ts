@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { packageAsset, packageEntrypoint, packageExecutable, packageRootFor } from "../src/runtime-root.js";
+import { moduleAssetUrl, packageAsset, packageEntrypoint, packageExecutable, packageRootFor } from "../src/runtime-root.js";
 
 const cleanup: string[] = [];
 afterEach(() => cleanup.splice(0).forEach((path) => rmSync(path, { recursive: true, force: true })));
@@ -60,5 +60,22 @@ describe("runtime package layout", () => {
       "dist/src/generated-patterns.js",
       "src/generated-patterns.ts",
     )).toBe(join(root, "dist/src/generated-patterns.js"));
+  });
+});
+
+
+describe("strict module-relative assets", () => {
+  it.each([
+    ["file:///opt/lcm/src/storage/postgresql/migrations.ts", "file:///opt/lcm/src/storage/postgresql/migrations/0001.sql"],
+    ["file:///opt/lcm/dist/src/storage/postgresql/migrations.js", "file:///opt/lcm/dist/src/storage/postgresql/migrations/0001.sql"],
+    ["file:///opt/lcm/dist/lcm.mjs", "file:///opt/lcm/dist/src/storage/postgresql/migrations/0001.sql"],
+    ["file:///opt/dist/my%20package/src/storage/postgresql/migrations.ts", "file:///opt/dist/my%20package/src/storage/postgresql/migrations/0001.sql"],
+    ["file:///opt/dist/my%20package/dist/src/storage/postgresql/migrations.js", "file:///opt/dist/my%20package/dist/src/storage/postgresql/migrations/0001.sql"],
+    ["file:///opt/dist/my%20package/dist/lcm.mjs", "file:///opt/dist/my%20package/dist/src/storage/postgresql/migrations/0001.sql"],
+    ["file:///opt/lcm/dist/other.mjs", "file:///opt/lcm/dist/migrations/0001.sql"],
+  ])("resolves %s without probing alternate layouts", (moduleUrl, expected) => {
+    const asset = moduleAssetUrl(moduleUrl, "./migrations/0001.sql", "./src/storage/postgresql/migrations/0001.sql");
+    expect(asset).toBeInstanceOf(URL);
+    expect(asset.href).toBe(expected);
   });
 });

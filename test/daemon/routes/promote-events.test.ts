@@ -224,6 +224,8 @@ describe("promote-events route", () => {
       lexicalSearch: expect.any(Object),
     });
     expect(call.confidence).toBe(0.5);
+    expect(call.candidateScope).toBe("owner");
+    expect(call.backend).toBe("sqlite");
     expect(call.tags).toContain("type:preference");
     expect(call.tags).toContain("source:passive-capture");
   });

@@ -938,6 +938,8 @@ async function promoteEventsBatch(
               ...(reinforced ? ["signal:reinforced"] : []),
             ],
             sourceProjectId: project.projectId,
+            candidateScope: "owner" as const,
+            backend: project.backend,
             sessionId: event.session_id,
             depth: 0,
             confidence,
@@ -949,11 +951,14 @@ async function promoteEventsBatch(
           };
           if (!receiptEra) {
             if (event.priority === 3 && !reinforced) {
+              const candidateSourceProjectId = project.backend === "postgresql"
+                ? undefined
+                : project.projectId;
               const existing = await project.lexicalSearch.searchPromoted(
                 scrubbedData,
                 1,
                 undefined,
-                project.projectId,
+                candidateSourceProjectId,
               );
               if (existing.length === 0) {
                 processedIds.push(event.event_id);

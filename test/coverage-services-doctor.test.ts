@@ -51,7 +51,7 @@ function makeDeps(options: {
   settings?: unknown;
   settingsText?: string;
   pkg?: unknown;
-  health?: Array<unknown>;
+  observations?: Array<unknown>;
   exists?: (path: string) => boolean;
   readError?: (path: string) => unknown;
   writeError?: unknown;
@@ -62,7 +62,7 @@ function makeDeps(options: {
   readPaths?: string[];
   writes?: string[];
 } = {}): DoctorDeps {
-  const health = [...(options.health ?? [{ ok: false }])];
+  const observations = [...(options.observations ?? [{ ok: false }])];
   const configReadError = options.readError?.(join(DOCTOR_HOME, ".lcm", "config.json"));
   const configSeams = configReadError
     ? doctorConfigReadFailureSeams(configReadError)
@@ -91,7 +91,7 @@ function makeDeps(options: {
     }),
     mkdirSync: vi.fn(),
     spawnSync: (...args) => mocks.spawnSync(...args),
-    fetch: vi.fn().mockImplementation(async () => health.shift() ?? { ok: false }) as typeof fetch,
+    fetch: vi.fn().mockImplementation(async () => observations.shift() ?? { ok: false }) as typeof fetch,
     homedir: DOCTOR_HOME,
     platform: "linux",
     cwd: DOCTOR_CWD,
@@ -101,9 +101,10 @@ function makeDeps(options: {
   };
 }
 
-function readyHealth(overrides: Record<string, unknown> = {}) {
-  return { ok: true, json: async () => ({
-    status: "ok", version: "1.2.3", pid: 4242, storageBackend: "sqlite",
+function identityObservation(overrides: Record<string, unknown> = {}) {
+  return { ok: true, status: 200, json: async () => ({
+    status: "ok", observation: "identity-only", storage: { status: "unverified" },
+    version: "1.2.3", pid: 4242, storageBackend: "sqlite", uptime: 10, daemonInstanceId: "doctor-fixture-instance",
     entrypoint: join(process.cwd(), "dist", "lcm.mjs"),
     runtimeDigest: "doctor-fixture-digest", ...overrides,
   }) };
@@ -139,10 +140,11 @@ describe("doctor service coverage", () => {
   });
 
   it("does not start an MCP handshake or invoke daemon lifecycle operations", async () => {
-    const deps = makeDeps({ health: [readyHealth()] });
+    const deps = makeDeps({ observations: [identityObservation()] });
     const results = await runDoctor(deps);
-    expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "pass" });
-    expect(deps.fetch).toHaveBeenCalledExactlyOnceWith("http://127.0.0.1:3737/health", {
+    expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "pass",
+      message: "Authenticated daemon version and runtime identity verified; active storage readiness was not probed" });
+    expect(deps.fetch).toHaveBeenCalledExactlyOnceWith("http://127.0.0.1:3737/health/observe", {
       headers: { Authorization: "Bearer doctor-fixture-token" }, signal: expect.any(AbortSignal),
     });
     expect(deps.writeFileSync).not.toHaveBeenCalled();
@@ -286,16 +288,16 @@ describe("doctor service coverage", () => {
     const results = await runDoctor(makeDeps({
       config: { llm: { provider: "codex-process" } },
       procEnviron: "HOME=/isolated\0PATH=/daemon/runtime/bin:/usr/bin\0LANG=C\0",
-      health: [
-        readyHealth({ pid: 4242 }),
-        readyHealth({ pid: 4242 }),
+      observations: [
+        identityObservation({ pid: 4242 }),
+        identityObservation({ pid: 4242 }),
       ],
     }));
 
     expect(results.find((result) => result.name === "codex-process")?.status).toBe("pass");
   });
 
-  it("uses the PID from authenticated matching health", async () => {
+  it("uses the PID from authenticated matching observation", async () => {
     const readPaths: string[] = [];
     mocks.spawnSync.mockImplementation((cmd: string, args: string[], opts?: object) => {
       if (cmd === "/bin/sh" && args[1]?.includes("command -v codex")) {
@@ -309,9 +311,9 @@ describe("doctor service coverage", () => {
       config: { llm: { provider: "codex-process" } },
       procEnviron: "PATH=/health-pid/bin:/usr/bin\0",
       readPaths,
-      health: [
-        readyHealth({ pid: 4343 }),
-        readyHealth({ pid: 4343 }),
+      observations: [
+        identityObservation({ pid: 4343 }),
+        identityObservation({ pid: 4343 }),
       ],
     }));
 
@@ -320,12 +322,12 @@ describe("doctor service coverage", () => {
   });
 
   it.each(["version", "runtimeDigest", "entrypoint", "storageBackend"])(
-    "does not inspect a health PID when %s mismatches the expected identity",
+    "does not inspect an observation PID when %s mismatches the expected identity",
     async (field) => {
       const readPaths: string[] = [];
       const results = await runDoctor(makeDeps({
         config: { llm: { provider: "codex-process" } }, readPaths,
-        health: [readyHealth({ [field]: "untrusted-identity-canary" })],
+        observations: [identityObservation({ [field]: "untrusted-identity-canary" })],
       }));
       expect(results.find((result) => result.name === "daemon")?.status).toBe("fail");
       expect(readPaths).not.toContain("/proc/4242/environ");
@@ -363,9 +365,9 @@ describe("doctor service coverage", () => {
       config: { llm: { provider: "codex-process" } },
       procEnviron,
       readError: (path) => readFails && path === "/proc/4242/environ" ? new Error("proc hidden") : undefined,
-      health: [
-        readyHealth({ pid }),
-        readyHealth({ pid }),
+      observations: [
+        identityObservation({ pid }),
+        identityObservation({ pid }),
       ],
     }));
 
@@ -385,9 +387,9 @@ describe("doctor service coverage", () => {
     const results = await runDoctor(makeDeps({
       config: { llm: { provider: "codex-process" } },
       procEnviron: "HOME=/isolated\0PATH=\0LANG=C\0",
-      health: [
-        readyHealth(),
-        readyHealth(),
+      observations: [
+        identityObservation(),
+        identityObservation(),
       ],
     }));
 
@@ -505,7 +507,7 @@ describe("doctor service coverage", () => {
     expect((await runDoctor(makeDeps())).some((result) => result.name === "events-staleness")).toBe(false);
   });
 
-  it("covers healthy daemon backlog without sidecar metadata notes and plural scan messages", async () => {
+  it("covers verified daemon backlog without sidecar metadata notes and plural scan messages", async () => {
     vi.useFakeTimers();
     mocks.collectEvents.mockReturnValue({
       captured: 300, unprocessed: 250, errors: 0, lastCapture: null,
@@ -513,9 +515,9 @@ describe("doctor service coverage", () => {
       scanErrors: 2, scanSkipped: 2, prunedSidecars: 2,
     });
     const results = await runDoctor(makeDeps({
-      health: [
-        readyHealth(),
-        readyHealth(),
+      observations: [
+        identityObservation(),
+        identityObservation(),
       ],
     }));
     expect(results.find((result) => result.name === "events-capture")?.message).toContain("run: lcm events promote --all");
@@ -542,7 +544,7 @@ describe("doctor service coverage", () => {
     expect(results.find((result) => result.name === "events-staleness")?.message).toContain("h ago");
   });
 
-  it("covers healthy singular-sidecar scope and one-to-seven-day aggregate staleness", async () => {
+  it("covers verified singular-sidecar scope and one-to-seven-day aggregate staleness", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-10T00:00:00Z"));
     mocks.collectEvents.mockReturnValue({
@@ -550,9 +552,9 @@ describe("doctor service coverage", () => {
       sidecarsWithUnprocessed: 1, orphanedSidecarsWithUnprocessed: 0,
       lastCapture: "2026-01-08 00:00:00",
     });
-    const results = await runDoctor(makeDeps({ health: [
-      readyHealth(),
-      readyHealth(),
+    const results = await runDoctor(makeDeps({ observations: [
+      identityObservation(),
+      identityObservation(),
     ] }));
     expect(results.find((result) => result.name === "events-capture")?.message).toContain("1 project sidecar");
     expect(results.find((result) => result.name === "events-staleness")?.message).toContain("2d ago");

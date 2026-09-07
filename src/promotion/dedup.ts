@@ -18,6 +18,9 @@ export type DedupInsertInput = Readonly<{
   content: string;
   tags: string[];
   sourceProjectId?: string;
+  /** Search across the bound owner's provenance on PostgreSQL only. */
+  candidateScope?: "source" | "owner";
+  backend?: ProjectStorage["backend"];
   sessionId?: string;
   depth: number;
   confidence: number;
@@ -45,6 +48,9 @@ type DedupParams = {
 } & ((DedupRepositories & {
   sourceProjectId?: string;
   repositories?: TransactionRepositories;
+  /** Search across the bound owner's provenance on PostgreSQL only. */
+  candidateScope?: "source" | "owner";
+  backend?: ProjectStorage["backend"];
 }) | { store: LegacyDedupStore; projectId: string });
 
 function isDuplicateCandidate(
@@ -52,8 +58,8 @@ function isDuplicateCandidate(
   content: string,
   bm25Threshold: number,
 ): boolean {
-  // Exact content identity is conclusive regardless of the backend's rank
-  // scale. Only nonidentical ranked candidates need the fuzzy-match threshold.
+  // Exact byte-for-byte content identity always deduplicates, regardless of
+  // rank sign. Nonidentical candidates must clear the negative BM25 threshold.
   if (candidate.content === content) return true;
   return candidate.rank < 0 && candidate.rank <= -bm25Threshold;
 }
@@ -77,6 +83,8 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
       content,
       tags,
       sourceProjectId: params.sourceProjectId,
+      candidateScope: params.candidateScope,
+      backend: params.backend,
       sessionId,
       depth,
       confidence,
@@ -96,7 +104,7 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
     params.projectId,
   );
 
-  // Ranked matches must clear the BM25 threshold; unranked fallbacks require exact content.
+  // Exact identity is authoritative; only nonidentical ranked matches need the BM25 threshold.
   const duplicates = candidates.filter(
     (candidate) => isDuplicateCandidate(candidate, content, thresholds.dedupBm25Threshold),
   );
@@ -133,11 +141,15 @@ export async function deduplicateAndInsertInRepositories(
   repositories: TransactionRepositories,
   input: DedupInsertInput,
 ): Promise<string> {
+  const candidateSourceProjectId = input.candidateScope === "owner"
+    && input.backend === "postgresql"
+    ? undefined
+    : input.sourceProjectId;
   const candidates = await repositories.lexicalSearch.searchPromoted(
     input.content,
     input.thresholds.dedupCandidateLimit,
     undefined,
-    input.sourceProjectId,
+    candidateSourceProjectId,
   );
   const duplicates = candidates.filter(
     (candidate) => isDuplicateCandidate(candidate, input.content, input.thresholds.dedupBm25Threshold),
