@@ -289,6 +289,13 @@ When a pattern crosses the reinforcement threshold, `reinforcementBoost` is adde
   - Pruned after 30 days on SessionStart
   - Queryable by `lcm doctor` for health diagnostics
 
+SessionStart holds the publication consumer lock only while it opens, prunes,
+inspects, and closes the local sidecar. A concurrent publication causes this
+best-effort maintenance and its promotion trigger to be skipped; the later
+restore proceeds only if its own short publication admission succeeds.
+Publication-journal errors remain fail-closed. Daemon startup and network
+requests do not retain the maintenance lock.
+
 - **Promoted store**: Events promoted via `deduplicateAndInsert()` into the main LCM database
   - Tagged with `source:passive-capture` and `hook:<PostToolUse|UserPromptSubmit>`
   - Searchable via `lcm search` and `lcm grep`
