@@ -163,6 +163,14 @@ When the daemon processes queued events, it applies three promotion tiers:
 
 **Tier 3 — Pattern reinforcement** (priority 3): File access and tool usage events start as low-confidence signals. A one-off event is skipped unless it matches an existing entry in the promoted store. To bootstrap a new promotion without a seed, the same pattern must appear at least three times across at least two distinct sessions in recent sidecar history. Within one batch, successful reinforcement lookups are reused. A transient lookup failure leaves only that event unprocessed and retryable; a later sibling with the same pattern performs an independent retry. The reinforcement boost only applies on the insert path for a new memory, not when re-confirming an already-promoted entry.
 
+With PostgreSQL selected, passive promotion searches the current owner's promoted
+knowledge across its provenance values. This lets an event converge with a
+memory recorded through a local path hash, a remote project UUID, or the manual
+`/store` route while keeping the new row's remote UUID provenance unchanged.
+The PostgreSQL project predicate still excludes memories belonging to another
+owner. SQLite keeps its existing source-project filter, so its promotion scope
+is unchanged.
+
 ### Error→Fix Correlation
 
 When a tool error is followed by a successful command with a matching prefix (within 20 events), the system correlates them as an error→fix pair. These are tagged `type:solution` and promoted with higher priority.
