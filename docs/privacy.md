@@ -88,6 +88,121 @@ With the default SQLite backend, all storage is on your machine:
 
 On first startup after upgrading from older releases, lcm automatically migrates an existing legacy runtime directory to `~/.lcm/` when `~/.lcm/` is absent or does not already contain LCM data.
 
+### Embedded NUL in promoted memory
+
+SQLite promoted-memory content must be ordinary SQLite `TEXT` without an
+embedded NUL character (`U+0000`). The Node SQLite binding can return only the
+prefix of a scalar value when a legacy row contains that byte. The promoted
+memory store refuses to publish, search, list, export, recall, or replay these
+selected values into its FTS index.
+The refusal uses a fixed error and does not include the memory text, ID, path,
+or query. NUL characters in JSON-escaped tags remain supported.
+
+New promoted content containing `U+0000` is rejected before the database write.
+For a legacy row, use the offline procedure below with **Node.js 24 or newer**
+(the built-in `node:sqlite` module supplies everything; no npm dependencies or
+LCM internal imports are needed). LCM does not strip bytes, truncate rows, or
+run an automatic migration. If no intended replacement is known, preserve the
+backup and leave the row refused.
+
+1. Close agent sessions and stop the LCM service with your service manager.
+   Keep all writers, including hooks, CLI commands and worktree reconciliation,
+   stopped throughout maintenance. Identify the project's existing
+   `~/.lcm/projects/{hash}/db.sqlite` using its adjacent `meta.json`; use the
+   configured runtime directory if yours differs. This procedure is only for
+   SQLite projects.
+2. In a private directory (`umask 077` on POSIX), save the following script as
+   `repair-promoted.mjs`. First run `node repair-promoted.mjs /absolute/path/db.sqlite`
+   to print affected IDs only. It opens the database read-only and does not
+   print memory content.
+3. Put the complete intended replacement in a private UTF-8 text file. Every
+   byte, including a final newline, is part of the replacement. Run the repair
+   with the selected ID, replacement file and a **new backup filename**:
+
+   ```sh
+   node repair-promoted.mjs /absolute/path/db.sqlite SELECTED_ID /absolute/path/replacement.txt /absolute/path/before-repair.sqlite
+   ```
+
+   The script creates a consistent SQLite backup (including committed WAL
+   data), verifies its integrity, then replaces that row and its FTS entry in
+   one transaction. It preserves all other fields, and keeps archived rows out
+   of the search index. It refuses healthy rows, unknown IDs, invalid UTF-8 and
+   NUL-containing replacements. A failed repair rolls back; keep the backup.
+
+```js
+import { DatabaseSync, backup } from "node:sqlite";
+import { closeSync, openSync, readFileSync, statSync } from "node:fs";
+
+const args = process.argv.slice(2);
+if (args.length !== 1 && args.length !== 4) {
+  throw new Error("Usage: node repair-promoted.mjs DB [ID TEXT_FILE NEW_BACKUP]");
+}
+const [path, id, textFile, backupPath] = args;
+if (!statSync(path).isFile()) throw new Error("DB must be an existing file");
+const unsupported = "typeof(content) <> 'text' OR instr(content, char(0)) > 0";
+const db = new DatabaseSync(path, { readOnly: args.length === 1 });
+try {
+  if (args.length === 1) {
+    for (const row of db.prepare(`SELECT id FROM promoted WHERE ${unsupported}`).all()) {
+      console.log(JSON.stringify(row.id));
+    }
+  } else {
+    const content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+      .decode(readFileSync(textFile));
+    if (content.includes("\u0000")) throw new Error("Replacement contains NUL");
+    // Exclusive creation prevents overwriting an existing backup or the DB.
+    closeSync(openSync(backupPath, "wx", 0o600));
+    await backup(db, backupPath);
+    const saved = new DatabaseSync(backupPath, { readOnly: true });
+    try {
+      const checks = saved.prepare("PRAGMA integrity_check").all();
+      if (checks.length !== 1 || checks[0].integrity_check !== "ok") {
+        throw new Error("Backup integrity check failed");
+      }
+    } finally {
+      saved.close();
+    }
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = db.prepare(`SELECT rowid, tags, archived_at FROM promoted
+        WHERE id = ? AND (${unsupported})`).get(id);
+      if (!row) throw new Error("ID is missing or does not need repair");
+      db.prepare("UPDATE promoted SET content = ? WHERE id = ?").run(content, id);
+      const fts = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'promoted_fts'").get();
+      if (fts) {
+        db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
+        if (row.archived_at === null) {
+          db.prepare("INSERT INTO promoted_fts(rowid, content, tags) VALUES (?, ?, ?)")
+            .run(row.rowid, content, row.tags);
+        }
+      }
+      db.exec("COMMIT");
+      console.log("Repair committed; retain the verified backup.");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+} finally {
+  db.close();
+}
+```
+
+4. Repeat the diagnostic until no affected IDs remain (use a new backup name
+   for each repair). Restart the service and agent sessions, then verify the
+   active memory with `lcm search "distinctive replacement words"` from the
+   original project directory before resuming normal use. Archived memories
+   remain excluded from search; the offline diagnostic verifies that their
+   content is now supported. Retain the backup until verification is complete.
+   Do not replace a live
+   database file or discard its WAL/SHM sidecars to restore a backup; stop all
+   writers again before any restoration.
+
+Legacy worktree reconciliation uses a separate import path. Inspect and
+deliberately repair affected source rows before reconciling worktrees; this
+store guard does not protect that import path. The reconciliation limitation
+is tracked in [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
+
 No data is sent to any Long Context Manager (LCM) server. There is no telemetry.
 An explicitly configured PostgreSQL backend is a user-operated remote-primary
 store; daemon project writes and reads use it only after the publication and

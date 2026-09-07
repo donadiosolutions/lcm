@@ -45,6 +45,46 @@ export type SearchResult = {
   rank: number;
 };
 
+type PromotedContentRow = {
+  content: unknown;
+  content_type: unknown;
+  content_nul_marker: unknown;
+};
+
+const PROMOTED_CONTENT_ERROR = "stored promoted content is unsupported";
+
+/**
+ * SQLite's node:sqlite binding truncates scalar TEXT at an embedded NUL.
+ * Inspect the value in SQLite first, then admit only a real string whose
+ * numeric marker proves that no NUL was present. The marker is deliberately
+ * validated at runtime because adapters and test doubles can return malformed
+ * rows just as a legacy database can contain a non-TEXT value.
+ */
+export function readPromotedContent(row: PromotedContentRow): string {
+  if (
+    typeof row.content !== "string"
+    || row.content_type !== "text"
+    || typeof row.content_nul_marker !== "number"
+    || !Number.isFinite(row.content_nul_marker)
+    || !Number.isInteger(row.content_nul_marker)
+    || row.content_nul_marker < 0
+    || row.content_nul_marker > 0
+    || row.content.includes("\u0000")
+  ) {
+    throw new TypeError(PROMOTED_CONTENT_ERROR);
+  }
+  return row.content;
+}
+
+const promotedContentProjection = (alias: string): string =>
+  `${alias}.*, typeof(${alias}.content) AS content_type, instr(${alias}.content, char(0)) AS content_nul_marker`;
+
+function publicPromotedRow(row: PromotedRow & PromotedContentRow): PromotedRow {
+  const content = readPromotedContent(row);
+  const { content_type: _contentType, content_nul_marker: _marker, ...publicRow } = row;
+  return { ...publicRow, content } as PromotedRow;
+}
+
 export function parsePromotedTags(serialized: string): string[] {
   try {
     const parsed: unknown = JSON.parse(serialized);
@@ -220,6 +260,9 @@ export class PromotedStore {
   }
 
   insert(params: InsertParams): string {
+    if (typeof params.content !== "string" || params.content.includes("\u0000")) {
+      throw new TypeError("promoted content contains an unsupported string");
+    }
     const id = randomUUID();
     if (params.tags && (!Array.isArray(params.tags) || !params.tags.every((tag) => typeof tag === "string"))) {
       throw new TypeError("tags must be an array of strings");
@@ -264,7 +307,10 @@ export class PromotedStore {
   }
 
   getById(id: string): PromotedRow | null {
-    return (this.db.prepare("SELECT * FROM promoted WHERE id = ?").get(id) as PromotedRow) ?? null;
+    const row = this.db.prepare(
+      `SELECT ${promotedContentProjection("promoted")} FROM promoted WHERE id = ?`
+    ).get(id) as (PromotedRow & PromotedContentRow) | undefined;
+    return row ? publicPromotedRow(row) : null;
   }
 
   search(query: string, limit: number, filterTags?: string[], projectId?: string): SearchResult[] {
@@ -314,7 +360,9 @@ export class PromotedStore {
     if (!needsTagFilter || useNativeTagFilter) queryParams.push(limit);
 
     const statement = this.db.prepare(
-      `SELECT p.id, p.content, p.tags, p.project_id, p.session_id, p.confidence, p.created_at, rank
+      `SELECT p.id, p.content, p.tags, p.project_id, p.session_id, p.confidence, p.created_at, rank,
+              typeof(p.content) AS content_type,
+              instr(p.content, char(0)) AS content_nul_marker
        FROM promoted_fts fts
        JOIN promoted p ON p.rowid = fts.rowid
        WHERE promoted_fts MATCH ?
@@ -325,12 +373,13 @@ export class PromotedStore {
        ${!needsTagFilter || useNativeTagFilter ? "LIMIT ?" : ""}`
     );
 
-    const toSearchResult = (row: PromotedRow & { rank: number }): SearchResult | undefined => {
+    const toSearchResult = (row: PromotedRow & PromotedContentRow & { rank: number }): SearchResult | undefined => {
       const tags = parsePromotedTags(row.tags);
       if (needsTagFilter && !filterTags!.every((tag) => tags.includes(tag))) return undefined;
+      const content = readPromotedContent(row);
       return {
         id: row.id,
-        content: row.content,
+        content,
         tags,
         projectId: row.project_id,
         sessionId: row.session_id,
@@ -342,7 +391,7 @@ export class PromotedStore {
 
     if (needsTagFilter && !useNativeTagFilter && typeof statement.iterate === "function") {
       const results: SearchResult[] = [];
-      for (const row of statement.iterate(...queryParams) as Iterable<PromotedRow & { rank: number }>) {
+      for (const row of statement.iterate(...queryParams) as Iterable<PromotedRow & PromotedContentRow & { rank: number }>) {
         const result = toSearchResult(row);
         if (result) results.push(result);
         if (limit >= 0 && results.length >= limit) break;
@@ -350,7 +399,15 @@ export class PromotedStore {
       return results;
     }
 
-    const rows = statement.all(...queryParams) as Array<PromotedRow & { rank: number }>;
+    const rows = statement.all(...queryParams) as Array<PromotedRow & PromotedContentRow & { rank: number }>;
+    if (needsTagFilter && !useNativeTagFilter) {
+      const eligibleRows = rows.filter((row) => {
+        const tags = parsePromotedTags(row.tags);
+        return filterTags!.every((tag) => tags.includes(tag));
+      });
+      const selectedRows = limit < 0 ? eligibleRows : eligibleRows.slice(0, limit);
+      return selectedRows.map((row) => toSearchResult(row)!);
+    }
     const results = rows.flatMap((row) => {
       const result = toSearchResult(row);
       return result ? [result] : [];
@@ -360,7 +417,7 @@ export class PromotedStore {
   }
 
   getAll(opts?: { projectId?: string; since?: string; tags?: string[] }): PromotedRow[] {
-    let sql = "SELECT * FROM promoted WHERE archived_at IS NULL";
+    let sql = `SELECT ${promotedContentProjection("promoted")} FROM promoted WHERE archived_at IS NULL`;
     const params: (string | number)[] = [];
 
     if (opts?.projectId !== undefined) {
@@ -373,7 +430,7 @@ export class PromotedStore {
     }
     sql += " ORDER BY created_at ASC";
 
-    let rows = this.db.prepare(sql).all(...params) as PromotedRow[];
+    let rows = this.db.prepare(sql).all(...params) as Array<PromotedRow & PromotedContentRow>;
 
     if (opts?.tags && opts.tags.length > 0) {
       rows = rows.filter((r) => {
@@ -382,14 +439,16 @@ export class PromotedStore {
       });
     }
 
-    return rows;
+    return rows.map(publicPromotedRow);
   }
 
   listContentPrefixes(limit: number): string[] {
     const rows = this.db.prepare(
-      "SELECT content FROM promoted WHERE archived_at IS NULL LIMIT ?"
-    ).all(limit) as Array<{ content: string }>;
-    return rows.map((r) => r.content);
+      `SELECT content, typeof(content) AS content_type,
+              instr(content, char(0)) AS content_nul_marker
+       FROM promoted WHERE archived_at IS NULL LIMIT ?`
+    ).all(limit) as Array<PromotedContentRow>;
+    return rows.map(readPromotedContent);
   }
 
   archive(id: string): void {
@@ -421,11 +480,18 @@ export class PromotedStore {
   }
 
   update(id: string, fields: { content?: string; confidence?: number; tags?: string[]; metadata?: JsonObject }): void {
+    if (fields.content !== undefined && (typeof fields.content !== "string" || fields.content.includes("\u0000"))) {
+      throw new TypeError("promoted content contains an unsupported string");
+    }
     const serializedMetadata = fields.metadata === undefined
       ? undefined
       : serializePromotedMetadata(fields.metadata);
-    const row = this.db.prepare("SELECT rowid, content, tags FROM promoted WHERE id = ?").get(id) as
-      | { rowid: number; content: string; tags: string }
+    const row = this.db.prepare(
+      `SELECT rowid, content, tags, typeof(content) AS content_type,
+              instr(content, char(0)) AS content_nul_marker
+       FROM promoted WHERE id = ?`
+    ).get(id) as
+      | ({ rowid: number; content: unknown; tags: string } & PromotedContentRow)
       | undefined;
     if (!row) return;
 
@@ -454,14 +520,15 @@ export class PromotedStore {
       }
       if (fields.tags !== undefined) {
         const newTags = JSON.stringify(fields.tags);
+        const content = this.fts5Available ? readPromotedContent(row) : undefined;
         this.db.prepare("UPDATE promoted SET tags = ? WHERE id = ?").run(newTags, id);
         if (this.fts5Available) {
-            this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
-            this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
-              row.rowid,
-              row.content,
-              newTags,
-            );
+          this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
+          this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
+            row.rowid,
+            content!,
+            newTags,
+          );
         }
       }
       if (serializedMetadata !== undefined) {
@@ -499,7 +566,7 @@ export class PromotedStore {
     // which is stored via datetime('now'). ISO-8601 with T/Z sorts incorrectly.
     const cutoff = new Date(cutoffMs).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
 
-    let sql = `SELECT * FROM promoted WHERE archived_at IS NULL AND created_at < ?`;
+    let sql = `SELECT ${promotedContentProjection("promoted")} FROM promoted WHERE archived_at IS NULL AND created_at < ?`;
     const params: (string | number)[] = [cutoff];
 
     if (opts.projectId !== undefined) {
@@ -508,7 +575,7 @@ export class PromotedStore {
     }
     sql += " ORDER BY created_at ASC";
 
-    const rows = this.db.prepare(sql).all(...params) as PromotedRow[];
+    const rows = this.db.prepare(sql).all(...params) as Array<PromotedRow & PromotedContentRow>;
     if (rows.length === 0) return [];
 
     // Batch: get surfacing counts for all candidate IDs in one query
@@ -550,7 +617,7 @@ export class PromotedStore {
       const purelyOld = surfacingCount === 0 && usageCount === 0;
 
       if (surfacedWithoutUse || purelyOld) {
-        result.push({ ...row, surfacingCount, usageCount, daysSinceCreated });
+        result.push({ ...publicPromotedRow(row), surfacingCount, usageCount, daysSinceCreated });
       }
     }
 
@@ -559,8 +626,12 @@ export class PromotedStore {
 
   /** Revive a previously archived memory back to active status. */
   revive(id: string): void {
-    const row = this.db.prepare("SELECT rowid, content, tags FROM promoted WHERE id = ?").get(id) as
-      | { rowid: number; content: string; tags: string }
+    const row = this.db.prepare(
+      `SELECT rowid, content, tags, typeof(content) AS content_type,
+              instr(content, char(0)) AS content_nul_marker
+       FROM promoted WHERE id = ?`
+    ).get(id) as
+      | ({ rowid: number; content: unknown; tags: string } & PromotedContentRow)
       | undefined;
     if (!row) return;
 
@@ -570,12 +641,13 @@ export class PromotedStore {
     }
 
     this.withFtsSavepoint(() => {
+      const content = readPromotedContent(row);
       this.db.prepare("UPDATE promoted SET archived_at = NULL WHERE id = ?").run(id);
       // Delete first so a stale or already-present mirror is replaced without
       // hiding unrelated SQLite failures behind a broad duplicate catch.
       this.db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
       this.db.prepare("INSERT INTO promoted_fts (rowid, content, tags) VALUES (?, ?, ?)").run(
-        row.rowid, row.content, row.tags,
+        row.rowid, content, row.tags,
       );
     });
   }
@@ -617,7 +689,7 @@ export class PromotedStore {
     };
     const termClauses = uniqueTerms.map((_term, index) => matchClause(index));
     const scoreClauses = uniqueTerms.map((_term, index) => `CASE WHEN ${matchClause(index)} THEN 1 ELSE 0 END`);
-    let sql = `SELECT *, (${scoreClauses.join(" + ")}) AS matched_terms
+    let sql = `SELECT ${promotedContentProjection("promoted")}, (${scoreClauses.join(" + ")}) AS matched_terms
       FROM promoted WHERE archived_at IS NULL AND (${termClauses.join(" OR ")})`;
     if (projectId) {
       sql += ` AND project_id = ?${params.length + 1}`;
@@ -625,22 +697,28 @@ export class PromotedStore {
     }
     sql += " ORDER BY matched_terms DESC, confidence DESC, created_at ASC";
 
-    let results = (this.db.prepare(sql).all(...params) as Array<PromotedRow & { matched_terms: number }>).map((row) => ({
-      id: row.id,
-      content: row.content,
+    const rows = this.db.prepare(sql).all(...params) as Array<PromotedRow & PromotedContentRow & { matched_terms: number }>;
+    let candidates = rows.map((row) => ({
+      row,
       tags: parsePromotedTags(row.tags),
-      projectId: row.project_id,
-      sessionId: row.session_id,
-      confidence: row.confidence,
-      createdAt: row.created_at,
       rank: FALLBACK_TERM_SCORE * row.matched_terms * (row.matched_terms / uniqueTerms.length),
     }));
     if (filterTags && filterTags.length > 0) {
-      results = results.filter((result) => filterTags.every((tag) => result.tags.includes(tag)));
+      candidates = candidates.filter(({ tags }) => filterTags.every((tag) => tags.includes(tag)));
     }
     // Apply exact decoded-tag filtering before the caller's limit. Applying
     // LIMIT in SQL first can discard every qualifying tagged row when more
     // highly ranked untagged matches precede it.
-    return limit < 0 ? results : results.slice(0, limit);
+    const selected = limit < 0 ? candidates : candidates.slice(0, limit);
+    return selected.map(({ row, tags, rank }) => ({
+      id: row.id,
+      content: readPromotedContent(row),
+      tags,
+      projectId: row.project_id,
+      sessionId: row.session_id,
+      confidence: row.confidence,
+      createdAt: row.created_at,
+      rank,
+    }));
   }
 }

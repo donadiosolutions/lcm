@@ -223,6 +223,19 @@ describe("promote persistence boundaries", () => {
     expect(mocks.openProject).not.toHaveBeenCalled();
   });
 
+  it("fails the promote route closed when a legacy NUL row blocks deduplication", async () => {
+    mocks.prefixes.mockImplementationOnce(() => {
+      throw new TypeError("stored promoted content is unsupported");
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "stored promoted content is unsupported",
+    });
+    expect(mocks.dedup).not.toHaveBeenCalled();
+  });
+
   it("compares stored prefixes with the same scrubbed content used for insertion", async () => {
     mocks.conversations.mockResolvedValueOnce([{ conversationId: 1, sessionId: "s" }]);
     mocks.summaries.mockResolvedValueOnce([
