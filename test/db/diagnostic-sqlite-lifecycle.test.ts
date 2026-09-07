@@ -2,8 +2,12 @@ import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const harness = vi.hoisted(() => ({ fork: vi.fn() }));
+const harness = vi.hoisted(() => ({ fork: vi.fn(), packageAsset: vi.fn() }));
 vi.mock("node:child_process", () => ({ fork: harness.fork }));
+vi.mock("../../src/runtime-root.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../../src/runtime-root.js")>(),
+  packageAsset: harness.packageAsset,
+}));
 import { readDiagnosticSqlite, withDiagnosticSqliteSession } from "../../src/db/diagnostic-sqlite.js";
 
 class DiagnosticChild extends EventEmitter {
@@ -17,6 +21,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   child = new DiagnosticChild();
   harness.fork.mockReset().mockReturnValue(child as unknown as ChildProcess);
+  harness.packageAsset.mockReset().mockReturnValue("/package/src/db/diagnostic-sqlite-worker.ts");
 });
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
@@ -35,11 +40,21 @@ describe("diagnostic child ownership and lifecycle", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("remaps borrowed parent descriptors and avoids preload or ambient environment startup", async () => {
+  it.each([
+    ["source", "/package/src/db/diagnostic-sqlite-worker.ts", ["--experimental-strip-types", "--experimental-sqlite"]],
+    ["compiled", "/package/dist/src/db/diagnostic-sqlite-worker.js", ["--experimental-sqlite"]],
+  ] as const)("remaps borrowed descriptors and isolates the %s worker launch", async (_kind, workerPath, execArgv) => {
+    harness.packageAsset.mockReturnValue(workerPath);
     const reading=readDiagnosticSqlite({...request,parents:[{path:"/trusted",fd:25,device:1n,inode:3n}]});
     const [sent] = child.send.mock.calls[0];
     expect(sent).toMatchObject({parents:[{path:"/trusted",fd:4,device:1n,inode:3n}]});
-    expect(harness.fork.mock.calls[0][2]).toMatchObject({execArgv:[],env:{},stdio:["ignore","ignore","ignore","ipc",25],serialization:"advanced"});
+    expect(harness.fork).toHaveBeenCalledWith(workerPath, ["--lcm-diagnostic-sqlite-worker"], {
+      execPath: process.execPath,
+      execArgv,
+      env: {},
+      serialization: "advanced",
+      stdio: ["ignore", "ignore", "ignore", "ipc", 25],
+    });
     child.emit("message",{ok:true,rows:[]});
     await reading;
   });
@@ -135,6 +150,25 @@ describe("snapshot-owned SQLite session", () => {
     child.emit("exit", 0);
     expect(child.kill).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
+  });
+  it.each([
+    ["source", "/package/src/db/diagnostic-sqlite-worker.ts", ["--experimental-strip-types", "--experimental-sqlite"]],
+    ["compiled", "/package/dist/src/db/diagnostic-sqlite-worker.js", ["--experimental-sqlite"]],
+  ] as const)("isolates the %s session worker launch", async (_kind, workerPath, execArgv) => {
+    harness.packageAsset.mockReturnValue(workerPath);
+    const {result} = start(signal => {
+      const reading = readDiagnosticSqlite({...request, signal});
+      expect(harness.fork).toHaveBeenCalledWith(workerPath, ["--lcm-diagnostic-sqlite-session"], {
+        execPath: process.execPath,
+        execArgv,
+        env: {},
+        serialization: "advanced",
+        stdio: ["ignore", "ignore", "ignore", "ipc"],
+      });
+      child.emit("message", {id: 1, ok: true, rows: []});
+      return reading;
+    });
+    await expect(result).resolves.toEqual([]);
   });
   it("borrows the enclosing session for a nested sidecar scan", async () => {
     const {result} = start(signal => withDiagnosticSqliteSession(signal, async () => {

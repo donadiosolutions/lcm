@@ -1,12 +1,33 @@
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const sqlitePool = vi.hoisted(() => ({
+  get: vi.fn(() => ({
+    totalConnections: 0,
+    activeConnections: 0,
+    idleConnections: 0,
+    connections: [],
+  })),
+}));
+vi.mock('../../src/db/connection.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../../src/db/connection.js')>(),
+  getPoolStats: sqlitePool.get,
+}));
 import { BackendPublicationJournalError } from '../../src/storage/backend-publication.js';
 import { backendDiagnosticFailure, collectBackendDiagnostics } from '../../src/storage/diagnostics.js';
 
 const homes: string[] = [];
 afterEach(() => { for (const home of homes.splice(0)) rmSync(home, {recursive:true,force:true}); });
+beforeEach(() => {
+  sqlitePool.get.mockReset().mockReturnValue({
+    totalConnections: 0,
+    activeConnections: 0,
+    idleConnections: 0,
+    connections: [],
+  });
+});
 describe('backend diagnostics', () => {
   it('observes missing SQLite state without creating a home or claiming a schema probe', async () => {
     const home = mkdtempSync(join(tmpdir(), 'lcm-diagnostic-')); homes.push(home);
@@ -29,7 +50,6 @@ describe('backend diagnostics', () => {
 });
 
 import { mkdirSync, writeFileSync, symlinkSync } from 'node:fs';
-import { vi } from 'vitest';
 import { parseDaemonConfig } from '../../src/daemon/config.js';
 import { PostgreSqlStorageOperationError } from '../../src/storage/postgresql/errors.js';
 import type { BackendDiagnosticDependencies, BackendDiagnosticObservation, BackendDiagnosticRuntime } from '../../src/storage/diagnostics.js';
@@ -220,6 +240,118 @@ it('reports daemon origin for a borrowed SQLite pool',async()=>{
   const {dependencies,observation}=fixture();observation.config.storage={backend:'sqlite'};
   const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:{backend:'sqlite'} as never,collectSqlite:async()=>{}});
   expect(result).toMatchObject({classification:'healthy',pool:{origin:'daemon',status:'ready'}});
+});
+
+describe('independent SQLite pool observation', () => {
+  const observedPool = {
+    totalConnections: 7,
+    activeConnections: 4,
+    idleConnections: 3,
+    connections: [{path:'/private/project/database.sqlite',refs:4,status:'active' as const}],
+  };
+
+  it.each([
+    ['local', undefined],
+    ['daemon', {backend:'sqlite',close:vi.fn()}],
+  ] as const)('retains authenticated %s counters when SQLite collection stalls', async (origin, storageFactory) => {
+    const {dependencies,observation}=fixture();
+    observation.config.storage={backend:'sqlite'};
+    sqlitePool.get.mockReturnValue(observedPool);
+    const collectSqlite=vi.fn(()=>new Promise<void>(()=>{}));
+    const result=await collectBackendDiagnostics({
+      _dependencies:dependencies,
+      _deadlineMs:10,
+      collectSqlite,
+      ...(storageFactory === undefined ? {} : {storageFactory:storageFactory as never}),
+    });
+    expect(result).toMatchObject({
+      classification:'timeout',
+      publication:'ready',
+      pool:{origin,status:'ready',total:7,idle:3},
+      schema:'unverified',
+      project:{status:'unverified'},
+      outbox:{status:'unverified'},
+    });
+    expect(result.pool).not.toHaveProperty('connections');
+    expect(JSON.stringify(result)).not.toContain('/private/project');
+    expect(sqlitePool.get).toHaveBeenCalledOnce();
+    expect(sqlitePool.get.mock.invocationCallOrder[0]).toBeLessThan(collectSqlite.mock.invocationCallOrder[0]);
+    expect(dependencies.observePublication).toHaveBeenCalledTimes(2);
+    if (storageFactory !== undefined) expect(storageFactory.close).not.toHaveBeenCalled();
+  });
+
+  it('retains only pool counters when the outbox observation stalls', async () => {
+    const {dependencies,observation}=fixture();
+    observation.config.storage={backend:'sqlite'};
+    dependencies.readOutbox=vi.fn(()=>new Promise(()=>{}));
+    sqlitePool.get.mockReturnValue(observedPool);
+    const result=await collectBackendDiagnostics({
+      _dependencies:dependencies,
+      _deadlineMs:10,
+      collectSqlite:async()=>{},
+    });
+    expect(result).toMatchObject({
+      classification:'timeout',
+      pool:{origin:'local',status:'ready',total:7,idle:3},
+      schema:'unverified',
+      project:{status:'unverified'},
+      outbox:{status:'unverified'},
+    });
+    expect(result.metrics).toBeUndefined();
+  });
+
+  it('captures safe counters before honoring a pre-aborted caller', async () => {
+    const {dependencies,observation}=fixture();
+    observation.config.storage={backend:'sqlite'};
+    sqlitePool.get.mockReturnValue(observedPool);
+    const controller=new AbortController();controller.abort();
+    const collectSqlite=vi.fn(async()=>{});
+    const result=await collectBackendDiagnostics({
+      _dependencies:dependencies,
+      signal:controller.signal,
+      collectSqlite,
+    });
+    expect(result).toMatchObject({classification:'timeout',pool:{origin:'local',status:'ready',total:7,idle:3}});
+    expect(sqlitePool.get).toHaveBeenCalledOnce();
+    expect(collectSqlite).not.toHaveBeenCalled();
+    expect(dependencies.readOutbox).not.toHaveBeenCalled();
+  });
+
+  it.each(['changed','refused'] as const)('discards SQLite counters when the timeout witness is %s', async mode => {
+    const {dependencies,observation}=fixture();
+    observation.config.storage={backend:'sqlite'};
+    dependencies.observePublication=vi.fn().mockReturnValueOnce(observation).mockImplementation(()=>{
+      if(mode==='refused') throw new BackendPublicationJournalError('unexpected-state','private authority');
+      return {...observation,witness:'changed'};
+    });
+    sqlitePool.get.mockReturnValue(observedPool);
+    const result=await collectBackendDiagnostics({
+      _dependencies:dependencies,
+      _deadlineMs:10,
+      collectSqlite:()=>new Promise(()=>{}),
+    });
+    expect(result).toMatchObject({classification:'stale-publication',publication:'unavailable',pool:{status:'unverified'}});
+    expect(result.pool.total).toBeUndefined();
+    expect(result.pool.idle).toBeUndefined();
+    expect(JSON.stringify(result)).not.toMatch(/private|database\.sqlite/);
+  });
+
+  it.each([
+    ['throws', undefined],
+    ['negative total', {...observedPool,totalConnections:-1}],
+    ['fractional idle', {...observedPool,idleConnections:1.5}],
+    ['unsafe total', {...observedPool,totalConnections:Number.MAX_SAFE_INTEGER+1}],
+  ] as const)('keeps SQLite unhealthy when pool observation %s', async (_mode, value) => {
+    const {dependencies,observation}=fixture();
+    observation.config.storage={backend:'sqlite'};
+    if(value === undefined) sqlitePool.get.mockImplementation(()=>{throw new Error('/private/pool');});
+    else sqlitePool.get.mockReturnValue(value);
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,collectSqlite:async()=>{}});
+    expect(result).toMatchObject({classification:'unavailable',pool:{origin:'local',status:'unverified'}});
+    expect(result.pool.total).toBeUndefined();
+    expect(result.pool.idle).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain('/private');
+  });
 });
 
 describe('selected and aggregate diagnostic identities', () => {
