@@ -16,7 +16,6 @@ import {
   rmSync,
   statSync,
   unlinkSync,
-  writeFileSync,
   writeSync,
 } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
@@ -83,7 +82,7 @@ import {
   readPrivateMutationLockOwner,
   PrivateMutationLockContentionError,
 } from "../private-mutation-lock.js";
-import { readBoundedRegularFileWithStat } from "../security-files.js";
+import { atomicWritePrivateFile, readBoundedRegularFileWithStat } from "../security-files.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
@@ -2071,7 +2070,7 @@ function startViaDetachedSpawn(
 
   if (child.pid) {
     if (scopedState) writeScopedPidFile(scopedState, child.pid);
-    else writeFileSync(opts.pidFilePath, String(child.pid));
+    else atomicWritePrivateFile(opts.pidFilePath, String(child.pid));
   }
   return {
     getWarning: () => errorMessage ? `detached spawn failed (${errorMessage})` : undefined,
