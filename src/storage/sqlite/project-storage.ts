@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { assertBackendPublicationConsumerAccess, type BackendPublicationLockToken } from "../backend-publication.js";
 import { SqliteNativeTranscriptRepository } from "./native-transcript-repository.js";
 import type { DatabaseSync } from "node:sqlite";
 import { closeLcmConnection } from "../../db/connection.js";
@@ -32,6 +34,7 @@ export class SqliteProjectStorage implements ProjectStorage {
   readonly lexicalSearch: ProjectRepositories["lexicalSearch"];
   readonly coordination: ProjectRepositories["coordination"];
 
+  private readonly operationAdmission = new AsyncLocalStorage<SqliteOperationAdmission>();
   private readonly stores: SqliteRepositoryStores;
   private closed = false;
   private closePromise: Promise<void> | undefined;
@@ -51,8 +54,8 @@ export class SqliteProjectStorage implements ProjectStorage {
     const invoke: RepositoryInvoker = async (domain, operation, callback, atomic) => {
       this.assertOpen(domain, operation);
       return atomic
-        ? this.executor.runAtomic(domain, operation, callback, this.admission)
-        : this.executor.run(domain, operation, callback, this.admission);
+        ? this.executor.runAtomic(domain, operation, callback, this.operationAdmission.getStore() ?? this.admission)
+        : this.executor.run(domain, operation, callback, this.operationAdmission.getStore() ?? this.admission);
     };
     this.nativeTranscripts = Object.freeze({
       machineId: "local",
@@ -70,6 +73,19 @@ export class SqliteProjectStorage implements ProjectStorage {
     this.coordination = repositories.coordination;
   }
 
+  /** Use the caller's live token only for this handle's current operation. */
+  withPublicationAdmission<T>(
+    lockToken: BackendPublicationLockToken,
+    callback: () => T,
+  ): T {
+    if (this.admission?.homeDir !== undefined) {
+      assertBackendPublicationConsumerAccess({
+        homeDir: this.admission.homeDir, backend: "sqlite", lockToken,
+      });
+    }
+    return this.operationAdmission.run({ ...this.admission, lockToken }, callback);
+  }
+
   async transaction<T>(
     callback: (repositories: TransactionRepositories) => Promise<T>,
   ): Promise<T> {
@@ -84,7 +100,12 @@ export class SqliteProjectStorage implements ProjectStorage {
             : this.executor.runScoped(token, domain, operation, operationCallback),
       );
       return callback(repositories);
-    }, this.admission);
+    }, this.operationAdmission.getStore() ?? this.admission);
+  }
+
+  /** Factory probes may outlive the publication scope that opened this handle. */
+  healthWithFreshAdmission(): Promise<StorageHealth> {
+    return this.operationAdmission.run({ homeDir: this.admission?.homeDir }, () => this.health());
   }
 
   async health(): Promise<StorageHealth> {
@@ -102,7 +123,7 @@ export class SqliteProjectStorage implements ProjectStorage {
           }
           throw error;
         }
-      }, this.admission);
+      }, this.operationAdmission.getStore() ?? this.admission);
       candidate = { status: "healthy", backend: "sqlite", projectId: this.projectId };
     } catch (error) {
       const normalized = normalizeStorageError(error, {

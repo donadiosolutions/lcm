@@ -606,6 +606,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
       ["src/daemon/project.ts", "unit-daemon-core"],
+      // Compact forwards current operation tokens; SQLite validates handle admission.
       ["src/daemon/routes/compact.ts", "unit-daemon-routes"],
       ["src/daemon/routes/describe.ts", "unit-daemon-routes"],
       ["src/daemon/routes/expand.ts", "unit-daemon-routes"],
@@ -674,7 +675,9 @@ describe("Codecov configuration", () => {
       // opened-identity fencing local-persistence-owned.
       ["src/db/connection.ts", "unit-local-persistence"],
       ["src/db/database-parent.ts", "unit-local-persistence"],
+      // Retained-handle token scopes and fresh factory health remain local persistence.
       ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
+      ["src/storage/sqlite/project-storage.ts", "unit-local-persistence"],
       // #1020 keeps message timestamp mapping in the existing local-persistence
       // component; conversation timestamps remain on their existing mapper.
       ["src/store/conversation-store.ts", "unit-local-persistence"],

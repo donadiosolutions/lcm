@@ -11,6 +11,12 @@ storage backend, or execute rollback by itself. The immutable SQLite snapshot
 capability adds the authenticated source artifact used by those later steps;
 it still does not copy records into PostgreSQL or select a destination.
 
+Compaction releases publication admission while waiting for a model and revalidates
+it for each subsequent storage operation. A project handle uses that operation's
+current token; it cannot reuse the expired token from opening the project. Daemon
+health probes acquire their own fresh admission, so an idle model request does not
+make storage unhealthy. Both paths still refuse access during a migration hold.
+
 ## Immutable SQLite preparation and capture
 
 Migration preparation is an explicit upgrade action. For an enrolled machine,

@@ -125,7 +125,10 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
   return canonical.id;
 }
 
-/** Run dedup inside a caller-owned transaction, including receipt insertion. */
+/**
+ * Run dedup inside a caller-owned transaction. The caller records any receipt
+ * in that same transaction alongside these promoted-memory changes.
+ */
 export async function deduplicateAndInsertInRepositories(
   repositories: TransactionRepositories,
   input: DedupInsertInput,

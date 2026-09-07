@@ -107,6 +107,7 @@ component_management:
         - "^src/daemon/summarizer\\.ts$"
         - "^src/daemon/validate-cwd\\.ts$"
         - "^src/daemon/version\\.ts$"
+    # Compact forwards each live operation token; SQLite owns handle-scoped admission.
     - component_id: "unit-daemon-routes"
       name: "Unit - Daemon Routes"
       paths:
@@ -176,6 +177,7 @@ component_management:
         - "src/db/"
         # Captured UTF-8 decoding and immutable-file authority remain local-persistence-owned.
         # #618 optional receipt schema admission stays local-persistence-owned.
+        # Includes current-token scopes and independently admitted factory health.
         - "src/storage/sqlite/"
         - "src/store/"
     - component_id: "unit-storage-abstractions"

@@ -110,6 +110,86 @@ describe("SQLite factory maintenance admission", () => {
     return { homeDir, dbPath, factory, hold, identity: { id: projectId, canonical: homeDir } };
   }
 
+  it("uses current operation admission without reviving the expired opening token", async () => {
+    const context = fixture();
+    try {
+      const project = await publication.withBackendPublicationConsumerLockAsync(context.homeDir,
+        token => context.factory.openProject(context.identity, token)) as SqliteProjectStorage;
+      await expect(project.conversations.getOrCreateConversation("expired-opening")).rejects.toThrow();
+      expect(await context.factory.health()).toMatchObject({ status: "healthy" });
+      await publication.withBackendPublicationConsumerLockAsync(context.homeDir, async token => {
+        await project.withPublicationAdmission(token, async () => {
+          const conversation = await project.conversations.getOrCreateConversation("fresh-operation");
+          await project.transaction(async repositories => {
+            expect(await repositories.conversations.getMessageCount(conversation.conversationId)).toBe(0);
+          });
+          expect(await project.health()).toMatchObject({ status: "healthy" });
+        });
+        // Leaving the operation restores the original, now-expired admission.
+        await expect(project.conversations.getOrCreateConversation("outside-scope")).rejects.toThrow();
+      });
+      await expect(project.conversations.getOrCreateConversation("after-release")).rejects.toThrow();
+      await context.hold();
+      const bytes = readFileSync(context.dbPath);
+      expect(await context.factory.health()).toMatchObject({ status: "unavailable" });
+      await publication.withBackendPublicationConsumerLockAsync(context.homeDir, async token => {
+        expect(() => project.withPublicationAdmission(token,
+          () => project.conversations.getOrCreateConversation("held"))).toThrow();
+      }, { allowUnresolved: true });
+      expect(readFileSync(context.dbPath)).toEqual(bytes);
+      await project.close();
+    } finally { await context.factory.close(); rmSync(context.homeDir, { recursive: true, force: true }); }
+  });
+
+  it("keeps current admission local to one handle and rejects detached work after release", async () => {
+    const context = fixture();
+    const resume = deferred();
+    let detached: Promise<unknown> | undefined;
+    try {
+      const [project, sibling] = await publication.withBackendPublicationConsumerLockAsync(context.homeDir,
+        async token => [
+          await context.factory.openProject(context.identity, token) as SqliteProjectStorage,
+          await context.factory.openProject(context.identity, token),
+        ] as const);
+      await publication.withBackendPublicationConsumerLockAsync(context.homeDir, token =>
+        project.withPublicationAdmission(token, async () => {
+          await project.conversations.getOrCreateConversation("admitted-handle");
+          await expect(sibling.conversations.getOrCreateConversation("unscoped-handle")).rejects.toThrow();
+          detached = resume.promise.then(() => project.conversations.getOrCreateConversation("detached"));
+        }));
+      const refused = expect(detached).rejects.toThrow();
+      resume.resolve();
+      await refused;
+      await project.close();
+      await sibling.close();
+    } finally {
+      resume.resolve();
+      await detached?.catch(() => undefined);
+      await context.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects wrong-home and revoked operation tokens before using a retained project", async () => {
+    const context = fixture();
+    const other = fixture();
+    try {
+      const project = await context.factory.openProject(context.identity) as SqliteProjectStorage;
+      const callback = vi.fn(async () => undefined);
+      const revoked = await publication.withBackendPublicationConsumerLockAsync(context.homeDir, token => token);
+      expect(() => project.withPublicationAdmission(revoked, callback)).toThrow();
+      await publication.withBackendPublicationConsumerLockAsync(other.homeDir, token => {
+        expect(() => project.withPublicationAdmission(token, callback)).toThrow();
+      });
+      expect(callback).not.toHaveBeenCalled();
+      await project.close();
+    } finally {
+      await context.factory.close(); await other.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+      rmSync(other.homeDir, { recursive: true, force: true });
+    }
+  });
+
   it("fences a retained native transcript writer after maintenance entry", async () => {
     const context = fixture();
     try {

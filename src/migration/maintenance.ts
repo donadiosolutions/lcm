@@ -22,7 +22,6 @@ import {
   readBackendMaintenanceJournal,
   rebindBackendMaintenanceCutoff,
   withBackendPublicationAppendBarrierAsync,
-  withBackendPublicationConsumerLockAsync,
   type BackendPublicationLockToken,
 } from "../storage/backend-publication.js";
 import type { StorageBackendName } from "../storage/contracts.js";

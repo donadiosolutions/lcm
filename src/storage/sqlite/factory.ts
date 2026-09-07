@@ -214,7 +214,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       (project) => !activeProjectIds.has(project.id),
     );
     const projectHealth = await Promise.all([
-      ...[...this.projects].map((project) => project.health()),
+      ...[...this.projects].map((project) => project.healthWithFreshAdmission()),
       ...idleProjects.map((project) => this.probeKnownProject(project)),
     ]);
     if (this.closed) return { status: "closed", backend: "sqlite" };

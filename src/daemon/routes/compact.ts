@@ -22,6 +22,7 @@ import {
   readBoundedRegularFile,
   type PrivateDirectoryHandle,
 } from "../../security-files.js";
+import { SqliteProjectStorage } from "../../storage/sqlite/project-storage.js";
 import { enqueue } from "../project-queue.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler, RoutePublicationAdmission } from "../server.js";
@@ -244,18 +245,23 @@ function admittedProjectStorage(
   project: ProjectStorage,
   withPublicationAdmission: RoutePublicationAdmission,
 ): ProjectStorage {
+  const withCurrentAdmission: RoutePublicationAdmission = operation =>
+    withPublicationAdmission(token =>
+      project instanceof SqliteProjectStorage && token !== undefined
+        ? project.withPublicationAdmission(token, () => operation(token))
+        : operation(token));
   const repositories = Object.fromEntries(
     PROJECT_REPOSITORY_KEYS.map((key) => [
       key,
-      admittedRepository(project[key] as object, withPublicationAdmission),
+      admittedRepository(project[key] as object, withCurrentAdmission),
     ]),
   ) as Pick<ProjectStorage, typeof PROJECT_REPOSITORY_KEYS[number]>;
   return {
     ...project,
     ...repositories,
     transaction: <T>(callback: (repositories: TransactionRepositories) => Promise<T>): Promise<T> =>
-      withPublicationAdmission<T>(() => project.transaction<T>(callback)),
-    health: () => withPublicationAdmission(() => project.health()),
+      withCurrentAdmission<T>(() => project.transaction<T>(callback)),
+    health: () => withCurrentAdmission(() => project.health()),
     // Cleanup must remain possible after an admission failure.
     close: () => project.close(),
   };

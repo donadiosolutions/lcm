@@ -1478,7 +1478,11 @@ describe("authenticated SQLite snapshot artifacts", () => {
     const carriageReturn = await heldFixture();
     await captureFixture(carriageReturn);
     const witnessPath = join(generationDirectory(carriageReturn.homeDir), "witness.json");
-    writeFileSync(witnessPath, readFileSync(witnessPath, "utf8").replace("\n", "\r\n"), { mode: 0o600 });
+    const witnessBytes = readFileSync(witnessPath, "utf8");
+    const firstNewline = witnessBytes.indexOf("\n");
+    expect(firstNewline).toBeGreaterThanOrEqual(0);
+    const carriageReturnBytes = witnessBytes.slice(0, firstNewline) + "\r" + witnessBytes.slice(firstNewline);
+    writeFileSync(witnessPath, carriageReturnBytes, { mode: 0o600 });
     expect(await classifySqliteSnapshotArtifact("generation-1", { homeDir: carriageReturn.homeDir }))
       .toEqual({ state: "tampered", generationId: "generation-1" });
 
