@@ -989,10 +989,24 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(gateway.upstreamFailureCategory).toBe("upstream-stream");
   });
 
-  it.each([
-    ["malformed SSE", "event: response.completed\ndata: not-json\n\n"],
-    ["incomplete SSE", "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\"}\n\n"],
-  ] as const)("latches upstream-stream for an accepted HTTP 200 %s", async (_label, body) => {
+  it("latches upstream-stream before awaiting a deferred upstream cancel", async () => {
+    let releaseCancel!: () => void;
+    const cancelStarted = new Promise<void>(resolve => {
+      releaseCancel = resolve;
+    });
+    let cancelPending!: () => void;
+    const cancelFinished = new Promise<void>(resolve => {
+      cancelPending = resolve;
+    });
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("event: response.completed\ndata: not-json\n\n"));
+      },
+      cancel() {
+        releaseCancel();
+        return cancelFinished;
+      },
+    });
     const gateway = await createCodexResponsesGateway({
       prompt: PROMPT,
       _fetch: async () => new Response(body, {
@@ -1002,13 +1016,59 @@ describe("Codex Responses zero-tools gateway", () => {
     });
     gateways.push(gateway);
 
-    await fetchGateway(gateway).then(async response => {
+    const responsePending = fetchGateway(gateway);
+    try {
+      await vi.waitFor(() => expect(gateway.requestAccepted).toBe(true));
+      await cancelStarted;
+      expect(gateway.upstreamFailureCategory).toBe("upstream-stream");
+      cancelPending();
+      const response = await responsePending;
       expect(response.status).toBe(502);
       expect(await response.text()).toBe("codex responses gateway request failed\n");
-    }).catch(() => undefined);
+      await expect(gateway.waitForCompletion()).rejects.toThrow("codex responses gateway did not complete");
+    } finally {
+      cancelPending();
+      await responsePending.catch(() => undefined);
+    }
+  });
+
+  it("latches upstream-stream for a malformed accepted HTTP 200 SSE body", async () => {
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response("event: response.completed\ndata: not-json\n\n", {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+    gateways.push(gateway);
+
+    const response = await fetchGateway(gateway);
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("codex responses gateway request failed\n");
     expect(gateway.requestAccepted).toBe(true);
     expect(gateway.requestCompleted).toBe(false);
     expect(gateway.upstreamFailureCategory).toBe("upstream-stream");
+  });
+
+  it("latches upstream-stream for an incomplete accepted HTTP 200 SSE body", async () => {
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\"}\n\n", {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+    gateways.push(gateway);
+
+    const response = await fetchGateway(gateway).catch(() => undefined);
+    if (response !== undefined) {
+      expect(response.status).toBe(200);
+      await response.text().catch(() => undefined);
+    }
+    expect(gateway.requestAccepted).toBe(true);
+    expect(gateway.requestCompleted).toBe(false);
+    expect(gateway.upstreamFailureCategory).toBe("upstream-stream");
+    await expect(gateway.waitForCompletion()).rejects.toThrow("codex responses gateway did not complete");
   });
 
   it("latches upstream-stream when an accepted HTTP 200 reader fails", async () => {
@@ -1074,9 +1134,12 @@ describe("Codex Responses zero-tools gateway", () => {
     gateways.push(gateway);
     const responsePending = fetchGateway(gateway).catch(() => undefined);
     await vi.waitFor(() => expect(gateway.requestAccepted).toBe(true));
-    await gateway.close();
-    releaseRead();
-    await responsePending;
+    try {
+      await gateway.close();
+    } finally {
+      releaseRead();
+      await responsePending;
+    }
     expect(gateway.upstreamFailureCategory).toBeUndefined();
   });
 
@@ -1872,10 +1935,10 @@ describe("Codex Responses zero-tools gateway", () => {
   });
 
   it.each([
-    ["fetch failure", async () => { throw new Error("UPSTREAM-SECRET"); }],
-    ["redirect", async () => new Response("UPSTREAM-SECRET", { status: 302, headers: { location: "https://evil.invalid" } })],
-    ["wrong content type", async () => new Response("UPSTREAM-SECRET", { status: 200, headers: { "content-type": "application/json" } })],
-  ])("maps %s to a bounded generic failure", async (_label, fetchImpl) => {
+    ["fetch failure", async () => { throw new Error("UPSTREAM-SECRET"); }, "upstream-request"],
+    ["redirect", async () => new Response("UPSTREAM-SECRET", { status: 302, headers: { location: "https://evil.invalid" } }), "upstream-request"],
+    ["wrong content type", async () => new Response("UPSTREAM-SECRET", { status: 200, headers: { "content-type": "application/json" } }), "upstream-stream"],
+  ] as const)("maps %s to a bounded generic failure", async (_label, fetchImpl, category) => {
     const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: fetchImpl as typeof fetch });
     gateways.push(gateway);
     const response = await fetchGateway(gateway);
@@ -1883,6 +1946,7 @@ describe("Codex Responses zero-tools gateway", () => {
     const text = await response.text();
     expect(text).toBe("codex responses gateway request failed\n");
     expect(text).not.toContain("UPSTREAM-SECRET");
+    expect(gateway.upstreamFailureCategory).toBe(category);
     await expect(gateway.waitForCompletion()).rejects.toThrow("codex responses gateway did not complete");
   });
 

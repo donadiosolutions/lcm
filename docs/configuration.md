@@ -1180,7 +1180,7 @@ Failures after an accepted HTTP 200 response are reported as an upstream stream
 failure, including a missing body, wrong media type, malformed or incomplete
 SSE, reader failure, or clean EOF before completion. Error bodies and provider
 diagnostics are never shown. Retry later or select a different available model
-when either safe upstream failure is reported.
+when any safe upstream failure is reported.
 
 ```json
 {
