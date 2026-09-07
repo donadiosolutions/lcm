@@ -201,7 +201,7 @@ const expectedComponents = [
     name: "Unit - Memory and Retrieval",
     paths: [
       // The #971 compact cwd client contract and #973 stats database admission
-      // remain memory/retrieval-owned.
+      // and #1146 metadata-only aggregate diagnostics remain memory/retrieval-owned.
       "src/memory/",
       "^src/expansion\\.ts$",
       "^src/retrieval\\.ts$",

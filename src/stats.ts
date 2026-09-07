@@ -241,7 +241,7 @@ async function queryProjectStats(
   } catch (error) {
     assertStatsDirectories(directories);
     const currentDatabase = inspectStatsDatabasePath(dbPath);
-    if (currentDatabase === null) return null;
+    if (currentDatabase === null) throw new StatsDatabaseAdmissionError();
     if (!sameDatabaseFile(expectedDatabase, currentDatabase)) throw new StatsDatabaseAdmissionError();
     throw error;
   }
@@ -571,7 +571,11 @@ async function collectSqliteStats(options: CollectStatsOptions & {
         const projectDirectories = [...directories, { handle: projectHandle, path: projectPath }];
         assertStatsDirectories(projectDirectories);
         const project = await queryProjectStats(join(projectPath, "db.sqlite"), entry.name, options, projectDirectories, options.signal);
-        if (!project) throw new Error("Statistics unavailable");
+        if (!project) {
+          assertStatsDirectories(projectDirectories);
+          if (options.projectId !== undefined) throw new Error("Statistics unavailable");
+          continue;
+        }
         result.projects++;
         result.conversations += project.conversations;
         result.compactedConversations += project.compactedConversations;
