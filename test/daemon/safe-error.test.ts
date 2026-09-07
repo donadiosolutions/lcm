@@ -606,6 +606,8 @@ describe("sanitizeError", () => {
     ["file:///C:\\E::\\SECRET", "file://<path>"],
     ["https://example.test/C:\\E::\\SECRET", "https://example.test/<path>"],
     ["C:\\E::\\E::\\SECRET", "<path>"],
+    ["C:\\E::\\1SECRET", "<path>"],
+    ["C:\\E::\\", "<path>"],
     ["/p\\C:\\E::\\SECRET https://pub.test/x", "<path>\\<path> https://pub.test/x"],
   ] as const)("redacts doubled-colon drive segments inside recognized paths: %#", (input, expected) => {
     const result = sanitizeError(input);

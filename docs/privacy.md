@@ -299,7 +299,9 @@ The `Security` section of the doctor output shows:
   `<path>`; quoted paths may contain spaces, while unquoted paths stop at
   whitespace so arbitrary trailing prose remains intact. Inside an already
   recognized path, a drive-shaped doubled-colon segment ending in a backslash
-  is also redacted, including in slash-prefixed Windows drives. This does not
+  is also redacted, including in slash-prefixed Windows drives. A URL-shaped
+  scheme token immediately after that backslash retains the existing URL
+  boundary behavior. This does not
   make doubled-colon text a new path start: standalone `E::\` tails, longer
   colon runs, and non-drive-shaped segments remain unchanged. File URLs
   preserve their scheme and authority spelling while replacing a non-root path

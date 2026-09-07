@@ -5,7 +5,6 @@
 const PATH_WORD_PATTERN = /^[\p{L}\p{N}\p{M}]$/u;
 const URL_SCHEME_START_PATTERN = /^[A-Za-z]$/u;
 const URL_SCHEME_CHARACTER_PATTERN = /^[A-Za-z\d+.-]$/u;
-const URL_SCHEME_LITERAL_PATTERN = /^[A-Za-z][A-Za-z\d+.-]*:\/\//u;
 const FILE_SCHEME = "file";
 const WHITESPACE_PATTERN = /\s/u;
 const PATH_DELIMITERS = new Set(["#", "&", "=", "|", ",", ";", ":", "!", "?", ")", "]", "}", "'", '"', "<", ">"]);
@@ -321,6 +320,13 @@ function isWindowsDrivePathStart(chars: readonly string[], index: number): boole
   return !isPathWord(chars[index - 1]);
 }
 
+function startsUrlSchemeLiteral(chars: readonly string[], index: number): boolean {
+  if (!URL_SCHEME_START_PATTERN.test(chars[index] ?? "")) return false;
+  let cursor = index + 1;
+  while (URL_SCHEME_CHARACTER_PATTERN.test(chars[cursor] ?? "")) cursor += 1;
+  return chars[cursor] === ":" && chars[cursor + 1] === "/" && chars[cursor + 2] === "/";
+}
+
 function isDoubledDriveColonInPath(chars: readonly string[], index: number, windows: boolean): boolean {
   const boundary = chars[index - 2];
   return (
@@ -329,7 +335,7 @@ function isDoubledDriveColonInPath(chars: readonly string[], index: number, wind
     chars[index + 2] === "\\" &&
     /^[A-Za-z]$/u.test(chars[index - 1] ?? "") &&
     (boundary === "\\" || (windows && boundary === "/")) &&
-    !URL_SCHEME_LITERAL_PATTERN.test(chars.slice(index + 3).join(""))
+    !startsUrlSchemeLiteral(chars, index + 3)
   );
 }
 
