@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   })),
   privateContention: false,
   loadProjectPatterns: vi.fn(async () => [] as string[]),
+  forProject: vi.fn(async () => ({ scrub: (value: string) => value })),
   readSyncDate: vi.fn(() => "2026-07-18" as string | null),
   scrub: vi.fn((value: string) => value),
 }));
@@ -58,9 +59,13 @@ vi.mock("../src/runtime-paths.js", () => ({
 vi.mock("../src/scrub.js", () => ({
   NATIVE_PATTERNS: [],
   readGitleaksSyncDate: mocks.readSyncDate,
-  ScrubEngine: {
-    loadProjectPatterns: mocks.loadProjectPatterns,
-    forProject: vi.fn(async () => ({ scrub: mocks.scrub })),
+  ScrubEngine: class {
+    static loadProjectPatterns = mocks.loadProjectPatterns;
+    static forProject = mocks.forProject;
+
+    scrub(value: string): string {
+      return mocks.scrub(value);
+    }
   },
 }));
 
@@ -81,8 +86,10 @@ describe("sensitive configuration fallbacks", () => {
   });
 
   it("tests text with an absent normalized security section", async () => {
+    mocks.forProject.mockClear();
     const result = await handleSensitive(["test", "ordinary"], "/isolated/project", "/isolated/config.json");
     expect(result).toMatchObject({ exitCode: 0, stdout: expect.stringContaining("No patterns matched") });
+    expect(mocks.forProject).not.toHaveBeenCalled();
   });
 
   it("does not convert unresolved publication evidence into an empty pattern fallback", async () => {

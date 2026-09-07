@@ -387,7 +387,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm sensitive purge --yes", "IRREVERSIBLY delete all stored memory and patterns for current project"],
       ["lcm sensitive purge --all --yes", "IRREVERSIBLY delete all stored memory and patterns for ALL projects"],
     ],
-    notes: "Built-in patterns cover common secrets (API keys, tokens, passwords). Project patterns are stored in ~/.lcm/projects/<id>/sensitive-patterns.txt; global patterns are stored in config.json. The 'purge' subcommand deletes the entire project data directory (including stored memory) and cannot be undone.",
+    notes: "Built-in patterns cover common secrets (API keys, tokens, passwords). Project patterns are stored in ~/.lcm/projects/<id>/sensitive-patterns.txt; the leaf must be a regular, current-user-owned, single-link file or the command exits nonzero with a validation error and preserves any external hard link. On platforms without an effective user ID, only the owner check is skipped. Global patterns are stored in config.json. The 'purge' subcommand deletes the entire project data directory (including stored memory) and cannot be undone.",
   },
 
   export: {

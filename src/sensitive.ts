@@ -33,6 +33,8 @@ function loadProjectPatternsBounded(patternsFile: string): string[] {
     content = readBoundedRegularFile(patternsFile, {
       allowedRoot: dirname(patternsFile),
       maxBytes: MAX_SENSITIVE_PATTERN_BYTES,
+      expectedUid: process.getuid?.(),
+      requireSingleLink: true,
     });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
@@ -235,6 +237,8 @@ async function sensitiveAdd(
         const current = readBoundedRegularFile(patternsFile, {
           allowedRoot: dirname(patternsFile),
           maxBytes: MAX_SENSITIVE_PATTERN_BYTES,
+          expectedUid: process.getuid?.(),
+          requireSingleLink: true,
         });
         const normalized = current.length > 0 && !current.endsWith("\n") ? current + "\n" : current;
         await writeFile(patternsFile, normalized + line, "utf-8");
@@ -283,6 +287,8 @@ async function sensitiveRemove(
         raw = readBoundedRegularFile(patternsFile, {
           allowedRoot: dirname(patternsFile),
           maxBytes: MAX_SENSITIVE_PATTERN_BYTES,
+          expectedUid: process.getuid?.(),
+          requireSingleLink: true,
         });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -314,17 +320,15 @@ async function sensitiveTest(
 
   const globalUserPatterns = loadGlobalUserPatterns(configPath);
   const patternsFile = join(projectDir(cwd), "sensitive-patterns.txt");
-  const engine = await ScrubEngine.forProject(globalUserPatterns, projectDir(cwd));
-
-  const redacted = engine.scrub(input);
-
-  const lines: string[] = [];
-
-  // Find which patterns matched
   const projectPatterns = await withBackendPublicationConsumerLockAsync(
     backendPublicationHomeForConfigPath(configPath),
     () => loadProjectPatternsBounded(patternsFile),
   );
+  const engine = new ScrubEngine(globalUserPatterns, projectPatterns);
+
+  const redacted = engine.scrub(input);
+
+  const lines: string[] = [];
 
   const matched: string[] = [];
 
