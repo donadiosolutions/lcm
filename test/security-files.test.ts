@@ -115,16 +115,64 @@ describe("private filesystem primitives", () => {
     }
   });
 
+  it("returns the identity of the prepared inode that it publishes", () => {
+    const root = makeRoot();
+    chmodSync(root, 0o700);
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    try {
+      const published = atomicWritePrivateFile(target, "content", {}, parent);
+      const actual = statSync(target, { bigint: true });
+
+      expect(published.dev).toBe(actual.dev);
+      expect(published.ino).toBe(actual.ino);
+      expect(published.parentDev.toString(10)).toBe(parent.witness.dev);
+      expect(published.parentIno.toString(10)).toBe(parent.witness.ino);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("runs opt-in replacement validation after temp preparation and cleans refusal", () => {
+    const root = makeRoot();
+    chmodSync(root, 0o700);
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    writeFileSync(target, "preserve", { mode: 0o600 });
+    const refusal = new Error("destination authorization changed");
+    try {
+      expect(() => atomicWritePrivateFile(target, "replacement", {}, parent, {
+        beforeReplace: () => {
+          expect(readdirSync(root).some((name) => /^\.metadata\.json\..+\.tmp$/u.test(name)))
+            .toBe(true);
+          throw refusal;
+        },
+      })).toThrow(refusal);
+      expect(readFileSync(target, "utf8")).toBe("preserve");
+      expect(readdirSync(root).filter((name) => /^\.metadata\.json\..+\.tmp$/u.test(name)))
+        .toEqual([]);
+    } finally {
+      parent.close();
+    }
+  });
+
   it("publishes an absent destination exclusively through a retained parent", () => {
     const root = makeRoot();
     const parent = openPrivateDirectory(root);
     const target = join(root, "metadata.json");
     try {
-      atomicWritePrivateFile(target, "content", {}, parent, { requireAbsent: true });
+      const published = atomicWritePrivateFile(
+        target,
+        "content",
+        {},
+        parent,
+        { requireAbsent: true },
+      );
 
       expect(readFileSync(target, "utf8")).toBe("content");
       expect(statSync(target).mode & 0o777).toBe(0o600);
       expect(fsStatSync(target).nlink).toBe(1);
+      expect(published.ino).toBe(statSync(target, { bigint: true }).ino);
       expect(readdirSync(root).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toEqual([]);
     } finally {
       parent.close();

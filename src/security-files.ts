@@ -444,7 +444,7 @@ type PrivatePathIdentity = Readonly<{
   ino: bigint;
 }>;
 
-type PrivateFileIdentity = PrivatePathIdentity & Readonly<{
+export type PrivateFileIdentity = PrivatePathIdentity & Readonly<{
   parentDev: bigint;
   parentIno: bigint;
 }>;
@@ -940,8 +940,12 @@ export function atomicWritePrivateFile(
     readonly write?: typeof writeFileSync;
   } = {},
   parent?: PrivateDirectoryHandle,
-  options: Readonly<{ requireAbsent?: boolean }> = {},
-): void {
+  options: Readonly<{
+    requireAbsent?: boolean;
+    /** Revalidate an existing destination after temp preparation and before replacement. */
+    beforeReplace?: () => void;
+  }> = {},
+): PrivateFileIdentity {
   const directory = dirname(path);
   if (options.requireAbsent) {
     if (parent === undefined) {
@@ -1083,7 +1087,7 @@ export function atomicWritePrivateFile(
       }
     }
     if (primaryErrorPresent) throw primaryError;
-    return;
+    return tempIdentity as PrivateFileIdentity;
   }
   if (parent === undefined) {
     ensurePrivateDirectory(directory);
@@ -1148,6 +1152,10 @@ export function atomicWritePrivateFile(
       assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
       assertPrivateTemporaryFileIdentity(tempPath, preparedIdentity);
     }
+    // Portable rename cannot provide descriptor-relative compare-and-swap.
+    // Callers with a destination policy can revalidate at the last boundary
+    // after temp preparation without changing the generic writer's default.
+    options.beforeReplace?.();
     try {
       (operations.rename ?? renameSync)(tempPath, path);
     } catch (error) {
@@ -1190,6 +1198,7 @@ export function atomicWritePrivateFile(
     }
     throw primaryError;
   }
+  return tempIdentity as PrivateFileIdentity;
 }
 
 /**
