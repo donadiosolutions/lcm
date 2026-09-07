@@ -191,7 +191,7 @@ describe('PostgreSQL canonical destination native persistence',()=>{
 
 });
 
-it('retains own-project provenance for filtered runtime reads and authenticated v1 export after PostgreSQL-SQLite-PostgreSQL transfer',async()=>{
+it('retains provenance filters and exports all owner-held knowledge after PostgreSQL-SQLite-PostgreSQL transfer',async()=>{
   await withPostgreSqlTestDatabase('portable-self-origin',async origin=>{
     const originSettings=settings(origin.runtimeUrl);
     await grantPortablePostgreSql(origin);
@@ -202,10 +202,11 @@ it('retains own-project provenance for filtered runtime reads and authenticated 
     const ownId=PORTABLE_POSTGRESQL_FIXTURE.ownProjectMemoryId;
     const externalId=PORTABLE_POSTGRESQL_FIXTURE.memoryId;
     const ownContent='Own project portable memory';
+    const externalContent='External provenance memory';
     await origin.migrator.query({text:'INSERT INTO lcm.machines(machine_id,identity_key,display_name) VALUES ($1,$2,$3)',values:[machine.machineId,machine.identityKey,machine.displayName]},context);
     await origin.migrator.query({text:'INSERT INTO lcm.projects(project_id,identity_key,display_name) VALUES ($1,$2,$3)',values:[project.projectId,localProjectId,project.displayName]},context);
     for(const alias of project.aliases) await origin.migrator.query({text:'INSERT INTO lcm.project_aliases(project_id,machine_id,path,normalized_path) VALUES ($1,$2,$3,$4)',values:[project.projectId,alias.machineId,alias.path,alias.normalizedPath]},context);
-    await origin.migrator.query({text:"INSERT INTO lcm.promoted_memories(memory_id,project_id,source_project_id,content) VALUES ($1,$2,$6,$3),($4,$2,'external-project',$5)",values:[ownId,project.projectId,ownContent,externalId,'External provenance memory',project.projectId]},context);
+    await origin.migrator.query({text:"INSERT INTO lcm.promoted_memories(memory_id,project_id,source_project_id,content) VALUES ($1,$2,$6,$3),($4,$2,'external-project',$5)",values:[ownId,project.projectId,ownContent,externalId,externalContent,project.projectId]},context);
     const targetSettings={...originSettings,url:target.runtimeUrl};
     const transferSql=readFileSync(join(process.cwd(),'src/storage/postgresql/reference/postgresql-transfer-grants.sql'),'utf8').split('\n').filter(line=>!line.startsWith('\\')).join('\n').replaceAll(':"lcm_runtime_role"','"lcm_test_runtime"');
     await administrator.query({text:transferSql},context);
@@ -220,6 +221,13 @@ it('retains own-project provenance for filtered runtime reads and authenticated 
       expect(intermediate.describe().contentSha256).toBe(manifest.contentSha256);
       const destination=await createPostgreSqlPortableDestination({settings:targetSettings,expectedOwner:'lcm_test_migrator',expectedIdentity,generationId:'self-provenance-return',runId:'self-provenance-run',scratchParent:projectRoot});handles.push(destination);
       expect((await runPortableTransfer({source:intermediate,destination,maxRecords:1})).contentSha256).toBe(manifest.contentSha256);
+      // A different owner cannot enter this project's reads or export even when
+      // its provenance claims the selected project. All rows are private fixtures.
+      const foreignProjectId='01990000-0000-7000-8000-000000000099';
+      const foreignMemoryId=PORTABLE_POSTGRESQL_FIXTURE.archivedMemoryId;
+      const foreignContent='Foreign owner memory must remain private';
+      await administrator.query({text:"INSERT INTO lcm.projects(project_id,identity_key,display_name) VALUES ($1,$2,'Foreign export owner')",values:[foreignProjectId,'f'.repeat(64)]},context);
+      await administrator.query({text:'INSERT INTO lcm.promoted_memories(memory_id,project_id,source_project_id,content) VALUES ($1,$2,$3,$4)',values:[foreignMemoryId,foreignProjectId,project.projectId,foreignContent]},context);
       const repository=new PostgreSqlPromotedMemoryRepository(target.runtime,project.projectId);
       expect(await repository.getAll({sourceProjectId:project.projectId})).toEqual([expect.objectContaining({id:ownId,content:ownContent,projectId:project.projectId})]);
       expect(await repository.getAll({sourceProjectId:'external-project'})).toEqual([expect.objectContaining({id:externalId,projectId:'external-project'})]);
@@ -228,10 +236,17 @@ it('retains own-project provenance for filtered runtime reads and authenticated 
       await administrator.query({text:transferSql.replace(/\bGRANT\b/g,'REVOKE').replace(/\bTO "lcm_test_runtime"/g,'FROM "lcm_test_runtime"')},context);
       await restoreRuntimeGrants(administrator);
       const output=join(projectRoot,'roundtrip-knowledge.json');
-      expect(await exportKnowledge(projectPath,{output,skipScrub:true})).toEqual({exported:1,projectCwd:projectPath});
+      expect(await exportKnowledge(projectPath,{output,skipScrub:true})).toEqual({exported:2,projectCwd:projectPath});
       const document=JSON.parse(readFileSync(output,'utf8')) as ExportDocument;
-      expect(document).toMatchObject({version:1,projectCwd:projectPath,entries:[expect.objectContaining({content:ownContent,sessionId:null})]});
-      expect(document.entries).toHaveLength(1);
+      expect(document).toMatchObject({version:1,projectCwd:projectPath});
+      expect(document.entries).toEqual(expect.arrayContaining([
+        expect.objectContaining({content:ownContent,sessionId:null}),
+        expect.objectContaining({content:externalContent,sessionId:null}),
+      ]));
+      expect(document.entries).toHaveLength(2);
+      expect(document.entries.some(entry=>entry.content===foreignContent)).toBe(false);
+      const foreign=new PostgreSqlPromotedMemoryRepository(target.runtime,foreignProjectId);
+      expect(await foreign.getAll()).toEqual([expect.objectContaining({id:foreignMemoryId,content:foreignContent,projectId:project.projectId})]);
     }finally{for(const handle of handles.reverse()) await handle.close();}
     });
   });
