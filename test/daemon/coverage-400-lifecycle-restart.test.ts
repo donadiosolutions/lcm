@@ -68,7 +68,14 @@ const legacyPidFileFault = vi.hoisted(() => ({
   openFlags: [] as Array<number | string>,
   parentPath: undefined as string | undefined,
   parentStatCalls: 0,
-  parentFault: undefined as "missing" | "non-directory" | "identity-change" | undefined,
+  parentFault: undefined as
+    | "first-missing"
+    | "first-non-directory"
+    | "missing"
+    | "non-directory"
+    | "device-change"
+    | "inode-change"
+    | undefined,
   leafLstatError: undefined as "EACCES" | undefined,
   preflightArmed: false,
   closeErrorDescriptor: undefined as number | undefined,
@@ -150,19 +157,29 @@ vi.mock("node:fs", async (importOriginal) => {
         )
       ) {
         legacyPidFileFault.parentStatCalls += 1;
+        const faultCall = legacyPidFileFault.parentFault?.startsWith("first-") === true ? 1 : 2;
+        if (
+          legacyPidFileFault.parentStatCalls === faultCall
+          && legacyPidFileFault.parentFault?.endsWith("missing") === true
+        ) {
+          const error = new Error("PID parent disappeared") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
         const current = actual.statSync(...args);
-        if (legacyPidFileFault.parentStatCalls === 2) {
-          if (legacyPidFileFault.parentFault === "missing") {
-            const error = new Error("PID parent disappeared") as NodeJS.ErrnoException;
-            error.code = "ENOENT";
-            throw error;
-          }
+        if (legacyPidFileFault.parentStatCalls === faultCall) {
           return new Proxy(current, {
             get: (target, property, receiver) => {
-              if (property === "isDirectory" && legacyPidFileFault.parentFault === "non-directory") {
+              if (
+                property === "isDirectory"
+                && legacyPidFileFault.parentFault?.endsWith("non-directory") === true
+              ) {
                 return () => false;
               }
-              if (property === "dev" && legacyPidFileFault.parentFault === "identity-change") {
+              if (property === "dev" && legacyPidFileFault.parentFault === "device-change") {
+                return Number(Reflect.get(target, property, receiver)) + 1;
+              }
+              if (property === "ino" && legacyPidFileFault.parentFault === "inode-change") {
                 return Number(Reflect.get(target, property, receiver)) + 1;
               }
               return Reflect.get(target, property, receiver);
@@ -524,7 +541,13 @@ type LegacyFixtureConfig = Readonly<{
   formerCleanupMutation?: "replacement" | "symlink" | "hardlink";
   pidCloseError?: boolean;
   pidValidationFaultAfterStop?: "missing" | "dangling-symlink";
-  pidMissingParentFault?: "missing" | "non-directory" | "identity-change";
+  pidMissingParentFault?:
+    | "first-missing"
+    | "first-non-directory"
+    | "missing"
+    | "non-directory"
+    | "device-change"
+    | "inode-change";
   pidLeafLstatError?: "EACCES";
   useProcListener?: boolean;
   abortSignal?: AbortSignal;
@@ -2358,7 +2381,14 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     expect(lstatSync(fixture.pidPath).isSymbolicLink()).toBe(true);
   });
 
-  it.each(["missing", "non-directory", "identity-change"] as const)(
+  it.each([
+    "first-missing",
+    "first-non-directory",
+    "missing",
+    "non-directory",
+    "device-change",
+    "inode-change",
+  ] as const)(
     "refuses direct PID absence when the parent is %s during classification",
     async (parentFault) => {
       const fixture = await runLegacyFixture({
@@ -2372,6 +2402,7 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
         refusalReason: "ambiguous",
       });
       expect(fixture.supervisor.discoverLegacySystemdUnits).not.toHaveBeenCalled();
+      expect(fixture.supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
       expect(fixture.supervisor.start).not.toHaveBeenCalled();
       expect(fixture.ensure).not.toHaveBeenCalled();
     },
