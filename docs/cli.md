@@ -300,7 +300,11 @@ considered within that same deadline. A timeout is reported even if a probe stal
 cleanup does not replace the primary failure classification. A diagnostic
 probe owns and closes its own resources, while a daemon's shared pool stays
 open. `lcm stats --pool` reports safe pool counts and whether they came from
-the daemon or a diagnostic probe. PostgreSQL observations include configured
+the daemon, a local SQLite process, or a diagnostic probe. SQLite total and
+idle counts are captured before project and outbox reads. They may remain
+available when either read times out, provided the publication and configuration
+still authenticate; the timed-out project, schema, and outbox facts remain
+unverified. PostgreSQL observations include configured
 maximum, total, idle, and waiting connections and the observed failure latch.
 Daemon pool counts are observed independently before the remote probe starts.
 They may remain available when that probe times out or fails, provided the
@@ -308,6 +312,11 @@ publication and configuration still authenticate. A ready pool observation
 means its counts were available; it does not establish remote backend health.
 The snapshot retains its failure classification and recovery action.
 Unavailable counts are omitted rather than reported as zero.
+
+Unexpected failures at the daemon statistics routes retain the configured
+backend name when it is known. Their snapshots contain only the standard
+classification and fixed recovery action; raw errors and partial metrics are
+discarded.
 
 Numeric statistics such as token totals, compression, recall counters, and
 local outbox counts are included only when observed. Partial or unavailable
