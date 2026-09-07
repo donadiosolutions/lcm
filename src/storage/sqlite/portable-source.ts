@@ -98,6 +98,8 @@ const sourceLayouts: Readonly<Record<string,string>> = {
   "messages_fts_data": "id:INTEGER|block:BLOB",
   "messages_fts_docsize": "id:INTEGER|sz:BLOB",
   "messages_fts_idx": "segid:|term:|pgno:",
+  "migration_receipt_v1_epochs": "project_id:TEXT|machine_id:TEXT|epoch_id:TEXT|first_machine_sequence:TEXT|established_at:TEXT|checksum_sha256:TEXT",
+  "migration_receipt_v1_events": "project_id:TEXT|machine_id:TEXT|epoch_id:TEXT|event_uuid:TEXT|machine_sequence:TEXT|envelope_sha256:TEXT|outcome:TEXT|effect_witness_json:TEXT|committed_at:TEXT|checksum_sha256:TEXT",
   "promoted": "id:TEXT|content:TEXT|tags:TEXT|metadata:TEXT|source_summary_id:TEXT|project_id:TEXT|session_id:TEXT|depth:INTEGER|confidence:REAL|created_at:TEXT|archived_at:TEXT",
   "promoted_fts": "content:|tags:",
   "promoted_fts_config": "k:|v:",
@@ -166,10 +168,10 @@ export function validateSqlitePortableSchema(db: DatabaseSync): void {
     seen.add(name);
   }
   for (const name of Object.keys(sourceLayouts)) {
-    if (name.includes("_fts") || name.startsWith("sqlite_") || name.startsWith("runtime_native_") || name.startsWith("portable_archive_") || name.startsWith("transfer_")) continue;
+    if (name.includes("_fts") || name.startsWith("sqlite_") || name.startsWith("runtime_native_") || name.startsWith("portable_archive_") || name.startsWith("transfer_") || name.startsWith("migration_receipt_v1_")) continue;
     if (!seen.has(name)) throw new PortableTransferError("unsupported-capability");
   }
-  for (const prefix of ["runtime_native_","portable_archive_","transfer_"]) {
+  for (const prefix of ["runtime_native_","portable_archive_","transfer_","migration_receipt_v1_"]) {
     const group=Object.keys(sourceLayouts).filter(name=>name.startsWith(prefix));
     const present=group.filter(name=>seen.has(name)).length;
     if(present !== 0 && present !== group.length) throw new PortableTransferError("unsupported-capability");

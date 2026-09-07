@@ -14,6 +14,28 @@ new CLI command. It prepares and verifies an isolated destination. It does not
 select a backend, publish a generation, replace an active project, activate an
 outbox, or perform a cutover.
 
+## Optional migration receipt metadata
+
+SQLite sources and resumed SQLite destinations may contain the exact optional
+`migration_receipt_v1_epochs` and `migration_receipt_v1_events` tables defined by
+[migration receipt contract v1](https://github.com/donadiosolutions/lcm/issues/622#issuecomment-5565672907).
+Both tables must be present together with the expected column names, order and
+declared types. Legacy captures with neither table remain supported. Partial
+pairs, altered columns, extra tables, views or triggers remain unsupported.
+The existing encoding, schema-size, NUL and foreign-key checks still apply.
+
+Empty and populated receipt tables contribute no portable records or new domains.
+Generic transfer does not create or copy this private metadata. It preserves
+receipt rows already present in an admitted destination. Canonical records,
+domain counts and content hashes remain the same when only receipts differ;
+file identities and source witnesses still change because they bind the actual
+captured bytes.
+
+Schema admission does not authenticate receipt checksums, epoch enforcement or
+claims about an event's effects. Migration orchestration owns those checks and
+supplies a separate authenticated receipt witness. Consumers must not reconstruct
+that witness from the canonical stream.
+
 ## Source and destination ownership
 
 Choose the source generation and destination explicitly. Keep transfer files,
