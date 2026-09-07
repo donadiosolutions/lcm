@@ -499,6 +499,33 @@ describe("batch compaction discovery", () => {
     expect(onTransportFailure).toHaveBeenCalledWith(transportError);
   });
 
+  it("preserves a safe upstream failure message in batch output and progress", async () => {
+    const cwd = makeDir("compact-upstream-failure");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    const safeMessage = "Codex compaction upstream request failed. Retry later or choose another available model.";
+    vi.spyOn(DaemonClient.prototype, "post").mockRejectedValue(new Error(safeMessage));
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      onProgress: patch => progress.push(patch),
+    });
+
+    expect(result.failures).toBe(1);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(`FAILED (${safeMessage})`));
+    expect(progress.find(patch => patch.errors)?.errors).toEqual([
+      { sessionId: "session-1", message: safeMessage },
+    ]);
+  });
+
   it("reports daemon no-ops as unchanged and excludes them from promotion projects", async () => {
     const cwd = makeDir("compact-noop-accounting");
     const paths = projectPaths(cwd);
