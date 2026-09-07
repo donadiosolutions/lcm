@@ -56,6 +56,8 @@ const expectedComponents = [
       "^src/config-projection\\.ts$",
       // #1086/#1095/#1119 keep cleanup-error precedence in this existing
       // configuration-security owner without changing component topology.
+      // #1134/#1135/#1136 preserve private-write failures while retaining
+      // ordered descriptor, temporary-file, and parent cleanup evidence here.
       // PR #791 keeps generated Gitleaks hostname-literal normalization in
       // this existing configuration-security owner.
       "^src/generated-patterns\\.ts$",
@@ -70,6 +72,8 @@ const expectedComponents = [
       "^src/secret-key\\.ts$",
       // #1032 keeps retained-parent atomic-write outcome hardening in this owner.
       "^src/security-files\\.ts$",
+      // #1133 keeps project-pattern owner/single-link admission and authenticated
+      // single-snapshot scrubbing in this existing configuration-security owner.
       "^src/sensitive\\.ts$",
       "^src/shell-quote\\.ts$",
       "^src/terminal-sanitize\\.ts$",
@@ -627,6 +631,8 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/status.ts", "unit-daemon-routes"],
       ["src/daemon/routes/session-complete.ts", "unit-daemon-routes"],
       ["src/daemon/routes/review-stale.ts", "unit-daemon-routes"],
+      // #1148 keeps promoted created_at UTC parsing in the existing daemon
+      // routes owner; prompt-search and restore retain their route ownership.
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
       // #833 passive-event identity admission remains route-owned.
@@ -653,6 +659,8 @@ describe("Codecov configuration", () => {
       // caller-cancellation handling during resolver teardown in this owner.
       // #1154/#1157 retain Spark protocol normalization, bounded upstream
       // classification, and terminal sentinel handling in this owner.
+      // #1168 retains accepted HTTP body and SSE failure classification in
+      // this LLM-owned component.
       ["src/llm/codex-process.ts", "unit-llm-prompts"],
       ["src/llm/codex-config.ts", "unit-llm-prompts"],
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],

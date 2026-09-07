@@ -48,6 +48,8 @@ component_management:
         # existing filesystem-topology owner.
         # #1086/#1095/#1119 keep cleanup-error precedence in this existing
         # configuration-security owner without changing component topology.
+        # #1134/#1135/#1136 preserve private-write failures while retaining
+        # ordered descriptor, temporary-file, and parent cleanup evidence here.
         # PR #791 keeps generated Gitleaks hostname-literal normalization in
         # this existing configuration-security owner.
         - "^src/config-manager\\.ts$"
@@ -63,6 +65,8 @@ component_management:
         - "^src/scrub\\.ts$"
         - "^src/secret-key\\.ts$"
         - "^src/security-files\\.ts$"
+        # #1133 keeps project-pattern owner/single-link admission and authenticated
+        # single-snapshot scrubbing in this existing configuration-security owner.
         - "^src/sensitive\\.ts$"
         - "^src/shell-quote\\.ts$"
         - "^src/terminal-sanitize\\.ts$"
@@ -127,6 +131,8 @@ component_management:
         # episodic search candidate recall, and #890 bounded best-effort status
         # metadata reads,
         # and #833 passive-event identity admission remain route-owned.
+        # #1148 keeps promoted created_at UTC parsing in this existing
+        # daemon-routes owner without changing the component taxonomy.
         # #828 promotes topology failures through the route boundary while
         # preserving ordinary best-effort metadata persistence.
         # #947 keeps direct metadata-parent resource exhaustion best-effort
@@ -161,6 +167,8 @@ component_management:
         # caller-cancellation handling during resolver teardown here.
         # #1154/#1157 keep Spark protocol normalization, bounded upstream
         # classification, and terminal sentinel handling in this owner.
+        # #1168 keeps accepted HTTP body and SSE failure classification in
+        # this LLM-owned component.
         - "src/llm/"
         - "src/prompts/"
     - component_id: "unit-local-persistence"

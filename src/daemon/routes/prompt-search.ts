@@ -3,6 +3,7 @@ import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { SearchResult } from "../../db/promoted.js";
 import type { RecallFeedback } from "../../db/recall.js";
+import { parseStoredTimestamp } from "../../db/stored-timestamp.js";
 import { selectMemoryHintsWithinBudget } from "../../hooks/memory-context.js";
 import { validateCwd } from "../validate-cwd.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
@@ -39,7 +40,7 @@ function computeBaseScore(
   halfLife: number,
   crossSessionAffinity: number,
 ): number {
-  const createdAtMs = new Date(result.createdAt).getTime();
+  const createdAtMs = parseStoredTimestamp(result.createdAt).getTime();
   const ageHours = Number.isFinite(createdAtMs)
     ? Math.max(0, (now - createdAtMs) / 3_600_000)
     : 0;
@@ -114,7 +115,7 @@ function rankResults(
         : 0;
 
       // Staleness: old memory surfaced without use
-      const createdAtMs = new Date(result.createdAt).getTime();
+      const createdAtMs = parseStoredTimestamp(result.createdAt).getTime();
       const ageDays = Number.isFinite(createdAtMs) ? (options.now - createdAtMs) / 86_400_000 : 0;
       const isStale = ageDays >= options.staleAfterDays
         && feedback.usageCount === 0
