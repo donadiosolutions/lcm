@@ -24,9 +24,18 @@ major blockers, repeated failures or milestones, not routine worker chatter.
 
 At dispatch establish a supported event path and verify its first delivery. Where
 available, `send_message` delivers to a running recipient without starting a turn;
-`followup_task` starts an existing worker's next task. Use `wait_agent` for active
-waiting. Call collaboration tools directly using their live-schema recipients, not
-inside an execution wrapper. Ending the root turn is not a wake-up mechanism.
+`followup_task` starts an existing worker's next task. When the root has no ready
+action and is waiting for Bug owners or task owners during triage or implementation,
+call `collaboration.wait_agent({"timeout_ms":3600000})` directly to stay running and
+reachable. The default timeout is 3600000 milliseconds (one hour), the tool's
+maximum. Keep this wait independent of the 30-minute scheduled watchdog; do not
+shorten it to the next watchdog deadline. This allows one scheduled run to be
+missed while the next run is still due within the one-hour wait window.
+After each return, handle owner messages and user input, reconcile actionable
+events, and call it again while owner work remains pending and no ready action
+exists. A timeout alone does not justify ending the root turn. Call collaboration
+tools using their live-schema recipients and arguments, not inside an execution
+wrapper. Ending the root turn is not a wake-up mechanism.
 
 Wake promptly on barriers, readiness changes, publication/merge requests or results,
 parking, blockers, escalation, failure, deconfliction and environment failure.
@@ -35,8 +44,9 @@ recovery; record accepted evidence, source revision and rationale before admissi
 The scheduler consumes caller-defined acceptance, never invents it. Refill slots
 on events rather than waiting for the watchdog; do not busy-poll healthy workers.
 
-Maintain one supported `WATCHDOG_MINUTES` wake-up or active-wait deadline carrying
-run identity and record location. Reuse it on recovery, without creating another
+Maintain one supported scheduled watchdog task every `WATCHDOG_MINUTES` (30 minutes
+by default), carrying run identity and record location, alongside the one-hour
+active wait. Reuse it on recovery, without creating another scheduled task or
 autonomous goal. Shorter runtime wait returns are neither watchdog passes nor
 reasons for user reports. At each actual watchdog pass:
 

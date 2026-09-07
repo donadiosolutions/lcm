@@ -344,13 +344,19 @@ file. The doctor headline reports that total. Verbose output still emits one
 representative skipped row without repeating the count, so diagnostics remain
 bounded.
 
-Low nonzero backlog is reported as passing when both the daemon and its storage
-backend are healthy, because the daemon processes queued events automatically.
-If the daemon process is reachable while PostgreSQL storage is unavailable,
-`lcm doctor` warns that the queue cannot drain until storage recovers. When the
-daemon and storage are healthy but 200 or more queued events remain across
-project sidecars, `lcm doctor` warns and suggests `lcm events promote --all`
-instead of asking you to restart the daemon.
+A nonzero backlog, including fewer than 200 queued events, produces a warning:
+active storage readiness was not probed, so queue draining is unverified.
+Doctor verifies daemon identity separately from its backend read diagnostic
+snapshot. A healthy read snapshot does not prove active storage readiness or
+that queued events will drain.
+
+With verified daemon identity and 200 or more queued events across project
+sidecars, doctor preserves the backlog counts and suggests `lcm events promote
+--all` for metadata-backed sidecars. If some sidecars lack project metadata,
+it identifies those orphans and explains that they need metadata repair or
+pruning. If all pending sidecars are orphaned, the command can only report
+them; doctor suggests removing stale orphan sidecars or triggering new activity
+after `lcm install`. Queue draining remains unverified in each case.
 
 Doctor and stats scan sidecars observationally with orphan pruning disabled.
 Existing orphan sidecars, including their unprocessed events, delivery

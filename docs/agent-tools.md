@@ -319,6 +319,11 @@ gotcha, solution, or reusable workflow, including its rationale.
 | `tags` | string[] | | — | Canonical tags (see [tag-schema.md](tag-schema.md)) |
 | `metadata` | object | | — | Optional key/value metadata |
 
+With SQLite, `text` must be a string without an embedded NUL character
+(`U+0000`); LCM rejects it before persistence. Existing legacy rows containing
+that byte are refused when selected for reading, search, export, recall, or
+FTS replay. NUL characters in JSON-escaped tags remain supported.
+
 **Examples:**
 
 ```

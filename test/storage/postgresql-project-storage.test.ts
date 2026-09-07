@@ -85,6 +85,17 @@ class FakeRuntime implements PostgreSqlProjectStorageRuntime {
 }
 
 describe("PostgreSqlProjectStorage", () => {
+  it("exposes native transcript storage with scoped snapshot reads and closed-handle rejection", async () => {
+    const runtime = new FakeRuntime();
+    const storage = new PostgreSqlProjectStorage(runtime, PROJECT_ID, MACHINE_ID, () => undefined);
+    expect(storage.nativeTranscripts?.machineId).toBe(MACHINE_ID);
+    expect(await storage.nativeTranscripts!.repository.getNativeTranscriptMessageSnapshot("native-session")).toEqual([]);
+    expect(runtime.queryConfigs[0]?.values).toEqual([PROJECT_ID, "native-session"]);
+    await storage.close();
+    await expect(storage.nativeTranscripts!.repository.getNativeTranscriptMessageSnapshot("native-session"))
+      .rejects.toMatchObject({ code: "STORAGE_CLOSED" });
+  });
+
   it("aborts and awaits a coordination repository operation with project and machine identity", async () => {
     let queryObserved!: () => void;
     const observed = new Promise<void>((resolve) => { queryObserved = resolve; });

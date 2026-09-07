@@ -229,8 +229,11 @@ describe("CI workflow", () => {
       expect(bootstrap).toContain("npm_config_store_dir=%s");
       expect(bootstrap).toContain('"$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"');
       expect(steps[locateIndex]?.run).toContain('store_path="$(pnpm store path)"');
+      const cacheSha = steps === setup.runs.steps
+        ? "cdf6c1fa76f9f475f3d7449005a359c84ca0f306"
+        : "55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
       expect(steps[cacheIndex]).toMatchObject({
-        uses: "actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306",
+        uses: `actions/cache@${cacheSha}`,
         with: {
           path: "${{ steps.pnpm-store.outputs.path }}",
           key: `pnpm-store-v1-\${{ runner.os }}-\${{ runner.arch }}-node-${nodeVersion}-\${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}`,
@@ -293,11 +296,11 @@ describe("CI workflow", () => {
         },
         {
           name: "Initialize CodeQL",
-          uses: "github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38",
+          uses: "github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938",
         },
         {
           name: "Analyze",
-          uses: "github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38",
+          uses: "github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938",
         },
       ]);
     }

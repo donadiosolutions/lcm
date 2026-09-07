@@ -15,17 +15,15 @@ import {
   StorageBackendUnavailableError,
 } from "../../src/storage/backend.js";
 
-describe("storage backend staged availability", () => {
-  it("reports the bounded PostgreSQL-unavailable diagnostic after publication admission", () => {
-    expect(() => selectStorageBackend({ backend: "postgresql", homeDir: "/synthetic/home" }))
-      .toThrowError(StorageBackendUnavailableError);
-    try {
-      selectStorageBackend({ backend: "postgresql", homeDir: "/synthetic/home" });
-    } catch (error) {
-      expect(error).toMatchObject({
-        name: "StorageBackendUnavailableError",
-        message: expect.stringContaining("use storage.backend \"sqlite\""),
-      });
-    }
+describe("storage backend availability", () => {
+  it("selects PostgreSQL after publication admission", () => {
+    expect(selectStorageBackend({ backend: "postgresql", homeDir: "/synthetic/home" }))
+      .toEqual({backend: "postgresql"});
+  });
+  it("keeps an explicit bounded refusal for operations awaiting PostgreSQL support", () => {
+    expect(new StorageBackendUnavailableError("postgresql")).toMatchObject({
+      name: "StorageBackendUnavailableError",
+      message: "This operation is not available for the postgresql storage backend.",
+    });
   });
 });

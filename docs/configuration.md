@@ -136,6 +136,20 @@ same session, the flat transcript is preferred; other similarly named files and
 subagent transcripts remain independent. Files with equal modification times
 are imported deterministically by session ID and then path.
 
+`lcm import --all` discovers Claude projects through authenticated local project
+bindings, including their aliases. This also works with a newly linked
+PostgreSQL project that has no local `meta.json` or SQLite database. It does not
+enumerate other projects hosted by the PostgreSQL server. `--provider all --all`
+uses the same Claude discovery alongside Codex discovery. A Claude folder that
+matches no known project or matches multiple projects is refused: each discovered
+session is counted as unresolved or ambiguous and as failed, so the command exits
+with status 1. `--verbose` reports the refused folders on stderr; `--dry-run`
+reports the same mapping refusals without ingesting sessions. Register or link the
+intended project before retrying an unresolved folder. Resolve conflicting local
+project paths before retrying an ambiguous folder; Claude folder encoding can
+collide when different paths contain slashes and dashes. Replay and chronological
+session ordering apply after project resolution as usual.
+
 The default Codex connector is the CLI bundle. It writes native hooks to
 `~/.codex/hooks.json`, enables Codex's current `hooks` feature in
 `~/.codex/config.toml`, and installs the LCM skill at
@@ -382,8 +396,8 @@ and production project-storage factory are also used by the daemon and MCP
 storage routes when `storage.backend` is explicitly `postgresql`. The factory
 composes all nine shared repository contracts only after eager runtime-readiness
 checks and per-project publication and identity admission. The native-transcript
-adapter remains a separate explicit backfill seam and does not add a daemon
-route or CLI command. SQLite remains the default; an explicit PostgreSQL
+capability runs through the existing transcript-path ingest route and
+`lcm import`; it also remains available to explicit embedded callers. SQLite remains the default; an explicit PostgreSQL
 selection never falls back to a project SQLite database. The factory's
 readiness contract also requires the parity extensions at their current default
 versions in the `public` schema; see the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md#required-extensions-and-postgresql-version).
@@ -507,7 +521,8 @@ and
 [`postgresql-runtime-coordination-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql).
 Apply the separate
 [`postgresql-runtime-transcript-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql)
-only when the explicit native-transcript repository is used. Run every script
+for `lcm import`, transcript-path daemon ingestion, or explicit native-transcript
+repository use. Structured-message ingestion does not require this grant. Run every script
 as the migration owner or an administrator with equivalent grant authority,
 substituting the deployment's restricted runtime role. Applying a function
 grant through the runtime role itself creates foreign-grantor ACL evidence and
@@ -542,7 +557,7 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql
 
-# Optional: explicit native-transcript import only.
+# Required for native transcript imports (including lcm import).
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql
@@ -551,8 +566,9 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 The transcript grant permits immutable inserts, provenance reads, and bounded
 checkpoint updates only; it grants no payload update, deletion, truncation, or
 unrelated table access. Applying it makes the explicit native-transcript
-repository usable; native-transcript daemon and CLI routing remains outside
-this issue. See
+repository usable through the selected daemon and CLI import routes. Missing
+grants fail native imports without falling back to SQLite; parsed messages
+committed before the native failure remain available for retry. See
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md) before
 running an explicit backfill.
 The memory grant permits direct use of the selected promoted-memory, recall,
@@ -612,6 +628,15 @@ selection, publish a new authenticated selection targeting SQLite through the
 same publication workflow, then restart the daemon. Never leave identity
 commands configured with migration-owner credentials. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for
 the exact extension, role, ownership, ACL, backup, and recovery contracts.
+
+Daemon startup and `lcm postgres migrate` verify the SQL migration files shipped
+with the installed package. For the npm CLI, these files are under
+`dist/src/storage/postgresql/migrations/*.sql` inside the installed LCM package.
+If a file is missing or its SHA-256 checksum differs from the release manifest,
+startup or migration fails. Reinstall the complete package from a trusted release
+artifact; do not edit the SQL files or copy files from a source checkout into the
+installation. Source files cannot replace missing packaged migrations. A selected
+PostgreSQL backend never falls back to SQLite after an asset verification failure.
 
 The URL must use the `postgresql:` scheme. Do not add `ssl`, `sslmode`,
 `sslcert`, `sslkey`, `sslrootcert`, or other `ssl*` query parameters; LCM owns
@@ -731,15 +756,32 @@ PID. It does not inspect project databases or expose installation paths.
 Supplying a valid daemon bearer token returns the full storage-backed health
 diagnostic; supplying an invalid credential returns `401`. Embedded and test
 callers that intentionally create a daemon without a token retain the full
-health response. `lcm doctor` treats public health as liveness only and uses the
-authenticated health result from an already-running managed daemon to decide
-whether passive-learning queues can drain. Doctor never starts one.
-Authenticated healthy storage is ready, authenticated unhealthy storage is
-unavailable, and a missing or unreadable managed-daemon token leaves
-readiness unverified. In that unverified state, doctor warns that access to the
-daemon token and authenticated diagnostics must be restored before it can
-promise that queued events will drain. Embedded and test-only tokenless servers
-do not relax this production doctor authentication requirement.
+health response.
+
+Diagnostic commands `lcm doctor`, `lcm status`, and `lcm stats --pool` instead use
+internal `GET /health/observe`. It requires the daemon bearer token, including
+refusing tokenless embedded servers with `401`, and remains subject to the
+normal configuration, publication, and shutdown admission checks. Its HTTP 200
+JSON has `status: "ok"`, `observation: "identity-only"`, and
+`storage: { "status": "unverified" }`, with version, selected backend, uptime,
+PID, entrypoint, daemon generation, and the actual runtime digest when available.
+An owner identifier is included when configured. No storage readiness or backend
+error result is included: observation never calls storage health or opens project
+storage. This endpoint is an internal diagnostic mechanism with no third-party
+compatibility promise.
+
+Doctor requires this explicit response and exact installed runtime identity;
+missing credentials, incompatible responses, or identity mismatches fail the
+daemon check without starting or repairing a daemon. A verified daemon check
+means identity was verified and active storage readiness was not probed. Doctor's
+separate backend diagnostic snapshot retains its healthy/degraded/unavailable
+classification for observed inventory, schema, and read availability. A staged
+or unavailable PostgreSQL backend can still expose process identity; unavailable
+backend reads fail the independent backend check. If reads succeed but write
+readiness would fail, doctor may report a healthy read snapshot while active
+storage readiness stays explicitly unverified. Pending queues therefore warn
+that queue draining is unverified. Authenticated active `GET /health` continues
+to probe storage readiness for lifecycle callers.
 
 Before sending the bearer token or admitting a daemon for ordinary use,
 lifecycle checks require the public `/health` PID and installed version, a
@@ -773,7 +815,7 @@ ports and performs no network I/O.
 Use `lcm daemon restart` after configuration changes. It validates the complete
 effective configuration before asking the host service manager to replace the
 managed process, then waits for authenticated health. `lcm doctor` is the
-canonical diagnostic command; it checks daemon health, service-manager
+canonical diagnostic command; it checks daemon identity, backend read diagnostics, service-manager
 availability, hooks, connector registration, MCP setup, and summarizer
 readiness. Do not start a second daemon to work around a health failure.
 
@@ -910,12 +952,12 @@ reassigned only from exact thread ownership or a unique repository URL under an
 existing `~/.codex/worktrees/<token>` tombstone; unresolved and ambiguous
 sessions are reported and skipped.
 
-Claude `lcm import --all` maps projects through each local `meta.json`. It uses
-only owner-local, single-link regular files up to 1 MiB and silently skips a
-symlink, FIFO, directory, oversized file, foreign-owner file, or multiply
-linked file for that import run. Trusted sibling projects continue importing.
-See [Metadata-backed map discovery](project-identity.md#metadata-backed-map-discovery)
-for recovery and concurrent-publication behavior.
+Claude `lcm import --all` selects projects from authenticated local bindings.
+It does not enumerate `meta.json` files as project authority. The daemon's
+periodic Claude transcript scan still reads bounded, owner-local, single-link
+metadata; rejected metadata is skipped for that scan. See
+[Metadata-backed map discovery](project-identity.md#metadata-backed-map-discovery)
+for metadata recovery and concurrent-publication behavior.
 
 See [Machine registration and project identity](project-identity.md) for
 permissions, recovery, pairing, stored-data guards, backup behavior, migration,

@@ -9,6 +9,8 @@ const originalUserProfile = process.env.USERPROFILE;
 
 const state = vi.hoisted(() => ({
   afterHealth: undefined as (() => void) | undefined,
+  afterObservation: undefined as (() => void) | undefined,
+  backend: "sqlite" as "sqlite" | "postgresql",
 }));
 
 vi.mock("../../src/daemon/version.js", async importOriginal => ({
@@ -25,9 +27,18 @@ vi.mock("../../src/daemon/client.js", () => ({
       return {
         status: "ok",
         version: "test",
-        storageBackend: "sqlite",
+        storageBackend: state.backend,
         entrypoint: "/opt/lcm/lcm.mjs",
         runtimeDigest: "runtime",
+      };
+    }
+
+    async observe() {
+      state.afterObservation?.();
+      return {
+        status: "ok", observation: "identity-only", storage: { status: "unverified" },
+        version: "test", storageBackend: state.backend, entrypoint: "/opt/lcm/lcm.mjs",
+        runtimeDigest: "runtime", pid: 42, uptime: 0, daemonInstanceId: "generation",
       };
     }
 
@@ -50,7 +61,7 @@ vi.mock("../../src/daemon/client.js", () => ({
 
     async get() {
       return { backendDiagnostics: {
-        backend: "sqlite", classification: "healthy", remediation: "No action required.",
+        backend: state.backend, classification: "healthy", remediation: "No action required.",
         publication: "ready", tls: "not-applicable", schema: "ready",
         extensions: "not-applicable", search: "ready",
         pool: { origin: "daemon", status: "ready", total: 0, idle: 0 },
@@ -73,6 +84,9 @@ vi.mock("../../src/runtime-paths.js", async importOriginal => {
 
 afterEach(() => {
   state.afterHealth = undefined;
+  state.afterObservation = undefined;
+  state.backend = "sqlite";
+  vi.unstubAllEnvs();
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
   if (originalUserProfile === undefined) delete process.env.USERPROFILE;
@@ -143,6 +157,8 @@ describe("runCli healthy-daemon reads during publication", () => {
     writeFileSync(tokenPath, "test-token", { mode: 0o600 });
     state.afterHealth = () => {
       state.afterHealth = undefined;
+  state.backend = "sqlite";
+  vi.unstubAllEnvs();
       writeFileSync(configPath, JSON.stringify({ storage: { backend: "postgresql" } }), { mode: 0o600 });
     };
 
@@ -154,4 +170,53 @@ describe("runCli healthy-daemon reads during publication", () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+  it.each(["status", "pool"])("refuses changed configuration after %s identity observation", async command => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-cli-observe-drift-"));
+    const root = join(home, ".lcm");
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    mkdirSync(root, { mode: 0o700 });
+    const configPath = join(root, "config.json");
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    writeFileSync(join(root, "daemon.token"), "test-token", { mode: 0o600 });
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    state.afterObservation = () => {
+      writeFileSync(configPath, JSON.stringify({ daemon: { port: 3738 } }), { mode: 0o600 });
+    };
+    try {
+      const { runCli } = await import("../../bin/lcm.js");
+      await expect(runCli(["node", "lcm", ...(command === "status" ? ["status", "--json"] : ["stats", "--pool", "--json"])]))
+        .resolves.toBeUndefined();
+      const result = JSON.parse(String(stdout.mock.calls.at(-1)?.[0]));
+      if (command === "status") expect(result).toMatchObject({ daemon: { status: "down" }, diagnosticSource: "local" });
+      else expect(result.backendDiagnostics.pool.origin).not.toBe("daemon");
+    } finally {
+      stdout.mockRestore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("observes configured PostgreSQL pool stats without operational bootstrap", async () => {
+    const home=mkdtempSync(join(tmpdir(),"lcm-cli-pool-pg-"));
+    const root=join(home,".lcm");
+    process.env.HOME=home;
+    process.env.USERPROFILE=home;
+    mkdirSync(root,{mode:0o700});
+    const ca=join(root,"ca.crt");
+    writeFileSync(ca,"trusted-ca",{mode:0o600});
+    writeFileSync(join(root,"config.json"),JSON.stringify({storage:{backend:"postgresql"}}),{mode:0o600});
+    writeFileSync(join(root,"daemon.token"),"test-token",{mode:0o600});
+    vi.stubEnv("LCM_POSTGRES_URL","postgresql://user:password@db.example.com/lcm");
+    vi.stubEnv("LCM_POSTGRES_CA_FILE",ca);
+    vi.stubEnv("LCM_POSTGRES_MIGRATION_ROLE","lcm_test_migrator");
+    const observation=vi.fn();
+    state.afterObservation=observation;
+    state.backend="postgresql";
+    try {
+      const {runCli}=await import("../../bin/lcm.js");
+      await expect(runCli(["node","lcm","stats","--pool"])).resolves.toBeUndefined();
+      expect(observation).toHaveBeenCalledOnce();
+    } finally {rmSync(home,{recursive:true,force:true});}
+  });
+
 });

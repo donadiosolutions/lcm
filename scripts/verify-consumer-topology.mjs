@@ -1,3 +1,4 @@
+import { verifyPortablePackage } from "./portable-package-smoke.mjs";
 import {
   existsSync,
   chmodSync,
@@ -207,6 +208,7 @@ export function executeConsumerTopology(scratch, { spawn = spawnSync } = {}) {
     }
     verifyNoPublishedBuildDependencies(directory, label);
     verifyPostgreSqlApi(directory, spawn);
+    verifyPortablePackage(directory, { spawn });
     console.log(
       `${label}: lcm=${pkg.version} external-sdk=absent cli=${verifyCli(directory, scratch, { spawn })}`,
     );

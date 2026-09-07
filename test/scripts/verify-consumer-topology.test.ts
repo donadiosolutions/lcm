@@ -674,7 +674,14 @@ describe("consumer package manager boundary", () => {
       expect(packageCommands.slice(1).every(({ env }) => env?.npm_config_ignore_scripts === "true"))
         .toBe(true);
       expect(packageCommands.slice(2).every(({ cwd }) => isStrictDescendant(scratch, cwd))).toBe(true);
-      expect(commands.filter(({ command }) => command === process.execPath)).toHaveLength(4);
+      expect(commands.filter(({ command }) => command === process.execPath)).toHaveLength(8);
+      for (const topology of ["ordinary", "conflicting"]) {
+        const consumer = join(scratch, topology);
+        expect(commands.some(({ command, args, cwd }) => command === process.execPath && cwd === consumer
+          && args.some(argument => argument.includes('import("@donadiosolutions/lcm/storage/portable")')))).toBe(true);
+        expect(commands.some(({ command, args, cwd }) => command === process.execPath && cwd === consumer
+          && args.includes(join(consumer, "portable-package.mts")))).toBe(true);
+      }
       expect(logs).toContainEqual(expect.stringContaining("sdk-express-qs=6.16.0"));
       expect(logs).toContainEqual(expect.stringContaining("sdk-body-parser-qs=6.16.0"));
     } finally {

@@ -13,9 +13,11 @@ component_management:
         # #1088 keeps unsupported connector-list-format admission CLI-owned.
         # #978 keeps compact replacement runtime-digest admission CLI-owned.
         # #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
+        # #1201 keeps diagnostic-only identity admission CLI-owned.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
+        - "^src/cli-storage\\.ts$"
     - component_id: "unit-installation"
       name: "Unit - Installation"
       paths:
@@ -55,6 +57,8 @@ component_management:
         - "^src/legacy-names\\.ts$"
         - "^src/private-mutation-lock\\.ts$"
         - "^src/runtime-paths\\.ts$"
+        # #1195 keeps strict moduleAssetUrl resource resolution in this
+        # existing configuration-security owner.
         - "^src/runtime-root\\.ts$"
         - "^src/scrub\\.ts$"
         - "^src/secret-key\\.ts$"
@@ -75,7 +79,9 @@ component_management:
       name: "Unit - Hooks"
       paths:
         # Includes native adapters and the #726/#737 publication-diagnostic flow.
+        # Claude's bounded session-completion acknowledgment remains hook-owned.
         - "src/hooks/"
+    # #1201 keeps process-only observation, its parser/client, and route allowlist here.
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
@@ -97,9 +103,10 @@ component_management:
         - "^src/daemon/proxy-manager\\.ts$"
         - "^src/daemon/remediation\\.ts$"
         # Error sanitization, including #893 adjacent-path, #903 prefixed
-        # nested-file, #924 embedded-quote authority, #1010 pathless-tail
-        # bracket redaction, #1060 adjacent nested-file scheme preservation,
-        # and #1117 glued file-authority handling, remains daemon-core-owned.
+        # nested-file, #924 embedded-quote, #925/#1076 quoted-authority,
+        # quoted/root-only backslash handoff, #1010 pathless-tail brackets,
+        # #1060 adjacent nested-file schemes, #1117 glued authorities, and
+        # #1128 active file-URL own-query backslash paths remain daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -170,8 +177,12 @@ component_management:
         # opened-identity fencing local-persistence-owned.
         # #1020 keeps UTC message timestamp mapping in conversation-store-owned
         # local persistence paths.
+        # #1082 keeps SQLite promoted-content NUL admission and replay guards
+        # in local persistence; this change does not alter component ownership.
         # #1084/#1085/#1092 keep SQLite UTC timestamp parsing in this owner.
         - "src/db/"
+        # Captured UTF-8 decoding and immutable-file authority remain local-persistence-owned.
+        # #618 optional receipt schema admission stays local-persistence-owned.
         - "src/storage/sqlite/"
         - "src/store/"
     - component_id: "unit-storage-abstractions"
@@ -200,9 +211,14 @@ component_management:
         - "^src/storage/home-lock-topology\\.ts$"
         - "^src/storage/identity-context\\.ts$"
         - "^src/storage/index\\.ts$"
+        # Curated portable package API remains storage-abstractions-owned.
+        - "^src/storage/portable\\.ts$"
         - "^src/storage/portable-record\\.ts$"
         # The #763 manifest and #816 checkpoint negative-zero taxonomies remain storage-abstractions-owned.
         - "^src/storage/portable-record-stream\\.ts$"
+        # #618 shared canonical transfer and bounded validation index.
+        - "^src/storage/portable-transfer\\.ts$"
+        - "^src/storage/portable-index\\.ts$"
         - "^src/storage/postgresql/project-storage\\.ts$"
     - component_id: "unit-migration-cutover"
       name: "Unit - Migration and Cutover"
@@ -218,7 +234,7 @@ component_management:
     - component_id: "unit-transcripts-import"
       name: "Unit - Transcripts and Import"
       paths:
-        # #1106 keeps all-project metadata discovery within this import owner.
+        # #1106 bounded custom-directory metadata stays within this import owner.
         - "^src/codex-transcript\\.ts$"
         - "^src/import-summary\\.ts$"
         - "^src/import\\.ts$"
@@ -243,7 +259,7 @@ component_management:
     - component_id: "unit-compaction-summarization"
       name: "Unit - Compaction and Summarization"
       paths:
-        # #1106 keeps batch metadata discovery within this compaction owner.
+        # #618 authenticated batch discovery remains within this compaction owner.
         - "^src/batch-compact\\.ts$"
         - "^src/compaction\\.ts$"
         - "^src/large-files\\.ts$"
@@ -267,6 +283,7 @@ component_management:
         - "^src/git-project\\.ts$"
         - "^src/machine-identity\\.ts$"
         # #889 keeps private import metadata publication in this owner.
+        # #618 knowledge provenance scoping remains owned by project/worktree operations.
         - "^src/portable-knowledge\\.ts$"
         # #1049 keeps project metadata owner and single-link admission in this
         # existing component; no taxonomy, status, or policy change.
@@ -276,10 +293,13 @@ component_management:
         # #1048 keeps target metadata leaf authentication in this owner.
         # #1069 preserves completed reconciliation evidence after retained
         # directory cleanup failures in this existing component.
+        # #1107 and #1109 keep pattern and journal leaf authentication in this
+        # existing component; no taxonomy, status, or policy change.
         # #1059 keeps retained journal-parent publication in this existing owner.
         # #1087 bounds canonical metadata publication in this existing owner.
         # #1091 preserves completion evidence across publication failures here.
         - "^src/worktree-reconciliation\\.ts$"
+    # #1201 keeps doctor identity observation and unverified queue readiness here.
     - component_id: "unit-diagnostics"
       name: "Unit - Diagnostics"
       paths:
@@ -320,11 +340,21 @@ component_management:
         - "^src/storage/postgresql/factory\\.ts$"
         - "^src/storage/postgresql/index\\.ts$"
         - "^src/storage/postgresql/runtime\\.ts$"
+        - "^src/storage/postgresql/snapshot-session\\.ts$"
         - "^src/storage/postgresql\\.ts$"
+    - component_id: "integration-postgresql-portable"
+      name: "Integration - PostgreSQL Portable Transfer"
+      paths:
+        # #618 canonical self-provenance stays in PostgreSQL portable transfer.
+        - "^src/storage/postgresql/portable-source\\.ts$"
+        - "^src/storage/postgresql/portable-destination\\.ts$"
+        - "^src/storage/postgresql/portable-mapping\\.ts$"
     - component_id: "integration-postgresql-schema"
       name: "Integration - PostgreSQL Schema"
       paths:
         - "^src/storage/postgresql/extensions\\.ts$"
+        # #1195 keeps packaged SQL loading and checksum verification in
+        # the existing PostgreSQL schema owner.
         - "^src/storage/postgresql/migrations\\.ts$"
         - "^src/storage/postgresql/provisioning\\.ts$"
         - "^src/storage/postgresql/runtime-readiness\\.ts$"

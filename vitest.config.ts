@@ -9,6 +9,7 @@ const serialSqliteTests = [...sqliteRouteTests, ...worktreeReconciliationTests];
 const portableBoundaryTests = [
   "test/storage/portable-record.test.ts",
   "test/storage/portable-record-stream.test.ts",
+  "test/storage/sqlite-portable-source.test.ts",
 ];
 const packageConfigTests = ["test/package-config.test.ts"];
 const e2eTests = ["test/e2e/**/*.test.ts"];

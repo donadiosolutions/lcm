@@ -7,7 +7,7 @@ import { NATIVE_PATTERNS, ScrubEngine, readGitleaksSyncDate } from "./scrub.js";
 import { GITLEAKS_PATTERNS } from "./generated-patterns.js";
 import { projectDir } from "./daemon/project.js";
 import { loadStoredConfigProjection } from "./config-projection.js";
-import { selectStorageBackend } from "./storage/backend.js";
+import { selectStorageBackend, StorageBackendUnavailableError } from "./storage/backend.js";
 import { validateRegex } from "./store/regex-safety.js";
 import { configPath as runtimeConfigPath, projectsDir as runtimeProjectsDir } from "./runtime-paths.js";
 import { atomicWritePrivateFile, OWNER_ONLY_FILE_MODES, readBoundedRegularFile } from "./security-files.js";
@@ -399,6 +399,7 @@ async function sensitivePurge(
   const publicationHome = backendPublicationHomeForConfigPath(configPath);
   const storage = loadStoredConfigProjection(configPath).storage;
   selectStorageBackend({ ...storage, homeDir: publicationHome });
+  if (storage.backend === "postgresql") throw new StorageBackendUnavailableError(storage.backend);
 
   if (purgeAll) {
     const allProjectsDir = runtimeProjectsDir();

@@ -34,6 +34,41 @@ export type DaemonHealth = {
   };
 };
 
+/** Process identity only: never evidence of active storage readiness. */
+export type DaemonObservation = {
+  status: "ok";
+  observation: "identity-only";
+  storage: { status: "unverified" };
+  version: string;
+  storageBackend: StorageBackend;
+  uptime: number;
+  pid: number;
+  entrypoint: string;
+  daemonInstanceId: string;
+  runtimeDigest?: string;
+  ownerId?: string;
+};
+
+/** Shared, transport-independent admission for diagnostic identity responses. */
+export function parseDaemonObservation(statusCode: number, value: unknown): DaemonObservation | null {
+  if (statusCode !== 200 || typeof value !== "object" || value === null) return null;
+  const identity = value as Partial<DaemonObservation>;
+  if (
+    identity.status !== "ok"
+    || identity.observation !== "identity-only"
+    || identity.storage?.status !== "unverified"
+    || typeof identity.version !== "string" || identity.version.length === 0
+    || (identity.storageBackend !== "sqlite" && identity.storageBackend !== "postgresql")
+    || !Number.isSafeInteger(identity.uptime) || identity.uptime! < 0
+    || !Number.isSafeInteger(identity.pid) || identity.pid! <= 0
+    || typeof identity.entrypoint !== "string" || identity.entrypoint.length === 0
+    || typeof identity.daemonInstanceId !== "string" || identity.daemonInstanceId.length === 0
+    || (identity.runtimeDigest !== undefined && (typeof identity.runtimeDigest !== "string" || identity.runtimeDigest.length === 0))
+    || (identity.ownerId !== undefined && (typeof identity.ownerId !== "string" || identity.ownerId.length === 0))
+  ) return null;
+  return identity as DaemonObservation;
+}
+
 type DaemonHealthResponse = Omit<DaemonHealth, "storageBackend"> & {
   storageBackend?: StorageBackend;
 };
@@ -101,6 +136,23 @@ export class DaemonClient {
       }
       // Daemons predating backend identity were necessarily SQLite-only.
       return { ...health, storageBackend: health.storageBackend ?? "sqlite" };
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      return null;
+    }
+  }
+
+  async observe(options?: DaemonRequestOptions): Promise<DaemonObservation | null> {
+    try {
+      throwIfAborted(options?.signal);
+      const token = this.getToken();
+      if (!token) return null;
+      const response = await daemonJsonResponse<unknown>(this.port, "/health/observe", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+        ...options,
+      });
+      return parseDaemonObservation(response.statusCode, response.data);
     } catch (error) {
       if (isAbortError(error)) throw error;
       return null;

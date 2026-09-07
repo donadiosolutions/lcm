@@ -16,6 +16,51 @@ lcm project link --help
 lcm connectors install --help
 ```
 
+Storage-backed commands use the backend selected in the authenticated LCM
+configuration. SQLite remains the default. With `storage.backend` set to
+`postgresql`, reads, writes, native session import, compaction, and promoted
+knowledge transfer use that PostgreSQL database. Each selected project must
+already be linked to a registered remote project and the local machine must
+be registered. Missing bindings or database failures stop the operation;
+commands never fall back to a local SQLite database. Backend selection applies
+to the configured home and daemon, rather than individual projects.
+
+`lcm export --all`, `lcm promote --all`, and `lcm compact --all` enumerate authenticated locally known
+project paths and bindings, including bindings that have no SQLite database or
+`meta.json`. Aliases of the same selected project are processed once. This does
+not enumerate every project hosted by the PostgreSQL server. An unbound local
+project requires `lcm project create` or `lcm project link <project-id>` before
+it can be selected with PostgreSQL.
+
+`lcm promote --all` processes the canonical paths from those bindings even when
+no local `meta.json` exists. `--verbose` reports each project's counts and
+`--dry-run` previews the same selected projects. Progress and summaries go to
+stderr. A failed project request is reported and makes the command exit with
+status 1; other admitted projects may still complete. Identity or publication
+refusals stop the command, and no successful empty-result message hides a failed
+scan.
+
+Unbound-project errors explain how to run `lcm project create` or
+`lcm project link <project-id>`. Missing local storage errors direct you to
+`lcm import` or `lcm import-knowledge <file>` in the intended project. CLI
+remedies for these known failures are fixed messages; database diagnostics,
+connection strings, and mutable exception text are not printed. Unknown
+failures retain a generic diagnostic and exit with status 1.
+
+`lcm export` without `--output` writes only the version-1 promoted-knowledge
+JSON document to stdout. Progress and status messages go to stderr. With
+`--all`, one file is written per project using a path-derived unique suffix;
+`--all --output <file>` is rejected because one file cannot represent multiple
+project exports. Any project failure makes the command exit with status 1,
+including partial exports; files already completed remain available. Successful
+commands exit with status 0. Native session import also exits with status 1
+when any session fails.
+
+`lcm sensitive purge` currently refuses PostgreSQL explicitly before deleting
+local data. Statistics, status and doctor use the configured backend through
+read-only diagnostic snapshots; observing them does not bootstrap or migrate
+storage, prune local events, or fall back to a different backend.
+
 Connector installation manages one complete transport bundle per agent:
 
 ```bash
@@ -49,6 +94,13 @@ lcm store 'Use ensureDaemon before background promote' --tag type:solution --tag
 In `lcm store`, `--tag` and `--tags` are repeatable single-tag aliases. This is
 different from `lcm export --tags`, which remains a comma-separated filter,
 for example `lcm export --tags decision,architecture`.
+
+When SQLite is selected, the stored text must not contain an embedded NUL
+character (`U+0000`). The store operation rejects that input before writing;
+JSON-escaped NUL characters in tags remain supported. A selected legacy
+promoted row containing an embedded NUL fails closed instead of returning a
+truncated value. See [Privacy & Data Handling](privacy.md#embedded-nul-in-promoted-memory)
+for the read-only diagnostic and deliberate replacement procedure.
 
 `lcm export` writes JSON by default. The optional `--format` value accepts
 only `json`; unsupported values are rejected before export work or output
@@ -87,6 +139,15 @@ read preparation retry only the lock-acquisition callback. Output, exit status,
 and export file writes happen once after the callback succeeds. Mutation and
 lifecycle commands keep their existing admission and migration behavior.
 
+When version 1 knowledge export/import or compaction discovery opens project
+storage, its selected backend stays protected until the storage work and
+connection cleanup finish.
+Backend publication must wait or report contention during that interval.
+Automatic publication retries stop once project preparation begins; an error
+from opening storage, performing the operation, cleanup, or final publication
+validation is reported without replaying the operation. A failed command may
+already have committed storage changes, so inspect its result before retrying.
+
 If home or legacy-entry authentication fails and closing its already-open
 descriptor also fails, LCM preserves both errors in order: the authentication
 or validation failure remains the primary cause, and the close failure remains
@@ -112,7 +173,7 @@ lock-acquisition callback is preserved only if that callback admitted at least
 one retry; otherwise, the current contention is reported. Exhausted or
 rejected export admission exits unsuccessfully, including with `--output` or
 `--all`. An `--all` export may have already written earlier projects when a
-later project fails; those outputs remain, and no successful total is printed.
+later project fails; those outputs remain, and the command exits with status 1.
 
 The process-local catalogue discovery cache uses a monotonic elapsed-time TTL
 capped at 1,000 milliseconds; wall-clock corrections do not extend or shorten
@@ -207,10 +268,10 @@ closed if that lock is held by another operation.
 
 Doctor's map validation and worktree inspection are observational. It reports
 invalid or ambiguous mappings without normalization, duplicate removal, or
-reconciliation writes. Existing-daemon health is bounded and authenticated;
-readiness is not inferred from public liveness. Missing installed version or
-packaged runtime digest, mismatched identity, and unreadable credentials leave
-managed-daemon readiness unverified. Run doctor from the installed `lcm.mjs`
+reconciliation writes. Existing-daemon identity observation is bounded and
+authenticated; it does not probe active storage readiness. Missing installed
+version or packaged runtime digest, mismatched identity, and unreadable
+credentials leave managed-daemon identity unverified. Run doctor from the installed `lcm.mjs`
 artifact; reinstall LCM if that artifact is unreadable or damaged.
 
 Doctor does not acquire publication mutation locks, wait for a lock holder to
@@ -364,8 +425,8 @@ filesystem authority. Event scans likewise preserve existing sidecars and
 report skipped or failed observations without pruning them.
 
 `lcm status` reports verified daemon details, available numeric project counts,
-and the same backend diagnostic snapshot. If authenticated daemon health is
-available but its status request fails, the daemon remains reported as up and
+and the same backend diagnostic snapshot. If authenticated daemon identity is
+verified but its status request fails, the daemon remains reported as up and
 the command performs a fresh local diagnostic observation. The output identifies
 that fallback; backend readiness can change between the two observations.
 It omits the former `lastIngest`,
@@ -374,9 +435,27 @@ the diagnostic allowlist. A missing or unreadable project has no numeric
 project object, so an unavailable observation cannot be confused with an
 observed empty database.
 
+`lcm status`, `lcm stats --pool`, and `lcm doctor` authenticate an existing
+daemon through the internal `GET /health/observe` endpoint. It reports process
+identity with `observation: "identity-only"` and `storage.status: "unverified"`;
+it never opens project storage or runs the active readiness probe. Diagnostics
+require the exact installed version, backend, entrypoint, runtime digest, and
+unchanged configuration witness. An old daemon without this endpoint, malformed
+response, missing credentials, or mismatched identity refuses observation;
+there is no retry through active `/health` or automatic lifecycle repair.
+Status and pool statistics retain their local diagnostic fallback. Status JSON
+identifies its source with `diagnosticSource: "daemon"` or `"local"`.
+
+Doctor reports verified daemon identity separately from its backend diagnostic
+snapshot. That snapshot describes observed read availability and schema state;
+it cannot establish write readiness. Even if both checks pass, active storage
+readiness remains unprobed. A pending passive queue warns that queue draining is
+unverified, preserving backlog counts and remediation guidance. Use the explicit
+managed lifecycle commands when active readiness or restart is needed.
+
 ## Daemon-dependent resilience
 
-`lcm doctor` limits the complete daemon health exchange to two seconds. The
+`lcm doctor` limits the complete daemon identity observation exchange to two seconds. The
 deadline covers both the HTTP response and parsing its JSON body, so an
 unresponsive or partially responding local daemon cannot hold up the remaining
 diagnostics.
@@ -413,20 +492,18 @@ error. `--dry-run` never writes metadata. On platforms with a POSIX UID, the
 existing metadata file must be owned by the current UID; where UIDs are
 unavailable, that ownership check is skipped.
 
-`lcm compact --all` reports each SQLite project that it cannot open, migrate, or
+`lcm compact --all` reports each selected project that it cannot open, prepare, or
 scan as a failure in the Compact phase while continuing with readable projects.
 These failures produce a nonzero exit status and are not reported as “Nothing to
 compact.” A failed scan does not mark any session as processed. Back up the
-reported project database, resolve the SQLite or schema error, and rerun the
+reported project database, resolve its storage or schema error, and rerun the
 command; the still-eligible sessions will be discovered again.
 
-Before opening a project database, `lcm compact --all` accepts `meta.json` only
-as an owner-local, single-link regular file of at most 1 MiB. Unsafe or malformed
-metadata is reported as `project metadata is unreadable or malformed`; missing
-metadata retains its separate missing-file message. A concurrent atomic
-publication can briefly fail the single-link or descriptor checks, so retry
-after that activity settles. Persistent failures require restoring trusted
-project metadata; the command does not weaken admission or repair the file.
+`lcm compact --all` discovers projects from authenticated project bindings.
+It does not read `meta.json` to select projects or trust unbound metadata
+directories. Missing or unsafe discovery metadata therefore does not override
+a valid binding or become a separate metadata-scan failure. Storage and schema
+failures for selected projects are still reported as described above.
 
 ### Managed-daemon recovery
 
@@ -567,7 +644,13 @@ sequential. Compacted projects are promoted in deterministic discovery order.
 
 `--dry-run` validates configuration and discovery, but does not start the
 daemon, register an invocation lease, dispatch compact/provider work, write
-summaries, or promote anything.
+summaries, or promote anything. SQLite preview discovery opens only existing
+authenticated database files and does not run schema migrations or change
+`PRAGMA user_version`. A missing database is not created. A schema that cannot
+be read is reported as a discovery failure. Unresolved legacy worktree identities
+with a separate database are refused explicitly; preview never merges or
+removes that data. Resolve the normal worktree reconciliation first, or use the
+recovery/migration owner when native archive facts require it.
 
 Every non-hook manual compact is bound to an authenticated daemon invocation.
 The lease is refreshed while work runs. A heartbeat failure, transport

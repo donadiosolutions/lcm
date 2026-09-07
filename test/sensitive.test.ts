@@ -407,6 +407,15 @@ describe("lcm sensitive", () => {
     }
   });
 
+  it("purge refuses admitted PostgreSQL before deleting local data", async () => {
+    const content = JSON.stringify({ storage: { backend: "postgresql" } });
+    writeConfigFile(configPath, content);
+    await completePostgreSqlPublication(configPath, content);
+    await expect(handleSensitive(["purge", "--yes"], cwd, configPath))
+      .rejects.toMatchObject({name: "StorageBackendUnavailableError"});
+    expect(existsSync(pDir)).toBe(true);
+  });
+
   it("purge --yes: succeeds when project data is already absent", async (): Promise<void> => {
     rmSync(pDir, { recursive: true, force: true });
     await expect(handleSensitive(["purge", "--yes"], cwd, configPath)).resolves.toEqual({

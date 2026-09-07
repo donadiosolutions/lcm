@@ -107,6 +107,27 @@ function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T)
   }
 }
 
+function withReportedForeignFileOwner<T>(
+  path: string,
+  callback: () => T,
+  active: () => boolean = () => true,
+): T {
+  const expected = statSync(path);
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const originalFstat = nodeFs.fstatSync as typeof fstatSync;
+  return withPatchedFs("fstatSync", ((fd: number, options?: unknown) => {
+    const observed = originalFstat(fd, options as never);
+    if (
+      !active()
+      || observed.dev !== expected.dev
+      || observed.ino !== expected.ino
+    ) return observed;
+    const foreign = Object.create(observed) as typeof observed;
+    Object.defineProperty(foreign, "uid", { value: expected.uid + 1 });
+    return foreign;
+  }) as typeof fstatSync, callback);
+}
+
 type IsolatedDirectoryFaults = Readonly<{
   targetDir: string;
   journalDir?: string;
@@ -1366,6 +1387,87 @@ describe("worktree reconciliation", () => {
     if (originalUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = originalUserProfile;
   });
+
+  it.each([
+    "runtime_native_transcripts",
+    "runtime_native_transcript_messages",
+    "runtime_native_ingest_checkpoints",
+  ])("refuses populated %s before modifying either project store", (nativeTable) => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    })}\n`);
+    clearProjectMapCache();
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const sourceDir = join(home, ".lcm", "projects", sourceHash);
+    const targetPath = join(targetDir, "db.sqlite");
+    const sourcePath = join(sourceDir, "db.sqlite");
+    makeDatabase(targetPath, "native-main", "target content", targetHash);
+    makeDatabase(sourcePath, "native-legacy", "source content", sourceHash);
+    const source = new DatabaseSync(sourcePath);
+    // Any populated native table must block, even a partially recovered schema.
+    source.exec(`DROP TABLE ${nativeTable}; CREATE TABLE ${nativeTable}(evidence TEXT); INSERT INTO ${nativeTable} VALUES('PRIVATE_NATIVE_CONTENT')`);
+    removeLegacyMainMetadataColumns(source);
+    source.close();
+    writePrivateFixtureFile(join(sourceDir, "sensitive-patterns.txt"), "SOURCE_PATTERN\n");
+    writePrivateFixtureFile(join(targetDir, "sensitive-patterns.txt"), "TARGET_PATTERN\n");
+    const files = [sourcePath, targetPath, projectMapPath(), join(sourceDir, "sensitive-patterns.txt"), join(targetDir, "sensitive-patterns.txt")];
+    const before = files.map(path => readFileSync(path));
+    const sourceEntries = readdirSync(sourceDir);
+    const targetEntries = readdirSync(targetDir);
+    for (const dryRun of [true, false]) {
+      expect(() => reconcileWorktrees(main, { dryRun }))
+        .toThrow("legacy SQLite native transcript state cannot be reconciled safely");
+      files.forEach((path, index) => expect(readFileSync(path)).toEqual(before[index]));
+      expect(readdirSync(sourceDir)).toEqual(sourceEntries);
+      expect(readdirSync(targetDir)).toEqual(targetEntries);
+      expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+      expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
+    }
+    const [journal] = listWorktreeReconciliationJournals();
+    expect(journal).toMatchObject({ phase: "blocked", backupPaths: [] });
+    expect(journal!.reason).not.toContain("PRIVATE_NATIVE_CONTENT");
+  }, FULL_SUITE_SNAPSHOT_VALIDATION_TEST_TIMEOUT_MS);
+
+  it("refuses native rows added after preflight before committing a source fence", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    })}\n`);
+    clearProjectMapCache();
+    const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    const targetPath = join(home, ".lcm", "projects", targetHash, "db.sqlite");
+    makeDatabase(sourcePath, "native-race-source", "source content", sourceHash);
+    makeDatabase(targetPath, "native-race-target", "target content", targetHash);
+    const targetBefore = readFileSync(targetPath);
+    const mapBefore = readFileSync(projectMapPath());
+    expect(() => reconcileWorktrees(main, {
+      _observer(event) {
+        if (event !== "before-source-main-merge") return;
+        const source = new DatabaseSync(sourcePath);
+        // Unknown future native tables also fail closed rather than being omitted.
+        source.exec("CREATE TABLE Runtime_Native_Race(evidence TEXT); INSERT INTO runtime_native_race VALUES('retained')");
+        source.close();
+      },
+    })).toThrow("legacy SQLite native transcript state cannot be reconciled safely");
+    expect(readFileSync(targetPath)).toEqual(targetBefore);
+    expect(readFileSync(projectMapPath())).toEqual(mapBefore);
+    const source = new DatabaseSync(sourcePath, { readOnly: true });
+    try {
+      expect(source.prepare("SELECT evidence FROM runtime_native_race").get()).toMatchObject({ evidence: "retained" });
+      expect(source.prepare("SELECT count(*) AS count FROM conversations").get()).toMatchObject({ count: 1 });
+      expect(source.prepare("SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'").get()).toBeUndefined();
+    } finally { source.close(); }
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+  }, FULL_SUITE_SNAPSHOT_VALIDATION_TEST_TIMEOUT_MS);
 
   it("transactionally merges complete state, archives sources, and folds aliases", () => {
     const { linked } = makeRepository(home);
@@ -6178,6 +6280,240 @@ describe("worktree reconciliation", () => {
     expect(() => listWorktreeReconciliationJournals()).toThrow("journal is malformed");
   });
 
+  it("rejects a hard-linked completed journal before fast-path reuse", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root, { recursive: true });
+    const journalPath = join(root, `${targetHash}.json`);
+    const journalBytes = JSON.stringify({
+      version: 1,
+      targetHash,
+      canonical,
+      sourceHashes: [],
+      pendingSourceHashes: [],
+      aliases: [canonical],
+      createdAt: "2026-09-06T00:00:00.000Z",
+      updatedAt: "2026-09-06T00:00:00.000Z",
+      phase: "completed",
+      backupPaths: [],
+    });
+    writePrivateFixtureFile(journalPath, journalBytes);
+    const externalLink = join(home, "external-reconciliation-journal.json");
+    linkSync(journalPath, externalLink);
+    const before = statSync(journalPath);
+    const parseSpy = vi.spyOn(JSON, "parse");
+
+    try {
+      expect(() => reconcileWorktrees(main)).toThrow("file has multiple hard links");
+      expect(parseSpy.mock.calls.some(([content]) => content === journalBytes)).toBe(false);
+    } finally {
+      parseSpy.mockRestore();
+    }
+
+    const after = statSync(journalPath);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mode).toBe(before.mode);
+    expect(after.nlink).toBe(2);
+    expect(readFileSync(journalPath, "utf8")).toBe(journalBytes);
+    expect(statSync(externalLink).ino).toBe(before.ino);
+    expect(readFileSync(externalLink, "utf8")).toBe(journalBytes);
+  });
+
+  it("rejects a wrong-owner journal on the locked re-read", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root, { recursive: true });
+    const journalPath = join(root, `${targetHash}.json`);
+    const journalBytes = JSON.stringify({
+      version: 1,
+      targetHash,
+      canonical,
+      sourceHashes: [],
+      pendingSourceHashes: [],
+      aliases: [canonical],
+      createdAt: "2026-09-06T00:00:00.000Z",
+      updatedAt: "2026-09-06T00:00:00.000Z",
+      phase: "planned",
+      backupPaths: [],
+    });
+    writePrivateFixtureFile(journalPath, journalBytes);
+    const before = statSync(journalPath);
+    let foreignOwner = false;
+
+    expect(() => withReportedForeignFileOwner(
+      journalPath,
+      () => reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event === "after-map-preflight") foreignOwner = true;
+        },
+      }),
+      () => foreignOwner,
+    )).toThrow("file owner is not trusted");
+
+    const after = statSync(journalPath);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mode).toBe(before.mode);
+    expect(after.nlink).toBe(1);
+    expect(readFileSync(journalPath, "utf8")).toBe(journalBytes);
+  });
+
+  it("rejects an unsafe journal mode while listing reconciliation state", () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    const journalPath = join(root, `${targetHash}.json`);
+    const journalBytes = JSON.stringify({
+      version: 1,
+      targetHash,
+      canonical: "/project",
+      sourceHashes: [],
+      aliases: ["/project"],
+      createdAt: "2026-09-06T00:00:00.000Z",
+      updatedAt: "2026-09-06T00:00:00.000Z",
+      phase: "completed",
+      backupPaths: [],
+    });
+    makePrivateFixtureDirectory(root, { recursive: true });
+    writePrivateFixtureFile(journalPath, journalBytes);
+    fsChmodSync(journalPath, 0o644);
+    const before = statSync(journalPath);
+    const parseSpy = vi.spyOn(JSON, "parse");
+
+    try {
+      expect(() => listWorktreeReconciliationJournals()).toThrow("file mode is not trusted");
+      expect(parseSpy.mock.calls.some(([content]) => content === journalBytes)).toBe(false);
+    } finally {
+      parseSpy.mockRestore();
+    }
+
+    const after = statSync(journalPath);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mode & 0o777).toBe(0o644);
+    expect(after.nlink).toBe(1);
+    expect(readFileSync(journalPath, "utf8")).toBe(journalBytes);
+  });
+
+  it("aggregates a primary topology failure when its journal becomes unsafe", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root, { recursive: true });
+    const journalPath = join(root, `${targetHash}.json`);
+    const journalBytes = JSON.stringify({
+      version: 1,
+      targetHash,
+      canonical,
+      sourceHashes: [],
+      pendingSourceHashes: [],
+      aliases: [canonical],
+      createdAt: "2026-09-06T00:00:00.000Z",
+      updatedAt: "2026-09-06T00:00:00.000Z",
+      phase: "planned",
+      backupPaths: [],
+    });
+    writePrivateFixtureFile(journalPath, journalBytes);
+    const before = statSync(journalPath);
+    const primary = new securityFiles.PrivateDirectoryTopologyError(
+      "primary topology failure",
+    );
+    let caught: unknown;
+
+    try {
+      reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event !== "after-map-preflight") return;
+          fsChmodSync(journalPath, 0o644);
+          throw primary;
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).cause).toBe(primary);
+    expect((caught as AggregateError).errors).toHaveLength(2);
+    expect((caught as AggregateError).errors[0]).toBe(primary);
+    expect((caught as AggregateError).errors[0])
+      .toBeInstanceOf(securityFiles.PrivateDirectoryTopologyError);
+    expect(String((caught as AggregateError).errors[1]))
+      .toContain("file mode is not trusted");
+    const after = statSync(journalPath);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mode & 0o777).toBe(0o644);
+    expect(after.nlink).toBe(1);
+    expect(readFileSync(journalPath, "utf8")).toBe(journalBytes);
+  });
+
+  it("aggregates a generic failure when its journal becomes unsafe", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root, { recursive: true });
+    const journalPath = join(root, `${targetHash}.json`);
+    const journalBytes = JSON.stringify({
+      version: 1,
+      targetHash,
+      canonical,
+      sourceHashes: [],
+      pendingSourceHashes: [],
+      aliases: [canonical],
+      createdAt: "2026-09-06T00:00:00.000Z",
+      updatedAt: "2026-09-06T00:00:00.000Z",
+      phase: "planned",
+      backupPaths: [],
+    });
+    writePrivateFixtureFile(journalPath, journalBytes);
+    const before = statSync(journalPath);
+    const primary = new Error("primary reconciliation failure");
+    let caught: unknown;
+
+    try {
+      reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event !== "after-map-preflight") return;
+          fsChmodSync(journalPath, 0o644);
+          throw primary;
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).cause).toBe(primary);
+    expect((caught as AggregateError).errors).toHaveLength(2);
+    expect((caught as AggregateError).errors[0]).toBe(primary);
+    expect(String((caught as AggregateError).errors[1]))
+      .toContain("file mode is not trusted");
+    const after = statSync(journalPath);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mode & 0o777).toBe(0o644);
+    expect(after.nlink).toBe(1);
+    expect(readFileSync(journalPath, "utf8")).toBe(journalBytes);
+  });
+
   it("merges an empty pattern file without database state", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
@@ -6913,6 +7249,146 @@ describe("worktree reconciliation", () => {
     );
     expect(existsSync(recreatedEvents)).toBe(true);
   }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it.each([
+    { site: "snapshot", fault: "hard-linked" },
+    { site: "snapshot", fault: "foreign-owned" },
+    { site: "merge source", fault: "hard-linked" },
+    { site: "merge source", fault: "foreign-owned" },
+    { site: "merge target", fault: "hard-linked" },
+    { site: "merge target", fault: "foreign-owned" },
+    { site: "archive", fault: "hard-linked" },
+    { site: "archive", fault: "foreign-owned" },
+  ] as const)("rejects a $fault pattern leaf at the $site read", ({ site, fault }) => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const sourceDir = join(home, ".lcm", "projects", sourceHash);
+    makePrivateFixtureDirectory(targetDir, { recursive: true });
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
+    const targetPatterns = join(targetDir, "sensitive-patterns.txt");
+    const sourcePatterns = join(sourceDir, "sensitive-patterns.txt");
+    writePrivateFixtureFile(targetPatterns, "TARGET_PATTERN\n");
+    writePrivateFixtureFile(sourcePatterns, "SOURCE_PATTERN\n");
+    const patternPath = site === "merge target" ? targetPatterns : sourcePatterns;
+    const before = statSync(patternPath);
+    const externalLink = join(
+      home,
+      `external-${site.replaceAll(" ", "-")}-patterns.txt`,
+    );
+    let authenticationActive = site === "snapshot" || site === "merge target";
+    let beforeSourcePatternsMergeObserved = false;
+    let refusedPath = patternPath;
+    const activateAuthenticationFault = (archivePath?: string) => {
+      authenticationActive = true;
+      if (archivePath !== undefined) refusedPath = archivePath;
+      if (fault === "hard-linked") linkSync(refusedPath, externalLink);
+    };
+    if (authenticationActive && fault === "hard-linked") {
+      activateAuthenticationFault();
+    }
+    const reconcile = () => reconcileWorktrees(main, {
+      now: new Date("2026-09-06T12:00:00Z"),
+      _observer: (event, _source, detailPath) => {
+        if (event === "before-source-patterns-merge") {
+          beforeSourcePatternsMergeObserved = true;
+        }
+        if (site === "merge source" && event === "before-source-patterns-merge") {
+          activateAuthenticationFault();
+        }
+        if (
+          site === "archive"
+          && event === "after-source-archive-rename"
+          && detailPath?.includes("oldprojects")
+        ) {
+          activateAuthenticationFault(join(detailPath, "sensitive-patterns.txt"));
+        }
+      },
+    });
+    const expectedError = fault === "hard-linked"
+      ? "file has multiple hard links"
+      : "file owner is not trusted";
+
+    if (fault === "foreign-owned") {
+      expect(() => withReportedForeignFileOwner(
+        patternPath,
+        reconcile,
+        () => authenticationActive,
+      )).toThrow(expectedError);
+    } else {
+      expect(reconcile).toThrow(expectedError);
+    }
+    if (site === "snapshot") {
+      expect(beforeSourcePatternsMergeObserved).toBe(false);
+    }
+
+    const after = statSync(refusedPath);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mode).toBe(before.mode);
+    expect(after.nlink).toBe(fault === "hard-linked" ? 2 : 1);
+    expect(readFileSync(refusedPath, "utf8")).toBe(
+      site === "merge target" ? "TARGET_PATTERN\n" : "SOURCE_PATTERN\n",
+    );
+    if (fault === "hard-linked") {
+      expect(statSync(externalLink).ino).toBe(before.ino);
+      expect(readFileSync(externalLink, "utf8")).toBe(readFileSync(refusedPath, "utf8"));
+    }
+    expect(readFileSync(targetPatterns, "utf8")).toBe(
+      site === "archive"
+        ? "TARGET_PATTERN\nSOURCE_PATTERN\n"
+        : "TARGET_PATTERN\n",
+    );
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      reason: expect.stringContaining(expectedError),
+    }]);
+  });
+
+  it("accepts owned single-link 0644 pattern files without rewriting a no-op target", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const sourceDir = join(home, ".lcm", "projects", sourceHash);
+    makePrivateFixtureDirectory(targetDir, { recursive: true });
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
+    const targetPatterns = join(targetDir, "sensitive-patterns.txt");
+    const sourcePatterns = join(sourceDir, "sensitive-patterns.txt");
+    writePrivateFixtureFile(targetPatterns, "SAME_PATTERN\n");
+    writePrivateFixtureFile(sourcePatterns, "SAME_PATTERN\n");
+    fsChmodSync(targetPatterns, 0o644);
+    fsChmodSync(sourcePatterns, 0o644);
+    const targetBefore = statSync(targetPatterns);
+
+    const result = reconcileWorktrees(main, {
+      now: new Date("2026-09-06T12:00:00Z"),
+    });
+
+    expect(result.status).toBe("completed");
+    expect(statSync(targetPatterns).ino).toBe(targetBefore.ino);
+    expect(statSync(targetPatterns).mode & 0o777).toBe(0o644);
+    expect(statSync(targetPatterns).nlink).toBe(1);
+    expect(readFileSync(targetPatterns, "utf8")).toBe("SAME_PATTERN\n");
+    const archivedProject = result.backupPaths.find((path) => path.includes("oldprojects"))!;
+    const archivedPatterns = join(archivedProject, "sensitive-patterns.txt");
+    expect(statSync(archivedPatterns).mode & 0o777).toBe(0o644);
+    expect(statSync(archivedPatterns).nlink).toBe(1);
+    expect(readFileSync(archivedPatterns, "utf8")).toBe("SAME_PATTERN\n");
+  });
 
   it("never archives patterns that changed after they were merged", () => {
     const { main, linked } = makeRepository(home);

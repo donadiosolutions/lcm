@@ -73,8 +73,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let foundFilePath = false;
   let filePathBracketDepth = 0;
   let restartedPathlessFile = false;
+  let quotedPathEnded = false;
   let restartedPathlessBrackets = 0;
   let queryOrFragment = false;
+  let queryOrFragmentStart = -1;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
@@ -88,11 +90,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      quotedPathEnded = false;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
       continue;
     }
-    if (separator >= 0 && (char === "?" || char === "#")) queryOrFragment = true;
+    if (separator >= 0 && (char === "?" || char === "#")) {
+      queryOrFragment = true;
+      queryOrFragmentStart = index;
+    }
     const nestedFileSchemeStart = isNestedFileUrlStart(chars, index)
       ? index + 1
       : queryOrFragment &&
@@ -175,15 +181,40 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       queryOrFragment = false;
     }
     // Conservatively keep supported punctuation and embedded double quotes in
-    // an exact file URL authority until the first path separator. A quote that
-    // matches one immediately before the scheme still closes that quoted URL;
-    // once a path starts, URL-ending delimiters keep their existing behavior.
+    // an exact file URL authority until the first path separator. A matching
+    // double quote still closes its quoted URL. A matching apostrophe closes
+    // only before a fresh file URL literal so that separately quoted nested
+    // file URLs retain their own path boundary. Once a path starts, URL-ending
+    // delimiters keep their existing behavior.
     const fileAuthorityDelimiter =
       exactFileScheme &&
       !foundFilePath &&
       (char === '"' || FILE_URL_AUTHORITY_DELIMITERS.has(char)) &&
-      !(schemeQuote !== 0 && quoteCode(char) === schemeQuote);
-    if (separator >= 0 && brackets === 0 && URL_END_DELIMITERS.has(char) && !fileAuthorityDelimiter) {
+      !(
+        schemeQuote !== 0 &&
+        quoteCode(char) === schemeQuote &&
+        (char === '"' || isFileUrlLiteral(chars, index + 1))
+      );
+    const closesQuotedFilePath = foundFilePath && schemeQuote !== 0 && quoteCode(char) === schemeQuote;
+    if (separator >= 0 && brackets > 0 && closesQuotedFilePath && URL_END_DELIMITERS.has(char)) {
+      // The quoted path ended. Keep URL and wrapper state so an adjacent
+      // separator after the wrapper still restarts a file path, but stop
+      // claiming later slashes as this URL authority.
+      quotedPathEnded = true;
+      schemeQuote = 0;
+      // An adjacent backslash starts a fresh path even before the wrapper closes.
+      if (chars[index + 1] === "\\") foundFilePath = false;
+      continue;
+    }
+    if (
+      separator >= 0 &&
+      brackets === 0 &&
+      URL_END_DELIMITERS.has(char) &&
+      !fileAuthorityDelimiter
+    ) {
+      // A closed quoted file path can hand off a root-relative Windows tail,
+      // even when the preceding path contains only root separators.
+      if (closesQuotedFilePath && chars[index + 1] === "\\") file[index + 1] = 1;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;
@@ -197,10 +228,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       continue;
     }
     if (separator >= 0) {
-      if (char === "/") authority[index] = 1;
+      if (char === "/" && !quotedPathEnded) authority[index] = 1;
       if (
         exactFileScheme &&
-        !foundFilePath &&
+        // After an outer path, only a backslash in its query or
+        // fragment starts another file path. The delimiter must belong to
+        // this URL, rather than an enclosing URL before its scheme separator.
+        (!foundFilePath || (queryOrFragmentStart > separator && char === "\\")) &&
         index > separator + 2 &&
         // Valid bracketed IP-literal authorities cannot contain a slash or backslash,
         // so the first such separator is the file URL path boundary even when
@@ -343,6 +377,10 @@ function scanAbsolutePath(
       index += 1;
       continue;
     }
+    if (char === ":" && chars[index + 1] === "\\" && isWindowsDrivePathStart(chars, index - 1)) {
+      index += 1;
+      continue;
+    }
     if (
       quote === undefined &&
       char === ":" &&
@@ -396,6 +434,7 @@ function scanAbsolutePath(
       index += 1;
       continue;
     }
+    if (!windows && char === "\\" && (isUncPathStart(chars, index) || isWindowsDrivePathStart(chars, index + 1))) break;
     if (char === "(" && sawPathCharacter) {
       parentheses += 1;
       sawNonSeparator = true;

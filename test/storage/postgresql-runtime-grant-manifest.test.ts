@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST,
+  POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
   type PostgreSqlRuntimePrivilegeEntry,
   type PostgreSqlRuntimePrivilegeKind,
 } from "../../src/storage/postgresql/runtime-readiness.js";
@@ -169,5 +170,20 @@ describe("PostgreSQL runtime privilege manifest grant scripts", () => {
       { object: "public.similarity(text, text)", extension: "pg_trgm" },
       { object: "public.similarity_op(text, text)", extension: "pg_trgm" },
     ]);
+  });
+});
+
+
+describe("PostgreSQL transfer privilege manifest grant scripts", () => {
+  it("requires exactly the runtime, transcript, and canonical transfer grants", () => {
+    const scriptEntries = new Set([
+      ...REQUIRED_GRANT_SCRIPTS,
+      OPTIONAL_GRANT_SCRIPT,
+      "postgresql-transfer-grants.sql",
+    ].flatMap((filename) => [...parseGrantScript(filename)]));
+    const manifestEntries = POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST.required.map(manifestKey);
+    expect(new Set(manifestEntries).size).toBe(manifestEntries.length);
+    expect(sorted(manifestEntries)).toEqual(sorted(scriptEntries));
+    expect(POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST.optional).toEqual([]);
   });
 });

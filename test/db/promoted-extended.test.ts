@@ -214,7 +214,7 @@ describe("PromotedStore extended", () => {
     const db = {
       exec: (sql: string) => execCalls.push(sql),
       prepare: (sql: string) => ({
-        get: () => ({ rowid: 1, content: "content", tags: "[]" }),
+        get: () => ({ rowid: 1, content: "content", content_type: "text", content_nul_marker: 0, tags: "[]" }),
         run: () => {
           if (sql.startsWith("UPDATE promoted")) throw new Error("update failed");
         },
@@ -234,7 +234,7 @@ describe("PromotedStore extended", () => {
       isTransaction: true,
       exec: (sql: string) => execCalls.push(sql),
       prepare: (sql: string) => ({
-        get: () => ({ rowid: 1, content: "content", tags: "[]" }),
+        get: () => ({ rowid: 1, content: "content", content_type: "text", content_nul_marker: 0, tags: "[]" }),
         run: () => {
           if (sql.startsWith("UPDATE promoted")) throw new Error("update failed");
         },

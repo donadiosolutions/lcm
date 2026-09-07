@@ -8,7 +8,8 @@ import { loadDaemonConfig, type DaemonConfig } from "../../src/daemon/config.js"
 import { safeLogError } from "../../src/hooks/hook-errors.js";
 import * as publicationFence from "../../src/hooks/publication-fence.js";
 import * as daemonNotice from "../../src/hooks/daemon-notice.js";
-import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
+import { BackendPublicationJournalError, withBackendPublicationConsumerLock } from "../../src/storage/backend-publication.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn().mockResolvedValue({ connected: true, port: 3737, spawned: false }),
@@ -43,6 +44,7 @@ function createMockClient(ingestResponse: IngestResponse): DaemonClient {
   const client = new DaemonClient("http://127.0.0.1:3737");
   vi.spyOn(client, "post").mockImplementation(async <T>(path: string): Promise<T> => {
     if (path === "/ingest") return ingestResponse as T;
+    if (path === "/session-complete") return { recorded: true } as T;
     throw new Error(`unexpected path: ${path}`);
   });
   return client;
@@ -304,34 +306,192 @@ describe("handleSessionEnd", () => {
     expect(promoteCalls.length).toBe(1);
   });
 
-  it("records session completion in ingest manifest", async () => {
+  it("validates one config snapshot before the fresh ingest fence and transport", async () => {
+    const order: string[] = [];
+    const actualFence = publicationFence.assertHookPublicationFence;
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {
+      order.push("fence");
+      actualFence();
+    });
+    vi.mocked(loadDaemonConfig).mockImplementation(() => { order.push("config"); return defaultConfig; });
+    const client = createMockClient({ ingested: 2 });
+    vi.mocked(client.post).mockImplementation(async <T>(path: string): Promise<T> => {
+      order.push(path);
+      return (path === "/ingest" ? { ingested: 2 } : { recorded: true }) as T;
+    });
+    try {
+      await expect(handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client))
+        .resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(order).toEqual(["fence", "config", "fence", "/ingest", "fence", "/session-complete"]);
+    } finally { fence.mockRestore(); }
+  });
+
+  it("does not reacquire config authority after ingest can cause live lock contention", async () => {
+    const actual = await vi.importActual<typeof import("../../src/daemon/config.js")>("../../src/daemon/config.js");
+    let ingestReturned = false;
+    vi.mocked(loadDaemonConfig).mockImplementation(path => {
+      if (ingestReturned) {
+        // Inject a real live publication owner precisely at the old late read.
+        // The actual config loader must refuse that lock, not bypass it.
+        return withBackendPublicationConsumerLock(undefined, () => actual.loadDaemonConfig(path));
+      }
+      return actual.loadDaemonConfig(path);
+    });
+    const client = createMockClient({ ingested: 2 });
+    vi.mocked(client.post).mockImplementation(async <T>(path: string): Promise<T> => {
+      if (path === "/ingest") {
+        publicationFence.assertHookPublicationFence();
+        ingestReturned = true;
+        return { ingested: 2 } as T;
+      }
+      return { recorded: true } as T;
+    });
+    await expect(handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client))
+      .resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(client.post).toHaveBeenCalledWith("/session-complete", {
+      session_id: "s1", cwd: "/tmp", message_count: 2,
+    }, { signal: expect.any(AbortSignal) });
+  });
+
+  it.each(["ordinary", "journal"])("sends no ingest when config admission fails: %s", async kind => {
+    const error = kind === "journal"
+      ? new BackendPublicationJournalError("malformed-journal", "fixture config admission refused")
+      : new PrivateMutationLockContentionError("fixture config owner busy");
+    vi.mocked(loadDaemonConfig).mockImplementation(() => { throw error; });
+    const client = createMockClient({ ingested: 2 });
+    const pending = handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client);
+    if (kind === "journal") await expect(pending).rejects.toBe(error);
+    else await expect(pending).resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(client.post).not.toHaveBeenCalled();
+  });
+
+  it("applies settings changed during ingest to the next invocation", async () => {
+    const before = {
+      ...defaultConfig,
+      hooks: { ...defaultConfig.hooks, disableAutoCompact: true },
+      security: { ...defaultConfig.security, notify_on_filter: false },
+    };
+    const after = {
+      ...defaultConfig,
+      hooks: { ...defaultConfig.hooks, disableAutoCompact: false },
+      security: { ...defaultConfig.security, notify_on_filter: true },
+    };
+    vi.mocked(loadDaemonConfig).mockReturnValue(before);
+    let releaseIngest!: () => void;
+    let startIngest!: () => void;
+    const started = new Promise<void>(resolve => { startIngest = resolve; });
+    const gate = new Promise<void>(resolve => { releaseIngest = resolve; });
+    const client = createMockClient({ ingested: 2 });
+    vi.mocked(client.post).mockImplementation(async <T>(path: string): Promise<T> => {
+      if (path !== "/ingest") return { recorded: true } as T;
+      startIngest();
+      await gate;
+      return { ingested: 2, redacted: 1, redactedCategories: ["built_in"] } as T;
+    });
     const { request } = await import("node:http");
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const pending = handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client);
+    try {
+      await started;
+      vi.mocked(loadDaemonConfig).mockReturnValue(after);
+      releaseIngest();
+      await expect(pending).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(loadDaemonConfig).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(request).mock.calls.some(args => httpCallPath(args) === "/compact")).toBe(false);
+      expect(stderr).not.toHaveBeenCalled();
+      await handleSessionEnd('{"session_id":"s2","cwd":"/tmp"}', client);
+      expect(loadDaemonConfig).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(request).mock.calls.some(args => httpCallPath(args) === "/compact")).toBe(true);
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("built_in"));
+    } finally { releaseIngest(); await pending; stderr.mockRestore(); }
+  });
+
+  it("waits for acknowledged completion without retaining publication admission", async () => {
     const client = createMockClient({ ingested: 5, totalTokens: 100 });
-    await handleSessionEnd(
-      JSON.stringify({ session_id: "s1", cwd: "/tmp" }),
-      client, 3737,
-    );
-    const httpReqMock = vi.mocked(request);
-    const manifestCalls = httpReqMock.mock.calls.filter(
-      (args) => httpCallPath(args) === "/session-complete",
-    );
-    expect(manifestCalls.length).toBe(1);
+    let acknowledge!: () => void;
+    let completionStarted!: () => void;
+    const started = new Promise<void>(resolve => { completionStarted = resolve; });
+    const acknowledged = new Promise<void>(resolve => { acknowledge = resolve; });
+    vi.mocked(client.post).mockImplementation(async <T>(path: string): Promise<T> => {
+      if (path === "/ingest") return { ingested: 5 } as T;
+      completionStarted();
+      // This real fence can acquire the lock while the HTTP seam is pending.
+      publicationFence.assertHookPublicationFence();
+      await acknowledged;
+      return { recorded: true } as T;
+    });
+    let settled = false;
+    const pending = handleSessionEnd(JSON.stringify({ session_id: "s1", cwd: "/tmp" }), client, 3737)
+      .then(result => { settled = true; return result; });
+    try {
+      const first = await Promise.race([started.then(() => "request"), pending.then(() => "returned")]);
+      expect(first).toBe("request");
+      expect(settled).toBe(false);
+      expect(client.post).toHaveBeenCalledWith("/session-complete", {
+        session_id: "s1", cwd: "/tmp", message_count: 5,
+      }, { signal: expect.any(AbortSignal) });
+    } finally { acknowledge(); }
+    await expect(pending).resolves.toEqual({ exitCode: 0, stdout: "" });
+  });
+
+  it.each([0, undefined])("sends a zero completion delta for ingested %s", async ingested => {
+    const client = createMockClient({ ingested });
+    await expect(handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client))
+      .resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(client.post).toHaveBeenCalledWith("/session-complete", {
+      session_id: "s1", cwd: "/tmp", message_count: 0,
+    }, { signal: expect.any(AbortSignal) });
   });
 
   it("does not mark Codex sessions complete because Stop is turn-scoped", async () => {
-    const { request } = await import("node:http");
     const client = createMockClient({ ingested: 5, totalTokens: 100 });
     await handleSessionEnd(
-      JSON.stringify({ session_id: "s1", cwd: "/tmp", client: "codex" }),
-      client,
-      3737,
+      JSON.stringify({ session_id: "s1", cwd: "/tmp", client: "codex" }), client, 3737,
     );
-    const httpReqMock = vi.mocked(request);
-    const manifestCalls = httpReqMock.mock.calls.filter(
-      (args) => httpCallPath(args) === "/session-complete",
-    );
-    expect(manifestCalls.length).toBe(0);
+    expect(vi.mocked(client.post).mock.calls.some(([path]) => path === "/session-complete")).toBe(false);
     expect(client.post).toHaveBeenCalledWith("/ingest", { session_id: "s1", cwd: "/tmp", client: "codex" });
+  });
+
+  it.each([
+    new Error("transport failed"),
+    Object.assign(new Error("backend publication admission blocked"), { statusCode: 503 }),
+    Object.assign(new Error("deadline expired"), { name: "AbortError" }),
+    new SyntaxError("invalid response JSON"),
+  ])("keeps ordinary completion failure nonfatal: %s", async error => {
+    const client = createMockClient({ ingested: 2 });
+    vi.mocked(client.post).mockResolvedValueOnce({ ingested: 2 }).mockRejectedValueOnce(error);
+    await expect(handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client))
+      .resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(client.post).toHaveBeenCalledWith("/session-complete", expect.any(Object), {
+      signal: expect.any(AbortSignal),
+    });
+  });
+
+  it.each(["contention", "journal"])("preserves fresh completion fence %s policy", async kind => {
+    const client = createMockClient({ ingested: 2 });
+    const error = kind === "contention"
+      ? new PrivateMutationLockContentionError("fixture publication busy")
+      : new BackendPublicationJournalError("unresolved-publication", "fixture journal unresolved");
+    const actualFence = publicationFence.assertHookPublicationFence;
+    let admissionCount = 0;
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {
+      if (++admissionCount === 3) throw error;
+      actualFence();
+    });
+    try {
+      const pending = handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client);
+      if (kind === "journal") await expect(pending).rejects.toBe(error);
+      else await expect(pending).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(admissionCount).toBe(3);
+      expect(vi.mocked(client.post).mock.calls.some(([path]) => path === "/session-complete")).toBe(false);
+    } finally { fence.mockRestore(); }
+  });
+
+  it("rethrows a local journal error from the completion request seam", async () => {
+    const client = createMockClient({ ingested: 2 });
+    const error = new BackendPublicationJournalError("malformed-journal", "fixture journal malformed");
+    vi.mocked(client.post).mockResolvedValueOnce({ ingested: 2 }).mockRejectedValueOnce(error);
+    await expect(handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client)).rejects.toBe(error);
   });
 
   it("calls socket.unref() so the process does not wait for a compact response", async () => {
@@ -433,15 +593,13 @@ describe("handleSessionEnd", () => {
     }, "built_in, project"],
   ])("normalizes %s category metadata", async (_label, ingestResponse, expected) => {
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
-    const { request } = await import("node:http");
+    const client = createMockClient(ingestResponse);
     await handleSessionEnd(
       JSON.stringify({ session_id: "s1", cwd: "/tmp" }),
-      createMockClient(ingestResponse),
+      client,
     );
     expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining(`pattern: ${expected})`));
-    const complete = vi.mocked(request).mock.calls.find(
-      (args) => httpCallPath(args) === "/session-complete",
-    );
+    const complete = vi.mocked(client.post).mock.calls.find(([path]) => path === "/session-complete");
     expect(complete).toBeDefined();
     stderrSpy.mockRestore();
   });
