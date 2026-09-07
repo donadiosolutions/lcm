@@ -606,6 +606,7 @@ describe("sanitizeError", () => {
     ["file:///C:\\E::\\SECRET", "file://<path>"],
     ["https://example.test/C:\\E::\\SECRET", "https://example.test/<path>"],
     ["C:\\E::\\E::\\SECRET", "<path>"],
+    ["/p\\E::\\dir/F::\\SECRET", "<path>"],
     ["C:\\E::\\1SECRET", "<path>"],
     ["C:\\E::\\", "<path>"],
     ["/p\\C:\\E::\\SECRET https://pub.test/x", "<path>\\<path> https://pub.test/x"],

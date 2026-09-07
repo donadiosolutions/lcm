@@ -403,6 +403,7 @@ function scanAbsolutePath(
       continue;
     }
     if (isDoubledDriveColonInPath(chars, index, windowsContext)) {
+      windowsContext = true;
       index += 2;
       continue;
     }
