@@ -293,9 +293,14 @@ bundled Gitleaks rules, built-in patterns, global `security.sensitivePatterns`,
 and the project's `sensitive-patterns.txt`. Previously captured passive events
 are scrubbed again before promotion.
 
-Bundled rules scoped to a service hostname match that literal hostname,
-including its dots. A lookalike hostname is not treated or redacted as that
-service; add a custom pattern when your environment intentionally uses one.
+The bundled Slack webhook (`hooks.slack.com`) and Sidekiq
+(`gems.contribsys.com` and `enterprise.contribsys.com`) service-hostname rules
+match their hostnames case-insensitively while treating dots literally. The
+Slack webhook rule still accepts only the lowercase `/services`, `/workflows`,
+and `/triggers` path prefixes and preserves its token-suffix boundaries. A
+lookalike hostname is not treated or redacted as that service; add a custom
+pattern when your environment intentionally uses one. Other bundled hostname
+rules retain their own matching behavior.
 
 For PostgreSQL native transcripts, the embedded caller must explicitly
 load and pass both effective custom-pattern arrays: global

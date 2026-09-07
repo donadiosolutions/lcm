@@ -126,7 +126,9 @@ function convertGoRegex(goRegex: string): { regex: string; flags: string } {
 // Pinned gitleaks revision 4c232b5014f7618360bd992b4c489cb055881c6b
 // spells these service hostnames with wildcard dots. Keep the correction in
 // the generator so weekly regeneration preserves the fixes for CodeQL alerts
-// 190, 191, and 192. replaceAll is also a no-op if upstream restores escapes.
+// 190, 191, and 192. Slack's hostname is also paired-case normalized so the
+// detector accepts lower-, upper-, and mixed-case hostnames while retaining
+// lowercase path and token semantics.
 const HOST_LITERALS_BY_RULE: Readonly<Record<string, readonly string[]>> = {
   "sidekiq-sensitive-url": [
     "gems.contribsys.com",
@@ -135,6 +137,18 @@ const HOST_LITERALS_BY_RULE: Readonly<Record<string, readonly string[]>> = {
   "slack-webhook-url": ["hooks.slack.com"],
 };
 
+const PAIRED_CASE_HOST_RULES: ReadonlySet<string> = new Set([
+  "slack-webhook-url",
+]);
+
+function pairedCaseHostname(hostname: string): string {
+  return hostname.replace(/[a-z.]/g, (character) =>
+    character === "."
+      ? "\\."
+      : `[${character.toUpperCase()}${character}]`,
+  );
+}
+
 export function normalizeGitleaksHostnameLiterals(
   ruleId: string,
   regex: string,
@@ -142,11 +156,17 @@ export function normalizeGitleaksHostnameLiterals(
   const hostnames = HOST_LITERALS_BY_RULE[ruleId];
   if (!hostnames) return regex;
 
+  const usePairedCase = PAIRED_CASE_HOST_RULES.has(ruleId);
   return hostnames.reduce(
-    (normalized, hostname) => normalized.replaceAll(
-      hostname,
-      hostname.replaceAll(".", "\\."),
-    ),
+    (normalized, hostname) => {
+      const escapedHostname = hostname.replaceAll(".", "\\.");
+      const replacement = usePairedCase
+        ? pairedCaseHostname(hostname)
+        : escapedHostname;
+      return normalized
+        .replaceAll(hostname, replacement)
+        .replaceAll(escapedHostname, replacement);
+    },
     regex,
   );
 }
