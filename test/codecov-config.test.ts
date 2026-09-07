@@ -54,6 +54,10 @@ const expectedComponents = [
     paths: [
       "^src/config-manager\\.ts$",
       "^src/config-projection\\.ts$",
+      // #1086/#1095/#1119 keep cleanup-error precedence in this existing
+      // configuration-security owner without changing component topology.
+      // PR #791 keeps generated Gitleaks hostname-literal normalization in
+      // this existing configuration-security owner.
       "^src/generated-patterns\\.ts$",
       "^src/home-parent-auth\\.ts$",
       "^src/legacy-names\\.ts$",
@@ -237,6 +241,7 @@ const expectedComponents = [
       // #1048 keeps target metadata leaf authentication in this owner.
       // #1069 preserves completed reconciliation evidence after retained
       // directory cleanup failures in this existing component.
+      // #1059 keeps retained journal-parent publication in this existing owner.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
@@ -556,6 +561,7 @@ describe("Codecov configuration", () => {
     const expectedOwners = [
       // #866 export admission failures and sensitive result emission stay CLI-owned.
       // #1081 keeps unsupported export-format admission CLI-owned.
+      // #1088 keeps unsupported connector-list-format admission CLI-owned.
       // #978 keeps compact replacement runtime-digest admission CLI-owned.
       // #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
       ["bin/lcm.ts", "unit-cli"],

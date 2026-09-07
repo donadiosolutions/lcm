@@ -1939,6 +1939,54 @@ describe("runCli orchestration actions", () => {
     },
   );
 
+  it.each(["yaml", "", "JSON", " json ", "json\u0000"])(
+    "rejects unsupported connector list format %j before inventory",
+    async format => {
+      const installer = await import("../../src/connectors/installer.js");
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+      const result = await invoke(["connectors", "list", "--format", format]);
+
+      expect(result?.message).toBe("exit:1");
+      expect(error).toHaveBeenCalledExactlyOnceWith("Invalid --format: expected text or json.");
+      expect(log).not.toHaveBeenCalled();
+      expect(stdout).not.toHaveBeenCalled();
+      expect(installer.listConnectorInventory).not.toHaveBeenCalled();
+      expect(installer.listConnectors).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects unsupported connector list format with --global before inventory", async () => {
+    const installer = await import("../../src/connectors/installer.js");
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    const result = await invoke(["connectors", "list", "--format", "yaml", "--global"]);
+
+    expect(result?.message).toBe("exit:1");
+    expect(error).toHaveBeenCalledExactlyOnceWith("Invalid --format: expected text or json.");
+    expect(log).not.toHaveBeenCalled();
+    expect(stdout).not.toHaveBeenCalled();
+    expect(installer.listConnectorInventory).not.toHaveBeenCalled();
+    expect(installer.listConnectors).not.toHaveBeenCalled();
+  });
+
+  it("keeps connector list help ahead of format validation", async () => {
+    const installer = await import("../../src/connectors/installer.js");
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await invoke(["connectors", "list", "--format", "yaml", "--help"]);
+
+    expect(result?.message).toBe("exit:0");
+    expect(state.printHelp).toHaveBeenCalledExactlyOnceWith("connectors");
+    expect(error).not.toHaveBeenCalled();
+    expect(installer.listConnectorInventory).not.toHaveBeenCalled();
+    expect(installer.listConnectors).not.toHaveBeenCalled();
+  });
+
   it("rejects an unsupported export format before PostgreSQL preparation", async () => {
     const portable = await import("../../src/portable-knowledge.js");
     state.storageBackend = "postgresql";
@@ -2333,6 +2381,17 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(text).toContain("Default transport");
     expect(text).toContain("Supported transports");
     expect(text).not.toContain("Default  ");
+  });
+
+  it("keeps default and explicit text connector output equivalent", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    expect(await invoke(["connectors", "list"])).toBeUndefined();
+    const defaultOutput = [...log.mock.calls];
+
+    log.mockClear();
+    expect(await invoke(["connectors", "list", "--format", "text"])).toBeUndefined();
+    expect(log.mock.calls).toEqual(defaultOutput);
   });
 
   it("does not infer a Codex CLI transport when native MCP inspection is unknown", async () => {

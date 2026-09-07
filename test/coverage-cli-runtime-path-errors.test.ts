@@ -1317,6 +1317,140 @@ describe("runtime home rename failures", () => {
   });
 
   it.each([
+    { label: "an Error", authenticationError: new Error("synthetic home authentication failure") as unknown },
+    { label: "undefined", authenticationError: undefined as unknown },
+  ])("preserves $label home authentication failure identity after parent cleanup", ({ authenticationError }) => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-home-auth-"));
+    homes.push(home);
+    mkdirSync(lcmHomeDir(home), { mode: 0o700 });
+    const parentPath = dirname(home);
+    let parentFd: number | undefined;
+    let homeFd: number | undefined;
+    let parentCloses = 0;
+    let homeCloses = 0;
+    fsControl.openHook = (path, fd) => {
+      if (path === parentPath && parentFd === undefined) parentFd = fd;
+      if (path === home && homeFd === undefined) homeFd = fd;
+    };
+    fsControl.fstatFdHook = (_path, fd) => {
+      if (fd === homeFd) throw authenticationError;
+    };
+    fsControl.closeHook = (_path, fd) => {
+      if (fd === parentFd) parentCloses += 1;
+      if (fd === homeFd) homeCloses += 1;
+    };
+
+    let didThrow = false;
+    let failure: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (error) {
+      didThrow = true;
+      failure = error;
+    }
+
+    expect(didThrow).toBe(true);
+    expect(failure).toBe(authenticationError);
+    expect(parentCloses).toBe(1);
+    expect(homeCloses).toBe(1);
+    expect(parentFd).toBeTypeOf("number");
+    expect(homeFd).toBeTypeOf("number");
+    expect(() => fstatSync(parentFd!, { bigint: true })).toThrowError(
+      expect.objectContaining({ code: "EBADF" }),
+    );
+    expect(() => fstatSync(homeFd!, { bigint: true })).toThrowError(
+      expect.objectContaining({ code: "EBADF" }),
+    );
+  });
+
+  it("preserves home authentication and parent cleanup failures in order", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-home-cleanup-"));
+    homes.push(home);
+    mkdirSync(lcmHomeDir(home), { mode: 0o700 });
+    const parentPath = dirname(home);
+    const authenticationError = new Error("synthetic home authentication failure");
+    const cleanupError = Object.assign(new Error("synthetic parent cleanup failure"), { code: "EIO" });
+    let parentFd: number | undefined;
+    let homeFd: number | undefined;
+    let parentCloses = 0;
+    fsControl.openHook = (path, fd) => {
+      if (path === parentPath && parentFd === undefined) parentFd = fd;
+      if (path === home && homeFd === undefined) homeFd = fd;
+    };
+    fsControl.fstatFdHook = (_path, fd) => {
+      if (fd === homeFd) throw authenticationError;
+    };
+    fsControl.closeAfterHook = (_path, fd) => {
+      if (fd !== parentFd) return;
+      parentCloses += 1;
+      expect(() => fstatSync(fd, { bigint: true })).toThrowError(
+        expect.objectContaining({ code: "EBADF" }),
+      );
+      throw cleanupError;
+    };
+
+    let failure: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (error) {
+      failure = error;
+    } finally {
+      fsControl.closeAfterHook = undefined;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).message).toBe(
+      "home topology authentication and parent cleanup failed",
+    );
+    expect((failure as AggregateError).errors).toEqual([authenticationError, cleanupError]);
+    expect((failure as AggregateError & { cause?: unknown }).cause).toBe(authenticationError);
+    expect(parentCloses).toBe(1);
+  });
+
+  it("keeps nested home and parent cleanup evidence ordered", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-home-nested-cleanup-"));
+    homes.push(home);
+    mkdirSync(lcmHomeDir(home), { mode: 0o700 });
+    const parentPath = dirname(home);
+    const authenticationError = new Error("synthetic home authentication failure");
+    const homeCleanupError = Object.assign(new Error("synthetic home cleanup failure"), { code: "EIO" });
+    const parentCleanupError = Object.assign(new Error("synthetic parent cleanup failure"), { code: "EIO" });
+    let parentFd: number | undefined;
+    let homeFd: number | undefined;
+    fsControl.openHook = (path, fd) => {
+      if (path === parentPath && parentFd === undefined) parentFd = fd;
+      if (path === home && homeFd === undefined) homeFd = fd;
+    };
+    fsControl.fstatFdHook = (_path, fd) => {
+      if (fd === homeFd) throw authenticationError;
+    };
+    fsControl.closeAfterHook = (_path, fd) => {
+      if (fd === homeFd) throw homeCleanupError;
+      if (fd === parentFd) throw parentCleanupError;
+    };
+
+    let failure: unknown;
+    try {
+      bootstrapLcmHome(home);
+    } catch (error) {
+      failure = error;
+    } finally {
+      fsControl.closeAfterHook = undefined;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    const outer = failure as AggregateError & { cause?: unknown };
+    expect(outer.message).toBe("home topology authentication and parent cleanup failed");
+    expect(outer.errors[1]).toBe(parentCleanupError);
+    expect(outer.cause).toBe(outer.errors[0]);
+    expect(outer.errors[0]).toBeInstanceOf(AggregateError);
+    const inner = outer.errors[0] as AggregateError & { cause?: unknown };
+    expect(inner.message).toBe("directory authentication and cleanup failed");
+    expect(inner.errors).toEqual([authenticationError, homeCleanupError]);
+    expect(inner.cause).toBe(authenticationError);
+  });
+
+  it.each([
     { label: "an Error", authenticationError: new Error("synthetic parent authentication failure") as unknown },
     { label: "undefined", authenticationError: undefined as unknown },
   ])("preserves $label parent authentication failure identity after cleanup", ({ authenticationError }) => {
@@ -2100,6 +2234,55 @@ describe("runtime home rename failures", () => {
     };
 
     expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("entry changed before descriptor validation");
+  });
+
+  it("preserves migration entry validation and cleanup failures in order", () => {
+    const paths = legacyHome();
+    const cleanupError = Object.assign(new Error("synthetic migration entry cleanup failure"), { code: "EIO" });
+    let valueFd: number | undefined;
+    let valueCloses = 0;
+    fsControl.openHook = (path, fd) => {
+      if (path.endsWith("value.txt") && valueFd === undefined) valueFd = fd;
+    };
+    fsControl.fstatHook = (path, stat) => path.endsWith("value.txt")
+      ? { ...(stat as object), ino: (stat as { ino: bigint }).ino + 1n }
+      : stat;
+    fsControl.closeAfterHook = (path, fd) => {
+      if (!path.endsWith("value.txt") || fd !== valueFd) return;
+      valueCloses += 1;
+      expect(() => fstatSync(fd, { bigint: true })).toThrowError(
+        expect.objectContaining({ code: "EBADF" }),
+      );
+      throw cleanupError;
+    };
+
+    let failure: unknown;
+    try {
+      migrateLegacyHomeIfNeeded(paths.home);
+    } catch (error) {
+      failure = error;
+    } finally {
+      fsControl.closeAfterHook = undefined;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    const aggregate = failure as AggregateError & { cause?: unknown };
+    expect(aggregate.message).toBe("migration entry validation and cleanup failed");
+    expect(aggregate.errors[0]).toBeInstanceOf(Error);
+    expect((aggregate.errors[0] as Error).message).toBe(
+      "legacy migration entry changed before descriptor validation",
+    );
+    expect(aggregate.errors[1]).toBe(cleanupError);
+    expect(aggregate.cause).toBe(aggregate.errors[0]);
+    expect(valueCloses).toBe(1);
+    expect(valueFd).toBeTypeOf("number");
+  });
+
+  it("treats an initially absent legacy migration entry as absent", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-absent-legacy-"));
+    homes.push(home);
+
+    expect(migrateLegacyHomeIfNeeded(home)).toMatchObject({ migrated: false });
   });
 
   it("rejects an entry whose pathname type differs from its opened descriptor", () => {

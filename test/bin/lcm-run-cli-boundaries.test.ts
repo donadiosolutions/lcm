@@ -1074,6 +1074,21 @@ describe("runCli lifecycle and connector boundaries", () => {
     expect((await invoke(["connectors", "remove", "codex"]))?.message).toBe("exit:1");
   });
 
+  it("rejects direct connector list formats before inventory", async () => {
+    const actions = await captureRunCliActions();
+    const installer = await import("../../src/connectors/installer.js");
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await expect(actions.get("connectors/list")!({ format: "yaml" })).rejects.toThrow("exit:1");
+    expect(error).toHaveBeenCalledExactlyOnceWith("Invalid --format: expected text or json.");
+    expect(log).not.toHaveBeenCalled();
+    expect(stdout).not.toHaveBeenCalled();
+    expect(installer.listConnectorInventory).toBeUndefined();
+    expect(installer.listConnectors).not.toHaveBeenCalled();
+  });
+
   it("covers nested connector callbacks which Commander cannot route", async () => {
     const captured = new Map<string, ActionHandler>();
     const original = Command.prototype.action;

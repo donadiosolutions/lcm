@@ -78,6 +78,7 @@ vi.mock("../../../src/stats.js", async (importOriginal) => ({
 
 
 import { backendDiagnosticFailure } from "../../../src/storage/diagnostics.js";
+import { BackendPublicationJournalError } from "../../../src/storage/backend-publication.js";
 import { StatsUnavailableError } from "../../../src/stats.js";
 import { createDescribeHandler } from "../../../src/daemon/routes/describe.js";
 import { createExpandHandler } from "../../../src/daemon/routes/expand.js";
@@ -806,6 +807,42 @@ describe("persistence read route boundaries", () => {
     await invoke(createStatsHandler(), {});
     expectLast(200, { backendDiagnostics: diagnostics });
     expect(JSON.stringify(mocks.end.mock.calls)).not.toContain("private diagnostic canary");
+  });
+
+  it("preserves configured backend identity across sanitized route failures", async () => {
+    const unavailableDiagnostics = backendDiagnosticFailure(new Error("private unavailable"), "sqlite");
+    const handlers = [
+      ["stats", createStatsHandler],
+      ["pool", createPoolStatsHandler],
+    ] as const;
+    const factories = [
+      ["sqlite", injectedFactory()],
+      ["postgresql", {...injectedFactory(),backend:"postgresql"} as StorageBackendFactory],
+      ["unavailable", undefined],
+    ] as const;
+    const failures = [
+      new Error("private error canary"),
+      {private:"non-error canary"},
+      new BackendPublicationJournalError("unexpected-state", "private publication canary"),
+    ];
+    for (const [_route, createHandler] of handlers) {
+      for (const [backend, factory] of factories) {
+        for (const failure of failures) {
+          mocks.stats.mockImplementationOnce(() => { throw failure; });
+          await invoke(createHandler("/configured-home", factory), {});
+          const expected = backendDiagnosticFailure(failure, backend);
+          expectLast(200, {backendDiagnostics:expected});
+          expect(expected.metrics).toBeUndefined();
+          expect(JSON.stringify(mocks.end.mock.calls.at(-1))).not.toMatch(/private|canary/);
+        }
+      }
+    }
+
+    for (const createHandler of [createStatsHandler,createPoolStatsHandler]) {
+      mocks.stats.mockImplementationOnce(() => { throw new StatsUnavailableError(unavailableDiagnostics); });
+      await invoke(createHandler("/configured-home", injectedFactory()), {});
+      expectLast(200, {backendDiagnostics:unavailableDiagnostics});
+    }
   });
 
   it("covers layered search validation, filtering, failures, and disabled layers", async () => {

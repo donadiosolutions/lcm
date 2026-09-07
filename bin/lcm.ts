@@ -3392,6 +3392,10 @@ export async function runCli(
         printHelp("connectors"); exit(0);
       }
       const format: string = opts.format ?? "text";
+      if (format !== "text" && format !== "json") {
+        console.error("Invalid --format: expected text or json.");
+        exit(1);
+      }
       const { listConnectors, listConnectorInventory } = await import("../src/connectors/installer.js");
       const { AGENTS } = await import("../src/connectors/registry.js");
       const connectorCwd = opts.global ? homedir() : process.cwd();
