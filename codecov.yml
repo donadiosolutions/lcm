@@ -44,6 +44,8 @@ component_management:
         # descriptor cleanup also fails.
         # #1062 keeps retained-parent create-if-absent publication within the
         # existing filesystem-topology owner.
+        # #1086/#1095/#1119 keep cleanup-error precedence in this existing
+        # configuration-security owner without changing component topology.
         # PR #791 keeps generated Gitleaks hostname-literal normalization in
         # this existing configuration-security owner.
         - "^src/config-manager\\.ts$"
@@ -94,8 +96,9 @@ component_management:
         - "^src/daemon/proxy-manager\\.ts$"
         - "^src/daemon/remediation\\.ts$"
         # Error sanitization, including #893 adjacent-path, #903 prefixed
-        # nested-file, #924 embedded-quote file-authority, and #1060 adjacent
-        # nested-file scheme preservation, remains daemon-core-owned.
+        # nested-file, #924 embedded-quote file-authority, #1060 adjacent
+        # nested-file scheme preservation, and #1117 glued file-authority
+        # handling remain daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -157,6 +160,7 @@ component_management:
         # while retaining local-persistence ownership.
         # #898's guarded dual-JSON eligibility keeps this search in the same owner.
         # #989 retains event-sidecar parent authentication in this owner.
+        # #1101 retains numeric skipped-sidecar counts in this owner.
         # #992 keeps pre-initialization SQLite leaf admission and final
         # opened-identity fencing local-persistence-owned.
         # #1020 keeps UTC message timestamp mapping in conversation-store-owned

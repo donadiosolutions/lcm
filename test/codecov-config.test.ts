@@ -54,6 +54,8 @@ const expectedComponents = [
     paths: [
       "^src/config-manager\\.ts$",
       "^src/config-projection\\.ts$",
+      // #1086/#1095/#1119 keep cleanup-error precedence in this existing
+      // configuration-security owner without changing component topology.
       // PR #791 keeps generated Gitleaks hostname-literal normalization in
       // this existing configuration-security owner.
       "^src/generated-patterns\\.ts$",
@@ -101,8 +103,9 @@ const expectedComponents = [
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
       // Error sanitization, including #893 adjacent-path, #903 prefixed
-      // nested-file, #924 embedded-quote file-authority, and #1060 adjacent
-      // nested-file scheme preservation, remains daemon-core-owned.
+      // nested-file, #924 embedded-quote file-authority, #1060 adjacent
+      // nested-file scheme preservation, and #1117 glued file-authority
+      // handling remain daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -622,6 +625,7 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.
+      // #1101 numeric skipped-sidecar counts stay local-persistence-owned.
       ["src/db/event-sidecars.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"],

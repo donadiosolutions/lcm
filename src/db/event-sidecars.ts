@@ -38,6 +38,8 @@ export interface EventSidecarSummary {
   recentErrors?: Array<{ created_at: string; hook: string; error: string }>;
   scanError?: string;
   scanSkipped?: string;
+  /** Number of sidecar files represented by a bounded skipped summary. */
+  scanSkippedCount?: number;
   pruned?: boolean;
   pruneReason?: string;
 }
@@ -250,7 +252,12 @@ function failedSidecarSummary(
   };
 }
 
-function skippedSidecarSummary(file: string, path: string, scanSkipped: string): EventSidecarSummary {
+function skippedSidecarSummary(
+  file: string,
+  path: string,
+  scanSkipped: string,
+  scanSkippedCount: number,
+): EventSidecarSummary {
   const projectId = file.slice(0, -".db".length);
   return {
     file,
@@ -270,6 +277,7 @@ function skippedSidecarSummary(file: string, path: string, scanSkipped: string):
     deliveryQuarantined: 0,
     oldestDeliveryAt: null,
     scanSkipped,
+    scanSkippedCount,
   };
 }
 
@@ -399,6 +407,7 @@ async function scanEventSidecars(options: EventSidecarScanOptions): Promise<Even
           skippedFile,
           join(dir, skippedFile),
           `${skippedCount} ${skippedCount === 1 ? "sidecar" : "sidecars"} ${reason}`,
+          skippedCount,
         ));
         break;
       }
@@ -519,7 +528,7 @@ async function scanEventSidecars(options: EventSidecarScanOptions): Promise<Even
         if (error instanceof EventSidecarScanStoppedError || code === "DIAGNOSTIC_SQLITE_TIMEOUT" || code === "DIAGNOSTIC_SQLITE_ABORTED") {
           const reason = error instanceof EventSidecarScanStoppedError ? error.message
             : code === "DIAGNOSTIC_SQLITE_ABORTED" ? "sidecar scan cancelled" : "sidecar scan skipped after timeout";
-          sidecars.push(skippedSidecarSummary(file, path, reason));
+          sidecars.push(skippedSidecarSummary(file, path, reason, files.length - index));
           break;
         }
         sidecars.push(failedSidecarSummary(
