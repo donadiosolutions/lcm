@@ -139,6 +139,12 @@ database sidecars move to timestamped private backups under
 remain at the retired project and event paths so an older LCM process cannot
 recreate a split store. The project map then folds live and deleted worktree
 paths into canonical aliases. Legacy data remains recoverable in the backups.
+If the retained target identity changes immediately after a database commit,
+reconciliation keeps the topology diagnostic as the primary error and records
+the journal as blocked. It does not issue a second rollback against a
+transaction that has already committed. When an active transaction rollback
+itself fails, the original merge error remains first and the rollback failure
+is retained as secondary cause evidence.
 An event-path sentinel is recognized only when the hash-named
 `~/.lcm/events/<local-hash>.db` path is a real directory containing exactly one
 bounded, regular `fence.json` marker whose version, hash, kind, JSON bytes, and
