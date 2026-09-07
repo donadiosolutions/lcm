@@ -193,7 +193,8 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
               throwIfAborted(signal);
               let snapshot: NativeTranscriptSourceSnapshot | undefined;
               let closeSnapshot: (() => Promise<void>) | undefined;
-              let failed = false;
+              let attemptFailed = false;
+              let retryableFailure: NativeTranscriptSourceChangedError | undefined;
               try {
                 let messages = resolvedMessages;
                 if (importNative !== undefined) {
@@ -242,7 +243,8 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
                     : CLAUDE_NATIVE_TRANSCRIPT_FORMAT;
                   const projectPatterns = await ScrubEngine.loadProjectPatterns(join(paths.dir, "sensitive-patterns.txt"));
                   const quarantine = openLocalTranscriptQuarantine(project.projectId, format.clientName);
-                  let failed = false;
+                  let backfillFailed = false;
+                  let backfillRetryFailure: NativeTranscriptSourceChangedError | undefined;
                   try {
                     await runNativeTranscriptBackfill({
                       repository: native.repository,
@@ -257,11 +259,17 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
                       quarantine,
                     });
                   } catch (error) {
-                    failed = true;
+                    backfillFailed = true;
+                    if (error instanceof NativeTranscriptSourceChangedError && attempt === 0 && !signal.aborted) {
+                      backfillRetryFailure = error;
+                    }
                     throw error;
                   } finally {
                     try { await quarantine.close(); } catch (error) {
-                      if (!failed) throw error;
+                      if (backfillRetryFailure !== undefined) {
+                        throw new AggregateError([backfillRetryFailure, error], "Native ingest quarantine cleanup failed", { cause: backfillRetryFailure });
+                      }
+                      if (!backfillFailed) throw error;
                     }
                   }
                 }
@@ -269,14 +277,18 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
                 throwIfAborted(signal);
                 break;
               } catch (error) {
-                failed = true;
+                attemptFailed = true;
                 if (!(error instanceof NativeTranscriptSourceChangedError) || attempt === 1) throw error;
                 throwIfAborted(signal);
                 if (sourceWitness === undefined) throw error;
                 retryFailure = error;
+                retryableFailure = error;
               } finally {
                 try { await closeSnapshot?.(); } catch (error) {
-                  if (!failed) throw error;
+                  if (retryableFailure !== undefined) {
+                    throw new AggregateError([retryableFailure, error], "Native ingest source cleanup failed", { cause: retryableFailure });
+                  }
+                  if (!attemptFailed) throw error;
                 }
               }
             }

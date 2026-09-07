@@ -149,9 +149,9 @@ vi.mock("../../../src/storage/native-transcript-ingest.js", async (importOrigina
   CODEX_NATIVE_TRANSCRIPT_FORMAT: { clientName: "codex" },
   createExactNativeTranscriptMessageResolver: () => ({}),
   createFileNativeTranscriptSource: () => ({ openSnapshot: async () => { await mocks.snapshotOpen(); return ({
-    metadata: { sizeBytes: 0, modifiedAtMs: 0, changedAtMs: 0 },
+    metadata: { sizeBytes: 2, modifiedAtMs: 0, changedAtMs: 0 },
     stream: async function* () { yield await mocks.snapshotStream(); },
-    digestPrefix: async () => "",
+    digestPrefix: async () => "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
     assertUnchanged: mocks.snapshotAssert,
     assertByteRangesUnchanged: async () => undefined,
     close: mocks.snapshotClose,
@@ -227,6 +227,75 @@ describe("ingest persistence boundaries", () => {
       dbPath: `/lcm/projects/${identity.id}/db.sqlite`,
       metaPath: `/lcm/projects/${identity.id}/meta.json`,
     }));
+  });
+
+  for (const cleanup of ["source", "quarantine", "clean"] as const) {
+    it(`handles retryable source mutation with ${cleanup} cleanup`, async () => {
+      const { NativeTranscriptSourceChangedError } = await import("../../../src/storage/native-transcript-ingest.js");
+      const primary = new NativeTranscriptSourceChangedError();
+      const cleanupFailure = new Error("synthetic cleanup failure");
+      mocks.nativeBackfill.mockRejectedValueOnce(primary);
+      if (cleanup === "source") mocks.snapshotClose.mockRejectedValueOnce(cleanupFailure);
+      // Boundary consistency control: production quarantine close currently suppresses DB close errors.
+      if (cleanup === "quarantine") mocks.closeQuarantine.mockRejectedValueOnce(cleanupFailure);
+      await createIngestHandler(config)({} as never, response, JSON.stringify({
+        session_id: "retry-cleanup", cwd: "/ok", transcript_path: "/safe",
+      }));
+      const attempts = cleanup === "clean" ? 2 : 1;
+      expect(mocks.snapshotOpen).toHaveBeenCalledTimes(attempts);
+      expect(mocks.snapshotClose).toHaveBeenCalledTimes(attempts);
+      expect(mocks.closeQuarantine).toHaveBeenCalledTimes(attempts);
+      expect(mocks.nativeBackfill).toHaveBeenCalledTimes(attempts);
+      expect(mocks.closeConnection).toHaveBeenCalledOnce();
+      if (cleanup === "clean") {
+        expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 0, totalTokens: 0 });
+        expect(mocks.logError).not.toHaveBeenCalled();
+      } else {
+        expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed", code: "INGEST_FAILED" });
+        expect(mocks.logError).toHaveBeenCalledOnce();
+        const failure = mocks.logError.mock.calls[0]![1] as AggregateError;
+        expect(failure).toBeInstanceOf(AggregateError);
+        expect(failure.errors).toEqual([primary, cleanupFailure]);
+        expect(failure.cause).toBe(primary);
+        expect(failure.message).toBe(`Native ingest ${cleanup} cleanup failed`);
+      }
+    });
+  }
+
+  for (const cleanup of ["source", "quarantine"] as const) {
+    it(`preserves terminal mutation over ${cleanup} cleanup failure`, async () => {
+      const { NativeTranscriptSourceChangedError } = await import("../../../src/storage/native-transcript-ingest.js");
+      const primary = new NativeTranscriptSourceChangedError();
+      mocks.nativeBackfill.mockRejectedValueOnce(primary).mockRejectedValueOnce(primary);
+      const close = cleanup === "source" ? mocks.snapshotClose : mocks.closeQuarantine;
+      close.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("terminal cleanup failure"));
+      await createIngestHandler(config)({} as never, response, JSON.stringify({
+        session_id: "terminal-cleanup", cwd: "/ok", transcript_path: "/safe",
+      }));
+      expect(mocks.snapshotOpen).toHaveBeenCalledTimes(2);
+      expect(mocks.snapshotClose).toHaveBeenCalledTimes(2);
+      expect(mocks.closeQuarantine).toHaveBeenCalledTimes(2);
+      expect(mocks.logError).toHaveBeenCalledExactlyOnceWith("ingest", primary, expect.anything());
+      expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed", code: "INGEST_FAILED" });
+    });
+  }
+
+  it("does not turn cancelled mutation into a quarantine cleanup retry", async () => {
+    const { NativeTranscriptSourceChangedError } = await import("../../../src/storage/native-transcript-ingest.js");
+    const controller = new AbortController();
+    mocks.nativeBackfill.mockImplementationOnce(async () => {
+      controller.abort();
+      throw new NativeTranscriptSourceChangedError();
+    });
+    mocks.closeQuarantine.mockRejectedValueOnce(new Error("cancelled cleanup failure"));
+    await createIngestHandler(config)({} as never, response, JSON.stringify({
+      session_id: "cancel-cleanup", cwd: "/ok", transcript_path: "/safe",
+    }), { signal: controller.signal });
+    expect(mocks.snapshotOpen).toHaveBeenCalledOnce();
+    expect(mocks.snapshotClose).toHaveBeenCalledOnce();
+    expect(mocks.closeQuarantine).toHaveBeenCalledOnce();
+    expect(mocks.logError).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 499, { status: "cancelled", error: "ingest cancelled" });
   });
 
   for (const boundary of ["open", "read", "stream", "parser", "scrubber", "native", "close"] as const) {

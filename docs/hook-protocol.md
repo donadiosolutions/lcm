@@ -321,7 +321,10 @@ link checks. If a fully read and validated source changes during ingestion, LCM
 makes one fresh attempt only when the original byte prefix remains identical;
 appended bytes are allowed. Shrink or rewrite of that prefix fails the request.
 Mutation before the first complete validated snapshot is available also fails
-without an internal retry. For an eligible append,
+without an internal retry. A failure closing the source or quarantine after an
+otherwise retryable source change also fails the request without retrying; the
+source-change and cleanup failures are retained together in one ingest error.
+For an eligible append,
 a stable second attempt completes without recording an ingest error. Inserted
 message and redaction counts include both attempts without duplicating committed
 messages. A source that changes again fails the request; a later hook event can
