@@ -10,6 +10,7 @@ component_management:
         # hook entrypoints, and #866 publication-converged CLI reads exclusively
         # in Unit - CLI, including export admission failures and sensitive output.
         # #1081 keeps unsupported export-format admission CLI-owned.
+        # #1088 keeps unsupported connector-list-format admission CLI-owned.
         # #978 keeps compact replacement runtime-digest admission CLI-owned.
         # #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
         - "bin/"

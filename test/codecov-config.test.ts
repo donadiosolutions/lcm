@@ -543,6 +543,7 @@ describe("Codecov configuration", () => {
     const expectedOwners = [
       // #866 export admission failures and sensitive result emission stay CLI-owned.
       // #1081 keeps unsupported export-format admission CLI-owned.
+      // #1088 keeps unsupported connector-list-format admission CLI-owned.
       // #978 keeps compact replacement runtime-digest admission CLI-owned.
       // #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
       ["bin/lcm.ts", "unit-cli"],
