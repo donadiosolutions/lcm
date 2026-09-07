@@ -166,6 +166,7 @@ component_management:
         # opened-identity fencing local-persistence-owned.
         # #1020 keeps UTC message timestamp mapping in conversation-store-owned
         # local persistence paths.
+        # #1084/#1085/#1092 keep SQLite UTC timestamp parsing in this owner.
         - "src/db/"
         - "src/storage/sqlite/"
         - "src/store/"
