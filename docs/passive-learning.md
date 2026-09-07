@@ -8,6 +8,12 @@ explicit durable rationale: agents should still call `lcm_store` immediately
 when they recognize a durable decision, preference, root cause, pattern,
 gotcha, solution, or reusable workflow.
 
+Promoted-memory `created_at` values in SQLite's space-separated form are
+interpreted as UTC for prompt-search ranking, stale-memory evaluation, restored
+project knowledge, and passive insights. This keeps those decisions consistent
+when the host is configured for a non-UTC timezone; timestamps with explicit
+offsets retain their stated offset.
+
 ## How It Works
 
 ### Event Capture

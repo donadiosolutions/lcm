@@ -10,6 +10,7 @@ import { justCompactedMap, JUST_COMPACTED_TTL_MS } from "./compact.js";
 import { fenceContent } from "../content-fence.js";
 import { validateCwd } from "../validate-cwd.js";
 import { normalizeTranscriptClient, type TranscriptClient } from "../../transcript-provider.js";
+import { parseStoredTimestamp } from "../../db/stored-timestamp.js";
 import { readBoundedRegularFile } from "../../security-files.js";
 import {
   type SessionInstructionsScope,
@@ -211,7 +212,7 @@ export function createRestoreHandler(
                   const maxAgeDays = config.restoration.restoreMaxPromotedAgeDays;
                   const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
                   const results = (await storage.lexicalSearch.searchPromoted(`project context ${cwd}`, 20))
-                    .filter((r) => !r.createdAt || Date.parse(r.createdAt) >= cutoffMs)
+                    .filter((r) => !r.createdAt || parseStoredTimestamp(r.createdAt).getTime() >= cutoffMs)
                     .slice(0, 5);
                   if (results.length > 0) {
                     promotedContext = fenceContent(
@@ -261,7 +262,7 @@ export function createRestoreHandler(
                   10,
                   ["source:passive-capture"],
                 ))
-                  .filter((r) => r.confidence >= minConfidence && (!r.createdAt || Date.parse(r.createdAt) >= cutoffMs))
+                  .filter((r) => r.confidence >= minConfidence && (!r.createdAt || parseStoredTimestamp(r.createdAt).getTime() >= cutoffMs))
                   .slice(0, 5)
                   .map((r) => ({ content: r.content, confidence: r.confidence, tags: r.tags }));
               } catch (error) {
