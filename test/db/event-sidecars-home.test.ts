@@ -49,6 +49,7 @@ vi.mock("../../src/db/diagnostic-sqlite.js", async (importOriginal) => {
 
 const projectId = "a".repeat(64);
 const otherId = "b".repeat(64);
+const thirdId = "c".repeat(64);
 
 describe("configured-home sidecar observation", () => {
   let homeDir: string;
@@ -61,6 +62,13 @@ describe("configured-home sidecar observation", () => {
     const db = new EventsDb(path);
     db.close();
   });
+
+  function addSidecar(id: string): string {
+    const sidecarPath = join(homeDir, ".lcm", "events", `${id}.db`);
+    const db = new EventsDb(sidecarPath);
+    db.close();
+    return sidecarPath;
+  }
 
   afterEach(() => {
     directoryHooks.phase = "";
@@ -259,15 +267,38 @@ describe("configured-home sidecar observation", () => {
     vi.useFakeTimers();
     const controller = new AbortController();
     const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
-    vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options) {
+    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options) {
       const result = await realOpen.call(this, path, options);
       if (kind === "abort") controller.abort();
       else vi.setSystemTime(Date.now() + 100);
       return result;
     });
+    addSidecar(otherId);
+    addSidecar(thirdId);
     const result = await collectEventSidecars({ homeDir, timeoutMs: 25, signal: controller.signal });
     expect(result[0].scanSkipped).toContain(kind === "abort" ? "cancelled" : "timeout");
+    expect(result[0].scanSkippedCount).toBe(3);
+    expect(result).toHaveLength(1);
+    expect(openSpy).toHaveBeenCalledOnce();
     expect(existsSync(path)).toBe(true);
+  });
+
+  it("retains a count of one for a single-file in-flight stop", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
+    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options) {
+      const result = await realOpen.call(this, path, options);
+      controller.abort();
+      return result;
+    });
+
+    const result = await collectEventSidecars({ homeDir, signal: controller.signal });
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ scanSkippedCount: 1 });
+    expect(result[0].scanSkipped).toContain("cancelled");
+    expect(openSpy).toHaveBeenCalledOnce();
   });
 
   it("cancels a pending health read and closes without waiting for it", async () => {
@@ -275,18 +306,45 @@ describe("configured-home sidecar observation", () => {
     const controller = new AbortController();
     const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
     let opened: LocalHookOutboxRepository | undefined;
-    vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options) {
+    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options) {
       opened = await realOpen.call(this, path, options);
       vi.spyOn(opened, "getHealthStats").mockImplementationOnce(() => new Promise(() => {}));
       return opened;
     });
+    addSidecar(otherId);
+    addSidecar(thirdId);
     const resultPromise = collectEventSidecars({ homeDir, signal: controller.signal });
     await vi.advanceTimersByTimeAsync(0);
     controller.abort(new Error("private abort"));
     const result = await resultPromise;
     expect(result[0].scanSkipped).toContain("cancelled");
+    expect(result[0].scanSkippedCount).toBe(3);
+    expect(result).toHaveLength(1);
+    expect(openSpy).toHaveBeenCalledOnce();
     await expect(opened!.getHealthStats()).rejects.toThrow();
     expect(existsSync(path)).toBe(true);
+  });
+
+  it("counts the current file and tail when a middle scan stops", async () => {
+    const controller = new AbortController();
+    addSidecar(otherId);
+    addSidecar(thirdId);
+    const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
+    let openCalls = 0;
+    vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementation(async function (path, options) {
+      const result = await realOpen.call(this, path, options);
+      openCalls++;
+      if (openCalls === 2) controller.abort();
+      return result;
+    });
+
+    const result = await collectEventSidecars({ homeDir, signal: controller.signal });
+
+    expect(result).toHaveLength(2);
+    expect(result[1]).toMatchObject({ scanSkippedCount: 2 });
+    expect(result[1].scanSkipped).toContain("cancelled");
+    expect(openCalls).toBe(2);
+    expect(result.some(({ file }) => file === `${thirdId}.db`)).toBe(false);
   });
 
   it("bounds a stalled open and closes its late result exactly once", async () => {
@@ -294,16 +352,21 @@ describe("configured-home sidecar observation", () => {
     let finishOpen!: () => void;
     let lateRepository: LocalHookOutboxRepository | undefined;
     const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
-    vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options) {
+    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options) {
       await new Promise<void>(resolve => { finishOpen = resolve; });
       lateRepository = await realOpen.call(this, path, options);
       return lateRepository;
     });
     const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close");
+    addSidecar(otherId);
+    addSidecar(thirdId);
     const resultPromise = collectEventSidecars({ homeDir, timeoutMs: 25 });
     await vi.advanceTimersByTimeAsync(25);
     const result = await resultPromise;
     expect(result[0].scanSkipped).toContain("timeout");
+    expect(result[0].scanSkippedCount).toBe(3);
+    expect(result).toHaveLength(1);
+    expect(openSpy).toHaveBeenCalledOnce();
     finishOpen();
     await vi.advanceTimersByTimeAsync(0);
     expect(close).toHaveBeenCalledOnce();

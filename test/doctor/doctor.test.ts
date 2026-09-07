@@ -1468,6 +1468,7 @@ describe("Passive Learning checks", () => {
     const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
     const scanSkipped = results.find(r => r.name === "events-sidecar-scan-skipped");
     expect(scanSkipped?.status).toBe("skip");
+    expect(scanSkipped?.message).toContain("4 sidecars skipped by scan budget");
     expect(scanSkipped?.message).toContain("--events-max-dbs all");
     expect(results.find(r => r.name === "events-sidecar-scan")).toBeUndefined();
   });
