@@ -239,9 +239,10 @@ Reconciliation journals and project-sensitive pattern files are also
 authenticated before LCM reads their contents. A journal must be a regular
 file, have exactly one hard link, and use an
 owner-only mode (`0400`, `0500`, `0600`, or `0700`). Listing selects every
-journal-shaped name and authenticates its leaf, so a directory, symlink, FIFO,
-hard link, or otherwise unsafe journal stops the listing rather than producing
-an incomplete view. The listing-root absence prefilter remains a separate
+journal-shaped name and authenticates each leaf that remains present, so a
+directory, symlink, FIFO, hard link, or otherwise unsafe present journal stops
+the listing. An entry that disappears after directory enumeration is omitted.
+The listing-root absence prefilter remains a separate
 limitation tracked by [#1178](https://github.com/donadiosolutions/lcm/issues/1178).
 Pattern files that LCM reads must be regular files with exactly one hard link.
 Reconciliation refuses a present non-regular source `sensitive-patterns.txt`

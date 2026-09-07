@@ -156,6 +156,32 @@ describe("private filesystem primitives", () => {
     }
   });
 
+  it("refuses a temporary inode substituted during opt-in replacement validation", () => {
+    const root = makeRoot();
+    chmodSync(root, 0o700);
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const nonce = Buffer.alloc(12, 0xab);
+    const tempPath = join(root, `.metadata.json.${nonce.toString("hex")}.tmp`);
+    const displacedTempPath = `${tempPath}.displaced`;
+    writeFileSync(target, "preserve", { mode: 0o600 });
+    try {
+      expect(() => atomicWritePrivateFile(target, "replacement", {
+        random: () => nonce,
+      }, parent, {
+        beforeReplace: () => {
+          renameSync(tempPath, displacedTempPath);
+          writeFileSync(tempPath, "substituted temporary evidence", { mode: 0o600 });
+        },
+      })).toThrow("private temporary file topology is not trusted");
+      expect(readFileSync(target, "utf8")).toBe("preserve");
+      expect(readFileSync(tempPath, "utf8")).toBe("substituted temporary evidence");
+      expect(readFileSync(displacedTempPath, "utf8")).toBe("replacement");
+    } finally {
+      parent.close();
+    }
+  });
+
   it("publishes an absent destination exclusively through a retained parent", () => {
     const root = makeRoot();
     const parent = openPrivateDirectory(root);

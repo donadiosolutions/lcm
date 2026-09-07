@@ -1155,7 +1155,10 @@ export function atomicWritePrivateFile(
     // Portable rename cannot provide descriptor-relative compare-and-swap.
     // Callers with a destination policy can revalidate at the last boundary
     // after temp preparation without changing the generic writer's default.
-    options.beforeReplace?.();
+    if (options.beforeReplace !== undefined) {
+      options.beforeReplace();
+      assertPrivateTemporaryFileIdentity(tempPath, preparedIdentity);
+    }
     try {
       (operations.rename ?? renameSync)(tempPath, path);
     } catch (error) {
