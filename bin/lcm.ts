@@ -42,6 +42,7 @@ import {
 } from "../src/runtime-paths.js";
 import type { ProgressState } from "../src/cli/progress-state.js";
 import { StorageBackendUnavailableError } from "../src/storage/backend.js";
+import { PrivateMutationLockContentionError } from "../src/private-mutation-lock.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
 import { BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC } from "../src/hooks/publication-fence.js";
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
@@ -77,6 +78,7 @@ import type {
 } from "../src/storage/postgresql/passive-event-repository.js";
 import { CONNECTOR_TRANSPORTS } from "../src/connectors/types.js";
 import { createAbortError, isAbortError, throwIfAborted } from "../src/daemon/cancellation.js";
+import { SUPERVISOR_DAEMON_TEMP_CREATION_WARNING } from "../src/daemon/supervisor.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -732,6 +734,7 @@ export async function cancelAndDrainCompactInvocation(
   }
 
   let restartDeadline: number | undefined;
+  let replacementProofDiagnostic: string | undefined;
   const boundedRestart = async <T>(
     operation: (signal: AbortSignal) => Promise<T>,
   ): Promise<BoundedResult<T>> => {
@@ -764,15 +767,27 @@ export async function cancelAndDrainCompactInvocation(
     if (!oldGone || !providersGone) return false;
     const replacementResult = await boundedRestart(signal => health(options.createFreshClient(), { signal }));
     const replacement = replacementResult.value;
-    replacementVerified = replacementResult.settled
+    const replacementIdentityWithoutRuntime = replacementResult.settled
       && replacementResult.error === undefined
       && replacement !== null
       && replacement !== undefined
       && replacement.daemonInstanceId !== undefined
       && replacement.daemonInstanceId !== options.originalHealth?.daemonInstanceId
-      && (options.expectedRuntimeDigest === undefined || replacement.runtimeDigest === options.expectedRuntimeDigest)
       && (options.expectedStorageBackend === undefined || replacement.storageBackend === options.expectedStorageBackend)
       && (replacement.status === "ok" || replacement.status === "healthy");
+    const expectedRuntimeDigest = options.expectedRuntimeDigest;
+    const expectedRuntimeDigestAvailable = typeof expectedRuntimeDigest === "string"
+      && expectedRuntimeDigest.length > 0;
+    if (replacementIdentityWithoutRuntime) {
+      if (!expectedRuntimeDigestAvailable) {
+        replacementProofDiagnostic = "expected runtime digest is unavailable; cannot verify replacement identity";
+      } else if (replacement.runtimeDigest !== expectedRuntimeDigest) {
+        replacementProofDiagnostic = "replacement daemon runtime digest does not match the invoking CLI";
+      }
+    }
+    replacementVerified = replacementIdentityWithoutRuntime
+      && expectedRuntimeDigestAvailable
+      && replacement.runtimeDigest === expectedRuntimeDigest;
     return replacementVerified;
   };
 
@@ -780,6 +795,7 @@ export async function cancelAndDrainCompactInvocation(
     restartAttempted = true;
     if (session.restart !== undefined) {
       if (await proveReplacement(session.restart)) daemonZero = true;
+      else if (replacementProofDiagnostic !== undefined) diagnostic = replacementProofDiagnostic;
     } else if (session.restartPromise !== undefined) {
       const pendingRestart = await boundedRestart(async () => await session.restartPromise!);
       if (pendingRestart.settled
@@ -788,6 +804,7 @@ export async function cancelAndDrainCompactInvocation(
         session.restart = pendingRestart.value;
         session.restartPromise = undefined;
         if (await proveReplacement(pendingRestart.value)) daemonZero = true;
+        else if (replacementProofDiagnostic !== undefined) diagnostic = replacementProofDiagnostic;
       } else if (pendingRestart.settled) {
         // A terminally failed attempt no longer owns restart admission. Permit
         // a later drain iteration to start one fresh managed restart.
@@ -824,7 +841,9 @@ export async function cancelAndDrainCompactInvocation(
       }
       if (await proveReplacement(restart)) daemonZero = true;
       if (!replacementVerified) {
-        diagnostic = restart.warning ?? "managed daemon restart did not prove replacement identity";
+        diagnostic = replacementProofDiagnostic
+          ?? restart.warning
+          ?? "managed daemon restart did not prove replacement identity";
       }
     } catch (error) {
       diagnostic = error instanceof Error ? error.message : "managed daemon restart was not verified";
@@ -1183,31 +1202,69 @@ function resolveCustomHelpRequest(cliArgv: string[]): CustomHelpRequest | undefi
   return { command };
 }
 
+type PublicationAdmissionRunner = <T>(run: () => T | Promise<T>) => Promise<T>;
+
+function isNestedUnderRoot(actionCommand: Command, parentName: string, actionName?: string): boolean {
+  const parent = actionCommand.parent;
+  return parent?.name() === parentName
+    && parent.parent?.name() === "lcm"
+    && (actionName === undefined || actionCommand.name() === actionName);
+}
+
 function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   const action = actionCommand.name();
   const topLevel = actionCommand.parent?.name() === "lcm";
-  if (topLevel && (action === "search" || action === "grep" || action === "describe" || action === "expand")) return false;
+  if (topLevel && (
+    action === "search"
+    || action === "grep"
+    || action === "describe"
+    || action === "expand"
+  )) return false;
   if (topLevel && action === "post-tool") return false;
   if (topLevel && action === "status") return false;
-  if (topLevel && action === "stats") return actionCommand.opts<Record<string, unknown>>().pool !== true;
+  if (topLevel && (action === "stats" || action === "doctor")) return false;
   if (topLevel && (action === "diagnose" || action === "help")) return false;
   if ((action === "list" || action === "doctor") && actionCommand.parent?.name() === "connectors") return false;
   if (topLevel && ["daemon", "config", "machine", "project", "postgres", "events", "connectors"].includes(action)) return false;
   return true;
 }
 
-type DaemonClientProvider = (options?: { readonly preflightStorage?: boolean }) => Promise<DaemonClient>;
+function shouldUsePublicationConvergence(actionCommand: Command): boolean {
+  const action = actionCommand.name();
+  const topLevel = actionCommand.parent?.name() === "lcm";
+  if (topLevel && action === "install") return true;
+  if (topLevel && action === "export") return true;
+  if (isNestedUnderRoot(actionCommand, "machine", "show")) return true;
+  if (isNestedUnderRoot(actionCommand, "project", "list")
+    || isNestedUnderRoot(actionCommand, "project", "show")) return true;
+  if (isNestedUnderRoot(actionCommand, "config", "get")) return true;
+  if (isNestedUnderRoot(actionCommand, "events", "status")
+    || isNestedUnderRoot(actionCommand, "events", "validate")
+    || isNestedUnderRoot(actionCommand, "events", "quarantine")) return true;
+  if (topLevel && action === "sensitive") {
+    const processed = actionCommand.processedArgs[0] as unknown;
+    return Array.isArray(processed) && (processed[0] === "list" || processed[0] === "test");
+  }
+  return false;
+}
+
+type DaemonClientOptions = {
+  readonly rootBootstrapComplete?: boolean;
+  readonly diagnosticOnly?: boolean;
+};
+
+type DaemonClientProvider = (options?: DaemonClientOptions) => Promise<DaemonClient>;
 
 export function registerMemoryCommands(
   program: Command,
-  readClient: DaemonClientProvider = createDaemonClientOrExit,
+  daemonClient: DaemonClientProvider = createDaemonClientOrExit,
 ): void {
   program
     .command("search <query>")
     .description("Search memory across episodic and promoted layers")
     .option("--limit <n>", "Max results per layer", "5")
     .option("--layer <name>", "Layer to search: episodic or promoted (repeatable)", collectRepeatedOption, [])
-    .option("--tag <tag>", "Require a tag on matching entries (repeatable)", collectRepeatedOption, [])
+    .option("--tag <tag>", "Filter promoted entries by all specified tags; episodic history remains unfiltered (repeatable)", collectRepeatedOption, [])
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (query: string, opts) => {
@@ -1215,7 +1272,7 @@ export function registerMemoryCommands(
       const tags = normalizeStringList(opts.tag) ?? [];
       ensureAllowedValues(layers, ["episodic", "promoted"], "--layer");
 
-      const client = await readClient();
+      const client = await daemonClient();
       const result = await client.post("/search", {
         cwd: process.cwd(),
         query,
@@ -1231,20 +1288,20 @@ export function registerMemoryCommands(
     .description("Search raw messages and summaries by keyword or regex")
     .option("--mode <mode>", "Search mode: full_text or regex", "full_text")
     .option("--scope <scope>", "Scope: messages, summaries, or both", "both")
-    .option("--since <iso>", "Only include matches on or after this ISO timestamp")
+    .option("--since <iso>", "Inclusive lower bound: YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm); invalid values return HTTP 400")
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (query: string, opts) => {
       const mode = ensureAllowedValue(opts.mode, ["full_text", "regex"], "--mode");
       const scope = ensureAllowedValue(opts.scope, ["messages", "summaries", "both"], "--scope");
 
-      const client = await readClient();
+      const client = await daemonClient();
       const result = await client.post("/grep", {
         cwd: process.cwd(),
         query,
         mode,
         scope,
-        since: typeof opts.since === "string" && opts.since.length > 0 ? opts.since : undefined,
+        since: typeof opts.since === "string" ? opts.since : undefined,
       });
       printJson(result);
     });
@@ -1260,7 +1317,7 @@ export function registerMemoryCommands(
         printHelp("describe"); exit(0);
       }
 
-      const client = await readClient();
+      const client = await daemonClient();
       const result = await client.post("/describe", { cwd: process.cwd(), nodeId });
       printJson(result);
     });
@@ -1277,7 +1334,7 @@ export function registerMemoryCommands(
         printHelp("expand"); exit(0);
       }
 
-      const client = await readClient();
+      const client = await daemonClient();
       const result = await client.post("/expand", {
         cwd: process.cwd(),
         nodeId,
@@ -1303,7 +1360,7 @@ export function registerMemoryCommands(
         printHelp("store"); exit(0);
       }
 
-      const client = await createDaemonClientOrExit();
+      const client = await daemonClient({ rootBootstrapComplete: true });
       const result = await client.post("/store", {
         cwd: process.cwd(),
         text,
@@ -1442,7 +1499,10 @@ function serializableCoordinationDiagnostics(
   };
 }
 
-export function registerProjectCommand(program: Command): void {
+export function registerProjectCommand(
+  program: Command,
+  publicationRetry?: PublicationAdmissionRunner,
+): void {
   type ProjectOptions = {
     help?: boolean;
     json?: boolean;
@@ -1522,7 +1582,8 @@ export function registerProjectCommand(program: Command): void {
       }
       try {
         const { listProjects } = await import("../src/identity-service.js");
-        const result = await listProjects(await loadIdentityStorageConfig());
+        const read = async () => listProjects(await loadIdentityStorageConfig());
+        const result = publicationRetry === undefined ? await read() : await publicationRetry(read);
         if (opts.json) {
           printJson(result);
           return;
@@ -1562,7 +1623,8 @@ export function registerProjectCommand(program: Command): void {
       }
       try {
         const { showProject } = await import("../src/identity-service.js");
-        const shown = await showProject(await loadIdentityStorageConfig(), target);
+        const read = async () => showProject(await loadIdentityStorageConfig(), target);
+        const shown = publicationRetry === undefined ? await read() : await publicationRetry(read);
         if (opts.json) {
           printJson(shown);
           return;
@@ -1924,6 +1986,7 @@ export function writeCliError(value: string): void {
 type LifecycleResultWithRefusal = Readonly<{
   connected?: boolean;
   refusalReason?: unknown;
+  warning?: unknown;
 }>;
 
 function daemonRefusalReason(
@@ -1948,7 +2011,10 @@ function daemonUnavailableMessage(
   result: LifecycleResultWithRefusal | undefined,
   fallback: DaemonRefusalReason,
 ): string {
-  return mapDaemonRefusalToRemediation(daemonRefusalReason(result, fallback)).message;
+  const message = mapDaemonRefusalToRemediation(daemonRefusalReason(result, fallback)).message;
+  return result?.warning === SUPERVISOR_DAEMON_TEMP_CREATION_WARNING
+    ? `${message} ${SUPERVISOR_DAEMON_TEMP_CREATION_WARNING}`
+    : message;
 }
 
 function clearDaemonRemediationMarker(): void {
@@ -1961,16 +2027,14 @@ type DaemonClientWithConfig = Readonly<{
   health?: DaemonHealth;
 }>;
 
-async function createDaemonClientOrExitWithConfig(
-  options: { readonly preflightStorage?: boolean } = {},
-): Promise<DaemonClientWithConfig> {
+async function createDaemonClientOrExitWithConfig(): Promise<DaemonClientWithConfig> {
   const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
   const { loadDaemonConfig } = await import("../src/daemon/config.js");
   const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
 
   const configFile = defaultConfigPath();
   const config = loadDaemonConfig(configFile);
-  if (options.preflightStorage !== false) selectStorageBackendForConfig(configFile, config.storage);
+  selectStorageBackendForConfig(configFile, config.storage);
   const port = config.daemon?.port ?? 3737;
   const pidFilePath = daemonPidPath();
   const tokenPath = daemonTokenPath();
@@ -2000,15 +2064,13 @@ async function createDaemonClientOrExitWithConfig(
   };
 }
 
-async function createDaemonClientOrExit(
-  options: { readonly preflightStorage?: boolean } = {},
-): Promise<DaemonClient> {
-  return (await createDaemonClientOrExitWithConfig(options)).client;
+async function createDaemonClientOrExit(): Promise<DaemonClient> {
+  return (await createDaemonClientOrExitWithConfig()).client;
 }
 
 async function createDaemonReadClientOrExit(
   preflightSeams?: RootBootstrapRetrySeams,
-  options: { readonly preflightStorage?: boolean } = {},
+  options: DaemonClientOptions = {},
 ): Promise<DaemonClientWithConfig> {
   const configPath = defaultConfigPath();
   try {
@@ -2019,7 +2081,7 @@ async function createDaemonReadClientOrExit(
     if (typeof token === "string" && token.length > 0) {
       const port = first.config.daemon.port;
       const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
-      const health = await client.health();
+      const health = await client.health(options.diagnosticOnly ? { timeoutMs: 2000 } : undefined);
       if (
         (health?.status === "ok" || health?.status === "healthy")
         && typeof PKG_VERSION === "string"
@@ -2052,12 +2114,16 @@ async function createDaemonReadClientOrExit(
     // existing authenticated migration and lifecycle path below.
   }
 
-  await migrateLegacyHomeWithRetry({
-    migrate: preflightSeams?.migrate ?? migrateLegacyHomeIfNeeded,
-    sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
-    attempt: preflightSeams?.attempt,
-  });
-  return createDaemonClientOrExitWithConfig(options);
+  if (options.diagnosticOnly) throw new Error("Daemon identity could not be verified; run lcm daemon status.");
+
+  if (options.rootBootstrapComplete !== true) {
+    await migrateLegacyHomeWithRetry({
+      migrate: preflightSeams?.migrate ?? migrateLegacyHomeIfNeeded,
+      sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
+      attempt: preflightSeams?.attempt,
+    });
+  }
+  return createDaemonClientOrExitWithConfig();
 }
 
 /** @internal CLI entry seam; defaults preserve the published executable behavior. */
@@ -2086,6 +2152,12 @@ export async function runCli(
   const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
 
   const program = new Command();
+  let publicationConvergence: import("../src/storage/publication-convergence.js").PublicationConvergence | undefined;
+  let publicationAdmissionRetry: PublicationAdmissionRunner | undefined;
+  const runWithPublicationRetry: PublicationAdmissionRunner = async <T>(run: () => T | Promise<T>) =>
+    publicationAdmissionRetry === undefined
+      ? await run()
+      : await publicationAdmissionRetry(run);
   program
     .name("lcm")
     .description("Long Context Manager for coding agents")
@@ -2263,11 +2335,12 @@ export async function runCli(
       if (opts.help) await withCustomHelp(configCmd, "config");
       try {
         const { formatConfigValue, getConfigValue } = await import("../src/config-manager.js");
-        console.log(formatConfigValue(getConfigValue({
+        const text = await runWithPublicationRetry(() => formatConfigValue(getConfigValue({
           configPath: defaultConfigPath(),
           path,
           effective: opts.effective ?? false,
         })));
+        console.log(text);
       } catch (error) {
         console.error(error instanceof Error ? error.message : "Unable to read configuration");
         exit(1);
@@ -2840,7 +2913,7 @@ export async function runCli(
         await install(new DryRunServiceDeps());
         console.log("\n  No changes written.");
       } else {
-        await install();
+        await install(undefined, publicationConvergence);
       }
     });
 
@@ -2877,70 +2950,50 @@ export async function runCli(
         printHelp("status"); exit(0);
       }
       const jsonFlag: boolean = opts.json ?? false;
-      const readClient = await createDaemonReadClientOrExit(preflightSeams, { preflightStorage: false });
-      const { client, config } = readClient;
-
-      let daemonStatus = "down";
-      let statusData: any = null;
-
+      const { collectStats, StatsUnavailableError } = await import("../src/stats.js");
+      const { backendDiagnosticFailure } = await import("../src/storage/diagnostics.js");
+      const { renderBackendDiagnostics } = await import("../src/storage/diagnostic-renderer.js");
+      let observedDaemon: { status: string; version?: string; uptime?: number; port?: number } = { status: "down" };
+      let diagnosticSource: "daemon" | "local" = "local";
+      let statusData: {
+        daemon: { status?: string; version?: string; uptime?: number; port?: number };
+        project?: { messageCount: number; summaryCount: number; promotedCount: number };
+        backendDiagnostics?: import("../src/storage/diagnostics.js").BackendDiagnosticSnapshot;
+      };
       try {
-        const health = readClient.health ?? await client.health();
-        daemonStatus = (["down", "up"] as const)[Number(Boolean(health))]!;
-        const daemonHealth = health as DaemonHealth | null;
-        if (daemonHealth?.status === "unavailable") {
-          statusData = {
-            daemon: {
-              status: "up",
-              version: daemonHealth.version,
-              uptime: daemonHealth.uptime,
-              port: config.daemon.port,
-              storageBackend: daemonHealth.storageBackend,
-              storageStatus: "unavailable",
-            },
-          };
+        const { client, health, config } = await createDaemonReadClientOrExit(preflightSeams, { diagnosticOnly: true });
+        // Diagnostic-only admission returns only after authenticated health and
+        // runtime identity match. A later backend refusal cannot erase that fact.
+        observedDaemon = { status: "up", version: health!.version, uptime: health!.uptime, port: config.daemon.port };
+        statusData = await client.post("/status", { cwd: process.cwd() }, { timeoutMs: 2000 });
+        statusData.daemon.status = "up";
+        diagnosticSource = "daemon";
+      } catch {
+        try {
+          const stats = await collectStats({ cwd: process.cwd() });
+          statusData = { daemon: observedDaemon, backendDiagnostics: stats.backendDiagnostics,
+            project: { messageCount: stats.messages, summaryCount: stats.summaries, promotedCount: stats.promotedCount } };
+        } catch (error) {
+          statusData = { daemon: observedDaemon, backendDiagnostics: error instanceof StatsUnavailableError
+            ? error.diagnostics : backendDiagnosticFailure(error) };
         }
-
-        // Also fetch /status endpoint if daemon is up
-        if (daemonStatus === "up" && !statusData) {
-          statusData = await client.post("/status", { cwd: process.cwd() });
-        }
-      } catch {}
-
-      if (jsonFlag) {
-        const result = {
-          daemon: daemonStatus === "up" ? statusData?.daemon : { status: "down" },
-          project: statusData?.project,
-        };
-        stdout.write(JSON.stringify(result, null, 2) + "\n");
-      } else {
-        const provider = config.llm?.provider ?? "unknown";
-        const providerDisplay = provider === "auto"
-          ? "auto (Claude->claude-process, Codex->codex-process)"
-          : provider;
-
-        if (statusData) {
-          console.log(`Daemon: ${daemonStatus}`);
-          console.log(`  Version: ${statusData.daemon.version}`);
-          console.log(`  Uptime: ${statusData.daemon.uptime}s`);
-          console.log(`  Port: ${statusData.daemon.port}`);
-          console.log(`  Provider: ${providerDisplay}`);
-          if (statusData.daemon.storageBackend) {
-            console.log(
-              `  Storage: ${statusData.daemon.storageBackend} (${statusData.daemon.storageStatus})`,
-            );
-          }
-          if (statusData.project) {
-            console.log();
-            console.log("Project:");
-            console.log(`  Messages: ${statusData.project.messageCount}`);
-            console.log(`  Summaries: ${statusData.project.summaryCount}`);
-            console.log(`  Promoted: ${statusData.project.promotedCount}`);
-            if (statusData.project.lastIngest) console.log(`  Last Ingest: ${statusData.project.lastIngest}`);
-            if (statusData.project.lastCompact) console.log(`  Last Compact: ${statusData.project.lastCompact}`);
-            if (statusData.project.lastPromote) console.log(`  Last Promote: ${statusData.project.lastPromote}`);
-          }
-        } else {
-          console.log(`daemon: ${daemonStatus} · provider: ${providerDisplay}`);
+      }
+      if (jsonFlag) stdout.write(JSON.stringify({ ...statusData, diagnosticSource }, null, 2) + "\n");
+      else {
+        console.log(`Daemon: ${statusData.daemon.status}`);
+        console.log(diagnosticSource === "daemon"
+          ? "Diagnostics source: daemon response."
+          : observedDaemon.status === "up"
+            ? "Diagnostics source: local observation after daemon status request failed."
+            : "Diagnostics source: local observation.");
+        if (statusData.daemon.version) console.log(`  Version: ${statusData.daemon.version}`);
+        if (statusData.daemon.uptime !== undefined) console.log(`  Uptime: ${statusData.daemon.uptime}s`);
+        if (statusData.daemon.port !== undefined) console.log(`  Port: ${statusData.daemon.port}`);
+        if (statusData.backendDiagnostics) console.log(renderBackendDiagnostics(statusData.backendDiagnostics));
+        if (statusData.project) {
+          console.log(`Messages: ${statusData.project.messageCount}`);
+          console.log(`Summaries: ${statusData.project.summaryCount}`);
+          console.log(`Promoted: ${statusData.project.promotedCount}`);
         }
       }
     });
@@ -2951,7 +3004,7 @@ export async function runCli(
     .description("Show memory inventory and compression ratios")
     .option("-v, --verbose", "Show per-conversation breakdown")
     .option("--pool", "Show connection pool statistics from the daemon")
-    .option("--json", "Output structured JSON (use with --pool)")
+    .option("--json", "Output structured JSON")
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
@@ -2960,57 +3013,38 @@ export async function runCli(
         printHelp("stats"); exit(0);
       }
 
+      const { renderBackendDiagnostics } = await import("../src/storage/diagnostic-renderer.js");
       if (opts.pool) {
-        const jsonFlag: boolean = opts.json ?? false;
-        const { client } = await createDaemonReadClientOrExit(preflightSeams);
-
-        let poolData: any = null;
+        const { collectStats, StatsUnavailableError } = await import("../src/stats.js");
+        const { backendDiagnosticFailure } = await import("../src/storage/diagnostics.js");
+        let backendDiagnostics: import("../src/storage/diagnostics.js").BackendDiagnosticSnapshot;
         try {
-          poolData = await client.get("/stats/pool");
-        } catch (err) {
-          console.error(`Error: ${err instanceof Error ? err.message : "could not load pool stats"}`);
-          exit(1);
+          const { client } = await createDaemonReadClientOrExit(preflightSeams, { diagnosticOnly: true });
+          const response = await client.get<{ backendDiagnostics: typeof backendDiagnostics }>("/stats/pool", { timeoutMs: 2000 });
+          backendDiagnostics = response.backendDiagnostics;
+        } catch {
+          try { backendDiagnostics = (await collectStats()).backendDiagnostics; }
+          catch (error) { backendDiagnostics = error instanceof StatsUnavailableError
+            ? error.diagnostics : backendDiagnosticFailure(error); }
         }
-
-        if (jsonFlag) {
-          stdout.write(JSON.stringify(poolData, null, 2) + "\n");
-        } else {
-          const dim = "\x1b[2m";
-          const cyan = "\x1b[36m";
-          const bold = "\x1b[1m";
-          const reset = "\x1b[0m";
-          console.log();
-          console.log(`    ${bold}${cyan}🔌 Connection Pool${reset}`);
-          console.log();
-          const rows: [string, string][] = [
-            ["Total", String(poolData.totalConnections)],
-            ["Active", String(poolData.activeConnections)],
-            ["Idle", String(poolData.idleConnections)],
-          ];
-          const labelWidth = Math.max(...rows.map(([l]) => l.length));
-          for (const [label, value] of rows) {
-            console.log(`    ${dim}${label.padEnd(labelWidth)}${reset}  ${value}`);
-          }
-          if (poolData.connections && poolData.connections.length > 0) {
-            console.log();
-            console.log(`    ${dim}Connections:${reset}`);
-            for (const conn of poolData.connections) {
-              const status = conn.status === "active" ? `${cyan}active${reset}` : `${dim}idle${reset}`;
-              console.log(`    ${dim}refs=${conn.refs}${reset}  ${status}  ${conn.path}`);
-            }
-          }
-          console.log();
-        }
+        if (opts.json) stdout.write(JSON.stringify({ backendDiagnostics }, null, 2) + "\n");
+        else console.log(renderBackendDiagnostics(backendDiagnostics));
         return;
       }
 
       const verbose: boolean = opts.verbose ?? false;
-      const { loadDaemonConfig } = await import("../src/daemon/config.js");
-      const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
-      const configFile = defaultConfigPath();
-      selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
-      const { collectStats, printStats } = await import("../src/stats.js");
-      printStats(await collectStats(), verbose);
+      const { collectStats, printStats, StatsUnavailableError } = await import("../src/stats.js");
+      const { backendDiagnosticFailure } = await import("../src/storage/diagnostics.js");
+      try {
+        const stats = await collectStats();
+        if (opts.json) stdout.write(JSON.stringify(stats, null, 2) + "\n");
+        else printStats(stats, verbose);
+      } catch (error) {
+        const diagnostics = error instanceof StatsUnavailableError ? error.diagnostics : backendDiagnosticFailure(error);
+        if (opts.json) stdout.write(JSON.stringify({ backendDiagnostics: diagnostics }, null, 2) + "\n");
+        else console.log(renderBackendDiagnostics(diagnostics));
+        exit(1);
+      }
     });
 
   // ─── doctor ────────────────────────────────────────────────────────────────
@@ -3104,10 +3138,10 @@ export async function runCli(
       }
       const jsonFlag: boolean = opts.json ?? false;
       try {
-        const output = await withPassiveEventOperatorSession(async ({ local, remote }) => ({
+        const output = await runWithPublicationRetry(() => withPassiveEventOperatorSession(async ({ local, remote }) => ({
           local: await local.getDeliveryDiagnostics(),
           remote: serializableCoordinationDiagnostics(await remote.getDiagnostics()),
-        }));
+        })));
         if (jsonFlag) {
           printJson(output);
           return;
@@ -3146,7 +3180,7 @@ export async function runCli(
       try {
         const limit = parsePositiveInteger(String(opts.limit), "--limit");
         if (limit > 500) throw new Error("--limit must not exceed 500");
-        const output = await withPassiveEventOperatorSession(async ({ local, remote }) => {
+        const output = await runWithPublicationRetry(() => withPassiveEventOperatorSession(async ({ local, remote }) => {
           const events = await local.listAwaitingRemote(limit, true);
           const records = events.length === 0
             ? []
@@ -3168,7 +3202,7 @@ export async function runCli(
             }
           }
           return { checked: events.length, matched, missing, mismatched };
-        });
+        }));
         if (jsonFlag) {
           printJson(output);
         } else {
@@ -3202,10 +3236,10 @@ export async function runCli(
       try {
         const limit = parsePositiveInteger(String(opts.limit), "--limit");
         if (limit > 500) throw new Error("--limit must not exceed 500");
-        const output = await withPassiveEventOperatorSession(async ({ local, remote }) => ({
+        const output = await runWithPublicationRetry(() => withPassiveEventOperatorSession(async ({ local, remote }) => ({
           local: await local.listQuarantined(limit),
           remote: (await remote.listQuarantined(limit)).map(serializablePassiveEvent),
-        }));
+        })));
         if (jsonFlag) {
           printJson(output);
           return;
@@ -3292,7 +3326,7 @@ export async function runCli(
   program.addCommand(eventsCmd);
 
   registerMachineCommand(program);
-  registerProjectCommand(program);
+  registerProjectCommand(program, runWithPublicationRetry);
   registerPostgreSqlCommand(program);
   registerMemoryCommands(
     program,
@@ -3607,7 +3641,10 @@ export async function runCli(
       const { join } = await import("node:path");
       const { homedir } = await import("node:os");
       const configPath = defaultConfigPath();
-      const r = await handleSensitive(args, process.cwd(), configPath);
+      const readSensitive = args[0] === "list" || args[0] === "test";
+      const r = await (readSensitive
+        ? runWithPublicationRetry(() => handleSensitive(args, process.cwd(), configPath))
+        : handleSensitive(args, process.cwd(), configPath));
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });
@@ -3864,7 +3901,7 @@ export async function runCli(
     .option("--tags <tags>", "Only export entries matching these comma-separated tags")
     .option("--since <date>", "Only export entries created on or after this ISO date (e.g. 2026-01-01)")
     .option("--output <file>", "Write output to file instead of stdout")
-    .option("--format <format>", "Output format: json (default)", "json")
+    .option("--format <format>", "Output format: json only (default)", "json")
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
@@ -3873,10 +3910,18 @@ export async function runCli(
         printHelp("export"); exit(0);
       }
 
+      const format = opts.format ?? "json";
+      if (format !== "json") {
+        console.error("Invalid --format: only json is supported.");
+        exit(1);
+      }
+
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
       const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
       const configFile = defaultConfigPath();
-      selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
+      await runWithPublicationRetry(() => {
+        selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
+      });
       const { exportKnowledge } = await import("../src/portable-knowledge.js");
       const { homedir } = await import("node:os");
       const { join } = await import("node:path");
@@ -3908,9 +3953,10 @@ export async function runCli(
         const reconciled = new Map<string, string>();
         for (const candidate of candidates) {
           try {
-            const result = reconcileWorktrees(candidate);
+            const result = await runWithPublicationRetry(() => reconcileWorktrees(candidate));
             reconciled.set(result.targetHash, result.canonical);
           } catch (err) {
+            if (err instanceof PrivateMutationLockContentionError || err instanceof BackendPublicationJournalError) throw err;
             const message = err instanceof Error ? err.message : String(err);
             process.stderr.write(`  Warning: could not reconcile ${candidate}: ${message}\n`);
           }
@@ -3929,7 +3975,13 @@ export async function runCli(
           outFile = join(process.cwd(), `lcm-export-${slug}.json`);
         }
         try {
-          const result = await exportKnowledge(cwd, { tags, since, output: outFile });
+          const exportOptions = {
+            tags,
+            since,
+            output: outFile,
+            ...(publicationConvergence === undefined ? {} : { _publicationConvergence: publicationConvergence }),
+          };
+          const result = await exportKnowledge(cwd, exportOptions);
           total += result.exported;
           if (all) {
             console.log(`  ${cwd}: ${result.exported} entries → ${outFile}`);
@@ -3937,6 +3989,7 @@ export async function runCli(
             console.log(`  Exported ${result.exported} entries to ${outFile}`);
           }
         } catch (err: any) {
+          if (err instanceof PrivateMutationLockContentionError || err instanceof BackendPublicationJournalError) throw err;
           process.stderr.write(`  Warning: ${err.message}\n`);
         }
       }
@@ -4020,6 +4073,20 @@ export async function runCli(
 
   program.hook("preAction", async (_thisCommand, actionCommand) => {
     if (!shouldRunRootBootstrapMigration(actionCommand)) return;
+    const action = actionCommand.name();
+    const usePublicationConvergence = shouldUsePublicationConvergence(actionCommand);
+    if (usePublicationConvergence) {
+      const { createInstallerPublicationConvergence } = await import("../installer/install.js");
+      publicationConvergence ??= await createInstallerPublicationConvergence();
+      const { withPublicationAdmissionRetry } = await import("../src/storage/publication-convergence.js");
+      publicationAdmissionRetry = (run) => withPublicationAdmissionRetry(run, publicationConvergence);
+      await withPublicationAdmissionRetry(() => migrateLegacyHomeWithRetry({
+        migrate,
+        sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
+        attempt: preflightSeams?.attempt,
+      }), publicationConvergence);
+      return;
+    }
     await migrateLegacyHomeWithRetry({
       migrate,
       sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
@@ -4055,6 +4122,7 @@ export function handleCliError(err: unknown): never {
       : err instanceof ConfigValidationError
       || err instanceof StorageBackendUnavailableError
       || err instanceof BootstrapLockContentionError
+      || err instanceof PrivateMutationLockContentionError
       ? err.message
       : err,
   );

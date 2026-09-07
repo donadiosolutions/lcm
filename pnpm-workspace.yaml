@@ -1,0 +1,11 @@
+packages:
+  - '.'
+
+overrides:
+  ajv>fast-uri: 3.1.7
+  qs: 6.16.0
+  read-yaml-file: 2.1.0
+
+onlyBuiltDependencies:
+  - esbuild
+  - fsevents

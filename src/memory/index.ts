@@ -1,12 +1,16 @@
 import { DaemonClient } from "../daemon/client.js";
+import type { SearchLayerInput } from "../retrieval.js";
 
-export type SearchResult = { episodic: any[]; semantic: any[] };
+export type SearchResult = {
+  episodic: any[];
+  promoted: any[];
+};
 
 export type MemoryApi = {
   store: (text: string, tags: string[], metadata?: Record<string, unknown>) => Promise<void>;
-  search: (query: string, options?: { limit?: number; threshold?: number; projectId?: string; layers?: ("episodic" | "semantic")[] }) => Promise<SearchResult>;
-  compact: (sessionId: string, transcriptPath: string) => Promise<{ summary: string }>;
-  recent: (projectId: string, limit?: number) => Promise<{ summaries: any[] }>;
+  search: (query: string, options?: { limit?: number; threshold?: number; projectId?: string; layers?: SearchLayerInput[]; cwd?: string; tags?: string[] }) => Promise<SearchResult>;
+  compact: (sessionId: string, transcriptPath: string, cwd?: string) => Promise<{ summary: string }>;
+  recent: (cwd: string, limit?: number) => Promise<{ summaries: any[] }>;
 };
 
 export function createMemoryApi(client: DaemonClient): MemoryApi {
@@ -17,11 +21,11 @@ export function createMemoryApi(client: DaemonClient): MemoryApi {
     async search(query, options) {
       return client.post<SearchResult>("/search", { query, ...options });
     },
-    async compact(sessionId, transcriptPath) {
-      return client.post("/compact", { session_id: sessionId, transcript_path: transcriptPath });
+    async compact(sessionId, transcriptPath, cwd = process.cwd()) {
+      return client.post("/compact", { session_id: sessionId, transcript_path: transcriptPath, cwd });
     },
-    async recent(projectId, limit = 5) {
-      return client.post("/recent", { projectId, limit });
+    async recent(cwd, limit = 5) {
+      return client.post("/recent", { cwd, limit });
     },
   };
 }

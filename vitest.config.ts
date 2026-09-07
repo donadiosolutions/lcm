@@ -6,10 +6,23 @@ import { defineConfig, type UserConfig } from "vitest/config";
 const sqliteRouteTests = ["test/daemon/routes/**/*.test.ts"];
 const worktreeReconciliationTests = ["test/worktree-reconciliation.test.ts"];
 const serialSqliteTests = [...sqliteRouteTests, ...worktreeReconciliationTests];
+const portableBoundaryTests = [
+  "test/storage/portable-record.test.ts",
+  "test/storage/portable-record-stream.test.ts",
+];
 const packageConfigTests = ["test/package-config.test.ts"];
 const e2eTests = ["test/e2e/**/*.test.ts"];
 const runtimeHomeSetup = ["test/setup/isolate-runtime-home.ts"];
 const runtimeHomeGlobalSetup = ["test/setup/runtime-home-global.ts"];
+const vitestRunRootCleanupRegistryKey = Symbol.for(
+  "donadiosolutions/lcm:vitest-run-root-cleanups:v1",
+);
+
+type VitestRunRootCleanup = () => void;
+
+type ProcessWithSymbolProperties = NodeJS.Process & {
+  [key: symbol]: unknown;
+};
 
 export interface VitestRunRootDependencies {
   readonly environment?: NodeJS.ProcessEnv;
@@ -24,6 +37,46 @@ export interface VitestRunRootDependencies {
 
 export interface VitestConfigurationResolverDependencies {
   readonly createRunRoot?: () => string;
+}
+
+export function drainVitestRunRootCleanups(
+  registry: Set<VitestRunRootCleanup>,
+): void {
+  const cleanups = [...registry];
+  registry.clear();
+  for (const cleanup of cleanups) {
+    try {
+      cleanup();
+    } catch {
+      // Cleanup is best effort and must not interfere with process exit.
+    }
+  }
+}
+
+function registerVitestRunRootCleanup(cleanup: VitestRunRootCleanup): void {
+  const processWithRegistry = process as ProcessWithSymbolProperties;
+  const existingRegistry = processWithRegistry[vitestRunRootCleanupRegistryKey] as
+    | Set<VitestRunRootCleanup>
+    | undefined;
+  if (existingRegistry !== undefined) {
+    existingRegistry.add(cleanup);
+    return;
+  }
+
+  const registry = new Set<VitestRunRootCleanup>();
+  const drain = (): void => drainVitestRunRootCleanups(registry);
+  try {
+    process.once("exit", drain);
+    processWithRegistry[vitestRunRootCleanupRegistryKey] = registry;
+  } catch (error) {
+    try {
+      process.removeListener("exit", drain);
+    } catch {
+      // Preserve the original setup error if listener rollback itself fails.
+    }
+    throw error;
+  }
+  registry.add(cleanup);
 }
 
 function assertFreshExplicitRoot(
@@ -60,8 +113,7 @@ export function createVitestRunRoot(
   const secureDirectory = dependencies.chmodSync ?? chmodSync;
   const inspectPath = dependencies.lstatSync ?? lstatSync;
   const removeDirectory = dependencies.rmSync ?? rmSync;
-  const registerProcessExit = dependencies.registerProcessExit
-    ?? ((listener: (code: number) => void) => process.once("exit", listener));
+  const registerProcessExit = dependencies.registerProcessExit;
   const override = environment.LCM_TEST_ARTIFACT_ROOT;
   let root: string;
 
@@ -91,7 +143,11 @@ export function createVitestRunRoot(
   try {
     secureDirectory(root, 0o700);
     if (override === undefined || override === "") {
-      registerProcessExit(cleanup);
+      if (registerProcessExit === undefined) {
+        registerVitestRunRootCleanup(cleanup);
+      } else {
+        registerProcessExit(cleanup);
+      }
     }
   } catch (error) {
     cleanup();
@@ -109,6 +165,7 @@ export function createVitestConfiguration(root: string): UserConfig {
       setupFiles: runtimeHomeSetup,
       include: ["**/*.test.ts"],
       exclude: ["node_modules/**", ".claude/**"],
+      pool: "forks",
       coverage: {
         include: ["bin/**/*.ts", "installer/**/*.ts", "src/**/*.ts"],
         reportsDirectory: join(root, "coverage"),
@@ -127,11 +184,13 @@ export function createVitestConfiguration(root: string): UserConfig {
         {
           test: {
             name: "unit-parallel",
+            pool: "forks",
             globalSetup: runtimeHomeGlobalSetup,
             setupFiles: runtimeHomeSetup,
             include: ["test/**/*.test.ts"],
             exclude: [
               ...serialSqliteTests,
+              ...portableBoundaryTests,
               ...packageConfigTests,
               ...e2eTests,
               "node_modules/**",
@@ -144,15 +203,33 @@ export function createVitestConfiguration(root: string): UserConfig {
         },
         {
           test: {
+            name: "unit-portable-boundaries",
+            pool: "forks",
+            globalSetup: runtimeHomeGlobalSetup,
+            setupFiles: runtimeHomeSetup,
+            include: portableBoundaryTests,
+            exclude: ["node_modules/**", ".claude/**"],
+            sequence: {
+              groupOrder: 1,
+            },
+            // Vitest 4.1.10 maps fileParallelism:false to maxWorkers:1. Keep
+            // the memory-heavy boundary files in their own ordered phase so
+            // they cannot overlap with ordinary unit workers or each other.
+            fileParallelism: false,
+          },
+        },
+        {
+          test: {
             name: "unit-package",
+            pool: "forks",
             globalSetup: runtimeHomeGlobalSetup,
             setupFiles: runtimeHomeSetup,
             include: packageConfigTests,
             exclude: ["node_modules/**", ".claude/**"],
             sequence: {
-              groupOrder: 1,
+              groupOrder: 2,
             },
-            // Package inventory tests run npm build and mutate dist. Keep them
+            // Package inventory tests run pnpm build and mutate dist. Keep them
             // out of the parallel unit pool so they cannot race other tests.
             fileParallelism: false,
           },
@@ -160,12 +237,13 @@ export function createVitestConfiguration(root: string): UserConfig {
         {
           test: {
             name: "unit-sqlite-routes",
+            pool: "forks",
             globalSetup: runtimeHomeGlobalSetup,
             setupFiles: runtimeHomeSetup,
             include: serialSqliteTests,
             exclude: ["node_modules/**", ".claude/**"],
             sequence: {
-              groupOrder: 2,
+              groupOrder: 3,
             },
             // Route handler and worktree reconciliation tests repeatedly open and migrate
             // project SQLite DBs. Keep this group serial and ordered after the parallel
@@ -176,12 +254,13 @@ export function createVitestConfiguration(root: string): UserConfig {
         {
           test: {
             name: "e2e",
+            pool: "forks",
             globalSetup: runtimeHomeGlobalSetup,
             setupFiles: runtimeHomeSetup,
             include: e2eTests,
             exclude: ["node_modules/**", ".claude/**"],
             sequence: {
-              groupOrder: 3,
+              groupOrder: 4,
             },
             // E2E tests spin up real daemons backed by SQLite — must run
             // sequentially to avoid concurrent write conflicts.

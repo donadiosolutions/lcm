@@ -8,6 +8,9 @@ import {
   withProjectStorage,
 } from "./storage-lifecycle.js";
 
+const DEFAULT_RECENT_LIMIT = 5;
+const MAX_RECENT_LIMIT = 1000;
+
 function sqliteTimestamp(date: Date): string {
   const pad = (value: number): string => String(value).padStart(2, "0");
   return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
@@ -16,7 +19,16 @@ function sqliteTimestamp(date: Date): string {
 export function createRecentHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
-    const { limit = 5 } = input;
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      sendJson(res, 400, { error: "invalid request body" });
+      return;
+    }
+    const { limit = DEFAULT_RECENT_LIMIT } = input;
+
+    if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > MAX_RECENT_LIMIT) {
+      sendJson(res, 400, { error: "invalid limit" });
+      return;
+    }
 
     if (!input.cwd) {
       sendJson(res, 200, { summaries: [] });

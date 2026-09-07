@@ -39,13 +39,20 @@ function executor(
 ): PostgreSqlMemoryExecutor & {
   query: ReturnType<typeof vi.fn>;
   transaction: ReturnType<typeof vi.fn>;
+  transactionOptions: PostgreSqlQueryOptions[];
 } {
   const query = vi.fn(implementation);
+  const transactionOptions: PostgreSqlQueryOptions[] = [];
   const db = {
     query,
     transaction: vi.fn(async (
       callback: Parameters<PostgreSqlMemoryExecutor["transaction"]>[0],
-    ) => callback(db)),
+      options: Parameters<PostgreSqlMemoryExecutor["transaction"]>[1],
+    ) => {
+      transactionOptions.push(options);
+      return callback(db);
+    }),
+    transactionOptions,
   } as unknown as PostgreSqlMemoryExecutor & {
     query: ReturnType<typeof vi.fn>;
     transaction: ReturnType<typeof vi.fn>;
@@ -61,14 +68,21 @@ function scopedExecutor(
 ): PostgreSqlMemoryScopedExecutor & {
   query: ReturnType<typeof vi.fn>;
   savepoint: ReturnType<typeof vi.fn>;
+  savepointOptions: PostgreSqlQueryOptions[];
 } {
   const query = vi.fn(implementation);
+  const savepointOptions: PostgreSqlQueryOptions[] = [];
   const scoped = {
     transactionScope: "active",
     query,
     savepoint: vi.fn(async (
       callback: Parameters<PostgreSqlMemoryScopedExecutor["savepoint"]>[0],
-    ) => callback({ query })),
+      options: Parameters<PostgreSqlMemoryScopedExecutor["savepoint"]>[1],
+    ) => {
+      savepointOptions.push(options);
+      return callback({ query });
+    }),
+    savepointOptions,
   } as PostgreSqlMemoryScopedExecutor & {
     query: ReturnType<typeof vi.fn>;
     savepoint: ReturnType<typeof vi.fn>;
@@ -524,6 +538,95 @@ describe("PostgreSQL memory repositories", () => {
       code: "STORAGE_TRANSACTION_SCOPE",
       domain: "recall",
     });
+  });
+
+  it("preserves machine identity only for coordination access contexts", async () => {
+    const root = executor((config) => config.text.includes("transaction_isolation")
+      ? result([{ transaction_isolation: "read committed" }])
+      : result([]));
+    const coordination = new PostgreSqlCoordinationRepository(
+      root,
+      projectId,
+      machineId,
+    );
+    await coordination.getSessionIngest("session-a");
+    await coordination.recordSessionIngest("session-a", 1);
+    expect(root.transactionOptions.length).toBeGreaterThan(0);
+    for (const options of root.transactionOptions) {
+      expect(options).toMatchObject({
+        domain: "coordination",
+        projectId,
+        machineId,
+      });
+    }
+    for (const [, options] of root.query.mock.calls) {
+      expect(options).toMatchObject({
+        domain: "coordination",
+        projectId,
+        machineId,
+      });
+    }
+
+    const scoped = scopedExecutor((config) =>
+      config.text.includes("transaction_isolation")
+        ? result([{ transaction_isolation: "read committed" }])
+        : result([]));
+    await new PostgreSqlCoordinationRepository(
+      scoped,
+      projectId,
+      machineId,
+    ).recordSessionIngest("session-a", 1);
+    expect(scoped.savepointOptions.length).toBeGreaterThan(0);
+    for (const options of scoped.savepointOptions) {
+      expect(options).toMatchObject({
+        domain: "coordination",
+        projectId,
+        machineId,
+      });
+    }
+    for (const [, options] of scoped.query.mock.calls) {
+      expect(options).toMatchObject({
+        domain: "coordination",
+        projectId,
+        machineId,
+      });
+    }
+
+    const unfenced = executor((config) => {
+      if (config.text.includes("top_recalled")) {
+        return result([{
+          memories_surfaced: "0",
+          memories_acted_upon: "0",
+          top_recalled: [],
+        }]);
+      }
+      if (config.text.includes("redaction_counters")) {
+        return result([{
+          gitleaks: "0",
+          built_in: "0",
+          global: "0",
+          project: "0",
+        }]);
+      }
+      return result([]);
+    });
+    await new PostgreSqlPromotedMemoryRepository(unfenced, projectId)
+      .listContentPrefixes(1);
+    await new PostgreSqlRecallRepository(unfenced, projectId).getStats();
+    const redaction = new PostgreSqlRedactionAdminRepository(unfenced, projectId);
+    await redaction.getCounts();
+    await redaction.upsertCounts({
+      gitleaks: 1,
+      builtIn: 0,
+      global: 0,
+      project: 0,
+    });
+    for (const [, options] of unfenced.query.mock.calls) {
+      expect(options).not.toHaveProperty("machineId");
+    }
+    for (const options of unfenced.transactionOptions) {
+      expect(options).not.toHaveProperty("machineId");
+    }
   });
 
   it("fails closed for invalid inputs before database access", async () => {

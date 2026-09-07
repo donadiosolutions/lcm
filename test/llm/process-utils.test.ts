@@ -10,6 +10,7 @@ import {
   reconcileProviderProcessWitnesses,
   readProviderProcessWitnesses,
   boundedModelForDisplay,
+  createFriendlyMissingCodexError,
   normalizeProcessBirthTime,
 } from "../../src/llm/process-utils.js";
 import { PrivateMutationLockContentionError, withPrivateMutationLock } from "../../src/private-mutation-lock.js";
@@ -42,6 +43,14 @@ describe("owned process lifecycle utilities", () => {
 
   it("uses a default model label for blank display input", () => {
     expect(boundedModelForDisplay("   ")).toBe("default");
+  });
+
+  it("creates the stable missing Codex diagnostic", () => {
+    expect(createFriendlyMissingCodexError().message).toBe([
+      "Codex CLI is not installed or not on PATH.",
+      "Install it first, for example: npm install -g @openai/codex",
+      "Then run lcm again.",
+    ].join("\n"));
   });
 
   it("uses the direct child when the pid/group identity is not safe", async () => {
@@ -718,50 +727,82 @@ describe("owned process lifecycle utilities", () => {
   });
 
   it("handles invalid process identities, probes, and signaling failures safely", async () => {
-    expect(__processUtilsTestUtils.positivePid(-1)).toBeUndefined();
-    expect(__processUtilsTestUtils.positivePid(Number.NaN)).toBeUndefined();
-    expect(__processUtilsTestUtils.linuxProcessGroupId(process.pid)).toBeGreaterThan(0);
-    expect(__processUtilsTestUtils.linuxProcessGroupId(Number.MAX_SAFE_INTEGER)).toBeUndefined();
-    expect(typeof __processUtilsTestUtils.defaultProcessGroupAlive(Number.MAX_SAFE_INTEGER)).toBe("boolean");
+    const processKill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      expect(__processUtilsTestUtils.positivePid(-1)).toBeUndefined();
+      expect(__processUtilsTestUtils.positivePid(Number.NaN)).toBeUndefined();
 
-    const invalidGroupChild = child(9123);
-    const invalidGroup = createOwnedProcessTeardown({
-      child: invalidGroupChild,
-      platform: "linux",
-      processGroupId: 0,
-      daemonProcessGroupId: 1,
-    });
-    const invalidPending = invalidGroup.terminate();
-    invalidGroupChild.emit("close");
-    await expect(invalidPending).resolves.toBe(true);
+      const invalidGroupChild = child(9123);
+      const invalidGroupKill = vi.fn();
+      const invalidGroup = createOwnedProcessTeardown({
+        child: invalidGroupChild,
+        platform: "linux",
+        processGroupId: 0,
+        daemonProcessGroupId: 1,
+        processBirthTime: () => null,
+        killProcess: invalidGroupKill,
+      });
+      const invalidPending = invalidGroup.terminate();
+      invalidGroupChild.emit("close");
+      await expect(invalidPending).resolves.toBe(true);
+      expect(invalidGroupKill).not.toHaveBeenCalled();
 
-    const throwingChild = child(9124);
-    throwingChild.kill.mockImplementation(() => { throw new Error("already gone"); });
-    const throwingGroup = createOwnedProcessTeardown({
-      child: throwingChild,
-      platform: "win32",
-    });
-    const throwingPending = throwingGroup.terminate();
-    throwingChild.emit("close");
-    await expect(throwingPending).resolves.toBe(true);
+      const throwingChild = child(9124);
+      throwingChild.kill.mockImplementation(() => { throw new Error("already gone"); });
+      const throwingGroup = createOwnedProcessTeardown({
+        child: throwingChild,
+        platform: "win32",
+      });
+      const throwingPending = throwingGroup.terminate();
+      throwingChild.emit("close");
+      await expect(throwingPending).resolves.toBe(true);
 
-    let probes = 0;
-    const probingChild = child(9125);
-    const probingGroup = createOwnedProcessTeardown({
-      child: probingChild,
-      platform: "linux",
-      processGroupId: 9125,
-      daemonProcessGroupId: 1,
-      processBirthTime: () => "birth-9125",
-      isProcessGroupAlive: () => {
-        probes += 1;
-        if (probes === 1) throw new Error("probe unavailable");
-        return false;
-      },
-    });
-    const probingPending = probingGroup.terminate();
-    probingChild.emit("close");
-    await expect(probingPending).resolves.toBe(true);
+      let probes = 0;
+      const probingChild = child(9125);
+      const probingGroupKill = vi.fn();
+      const probingGroup = createOwnedProcessTeardown({
+        child: probingChild,
+        platform: "linux",
+        processGroupId: 9125,
+        daemonProcessGroupId: 1,
+        processBirthTime: () => "birth-9125",
+        killProcess: probingGroupKill,
+        isProcessGroupAlive: () => {
+          probes += 1;
+          if (probes === 1) throw new Error("probe unavailable");
+          return false;
+        },
+      });
+      const probingPending = probingGroup.terminate();
+      probingChild.emit("close");
+      await expect(probingPending).resolves.toBe(true);
+      expect(probingGroupKill).toHaveBeenCalledWith(-9125, "SIGTERM");
+      expect(processKill).not.toHaveBeenCalled();
+    } finally {
+      processKill.mockRestore();
+    }
+  });
+
+  it("forwards validated group teardown through the default kill seam", async () => {
+    const processKill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      const processChild = child(9132);
+      const teardown = createOwnedProcessTeardown({
+        child: processChild,
+        platform: "linux",
+        processGroupId: 9132,
+        daemonProcessGroupId: 9131,
+        processBirthTime: () => "birth-9132",
+        isProcessGroupAlive: () => false,
+      });
+      const pending = teardown.terminate();
+      expect(processKill).toHaveBeenCalledWith(-9132, "SIGTERM");
+      expect(processKill).toHaveBeenCalledTimes(1);
+      processChild.emit("close");
+      await expect(pending).resolves.toBe(true);
+    } finally {
+      processKill.mockRestore();
+    }
   });
 
   it("derives Linux group state conservatively when explicit identities are omitted", async () => {
@@ -1616,33 +1657,52 @@ describe("owned process lifecycle utilities", () => {
     process.env.HOME = root;
     try {
       mkdirSync(join(root, ".lcm"), { recursive: true, mode: 0o700 });
+      // Path-less store: sole cover of the store default-path branch (src:671).
       const store = createProviderProcessWitnessStore({ daemonInstanceId: "daemon-default" });
-      const entry = {
+      expect(store.path).toBe(join(root, ".lcm", "daemon-runtime.json"));
+      const retained = {
         daemonInstanceId: "daemon-default",
         providerId: "claude-process",
-        pid: 17,
+        pid: 4101,
         pgid: null,
         processStartTime: null,
       } as const;
-      store.add(entry);
-      expect(store.path).toContain("daemon-runtime.json");
-      expect(readProviderProcessWitnesses({ _getUid: () => undefined })).toMatchObject({
-        available: true,
-        providers: [entry],
-      });
-      const reusedEntry = {
+      const stale = {
         daemonInstanceId: "daemon-default",
         providerId: "default-reconcile",
-        pid: process.pid,
+        pid: 4102,
         pgid: null,
         processStartTime: "old-process-birth",
       } as const;
-      store.add(reusedEntry);
-      expect(reconcileProviderProcessWitnesses({ daemonInstanceId: "daemon-default" })).toEqual({
+      store.add(retained);
+      store.add(stale);
+      // Path-less read: sole cover of the read default-path branch (src:555).
+      expect(readProviderProcessWitnesses({ _getUid: () => undefined })).toMatchObject({
         available: true,
-        providers: [entry],
+        providers: [retained, stale],
       });
-      store.remove(entry);
+      // Liveness and birth arrive only through seams; no host process is signaled.
+      const killProcess = vi.fn();
+      const processBirthTime = vi.fn(() => "new-process-birth");
+      // Path-less reconcile: sole cover of the reconcile default-path branch (src:750).
+      expect(reconcileProviderProcessWitnesses({
+        daemonInstanceId: "daemon-default",
+        killProcess,
+        processBirthTime,
+      })).toEqual({ available: true, providers: [retained] });
+      // Both rows are live; the stale row dies by birth mismatch, not by ESRCH.
+      expect(killProcess.mock.calls).toEqual([[retained.pid, 0], [stale.pid, 0]]);
+      expect(processBirthTime.mock.calls).toEqual([[stale.pid]]);
+      // Persisted readback: canonical reader plus the document actually on disk.
+      expect(readProviderProcessWitnesses({ _getUid: () => undefined })).toMatchObject({
+        available: true,
+        providers: [retained],
+      });
+      expect(JSON.parse(readFileSync(store.path, "utf8")) as unknown).toEqual({
+        version: 2,
+        daemonInstances: ["daemon-default"],
+        providers: [retained],
+      });
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;

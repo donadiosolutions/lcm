@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          token: ${{ secrets.PATTERNS_BOT_TOKEN }}
+          token: ${{ github.token }}
           persist-credentials: false
           fetch-depth: 0
 
@@ -35,18 +35,41 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22.20.0"
-          cache: npm
+
+      - name: Bootstrap verified pnpm
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bootstrap_root="$(mktemp -d "$RUNNER_TEMP/lcm-pnpm.XXXXXX")"
+          pnpm_bin="$(node scripts/bootstrap-pnpm.mjs --destination "$bootstrap_root/pnpm")"
+          printf '%s\n' "$pnpm_bin" >> "$GITHUB_PATH"
+          printf 'npm_config_store_dir=%s\n' "$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"
+
+      - name: Locate pnpm store
+        id: pnpm-store
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          store_path="$(pnpm store path)"
+          printf 'path=%s\n' "$store_path" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-22.20.0-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}
 
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Run update-gitleaks-patterns
-        run: node --experimental-strip-types scripts/update-gitleaks-patterns.ts
+        run: pnpm run update:patterns
 
       - name: Check for changes
         id: diff
         run: |
-          if git diff --quiet src/generated-patterns.ts; then
+          if git diff --quiet --ignore-matching-lines='^// Updated:' -- src/generated-patterns.ts; then
+            git restore src/generated-patterns.ts
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "No changes to generated-patterns.ts — skipping commit"
           else
@@ -86,21 +109,33 @@ jobs:
         if: steps.diff.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.PATTERNS_BOT_TOKEN }}
+          GH_PROMPT_DISABLED: "1"
         run: |
           RULE_COUNT="${{ steps.diff.outputs.rule_count }}"
           BRANCH="chore/update-gitleaks-patterns-${RULE_COUNT}-rules"
           CHANGESET=".changeset/gitleaks-patterns-${RULE_COUNT}.md"
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           git config user.name "gitleaks-patterns-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin "$BRANCH:refs/remotes/origin/$BRANCH" || true
+
+          set +e
+          GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c 'credential.helper=!gh auth git-credential' ls-remote --exit-code --refs origin "refs/heads/$BRANCH" >/dev/null
+          branch_status=$?
+          set -e
+          if [[ "$branch_status" -eq 0 ]]; then
+            GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+          elif [[ "$branch_status" -eq 2 ]]; then
+            echo "No existing remote branch found; push will create $BRANCH."
+          else
+            echo "::error::Existing branch discovery failed with status $branch_status"
+            exit 1
+          fi
 
           GENERATED_COPY="$RUNNER_TEMP/generated-patterns.ts"
           cp src/generated-patterns.ts "$GENERATED_COPY"
           git restore src/generated-patterns.ts
           git checkout -B "$BRANCH" origin/main
           cp "$GENERATED_COPY" src/generated-patterns.ts
-          UNEXPECTED=$(git status --short | grep -vE '^( M src/generated-patterns\.ts|\?\? \.changeset/gitleaks-patterns-[0-9]+\.md)$' || true)
+          UNEXPECTED=$(git status --short | awk '!/^( M src\/generated-patterns\.ts|\?\? \.changeset\/gitleaks-patterns-[0-9]+\.md)$/')
           if [[ -n "$UNEXPECTED" ]]; then
             echo "::error::Pattern update produced changes outside the allowlist"
             printf '%s\n' "$UNEXPECTED"
@@ -109,7 +144,7 @@ jobs:
 
           git add src/generated-patterns.ts "$CHANGESET"
           git commit -s -m "chore(security): sync gitleaks patterns → ${RULE_COUNT} rules"
-          git push -u origin "$BRANCH" --force-with-lease
+          GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push -u origin "$BRANCH" --force-with-lease
 
           PR_NUMBER=$(gh pr list \
             --repo "${{ github.repository }}" \
@@ -138,16 +173,20 @@ jobs:
         if: steps.diff.outputs.changed == 'true'
         run: |
           RULE_COUNT="${{ steps.diff.outputs.rule_count }}"
-          echo "### Gitleaks Patterns Updated" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Rules:** ${RULE_COUNT}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Branch:** chore/update-gitleaks-patterns-${RULE_COUNT}-rules" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "> **Manual step required:** Review and merge the generated PR to main when ready." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Gitleaks Patterns Updated"
+            echo ""
+            echo "- **Rules:** ${RULE_COUNT}"
+            echo "- **Branch:** chore/update-gitleaks-patterns-${RULE_COUNT}-rules"
+            echo ""
+            echo "> **Manual step required:** Review and merge the generated PR to main when ready."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: No-op summary
         if: steps.diff.outputs.changed == 'false'
         run: |
-          echo "### No Gitleaks Pattern Changes" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Gitleaks patterns are up to date — no commit needed." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### No Gitleaks Pattern Changes"
+            echo ""
+            echo "Gitleaks patterns are up to date — no commit needed."
+          } >> "$GITHUB_STEP_SUMMARY"

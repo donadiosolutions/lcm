@@ -6,6 +6,14 @@ import { join } from "node:path";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { createCodexProcessSummarizer } from "../../src/llm/codex-process.js";
 import { createAbortError, isAbortError } from "../../src/daemon/cancellation.js";
+import { sanitizeError } from "../../src/daemon/safe-error.js";
+
+const processStartTime = vi.hoisted(() => vi.fn((pid: number) => pid === 9517 ? "controlled-birth-9517" : null));
+
+vi.mock("../../src/private-mutation-lock.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/private-mutation-lock.js")>()),
+  processStartTime,
+}));
 
 vi.mock("../../src/llm/codex-responses-gateway.js", () => ({
   createCodexResponsesGateway: vi.fn(async () => ({
@@ -16,6 +24,10 @@ vi.mock("../../src/llm/codex-responses-gateway.js", () => ({
     waitForCompletion: vi.fn().mockResolvedValue(undefined),
     close: vi.fn().mockResolvedValue(undefined),
   })),
+}));
+
+vi.mock("../../src/llm/codex-config.js", () => ({
+  resolveCodexOpenAIBaseUrl: vi.fn(() => undefined),
 }));
 
 type SpawnFn = typeof import("node:child_process").spawn;
@@ -73,6 +85,7 @@ function baseDeps(child: FakeChild, overrides: Record<string, unknown> = {}) {
     mkdtempSync: vi.fn(() => mkdtempSync(join(tmpdir(), "lcm-codex-"))) as unknown as MkdtempSyncFn,
     readFileSync: vi.fn(() => "summary") as unknown as ReadFileSyncFn,
     rmSync: vi.fn() as unknown as RmSyncFn,
+    _resolveConfig: vi.fn(() => undefined),
     ...overrides,
   };
 }
@@ -100,7 +113,7 @@ describe("createCodexProcessSummarizer", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
-  it("awaits a late gateway close before abort rejection and temp cleanup", async () => {
+  it("closes a late gateway after abort without retaining temp state", async () => {
     const controller = new AbortController();
     const child = makeHangingChild();
     let resolveGateway: ((gateway: ReturnType<typeof makeGateway>) => void) | undefined;
@@ -127,11 +140,11 @@ describe("createCodexProcessSummarizer", () => {
     void pending.then(() => { settled = true; }, () => { settled = true; });
     await Promise.resolve();
     expect(settled).toBe(false);
-    expect(rmSyncMock).not.toHaveBeenCalled();
+    expect(rmSyncMock).toHaveBeenCalledOnce();
 
     resolveGateway?.(gateway);
     await vi.waitFor(() => expect(gateway.close).toHaveBeenCalledOnce());
-    expect(rmSyncMock).not.toHaveBeenCalled();
+    expect(rmSyncMock).toHaveBeenCalledOnce();
     releaseClose?.();
     expect(isAbortError((await observed).error)).toBe(true);
     expect(rmSyncMock).toHaveBeenCalledOnce();
@@ -403,15 +416,19 @@ describe("createCodexProcessSummarizer", () => {
     expect(witnessStore.add).toHaveBeenCalledOnce();
   });
 
-  it("uses the default process birth probe for witness entries", async () => {
+  it("publishes a witness from the controlled default process birth probe", async () => {
     const child = makeChild();
     (child as FakeChild & { pid: number }).pid = 9517;
     const witnessStore = { add: vi.fn(), remove: vi.fn(), path: "/tmp/daemon-runtime.json" };
     const summarizer = createCodexProcessSummarizer({
-      ...baseDeps(child), daemonInstanceId: "daemon-a", witnessStore,
+      ...baseDeps(child), daemonInstanceId: "daemon-a", witnessStore, platform: "win32",
     } as never);
     await expect(summarizer("text")).resolves.toBe("summary");
-    expect(witnessStore.add).toHaveBeenCalledWith(expect.objectContaining({ processStartTime: null }));
+    expect(witnessStore.add).toHaveBeenCalledWith(expect.objectContaining({
+      pid: 9517,
+      pgid: null,
+      processStartTime: "controlled-birth-9517",
+    }));
   });
 
   afterEach(() => {
@@ -516,6 +533,206 @@ describe("createCodexProcessSummarizer", () => {
     expect(stdin).not.toContain("PRIVATE TRANSCRIPT");
     expect(gateway.waitForCompletion).toHaveBeenCalledOnce();
     expect(gateway.close).toHaveBeenCalledOnce();
+  });
+
+  it("passes a resolved Codex endpoint to the gateway", async () => {
+    const child = makeChild(0);
+    const createGateway = vi.fn().mockResolvedValue(makeGateway());
+    const resolveConfig = vi.fn(async () => "https://proxy.example/v1/responses");
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child, { _createGateway: createGateway, _resolveConfig: resolveConfig }),
+    } as never);
+
+    await expect(summarizer("configured endpoint", false)).resolves.toBe("summary");
+    expect(resolveConfig).toHaveBeenCalledOnce();
+    expect(createGateway.mock.calls[0]?.[0]).toMatchObject({
+      upstreamResponsesUrl: "https://proxy.example/v1/responses",
+    });
+  });
+
+  it("keeps the shared budget monotonic across a backward wall-clock step during discovery", async () => {
+    let monotonicNow = 100;
+    let wallNow = 1_000;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const delays: number[] = [];
+    const child = makeChild(0);
+    const gateway = makeGateway();
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const resolveConfig = vi.fn(() => {
+      wallNow = 500;
+      monotonicNow = 125;
+      return "https://proxy.example/v1/responses";
+    });
+    const createGateway = vi.fn(async () => {
+      monotonicNow = 140;
+      return gateway;
+    });
+    const setTimeoutMock = vi.fn((callback: Parameters<typeof setTimeout>[0], delay?: number) => {
+      delays.push(delay ?? 0);
+      return setTimeout(callback, delay);
+    });
+    try {
+      const summarizer = createCodexProcessSummarizer({
+        ...baseDeps(child, {
+          timeoutMs: 100,
+          _resolveConfig: resolveConfig,
+          _createGateway: createGateway,
+          setTimeout: setTimeoutMock,
+          rmSync: rmSyncMock,
+        }),
+      } as never);
+
+      await expect(summarizer("backward wall step", false)).resolves.toBe("summary");
+      expect(resolveConfig).toHaveBeenCalledWith(undefined, 100, undefined);
+      expect(delays[0]).toBeCloseTo(75, 6);
+      expect(delays[1]).toBeCloseTo(60, 6);
+      expect(gateway.close).toHaveBeenCalledOnce();
+      expect(rmSyncMock).toHaveBeenCalledOnce();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("keeps the shared budget monotonic across a forward wall-clock step during gateway startup", async () => {
+    let monotonicNow = 200;
+    let wallNow = 2_000;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const delays: number[] = [];
+    const child = makeChild(0);
+    const gateway = makeGateway();
+    const rmSyncMock = vi.fn() as unknown as RmSyncFn;
+    const resolveConfig = vi.fn(() => {
+      monotonicNow = 210;
+      return "https://proxy.example/v1/responses";
+    });
+    const createGateway = vi.fn(async () => {
+      wallNow = 50_000;
+      monotonicNow = 230;
+      return gateway;
+    });
+    const setTimeoutMock = vi.fn((callback: Parameters<typeof setTimeout>[0], delay?: number) => {
+      delays.push(delay ?? 0);
+      return setTimeout(callback, delay);
+    });
+    try {
+      const summarizer = createCodexProcessSummarizer({
+        ...baseDeps(child, {
+          timeoutMs: 100,
+          _resolveConfig: resolveConfig,
+          _createGateway: createGateway,
+          setTimeout: setTimeoutMock,
+          rmSync: rmSyncMock,
+        }),
+      } as never);
+
+      await expect(summarizer("forward wall step", false)).resolves.toBe("summary");
+      expect(resolveConfig).toHaveBeenCalledWith(undefined, 100, undefined);
+      expect(delays[0]).toBeCloseTo(90, 6);
+      expect(delays[1]).toBeCloseTo(70, 6);
+      expect(gateway.close).toHaveBeenCalledOnce();
+      expect(rmSyncMock).toHaveBeenCalledOnce();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("cleans up when gateway startup fails or reaches the shared deadline", async () => {
+    const failed = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), {
+        _createGateway: vi.fn().mockRejectedValue(new Error("gateway startup failed")),
+      }),
+    } as never);
+    await expect(failed("startup failure", false)).rejects.toThrow("gateway startup failed");
+
+    let deadlineCallback: (() => void) | undefined;
+    const hanging = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), {
+        _createGateway: vi.fn(() => new Promise<never>(() => undefined)),
+        setTimeout: vi.fn((callback: () => void) => { deadlineCallback = callback; return 1 as never; }),
+        clearTimeout: vi.fn(),
+      }),
+    } as never);
+    const pending = hanging("gateway deadline", false);
+    await vi.waitFor(() => expect(deadlineCallback).toBeTypeOf("function"));
+    deadlineCallback?.();
+    await expect(pending).rejects.toThrow("codex process timed out");
+  });
+
+  it("closes a gateway when the absolute deadline expires before exec spawn", async () => {
+    const gateway = makeGateway({ close: vi.fn().mockRejectedValue(new Error("late close")) });
+    let nowCalls = 0;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), {
+        timeoutMs: 10,
+        _now: () => (nowCalls++ < 3 ? 0 : 20),
+        _createGateway: vi.fn().mockResolvedValue(gateway),
+        _resolveConfig: vi.fn(async () => "https://proxy.example/v1/responses"),
+      }),
+    } as never);
+    await expect(summarizer("expired deadline", false)).rejects.toThrow("codex process timed out");
+    expect(gateway.close).toHaveBeenCalledOnce();
+  });
+
+  it("awaits resolver-owned cancellation before rejecting and never starts a gateway", async () => {
+    const controller = new AbortController();
+    let releaseResolver!: () => void;
+    const resolver = new Promise<undefined>((_resolve, reject) => {
+      releaseResolver = () => reject(createAbortError(controller.signal.reason));
+    });
+    const createGateway = vi.fn();
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), {
+        _resolveConfig: vi.fn(() => resolver),
+        _createGateway: createGateway,
+      }),
+    } as never);
+    const pending = summarizer("cancel during discovery", false, { signal: controller.signal });
+    controller.abort();
+    let settled = false;
+    void pending.then(() => { settled = true; }, () => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(createGateway).not.toHaveBeenCalled();
+    releaseResolver();
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+  });
+
+  it("fails before discovery or gateway creation when the absolute deadline is exhausted", async () => {
+    let nowCalls = 0;
+    const resolveConfig = vi.fn(() => undefined);
+    const createGateway = vi.fn();
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), {
+        timeoutMs: 10,
+        _now: () => (nowCalls++ === 0 ? 0 : 100),
+        _resolveConfig: resolveConfig,
+        _createGateway: createGateway,
+      }),
+    } as never);
+    await expect(summarizer("expired before discovery", false)).rejects.toThrow("codex process timed out");
+    expect(resolveConfig).not.toHaveBeenCalled();
+    expect(createGateway).not.toHaveBeenCalled();
+  });
+
+  it("fails after discovery when the remaining budget is exhausted before gateway creation", async () => {
+    let nowCalls = 0;
+    const resolveConfig = vi.fn(() => undefined);
+    const createGateway = vi.fn();
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), {
+        timeoutMs: 10,
+        _now: () => (nowCalls++ < 2 ? 0 : 20),
+        _resolveConfig: resolveConfig,
+        _createGateway: createGateway,
+      }),
+    } as never);
+    await expect(summarizer("expired after discovery", false)).rejects.toThrow("codex process timed out");
+    expect(resolveConfig).toHaveBeenCalledOnce();
+    expect(createGateway).not.toHaveBeenCalled();
   });
 
   it("rejects an exit-0 child when no authenticated gateway request was accepted", async () => {
@@ -698,11 +915,12 @@ describe("createCodexProcessSummarizer", () => {
       const processChild = makeHangingChild();
       processChild.kill.mockImplementation(() => { processChild.emit("close", null); });
       const summarizer = createCodexProcessSummarizer({
-        ...baseDeps(processChild), timeoutMs: 1,
+        ...baseDeps(processChild), timeoutMs: 1, _now: () => 0,
       } as never);
       const pending = summarizer("text", false, { signal: controller.signal });
       const observed = pending.then(() => undefined, error => error);
       await vi.waitFor(() => expect(processChild.stdin.listenerCount("error")).toBeGreaterThan(0));
+      processChild.stderr.emit("data", "usage limit");
       await vi.advanceTimersByTimeAsync(1);
       controller.abort();
       await expect(observed).resolves.toMatchObject({ message: expect.stringMatching(/timed out/) });
@@ -827,7 +1045,7 @@ describe("createCodexProcessSummarizer", () => {
       const child = makeHangingChild();
       const gateway = makeGateway();
       const summarizer = createCodexProcessSummarizer({
-        ...baseDeps(child), _createGateway: vi.fn().mockResolvedValue(gateway), timeoutMs: 1,
+        ...baseDeps(child), _createGateway: vi.fn().mockResolvedValue(gateway), timeoutMs: 1, _now: () => 0,
       } as never);
       const pending = summarizer("text", false, { signal: controller.signal });
       const observed = pending.then(() => undefined, error => error);
@@ -1087,6 +1305,41 @@ describe("createCodexProcessSummarizer", () => {
     );
   });
 
+  it("preserves the resolver missing Codex diagnostic through the summarizer seam", async () => {
+    const actualConfig = await vi.importActual<typeof import("../../src/llm/codex-config.js")>("../../src/llm/codex-config.js");
+    const resolverChild = makeHangingChild();
+    resolverChild.kill.mockImplementation(() => {
+      resolverChild.emit("close", null);
+      return true;
+    });
+    const resolverSpawn = vi.fn(() => {
+      setImmediate(() => resolverChild.emit("error", Object.assign(new Error("spawn codex ENOENT secret"), { code: "ENOENT" })));
+      return resolverChild;
+    });
+    const execSpawn = vi.fn() as unknown as SpawnFn;
+    const createGateway = vi.fn();
+    const rmSync = vi.fn() as unknown as RmSyncFn;
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(makeHangingChild(), { spawn: execSpawn, rmSync }),
+      _createGateway: createGateway,
+      _resolveConfig: (signal, timeoutMs) => actualConfig.resolveCodexOpenAIBaseUrl({
+        spawn: resolverSpawn as never,
+        platform: "win32",
+        processBirthTime: () => "birth",
+        timeoutMs,
+      }, signal),
+    });
+
+    await expect(summarizer("text", false)).rejects.toMatchObject({ message: [
+      "Codex CLI is not installed or not on PATH.",
+      "Install it first, for example: npm install -g @openai/codex",
+      "Then run lcm again.",
+    ].join("\n") });
+    expect(createGateway).not.toHaveBeenCalled();
+    expect(execSpawn).not.toHaveBeenCalled();
+    expect(rmSync).toHaveBeenCalledOnce();
+  });
+
   it("rejects on non-zero exit", async () => {
     const child = makeChild(1, "boom");
     const spawn = vi.fn().mockReturnValue(child);
@@ -1106,6 +1359,259 @@ describe("createCodexProcessSummarizer", () => {
       /Codex CLI rejected.*provider codex-process.*reasoning effort "default\/omitted".*fast mode default\/omitted.*Upgrade the Codex CLI/s,
     );
     expect(readFileSyncMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["usage", "You've hit your usage limit for GPT-5.3-Codex-Spark. Try again at 4:27 AM."],
+    ["usage", "rate-limit reached"],
+    ["usage", "rate limit reached"],
+    ["usage", "usage-limit reached"],
+    ["authentication", "not logged in"],
+    ["authentication", "authentication required"],
+    ["authentication", "invalid API key"],
+    ["model", "unsupported model"],
+    ["model", "the model is not available"],
+    ["invalid-request", "unexpected argument: --bogus"],
+    ["invalid-request", "unknown flag"],
+  ] as const)("classifies %s diagnostics with fixed safe guidance", async (category, diagnostic) => {
+    const canary = "GPT-5.3-Codex-Spark 4:27 AM Bearer secret-token";
+    const child = makeChild(1, `${diagnostic} ${canary}`);
+    const summarizer = createCodexProcessSummarizer(baseDeps(child));
+    const error = await summarizer("Conversation text", false).catch((caught: unknown) => caught as Error);
+
+    expect(error.message).toBeDefined();
+    expect(error.message).not.toContain("Upgrade the Codex CLI");
+    expect(error.message).not.toContain(canary);
+    expect(error.message).not.toContain("secret-token");
+    expect(error.cause).toBeUndefined();
+    expect(JSON.stringify(error)).not.toContain(canary);
+    expect(sanitizeError(error.message)).toBe(error.message);
+    expect(error.message).toContain('reasoning effort "default/omitted"');
+    expect(error.message).toContain("fast mode default/omitted");
+    if (category === "usage") expect(error.message).toMatch(/usage limit|rate/i);
+    if (category === "authentication") expect(error.message).toMatch(/authentication|sign in/i);
+    if (category === "model") expect(error.message).toMatch(/model|supported/i);
+    if (category === "invalid-request") expect(error.message).toMatch(/invalid|compatibility/i);
+  });
+
+  it.each([
+    ["true", true],
+    ["false", false],
+  ] as const)("keeps defined %s controls in classified guidance", async (_label, fastMode) => {
+    const child = makeChild(1, "usage limit");
+    const error = await createCodexProcessSummarizer({
+      ...baseDeps(child),
+      model: "gpt-5.4",
+      reasoningEffort: "high",
+      fastMode,
+    })("text", false).catch((caught: unknown) => caught as Error);
+    expect(error.message).toMatch(/^Codex compaction reached a usage limit\./);
+    expect(error.message).toContain('model "gpt-5.4"');
+    expect(error.message).toContain('reasoning effort "high"');
+    expect(error.message).toContain(`fast mode ${fastMode}`);
+  });
+
+  it.each([
+    "limit", "token", "error", "model", "limitation", "rate limiting", "rate limited",
+    "usage limits", "unknown flags", "model is not availables", "not logged into",
+  ])("keeps lookalike diagnostic %s on the compatibility fallback", async (diagnostic) => {
+    const child = makeChild(1, diagnostic);
+    await expect(createCodexProcessSummarizer(baseDeps(child))("text", false))
+      .rejects.toThrow("Upgrade the Codex CLI");
+  });
+
+  it("uses fixed precedence across the complete stderr window", async () => {
+    const diagnostics = [
+      "authentication required then usage limit",
+      "unsupported model then rate-limit",
+      "invalid request then authentication failed",
+      "unknown flag then unsupported model",
+    ];
+    const expected = ["usage limit", "usage limit", "authentication", "model"];
+    for (const [index, diagnostic] of diagnostics.entries()) {
+      const child = makeChild(1, diagnostic);
+      const error = await createCodexProcessSummarizer(baseDeps(child))("text", false)
+        .catch((caught: unknown) => caught as Error);
+      expect(error.message).toMatch(new RegExp(expected[index]!, "i"));
+    }
+  });
+
+  it("classifies split multibyte and same-tick stderr while retaining only the terminal byte window", async () => {
+    const child = makeHangingChild();
+    const spawn = vi.fn().mockReturnValue(child);
+    const summarizer = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    });
+    const pending = summarizer("text", false);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    const diagnostic = Buffer.from("usage limit — GPT-5.3-Codex-Spark");
+    const splitAt = diagnostic.indexOf(0xE2) + 1;
+    child.stderr.emit("data", diagnostic.subarray(0, splitAt));
+    child.stderr.emit("data", diagnostic.subarray(splitAt));
+    child.emit("close", 1);
+    const error = await pending.catch((caught: unknown) => caught as Error);
+    expect(error.message).toMatch(/usage limit/i);
+    expect(child.stderr.listenerCount("data")).toBe(0);
+  });
+
+  it("accepts string stderr chunks and ignores unsupported diagnostic chunks", async () => {
+    const child = makeHangingChild();
+    const spawn = vi.fn().mockReturnValue(child);
+    const pending = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    })("text", false);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.stderr.emit("data", "authentication   required");
+    child.stderr.emit("data", `${"x".repeat(20_000)} authentication required`);
+    child.stderr.emit("data", "");
+    child.stderr.emit("data", { unexpected: true });
+    child.emit("close", 1);
+    const error = await pending.catch((caught: unknown) => caught as Error);
+    expect(error.message).toMatch(/authentication|sign in/i);
+  });
+
+  it("trims oversized stderr chunks by bytes and evicts complete ring chunks", async () => {
+    const child = makeHangingChild();
+    const spawn = vi.fn().mockReturnValue(child);
+    const pending = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    })("text", false);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.stderr.emit("data", Buffer.alloc(10_000, "x"));
+    child.stderr.emit("data", Buffer.alloc(10_010, "x"));
+    child.stderr.emit("data", Buffer.alloc(16_384, "x"));
+    child.emit("close", 1);
+    const error = await pending.catch((caught: unknown) => caught as Error);
+    expect(error.message).toContain("Upgrade the Codex CLI");
+  });
+
+  it("classifies a trailing phrase in an oversized Buffer chunk", async () => {
+    const child = makeHangingChild();
+    const spawn = vi.fn().mockReturnValue(child);
+    const pending = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    })("text", false);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.stderr.emit("data", Buffer.concat([Buffer.alloc(20_000, "x"), Buffer.from(" usage limit")]));
+    child.emit("close", 1);
+    const error = await pending.catch((caught: unknown) => caught as Error);
+    expect(error.message).toMatch(/^Codex compaction reached a usage limit\./);
+  });
+
+  it("drains a paused same-tick stderr write after attaching the listener", async () => {
+    const child = makeHangingChild();
+    child.stderr.write("usage limit");
+    const spawn = vi.fn().mockReturnValue(child);
+    const pending = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    })("text", false);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.emit("close", 1);
+    const error = await pending.catch((caught: unknown) => caught as Error);
+    expect(error.message).toMatch(/^Codex compaction reached a usage limit\./);
+  });
+
+  it("falls back when a known diagnostic is pushed out of the 16 KiB terminal window", async () => {
+    const child = makeChild(1, `usage limit${"x".repeat(16 * 1024)}`);
+    const error = await createCodexProcessSummarizer(baseDeps(child))("text", false)
+      .catch((caught: unknown) => caught as Error);
+    expect(error.message).toContain("Upgrade the Codex CLI");
+  });
+
+  it.each([
+    ["usage", 429],
+    ["authentication", 401],
+  ] as const)("prefers the gateway %s category over generic stderr", async (category) => {
+    const child = makeChild(1, category === "usage" ? "authentication required" : "usage limit");
+    const gateway = makeGateway({ upstreamFailureCategory: category });
+    const error = await createCodexProcessSummarizer({
+      ...baseDeps(child),
+      _createGateway: vi.fn().mockResolvedValue(gateway),
+    } as never)("text", false).catch((caught: unknown) => caught as Error);
+    expect(error.message).not.toContain("Upgrade the Codex CLI");
+    expect(error.message).toMatch(category === "usage" ? /usage limit/i : /authentication|sign in/i);
+  });
+
+  it("preserves gateway category precedence across abort, timeout, and success", async () => {
+    const successGateway = makeGateway({ upstreamFailureCategory: "usage" });
+    await expect(createCodexProcessSummarizer({
+      ...baseDeps(makeChild(0)),
+      _createGateway: vi.fn().mockResolvedValue(successGateway),
+    })("text", false)).resolves.toBe("summary");
+
+    const controller = new AbortController();
+    const abortChild = makeHangingChild();
+    abortChild.kill.mockImplementation(() => { abortChild.emit("close", null); });
+    const abortSpawn = vi.fn().mockReturnValue(abortChild);
+    const abortPending = createCodexProcessSummarizer({
+      ...baseDeps(abortChild),
+      spawn: abortSpawn as unknown as SpawnFn,
+      _createGateway: vi.fn().mockResolvedValue(makeGateway({ upstreamFailureCategory: "usage" })),
+    })("text", false, { signal: controller.signal });
+    await vi.waitFor(() => expect(abortSpawn).toHaveBeenCalledOnce());
+    controller.abort();
+    await expect(abortPending).rejects.toSatisfy(error => isAbortError(error));
+  });
+
+  it("preserves gateway category precedence on timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = makeHangingChild();
+      child.kill.mockImplementation(() => { child.emit("close", null); });
+      const gateway = makeGateway({ upstreamFailureCategory: "authentication" });
+      const pending = createCodexProcessSummarizer({
+        ...baseDeps(child),
+        timeoutMs: 1,
+        _now: () => 0,
+        _createGateway: vi.fn().mockResolvedValue(gateway),
+      })("text", false);
+      const observed = pending.then(() => undefined, error => error);
+      await vi.waitFor(() => expect(child.stdin.listenerCount("error")).toBeGreaterThan(0));
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(observed).resolves.toMatchObject({ message: expect.stringMatching(/timed out/) });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps classified controls and known evidence for a null exit", async () => {
+    const child = makeHangingChild();
+    const spawn = vi.fn().mockReturnValue(child);
+    const pending = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    })("text", false);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.stderr.emit("data", "usage limit");
+    child.emit("close", null);
+    const error = await pending.catch((caught: unknown) => caught as Error);
+    expect(error.message).toMatch(/usage limit/i);
+    expect(error.message).toContain('reasoning effort "default/omitted"');
+  });
+
+  it("lets abort win after quota stderr has been received", async () => {
+    const controller = new AbortController();
+    const child = makeHangingChild();
+    child.kill.mockImplementation(() => { child.emit("close", null); });
+    const spawn = vi.fn().mockReturnValue(child);
+    const pending = createCodexProcessSummarizer({
+      ...baseDeps(child),
+      spawn: spawn as unknown as SpawnFn,
+    })("text", false, { signal: controller.signal });
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.stderr.emit("data", "usage limit");
+    controller.abort();
+    await expect(pending).rejects.toSatisfy(error => isAbortError(error));
+  });
+
+  it("ignores quota stderr on a successful exit", async () => {
+    const child = makeChild(0, "usage limit");
+    await expect(createCodexProcessSummarizer(baseDeps(child))("text", false)).resolves.toBe("summary");
   });
 
   it("reports bounded controls without exposing CLI diagnostics", async () => {
@@ -1204,6 +1710,7 @@ describe("createCodexProcessSummarizer", () => {
     const summarizer = createCodexProcessSummarizer({
       ...baseDeps(child),
       timeoutMs: 1,
+      _now: () => 0,
     });
     await expect(summarizer("text", false)).rejects.toThrow("codex process timed out after 0s");
     child.emit("close", 0);

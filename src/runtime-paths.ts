@@ -29,9 +29,20 @@ import {
 } from "./storage/backend-publication.js";
 import {
   consumeBoundedRegularFile,
+  atomicWritePrivateFileDurable,
+  assertPrivateDirectory,
+  openPrivateDirectory,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
 } from "./security-files.js";
+import {
+  classifyHomeParent as classifySharedHomeParent,
+  observationFromPaths,
+  witnessContent,
+  witnessPath,
+  parentModeIsSafe,
+  type ParentAuthority,
+} from "./home-parent-auth.js";
 
 export const LCM_HOME_DIRNAME = ".lcm";
 export const LEGACY_LCM_HOME_DIRNAME = legacyLcmHomeDirname();
@@ -96,6 +107,7 @@ type DirectoryWitness = Readonly<{
   uid: number;
   gid: number;
   mode: number;
+  ctimeNs: string;
 }>;
 
 type OpenDirectory = Readonly<{
@@ -161,6 +173,7 @@ type TreeEntryKind = "directory" | "file";
 
 type PublicationAdmission = Readonly<{
   topology: HomeTopology;
+  parentAuthority: ParentAuthority;
   withFinalLock: <T>(callback: (lockToken: BackendPublicationLockToken) => T) => T;
 }>;
 
@@ -357,7 +370,10 @@ function assertPathMatchesDirectory(handle: Pick<OpenDirectory, "fd">, path: str
   if (canonical !== requested) throw new Error(`${label} path is a symlink or non-canonical path`);
   const stat = fstatSync(handle.fd, { bigint: true }) as unknown as BigIntFileStat;
   const pathStat = statSync(canonical, { bigint: true }) as unknown as BigIntFileStat;
-  if (!sameIdentity(statIdentity(stat), statIdentity(pathStat))) {
+  if (!sameIdentity(statIdentity(stat), statIdentity(pathStat))
+    || stat.uid !== pathStat.uid
+    || stat.gid !== pathStat.gid
+    || modeOf(stat) !== modeOf(pathStat)) {
     throw new Error(`${label} changed during validation`);
   }
 }
@@ -378,6 +394,7 @@ function openDirectory(
   options: Readonly<{
     privateExact?: boolean;
     allowStickyParent?: boolean;
+    deferOwner?: boolean;
   }> = {},
 ): OpenDirectory {
   const fd = openSync(
@@ -389,7 +406,10 @@ function openDirectory(
   try {
     const stat = fstatSync(fd, { bigint: true }) as unknown as BigIntFileStat;
     if (!stat.isDirectory()) throw new Error(`${label} is not a directory`);
-    if (!ownerMatches(stat, options.allowStickyParent === true)) throw new Error(`${label} owner is not trusted`);
+    const trustedOwner = ownerMatches(stat, options.allowStickyParent === true);
+    if (!options.deferOwner && !trustedOwner) {
+      throw new Error(`${label} owner is not trusted`);
+    }
     const mode = modeOf(stat);
     if (options.privateExact === true && mode !== PRIVATE_ROOT_MODE) {
       throw new Error(`${label} must have exact mode 0700`);
@@ -398,7 +418,8 @@ function openDirectory(
       const stickyRoot = options.allowStickyParent === true
         && (mode & 0o1000) !== 0
         && Number(stat.uid) === 0;
-      if (!stickyRoot) throw new Error(`${label} has unsafe writable mode`);
+      if (!stickyRoot && !options.deferOwner) throw new Error(`${label} has unsafe writable mode`);
+      if (options.deferOwner && (mode & 0o1000) === 0) throw new Error(`${label} has unsafe writable mode`);
     }
     assertPathMatchesDirectory({ fd }, path, label);
     return {
@@ -409,20 +430,32 @@ function openDirectory(
         uid: Number(stat.uid),
         gid: Number(stat.gid),
         mode,
+        ctimeNs: String(stat.ctimeNs),
       },
       close: () => {
         closeSync(fd);
       },
     };
-  } catch (error) {
-    closeSync(fd);
-    throw error;
+  } catch (authenticationError) {
+    try {
+      closeSync(fd);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [authenticationError, cleanupError],
+        "directory authentication and cleanup failed",
+        { cause: authenticationError },
+      );
+    }
+    throw authenticationError;
   }
 }
 
 function openHomeTopology(homeDir: string): HomeTopology {
   const absoluteHome = resolve(homeDir);
-  const parent = openDirectory(dirname(absoluteHome), "home parent", { allowStickyParent: true });
+  const parent = openDirectory(dirname(absoluteHome), "home parent", {
+    allowStickyParent: true,
+    deferOwner: true,
+  });
   try {
     const home = openDirectory(absoluteHome, "home directory");
     return { parent, home };
@@ -434,6 +467,122 @@ function openHomeTopology(homeDir: string): HomeTopology {
 
 function openPrivateRoot(root: string): OpenDirectory {
   return openDirectory(root, "private LCM root", { privateExact: true });
+}
+
+const BOOTSTRAP_HANDOFF_ERROR = "private LCM root changed before bootstrap handoff";
+
+function assertBootstrapRootCanonical(root: OpenDirectory, rootPath: string): void {
+  try {
+    assertPathMatchesDirectory(root, rootPath, "private LCM root");
+    const stat = fstatSync(root.fd, { bigint: true }) as unknown as BigIntFileStat;
+    if (!stat.isDirectory() || modeOf(stat) !== PRIVATE_ROOT_MODE || !ownerMatches(stat)) {
+      throw new Error(BOOTSTRAP_HANDOFF_ERROR);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === BOOTSTRAP_HANDOFF_ERROR) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    if (isMissing(error)
+      || message.includes("changed during validation")
+      || message.includes("path is a symlink or non-canonical path")) {
+      throw new Error(BOOTSTRAP_HANDOFF_ERROR);
+    }
+    throw error;
+  }
+}
+
+function captureBootstrapRootWitness(root: OpenDirectory, rootPath: string): TreeWitness {
+  assertBootstrapRootCanonical(root, rootPath);
+  let witness: TreeWitness;
+  try {
+    witness = treeWitnessOf(rootPath);
+  } catch (error) {
+    if (isMissing(error)) throw new Error(BOOTSTRAP_HANDOFF_ERROR);
+    throw error;
+  }
+  assertBootstrapRootCanonical(root, rootPath);
+  const retainedStat = fstatSync(root.fd, { bigint: true }) as unknown as BigIntFileStat;
+  const retained: TreeWitness = {
+    identity: statIdentity(retainedStat),
+    mode: modeOf(retainedStat),
+    uid: Number(retainedStat.uid),
+    gid: Number(retainedStat.gid),
+    hash: witness.hash,
+  };
+  if (!sameRootMetadata(witness, retained)) throw new Error(BOOTSTRAP_HANDOFF_ERROR);
+  return witness;
+}
+
+function parentObservation(topology: HomeTopology, homeDir: string) {
+  const homePath = resolve(homeDir);
+  const parentPath = dirname(homePath);
+  return observationFromPaths({
+    homePath: realpathForValidation(homePath),
+    homeDev: topology.home.witness.dev,
+    homeIno: topology.home.witness.ino,
+    homeUid: topology.home.witness.uid,
+    parentPath: realpathForValidation(parentPath),
+    parentDev: topology.parent.witness.dev,
+    parentIno: topology.parent.witness.ino,
+    parentMode: topology.parent.witness.mode,
+    parentUid: topology.parent.witness.uid,
+    parentGid: topology.parent.witness.gid.toString(),
+    parentCtimeNs: topology.parent.witness.ctimeNs,
+  });
+}
+
+function classifyHomeParent(topology: HomeTopology, homeDir: string, rootPresent: boolean): ParentAuthority {
+  const authority = classifySharedHomeParent(parentObservation(topology, homeDir), {
+    rootPresent,
+    witnessRoot: homeDir,
+  });
+  // The shared classifier may read the private-root witness. Revalidate both
+  // retained descriptors and their canonical path after that read before any
+  // caller performs a pathname-based mutation.
+  assertRootParent(topology, homeDir);
+  if (!parentModeIsSafe(topology.parent.witness.mode, authority)) {
+    throw new Error("home parent has unsafe writable mode");
+  }
+  return authority;
+}
+
+function refreshHomeParentWitness(topology: HomeTopology, homeDir: string, authority: ParentAuthority): void {
+  if (authority !== "direct-system-root") return;
+  const rootPath = lcmHomeDir(homeDir);
+  const root = openPrivateDirectory(rootPath, { expectedUid: currentUid() });
+  const path = witnessPath(homeDir);
+  try {
+    assertPrivateDirectory(root, rootPath, root.witness, currentUid());
+    const journal = readMigrationJournal(homeDir);
+    if (journal !== null && journal.phase !== "retained") {
+      throw new Error("cannot refresh home parent witness while legacy migration is nonterminal");
+    }
+    const content = witnessContent(parentObservation(topology, homeDir));
+    assertRootParent(topology, homeDir);
+    let existingPresent = false;
+    try {
+      readBoundedRegularFile(path, {
+        allowedRoot: resolve(rootPath),
+        maxBytes: 8 * 1024,
+        expectedUid: currentUid(),
+        allowedModes: [PRIVATE_FILE_MODE],
+        requireSingleLink: true,
+      });
+      existingPresent = true;
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
+    assertPrivateDirectory(root, rootPath, root.witness, currentUid());
+    assertRootParent(topology, homeDir);
+    // The witness is admission evidence under the cooperating LCM lock; the
+    // durable helper's present-file publication remains unconditional.
+    atomicWritePrivateFileDurable(path, content, {
+      expectedUid: currentUid(),
+      requireAbsent: !existingPresent,
+      maxExistingBytes: 8 * 1024,
+    });
+  } finally {
+    root.close();
+  }
 }
 
 function lstatIfPresent(path: string): BigIntFileStat | undefined {
@@ -1729,12 +1878,16 @@ function withPublicationAdmission<T>(homeDir: string, callback: (admission: Publ
         // boundary. The callback keeps the acquired token through every
         // root/config/source witness in the established-root case.
         assertBackendPublicationConsumerAccess({ homeDir, lockToken });
+        const parentAuthority = classifyHomeParent(topology, homeDir, true);
         return callback({
           topology,
+          parentAuthority,
           withFinalLock: (nested) => nested(lockToken),
         });
       });
     }
+
+    const parentAuthority = classifyHomeParent(topology, homeDir, false);
 
     // There is no root-backed publication state to consume while the root is
     // absent. The authenticated bootstrap lock is the interprocess boundary
@@ -1742,6 +1895,7 @@ function withPublicationAdmission<T>(homeDir: string, callback: (admission: Publ
     // the active root appears.
     return callback({
       topology,
+      parentAuthority,
       withFinalLock: (nested) => withBackendPublicationConsumerLock(homeDir, (lockToken) => {
         assertBackendPublicationConsumerAccess({ homeDir, lockToken });
         return nested(lockToken);
@@ -1765,19 +1919,29 @@ export function bootstrapLcmHome(homeDir: string = homedir()): RuntimeHomeBootst
     const result = migrateLegacyHomeUnlocked(homeDir, topology, admission);
     const root = lstatIfPresent(lcmHomeDir(homeDir));
     if (root === undefined) {
-      const created = createPrivateRoot(topology, homeDir);
-      created.root.close();
-      const expected = treeWitnessOf(lcmHomeDir(homeDir));
-      return admission.withFinalLock(() => {
-        const current = treeWitnessOf(lcmHomeDir(homeDir));
-        if (!sameIdentity(current.identity, expected.identity) || current.hash !== expected.hash || current.mode !== PRIVATE_ROOT_MODE) {
-          throw new Error("private LCM root changed before bootstrap handoff");
+      const createdRoot = createPrivateRoot(topology, homeDir);
+      const rootPath = lcmHomeDir(homeDir);
+      try {
+        const captured = captureBootstrapRootWitness(createdRoot.root, rootPath);
+        const expectedHash = createdRoot.created ? emptyDirectoryTreeHash() : captured.hash;
+        if (captured.hash !== expectedHash) {
+          throw new Error(BOOTSTRAP_HANDOFF_ERROR);
         }
-        const rootHandle = openPrivateRoot(lcmHomeDir(homeDir));
-        rootHandle.close();
-        return { ...result, created: true };
-      });
+        const expected = { ...captured, hash: expectedHash };
+        return admission.withFinalLock(() => {
+          const current = captureBootstrapRootWitness(createdRoot.root, rootPath);
+          if (!sameTreeWitness(current, expected)) throw new Error(BOOTSTRAP_HANDOFF_ERROR);
+          // Compare before the legitimate direct-system-root witness write;
+          // that write changes the root's child set and therefore its hash.
+          refreshHomeParentWitness(topology, homeDir, admission.parentAuthority);
+          assertBootstrapRootCanonical(createdRoot.root, rootPath);
+          return { ...result, created: true };
+        });
+      } finally {
+        createdRoot.root.close();
+      }
     }
+    refreshHomeParentWitness(topology, homeDir, admission.parentAuthority);
     const rootHandle = openPrivateRoot(lcmHomeDir(homeDir));
     rootHandle.close();
     return { ...result, created: existingRoot === undefined };
@@ -1791,6 +1955,11 @@ export function bootstrapLcmHome(homeDir: string = homedir()): RuntimeHomeBootst
  */
 export function migrateLegacyHomeIfNeeded(homeDir: string = homedir()): RuntimeHomeMigration {
   return withPublicationAdmission(homeDir, (admission) => {
-    return migrateLegacyHomeUnlocked(homeDir, admission.topology, admission);
+    const result = migrateLegacyHomeUnlocked(homeDir, admission.topology, admission);
+    if (lstatIfPresent(lcmHomeDir(homeDir)) === undefined) return result;
+    return admission.withFinalLock(() => {
+      refreshHomeParentWitness(admission.topology, homeDir, admission.parentAuthority);
+      return result;
+    });
   });
 }

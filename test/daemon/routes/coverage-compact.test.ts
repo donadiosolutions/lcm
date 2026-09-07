@@ -55,7 +55,14 @@ const state = vi.hoisted(() => ({
   compactInputObserver: undefined as ((input: unknown) => void | Promise<void>) | undefined,
   compactInput: undefined as unknown,
   createMessagesBulk: vi.fn(async () => []),
+  readMetadata: vi.fn(),
   writeFileSync: vi.fn(),
+  closeMetadataDirectory: vi.fn(),
+  openMetadataDirectory: vi.fn(() => ({
+    fd: 1,
+    witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+    close: state.closeMetadataDirectory,
+  })),
   compactionStorageProbe: undefined as ((storage: {
     health: () => Promise<unknown>;
     close: () => Promise<void>;
@@ -91,6 +98,7 @@ vi.mock("../../../src/daemon/summarizer.js", () => ({
 }));
 
 vi.mock("../../../src/daemon/project.js", () => ({
+  MAX_PROJECT_METADATA_BYTES: 1024 * 1024,
   projectIdentity: (cwd: string, storageConfig: unknown) => {
     if (state.identityError !== undefined) throw state.identityError;
     const local = state.paths(cwd);
@@ -100,6 +108,20 @@ vi.mock("../../../src/daemon/project.js", () => ({
   ensureProjectDirForIdentity: state.ensureProject,
   isSafeTranscriptPath: () => true,
 }));
+vi.mock("../../../src/security-files.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../src/security-files.js")>();
+  return {
+    ...actual,
+    readBoundedRegularFile: (...args: Parameters<typeof actual.readBoundedRegularFile>) => {
+      if (!args[0].endsWith("/meta.json")) return actual.readBoundedRegularFile(...args);
+      state.readMetadata(...args);
+      if (state.metaError !== undefined) throw state.metaError;
+      return state.metaText;
+    },
+    atomicWritePrivateFile: state.writeFileSync,
+    openPrivateDirectory: state.openMetadataDirectory,
+  };
+});
 
 vi.mock("../../../src/daemon/project-queue.js", () => ({
   enqueue: (id: string, work: () => unknown, signal?: AbortSignal) => {
@@ -249,11 +271,6 @@ vi.mock("../../../src/compaction.js", () => ({
 vi.mock("node:fs", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:fs")>()),
   existsSync: () => state.existingMeta,
-  readFileSync: () => {
-    if (state.metaError !== undefined) throw state.metaError;
-    return state.metaText;
-  },
-  writeFileSync: state.writeFileSync,
 }));
 
 // Keep this route unit isolated from the daemon's eager route-registration graph.
@@ -303,6 +320,7 @@ import { BackendPublicationJournalError } from "../../../src/storage/backend-pub
 import {
   createAbortError,
 } from "../../../src/daemon/cancellation.js";
+import { sameStorageIdentity } from "../../../src/daemon/routes/storage-lifecycle.js";
 import {
   createInvocationCoordinator,
   InvocationCoordinatorError,
@@ -407,8 +425,17 @@ describe("compact route coverage", () => {
     state.compactInputObserver = undefined;
     state.compactInput = undefined;
     state.createMessagesBulk.mockClear();
+    state.readMetadata.mockReset();
     state.writeFileSync.mockReset();
     state.writeFileSync.mockImplementation(() => undefined);
+    state.closeMetadataDirectory.mockReset();
+    state.closeMetadataDirectory.mockImplementation(() => undefined);
+    state.openMetadataDirectory.mockReset();
+    state.openMetadataDirectory.mockImplementation(() => ({
+      fd: 1,
+      witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+      close: state.closeMetadataDirectory,
+    }));
     justCompactedMap.clear();
     state.compactionStorageProbe = undefined;
   });
@@ -418,6 +445,30 @@ describe("compact route coverage", () => {
       .toContain("1.0M");
     expect(buildCompactionMessage({ tokensBefore: 0, tokensAfter: 0, messageCount: 0, summaryCount: 0, maxDepth: 0, promotedCount: 0 }))
       .toContain("0.0% saved");
+  });
+
+  it("uses the shared full storage identity comparison contract", () => {
+    const expected = {
+      id: "remote-a",
+      localProjectId: "local-a",
+      canonical: "/work/project",
+      remoteProjectId: "remote-a",
+      machineId: "machine-a",
+      selectedPath: "/work/project",
+    };
+    expect(sameStorageIdentity(expected, {
+      ...expected,
+      machineId: "machine-b",
+      selectedPath: "/work/alias",
+    })).toBe(true);
+    for (const actual of [
+      { ...expected, id: "remote-b" },
+      { ...expected, localProjectId: "local-b" },
+      { ...expected, canonical: "/work/other" },
+      { ...expected, remoteProjectId: "remote-b" },
+    ]) {
+      expect(sameStorageIdentity(expected, actual)).toBe(false);
+    }
   });
 
   it("fails PostgreSQL identity before local directory, scrubber, or storage effects", async () => {
@@ -626,7 +677,7 @@ describe("compact route coverage", () => {
     expect(closeFactory).not.toHaveBeenCalled();
   });
 
-  it("revalidates local and remote identity before queued storage setup", async () => {
+  it("revalidates the shared full identity before queued storage setup", async () => {
     const first = {
       id: "local-hash-a",
       canonical: "/work/project",
@@ -931,6 +982,7 @@ describe("compact route coverage", () => {
     const coordinator = createInvocationCoordinator({ daemonInstanceId });
     coordinator.start({ invocationId, command: "compact", daemonInstanceId });
     state.writeFileSync.mockImplementation(() => { throw createAbortError(); });
+    state.closeMetadataDirectory.mockImplementationOnce(() => { throw new Error("close failed"); });
     const output = response();
 
     await createCompactHandlerProduction(config())(
@@ -942,6 +994,7 @@ describe("compact route coverage", () => {
 
     expect(output.status()).toBe(499);
     expect(state.writeFileSync).toHaveBeenCalledOnce();
+    expect(state.closeMetadataDirectory).toHaveBeenCalledOnce();
     expect(justCompactedMap.has("metadata-abort")).toBe(false);
     await coordinator.shutdown();
   });
@@ -1786,10 +1839,205 @@ describe("compact route coverage", () => {
     expect(body.actionTaken).toBe(false);
   });
 
+  it("publishes project identity before an empty PostgreSQL compact returns", async () => {
+    let metadata: Record<string, unknown> | undefined;
+    state.paths.mockImplementation((cwd: string) => ({
+      id: "local-project-id",
+      dir: "/tmp/project",
+      dbPath: "/tmp/project/lcm.db",
+      metaPath: "/tmp/project/meta.json",
+      canonical: cwd,
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+    }));
+    state.ensureProject.mockImplementation((
+      identity: { canonical: string },
+      options?: { writeMetadata?: boolean },
+    ) => {
+      if (options?.writeMetadata !== false) metadata = { cwd: identity.canonical };
+      return "/tmp/project";
+    });
+    state.tokenCount = 0;
+    const value = config();
+    value.storage = {
+      backend: "postgresql",
+      postgresql: {
+        url: "postgresql://runtime@example.invalid/lcm",
+        caFile: "/ca.pem",
+        poolMax: 1,
+        connectionTimeoutMs: 1,
+        idleTimeoutMs: 1,
+        statementTimeoutMs: 1,
+      },
+    };
+    const output = response();
+
+    await createCompactHandler(value)(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "postgres-empty-context", cwd: "/tmp" }),
+    );
+
+    expect(output.json()).toMatchObject({
+      actionTaken: false,
+      summary: "No messages to compact.",
+    });
+    expect(metadata).toEqual({ cwd: "/tmp" });
+    expect(state.ensureProject).toHaveBeenCalledOnce();
+    expect(state.ensureProject).toHaveBeenCalledWith(expect.objectContaining({
+      id: "local-project-id",
+      canonical: "/tmp",
+    }));
+    expect(state.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("publishes bounded private metadata after compaction", async () => {
+    state.metaText = JSON.stringify({ retained: true, lastIngest: "old" });
+
+    const body = await call(JSON.stringify({ session_id: "private-meta", cwd: "/tmp" }));
+
+    expect(body).toMatchObject({ actionTaken: false });
+    expect(state.ensureProject).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "pid", canonical: "/tmp" }),
+    );
+    expect(state.openMetadataDirectory).toHaveBeenCalledWith("/tmp/project", {
+      expectedUid: process.getuid?.(),
+    });
+    expect(state.readMetadata).toHaveBeenCalledWith("/tmp/project/meta.json", {
+      allowedRoot: "/tmp/project",
+      maxBytes: 1024 * 1024,
+      expectedUid: process.getuid?.(),
+      requireSingleLink: true,
+    });
+    expect(state.writeFileSync).toHaveBeenCalledOnce();
+    const [path, serialized, options, parent] = state.writeFileSync.mock.calls[0] as [
+      string,
+      string,
+      Record<string, never>,
+      unknown,
+    ];
+    expect(path).toBe("/tmp/project/meta.json");
+    expect(options).toEqual({});
+    expect(parent).toEqual(expect.objectContaining({ fd: 1 }));
+    expect(JSON.parse(serialized)).toMatchObject({
+      retained: true,
+      lastIngest: "old",
+      cwd: "/tmp",
+      lastCompact: expect.any(String),
+    });
+    expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(1024 * 1024);
+    expect(state.closeMetadataDirectory).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["malformed JSON", "{"],
+    ["null", "null"],
+    ["array", "[]"],
+    ["primitive", "42"],
+  ])("preserves %s metadata while keeping compaction successful", async (_label, content) => {
+    state.metaText = content;
+    const body = await call(JSON.stringify({ session_id: `invalid-${_label}`, cwd: "/tmp" }));
+    expect(body).toMatchObject({ actionTaken: false });
+    expect(state.writeFileSync).not.toHaveBeenCalled();
+    expect(state.openMetadataDirectory).not.toHaveBeenCalled();
+  });
+
+  it("preserves metadata rejected by the bounded reader", async () => {
+    state.metaError = new Error("metadata owner, link, type, or size is not trusted");
+    const body = await call(JSON.stringify({ session_id: "rejected-input", cwd: "/tmp" }));
+    expect(body).toMatchObject({ actionTaken: false });
+    expect(state.writeFileSync).not.toHaveBeenCalled();
+    expect(state.openMetadataDirectory).not.toHaveBeenCalled();
+  });
+
+  it("bounds expanded metadata output and keeps compaction successful", async () => {
+    state.metaText = JSON.stringify({ retained: "é".repeat(524_288) });
+    const body = await call(JSON.stringify({ session_id: "expanded-output", cwd: "/tmp" }));
+    expect(body).toMatchObject({ actionTaken: false });
+    expect(state.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("accepts metadata at the exact byte limit when updated output stays bounded", async () => {
+    const template = {
+      retained: "",
+      cwd: "/tmp",
+      lastCompact: "1970-01-01T00:00:00.000Z",
+    };
+    const fixedBytes = Buffer.byteLength(JSON.stringify(template, null, 2) + "\n", "utf8");
+    template.retained = "x".repeat(1024 * 1024 - fixedBytes);
+    state.metaText = JSON.stringify(template, null, 2) + "\n";
+    expect(Buffer.byteLength(state.metaText, "utf8")).toBe(1024 * 1024);
+
+    const body = await call(JSON.stringify({ session_id: "exact-limit", cwd: "/tmp" }));
+
+    expect(body).toMatchObject({ actionTaken: false });
+    expect(state.writeFileSync).toHaveBeenCalledOnce();
+    const serialized = state.writeFileSync.mock.calls[0]![1] as string;
+    expect(Buffer.byteLength(serialized, "utf8")).toBe(1024 * 1024);
+  });
+
+  it("closes the metadata directory after an ordinary writer failure", async () => {
+    state.writeFileSync.mockImplementationOnce(() => { throw new Error("atomic publication failed"); });
+    state.closeMetadataDirectory.mockImplementationOnce(() => { throw new Error("close failed"); });
+    const body = await call(JSON.stringify({ session_id: "write-close", cwd: "/tmp" }));
+    expect(body).toMatchObject({ actionTaken: false });
+    expect(state.writeFileSync).toHaveBeenCalledOnce();
+    expect(state.closeMetadataDirectory).toHaveBeenCalledOnce();
+  });
+
+  it("keeps compaction successful when metadata directory cleanup alone fails", async () => {
+    state.closeMetadataDirectory.mockImplementationOnce(() => { throw new Error("close failed"); });
+
+    const body = await call(JSON.stringify({ session_id: "close-only", cwd: "/tmp" }));
+
+    expect(body).toMatchObject({ actionTaken: false });
+    expect(state.writeFileSync).toHaveBeenCalledOnce();
+    expect(state.closeMetadataDirectory).toHaveBeenCalledOnce();
+    expect(justCompactedMap.has("close-only")).toBe(true);
+  });
+
+  it("preserves a critical metadata error when directory cleanup also fails", async () => {
+    const privateDetail = "private metadata journal details";
+    state.writeFileSync.mockImplementationOnce(() => {
+      throw new BackendPublicationJournalError("unexpected-state", privateDetail);
+    });
+    state.closeMetadataDirectory.mockImplementationOnce(() => { throw new Error("close failed"); });
+    const output = response();
+
+    await createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "journal-write-close", cwd: "/tmp" }),
+      testCompactContext,
+    );
+
+    expect(state.writeFileSync).toHaveBeenCalledOnce();
+    expect(state.closeMetadataDirectory).toHaveBeenCalledOnce();
+    expect(output.json()).toEqual({
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    expect(JSON.stringify(output.json())).not.toContain(privateDetail);
+  });
+
+  it("supports metadata publication without process.getuid", async () => {
+    const originalGetuid = process.getuid;
+    Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+    try {
+      await call(JSON.stringify({ session_id: "no-uid", cwd: "/tmp" }));
+    } finally {
+      Object.defineProperty(process, "getuid", { configurable: true, value: originalGetuid });
+    }
+    expect(state.openMetadataDirectory).toHaveBeenCalledWith("/tmp/project", {
+      expectedUid: undefined,
+    });
+  });
+
   it("initializes metadata when the metadata file is absent", async () => {
     state.metaError = Object.assign(new Error("missing"), { code: "ENOENT" });
     const body = await call(JSON.stringify({ session_id: "missing-meta", cwd: "/tmp" }));
     expect(body.summary).toBe("No compaction needed.");
+    expect(state.writeFileSync).toHaveBeenCalledOnce();
+    expect(state.closeMetadataDirectory).toHaveBeenCalledOnce();
   });
 
   it("sanitizes a publication failure during metadata persistence after compaction", async () => {

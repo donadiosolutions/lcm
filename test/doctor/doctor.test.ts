@@ -1,9 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, symlinkSync, lstatSync, readdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, lstatSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
+import type { DoctorDeps } from "../../src/doctor/types.js";
+import { doctorConfigReadFailureSeams, doctorConfigSeams } from "./config-seams.js";
+import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-publication-journal.js";
+import {
+  PrivateMutationLockContentionError,
+  processStartTime as observedProcessStartTime,
+  readPrivateMutationLockOwner,
+} from "../../src/private-mutation-lock.js";
 import { renderGuidance } from "../../src/connectors/template-service.js";
 import { mergeClaudeSettings, REQUIRED_HOOKS } from "../../installer/install.js";
 import { legacyLcmMcpServerName } from "../../src/legacy-names.js";
@@ -11,15 +19,20 @@ import { LCM_MD_CONTENT } from "../../src/daemon/orientation.js";
 import { ensureDaemon, restartDaemon } from "../../src/daemon/lifecycle.js";
 import { emitDaemonNotice } from "../../src/hooks/daemon-notice.js";
 import { daemonRemediationMarkerPath } from "../../src/daemon/remediation.js";
+import { packageExecutable } from "../../src/runtime-root.js";
+import { RUNTIME_DIGEST } from "../../src/daemon/version.js";
 import {
   clearProjectMapCache,
   hashProjectPath,
   normalizeProjectPath,
 } from "../../src/project-map.js";
 import * as projectMapModule from "../../src/project-map.js";
+import * as worktreeReconciliationModule from "../../src/worktree-reconciliation.js";
 import {
   BackendPublicationJournalError,
+  assertBackendPublicationConfigReadAccess,
   backendPublicationCanonicalSha256,
+  withBackendPublicationConfigLockAsync,
 } from "../../src/storage/backend-publication.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
@@ -36,6 +49,8 @@ import { collectDetailedEventStats, collectEventStats } from "../../src/db/event
 const mockCollectEventStats = vi.mocked(collectEventStats);
 const mockCollectDetailedEventStats = vi.mocked(collectDetailedEventStats);
 let defaultDoctorHome: string;
+const TEST_RUNTIME_ENTRYPOINT = packageExecutable(import.meta.url, 3);
+const EXPECTED_RUNTIME_DIGEST = "a".repeat(64);
 
 beforeEach(() => {
   defaultDoctorHome = mkdtempSync(join(tmpdir(), "lcm-doctor-default-home-"));
@@ -70,8 +85,22 @@ function buildCleanSettingsJson(): string {
   return JSON.stringify({ mcpServers: { "lcm": {} } });
 }
 
-function minimalDeps(overrides: Partial<Parameters<typeof runDoctor>[0]> = {}) {
-  return {
+type DoctorOverrides = Partial<DoctorDeps> & {
+  /** Legacy publication seam adapter kept for the remaining deterministic refusal tests. */
+  _assertBackendPublication?: (homeDir: string, backend: "sqlite" | "postgresql") => void;
+};
+
+/**
+ * Build doctor dependencies. Configuration bytes come from the injected
+ * readFileSync/existsSync pair through the internal snapshot seam so the
+ * single production admission path is exercised. Pass
+ * `_readDaemonConfigRawSnapshot: undefined` explicitly to use the real
+ * filesystem snapshot reader against `homedir`.
+ */
+function minimalDeps(overrides: DoctorOverrides = {}): DoctorDeps {
+  const { _assertBackendPublication, ...rest } = overrides;
+  const base = {
+    collectBackendSnapshot: doctorConfigSeams("{}").collectBackendSnapshot,
     existsSync: () => true,
     readFileSync: (path: string) => {
       if (path.endsWith("config.json")) return "{}";
@@ -93,10 +122,38 @@ function minimalDeps(overrides: Partial<Parameters<typeof runDoctor>[0]> = {}) {
       message: "lcm: 7/7 tools",
     }),
     homedir: defaultDoctorHome,
+    _expectedRuntimeDigestForTesting: EXPECTED_RUNTIME_DIGEST,
     platform: "darwin",
-    _assertBackendPublication: () => undefined,
-    ...overrides,
+    ...rest,
   };
+  if (Object.hasOwn(rest, "_readDaemonConfigRawSnapshot")) return base;
+  const path = join(base.homedir, ".lcm", "config.json");
+  const assertReadAccess: DoctorDeps["_assertPublicationReadAccess"] = _assertBackendPublication === undefined
+    ? () => Object.freeze({ journalChecksumSha256: null })
+    : (_configPath, backend) => {
+      _assertBackendPublication(base.homedir, backend);
+      return Object.freeze({ journalChecksumSha256: null });
+    };
+  if (!base.existsSync(path)) return { ...base, ...doctorConfigSeams(null, assertReadAccess) };
+  let content: string;
+  try {
+    content = base.readFileSync(path, "utf-8");
+  } catch (error) {
+    return { ...base, ...doctorConfigReadFailureSeams(error) };
+  }
+  return { ...base, ...doctorConfigSeams(content, assertReadAccess) };
+}
+
+function writeLivePublicationOwner(home: string): void {
+  const processStartTime = observedProcessStartTime(process.pid);
+  if (processStartTime === null) throw new Error("current process birth time is unavailable");
+  writeFileSync(join(home, ".lcm.backend-publication.lock"), `${JSON.stringify({
+    version: 1,
+    pid: process.pid,
+    processStartTime,
+    nonce: "a".repeat(32),
+    createdAtMs: Date.now(),
+  })}\n`, { mode: 0o600 });
 }
 
 describe("doctor test fixture isolation", () => {
@@ -142,14 +199,18 @@ function publicationFileWitness(content: string | null): Record<string, unknown>
   };
 }
 
-function writeCompletedPublicationJournal(home: string, targetConfig: string | null): void {
+function writeCompletedPublicationJournal(
+  home: string,
+  targetConfig: string | null,
+  publicationId = "doctor-sentinel-test",
+): void {
   const publicationDir = join(home, ".lcm", "backend-publication");
   mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
   const sourceConfig = "{}";
   const absentProjectMap = publicationFileWitness(null);
   const payload = {
     version: 2,
-    publicationId: "doctor-sentinel-test",
+    publicationId,
     sourceBackend: "postgresql",
     targetBackend: "sqlite",
     phase: "completed",
@@ -230,7 +291,7 @@ describe("runDoctor canonical Claude skill check", () => {
     expect(check?.message).toContain("lcm-memory");
   });
 
-  it("repairs the canonical skill when it is missing", async () => {
+  it("recommends install when the canonical skill is missing", async () => {
     const written: Record<string, string> = {};
     const deps = minimalDeps({
       cwd: "/tmp/nonexistent-project-xyz",
@@ -240,11 +301,11 @@ describe("runDoctor canonical Claude skill check", () => {
     const results = await runDoctor(deps);
     const check = results.find((r) => r.name === "lcm-md");
     expect(check?.status).toBe("warn");
-    expect(check?.fixApplied).toBe(true);
-    expect(written[join(defaultDoctorHome, ".claude", "skills", "lcm-memory", "SKILL.md")]).toBeDefined();
+    expect(check).not.toHaveProperty("fixApplied");
+    expect(written).toEqual({});
   });
 
-  it("uses filesystem inspection before removing a recognized legacy skill", async () => {
+  it("preserves a recognized legacy skill", async () => {
     const legacySkillPath = join(defaultDoctorHome, ".claude", "skills", "lcm-context");
     mkdirSync(legacySkillPath, { recursive: true });
     writeFileSync(join(legacySkillPath, "SKILL.md"), "legacy lcm guidance\n");
@@ -259,12 +320,12 @@ describe("runDoctor canonical Claude skill check", () => {
     }));
 
     expect(results.find((result) => result.name === "lcm-md")?.status).toBe("pass");
-    expect(existsSync(legacySkillPath)).toBe(false);
+    expect(existsSync(legacySkillPath)).toBe(true);
   });
 });
 
 describe("runDoctor Claude integration ownership", () => {
-  it("persists legacy MCP cleanup when native hooks and the lcm MCP server are current", async () => {
+  it("preserves legacy MCP entries when native hooks and runtime registration are current", async () => {
     const runtimePath = join(process.cwd(), "dist", "lcm.mjs");
     const settings = mergeClaudeSettings({}, runtimePath);
     settings.mcpServers = {
@@ -282,19 +343,9 @@ describe("runDoctor Claude integration ownership", () => {
       writeFileSync: writes,
     }));
 
-    const settingsWrite = writes.mock.calls.find(([path]) => path.endsWith("settings.json"));
-    expect(settingsWrite).toBeDefined();
-    const persisted = JSON.parse(settingsWrite![1]);
-    expect(persisted.mcpServers).toEqual({
-      lcm: { type: "stdio", command: process.execPath, args: [runtimePath, "mcp"] },
-      unrelated: { command: "preserved" },
-    });
-    expect(results.find((result) => result.name === "hooks")?.status).toBe("pass");
-    expect(results.find((result) => result.name === "mcp-lcm")).toMatchObject({
-      status: "warn",
-      fixApplied: true,
-      message: "Removed the legacy lossless-claude MCP registration",
-    });
+    expect(writes).not.toHaveBeenCalled();
+    expect(results.find(r => r.name === "hooks")?.status).toBe("pass");
+    expect(results.find(r => r.name === "mcp-lcm")?.status).toBe("pass");
   });
 
   it("leaves an absent Claude integration read-only during Codex-only doctor runs", async () => {
@@ -315,6 +366,234 @@ describe("runDoctor Claude integration ownership", () => {
 });
 
 describe("runDoctor project map checks", () => {
+  it("admits a doctor read while the publication lock is held", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-lock-contention-"));
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(home, ".lcm", "config.json"), "{}\n", { mode: 0o600 });
+    try {
+      await withBackendPublicationConfigLockAsync(join(home, ".lcm", "config.json"), async () => {
+        const results = await runDoctor(minimalDeps({ homedir: home, _readDaemonConfigRawSnapshot: undefined }));
+        expect(results.find((result) => result.name === "config")).toMatchObject({ status: "pass" });
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks admission when the LCM root cannot be inspected", async () => {
+    const results = await runDoctor(minimalDeps({
+      _lstatLcmRootForTesting: (() => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); }) as never,
+    }));
+    expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+      status: "fail",
+      message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+    });
+    expect(results.find((result) => result.name === "project-map")?.status).toBe("skip");
+  });
+
+  it("blocks admission when the LCM root is a symlink", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-root-symlink-"));
+    const realRoot = join(home, "real-lcm");
+    mkdirSync(realRoot, { mode: 0o700 });
+    symlinkSync(realRoot, join(home, ".lcm"));
+    try {
+      // No lstat seam: the production filesystem inspection is exercised.
+      const results = await runDoctor(minimalDeps({ homedir: home, _readDaemonConfigRawSnapshot: undefined }));
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+      });
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("skip");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a symlink swap during the first publication admission", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-root-first-admission-swap-"));
+    const root = join(home, ".lcm");
+    const retainedRoot = join(home, "retained-lcm");
+    const configFile = join(root, "config.json");
+    mkdirSync(root, { mode: 0o700 });
+    writeFileSync(configFile, "{}\n", { mode: 0o600 });
+    let admissions = 0;
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        _readDaemonConfigRawSnapshot: undefined,
+        _assertPublicationReadAccess: (...args) => {
+          admissions += 1;
+          if (admissions === 1) {
+            renameSync(root, retainedRoot);
+            symlinkSync(retainedRoot, root);
+          }
+          return assertBackendPublicationConfigReadAccess(...args);
+        },
+      }));
+      expect(admissions).toBe(1);
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+      });
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("skip");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks an LCM root replacement on the invalid-config second snapshot path", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-invalid-root-second-snapshot-swap-"));
+    const root = join(home, ".lcm");
+    const retainedRoot = join(home, "retained-lcm");
+    const replacementRoot = join(home, "replacement-lcm");
+    const configFile = join(root, "config.json");
+    mkdirSync(root, { mode: 0o700 });
+    mkdirSync(replacementRoot, { mode: 0o700 });
+    writeFileSync(configFile, JSON.stringify({ storage: { backend: "invalid" } }), { mode: 0o600 });
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        _readDaemonConfigRawSnapshot: undefined,
+        _betweenConfigSnapshotsForTesting: () => {
+          renameSync(root, retainedRoot);
+          renameSync(join(retainedRoot, "config.json"), join(replacementRoot, "config.json"));
+          renameSync(replacementRoot, root);
+        },
+      }));
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+      });
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("skip");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["absent", "non-private"] as const)(
+    "preserves the legacy %s LCM-root read without publication evidence",
+    async (rootShape) => {
+      const home = mkdtempSync(join(tmpdir(), `lcm-doctor-legacy-${rootShape}-root-`));
+      if (rootShape === "non-private") {
+        mkdirSync(join(home, ".lcm"), { mode: 0o755 });
+        writeFileSync(join(home, ".lcm", "config.json"), "{}\n", { mode: 0o600 });
+      }
+      try {
+        const results = await runDoctor(minimalDeps({
+          homedir: home,
+          _readDaemonConfigRawSnapshot: undefined,
+        }));
+        expect(results.find((result) => result.name === "backend-publication")).toBeUndefined();
+        expect(results.find((result) => result.name === "config")).toMatchObject({ status: "pass" });
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("blocks admission when config bytes drift between lock-free snapshots", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-config-drift-"));
+    const configFile = join(home, ".lcm", "config.json");
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(configFile, "{}\n", { mode: 0o600 });
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap");
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        _readDaemonConfigRawSnapshot: undefined,
+        _betweenConfigSnapshotsForTesting: () => {
+          writeFileSync(configFile, JSON.stringify({ daemon: { port: 4545 } }), { mode: 0o600 });
+        },
+      }));
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+      });
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("skip");
+      expect(validateProjectMap).not.toHaveBeenCalled();
+    } finally {
+      validateProjectMap.mockRestore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks admission when invalid config bytes drift between lock-free snapshots", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-invalid-config-drift-"));
+    const lcmRoot = join(home, ".lcm");
+    const configFile = join(lcmRoot, "config.json");
+    const replacement = join(lcmRoot, "config.next.json");
+    mkdirSync(lcmRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(configFile, JSON.stringify({ daemon: { port: 4545 }, storage: { backend: "invalid" } }), { mode: 0o600 });
+    writeFileSync(replacement, JSON.stringify({ daemon: { port: 5656 }, storage: { backend: "invalid" } }), { mode: 0o600 });
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        _readDaemonConfigRawSnapshot: undefined,
+        _betweenConfigSnapshotsForTesting: () => renameSync(replacement, configFile),
+      }));
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+      });
+      expect(results.find((result) => result.name === "daemon")?.status).toBe("skip");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks invalid config when publication evidence changes between snapshots", async () => {
+    const invalidConfig = JSON.stringify({ storage: { backend: "invalid" } });
+    const admissions = vi.fn()
+      .mockReturnValueOnce(Object.freeze({ journalChecksumSha256: "a".repeat(64) }))
+      .mockReturnValueOnce(Object.freeze({ journalChecksumSha256: "b".repeat(64) }));
+    const results = await runDoctor(minimalDeps({
+      ...doctorConfigSeams(invalidConfig, admissions),
+    }));
+    expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+      status: "fail",
+      message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+    });
+    expect(results.find((result) => result.name === "daemon")?.status).toBe("skip");
+  });
+
+  it("blocks admission when publication evidence changes between lock-free snapshots", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-journal-drift-"));
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(home, ".lcm", "config.json"), "{}", { mode: 0o600 });
+    const firstChecksum = writeAbortedTerminalPublicationJournal(home, "terminal-publication-a");
+    const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap");
+    const admissions: Array<string | null> = [];
+    try {
+      const results = await runDoctor(minimalDeps({
+        homedir: home,
+        _readDaemonConfigRawSnapshot: undefined,
+        _assertPublicationReadAccess: (...args) => {
+          const admission = assertBackendPublicationConfigReadAccess(...args);
+          admissions.push(admission.journalChecksumSha256);
+          return admission;
+        },
+        _betweenConfigSnapshotsForTesting: () => {
+          // A second valid terminal journal with a different checksum: the
+          // config bytes and descriptor are unchanged, so only the evidence
+          // differs and the checksum inequality is the guard that fires.
+          writeAbortedTerminalPublicationJournal(home, "terminal-publication-b");
+        },
+      }));
+      expect(admissions).toHaveLength(2);
+      expect(admissions[0]).toBe(firstChecksum);
+      expect(admissions[1]).not.toBe(firstChecksum);
+      expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("authenticated publication state is invalid or unsafe"),
+      });
+      expect(results.find((result) => result.name === "config")?.status).toBe("pass");
+      expect(validateProjectMap).not.toHaveBeenCalled();
+    } finally {
+      validateProjectMap.mockRestore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("reports blocked publication admission without attempting repair", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-publication-blocked-"));
     try {
@@ -323,7 +602,7 @@ describe("runDoctor project map checks", () => {
       writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
       const results = await runDoctor(minimalDeps({
         homedir: home,
-        _assertBackendPublication: undefined,
+        _readDaemonConfigRawSnapshot: undefined,
       }));
 
       expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
@@ -345,7 +624,7 @@ describe("runDoctor project map checks", () => {
       const results = await runDoctor(minimalDeps({
         homedir: home,
         existsSync: (path: string) => !path.endsWith("config.json"),
-        _assertBackendPublication: undefined,
+        _readDaemonConfigRawSnapshot: undefined,
       }));
       expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
         status: "fail",
@@ -366,7 +645,7 @@ describe("runDoctor project map checks", () => {
       const results = await runDoctor(minimalDeps({
         homedir: home,
         existsSync: (path: string) => !path.endsWith("config.json"),
-        _assertBackendPublication: undefined,
+        _readDaemonConfigRawSnapshot: undefined,
       }));
       expect(results.find((result) => result.name === "backend-publication")).toBeUndefined();
       expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
@@ -379,19 +658,26 @@ describe("runDoctor project map checks", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-untrusted-config-"));
     const validateProjectMap = vi.spyOn(projectMapModule, "validateProjectMap");
     writeCompletedPublicationJournal(home, null);
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    const configFile = join(home, ".lcm", "config.json");
+    if (_label === "oversized") {
+      // One byte over the bounded snapshot limit: the real reader refuses it
+      // before any bytes are trusted.
+      writeFileSync(configFile, "x".repeat(4 * 1024 * 1024 + 1), { mode: 0o600 });
+    } else {
+      // A directory in place of the config file fails the regular-file check.
+      mkdirSync(configFile, { mode: 0o700 });
+    }
     try {
-      const boundedRead: (path: string, maxBytes: number) => string = _label === "oversized"
-        ? () => { throw new Error("file exceeds the configured size limit"); }
-        : () => { throw new Error("config read refused"); };
       const results = await runDoctor(minimalDeps({
         homedir: home,
-        _assertBackendPublication: undefined,
-        _readBoundedConfig: boundedRead,
+        _readDaemonConfigRawSnapshot: undefined,
       }));
       expect(results.find((result) => result.name === "backend-publication")).toMatchObject({
         status: "fail",
         message: expect.stringContaining("Backend publication admission is blocked"),
       });
+      expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
       expect(results.find((result) => result.name === "project-map")).toMatchObject({ status: "skip" });
       expect(results.find((result) => result.name === "events-capture")).toMatchObject({ status: "skip" });
       expect(validateProjectMap).not.toHaveBeenCalled();
@@ -409,15 +695,15 @@ describe("runDoctor project map checks", () => {
     const assertPublication = vi.fn(() => {
       throw new BackendPublicationJournalError("unresolved-publication", "publication remains unresolved");
     });
-    const base = minimalDeps();
+    const base = minimalDeps({
+      readFileSync: (path: string) => path.endsWith("config.json") ? content : minimalDeps().readFileSync(path),
+      _assertBackendPublication: assertPublication,
+    });
     try {
-      const results = await runDoctor({
-        ...base,
-        readFileSync: (path: string) => path.endsWith("config.json") ? content : base.readFileSync(path),
-        _assertBackendPublication: assertPublication,
-      });
-      if (_label === "malformed config") expect(assertPublication).toHaveBeenCalledOnce();
-      else expect(assertPublication).not.toHaveBeenCalled();
+      const results = await runDoctor(base);
+      // Both variants observe bytes safely through the seam, so the candidate
+      // backend is authenticated exactly once after validation fails.
+      expect(assertPublication).toHaveBeenCalledOnce();
       expect(validateProjectMap).not.toHaveBeenCalled();
       expect(results.find((result) => result.name === "backend-publication")).toMatchObject({ status: "fail" });
       expect(results.find((result) => result.name === "project-map")).toMatchObject({ status: "skip" });
@@ -471,150 +757,26 @@ describe("runDoctor project map checks", () => {
     });
   });
 
-  it("rethrows unexpected publication admission failures", async () => {
-    await expect(runDoctor(minimalDeps({
-      _assertBackendPublication: () => {
-        throw new Error("unexpected publication failure");
-      },
-    }))).rejects.toThrow("unexpected publication failure");
+  it("sanitizes unexpected publication admission failures", async () => {
+    const results = await runDoctor(minimalDeps({
+      _assertBackendPublication: () => { throw new Error("unexpected private publication failure"); },
+    }));
+    expect(results.find(r => r.name === "doctor-observation")?.status).toBe("fail");
+    expect(JSON.stringify(results)).not.toContain("private publication failure");
   });
 
-  it("renders blocked reconciliation guidance without retrying through project patterns", async () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-blocked-reconciliation-"));
-    try {
-      const main = join(home, "main");
-      const linked = join(home, "linked");
-      const commonDir = join(main, ".git");
-      const linkedGitDir = join(commonDir, "worktrees", "linked");
-      mkdirSync(join(commonDir, "objects"), { recursive: true });
-      mkdirSync(linkedGitDir, { recursive: true });
-      mkdirSync(linked);
-      writeFileSync(join(commonDir, "HEAD"), "ref: refs/heads/main\n");
-      writeFileSync(join(commonDir, "config"), "[core]\nrepositoryformatversion = 0\n");
-      writeFileSync(join(linkedGitDir, "HEAD"), "ref: refs/heads/linked\n");
-      writeFileSync(join(linkedGitDir, "commondir"), "../..\n");
-      writeFileSync(join(linked, ".git"), `gitdir: ${linkedGitDir}\n`);
-      writeFileSync(join(linkedGitDir, "gitdir"), `${join(linked, ".git")}\n`);
-      const targetHash = hashProjectPath(main);
-      const sourceHash = hashProjectPath(linked);
-      mkdirSync(join(home, ".lcm", "reconciliations"), { recursive: true });
-      writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({
-        [targetHash]: {
-          canonical: main,
-          aliases: [],
-          remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
-        },
-        [sourceHash]: {
-          canonical: linked,
-          aliases: [],
-          remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
-        },
-      }));
-      writeFileSync(
-        join(home, ".lcm", "reconciliations", `${targetHash}.json`),
-        JSON.stringify({
-          version: 1,
-          targetHash,
-          canonical: main,
-          sourceHashes: [],
-          pendingSourceHashes: [],
-          aliases: [main],
-          createdAt: "2026-07-25T00:00:00.000Z",
-          updatedAt: "2026-07-25T00:00:00.000Z",
-          phase: "blocked",
-          blockedFrom: "planned",
-          reason: "conflicting PostgreSQL project bindings",
-          backupPaths: [],
-        }),
-      );
-      clearProjectMapCache();
-
-      const results = await runDoctor(minimalDeps({
-        homedir: home,
-        cwd: main,
-      }));
-
-      expect(results.find((result) => result.name === "worktree-reconciliation"))
-        .toMatchObject({
-          status: "fail",
-          message: expect.stringContaining("reconcile-worktrees"),
-        });
-      expect(results.find((result) => result.name === "user-patterns"))
-        .toBeDefined();
-    } finally {
-      clearProjectMapCache();
-      rmSync(home, { recursive: true, force: true });
-    }
-  });
-
-  it.each([
-    ["blocked", "fail"],
-    ["merged", "warn"],
-    ["completed", "pass"],
-  ] as const)("reports %s worktree reconciliation journals", async (phase, status) => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-reconciliation-"));
-    try {
-      const targetHash = "a".repeat(64);
-      const root = join(home, ".lcm", "reconciliations");
-      mkdirSync(root, { recursive: true });
-      writeFileSync(join(root, `${targetHash}.json`), JSON.stringify({
-        version: 1,
-        targetHash,
-        canonical: "/project",
-        sourceHashes: ["b".repeat(64)],
-        aliases: ["/project"],
-        createdAt: "2026-07-25T00:00:00.000Z",
-        updatedAt: "2026-07-25T00:00:00.000Z",
-        phase,
-        backupPaths: [],
-      }));
-
-      const results = await runDoctor(minimalDeps({
-        homedir: home,
-        cwd: "/tmp/nonexistent-project-xyz",
-      }));
-      expect(results.find((result) => result.name === "worktree-reconciliation"))
-        .toMatchObject({ status });
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
-  });
-
-  it("reports malformed reconciliation journals and plural completed counts", async () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-reconciliation-malformed-"));
-    try {
-      const root = join(home, ".lcm", "reconciliations");
-      mkdirSync(root, { recursive: true });
-      writeFileSync(join(root, `${"a".repeat(64)}.json`), "{}");
-      let results = await runDoctor(minimalDeps({
-        homedir: home,
-        cwd: "/tmp/nonexistent-project-xyz",
-      }));
-      expect(results.find((result) => result.name === "worktree-reconciliation"))
-        .toMatchObject({ status: "fail", message: expect.stringContaining("malformed") });
-
-      for (const hash of ["a".repeat(64), "b".repeat(64)]) {
-        writeFileSync(join(root, `${hash}.json`), JSON.stringify({
-          version: 1,
-          targetHash: hash,
-          canonical: "/project",
-          sourceHashes: [],
-          aliases: ["/project"],
-          createdAt: "2026-07-25T00:00:00.000Z",
-          updatedAt: "2026-07-25T00:00:00.000Z",
-          phase: "completed",
-          backupPaths: [],
-        }));
-      }
-      results = await runDoctor(minimalDeps({
-        homedir: home,
-        cwd: "/tmp/nonexistent-project-xyz",
-      }));
-      expect(results.find((result) => result.name === "worktree-reconciliation"))
-        .toMatchObject({ status: "pass", message: "2 completed reconciliations" });
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
+  it("leaves reconciliation journals unprobed and provides an explicit command", async () => {
+    const journalRoot = join(defaultDoctorHome, ".lcm", "reconciliations");
+    mkdirSync(journalRoot, { mode: 0o700 });
+    const journalPath = join(journalRoot, `${"a".repeat(64)}.json`);
+    writeFileSync(journalPath, "private malformed journal", { mode: 0o600 });
+    const before = statSync(journalPath);
+    const results = await runDoctor(minimalDeps());
+    expect(results.find(r => r.name === "worktree-reconciliation")).toMatchObject({
+      status: "skip", message: expect.stringContaining("lcm project reconcile-worktrees"),
+    });
+    expect(statSync(journalPath).mtimeMs).toBe(before.mtimeMs);
+    expect(readFileSync(journalPath, "utf8")).toBe("private malformed journal");
   });
 
   it("fails on invalid map JSON", async () => {
@@ -627,13 +789,13 @@ describe("runDoctor project map checks", () => {
       const check = results.find((r) => r.name === "project-map");
 
       expect(check?.status).toBe("fail");
-      expect(check?.message).toContain("map.json");
+      expect(check?.message).toContain("Project map");
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
   });
 
-  it("auto-formats valid compact map JSON", async () => {
+  it("preserves valid compact map JSON bytes", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-format-"));
     try {
       const canonical = join(home, "project");
@@ -646,10 +808,9 @@ describe("runDoctor project map checks", () => {
       const results = await runDoctor(minimalDeps({ homedir: home, cwd: "/tmp/nonexistent-project-xyz" }));
       const check = results.find((r) => r.name === "project-map");
 
-      expect(check?.status).toBe("warn");
-      expect(check?.fixApplied).toBe(true);
-      expect(check?.message).toContain("backup:");
-      expect(readFileSync(mapPath, "utf-8")).toBe(JSON.stringify({ [hash]: { canonical, aliases: [] } }, null, 2) + "\n");
+      expect(check?.status).toBe("pass");
+      expect(check).not.toHaveProperty("fixApplied");
+      expect(readFileSync(mapPath, "utf-8")).toBe(JSON.stringify({ [hash]: { canonical, aliases: [] } }));
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -696,7 +857,7 @@ describe("runDoctor project map checks", () => {
     }
   });
 
-  it("reports project map auto-fix write failures without aborting doctor", async () => {
+  it("reports a non-private map as unavailable without aborting doctor", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-doctor-map-write-fail-"));
     try {
       const canonical = join(home, "project");
@@ -710,7 +871,7 @@ describe("runDoctor project map checks", () => {
       const check = results.find((r) => r.name === "project-map");
 
       expect(check?.status).toBe("fail");
-      expect(check?.message).toContain("map.json");
+      expect(check?.message).toContain("Project map");
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -737,734 +898,16 @@ describe("runDoctor project map checks", () => {
       const check = results.find((r) => r.name === "project-map");
 
       expect(check?.status).toBe("fail");
-      expect(check?.message).toContain("multiple hashes");
+      expect(check?.message).toContain("ambiguous");
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
-  });
-});
-
-describe("runDoctor daemon version mismatch", () => {
-  it("uses a lexical remediation scope when the state root is absent", async () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-remediation-"));
-    try {
-      const results = await runDoctor(minimalDeps({
-        homedir: home,
-        cwd: "/tmp/nonexistent-project-xyz",
-      }));
-      expect(results.find((result) => result.name === "daemon")?.message).toContain(
-        "lcm daemon unavailable (not-running)",
-      );
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
-  });
-
-  it("uses a lexical remediation scope when the home directory is not created", async () => {
-    const home = mkdtempSync(join(tmpdir(), "lcm-doctor-missing-home-"));
-    const uncreatedHome = home;
-    symlinkSync(join(home, "missing-lcm"), join(home, ".lcm"));
-    try {
-      const results = await runDoctor(minimalDeps({
-        homedir: uncreatedHome,
-        cwd: "/tmp/nonexistent-project-xyz",
-      }));
-
-      expect(results.find((result) => result.name === "daemon")?.message).toContain(
-        "backend publication admission is blocked",
-      );
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
-  });
-
-  it("uses an authoritative refusal reason for live daemon evidence", async () => {
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: false,
-      port: 3737,
-      spawned: false,
-      refusalReason: "live-no-response",
-    } as never);
-    const results = await runDoctor(minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      fetch: vi.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: async () => ({ status: "ok", version: "0.5.0" }),
-      }),
-    }));
-    expect(results.find((result) => result.name === "daemon")?.message).toContain(
-      "lcm daemon unavailable (live-no-response)",
-    );
-  });
-
-  it.each(["fetch", "json"] as const)(
-    "bounds the complete daemon health %s phase to two seconds",
-    async (phase) => {
-      vi.useFakeTimers();
-      let signal: AbortSignal | undefined;
-      const fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-        signal = init?.signal ?? undefined;
-        if (phase === "fetch") {
-          return await new Promise<Response>(() => undefined);
-        }
-        return {
-          ok: true,
-          status: 200,
-          json: async () => await new Promise(() => undefined),
-        } as Response;
-      });
-
-      const pending = runDoctor(minimalDeps({
-        cwd: "/tmp/nonexistent-project-xyz",
-        fetch: fetch as typeof globalThis.fetch,
-      }));
-      await vi.advanceTimersByTimeAsync(1999);
-      expect(signal?.aborted).toBe(false);
-      await vi.advanceTimersByTimeAsync(1);
-      const results = await pending;
-
-      expect(signal?.aborted).toBe(true);
-      expect(results.find((result) => result.name === "daemon")).toMatchObject({
-        status: "fail",
-      });
-    },
-  );
-
-  it("restarts a healthy daemon that is not parented by user systemd", async (): Promise<void> => {
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: true,
-      port: 7865,
-      spawned: true,
-      restartedForParent: true,
-      startMethod: "systemd-user",
-    });
-
-    const deps = minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      fetch: vi.fn()
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
-    });
-
-    const results = await runDoctor(deps);
-    const daemonResult = results.find((r) => r.name === "daemon");
-
-    expect(vi.mocked(ensureDaemon)).toHaveBeenCalledWith(
-      expect.objectContaining({ enforceUserManagerParent: true }),
-    );
-    expect(daemonResult?.status).toBe("warn");
-    expect(daemonResult?.fixApplied).toBe(true);
-    expect(daemonResult?.message).toContain("restarted under user systemd");
-  });
-
-  it("warns when Linux fallback starts a daemon without satisfying the parent invariant", async (): Promise<void> => {
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: true,
-      port: 7865,
-      spawned: true,
-      startMethod: "detached-spawn",
-      warning: "user systemd start failed (No medium found); used detached spawn fallback; daemon parent invariant is not satisfied",
-    });
-
-    const deps = minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      fetch: vi.fn()
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
-    });
-
-    const results = await runDoctor(deps);
-    const daemonResult = results.find((r) => r.name === "daemon");
-
-    expect(daemonResult?.status).toBe("warn");
-    expect(daemonResult?.fixApplied).toBe(false);
-    expect(daemonResult?.message).toContain("daemon parent invariant is not satisfied");
-  });
-
-  it("auto-restarts daemon on version mismatch and reports fixApplied when post-restart version matches", async (): Promise<void> => {
-    const pkgVersion = "0.6.0";
-    const daemonVersion = "0.5.0";
-
-    // restartDaemon returns connected on the authenticated migration attempt
-    vi.mocked(restartDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: true, restarted: true });
-
-    const deps = minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      readFileSync: (path: string) => {
-        if (path.endsWith("config.json")) return "{}";
-        if (path.endsWith("settings.json")) return buildSettingsJson();
-        if (path.endsWith("package.json")) return JSON.stringify({ version: pkgVersion });
-        if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
-        if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
-        return "{}";
-      },
-      // First fetch: daemon up with old version; second fetch: post-restart with new version
-      fetch: vi.fn()
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: daemonVersion }) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: pkgVersion }) }),
-    });
-
-    const results = await runDoctor(deps);
-    const daemonResult = results.find((r) => r.name === "daemon");
-
-    expect(vi.mocked(restartDaemon)).toHaveBeenCalledWith(
-      expect.objectContaining({ expectedVersion: pkgVersion, expectedStorageBackend: "sqlite" }),
-    );
-    expect(vi.mocked(ensureDaemon)).not.toHaveBeenCalled();
-    expect(daemonResult?.fixApplied).toBe(true);
-    expect(daemonResult?.message).toContain("restarted");
-    expect(daemonResult?.message).toContain(daemonVersion);
-    expect(daemonResult?.message).toContain(pkgVersion);
-  });
-
-  it("keeps matching-version health on ensureDaemon and never calls restartDaemon", async (): Promise<void> => {
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: false });
-    const deps = minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      fetch: vi.fn()
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
-    });
-
-    const results = await runDoctor(deps);
-    expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
-    expect(vi.mocked(restartDaemon)).not.toHaveBeenCalled();
-    expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "pass" });
-  });
-
-  it.each([
-    undefined,
-    "managed restart warning",
-  ] as const)("repairs matching-version stale configuration with an identical restart request (%s)", async (warning): Promise<void> => {
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: false,
-      port: 3737,
-      spawned: false,
-      refusalReason: "stale-config",
-    });
-    vi.mocked(restartDaemon).mockResolvedValueOnce({
-      connected: true,
-      port: 3737,
-      spawned: true,
-      restarted: true,
-      ...(warning === undefined ? {} : { warning }),
-    });
-    const fetch = vi.fn()
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) });
-
-    const results = await runDoctor(minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      fetch,
-    }));
-    const daemonResult = results.find((result) => result.name === "daemon");
-    const ensureOptions = vi.mocked(ensureDaemon).mock.calls[0]?.[0];
-
-    expect(ensureOptions).toBeDefined();
-    expect(vi.mocked(restartDaemon)).toHaveBeenCalledOnce();
-    expect(vi.mocked(restartDaemon)).toHaveBeenCalledWith(ensureOptions);
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(daemonResult).toMatchObject({ status: "warn", fixApplied: true });
-    expect(daemonResult?.message).toContain("stale configuration repaired");
-    expect(daemonResult?.message).toContain("daemon restarted");
-    if (warning === undefined) expect(daemonResult?.message).not.toContain("Warning:");
-    else expect(daemonResult?.message).toContain(warning);
-  });
-
-  it.each(["null", "reject"] as const)(
-    "does not report stale configuration repair as healthy when authenticated follow-up health %s",
-    async (followUpOutcome): Promise<void> => {
-      vi.mocked(ensureDaemon).mockResolvedValueOnce({
-        connected: false,
-        port: 3737,
-        spawned: false,
-        refusalReason: "stale-config",
-      });
-      vi.mocked(restartDaemon).mockResolvedValueOnce({
-        connected: true,
-        port: 3737,
-        spawned: true,
-        restarted: true,
-      });
-
-      const stateRoot = join(defaultDoctorHome, ".lcm");
-      const markerPath = daemonRemediationMarkerPath(stateRoot);
-      emitDaemonNotice({
-        scope: stateRoot,
-        stateRoot,
-        reason: "stale-config",
-        write: () => undefined,
-      });
-      expect(existsSync(markerPath)).toBe(true);
-
-      const fetch = vi.fn()
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) });
-      if (followUpOutcome === "null") {
-        fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: "degraded", version: "0.5.0" }) });
-      } else {
-        fetch.mockRejectedValueOnce(new Error("authenticated health unavailable"));
-      }
-
-      const results = await runDoctor(minimalDeps({
-        cwd: "/tmp/nonexistent-project-xyz",
-        fetch,
-      }));
-      const daemonResult = results.find((result) => result.name === "daemon");
-
-      expect(vi.mocked(ensureDaemon)).toHaveBeenCalledOnce();
-      expect(vi.mocked(restartDaemon)).toHaveBeenCalledOnce();
-      expect(fetch).toHaveBeenCalledTimes(2);
-      expect(fetch.mock.calls[0]?.[1]).not.toMatchObject({ headers: expect.anything() });
-      expect(fetch.mock.calls[1]?.[1]).toMatchObject({ headers: { Authorization: "Bearer {}" } });
-      expect(daemonResult).toMatchObject({ status: "fail", fixApplied: false });
-      expect(daemonResult?.message).toContain("authenticated health could not be verified after restart");
-      expect(daemonResult?.message).toContain(
-        "lcm daemon unavailable (stale-config); run 'lcm daemon restart'.",
-      );
-      expect(results.find((result) => result.name === "mcp-handshake-lcm")).toBeUndefined();
-      expect(existsSync(markerPath)).toBe(true);
-    },
-  );
-
-  it("does not restart a matching-version daemon for a non-stale ensure refusal", async (): Promise<void> => {
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: false,
-      port: 3737,
-      spawned: false,
-      refusalReason: "invalid-collision",
-    });
-
-    const results = await runDoctor(minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      fetch: vi.fn().mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ status: "ok", version: "0.5.0" }),
-      }),
-    }));
-    const daemonResult = results.find((result) => result.name === "daemon");
-
-    expect(vi.mocked(restartDaemon)).not.toHaveBeenCalled();
-    expect(daemonResult).toMatchObject({ status: "fail", fixApplied: false });
-    expect(daemonResult?.message).toContain(
-      "lcm daemon unavailable (invalid-collision); run 'lcm daemon restart' or 'lcm doctor'.",
-    );
-  });
-
-  it("keeps a stale-config restart refusal failed with its exact remediation", async (): Promise<void> => {
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: false,
-      port: 3737,
-      spawned: false,
-      refusalReason: "stale-config",
-    });
-    vi.mocked(restartDaemon).mockResolvedValueOnce({
-      connected: false,
-      port: 3737,
-      spawned: false,
-      restarted: false,
-      refusalReason: "stale-config",
-    });
-
-    const results = await runDoctor(minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      fetch: vi.fn().mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ status: "ok", version: "0.5.0" }),
-      }),
-    }));
-    const daemonResult = results.find((result) => result.name === "daemon");
-
-    expect(vi.mocked(restartDaemon)).toHaveBeenCalledOnce();
-    expect(daemonResult).toMatchObject({ status: "fail", fixApplied: false });
-    expect(daemonResult?.message).toContain(
-      "lcm daemon unavailable (stale-config); run 'lcm daemon restart'.",
-    );
-  });
-
-  it("reports warn with fixApplied:false when restart does not fix version mismatch", async (): Promise<void> => {
-    const pkgVersion = "0.6.0";
-    const daemonVersion = "0.5.0";
-
-    vi.mocked(restartDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: true, restarted: true });
-
-    const deps = minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      readFileSync: (path: string) => {
-        if (path.endsWith("config.json")) return "{}";
-        if (path.endsWith("settings.json")) return buildSettingsJson();
-        if (path.endsWith("package.json")) return JSON.stringify({ version: pkgVersion });
-        if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
-        if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
-        return "{}";
-      },
-      // Post-restart health still returns old version
-      fetch: vi.fn()
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: daemonVersion }) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: daemonVersion }) }),
-    });
-
-    const results = await runDoctor(deps);
-    const daemonResult = results.find((r) => r.name === "daemon");
-
-    expect(daemonResult?.fixApplied).toBe(false);
-    expect(daemonResult?.status).toBe("warn");
-    expect(daemonResult?.message).toContain("did not fix mismatch");
-    expect(daemonResult?.message).toContain("lcm daemon start");
-    expect(daemonResult?.message).not.toContain("lcm daemon start --detach");
-    expect(daemonResult?.message).not.toContain("lcm daemon restart");
-  });
-
-  it("treats missing daemon version as a mismatch when package version is known", async (): Promise<void> => {
-    const pkgVersion = "0.6.0";
-
-    vi.mocked(restartDaemon).mockResolvedValueOnce({ connected: true, port: 7865, spawned: true, restarted: true });
-
-    const deps = minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      readFileSync: (path: string) => {
-        if (path.endsWith("config.json")) return "{}";
-        if (path.endsWith("settings.json")) return buildSettingsJson();
-        if (path.endsWith("package.json")) return JSON.stringify({ version: pkgVersion });
-        if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
-        if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
-        return "{}";
-      },
-      fetch: vi.fn()
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok" }) })
-        .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok" }) }),
-    });
-
-    const results = await runDoctor(deps);
-    const daemonResult = results.find((r) => r.name === "daemon");
-
-    expect(daemonResult?.status).toBe("warn");
-    expect(daemonResult?.fixApplied).toBe(false);
-    expect(daemonResult?.message).toContain("unknown version running");
-    expect(daemonResult?.message).toContain(`v${pkgVersion} installed`);
-  });
-
-  it("does not recommend event promotion when a stale daemon restart throws", async (): Promise<void> => {
-    const pkgVersion = "0.6.0";
-    const daemonVersion = "0.5.0";
-    vi.mocked(restartDaemon).mockRejectedValueOnce(new Error("restart failed"));
-    mockCollectEventStats.mockReturnValue({ captured: 5000, unprocessed: 2000, errors: 0, lastCapture: "2026-03-26 10:00:00", sidecarsWithUnprocessed: 1 });
-
-    const deps = minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      readFileSync: (path: string) => {
-        if (path.endsWith("config.json")) return "{}";
-        if (path.endsWith("settings.json")) return buildSettingsJson();
-        if (path.endsWith("package.json")) return JSON.stringify({ version: pkgVersion });
-        if (path.endsWith("CLAUDE.md")) return "<!-- lcm:start -->\n<!-- Claude Code include: @lcm.md -->\n<!-- lcm:end -->\n";
-        if (path.endsWith("lcm.md")) return LCM_MD_CONTENT;
-        return "{}";
-      },
-      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: daemonVersion }) }),
-    });
-
-    const results = await runDoctor(deps);
-    const capture = results.find((r) => r.name === "events-capture");
-    const daemonResult = results.find((r) => r.name === "daemon");
-
-    expect(daemonResult?.message).toContain("lcm daemon start");
-    expect(daemonResult?.message).not.toContain("lcm daemon start --detach");
-    expect(daemonResult?.message).not.toContain("lcm daemon restart");
-    expect(capture?.message).toContain("daemon may be offline");
-    expect(capture?.message).not.toContain("lcm events promote --all");
-  });
-
-  it("reports daemon validation failure when restart throws without version mismatch", async (): Promise<void> => {
-    vi.mocked(ensureDaemon).mockRejectedValueOnce(new Error("restart failed"));
-
-    const deps = minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      fetch: vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.5.0" }) }),
-    });
-
-    const results = await runDoctor(deps);
-    const daemonResult = results.find((r) => r.name === "daemon");
-
-    expect(daemonResult?.status).toBe("warn");
-    expect(daemonResult?.message).toContain("daemon validation failed");
-    expect(daemonResult?.message).toContain("lcm daemon start");
-    expect(daemonResult?.message).not.toContain("lcm daemon start --detach");
-  });
-
-  it("reports daemon auto-start warnings when starting an offline daemon", async (): Promise<void> => {
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: true,
-      port: 7865,
-      spawned: true,
-      startMethod: "detached-spawn",
-      warning: "user systemd manager unavailable; daemon parent invariant is not verified",
-    });
-
-    const deps = minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      fetch: vi.fn().mockResolvedValueOnce({ ok: false }),
-    });
-
-    const results = await runDoctor(deps);
-    const daemonResult = results.find((r) => r.name === "daemon");
-
-    expect(daemonResult?.status).toBe("warn");
-    expect(daemonResult?.fixApplied).toBe(true);
-    expect(daemonResult?.message).toContain("localhost:3737");
-    expect(daemonResult?.message).toContain("daemon parent invariant is not verified");
-  });
-
-  it("authenticates healthy storage after auto-start before promising queue drain", async () => {
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: true,
-      port: 3737,
-      spawned: true,
-      pid: 4242,
-      startMethod: "systemd-user",
-    });
-    mockCollectEventStats.mockReturnValue({
-      captured: 100,
-      unprocessed: 5,
-      errors: 0,
-      lastCapture: "2026-03-26 10:00:00",
-    });
-    const fetch = vi.fn()
-      .mockRejectedValueOnce(new Error("daemon offline"))
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          status: "ok",
-          version: "0.5.0",
-          storageBackend: "sqlite",
-          uptime: 1,
-          pid: 4242,
-        }),
-      });
-
-    const results = await runDoctor(minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      fetch,
-      readFileSync: (path: string) => path.endsWith("daemon.token")
-        ? "doctor-token"
-        : minimalDeps().readFileSync(path),
-    }));
-
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(fetch).toHaveBeenNthCalledWith(
-      2,
-      "http://127.0.0.1:3737/health",
-      {
-        headers: { Authorization: "Bearer doctor-token" },
-        signal: expect.any(AbortSignal),
-      },
-    );
-    expect(results.find((result) => result.name === "daemon")).toMatchObject({
-      status: "warn",
-      fixApplied: true,
-      message: expect.stringContaining("started"),
-    });
-    expect(results.find((result) => result.name === "events-capture")).toMatchObject({
-      status: "pass",
-      message: expect.stringContaining("queued for automatic daemon processing"),
-    });
-  });
-
-  it("reports authenticated staged storage after PostgreSQL auto-start", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "lcm-doctor-postgres-autostart-"));
-    const caFile = join(dir, "ca.pem");
-    writeFileSync(caFile, "test-ca");
-    const previousUrl = process.env.LCM_POSTGRES_URL;
-    const previousCaFile = process.env.LCM_POSTGRES_CA_FILE;
-    const previousMigrationRole = process.env.LCM_POSTGRES_MIGRATION_ROLE;
-    process.env.LCM_POSTGRES_URL = "postgresql://user:password@db.example/lcm";
-    process.env.LCM_POSTGRES_CA_FILE = caFile;
-    process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
-    const stagedHealth = {
-      status: "unavailable",
-      version: "0.5.0",
-      storageBackend: "postgresql",
-      uptime: 1,
-      pid: 4242,
-      storage: {
-        status: "unavailable",
-        error: {
-          code: "STORAGE_INITIALIZATION_FAILED",
-          backend: "postgresql",
-          domain: "factory",
-          operation: "health",
-        },
-      },
-    };
-    const fetch = vi.fn()
-      .mockRejectedValueOnce(new Error("daemon offline"))
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 503,
-        json: async () => stagedHealth,
-      });
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: true,
-      port: 3737,
-      spawned: true,
-      pid: 4242,
-      startMethod: "systemd-user",
-    });
-    mockCollectEventStats.mockReturnValue({
-      captured: 100,
-      unprocessed: 5,
-      errors: 0,
-      lastCapture: "2026-03-26 10:00:00",
-    });
-    try {
-      const results = await runDoctor(minimalDeps({
-        cwd: "/tmp/nonexistent-project-xyz",
-        fetch,
-        readFileSync: (path: string) => {
-          if (path.endsWith("config.json")) {
-            return JSON.stringify({ storage: { backend: "postgresql" } });
-          }
-          if (path.endsWith("daemon.token")) return "doctor-token";
-          return minimalDeps().readFileSync(path);
-        },
-      }));
-
-      expect(fetch).toHaveBeenCalledTimes(2);
-      expect(fetch).toHaveBeenNthCalledWith(
-        2,
-        "http://127.0.0.1:3737/health",
-        {
-          headers: { Authorization: "Bearer doctor-token" },
-          signal: expect.any(AbortSignal),
-        },
-      );
-      expect(results.find((result) => result.name === "events-capture")).toMatchObject({
-        status: "warn",
-        message: expect.stringContaining("storage is unavailable"),
-      });
-      expect(results.find((result) => result.name === "events-capture")?.message)
-        .not.toContain("could not be authenticated");
-    } finally {
-      if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
-      else process.env.LCM_POSTGRES_URL = previousUrl;
-      if (previousCaFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
-      else process.env.LCM_POSTGRES_CA_FILE = previousCaFile;
-      if (previousMigrationRole === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE;
-      else process.env.LCM_POSTGRES_MIGRATION_ROLE = previousMigrationRole;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("keeps auto-started storage unverified when the daemon token is unreadable", async () => {
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: true,
-      port: 3737,
-      spawned: true,
-      pid: 4242,
-      startMethod: "systemd-user",
-    });
-    mockCollectEventStats.mockReturnValue({
-      captured: 100,
-      unprocessed: 5,
-      errors: 0,
-      lastCapture: "2026-03-26 10:00:00",
-    });
-    const fetch = vi.fn().mockRejectedValueOnce(new Error("daemon offline"));
-
-    const results = await runDoctor(minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      fetch,
-      readFileSync: (path: string) => {
-        if (path.endsWith("daemon.token")) throw new Error("permission denied");
-        return minimalDeps().readFileSync(path);
-      },
-    }));
-
-    expect(fetch).toHaveBeenCalledOnce();
-    expect(results.find((result) => result.name === "daemon")).toMatchObject({
-      status: "warn",
-      fixApplied: true,
-      message: expect.stringContaining("started"),
-    });
-    expect(results.find((result) => result.name === "events-capture")).toMatchObject({
-      status: "warn",
-      message: expect.stringContaining("storage readiness could not be authenticated"),
-    });
-    expect(results.find((result) => result.name === "events-capture")?.message)
-      .toContain("restore access to the daemon token and authenticated diagnostics");
-  });
-
-  it("does not recognize unavailable non-staged health before or after auto-start", async () => {
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: true,
-      port: 3737,
-      spawned: true,
-    });
-    const fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ status: "unavailable", version: "0.5.0" }),
-    });
-
-    const results = await runDoctor(minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      fetch,
-      readFileSync: (path: string) => path.endsWith("daemon.token")
-        ? "doctor-token"
-        : minimalDeps().readFileSync(path),
-    }));
-
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(fetch).toHaveBeenNthCalledWith(
-      2,
-      "http://127.0.0.1:3737/health",
-      {
-        headers: { Authorization: "Bearer doctor-token" },
-        signal: expect.any(AbortSignal),
-      },
-    );
-    expect(results.find((result) => result.name === "daemon")).toMatchObject({
-      status: "warn",
-      fixApplied: true,
-    });
-    expect(results.find((result) => result.name === "daemon")?.message)
-      .toContain("started");
-  });
-
-  it("ignores unrecognized health returned after validating a healthy daemon", async () => {
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: true,
-      port: 3737,
-      spawned: false,
-    });
-    const fetch = vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ status: "ok", version: "0.5.0" }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ status: "unavailable", version: "0.5.0" }),
-      });
-
-    const results = await runDoctor(minimalDeps({
-      cwd: "/tmp/nonexistent-project-xyz",
-      fetch,
-    }));
-
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(results.find((result) => result.name === "daemon")).toMatchObject({
-      status: "pass",
-      message: "localhost:3737 (up)",
-    });
   });
 });
 
 describe("runDoctor summarizer modes", () => {
   it("reports auto mode as Claude and Codex process defaults", async () => {
-    const results = await runDoctor({
+    const results = await runDoctor(minimalDeps({
       existsSync: () => true,
       readFileSync: (path: string) => {
         if (path.endsWith("config.json")) return JSON.stringify({ llm: { provider: "auto" } });
@@ -1486,7 +929,7 @@ describe("runDoctor summarizer modes", () => {
       fetch: vi.fn().mockResolvedValue({ ok: false }),
       homedir: defaultDoctorHome,
       platform: "darwin",
-    });
+    }));
 
     expect(results.find((result) => result.name === "stack")?.message).toContain("Summarizer: auto");
     expect(results.find((result) => result.name === "stack")?.message).toContain("Storage: sqlite");
@@ -1662,9 +1105,7 @@ describe("runDoctor configuration validation", () => {
     const config = results.find((result) => result.name === "config");
     const stack = results.find((result) => result.name === "stack");
     expect(config?.status).toBe("fail");
-    expect(config?.message).toContain("ConfigValidationError");
-    expect(config?.message).toContain("llm.baseURL");
-    expect(config?.message).toContain("[REDACTED]");
+    expect(config?.message).toContain("Configuration validation failed");
     for (const secret of secrets) expect(JSON.stringify(results)).not.toContain(secret);
     expect(stack?.status).toBe("pass");
     expect(stack?.message).toContain("Storage: unavailable");
@@ -1672,7 +1113,7 @@ describe("runDoctor configuration validation", () => {
     expect(results.some((result) => result.name === "secret-detection")).toBe(true);
   });
 
-  it("uses a valid configured daemon port when another config field is invalid", async () => {
+  it("does not probe a configured daemon when another config field is invalid", async () => {
     const fetch = vi.fn().mockResolvedValue({ ok: false });
     const results = await runDoctor(minimalDeps({
       fetch,
@@ -1685,12 +1126,9 @@ describe("runDoctor configuration validation", () => {
     }));
 
     expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
-    expect(fetch).toHaveBeenCalledWith(
-      "http://127.0.0.1:4545/health",
-      { signal: expect.any(AbortSignal) },
-    );
+    expect(fetch).not.toHaveBeenCalled();
     expect(ensureDaemon).not.toHaveBeenCalled();
-    expect(results.find((result) => result.name === "daemon")?.message).toContain("localhost:4545");
+    expect(results.find((result) => result.name === "daemon")?.status).toBe("skip");
   });
 
   it("does not transition a healthy SQLite daemon from an invalid PostgreSQL config", async () => {
@@ -1701,7 +1139,7 @@ describe("runDoctor configuration validation", () => {
     try {
       const fetch = vi.fn().mockResolvedValue({
         ok: true,
-        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242 }),
+        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242, entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: EXPECTED_RUNTIME_DIGEST }),
       });
       const results = await runDoctor(minimalDeps({
         fetch,
@@ -1716,11 +1154,9 @@ describe("runDoctor configuration validation", () => {
       expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
       expect(results.find((result) => result.name === "stack")?.message).toContain("Storage: unavailable");
       expect(results.find((result) => result.name === "daemon")).toMatchObject({
-        status: "warn",
-        fixApplied: false,
+        status: "skip",
       });
-      expect(results.find((result) => result.name === "daemon")?.message).toContain("repair skipped because config is invalid");
-      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(fetch).not.toHaveBeenCalled();
       expect(ensureDaemon).not.toHaveBeenCalled();
     } finally {
       if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
@@ -1730,7 +1166,7 @@ describe("runDoctor configuration validation", () => {
     }
   });
 
-  it("checks a valid PostgreSQL selection through daemon health and lifecycle", async () => {
+  it("checks a valid PostgreSQL selection through observation only", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-doctor-postgres-"));
     const caFile = join(dir, "ca.pem");
     writeFileSync(caFile, "test-ca");
@@ -1762,10 +1198,10 @@ describe("runDoctor configuration validation", () => {
         expect(configResult, configResult?.message).toMatchObject({ status: "pass" });
         expect(results.find((result) => result.name === "stack")?.message).toContain("Storage: postgresql");
         expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "fail" });
-        expect(results.find((result) => result.name === "daemon")?.message).toContain("not responding");
+        expect(results.find((result) => result.name === "daemon")?.message).toContain("unavailable");
       }
       expect(fetch).toHaveBeenCalledTimes(2);
-      expect(ensureDaemon).toHaveBeenCalledTimes(2);
+      expect(ensureDaemon).not.toHaveBeenCalled();
     } finally {
       if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
       else process.env.LCM_POSTGRES_URL = previousUrl;
@@ -1788,45 +1224,11 @@ describe("runDoctor configuration validation", () => {
     process.env.LCM_POSTGRES_CA_FILE = caFile;
     process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
     const stagedHealth = {
-      status: "unavailable",
-      version: "0.5.0",
-      storageBackend: "postgresql",
-      uptime: 10,
-      pid: 4242,
-      storage: {
-        status: "unavailable",
-        error: {
-          code: "STORAGE_INITIALIZATION_FAILED",
-          backend: "postgresql",
-          domain: "factory",
-          operation: "health",
-        },
-      },
+      status: "unavailable", version: "0.5.0", storageBackend: "postgresql", uptime: 10, pid: 4242,
+      entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: EXPECTED_RUNTIME_DIGEST,
+      storage: { status: "unavailable", error: { code: "STORAGE_INITIALIZATION_FAILED", backend: "postgresql", domain: "factory", operation: "health" } },
     };
-    const fetch = vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          status: "ok",
-          version: "0.5.0",
-          storageBackend: "postgresql",
-          uptime: 10,
-          pid: 4242,
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 503,
-        json: async () => stagedHealth,
-      });
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: true,
-      port: 3737,
-      spawned: false,
-      pid: 4242,
-      startMethod: "existing",
-    });
+    const fetch = vi.fn().mockResolvedValue({ ok: false, status: 503, json: async () => stagedHealth });
     mockCollectEventStats.mockReturnValue({
       captured: 100,
       unprocessed: 5,
@@ -1836,6 +1238,7 @@ describe("runDoctor configuration validation", () => {
     try {
       const results = await runDoctor(minimalDeps({
         fetch,
+        _expectedRuntimeDigestForTesting: EXPECTED_RUNTIME_DIGEST,
         readFileSync: (path: string) => {
           if (path.endsWith("config.json")) {
             return JSON.stringify({ storage: { backend: "postgresql" } });
@@ -1845,30 +1248,11 @@ describe("runDoctor configuration validation", () => {
         },
       }));
 
-      expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
-        expectedStorageBackend: "postgresql",
-        expectedVersion: "0.5.0",
-      }));
-      expect(fetch).toHaveBeenCalledTimes(2);
-      expect(fetch).toHaveBeenNthCalledWith(
-        1,
-        "http://127.0.0.1:3737/health",
-        { signal: expect.any(AbortSignal) },
-      );
-      expect(fetch).toHaveBeenNthCalledWith(
-        2,
-        "http://127.0.0.1:3737/health",
-        {
-          headers: { Authorization: "Bearer doctor-token" },
-          signal: expect.any(AbortSignal),
-        },
-      );
-      expect(results.find((result) => result.name === "daemon")).toMatchObject({
-        status: "pass",
-        message: "localhost:3737 (up)",
+      expect(ensureDaemon).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledExactlyOnceWith("http://127.0.0.1:3737/health", {
+        headers: { Authorization: "Bearer doctor-token" }, signal: expect.any(AbortSignal),
       });
-      expect(results.find((result) => result.name === "daemon")?.fixApplied)
-        .not.toBe(true);
+      expect(results.find(r => r.name === "daemon")).toMatchObject({ status: "warn" });
       expect(results.find((result) => result.name === "events-capture")).toMatchObject({
         status: "warn",
         message: expect.stringContaining("queue cannot drain until storage is healthy"),
@@ -1886,110 +1270,21 @@ describe("runDoctor configuration validation", () => {
     }
   });
 
-  it("does not send an authenticated health request when the daemon token is unreadable", async () => {
-    const fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        status: "ok",
-        version: "0.5.0",
-        storageBackend: "sqlite",
-        uptime: 10,
-        pid: 4242,
-      }),
-    });
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: true,
-      port: 3737,
-      spawned: false,
-      pid: 4242,
-      startMethod: "existing",
-    });
-    mockCollectEventStats.mockReturnValue({
-      captured: 100,
-      unprocessed: 5,
-      errors: 0,
-      lastCapture: "2026-03-26 10:00:00",
-    });
-
-    const results = await runDoctor(minimalDeps({
-      fetch,
-      readFileSync: (path: string) => {
-        if (path.endsWith("daemon.token")) throw new Error("permission denied");
-        return minimalDeps().readFileSync(path);
-      },
-    }));
-
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect(fetch).toHaveBeenCalledWith(
-      "http://127.0.0.1:3737/health",
-      { signal: expect.any(AbortSignal) },
-    );
-    expect(results.find((result) => result.name === "daemon")).toMatchObject({
-      status: "pass",
-      message: "localhost:3737 (up)",
-    });
-    expect(results.find((result) => result.name === "events-capture")).toMatchObject({
-      status: "warn",
-      message: expect.stringContaining("storage readiness could not be authenticated"),
-    });
-    expect(results.find((result) => result.name === "events-capture")?.message)
-      .toContain("restore access to the daemon token and authenticated diagnostics");
-    expect(results.find((result) => result.name === "events-capture")?.message)
-      .not.toContain("storage is unavailable");
-    expect(results.find((result) => result.name === "events-capture")?.message)
-      .not.toContain("queued for automatic daemon processing");
-  });
-
-  it("does not send an authenticated health request when the daemon token is empty", async () => {
-    const fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        status: "ok",
-        version: "0.5.0",
-        storageBackend: "sqlite",
-        uptime: 10,
-        pid: 4242,
-      }),
-    });
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: true,
-      port: 3737,
-      spawned: false,
-      pid: 4242,
-      startMethod: "existing",
-    });
-    mockCollectEventStats.mockReturnValue({
-      captured: 100,
-      unprocessed: 5,
-      errors: 0,
-      lastCapture: "2026-03-26 10:00:00",
-    });
-
-    const results = await runDoctor(minimalDeps({
-      fetch,
-      readFileSync: (path: string) => {
-        if (path.endsWith("daemon.token")) return " \n";
-        return minimalDeps().readFileSync(path);
-      },
-    }));
-
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect(fetch).toHaveBeenCalledWith(
-      "http://127.0.0.1:3737/health",
-      { signal: expect.any(AbortSignal) },
-    );
-    expect(results.find((result) => result.name === "events-capture")).toMatchObject({
-      status: "warn",
-      message: expect.stringContaining("storage readiness could not be authenticated"),
-    });
-    expect(results.find((result) => result.name === "events-capture")?.message)
-      .toContain("restore access to the daemon token and authenticated diagnostics");
-    expect(results.find((result) => result.name === "events-capture")?.message)
-      .not.toContain("storage is unavailable");
-    expect(results.find((result) => result.name === "events-capture")?.message)
-      .not.toContain("queued for automatic daemon processing");
+  it.each(["unreadable", "empty"])("does not probe when the daemon token is %s", async state => {
+    const fetch = vi.fn();
+    const deps = minimalDeps({ fetch, readFileSync: path => {
+      if (path.endsWith("daemon.token")) {
+        if (state === "unreadable") throw new Error("secret access failure");
+        return " ";
+      }
+      return minimalDeps().readFileSync(path);
+    } });
+    mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, lastCapture: null } as never);
+    const results = await runDoctor(deps);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(results.find(r => r.name === "daemon")?.status).toBe("fail");
+    expect(results.find(r => r.name === "events-capture")?.status).toBe("warn");
+    expect(JSON.stringify(results)).not.toContain("queued for automatic daemon processing");
   });
 
   it.each([0, 65536, 4545.5, "4545"])(
@@ -2006,10 +1301,7 @@ describe("runDoctor configuration validation", () => {
         },
       }));
 
-      expect(fetch).toHaveBeenCalledWith(
-        "http://127.0.0.1:3737/health",
-        { signal: expect.any(AbortSignal) },
-      );
+      expect(fetch).not.toHaveBeenCalled();
       expect(ensureDaemon).not.toHaveBeenCalled();
     },
   );
@@ -2019,14 +1311,14 @@ describe("runDoctor configuration validation", () => {
       readFileSync: (path: string) => path.endsWith("config.json") ? "{" : minimalDeps().readFileSync(path),
     }));
     expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
-    expect(results.find((result) => result.name === "config")?.message).toContain("malformed JSON");
+    expect(results.find((result) => result.name === "config")?.message).toContain("Configuration validation failed");
     expect(results.some((result) => result.name === "project-map")).toBe(true);
   });
 });
 
 describe("Passive Learning checks", () => {
-  it("runs passive learning checks when hooks status is warn (auto-fixed duplicates)", async () => {
-    // Use deps where hooks check produces "warn" (duplicate hooks in settings.json auto-fixed)
+  it("runs passive learning checks when hooks need operator repair", async () => {
+    // Use deps where hooks check produces "warn" (duplicate hooks in settings.json need repair)
     mockCollectEventStats.mockReturnValue({ captured: 10, unprocessed: 0, errors: 0, lastCapture: null });
     const depsWithBadHooks = minimalDeps({
       readFileSync: (path: string) => {
@@ -2069,11 +1361,11 @@ describe("Passive Learning checks", () => {
       fetch: vi.fn()
         .mockResolvedValueOnce({
           ok: true,
-          json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242 }),
+          json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242, entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: EXPECTED_RUNTIME_DIGEST }),
         })
         .mockResolvedValueOnce({
           ok: true,
-          json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242 }),
+          json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242, entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: EXPECTED_RUNTIME_DIGEST }),
         }),
       readFileSync: (path: string) => path.endsWith("daemon.token")
         ? "doctor-token"
@@ -2109,7 +1401,7 @@ describe("Passive Learning checks", () => {
       cwd: "/tmp/test-proj",
       fetch: vi.fn().mockResolvedValue({
         ok: true,
-        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242 }),
+        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242, entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: EXPECTED_RUNTIME_DIGEST }),
       }),
       readFileSync: (path: string) => path.endsWith("daemon.token")
         ? "doctor-token"
@@ -2135,7 +1427,7 @@ describe("Passive Learning checks", () => {
       cwd: "/tmp/test-proj",
       fetch: vi.fn().mockResolvedValue({
         ok: true,
-        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242 }),
+        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242, entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: EXPECTED_RUNTIME_DIGEST }),
       }),
       readFileSync: (path: string) => path.endsWith("daemon.token")
         ? "doctor-token"
@@ -2180,28 +1472,26 @@ describe("Passive Learning checks", () => {
     expect(results.find(r => r.name === "events-sidecar-scan")).toBeUndefined();
   });
 
-  it("reports pruned orphan sidecars as auto-fixed pass entries", async () => {
-    mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, prunedSidecars: 2, lastCapture: "2026-03-26 10:00:00" });
-    const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }));
-    const pruned = results.find(r => r.name === "events-sidecar-prune");
-    expect(pruned?.status).toBe("pass");
-    expect(pruned?.fixApplied).toBe(true);
-    expect(pruned?.message).toContain("pruned 2");
+  it("does not advertise pruning even when an injected scanner returns a legacy count", async () => {
+    mockCollectEventStats.mockReturnValue({ captured: 0, unprocessed: 0, errors: 0, lastCapture: null, prunedSidecars: 2 } as never);
+    const results = await runDoctor(minimalDeps());
+    expect(results.some(r => r.name === "events-sidecar-prune" || "fixApplied" in r)).toBe(false);
+    expect(mockCollectEventStats).toHaveBeenCalledWith(expect.objectContaining({ homeDir: defaultDoctorHome, pruneOrphanSidecars: false }));
   });
 
   it("passes doctor sidecar count limit through to passive learning stats", async () => {
     mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, lastCapture: "2026-03-26 10:00:00" });
     await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }), { eventsMaxDbs: 123 });
-    expect(mockCollectEventStats).toHaveBeenCalledWith({ timeoutMs: 2000, maxDbs: 123, pruneOrphanSidecars: true });
+    expect(mockCollectEventStats).toHaveBeenCalledWith({ homeDir: defaultDoctorHome, timeoutMs: 2000, maxDbs: 123, pruneOrphanSidecars: false });
   });
 
   it("falls back to the default sidecar count limit for invalid runDoctor options", async () => {
     mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, lastCapture: "2026-03-26 10:00:00" });
     await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }), { eventsMaxDbs: 0 });
-    expect(mockCollectEventStats).toHaveBeenCalledWith({ timeoutMs: 2000, maxDbs: 50, pruneOrphanSidecars: true });
+    expect(mockCollectEventStats).toHaveBeenCalledWith({ homeDir: defaultDoctorHome, timeoutMs: 2000, maxDbs: 50, pruneOrphanSidecars: false });
   });
 
-  it("shows scan failure paths in verbose project output", async () => {
+  it("omits scan failure paths in verbose project output", async () => {
     mockCollectDetailedEventStats.mockReturnValue({
       captured: 0,
       unprocessed: 0,
@@ -2221,13 +1511,13 @@ describe("Passive Learning checks", () => {
       recentErrors: [],
     });
     const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }), true);
-    const project = results.find(r => r.name === "events-project-corrupt.db");
+    const project = results.find(r => r.name === "events-project-1");
     expect(project?.status).toBe("warn");
-    expect(project?.message).toContain("database disk image is malformed");
-    expect(project?.message).toContain("/tmp/lcm-events/corrupt.db");
+    expect(project?.message).not.toContain("database disk image is malformed");
+    expect(project?.message).not.toContain("/tmp/lcm-events/corrupt.db");
   });
 
-  it("shows skipped scan paths in verbose project output", async () => {
+  it("omits skipped scan paths in verbose project output", async () => {
     mockCollectDetailedEventStats.mockReturnValue({
       captured: 0,
       unprocessed: 0,
@@ -2247,10 +1537,10 @@ describe("Passive Learning checks", () => {
       recentErrors: [],
     });
     const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }), true);
-    const project = results.find(r => r.name === "events-project-skipped.db");
+    const project = results.find(r => r.name === "events-project-1");
     expect(project?.status).toBe("skip");
     expect(project?.message).toContain("scan skipped");
-    expect(project?.message).toContain("/tmp/lcm-events/skipped.db");
+    expect(project?.message).not.toContain("/tmp/lcm-events/skipped.db");
   });
 
   it("sanitizes untrusted sidecar diagnostics before terminal display", async () => {
@@ -2273,9 +1563,9 @@ describe("Passive Learning checks", () => {
     });
     const results = await runDoctor(minimalDeps({ cwd: "/tmp/test-proj" }), true);
     const output = results.map(result => `${result.name}\n${result.message}`).join("\n");
-    expect(output).toContain("bad.db");
-    expect(output).toContain("bad path.db");
-    expect(output).toContain("hook spoof: error");
+    expect(output).not.toContain("bad.db");
+    expect(output).not.toContain("bad path.db");
+    expect(output).not.toContain("hook spoof: error");
     expect(output).not.toContain("\x1b");
     expect(output).not.toContain("\r");
   });
@@ -2298,4 +1588,215 @@ describe("Passive Learning checks", () => {
     expect(staleness?.status).toBe("warn");
     expect(staleness?.message).toContain("hooks may not be firing");
   });
+});
+
+describe("doctor observation contract", () => {
+  it("leaves missing managed hooks and guidance unchanged", async () => {
+    const deps = minimalDeps({ existsSync: path => !path.endsWith("SKILL.md") });
+    const results = await runDoctor(deps);
+    expect(results.find(r => r.name === "hooks")).toMatchObject({ status: "warn" });
+    expect(results.find(r => r.name === "lcm-md")).toMatchObject({ status: "warn" });
+    expect(deps.writeFileSync).not.toHaveBeenCalled();
+    expect(deps.mkdirSync).not.toHaveBeenCalled();
+    expect(results.some(r => "fixApplied" in r)).toBe(false);
+    expect(ensureDaemon).not.toHaveBeenCalled();
+    expect(restartDaemon).not.toHaveBeenCalled();
+  });
+
+  it("does not probe MCP or prune sidecars and omits arbitrary diagnostic metadata", async () => {
+    const canary = "postgres://private-role@private-host/SECRET_TRANSCRIPT";
+    mockCollectDetailedEventStats.mockReturnValue({ captured: 1, unprocessed: 0, errors: 1, lastCapture: null,
+      projects: [{ file: canary, path: canary, projectId: canary, cwd: canary, captured: 1, unprocessed: 0, lastCapture: null, metadataMissing: true, scanError: canary }],
+      recentErrors: [{ hook: canary, error: canary, created_at: canary }],
+    } as never);
+    const deps = minimalDeps();
+    const results = await runDoctor(deps, true);
+    expect(mockCollectDetailedEventStats).toHaveBeenCalledWith(expect.objectContaining({ pruneOrphanSidecars: false }));
+    expect(deps._testMcpHandshake).not.toHaveBeenCalled();
+    expect(results.find(r => r.name === "mcp-handshake-lcm")).toMatchObject({ status: "skip" });
+    expect(JSON.stringify(results)).not.toContain(canary);
+  });
+
+  it("preserves existing map and remediation marker bytes and inode", async () => {
+    const mapPath = join(defaultDoctorHome, ".lcm", "map.json");
+    const markerPath = join(defaultDoctorHome, ".lcm", "daemon-remediation.json");
+    writeFileSync(mapPath, "{}", { mode: 0o600 });
+    writeFileSync(markerPath, "owner marker", { mode: 0o600 });
+    const witness = () => [mapPath, markerPath].map(path => ({ content: readFileSync(path, "utf8"), ino: statSync(path).ino, mtime: statSync(path).mtimeMs }));
+    const before = witness();
+    await runDoctor(minimalDeps());
+    expect(witness()).toEqual(before);
+  });
+});
+
+it("does not promise queue drain without authenticated runtime identity", async () => {
+  mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, lastCapture: null } as never);
+  const results = await runDoctor(minimalDeps());
+  expect(results.find(r => r.name === "events-capture")).toMatchObject({ status: "warn" });
+  expect(JSON.stringify(results)).not.toContain("queued for automatic daemon processing");
+});
+
+describe("doctor authenticated daemon identity", () => {
+  function authenticatedDeps(health: Record<string, unknown>): DoctorDeps {
+    return minimalDeps({
+      _expectedRuntimeDigestForTesting: EXPECTED_RUNTIME_DIGEST,
+      readFileSync: path => path.endsWith("daemon.token") ? "doctor-token" : minimalDeps().readFileSync(path),
+      fetch: vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => health }),
+    });
+  }
+  const healthy = { status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242,
+    runtimeDigest: EXPECTED_RUNTIME_DIGEST, entrypoint: TEST_RUNTIME_ENTRYPOINT };
+
+  it.each([
+    ["version", undefined], ["version", "0.4.0"], ["runtimeDigest", undefined],
+    ["runtimeDigest", "foreign-digest"], ["entrypoint", "/private/other-runtime"],
+    ["storageBackend", "postgresql"], ["pid", undefined], ["pid", -1], ["pid", 1.5],
+    ["status", "unavailable"],
+  ])("rejects unmatched or missing %s without repairing it", async (key, value) => {
+    const results = await runDoctor(authenticatedDeps({ ...healthy, [key as string]: value }));
+    expect(results.find(r => r.name === "daemon")?.status).toBe("fail");
+    expect(ensureDaemon).not.toHaveBeenCalled();
+    expect(restartDaemon).not.toHaveBeenCalled();
+  });
+
+  it.each(["version", "digest"])("cannot trust peer identity when local %s is missing", async missing => {
+    const deps = authenticatedDeps(healthy);
+    const read = deps.readFileSync;
+    if (missing === "version") deps.readFileSync = path => path.endsWith("package.json") ? "{}" : read(path, "utf8");
+    else deps._expectedRuntimeDigestForTesting = undefined;
+    const results = await runDoctor(deps);
+    expect(results.find(r => r.name === "daemon")?.status).toBe("fail");
+  });
+
+  it.each(["fetch", "body"])("bounds a stalled %s and aborts its signal", async stage => {
+    vi.useFakeTimers();
+    const deps = authenticatedDeps(healthy);
+    let signal: AbortSignal | undefined;
+    deps.fetch = vi.fn().mockImplementation((_url, options) => {
+      signal = options.signal;
+      return stage === "fetch" ? new Promise(() => {})
+        : Promise.resolve({ ok: true, status: 200, json: () => new Promise(() => {}) });
+    });
+    const pending = runDoctor(deps);
+    await vi.advanceTimersByTimeAsync(2000);
+    const results = await pending;
+    expect(signal?.aborted).toBe(true);
+    expect(results.find(r => r.name === "daemon")).toMatchObject({ status: "fail", message: expect.stringContaining("timed out") });
+    const message = results.find(r => r.name === "daemon")?.message;
+    expect(message).toContain("run 'lcm daemon restart' or 'lcm doctor'");
+    expect(message).not.toMatch(/--detach|--foreground|\b(?:kill|pkill)\b/u);
+    expect(ensureDaemon).not.toHaveBeenCalled();
+    expect(restartDaemon).not.toHaveBeenCalled();
+  });
+
+  it("reports a verified daemon backlog even when optional sidecar metadata counts are absent", async () => {
+    mockCollectEventStats.mockReturnValue({ captured: 2000, unprocessed: 1000, errors: 0, lastCapture: null } as never);
+    const results = await runDoctor(authenticatedDeps(healthy));
+    expect(results.find(r => r.name === "events-capture")).toMatchObject({ status: "warn", message: expect.stringContaining("lcm events promote --all") });
+  });
+});
+
+describe("doctor bounded static map validation", () => {
+  const hash = "a".repeat(64);
+  it.each([
+    null, [], 5, { wrong: {} }, { [hash]: null }, { [hash]: [] }, { [hash]: 1 },
+    { [hash]: { canonical: 1, aliases: [] } },
+    { [hash]: { canonical: "relative", aliases: [] } },
+    { [hash]: { canonical: "/canonical", aliases: 1 } },
+    { [hash]: { canonical: "/canonical", aliases: [1] } },
+    { [hash]: { canonical: "/canonical", aliases: ["relative"] } },
+    { [hash]: { canonical: "/canonical", aliases: [], remoteProjectId: 1 } },
+    { [hash]: { canonical: "/canonical", aliases: [], remoteProjectId: "not-uuid" } },
+  ])("refuses malformed map shape %j without rewriting it", async map => {
+    const path = join(defaultDoctorHome, ".lcm", "map.json");
+    const content = JSON.stringify(map);
+    writeFileSync(path, content, { mode: 0o600 });
+    const results = await runDoctor(minimalDeps());
+    expect(results.find(r => r.name === "project-map")?.status).toBe("fail");
+    expect(readFileSync(path, "utf8")).toBe(content);
+  });
+
+  it("accepts canonical aliases and a UUIDv7 binding without exposing them", async () => {
+    const path = join(defaultDoctorHome, ".lcm", "map.json");
+    writeFileSync(path, JSON.stringify({ [hash]: { canonical: "/SECRET_CANARY", aliases: ["/SECRET_CANARY"], remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020" } }), { mode: 0o600 });
+    const results = await runDoctor(minimalDeps());
+    expect(results.find(r => r.name === "project-map")?.status).toBe("pass");
+    expect(JSON.stringify(results)).not.toContain("SECRET_CANARY");
+  });
+});
+
+it("reports an unreadable installed skill without disclosing the raw error", async () => {
+  const deps = minimalDeps();
+  const read = deps.readFileSync;
+  deps.readFileSync = path => {
+    if (path.endsWith("lcm-memory/SKILL.md")) throw new Error("PRIVATE_CA_PATH");
+    return read(path, "utf8");
+  };
+  const results = await runDoctor(deps);
+  expect(results.find(r => r.name === "lcm-md")?.status).toBe("fail");
+  expect(JSON.stringify(results)).not.toContain("PRIVATE_CA_PATH");
+});
+
+it("reports the CLI transport when managed settings have no owned MCP entry", async () => {
+  const deps = minimalDeps({ _claudeTransport: "cli" });
+  const read = deps.readFileSync;
+  deps.readFileSync = path => path.endsWith("settings.json")
+    ? JSON.stringify(mergeClaudeSettings({}, TEST_RUNTIME_ENTRYPOINT, process.execPath, "cli"))
+    : read(path, "utf8");
+  const results = await runDoctor(deps);
+  expect(results.find(r => r.name === "mcp-lcm")).toMatchObject({ status: "pass", message: "Claude CLI transport does not use MCP" });
+});
+
+it("leaves an absent diagnostic home absent", async () => {
+  const home = join(defaultDoctorHome, "never-created");
+  await runDoctor({ homedir: home, fetch: vi.fn(), spawnSync: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" }) });
+  expect(existsSync(home)).toBe(false);
+});
+
+it("preserves real settings, guidance, config and remediation witnesses", async () => {
+  const home = defaultDoctorHome;
+  const root = join(home, ".lcm");
+  const skillDir = join(home, ".claude", "skills", "lcm-memory");
+  mkdirSync(skillDir, { recursive: true, mode: 0o700 });
+  const files = new Map([
+    [join(root, "config.json"), "{}"],
+    [join(root, "map.json"), "{}"],
+    [daemonRemediationMarkerPath(root), "{\"private-marker\":true}"],
+    [join(home, ".claude", "settings.json"), '{"mcpServers":{"lcm":{}},"private":"KEEP"}'],
+    [join(skillDir, "SKILL.md"), "old private guidance"],
+  ]);
+  for (const [path, content] of files) writeFileSync(path, content, { mode: 0o600 });
+  const witness = () => [...files.keys()].map(path => ({ content: readFileSync(path, "utf8"), ino: statSync(path).ino, mtime: statSync(path).mtimeMs }));
+  const before = witness();
+  const results = await runDoctor({ homedir: home, fetch: vi.fn(), spawnSync: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" }) });
+  expect(results.find(r => r.name === "hooks")?.status).toBe("warn");
+  expect(witness()).toEqual(before);
+  expect(existsSync(join(home, ".lcm.backend-publication.lock"))).toBe(false);
+});
+
+it("contains unexpected observation failures without returning raw error payloads", async () => {
+  mockCollectEventStats.mockRejectedValueOnce(new Error("postgres://ROLE@HOST/SECRET_TRANSCRIPT"));
+  const results = await runDoctor(minimalDeps());
+  expect(results.find(r => r.name === "doctor-observation")?.status).toBe("fail");
+  expect(JSON.stringify(results)).not.toContain("SECRET_TRANSCRIPT");
+});
+
+it("preserves an existing legacy-only home without creating the current root", async () => {
+  const home = defaultDoctorHome;
+  rmSync(join(home, ".lcm"), { recursive: true });
+  const legacyRoot = join(home, ".lossless-claude");
+  mkdirSync(legacyRoot, { mode: 0o700 });
+  writeFileSync(join(legacyRoot, "config.json"), '{"private":"LEGACY_CANARY"}', { mode: 0o600 });
+  const before = readdirSync(home);
+  await runDoctor({ homedir: home, cwd: home, fetch: vi.fn(), spawnSync: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" }) });
+  expect(readdirSync(home)).toEqual(before);
+  expect(existsSync(join(home, ".lcm"))).toBe(false);
+  expect(readFileSync(join(legacyRoot, "config.json"), "utf8")).toBe('{"private":"LEGACY_CANARY"}');
+});
+
+it("uses the authenticated configuration for global pattern counts", async () => {
+  const content = JSON.stringify({ security: { sensitivePatterns: ["PATTERN_CANARY_A", "PATTERN_CANARY_B"] } });
+  const results = await runDoctor({ ...minimalDeps(), ...doctorConfigSeams(content) });
+  expect(results.find(row => row.name === "user-patterns")?.message).toContain("2 global");
+  expect(JSON.stringify(results)).not.toContain("PATTERN_CANARY");
 });

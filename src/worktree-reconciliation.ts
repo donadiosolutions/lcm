@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import {
   existsSync,
+  fchmodSync,
   linkSync,
   lstatSync,
   mkdtempSync,
@@ -39,8 +40,13 @@ import { lcmHomeDir, projectsDir } from "./runtime-paths.js";
 import {
   atomicWritePrivateFile,
   atomicWritePrivateFileExclusive,
+  assertPrivateDirectoryEntry,
   ensurePrivateDirectory,
+  openPrivateDirectory,
+  openPrivateDirectoryForCreation,
+  openPrivateDirectoryIfExists,
   readBoundedRegularFile,
+  type PrivateDirectoryHandle,
 } from "./security-files.js";
 import {
   PrivateMutationLockContentionError,
@@ -210,6 +216,164 @@ function projectStateDir(hash: string, homeDir?: string): string {
 
 function projectEventsPath(hash: string, homeDir?: string): string {
   return join(lcmHomeDir(homeDir), "events", `${hash}.db`);
+}
+
+type RetainedReconciliationTarget = Readonly<{
+  rootPath: string;
+  projectsPath: string;
+  targetPath: string;
+  eventsPath: string;
+  root: PrivateDirectoryHandle;
+  projects: PrivateDirectoryHandle;
+  target: PrivateDirectoryHandle;
+  events: PrivateDirectoryHandle;
+}>;
+
+function closeRetainedChildAndRethrow(
+  child: PrivateDirectoryHandle,
+  primaryError: unknown,
+): never {
+  try {
+    child.close();
+  } catch (cleanupError) {
+    throw new AggregateError(
+      [primaryError, cleanupError],
+      `reconciliation target child admission failed: ${String(primaryError)}`,
+      { cause: primaryError },
+    );
+  }
+  throw primaryError;
+}
+
+function acquireRetainedChild(
+  parent: PrivateDirectoryHandle,
+  parentPath: string,
+  childPath: string,
+): PrivateDirectoryHandle {
+  const expectedUid = parent.witness.uid;
+  assertPrivateDirectoryEntry(parent, parentPath, expectedUid);
+  const existing = openPrivateDirectoryIfExists(childPath, { expectedUid });
+  if (existing !== undefined) {
+    try {
+      assertPrivateDirectoryEntry(existing, childPath, expectedUid);
+      return existing;
+    } catch (error) {
+      closeRetainedChildAndRethrow(existing, error);
+    }
+  }
+
+  let created = false;
+  try {
+    mkdirSync(childPath, { recursive: false, mode: 0o700 });
+    created = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const child = created
+    ? openPrivateDirectoryForCreation(childPath, { expectedUid })
+    : openPrivateDirectory(childPath, { expectedUid });
+  try {
+    if (created) fchmodSync(child.fd, 0o700);
+    assertPrivateDirectoryEntry(child, childPath, expectedUid);
+    return child;
+  } catch (error) {
+    closeRetainedChildAndRethrow(child, error);
+  }
+}
+
+function assertRetainedReconciliationTarget(target: RetainedReconciliationTarget): void {
+  assertPrivateDirectoryEntry(target.root, target.rootPath, target.root.witness.uid);
+  assertPrivateDirectoryEntry(
+    target.projects,
+    target.projectsPath,
+    target.projects.witness.uid,
+  );
+  assertPrivateDirectoryEntry(target.target, target.targetPath, target.target.witness.uid);
+  assertPrivateDirectoryEntry(target.events, target.eventsPath, target.events.witness.uid);
+}
+
+function closePrivateDirectoryHandles(
+  handles: readonly PrivateDirectoryHandle[],
+): unknown[] {
+  const errors: unknown[] = [];
+  for (const handle of [...handles].reverse()) {
+    try {
+      handle.close();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  return errors;
+}
+
+function withRetainedReconciliationTarget<T>(
+  targetHash: string,
+  homeDir: string | undefined,
+  operation: (target: RetainedReconciliationTarget) => T,
+  onCompleted: () => void,
+): T {
+  const rootPath = lcmHomeDir(homeDir);
+  const projectsPath = projectsDir(homeDir);
+  const targetPath = projectStateDir(targetHash, homeDir);
+  const eventsPath = dirname(projectEventsPath(targetHash, homeDir));
+  const handles: PrivateDirectoryHandle[] = [];
+  let result: T | undefined;
+  let primaryError: unknown;
+  try {
+    const root = openPrivateDirectory(rootPath);
+    handles.push(root);
+    const projects = acquireRetainedChild(root, rootPath, projectsPath);
+    handles.push(projects);
+    const target = acquireRetainedChild(projects, projectsPath, targetPath);
+    handles.push(target);
+    const events = acquireRetainedChild(root, rootPath, eventsPath);
+    handles.push(events);
+    const retained = {
+      rootPath,
+      projectsPath,
+      targetPath,
+      eventsPath,
+      root,
+      projects,
+      target,
+      events,
+    };
+    assertRetainedReconciliationTarget(retained);
+    result = operation(retained);
+    assertRetainedReconciliationTarget(retained);
+    onCompleted();
+  } catch (error) {
+    primaryError = error;
+  }
+  const cleanupErrors = closePrivateDirectoryHandles(handles);
+  if (primaryError !== undefined && cleanupErrors.length > 0) {
+    throw new AggregateError(
+      [primaryError, ...cleanupErrors],
+      `reconciliation target operation failed: ${String(primaryError)}`,
+      { cause: primaryError },
+    );
+  }
+  if (primaryError !== undefined) throw primaryError;
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "reconciliation target directory cleanup failed");
+  }
+  return result as T;
+}
+
+function observeRetainedReconciliationTarget(
+  target: RetainedReconciliationTarget,
+  observer: ((
+    event: string,
+    source?: WorktreeReconciliationSource,
+    detailPath?: string,
+  ) => void) | undefined,
+  event: string,
+  source?: WorktreeReconciliationSource,
+  detailPath?: string,
+): void {
+  assertRetainedReconciliationTarget(target);
+  observer?.(event, source, detailPath);
+  assertRetainedReconciliationTarget(target);
 }
 
 function isRegularFile(path: string): boolean {
@@ -964,18 +1128,29 @@ function withNormalizedMainSnapshot<T>(
   source: DatabaseSync,
   targetPath: string,
   fts5AvailableOverride: boolean | undefined,
+  assertTarget: () => void,
   operation: (
     normalizedSource: DatabaseSync,
     features: { readonly fts5Available: boolean },
   ) => T,
 ): T {
+  assertTarget();
   const snapshotDir = mkdtempSync(
     join(dirname(targetPath), ".lcm-reconciliation-snapshot-"),
   );
+  assertTarget();
+  const snapshotDirectory = openPrivateDirectory(snapshotDir, {
+    expectedUid: process.getuid?.(),
+  });
   const snapshotPath = join(snapshotDir, "db.sqlite");
   let snapshot: DatabaseSync | undefined;
+  let result: T | undefined;
+  let primaryError: unknown;
   try {
+    assertPrivateDirectoryEntry(snapshotDirectory, snapshotDir, snapshotDirectory.witness.uid);
+    assertTarget();
     source.prepare("VACUUM INTO ?").run(snapshotPath);
+    assertTarget();
     snapshot = new DatabaseSync(snapshotPath);
     for (const trigger of rows(
       snapshot,
@@ -987,15 +1162,44 @@ function withNormalizedMainSnapshot<T>(
     const features = fts5AvailableOverride === undefined
       ? getLcmDbFeatures(snapshot)
       : { fts5Available: fts5AvailableOverride };
+    assertTarget();
     runLcmMigrations(snapshot, features);
-    return operation(snapshot, features);
-  } finally {
-    try {
-      snapshot?.close();
-    } finally {
-      rmSync(snapshotDir, { recursive: true, force: true });
-    }
+    assertTarget();
+    result = operation(snapshot, features);
+    assertTarget();
+  } catch (error) {
+    primaryError = error;
   }
+  const cleanupErrors: unknown[] = [];
+  try {
+    snapshot?.close();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    assertTarget();
+    assertPrivateDirectoryEntry(snapshotDirectory, snapshotDir, snapshotDirectory.witness.uid);
+    rmSync(snapshotDir, { recursive: true, force: true });
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    snapshotDirectory.close();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (primaryError !== undefined && cleanupErrors.length > 0) {
+    throw new AggregateError(
+      [primaryError, ...cleanupErrors],
+      `worktree reconciliation failed before safe snapshot cleanup: ${String(primaryError)}`,
+      { cause: primaryError },
+    );
+  }
+  if (primaryError !== undefined) throw primaryError;
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "normalized reconciliation snapshot cleanup failed");
+  }
+  return result as T;
 }
 
 function withSourceWriteFence<T>(
@@ -1027,37 +1231,66 @@ function withSourceWriteFence<T>(
   }
 }
 
+function rollbackTargetReconciliationTransaction(
+  target: DatabaseSync,
+  committed: boolean,
+  primaryError: unknown,
+): never {
+  if (!committed && target.isTransaction !== false) {
+    try {
+      target.exec("ROLLBACK");
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [primaryError, rollbackError],
+        `worktree reconciliation target transaction failed: ${String(primaryError)}`,
+        { cause: primaryError },
+      );
+    }
+  }
+  throw primaryError;
+}
+
 function mergeMainDatabase(
   sourcePath: string,
   targetPath: string,
   targetHash: string,
   sourceHash: string,
   busyTimeoutMs: number,
+  assertTarget: () => void,
   fts5AvailableOverride?: boolean,
   afterSourceFenceCommit?: () => void,
 ): void {
+  assertTarget();
   withSourceWriteFence(sourcePath, sourceHash, "project", busyTimeoutMs, (
     source,
     commitFence,
   ) => {
     commitFence();
+    assertTarget();
     return withNormalizedMainSnapshot(
       source,
       targetPath,
       fts5AvailableOverride,
+      assertTarget,
       (normalizedSource, features) => {
+        assertTarget();
         const target = getLcmConnection(targetPath);
         try {
+          assertTarget();
           runLcmMigrations(target, features);
+          assertTarget();
           target.exec(`
             CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources (
               source_hash TEXT PRIMARY KEY,
               merged_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
           `);
+          assertTarget();
           target.exec("BEGIN IMMEDIATE");
+          let committed = false;
           try {
             afterSourceFenceCommit?.();
+            assertTarget();
             if (
               row(
                 target,
@@ -1065,7 +1298,10 @@ function mergeMainDatabase(
                 sourceHash,
               )
             ) {
+              assertTarget();
               target.exec("COMMIT");
+              committed = true;
+              assertTarget();
               return;
             }
             for (const conversation of rows(
@@ -1121,17 +1357,21 @@ function mergeMainDatabase(
             target
               .prepare("INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)")
               .run(sourceHash);
+            assertTarget();
             target.exec("COMMIT");
+            committed = true;
+            assertTarget();
           } catch (error) {
-            target.exec("ROLLBACK");
-            throw error;
+            rollbackTargetReconciliationTransaction(target, committed, error);
           }
         } finally {
           closeLcmConnection(targetPath, target);
         }
+        assertTarget();
       },
     );
   });
+  assertTarget();
 }
 
 function mergeEventsDatabase(
@@ -1139,20 +1379,26 @@ function mergeEventsDatabase(
   targetPath: string,
   sourceHash: string,
   busyTimeoutMs: number,
+  assertTarget: () => void,
   afterTargetMigration: () => void,
   afterSourceFenceCommit?: () => void,
 ): void {
+  assertTarget();
   withSourceWriteFence(sourcePath, sourceHash, "events", busyTimeoutMs, (
     source,
     commitFence,
   ) => {
+    assertTarget();
     const migratedTarget = new EventsDb(targetPath);
     migratedTarget.close();
+    assertTarget();
     // Deterministic audit seam between live-schema migration and the
     // independently versioned reconciliation admission check.
     afterTargetMigration();
+    assertTarget();
     const target = getLcmConnection(targetPath);
     try {
+      assertTarget();
       const targetSchemaVersion = legacyEventsSchemaVersion(target);
       if (targetSchemaVersion > MAX_RECONCILIABLE_EVENT_SCHEMA_VERSION) {
         throw new Error(
@@ -1165,7 +1411,9 @@ function mergeEventsDatabase(
           merged_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
       `);
+      assertTarget();
       target.exec("BEGIN IMMEDIATE");
+      let committed = false;
       try {
         if (
           row(
@@ -1176,7 +1424,10 @@ function mergeEventsDatabase(
         ) {
           commitFence();
           afterSourceFenceCommit?.();
+          assertTarget();
           target.exec("COMMIT");
+          committed = true;
+          assertTarget();
           return;
         }
         const sourceSchemaVersion = legacyEventsSchemaVersion(source);
@@ -1186,12 +1437,14 @@ function mergeEventsDatabase(
           );
         }
         const sourceEvents = rows(source, "SELECT * FROM events ORDER BY event_id");
+        assertTarget();
         const legacySequences = sourceSchemaVersion < 4
           ? allocateLocalHookEventSequences(
             sourceEvents.length,
             join(dirname(targetPath), ".machine-sequence.sqlite"),
           )
           : [];
+        assertTarget();
         const sourceEventIds = new Set(sourceEvents.map((event) => Number(event.event_id)));
         const eventMap = new Map<number, number>();
         for (let sourceIndex = 0; sourceIndex < sourceEvents.length; sourceIndex++) {
@@ -1488,15 +1741,19 @@ function mergeEventsDatabase(
           .run(sourceHash);
         commitFence();
         afterSourceFenceCommit?.();
+        assertTarget();
         target.exec("COMMIT");
+        committed = true;
+        assertTarget();
       } catch (error) {
-        target.exec("ROLLBACK");
-        throw error;
+        rollbackTargetReconciliationTransaction(target, committed, error);
       }
     } finally {
       closeLcmConnection(targetPath, target);
     }
+    assertTarget();
   });
+  assertTarget();
 }
 
 function effectivePatterns(content: string): string[] {
@@ -1514,7 +1771,10 @@ function mergePatterns(
   source: WorktreeReconciliationSource,
   targetDir: string,
   expected: SourceComponentSnapshot,
+  targetParent: PrivateDirectoryHandle,
+  assertTarget: () => void,
 ): void {
+  assertTarget();
   const sourcePath = join(source.projectDir, "sensitive-patterns.txt");
   const sourceExists = isRegularFile(sourcePath);
   if (!expected.patterns && sourceExists) {
@@ -1527,7 +1787,10 @@ function mergePatterns(
       `worktree reconciliation source component disappeared before merge: ${source.hash}`,
     );
   }
-  if (!sourceExists) return;
+  if (!sourceExists) {
+    assertTarget();
+    return;
+  }
   const sourceContent = readBoundedRegularFile(sourcePath, {
     allowedRoot: source.projectDir,
     maxBytes: MAX_PATTERN_BYTES,
@@ -1541,22 +1804,37 @@ function mergePatterns(
     );
   }
   const targetPath = join(targetDir, "sensitive-patterns.txt");
+  assertTarget();
   const targetExists = isRegularFile(targetPath);
   const target = targetExists
     ? readBoundedRegularFile(targetPath, { allowedRoot: targetDir, maxBytes: MAX_PATTERN_BYTES })
     : "";
+  assertTarget();
   const targetEffective = new Set(effectivePatterns(target));
   const additions = [...new Set(effectivePatterns(sourceContent))]
     .filter((pattern) => !targetEffective.has(pattern));
   if (additions.length === 0) {
-    if (!targetExists) atomicWritePrivateFile(targetPath, "");
+    if (!targetExists) atomicWritePrivateFile(targetPath, "", {}, targetParent);
+    assertTarget();
     return;
   }
   const separator = target.length === 0 || target.endsWith("\n") ? "" : "\n";
-  atomicWritePrivateFile(targetPath, `${target}${separator}${additions.join("\n")}\n`);
+  atomicWritePrivateFile(
+    targetPath,
+    `${target}${separator}${additions.join("\n")}\n`,
+    {},
+    targetParent,
+  );
+  assertTarget();
 }
 
-function writeCanonicalTargetMetadata(targetDir: string, canonical: string): void {
+function writeCanonicalTargetMetadata(
+  targetDir: string,
+  canonical: string,
+  targetParent: PrivateDirectoryHandle,
+  assertTarget: () => void,
+): void {
+  assertTarget();
   const metaPath = join(targetDir, "meta.json");
   let metadata: Record<string, unknown> = {};
   if (existsSync(metaPath)) {
@@ -1566,17 +1844,26 @@ function writeCanonicalTargetMetadata(targetDir: string, canonical: string): voi
     const parsed = JSON.parse(readBoundedRegularFile(metaPath, {
       allowedRoot: targetDir,
       maxBytes: MAX_PROJECT_METADATA_BYTES,
+      expectedUid: targetParent.witness.uid,
+      requireSingleLink: true,
     })) as unknown;
+    assertTarget();
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       throw new Error(`invalid canonical project metadata: ${metaPath}`);
     }
     metadata = parsed as Record<string, unknown>;
-    if (metadata.cwd === canonical) return;
+    if (metadata.cwd === canonical) {
+      assertTarget();
+      return;
+    }
   }
   atomicWritePrivateFile(
     metaPath,
     `${JSON.stringify({ ...metadata, cwd: canonical }, null, 2)}\n`,
+    {},
+    targetParent,
   );
+  assertTarget();
 }
 
 function sourceComponentSnapshot(
@@ -1966,7 +2253,10 @@ export function reconcileWorktrees(
       return resultFromJournal(fastJournal, journalFile);
     }
   }
-  const executeLocked = (map: Record<string, ProjectMapEntry>): WorktreeReconciliationResult => {
+  const executeLocked = (
+    map: Record<string, ProjectMapEntry>,
+    completion: { marked: boolean },
+  ): WorktreeReconciliationResult => {
     opts._observer?.("after-map-preflight");
     const existingJournal = readJournal(journalFile);
     if (
@@ -2101,16 +2391,17 @@ export function reconcileWorktrees(
       delete journal.reason;
     }
     journal.sourceComponents ??= {};
+    const sourceComponents = journal.sourceComponents;
     for (const source of sources) {
       const current = sourceComponentSnapshot(source);
-      let expected = journal.sourceComponents[source.hash];
+      let expected = sourceComponents[source.hash];
       if (!expected) {
         if (journal.phase !== "planned") {
           throw new Error(
             `worktree reconciliation journal lacks a component snapshot for ${source.hash}`,
           );
         }
-        journal.sourceComponents[source.hash] = current;
+        sourceComponents[source.hash] = current;
         continue;
       }
       if (expected.patterns && expected.patternsDigest === undefined) {
@@ -2119,7 +2410,7 @@ export function reconcileWorktrees(
             `worktree reconciliation journal lacks a patterns digest for ${source.hash}`,
           );
         }
-        journal.sourceComponents[source.hash] = current;
+        sourceComponents[source.hash] = current;
         expected = current;
       }
       assertNoUnmergedComponentsAppeared(source, expected, current);
@@ -2139,81 +2430,151 @@ export function reconcileWorktrees(
     ensurePrivateDirectory(reconciliationDir(opts.homeDir));
     writeJournal(journalFile, journal);
 
-    try {
-      const targetDir = projectStateDir(targetHash, opts.homeDir);
-      ensurePrivateDirectory(targetDir);
+    const reconcileRetainedTarget = (
+      retainedTarget: RetainedReconciliationTarget,
+    ): WorktreeReconciliationResult => {
+      const targetDir = retainedTarget.targetPath;
       const targetDbPath = join(targetDir, "db.sqlite");
       const targetEventsPath = projectEventsPath(targetHash, opts.homeDir);
-      ensurePrivateDirectory(dirname(targetEventsPath));
+      const assertTarget = () => assertRetainedReconciliationTarget(retainedTarget);
+      assertTarget();
       if (journal.phase === "planned") {
         for (const source of sources) {
+          assertTarget();
           const sourceDbPath = join(source.projectDir, "db.sqlite");
           if (isRegularFile(sourceDbPath)) {
-            opts._observer?.("before-source-main-merge", source);
+            observeRetainedReconciliationTarget(
+              retainedTarget,
+              opts._observer,
+              "before-source-main-merge",
+              source,
+            );
             mergeMainDatabase(
               sourceDbPath,
               targetDbPath,
               targetHash,
               source.hash,
               sourceBusyTimeoutMs,
+              assertTarget,
               opts._fts5Available,
-              () => opts._observer?.(
+              () => observeRetainedReconciliationTarget(
+                retainedTarget,
+                opts._observer,
                 "after-source-fence-commit-before-target-commit",
                 source,
               ),
             );
           }
           if (isRegularFile(source.eventsPath)) {
-            opts._observer?.("before-source-events-merge", source);
+            observeRetainedReconciliationTarget(
+              retainedTarget,
+              opts._observer,
+              "before-source-events-merge",
+              source,
+            );
             mergeEventsDatabase(
               source.eventsPath,
               targetEventsPath,
               source.hash,
               sourceBusyTimeoutMs,
-              () => opts._observer?.("after-target-events-migration", source),
-              () => opts._observer?.(
+              assertTarget,
+              () => observeRetainedReconciliationTarget(
+                retainedTarget,
+                opts._observer,
+                "after-target-events-migration",
+                source,
+              ),
+              () => observeRetainedReconciliationTarget(
+                retainedTarget,
+                opts._observer,
                 "after-source-fence-commit-before-target-commit",
                 source,
               ),
             );
           }
-          opts._observer?.("before-source-patterns-merge", source);
-          mergePatterns(source, targetDir, journal.sourceComponents[source.hash]!);
+          observeRetainedReconciliationTarget(
+            retainedTarget,
+            opts._observer,
+            "before-source-patterns-merge",
+            source,
+          );
+          mergePatterns(
+            source,
+            targetDir,
+            sourceComponents[source.hash]!,
+            retainedTarget.target,
+            assertTarget,
+          );
+          assertTarget();
         }
-        writeCanonicalTargetMetadata(targetDir, canonical);
+        writeCanonicalTargetMetadata(
+          targetDir,
+          canonical,
+          retainedTarget.target,
+          assertTarget,
+        );
+        assertTarget();
         journal.phase = "merged";
         writeJournal(journalFile, journal);
-        opts._observer?.("after-merge-before-archive");
+        observeRetainedReconciliationTarget(
+          retainedTarget,
+          opts._observer,
+          "after-merge-before-archive",
+        );
       }
       if (journal.phase === "merged") {
         for (const source of sources) {
-          const expected = journal.sourceComponents[source.hash]!;
+          assertTarget();
+          const expected = sourceComponents[source.hash]!;
           assertNoUnmergedComponentsAppeared(
             source,
             expected,
             sourceComponentSnapshot(source),
           );
+          assertTarget();
         }
         journal.archiveAt ??= (opts.now ?? new Date()).toISOString();
         writeJournal(journalFile, journal);
         const now = new Date(journal.archiveAt);
         for (const source of sources) {
+          assertTarget();
           archiveSource(source, opts.homeDir, now, (backupPath) => {
+            assertTarget();
             journal.backupPaths.push(backupPath);
             writeJournal(journalFile, journal);
-          }, (event, detailPath) => opts._observer?.(event, source, detailPath));
+            assertTarget();
+          }, (event, detailPath) => observeRetainedReconciliationTarget(
+            retainedTarget,
+            opts._observer,
+            event,
+            source,
+            detailPath,
+          ));
+          assertTarget();
           assertArchivedPatternsMatch(
             source,
-            journal.sourceComponents[source.hash]!,
+            sourceComponents[source.hash]!,
             opts.homeDir,
             now,
           );
-          opts._observer?.("after-source-archive", source);
+          observeRetainedReconciliationTarget(
+            retainedTarget,
+            opts._observer,
+            "after-source-archive",
+            source,
+          );
         }
+        assertTarget();
         journal.phase = "archived";
         writeJournal(journalFile, journal);
       }
+      observeRetainedReconciliationTarget(
+        retainedTarget,
+        opts._observer,
+        "before-project-map-publication",
+      );
       const currentMap = listProjectMapEntries(opts.homeDir, opts._publicationLockToken);
+      assertTarget();
       const targetEntry = currentMap[targetHash];
       const sourcesRemain = pendingSourceHashes.some((hash) => currentMap[hash] !== undefined);
       if (!sourcesRemain && targetEntry) {
@@ -2229,6 +2590,7 @@ export function reconcileWorktrees(
           throw new Error("published worktree reconciliation map does not match its journal");
         }
       } else {
+        assertTarget();
         foldProjectMapEntriesLocked({
           targetHash,
           canonical,
@@ -2238,12 +2600,20 @@ export function reconcileWorktrees(
           homeDir: opts.homeDir,
           _publicationLockToken: opts._publicationLockToken,
           onBackupCreated: (backupPath) => {
+            assertTarget();
             journal.backupPaths.push(backupPath);
             writeJournal(journalFile, journal);
+            assertTarget();
           },
-          onMapPublished: () => opts._observer?.("after-project-map-published"),
+          onMapPublished: () => observeRetainedReconciliationTarget(
+            retainedTarget,
+            opts._observer,
+            "after-project-map-published",
+          ),
         });
+        assertTarget();
       }
+      assertTarget();
       journal.pendingSourceHashes = [];
       journal.phase = "completed";
       const publishedMapDiscovery = reconciliationDiscovery(
@@ -2259,25 +2629,40 @@ export function reconcileWorktrees(
         complete: discovery.complete && publishedMapDiscovery.complete,
       };
       writeJournal(journalFile, journal);
+      assertTarget();
       return resultFromJournal(journal, journalFile);
+    };
+    try {
+      return withRetainedReconciliationTarget(
+        targetHash,
+        opts.homeDir,
+        reconcileRetainedTarget,
+        () => {
+          completion.marked = true;
+        },
+      );
     } catch (error) {
       if (error instanceof BackendPublicationJournalError) throw error;
-      journal.blockedFrom = journal.phase === "merged" || journal.phase === "archived"
-        ? journal.phase
-        : journal.blockedFrom ?? "planned";
-      journal.phase = "blocked";
-      journal.reason = String(error);
-      writeJournal(journalFile, journal);
+      if (!completion.marked) {
+        journal.blockedFrom = journal.phase === "merged" || journal.phase === "archived"
+          ? journal.phase
+          : journal.blockedFrom ?? "planned";
+        journal.phase = "blocked";
+        journal.reason = String(error);
+        writeJournal(journalFile, journal);
+      }
       throw error;
     }
   };
 
   const execute = (map: Record<string, ProjectMapEntry>): WorktreeReconciliationResult => {
+    const completion = { marked: false };
     try {
-      return executeLocked(map);
+      return executeLocked(map, completion);
     } catch (error) {
       if (error instanceof BackendPublicationJournalError) throw error;
       if (opts.dryRun) throw error;
+      if (completion.marked) throw error;
       const current = readJournal(journalFile);
       if (current && resolve(current.canonical) !== canonical) throw error;
       {
@@ -2318,7 +2703,7 @@ export function reconcileWorktrees(
   if (opts.dryRun) return execute(readProjectMapSnapshot(opts.homeDir, opts._publicationLockToken));
   const lockWaitMs = opts._lockWaitMs ?? 5_000;
   const retryDelayMs = opts._lockRetryDelayMs ?? 50;
-  const deadline = Date.now() + lockWaitMs;
+  const deadline = performance.now() + lockWaitMs;
   let retryWaiter: Int32Array | undefined;
   while (true) {
     try {
@@ -2332,14 +2717,14 @@ export function reconcileWorktrees(
         ),
       );
     } catch (error) {
-      if (!(error instanceof PrivateMutationLockContentionError) || Date.now() >= deadline) {
+      if (!(error instanceof PrivateMutationLockContentionError) || performance.now() >= deadline) {
         throw error;
       }
       Atomics.wait(
         retryWaiter ??= new Int32Array(new SharedArrayBuffer(4)),
         0,
         0,
-        Math.min(retryDelayMs, Math.max(1, deadline - Date.now())),
+        Math.min(retryDelayMs, Math.max(1, deadline - performance.now())),
       );
     }
   }
@@ -2351,7 +2736,7 @@ export function ensureWorktreeProjectReconciled(
   opts: {
     /** @internal Override the bounded process-cache lifetime for deterministic tests. */
     readonly _cacheTtlMs?: number;
-    /** @internal Override wall-clock time for deterministic cache tests. */
+    /** @internal Override monotonic elapsed milliseconds for deterministic cache tests. */
     readonly _nowMs?: number;
     /** @internal Override ~/.codex for deterministic catalogue tests. */
     readonly _codexDir?: string;
@@ -2380,7 +2765,7 @@ export function ensureWorktreeProjectReconciled(
     id: hashProjectPath(anchor!.canonical),
     canonical: anchor!.canonical,
   };
-  const now = opts._nowMs ?? Date.now();
+  const now = opts._nowMs ?? performance.now();
   const ttlMs = cacheTtlMs(opts._cacheTtlMs);
   const identityCanonical = resolve(project.canonical);
   const cached = reconciledThisProcess.get(project.id);

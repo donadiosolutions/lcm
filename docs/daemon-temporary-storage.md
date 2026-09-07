@@ -6,11 +6,33 @@ always set to `<canonical state root>/daemon-tmp`.
 
 Before a daemon is registered with systemd or launchd, LCM creates that leaf
 only when it is absent. Creation is non-recursive and uses mode `0700`. An
-existing leaf is accepted only when it is a directory owned by the current
+owner-clearing process umask can clip those requested owner bits. When that
+happens during a creation performed by LCM, the newly created empty leaf is
+removed after an identity and canonical-path recheck, and startup reports that
+an owner-preserving umask such as `0077` is required. LCM does not change the
+process umask or repair an existing path. If validation or the bounded removal
+cannot be confirmed, the leaf is retained as evidence and may need operator
+attention.
+
+When this creation error reaches the managed daemon lifecycle, its refusal
+contains the fixed retry guidance above for initial starts, stale-registration
+repairs, authenticated legacy migrations, and ordinary managed restarts. Other
+supervisor failures retain a generic warning; their error text is not exposed.
+The ordinary CLI failure renderer includes this exact trusted warning after its
+mapped refusal remediation and does not expose other lifecycle warning values.
+
+An existing leaf is accepted only when it is a directory owned by the current
 user, has exactly the private mode (including special bits), is not a symbolic
 link, resolves to the exact expected pathname, and remains contained beneath
 the canonical state root. Any unsafe, partial, or raced condition fails closed;
 LCM does not chmod or repair an unsafe existing leaf.
+
+If an unsafe leaf was left by an older release, inspect the state root and
+verify that the leaf is owned by the expected user before repairing it. For an
+owned directory, either run `chmod 0700 <canonical state root>/daemon-tmp` or,
+when it is empty, remove it with `rmdir <canonical state root>/daemon-tmp`, then
+start again under an owner-preserving umask such as `0077`. LCM never performs
+these operator repairs automatically.
 
 The same state-root path is reused across daemon restarts, stop operations,
 credential cleanup, and launchd plist cleanup. This makes temporary files

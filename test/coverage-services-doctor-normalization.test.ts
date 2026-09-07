@@ -17,6 +17,7 @@ vi.mock("../src/db/events-stats.js", () => ({
 }));
 
 import { runDoctor } from "../src/doctor/doctor.js";
+import { doctorConfigSeams } from "./doctor/config-seams.js";
 import { LCM_MD_CONTENT } from "../src/daemon/orientation.js";
 import type { DoctorDeps } from "../src/doctor/types.js";
 
@@ -46,7 +47,7 @@ afterAll(() => {
   rmSync(NORMALIZATION_FIXTURE_ROOT, { recursive: true, force: true });
 });
 
-it("normalizes a merge result without an MCP servers object", async () => {
+it("compares missing normalized settings without writing during observation", async () => {
   const written: string[] = [];
   const deps: DoctorDeps = {
     existsSync: () => true,
@@ -65,17 +66,13 @@ it("normalizes a merge result without an MCP servers object", async () => {
     homedir: NORMALIZATION_HOME,
     platform: "linux",
     cwd: NORMALIZATION_CWD,
-    _assertBackendPublication: () => undefined,
+    ...doctorConfigSeams("{}"),
   };
 
-  mergeClaudeSettingsMock.mockReturnValueOnce({});
   const results = await runDoctor(deps);
-  mergeClaudeSettingsMock.mockReturnValueOnce({ mcpServers: null } as never);
-  await runDoctor(deps);
-  mergeClaudeSettingsMock.mockReturnValueOnce({ mcpServers: {} });
-  await runDoctor(deps);
 
   expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("warn");
   expect(mergeClaudeSettingsMock).toHaveBeenCalled();
-  expect(written.some((content) => content.includes('"mcpServers"'))).toBe(true);
+  expect(written).toEqual([]);
+  expect(deps.mkdirSync).not.toHaveBeenCalled();
 });

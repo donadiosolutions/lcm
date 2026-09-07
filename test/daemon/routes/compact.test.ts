@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { IncomingMessage } from "node:http";
 import { Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -14,7 +14,7 @@ import {
 } from "../../../src/daemon/server.js";
 import { ensureAuthToken, readAuthToken } from "../../../src/daemon/auth.js";
 import { loadDaemonConfig, parseDaemonConfig } from "../../../src/daemon/config.js";
-import { projectDbPath, projectId, projectIdentity } from "../../../src/daemon/project.js";
+import { projectDbPath, projectId, projectIdentity, projectPaths } from "../../../src/daemon/project.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import { ConversationStore } from "../../../src/store/conversation-store.js";
 import {
@@ -714,6 +714,59 @@ describe("POST /compact", () => {
     expect(body).toHaveProperty("summary");
     expect(body).toHaveProperty("actionTaken", false);
     expect(typeof body.summary).toBe("string");
+  });
+
+  it("publishes final compact metadata atomically with private mode", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-compact-metadata-"));
+    const paths = projectPaths(cwd);
+    tempDirs.push(cwd, paths.dir);
+    daemon = await createDaemon(loadDaemonConfig("/x", {
+      daemon: { port: 0 },
+      llm: { apiKey: "sk-test" },
+      summarizer: { mock: true },
+    }));
+    const baseUrl = `http://127.0.0.1:${daemon.address().port}`;
+    const ingested = await fetch(`${baseUrl}/ingest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "compact-metadata-first",
+        cwd,
+        messages: [{ role: "user", content: "first", tokenCount: 1 }],
+      }),
+    });
+    expect(ingested.status).toBe(200);
+    const endpoint = `${baseUrl}/compact`;
+
+    const first = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "compact-metadata-first", cwd }),
+    });
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({ actionTaken: false });
+    const created = JSON.parse(readFileSync(paths.metaPath, "utf8")) as Record<string, unknown>;
+    expect(created).toMatchObject({ cwd: paths.canonical, lastCompact: expect.any(String) });
+    expect(lstatSync(paths.metaPath).mode & 0o777).toBe(0o600);
+
+    const oldTimestamp = "1970-01-01T00:00:00.000Z";
+    writeFileSync(paths.metaPath, JSON.stringify({
+      retained: "value",
+      cwd: "/old",
+      lastCompact: oldTimestamp,
+    }), "utf8");
+    chmodSync(paths.metaPath, 0o644);
+    const second = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "compact-metadata-first", cwd }),
+    });
+    expect(second.status).toBe(200);
+    const replaced = JSON.parse(readFileSync(paths.metaPath, "utf8")) as Record<string, unknown>;
+    expect(replaced).toMatchObject({ retained: "value", cwd: paths.canonical });
+    expect(Date.parse(String(replaced.lastCompact))).toBeGreaterThan(Date.parse(oldTimestamp));
+    expect(lstatSync(paths.metaPath).mode & 0o777).toBe(0o600);
+    expect(readdirSync(paths.dir).filter(name => /^\.meta\.json\..+\.tmp$/u.test(name))).toEqual([]);
   });
 
   it("does not retain publication admission while the summarizer is pending", async () => {

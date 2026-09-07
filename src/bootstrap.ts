@@ -41,17 +41,22 @@ export interface EnsureCoreDeps {
   chmodSync?: (path: string, mode: number) => void;
   atomicWritePrivateFileDurable?: typeof atomicWritePrivateFileDurable;
   ensureRuntimeHome?: (homeDir: string) => void;
+  /** @internal Bounded admission convergence for one lock-taking step. */
+  _withPublicationAdmissionRetry?: <T>(step: () => T | Promise<T>) => Promise<T>;
   binaryPath?: string;
   transport?: ConnectorTransport;
   ensureDaemon: (opts: {
     port: number;
     pidFilePath: string;
     spawnTimeoutMs: number;
+    expectedVersion?: string;
     expectedStorageBackend?: "sqlite" | "postgresql";
     expectedEntrypoint?: string;
+    expectedRuntimeDigest?: string;
     enforceUserManagerParent?: boolean;
     spawnCommand?: string;
     spawnArgs?: string[];
+    _withPublicationAdmissionRetry?: <T>(step: () => T | Promise<T>) => Promise<T>;
   }) => Promise<{ connected: boolean }>;
 }
 
@@ -84,8 +89,10 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
   if (publicationHome === undefined) {
     throw new Error("canonical LCM configuration path is required");
   }
+  const wrap = deps._withPublicationAdmissionRetry
+    ?? (async <T>(step: () => T | Promise<T>) => await step());
   if (deps.ensureRuntimeHome !== undefined) {
-    deps.ensureRuntimeHome(publicationHome);
+    await wrap(() => deps.ensureRuntimeHome!(publicationHome));
   } else {
     // Explicit test/embedding dependencies do not get implicit filesystem
     // mutation, but they still inherit the publication fail-closed gate.
@@ -95,7 +102,7 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
   // 1. Authenticate publication state, then create config.json with
   // defaults if missing. Production defaults use the descriptor-bound durable
   // writer; injected dependencies retain the historical seam for tests.
-  const config = withBackendPublicationConfigLock(deps.configPath, (lockToken) => {
+  const config = await wrap(() => withBackendPublicationConfigLock(deps.configPath, (lockToken) => {
     if (!deps.existsSync(deps.configPath)) {
       const defaults = parseDaemonConfig("{}", {}, resolveDaemonConfigEnv(process.env));
       const content = JSON.stringify(daemonConfigForPersistence(defaults), null, 2);
@@ -147,7 +154,7 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
       lockToken,
     );
     return parsed;
-  });
+  }));
 
   // 2. Clean stale/duplicate hooks from settings.json (fixes #94)
   // Only rewrite settings.json if mergeClaudeSettings actually changed the data
@@ -163,7 +170,7 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
   }
 
   // 3. Start daemon if not running
-  selectStorageBackend({ ...config.storage, homeDir: publicationHome });
+  await wrap(() => selectStorageBackend({ ...config.storage, homeDir: publicationHome }));
   const result = await deps.ensureDaemon({
     port: config.daemon.port,
     pidFilePath: join(dirname(deps.configPath), "daemon.pid"),
@@ -173,6 +180,7 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
     spawnCommand: process.execPath,
     spawnArgs: [binaryPath, "daemon", "start", "--foreground"],
     enforceUserManagerParent: true,
+    _withPublicationAdmissionRetry: deps._withPublicationAdmissionRetry,
   });
   return { connected: result.connected, port: config.daemon.port };
 }

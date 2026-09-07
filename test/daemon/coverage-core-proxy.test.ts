@@ -22,7 +22,18 @@ function child(pid: number | undefined = 123) {
 const response = (ok: boolean, service = "claude-server") => ({ ok, json: async () => ({ service }) });
 
 beforeEach(() => {
-  vi.useFakeTimers(); vi.clearAllMocks(); mocks.exists.mockReturnValue(false);
+  vi.useFakeTimers();
+  mocks.spawn.mockReset();
+  mocks.read.mockReset();
+  mocks.write.mockReset();
+  mocks.unlink.mockReset();
+  mocks.exists.mockReset();
+  mocks.spawn.mockImplementation(() => { throw new Error("spawn not configured"); });
+  mocks.read.mockReturnValue("not-a-pid");
+  mocks.write.mockImplementation(() => {});
+  mocks.unlink.mockImplementation(() => {});
+  mocks.exists.mockReturnValue(false);
+  vi.spyOn(process, "kill").mockImplementation(() => { throw new Error("dead"); });
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
@@ -52,7 +63,7 @@ describe("proxy manager failure and monitor boundaries", () => {
     expect(await manager.isHealthy()).toBe(false);
   });
 
-  it("handles malformed PID files, read failures, and the real kill-check failure path", async () => {
+  it("handles malformed PID files, read failures, and the default kill-check failure path", async () => {
     mocks.exists.mockReturnValue(true);
     mocks.read.mockImplementation(() => { throw new Error("read"); });
     const cp = child(); mocks.spawn.mockReturnValue(cp);
@@ -63,28 +74,36 @@ describe("proxy manager failure and monitor boundaries", () => {
     await manager.stop();
     mocks.read.mockReturnValue("NaN");
     const second = createClaudeCliProxyManager({ port: 2, startupTimeoutMs: 20, model: "m", pidFilePath: "/pid", _fetchOverride: vi.fn().mockResolvedValue(response(true)), _killCheck: undefined });
-    vi.spyOn(process, "kill").mockImplementation(() => { throw new Error("dead"); });
     mocks.spawn.mockReturnValue(child());
     await second.start();
     expect(mocks.spawn).toHaveBeenCalledTimes(2);
     await second.stop();
 
     mocks.exists.mockReturnValue(true); mocks.read.mockReturnValue("77");
-    vi.spyOn(process, "kill").mockReturnValue(true);
+    vi.mocked(process.kill).mockReturnValue(true);
     mocks.spawn.mockReturnValue(child());
     const third = createClaudeCliProxyManager({ port: 2, startupTimeoutMs: 20, model: "m", pidFilePath: "/pid", _fetchOverride: vi.fn().mockResolvedValue(response(true, "foreign")) });
     await third.start();
     expect(process.kill).toHaveBeenCalledWith(77, 0);
+    await third.stop();
   });
 
   it("handles spawn error and exit callbacks plus PID cleanup failures", async () => {
     const cp = child(); mocks.spawn.mockReturnValue(cp);
     mocks.exists.mockReturnValue(true); mocks.unlink.mockImplementation(() => { throw new Error("unlink"); });
+    mocks.read.mockReturnValue("88");
     const manager = createClaudeCliProxyManager({ port: 3, startupTimeoutMs: 20, model: "m", pidFilePath: "/pid", _fetchOverride: vi.fn().mockResolvedValue(response(true)) });
     await manager.start();
-    cp.handlers.get("error")?.(new Error("spawn"));
+    expect(mocks.spawn).toHaveBeenCalledOnce();
+    expect(process.kill).toHaveBeenCalledWith(88, 0);
+    const errorHandler = cp.handlers.get("error");
+    const exitHandler = cp.handlers.get("exit");
+    expect(errorHandler).toBeTypeOf("function");
+    expect(exitHandler).toBeTypeOf("function");
+    expect(manager.available).toBe(true);
+    errorHandler?.(new Error("spawn"));
     expect(manager.available).toBe(false);
-    cp.handlers.get("exit")?.();
+    exitHandler?.();
     await expect(manager.stop()).resolves.toBeUndefined();
   });
 
@@ -136,6 +155,23 @@ describe("proxy manager failure and monitor boundaries", () => {
     await manager.stop();
   });
 
+  it("reuses a live stored PID without spawning", async () => {
+    mocks.exists.mockReturnValue(true);
+    mocks.read.mockReturnValue("101");
+    vi.mocked(process.kill).mockReturnValue(true);
+    const manager = createClaudeCliProxyManager({
+      port: 10, startupTimeoutMs: 10, model: "m", pidFilePath: "/pid",
+      _fetchOverride: vi.fn().mockResolvedValue(response(true)),
+    });
+
+    await manager.start();
+
+    expect(process.kill).toHaveBeenCalledWith(101, 0);
+    expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(manager.available).toBe(true);
+    await manager.stop();
+  });
+
   it("handles a failed automatic restart and resets restart state on stop", async () => {
     const cp = child(); mocks.spawn.mockReturnValue(cp);
     const fetch = vi.fn().mockResolvedValueOnce(response(true)).mockRejectedValue(new Error("down"));
@@ -161,5 +197,6 @@ describe("proxy manager failure and monitor boundaries", () => {
     await vi.advanceTimersByTimeAsync(5);
     expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("claude-server unavailable"));
     expect(manager.available).toBe(false);
+    await manager.stop();
   });
 });

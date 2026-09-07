@@ -250,7 +250,13 @@ fi
 if run_step 3; then
   step "Step 3 — Bump version files and CHANGELOG.md to $VERSION"
 
-  npm version "$VERSION" --no-git-tag-version --silent
+  VERSION="$VERSION" node <<'NODE'
+  const fs = require('node:fs');
+  const path = 'package.json';
+  const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+  pkg.version = process.env.VERSION;
+  fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+NODE
   ok "package.json → $VERSION"
 
   VERSION="$VERSION" node <<'NODE'
@@ -301,7 +307,7 @@ fi
 # ─── STEP 4: Commit and push ─────────────────────────────────────────────────
 if run_step 4; then
   step "Step 4 — Commit and push"
-  git add package.json package-lock.json CHANGELOG.md
+  git add package.json CHANGELOG.md
   if git diff --cached --quiet; then
     ok "No staged changes to commit; skipping git commit."
   else

@@ -6,24 +6,45 @@ import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncRetur
 import { ensureCore } from "../src/bootstrap.js";
 import { bootstrapLcmHome, lcmHomeDir } from "../src/runtime-paths.js";
 import {
+  assertPrivateDirectoryEntry,
   atomicWritePrivateFile,
   atomicWritePrivateFileDurable,
   OWNER_ONLY_FILE_MODES,
   readBoundedRegularFile,
 } from "../src/security-files.js";
 import { parseStoredConfig } from "../src/daemon/config.js";
+import {
+  DEFAULT_DAEMON_PORT,
+  daemonConfigSnapshotWitnessEqual,
+  readDaemonConfigRawSnapshot,
+  type DaemonConfigRawSnapshot,
+} from "../src/daemon/config.js";
+import { daemonTokenPath } from "../src/runtime-paths.js";
+import { readAuthToken } from "../src/daemon/auth.js";
 import { resolveAgentTransport } from "../src/connectors/registry.js";
 import { renderGuidance } from "../src/connectors/template-service.js";
 import type { ConnectorTransport } from "../src/connectors/types.js";
 import { LCM_HISTORICAL_SKILL_SHA256, LCM_MANAGED_SKILL_MARKER } from "../src/connectors/constants.js";
 import {
   assertBackendPublicationConfigAccess,
+  assertBackendPublicationConfigReadAccess,
   assertBackendPublicationConfigMutation,
   assertBackendPublicationConsumerAccess,
+  BackendPublicationJournalError,
   backendPublicationHomeForConfigPath,
+  openBackendPublicationReadRoot,
   withBackendPublicationConfigLock,
+  withBackendPublicationReadRoot,
   type BackendPublicationLockToken,
 } from "../src/storage/backend-publication.js";
+import {
+  capturePublicationIdentity,
+  createPublicationConvergence,
+  withPublicationAdmissionRetry,
+  type PublicationConvergence,
+  type PublicationConvergenceDeps,
+} from "../src/storage/publication-convergence.js";
+import { PACKAGED_RUNTIME_ENTRYPOINT, PKG_VERSION, RUNTIME_DIGEST } from "../src/daemon/version.js";
 import { packageExecutable, packageRootFor } from "../src/runtime-root.js";
 import {
   hasCanonicalClaudeMcpEntry,
@@ -61,12 +82,35 @@ export interface ServiceDeps {
   dryRun?: boolean;
   previewWriteFile?: (path: string, data: string) => void;
   promptUser: (question: string) => Promise<string>;
-  ensureDaemon?: (opts: { port: number; pidFilePath: string; spawnTimeoutMs: number }) => Promise<{ connected: boolean }>;
+  ensureDaemon?: (opts: {
+    port: number;
+    pidFilePath: string;
+    spawnTimeoutMs: number;
+    expectedVersion?: string;
+    expectedStorageBackend?: "sqlite" | "postgresql";
+    expectedEntrypoint?: string;
+    expectedRuntimeDigest?: string;
+    enforceUserManagerParent?: boolean;
+    spawnCommand?: string;
+    spawnArgs?: string[];
+    _withPublicationAdmissionRetry?: <T>(step: () => T | Promise<T>) => Promise<T>;
+  }) => Promise<{ connected: boolean }>;
   runDoctor?: () => Promise<Array<{ name: string; status: string; category?: string; message?: string }>>;
   /** Test seam for the canonical package-rendered Claude skill. */
   renderClaudeSkill?: (transport: ConnectorTransport) => string;
   /** Deterministic test seam; production resolves from stored config. */
   claudeTransport?: ConnectorTransport;
+  /** @internal Shared bounded publication convergence for CLI/install. */
+  publicationConvergence?: PublicationConvergence;
+  /** @internal Deterministic publication convergence seams. */
+  _publicationConvergenceNow?: () => number;
+  _publicationConvergenceSleep?: (delayMs: number) => Promise<void>;
+  _publicationConvergenceFetch?: typeof globalThis.fetch;
+  _readPrivateMutationLockOwnerForTesting?: PublicationConvergenceDeps["readOwner"];
+  _processStartTimeForTesting?: PublicationConvergenceDeps["processBirth"];
+  _readDaemonConfigRawSnapshot?: (configPath: string) => DaemonConfigRawSnapshot;
+  _assertBackendPublicationConfigReadAccess?: typeof assertBackendPublicationConfigReadAccess;
+  _forceLockFreePublicationReadForTesting?: boolean;
 }
 
 const CLAUDE_PLUGIN_REPOSITORIES = new Set([
@@ -266,6 +310,124 @@ const defaultDeps: ServiceDeps = {
   promptUser: readlinePrompt,
 };
 
+/** Build the install/CLI shared convergence object before taking any locks. */
+export async function createInstallerPublicationConvergence(
+  configPath: string = join(lcmHomeDir(), "config.json"),
+  seams: PublicationConvergenceDeps = {},
+): Promise<PublicationConvergence> {
+  let port = DEFAULT_DAEMON_PORT;
+  let backend: "sqlite" | "postgresql" = "sqlite";
+  let authenticated: Readonly<{
+    witness: DaemonConfigRawSnapshot["witness"];
+    journalChecksumSha256: string | null;
+  }> | undefined;
+  const readSnapshot = seams._readDaemonConfigRawSnapshot ?? readDaemonConfigRawSnapshot;
+  const assertReadAccess = seams._assertBackendPublicationConfigReadAccess
+    ?? assertBackendPublicationConfigReadAccess;
+  const homeDir = backendPublicationHomeForConfigPath(configPath);
+  const expectedVersion = seams._expectedVersionForTesting ?? PKG_VERSION;
+  const expectedEntrypoint = seams._expectedEntrypointForTesting ?? PACKAGED_RUNTIME_ENTRYPOINT;
+  const expectedRuntimeDigest = seams._expectedRuntimeDigestForTesting ?? RUNTIME_DIGEST;
+  let rootHandle: ReturnType<typeof openBackendPublicationReadRoot>;
+  let identity: PublicationConvergence["identity"];
+  const assertReadRoot = (canonicalHomeDir: string): void => {
+    rootHandle ??= openBackendPublicationReadRoot(canonicalHomeDir);
+    if (rootHandle !== undefined) {
+      assertPrivateDirectoryEntry(rootHandle, join(canonicalHomeDir, ".lcm"), rootHandle.witness.uid);
+    }
+  };
+  try {
+    try {
+      const snapshot = readSnapshot(configPath);
+      if (snapshot.witness.presence === "absent") throw new Error("configuration is absent");
+      const stored = parseStoredConfig(snapshot.content);
+      const daemon = stored.daemon as { port?: unknown } | undefined;
+      if (typeof daemon?.port === "number" && Number.isInteger(daemon.port)) port = daemon.port;
+      const storage = stored.storage as { backend?: unknown } | undefined;
+      if (storage?.backend === "postgresql") backend = "postgresql";
+      if (homeDir !== undefined) rootHandle = openBackendPublicationReadRoot(homeDir);
+      const witness = {
+        presence: snapshot.witness.presence,
+        rawSha256: snapshot.witness.rawSha256,
+        byteLength: snapshot.witness.byteLength,
+        dev: snapshot.witness.dev,
+        ino: snapshot.witness.ino,
+      } as const;
+      const firstJournal = assertReadAccess(configPath, backend, witness);
+      const second = readSnapshot(configPath);
+      if (!daemonConfigSnapshotWitnessEqual(snapshot.witness, second.witness)) throw new Error("configuration changed");
+      const secondJournal = assertReadAccess(configPath, backend, {
+        presence: second.witness.presence,
+        rawSha256: second.witness.rawSha256,
+        byteLength: second.witness.byteLength,
+        dev: second.witness.dev,
+        ino: second.witness.ino,
+      });
+      if (firstJournal.journalChecksumSha256 !== secondJournal.journalChecksumSha256) {
+        throw new Error("publication changed");
+      }
+      authenticated = {
+        witness: snapshot.witness,
+        journalChecksumSha256: secondJournal.journalChecksumSha256,
+      };
+    } catch {
+      // Missing, malformed, or unstable config cannot authenticate a daemon.
+    }
+    if (homeDir !== undefined && authenticated !== undefined) {
+      const captured = await capturePublicationIdentity({
+        port,
+        expectedVersion,
+        expectedStorageBackend: backend,
+        expectedEntrypoint,
+        expectedRuntimeDigest,
+        deps: {
+          ...seams,
+          homeDir,
+          lockPath: join(homeDir, ".lcm.backend-publication.lock"),
+          fetch: seams.fetch ?? globalThis.fetch,
+          readToken: seams.readToken ?? (() => readAuthToken(daemonTokenPath(homeDir))),
+        },
+      });
+      if (captured !== undefined) {
+        try {
+          assertReadRoot(homeDir);
+          const current = readSnapshot(configPath);
+          if (!daemonConfigSnapshotWitnessEqual(authenticated.witness, current.witness)) {
+            throw new Error("configuration changed");
+          }
+          const currentJournal = assertReadAccess(configPath, backend, {
+            presence: current.witness.presence,
+            rawSha256: current.witness.rawSha256,
+            byteLength: current.witness.byteLength,
+            dev: current.witness.dev,
+            ino: current.witness.ino,
+          });
+          if (currentJournal.journalChecksumSha256 !== authenticated.journalChecksumSha256) {
+            throw new Error("publication changed");
+          }
+          assertReadRoot(homeDir);
+          identity = captured;
+        } catch {
+          // Health captured across changed config or publication state is not reusable.
+        }
+      }
+    }
+  } finally {
+    rootHandle?.close();
+  }
+  return createPublicationConvergence({
+    port,
+    identity,
+    deps: {
+      ...seams,
+      homeDir,
+      lockPath: homeDir === undefined ? undefined : join(homeDir, ".lcm.backend-publication.lock"),
+      fetch: seams.fetch ?? globalThis.fetch,
+      readToken: seams.readToken ?? (() => homeDir === undefined ? null : readAuthToken(daemonTokenPath(homeDir))),
+    },
+  });
+}
+
 function safeConfigExists(deps: ServiceDeps, path: string): boolean {
   if (!deps.lstatSync) return deps.existsSync(path);
   try {
@@ -337,18 +499,68 @@ export function prepareInstallConfig(deps: ServiceDeps, path: string): InstallCo
   if (homeDir === undefined) {
     return inspectInstallConfig(deps, path);
   }
-  return withBackendPublicationConfigLock(path, (lockToken) => {
-    if (!safeConfigExists(deps, path)) {
-      assertBackendPublicationConsumerAccess({ homeDir, lockToken });
-      return { exists: false, content: null };
+  // Explicit unit fixtures retain the historical lock seam; production
+  // dependencies expose the descriptor reader used by the lock-free path.
+  if (deps._forceLockFreePublicationReadForTesting !== true
+    && (deps.readBoundedRegularFile === undefined || deps.readBoundedRegularFile !== readBoundedRegularFile)) {
+    return withBackendPublicationConfigLock(path, (lockToken) => {
+      if (!safeConfigExists(deps, path)) {
+        assertBackendPublicationConsumerAccess({ homeDir, lockToken });
+        return { exists: false, content: null };
+      }
+      const content = readInstallConfig(deps, path);
+      const stored = parseStoredConfig(content);
+      const backend = (stored.storage as { backend?: string } | undefined)?.backend === "postgresql"
+        ? "postgresql" : "sqlite";
+      assertBackendPublicationConfigAccess(path, backend, content, undefined, lockToken);
+      return { exists: true, content };
+    });
+  }
+  // Lock-free authenticated double snapshot. This keeps install's existence
+  // decision readable while a daemon is publishing, without permitting a
+  // mutation or accepting a mixed config/journal view.
+  const readSnapshot = deps._readDaemonConfigRawSnapshot ?? readDaemonConfigRawSnapshot;
+  const assertReadAccess = deps._assertBackendPublicationConfigReadAccess
+    ?? assertBackendPublicationConfigReadAccess;
+  return withBackendPublicationReadRoot(homeDir, (assertReadRoot) => {
+    const read = (): InstallConfigState & { journalChecksum: string | null; witness: ReturnType<typeof readDaemonConfigRawSnapshot>["witness"] } => {
+      const snapshot = readSnapshot(path);
+      if (snapshot.witness.presence === "absent") {
+        const journal = assertReadAccess(path, "sqlite", {
+          presence: "absent",
+          rawSha256: null,
+          byteLength: 0,
+          dev: null,
+          ino: null,
+        });
+        assertReadRoot();
+        return { exists: false, content: null, journalChecksum: journal.journalChecksumSha256, witness: snapshot.witness };
+      }
+      const stored = parseStoredConfig(snapshot.content);
+      const backend = (
+        stored.storage as { backend?: string } | undefined
+      )?.backend === "postgresql" ? "postgresql" : "sqlite";
+      const witness = {
+        presence: snapshot.witness.presence,
+        rawSha256: snapshot.witness.rawSha256,
+        byteLength: snapshot.witness.byteLength,
+        dev: snapshot.witness.dev,
+        ino: snapshot.witness.ino,
+      } as const;
+      const journal = assertReadAccess(path, backend, witness);
+      assertReadRoot();
+      return { exists: true, content: snapshot.content, journalChecksum: journal.journalChecksumSha256, witness: snapshot.witness };
+    };
+    const first = read();
+    const second = read();
+    if (first.exists !== second.exists || first.content !== second.content || first.journalChecksum !== second.journalChecksum
+      || !daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
+      throw new BackendPublicationJournalError(
+        "unexpected-state",
+        "configuration changed during lock-free publication admission",
+      );
     }
-    const content = readInstallConfig(deps, path);
-    const stored = parseStoredConfig(content);
-    const backend = (
-      stored.storage as { backend?: string } | undefined
-    )?.backend === "postgresql" ? "postgresql" : "sqlite";
-    assertBackendPublicationConfigAccess(path, backend, content, undefined, lockToken);
-    return { exists: true, content };
+    return { exists: first.exists, content: first.content };
   });
 }
 
@@ -630,7 +842,8 @@ function historicalSkillDigest(content: string): string {
 }
 
 function ownedCanonicalSkill(existing: string, generated: string): boolean {
-  return existing === generated
+  return existing.length === 0
+    || existing === generated
     || hasCanonicalSkillMarker(existing)
     || LCM_HISTORICAL_SKILL_SHA256.includes(
       historicalSkillDigest(existing) as (typeof LCM_HISTORICAL_SKILL_SHA256)[number],
@@ -765,7 +978,10 @@ export function resolveClaudeTransport(configPathValue: string): ConnectorTransp
   }
 }
 
-export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
+export async function install(
+  deps: ServiceDeps = defaultDeps,
+  suppliedConvergence?: PublicationConvergence,
+): Promise<void> {
   const lcDir = lcmHomeDir();
 
   const configPath = join(lcDir, "config.json");
@@ -778,7 +994,21 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
   // The installer is the operator-assisted root creator. Production deps use
   // descriptor-bound topology authentication; test/dry-run deps can inject a
   // no-op seam without causing the installer to mutate the real home.
-  deps.ensureLcmHome?.(homedir());
+  const convergence = suppliedConvergence ?? deps.publicationConvergence ?? (
+    deps.ensureLcmHome === undefined ? undefined : await createInstallerPublicationConvergence(
+      configPath,
+      {
+        now: deps._publicationConvergenceNow,
+        sleep: deps._publicationConvergenceSleep,
+        fetch: deps._publicationConvergenceFetch,
+        readOwner: deps._readPrivateMutationLockOwnerForTesting,
+        processBirth: deps._processStartTimeForTesting,
+      },
+    )
+  );
+  if (deps.ensureLcmHome !== undefined) {
+    await withPublicationAdmissionRetry(() => deps.ensureLcmHome!(homedir()), convergence);
+  }
   if (deps.ensureLcmHome === undefined) {
     // Compatibility seam for explicit test dependencies. The production
     // default never takes this recursive/pathname creation branch.
@@ -833,7 +1063,10 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     };
     const created = deps.ensureLcmHome !== undefined
       && backendPublicationHomeForConfigPath(configPath) !== undefined
-      ? withBackendPublicationConfigLock(configPath, (lockToken) => create(lockToken))
+      ? await withPublicationAdmissionRetry(
+        () => withBackendPublicationConfigLock(configPath, (lockToken) => create(lockToken)),
+        convergence,
+      )
       : create();
     if (created) console.log(`Created ${configPath}`);
   }
@@ -858,6 +1091,9 @@ export async function install(deps: ServiceDeps = defaultDeps): Promise<void> {
     mkdirSync: deps.mkdirSync,
     atomicWritePrivateFileDurable: deps.atomicWritePrivateFileDurable,
     ensureRuntimeHome: deps.ensureLcmHome,
+    _withPublicationAdmissionRetry: convergence === undefined
+      ? undefined
+      : <T>(step: () => T | Promise<T>) => withPublicationAdmissionRetry(step, convergence),
     binaryPath: lcmBin,
     transport: claudeTransport,
     ensureDaemon: deps.ensureDaemon ?? (async (opts) => {

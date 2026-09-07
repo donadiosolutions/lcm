@@ -421,9 +421,10 @@ export async function applyBackendPublicationProjectMapFile(
     } else {
       ensurePrivateDirectory(dirname(path));
       const recoveryFile = input.file as Extract<BackendPublicationRecoveryFile, { presence: "present" }>;
+      // The authenticated witness is checked before admission; publication of
+      // an existing map is still unconditional under the cooperating locks.
       atomicWritePrivateFileDurable(path, state.content, {
         requireAbsent: before.presence === "absent",
-        expectedContentSha256: before.presence === "present" ? before.rawSha256 : null,
         maxExistingBytes: 4 * 1024 * 1024,
         finalMode: recoveryFile.mode,
       });
@@ -627,6 +628,8 @@ function populateFromExistingProjectMetadata(map: ProjectMap, homeDir?: string):
       const meta = JSON.parse(readBoundedRegularFile(metaPath, {
         allowedRoot: join(root, entry.name),
         maxBytes: 1024 * 1024,
+        expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+        requireSingleLink: true,
       })) as { cwd?: unknown };
       if (typeof meta.cwd !== "string" || meta.cwd.length === 0) continue;
       const canonical = normalizeProjectPath(meta.cwd);

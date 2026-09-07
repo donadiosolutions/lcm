@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -306,6 +306,7 @@ describe("connector transport core", () => {
         expect(readFileSync(skillPath, "utf8")).toBe(priorSkill);
         expect(readFileSync(mcpPath, "utf8")).toContain('"lcm"');
         expect(readConnectorTransport(configPath, "cursor")).toBe("mcp");
+        expect(readdirSync(directory, { recursive: true }).filter((entry) => String(entry).includes(".lcm-connector-txn-"))).toEqual([]);
       } finally {
         rmSync(directory, { recursive: true, force: true });
       }

@@ -25,6 +25,15 @@ export function boundedModelForDisplay(model: string): string {
   return `${sanitized.slice(0, MAX_MODEL_DISPLAY_LENGTH)}...[truncated]`;
 }
 
+/** Create the stable, actionable diagnostic used when a provider CLI is absent. */
+export function createFriendlyMissingCodexError(): Error {
+  return new Error([
+    "Codex CLI is not installed or not on PATH.",
+    "Install it first, for example: npm install -g @openai/codex",
+    "Then run lcm again.",
+  ].join("\n"));
+}
+
 export function createProcessCompatibilityError(options: {
   cliName: string;
   providerId: string;

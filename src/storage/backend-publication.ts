@@ -7,6 +7,7 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
+  PrivateMutationLockContentionError,
   PrivateMutationPermit,
   withPrivateMutationLock,
   withPrivateMutationLockAsync,
@@ -21,6 +22,7 @@ import {
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
   isOwnerOnlyFileMode,
+  openPrivateDirectoryIfExists,
 } from "../security-files.js";
 import type { StorageBackendName } from "./contracts.js";
 import {
@@ -948,26 +950,55 @@ function parseJournal(content: string): BackendPublicationJournal {
   return journal;
 }
 
-function readJournal(homeDir?: string): BackendPublicationJournal | null {
+type BackendPublicationDirectoryHandle = ReturnType<typeof openPrivateDirectory>;
+
+function openBackendPublicationDirectoryForRead(
+  homeDir?: string,
+): BackendPublicationDirectoryHandle | undefined {
   const directory = backendPublicationDirectory(homeDir);
-  let directoryHandle;
   try {
-    directoryHandle = openPrivateDirectory(directory);
+    return openPrivateDirectoryIfExists(directory);
   } catch (error) {
-    if (isMissing(error)) return null;
     return fail("unsafe-storage", `backend publication directory cannot be opened: ${(error as Error).message}`);
   }
+}
+
+function withBackendPublicationDirectoryRead<T>(
+  homeDir: string | undefined,
+  callback: (handle: BackendPublicationDirectoryHandle | undefined) => T,
+): T {
+  const handle = openBackendPublicationDirectoryForRead(homeDir);
   try {
+    return callback(handle);
+  } finally {
+    handle?.close();
+  }
+}
+
+function readJournalFromDirectory(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle | undefined,
+): BackendPublicationJournal | null {
+  if (directoryHandle === undefined) return null;
+  const directory = backendPublicationDirectory(homeDir);
+  try {
+    assertPrivateDirectory(directoryHandle, directory, directoryHandle.witness);
     let journal: BackendPublicationJournal | null;
     try {
-      const content = readBoundedRegularFileWithStat(backendPublicationJournalPath(homeDir), {
+      const observed = readBoundedRegularFileWithStat(backendPublicationJournalPath(homeDir), {
         allowedRoot: directory,
         maxBytes: MAX_JOURNAL_BYTES,
         expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
         allowedModes: [0o600],
         requireSingleLink: true,
-      }).content;
-      journal = parseJournal(content);
+      });
+      if (
+        observed.parentDev !== directoryHandle.witness.dev
+        || observed.parentIno !== directoryHandle.witness.ino
+      ) {
+        return fail("unsafe-storage", "backend publication journal parent does not match the authenticated directory");
+      }
+      journal = parseJournal(observed.content);
     } catch (error) {
       if (isMissing(error)) journal = null;
       else if (error instanceof BackendPublicationJournalError) throw error;
@@ -975,27 +1006,31 @@ function readJournal(homeDir?: string): BackendPublicationJournal | null {
     }
     assertPrivateDirectory(directoryHandle, directory, directoryHandle.witness);
     return journal;
-  } finally {
-    directoryHandle.close();
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError) throw error;
+    return fail(
+      "unsafe-storage",
+      `backend publication directory changed during journal read: ${(error as Error).message}`,
+    );
   }
+}
+
+function readJournal(homeDir?: string): BackendPublicationJournal | null {
+  return withBackendPublicationDirectoryRead(
+    homeDir,
+    (handle) => readJournalFromDirectory(homeDir, handle),
+  );
 }
 
 export function readBackendPublicationJournal(homeDir?: string): BackendPublicationJournal | null {
   return readJournal(homeDir);
 }
 
-function backendPublicationEvidenceExists(
-  homeDir?: string,
-  emptyDirectoryIsEvidence = false,
-): boolean {
+function assertBackendPublicationEvidenceDirectory(
+  homeDir: string | undefined,
+  handle: BackendPublicationDirectoryHandle,
+): void {
   const directory = backendPublicationDirectory(homeDir);
-  let handle;
-  try {
-    handle = openPrivateDirectory(directory);
-  } catch (error) {
-    if (isMissing(error)) return false;
-    return fail("unsafe-storage", `backend publication directory cannot be opened: ${(error as Error).message}`);
-  }
   try {
     assertPrivateDirectory(handle, directory, handle.witness);
     const entries = readdirSync(directory);
@@ -1009,14 +1044,58 @@ function backendPublicationEvidenceExists(
       }
     }
     assertPrivateDirectory(handle, directory, handle.witness);
-    return entries.length > 0 || emptyDirectoryIsEvidence;
-  } finally {
-    handle.close();
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError) throw error;
+    return fail(
+      "unsafe-storage",
+      `backend publication directory changed during evidence enumeration: ${(error as Error).message}`,
+    );
   }
+}
+
+function withPublicationJournalForConsumer<T>(
+  homeDir: string | undefined,
+  callback: (
+    journal: BackendPublicationJournal | null,
+    handle: BackendPublicationDirectoryHandle | undefined,
+  ) => T,
+): T {
+  const inspect = (
+    handle: BackendPublicationDirectoryHandle | undefined,
+  ): T => {
+    const journal = readJournalFromDirectory(homeDir, handle);
+    if (journal === null && handle !== undefined) {
+      assertBackendPublicationEvidenceDirectory(homeDir, handle);
+      return fail("publication-evidence-missing", "backend publication evidence is incomplete");
+    }
+    return callback(journal, handle);
+  };
+  return withBackendPublicationDirectoryRead(homeDir, (initialHandle) => {
+    if (initialHandle !== undefined) return inspect(initialHandle);
+    return withBackendPublicationDirectoryRead(homeDir, inspect);
+  });
+}
+
+function readPublicationJournalForConsumer(homeDir?: string): BackendPublicationJournal | null {
+  return withPublicationJournalForConsumer(homeDir, (journal) => journal);
+}
+
+function readPublicationJournalForAccess(
+  homeDir: string | undefined,
+  permit: PrivateMutationPermit | undefined,
+): BackendPublicationJournal | null {
+  const journal = permit === undefined
+    ? readPublicationJournalForConsumer(homeDir)
+    : readJournal(homeDir);
+  if (journal === null && permit !== undefined) {
+    return fail("permit-mismatch", "backend publication permit has no durable journal");
+  }
+  return journal;
 }
 
 function assertTerminalPublicationEvidence(
   journal: BackendPublicationJournal,
+  directoryHandle: BackendPublicationDirectoryHandle,
   homeDir?: string,
 ): void {
   if (journal.phase !== "completed" && journal.phase !== "aborted") {
@@ -1031,7 +1110,7 @@ function assertTerminalPublicationEvidence(
     }
   }
   try {
-    authenticateMaterial(homeDir, journal);
+    authenticateMaterial(homeDir, journal, directoryHandle);
   } catch (error) {
     // Aborted publications remove their recovery material after the journal
     // reaches its terminal state. The journal checksum and state witnesses
@@ -1052,19 +1131,19 @@ function assertTerminalPublicationEvidence(
   }
 }
 
-function readConsumerPublicationJournal(
-  homeDir?: string,
-  emptyDirectoryIsEvidence = false,
-): BackendPublicationJournal | null {
-  const journal = readJournal(homeDir);
-  if (journal === null) {
-    if (backendPublicationEvidenceExists(homeDir, emptyDirectoryIsEvidence)) {
-      return fail("publication-evidence-missing", "backend publication evidence is incomplete");
-    }
-    return null;
-  }
-  assertTerminalPublicationEvidence(journal, homeDir);
-  return journal;
+function withConsumerPublicationJournal<T>(
+  homeDir: string | undefined,
+  callback: (journal: BackendPublicationJournal | null) => T,
+): T {
+  return withPublicationJournalForConsumer(homeDir, (journal, handle) => {
+    if (journal === null) return callback(journal);
+    assertTerminalPublicationEvidence(journal, handle!, homeDir);
+    return callback(journal);
+  });
+}
+
+function readConsumerPublicationJournal(homeDir?: string): BackendPublicationJournal | null {
+  return withConsumerPublicationJournal(homeDir, (journal) => journal);
 }
 
 function permitMetadata(
@@ -1107,28 +1186,22 @@ function assertBackendPublicationConsumerAccessUnlocked(options: {
   readonly permit?: PrivateMutationPermit;
   readonly lockToken?: BackendPublicationLockToken;
 } = {}): void {
-  const journal = readJournal(options.homeDir);
-  if (journal === null) {
-    if (backendPublicationEvidenceExists(options.homeDir)) {
-      return fail("publication-evidence-missing", "backend publication evidence is incomplete");
-    }
-    if (options.backend === "postgresql") {
-      return fail("publication-evidence-missing", "PostgreSQL selection has no completed backend publication evidence");
-    }
-    if (options.permit !== undefined) {
-      return fail("permit-mismatch", "backend publication permit has no durable journal");
-    }
-    return;
+  if (options.permit === undefined) {
+    return withConsumerPublicationJournal(options.homeDir, (journal) => {
+      if (journal === null) {
+        if (options.backend === "postgresql") {
+          return fail("publication-evidence-missing", "PostgreSQL selection has no completed backend publication evidence");
+        }
+        return;
+      }
+      const expected = journal.phase === "completed" ? journal.targetBackend : journal.sourceBackend;
+      if (options.backend !== undefined && options.backend !== expected) {
+        return fail("backend-mismatch", "stored backend does not match the completed publication journal");
+      }
+    });
   }
-  if (options.permit !== undefined) {
-    permitMetadata(options.permit, options.homeDir, journal);
-    return;
-  }
-  assertTerminalPublicationEvidence(journal, options.homeDir);
-  const expected = journal.phase === "completed" ? journal.targetBackend : journal.sourceBackend;
-  if (options.backend !== undefined && options.backend !== expected) {
-    return fail("backend-mismatch", "stored backend does not match the completed publication journal");
-  }
+  const journal = readPublicationJournalForAccess(options.homeDir, options.permit);
+  permitMetadata(options.permit, options.homeDir, journal!);
 }
 
 type ConsumerLockOptions = Readonly<{
@@ -1194,29 +1267,27 @@ function checkRetainedConsumerDirectories(
 
 function openOptionalPublicationDirectory(homeDir?: string): ReturnType<typeof openPrivateDirectory> | undefined {
   try {
-    return openPrivateDirectory(backendPublicationDirectory(homeDir));
+    return openPrivateDirectoryIfExists(backendPublicationDirectory(homeDir));
   } catch (error) {
-    if (isMissing(error)) return undefined;
     return fail("unsafe-storage", `backend publication directory cannot be opened: ${(error as Error).message}`);
   }
 }
 
 function openOptionalRootDirectory(homeDir?: string): ReturnType<typeof openPrivateDirectory> | undefined {
   try {
-    return openPrivateDirectory(rootPath(homeDir));
+    return openPrivateDirectoryIfExists(rootPath(homeDir));
   } catch (error) {
-    if (isMissing(error)) return undefined;
     // Older ordinary SQLite installations may have a non-private .lcm root.
     // Do not repair it during a read-only publication preflight. If the
     // publication directory exists, however, its authenticated root is part
     // of the evidence and the unsafe mode must fail closed.
     if ((error as Error).message.includes("private directory mode is not trusted")) {
       try {
-        const publication = openPrivateDirectory(backendPublicationDirectory(homeDir));
+        const publication = openPrivateDirectoryIfExists(backendPublicationDirectory(homeDir));
+        if (publication === undefined) return undefined;
         publication.close();
         return fail("unsafe-storage", "backend publication root is not private");
       } catch (publicationError) {
-        if (isMissing(publicationError)) return undefined;
         return fail(
           "unsafe-storage",
           "backend publication directory cannot be opened: " + (publicationError as Error).message,
@@ -1227,11 +1298,102 @@ function openOptionalRootDirectory(homeDir?: string): ReturnType<typeof openPriv
   }
 }
 
+type ConsumerOperationOutcome<T> =
+  | Readonly<{ succeeded: true; value: T }>
+  | Readonly<{ succeeded: false; error: unknown }>;
+
+function completeConsumerOperation<T>(
+  publicationHandle: ReturnType<typeof openPrivateDirectory> | undefined,
+  rootHandle: ReturnType<typeof openPrivateDirectory> | undefined,
+  outcome: ConsumerOperationOutcome<T>,
+): T {
+  const cleanupErrors: unknown[] = [];
+  for (const handle of [publicationHandle, rootHandle]) {
+    try {
+      handle?.close();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (cleanupErrors.length === 0) {
+    if (outcome.succeeded) return outcome.value;
+    throw outcome.error;
+  }
+  if (outcome.succeeded) {
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    throw new AggregateError(
+      cleanupErrors,
+      "backend publication consumer descriptor cleanup failed",
+    );
+  }
+  const aggregate = new AggregateError(
+    [outcome.error, ...cleanupErrors],
+    "backend publication consumer operation and descriptor cleanup failed",
+    { cause: outcome.error },
+  );
+  if (outcome.error instanceof BackendPublicationJournalError) {
+    throw new BackendPublicationJournalError(
+      outcome.error.reason,
+      outcome.error.message,
+      { cause: aggregate },
+    );
+  }
+  if (outcome.error instanceof PrivateMutationLockContentionError) {
+    throw new PrivateMutationLockContentionError(
+      outcome.error.message,
+      { cause: aggregate },
+    );
+  }
+  throw aggregate;
+}
+
 /** Open the canonical LCM root using the consumer path's legacy-read compatibility rule. */
 export function openBackendPublicationReadRoot(
   homeDir?: string,
 ): ReturnType<typeof openPrivateDirectory> | undefined {
   return openOptionalRootDirectory(homeDir);
+}
+
+/**
+ * Retain the canonical LCM root across one lock-free publication read.
+ * Legacy installations without an admissible root receive a refreshable
+ * no-op assertion until a private root or publication evidence appears.
+ */
+export function withBackendPublicationReadRoot<T>(
+  homeDir: string | undefined,
+  callback: (assertReadRoot: () => void) => T,
+): T {
+  const root = rootPath(homeDir);
+  let rootHandle: ReturnType<typeof openPrivateDirectory> | undefined;
+  const assertReadRoot = (): void => {
+    try {
+      if (rootHandle === undefined) {
+        rootHandle = openBackendPublicationReadRoot(homeDir);
+        return;
+      }
+      assertPrivateDirectory(rootHandle, root);
+      // Reopen with O_NOFOLLOW so a symlink to the retained inode is not
+      // accepted merely because path-based realpath identity still matches.
+      const currentRoot = openPrivateDirectory(root);
+      try {
+        assertPrivateDirectory(rootHandle, root);
+        assertPrivateDirectory(currentRoot, root);
+      } finally {
+        currentRoot.close();
+      }
+    } catch (error) {
+      if (error instanceof BackendPublicationJournalError) throw error;
+      return fail(
+        "unsafe-storage",
+        `private LCM root changed during validation: ${(error as Error).message}`,
+      );
+    }
+  };
+  try {
+    return callback(assertReadRoot);
+  } finally {
+    rootHandle?.close();
+  }
 }
 
 function consumerLockCallback<T>(
@@ -1244,9 +1406,7 @@ function consumerLockCallback<T>(
     return requireSynchronousResult(callback({}), undefined, options.permit);
   }
   let rootHandle = openOptionalRootDirectory(homeDir);
-  let publicationHandle = rootHandle === undefined
-    ? undefined
-    : openOptionalPublicationDirectory(homeDir);
+  let publicationHandle: ReturnType<typeof openPrivateDirectory> | undefined;
   const refreshDirectories = (): void => {
     rootHandle ??= openOptionalRootDirectory(homeDir);
     if (rootHandle !== undefined && publicationHandle === undefined) {
@@ -1268,12 +1428,16 @@ function consumerLockCallback<T>(
       revokeLockToken(token);
     }
   };
+  let outcome: ConsumerOperationOutcome<T>;
   try {
-    return withBackendPublicationLock(homeDir, run);
-  } finally {
-    publicationHandle?.close();
-    rootHandle?.close();
+    publicationHandle = rootHandle === undefined
+      ? undefined
+      : openOptionalPublicationDirectory(homeDir);
+    outcome = { succeeded: true, value: withBackendPublicationLock(homeDir, run) };
+  } catch (error) {
+    outcome = { succeeded: false, error };
   }
+  return completeConsumerOperation(publicationHandle, rootHandle, outcome);
 }
 
 /** Serialize a synchronous local consumer without creating publication roots. */
@@ -1304,9 +1468,7 @@ export async function withBackendPublicationConsumerLockAsync<T>(
     return callback({});
   }
   let rootHandle = openOptionalRootDirectory(homeDir);
-  let publicationHandle = rootHandle === undefined
-    ? undefined
-    : openOptionalPublicationDirectory(homeDir);
+  let publicationHandle: ReturnType<typeof openPrivateDirectory> | undefined;
   const refreshDirectories = (): void => {
     rootHandle ??= openOptionalRootDirectory(homeDir);
     if (rootHandle !== undefined && publicationHandle === undefined) {
@@ -1328,12 +1490,19 @@ export async function withBackendPublicationConsumerLockAsync<T>(
       revokeLockToken(token);
     }
   };
+  let outcome: ConsumerOperationOutcome<T>;
   try {
-    return await withBackendPublicationLockAsync(homeDir, run);
-  } finally {
-    publicationHandle?.close();
-    rootHandle?.close();
+    publicationHandle = rootHandle === undefined
+      ? undefined
+      : openOptionalPublicationDirectory(homeDir);
+    outcome = {
+      succeeded: true,
+      value: await withBackendPublicationLockAsync(homeDir, run),
+    };
+  } catch (error) {
+    outcome = { succeeded: false, error };
   }
+  return completeConsumerOperation(publicationHandle, rootHandle, outcome);
 }
 
 export function assertBackendPublicationConsumerAccess(options: {
@@ -1561,7 +1730,7 @@ function assertBackendPublicationConfigAccessUnlocked(
 ): void {
   const journal = permit === undefined
     ? readConsumerPublicationJournal(homeDir)
-    : readJournal(homeDir);
+    : readPublicationJournalForAccess(homeDir, permit);
   if (journal === null) {
     if (backend === "postgresql") {
       return fail("publication-evidence-missing", "PostgreSQL selection has no completed backend publication evidence");
@@ -1612,7 +1781,7 @@ export function assertBackendPublicationConfigReadAccess(
 ): Readonly<{ journalChecksumSha256: string | null }> {
   const homeDir = backendPublicationHomeForConfigPath(configPath);
   if (homeDir === undefined) return Object.freeze({ journalChecksumSha256: null });
-  const journal = readConsumerPublicationJournal(homeDir, true);
+  const journal = readConsumerPublicationJournal(homeDir);
   if (journal === null) {
     if (backend === "postgresql") {
       return fail("publication-evidence-missing", "PostgreSQL selection has no completed backend publication evidence");
@@ -1636,12 +1805,9 @@ function assertBackendPublicationConfigMutationUnlocked(
   currentContent: string | null | undefined,
   permit?: PrivateMutationPermit,
 ): void {
-  const journal = readJournal(homeDir);
+  const journal = readPublicationJournalForAccess(homeDir, permit);
   if (currentContent !== undefined) currentConfigWitness(homeDir, currentContent);
   if (journal === null) {
-    if (backendPublicationEvidenceExists(homeDir)) {
-      return fail("publication-evidence-missing", "backend publication evidence is incomplete");
-    }
     if (currentBackend !== candidateBackend && candidateBackend === "postgresql") {
       return fail("publication-evidence-missing", "PostgreSQL backend selection requires publication control");
     }
@@ -1724,11 +1890,8 @@ function assertBackendPublicationProjectMapMutationUnlocked(
   candidateContent: string | null | undefined,
   permit?: PrivateMutationPermit,
 ): void {
-  const journal = readJournal(homeDir);
-  if (journal === null) {
-    if (backendPublicationEvidenceExists(homeDir)) return fail("publication-evidence-missing", "backend publication evidence is incomplete");
-    return;
-  }
+  const journal = readPublicationJournalForAccess(homeDir, permit);
+  if (journal === null) return;
   if (journal.phase === "completed" || journal.phase === "aborted") return;
   const access = ["guarded", "map-publishing"].includes(journal.phase)
     ? "publish-project-map"
@@ -1779,7 +1942,7 @@ function assertBackendPublicationProjectMapAccessUnlocked(input: {
   }
   const journal = input.permit === undefined
     ? readConsumerPublicationJournal(input.homeDir)
-    : readJournal(input.homeDir);
+    : readPublicationJournalForAccess(input.homeDir, input.permit);
   if (journal === null) return;
   if (input.content === null) {
     assertLogicalWitness(captureBackendPublicationState(input.homeDir).projectMap, ABSENT_WITNESS, "current project map");
@@ -1877,41 +2040,59 @@ export async function withBackendPublicationPermit<T>(
 
 function writeJournal(
   journal: BackendPublicationJournal,
+  directoryHandle: BackendPublicationDirectoryHandle,
   homeDir: string | undefined,
   observer: BackendPublicationObserver,
   expectedChecksum?: string,
 ): void {
-  ensurePublicationDirectory(homeDir);
+  const directory = backendPublicationDirectory(homeDir);
   const path = backendPublicationJournalPath(homeDir);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
   observer("before-journal-read", path);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
   const current = (() => {
     try {
-      const raw = readBoundedRegularFileWithStat(path, {
-        allowedRoot: backendPublicationDirectory(homeDir),
+      const observed = readBoundedRegularFileWithStat(path, {
+        allowedRoot: directory,
         maxBytes: MAX_JOURNAL_BYTES,
         expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
         allowedModes: [0o600],
         requireSingleLink: true,
-      }).content;
-      return { raw, journal: parseJournal(raw) };
+      });
+      if (
+        observed.parentDev !== directoryHandle.witness.dev
+        || observed.parentIno !== directoryHandle.witness.ino
+      ) {
+        return fail(
+          "unsafe-storage",
+          "backend publication journal parent does not match the retained checkpoint directory",
+        );
+      }
+      return observed.content;
     } catch (error) {
       if (isMissing(error)) return null;
       throw error;
     }
   })();
-  if (expectedChecksum !== undefined && (current === null || current.journal.checksumSha256 !== expectedChecksum)) {
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
+  const parsed = current === null ? null : parseJournal(current);
+  if (expectedChecksum !== undefined && (parsed === null || parsed.checksumSha256 !== expectedChecksum)) {
     return fail("unexpected-state", "backend publication journal changed before update");
   }
-  if (expectedChecksum === undefined && current !== null) {
+  if (expectedChecksum === undefined && parsed !== null) {
     return fail("unresolved-publication", "backend publication journal already exists");
   }
   observer("before-journal-write", path);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
+  // The checksum check is journal-protocol admission under its lock; the
+  // generic durable helper performs unconditional publication when present.
   atomicWritePrivateFileDurable(path, journalContent(journal), {
     requireAbsent: expectedChecksum === undefined,
-    expectedContentSha256: current === null ? null : sha256(current.raw),
     maxExistingBytes: MAX_JOURNAL_BYTES,
   });
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
   observer("after-journal-write", path);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
 }
 
 function archiveTerminalJournal(
@@ -2095,9 +2276,70 @@ function sealMaterial(
   };
 }
 
+function assertBackendPublicationMaterialDirectory(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+  allowMutableNlink = false,
+): void {
+  try {
+    if (!allowMutableNlink) {
+      assertPrivateDirectory(
+        directoryHandle,
+        backendPublicationDirectory(homeDir),
+        directoryHandle.witness,
+      );
+    } else {
+      const observed = assertPrivateDirectory(
+        directoryHandle,
+        backendPublicationDirectory(homeDir),
+      );
+      if (
+        observed.dev !== directoryHandle.witness.dev
+        || observed.ino !== directoryHandle.witness.ino
+        || observed.mode !== directoryHandle.witness.mode
+        || observed.uid !== directoryHandle.witness.uid
+        || observed.gid !== directoryHandle.witness.gid
+      ) {
+        throw new Error("private directory identity changed");
+      }
+    }
+  } catch (error) {
+    return fail(
+      "unsafe-storage",
+      `backend publication directory changed during material authentication: ${(error as Error).message}`,
+    );
+  }
+}
+
+function assertBackendPublicationCheckpointDirectory(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+): void {
+  try {
+    const observed = assertPrivateDirectory(
+      directoryHandle,
+      backendPublicationDirectory(homeDir),
+    );
+    if (
+      observed.dev !== directoryHandle.witness.dev
+      || observed.ino !== directoryHandle.witness.ino
+      || observed.gid !== directoryHandle.witness.gid
+    ) {
+      throw new Error("private directory identity changed");
+    }
+  } catch (error) {
+    return fail(
+      "unsafe-storage",
+      `backend publication directory changed during journal checkpoint: ${(error as Error).message}`,
+    );
+  }
+}
+
 function authenticateMaterial(
   homeDir: string | undefined,
   journal: BackendPublicationJournal,
+  directoryHandle: BackendPublicationDirectoryHandle,
+  allowMutableDirectoryNlink = false,
 ): { reference: BackendPublicationRecoveryReference; material: BackendPublicationRecoveryMaterial } {
   const reference = journal.recoveryReference ?? {
     relativePath: `${journal.publicationId}.material`,
@@ -2107,32 +2349,47 @@ function authenticateMaterial(
   if (reference.relativePath !== `${journal.publicationId}.material`) {
     return fail("malformed-journal", "backend publication recovery material path is not deterministic");
   }
-  const path = join(backendPublicationDirectory(homeDir), reference.relativePath);
-  const content = readBoundedRegularFileWithStat(path, {
-    allowedRoot: backendPublicationDirectory(homeDir),
-    maxBytes: MAX_MATERIAL_BYTES,
-    expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
-    allowedModes: [0o600],
-    requireSingleLink: true,
-  }).content;
-  const digest = sha256(content);
-  if (
-    (reference.sealSha256 !== "" && digest !== reference.sealSha256)
-    || (reference.byteLength !== 0 && content.length !== reference.byteLength)
-  ) {
-    return fail("checksum-mismatch", "backend publication recovery material checksum does not match");
+  const directory = backendPublicationDirectory(homeDir);
+  assertBackendPublicationMaterialDirectory(homeDir, directoryHandle, allowMutableDirectoryNlink);
+  try {
+    const path = join(directory, reference.relativePath);
+    const observed = readBoundedRegularFileWithStat(path, {
+      allowedRoot: directory,
+      maxBytes: MAX_MATERIAL_BYTES,
+      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      allowedModes: [0o600],
+      requireSingleLink: true,
+    });
+    const observedParent = `${observed.parentDev}:${observed.parentIno}`;
+    const expectedParent = `${directoryHandle.witness.dev}:${directoryHandle.witness.ino}`;
+    if (observedParent !== expectedParent) {
+      return fail(
+        "unsafe-storage",
+        "backend publication recovery material parent does not match the authenticated directory",
+      );
+    }
+    const content = observed.content;
+    const digest = sha256(content);
+    if (
+      (reference.sealSha256 !== "" && digest !== reference.sealSha256)
+      || (reference.byteLength !== 0 && content.length !== reference.byteLength)
+    ) {
+      return fail("checksum-mismatch", "backend publication recovery material checksum does not match");
+    }
+    const material = parseMaterial(content, journal.publicationId);
+    assertContentState(backendPublicationMaterialWitness(material), journal.sourceState, "material source");
+    assertContentState(materialTargetWitness(material), journal.targetState, "material target");
+    return {
+      reference: {
+        relativePath: reference.relativePath,
+        sealSha256: digest,
+        byteLength: content.length,
+      },
+      material,
+    };
+  } finally {
+    assertBackendPublicationMaterialDirectory(homeDir, directoryHandle, allowMutableDirectoryNlink);
   }
-  const material = parseMaterial(content, journal.publicationId);
-  assertContentState(backendPublicationMaterialWitness(material), journal.sourceState, "material source");
-  assertContentState(materialTargetWitness(material), journal.targetState, "material target");
-  return {
-    reference: {
-      relativePath: reference.relativePath,
-      sealSha256: digest,
-      byteLength: content.length,
-    },
-    material,
-  };
 }
 
 function prospectiveJournal(
@@ -2166,6 +2423,7 @@ function prospectiveJournal(
 function transition(
   journal: BackendPublicationJournal,
   phase: BackendPublicationPhase,
+  directoryHandle: BackendPublicationDirectoryHandle,
   homeDir: string | undefined,
   observer: BackendPublicationObserver,
   updates: Partial<Pick<BackendPublicationJournal, "publishedConfigSha256" | "publishedProjectMapSha256" | "projects" | "recoveryReference" | "sourceState" | "targetState">> = {},
@@ -2176,7 +2434,7 @@ function transition(
     updatedAt: new Date().toISOString(),
     ...updates,
   });
-  writeJournal(next, homeDir, observer, journal.checksumSha256);
+  writeJournal(next, directoryHandle, homeDir, observer, journal.checksumSha256);
   return next;
 }
 
@@ -2225,9 +2483,9 @@ export class BackendPublicationCoordinator {
   }
 
   async prepare(input: PrepareBackendPublicationInput): Promise<BackendPublicationJournal> {
-    return this.#locked(async () => {
+    return this.#locked(async (directoryHandle) => {
       const validated = validateInput(input);
-      const existing = readJournal(this.#homeDir);
+      const existing = readJournalFromDirectory(this.#homeDir, directoryHandle);
       if (existing !== null) {
         if (existing.phase !== "completed" && existing.phase !== "aborted") {
           return fail("unresolved-publication", "backend publication journal already exists");
@@ -2248,17 +2506,18 @@ export class BackendPublicationCoordinator {
       });
       assertStateShape(observed, "observed");
       const preparing = prospectiveJournal(validated, observed, targetState, "preparing", null);
-      writeJournal(preparing, this.#homeDir, this.#observer, existing?.checksumSha256);
+      writeJournal(preparing, directoryHandle, this.#homeDir, this.#observer, existing?.checksumSha256);
       this.#observer("before-material-seal", materialPath(this.#homeDir, validated.publicationId));
       const reference = sealMaterial(this.#homeDir, validated.publicationId, validated.material);
       this.#observer("after-material-seal", materialPath(this.#homeDir, validated.publicationId));
       const sealedJournal = withChecksum({ ...preparing, recoveryReference: reference });
       this.#observer("before-material-authenticate", reference.relativePath);
-      authenticateMaterial(this.#homeDir, sealedJournal);
+      authenticateMaterial(this.#homeDir, sealedJournal, directoryHandle, true);
       this.#observer("after-material-authenticate", reference.relativePath);
       const prepared = transition(
         preparing,
         "prepared",
+        directoryHandle,
         this.#homeDir,
         this.#observer,
         { recoveryReference: reference },
@@ -2269,32 +2528,47 @@ export class BackendPublicationCoordinator {
   }
 
   async resume(): Promise<BackendPublicationJournal> {
-    return this.#locked(async () => this.#resumeUnlocked());
+    return this.#locked(async (directoryHandle) => this.#resumeUnlocked(directoryHandle));
   }
 
   async abort(): Promise<BackendPublicationJournal> {
-    return this.#locked(async () => this.#abortUnlocked());
+    return this.#locked(async (directoryHandle) => this.#abortUnlocked(directoryHandle));
   }
 
   async recoverPending(options: RecoverPendingOptions = {}): Promise<BackendPublicationJournal | null> {
-    return this.#locked(async () => {
-      const journal = readJournal(this.#homeDir);
+    return this.#locked(async (directoryHandle) => {
+      const journal = readJournalFromDirectory(this.#homeDir, directoryHandle);
       if (journal === null) return null;
-      if (options.disposition === "abort") return this.#abortUnlocked();
-      return this.#resumeUnlocked();
+      if (options.disposition === "abort") return this.#abortUnlocked(directoryHandle);
+      return this.#resumeUnlocked(directoryHandle);
     });
   }
 
-  async #locked<T>(callback: () => Promise<T>): Promise<T> {
+  async #locked<T>(callback: (directoryHandle: BackendPublicationDirectoryHandle) => Promise<T>): Promise<T> {
     return withBackendPublicationLockAsync(this.#homeDir, async () => {
       ensurePublicationDirectory(this.#homeDir);
-      return callback();
+      let directoryHandle: BackendPublicationDirectoryHandle | undefined;
+      try {
+        try {
+          directoryHandle = openPrivateDirectory(backendPublicationDirectory(this.#homeDir));
+        } catch (error) {
+          return fail("unsafe-storage", `backend publication directory cannot be opened: ${(error as Error).message}`);
+        }
+        const result = await callback(directoryHandle);
+        assertBackendPublicationMaterialDirectory(this.#homeDir, directoryHandle, true);
+        return result;
+      } finally {
+        directoryHandle?.close();
+      }
     });
   }
 
-  async #materialContext(journal: BackendPublicationJournal): Promise<BackendPublicationDriverContext> {
+  async #materialContext(
+    journal: BackendPublicationJournal,
+    directoryHandle: BackendPublicationDirectoryHandle,
+  ): Promise<BackendPublicationDriverContext> {
     this.#observer("before-material-authenticate", operationPath(this.#homeDir));
-    const authenticated = authenticateMaterial(this.#homeDir, journal);
+    const authenticated = authenticateMaterial(this.#homeDir, journal, directoryHandle, true);
     this.#observer("after-material-authenticate", operationPath(this.#homeDir));
     return {
       homeDir: this.#homeDir,
@@ -2343,12 +2617,15 @@ export class BackendPublicationCoordinator {
     });
   }
 
-  async #acquireAll(journal: BackendPublicationJournal): Promise<BackendPublicationJournal> {
+  async #acquireAll(
+    journal: BackendPublicationJournal,
+    directoryHandle: BackendPublicationDirectoryHandle,
+  ): Promise<BackendPublicationJournal> {
     if (
       this.#driver.acquireRemoteGuard === undefined
       || this.#driver.readRemoteGuard === undefined
     ) {
-      return transition(journal, "guarded", this.#homeDir, this.#observer);
+      return transition(journal, "guarded", directoryHandle, this.#homeDir, this.#observer);
     }
     let current = journal;
     for (let index = 0; index < current.projects.length; index += 1) {
@@ -2361,15 +2638,19 @@ export class BackendPublicationCoordinator {
       if (fence === null || !activeFence(fence)) return fail("unexpected-state", "remote guard is not active after acquisition");
       assertFence(fence, current, project);
       const projects = current.projects.map((entry, entryIndex) => entryIndex === index ? { ...entry, fence } : entry);
-      current = transition(current, "acquiring", this.#homeDir, this.#observer, { projects });
+      current = transition(current, "acquiring", directoryHandle, this.#homeDir, this.#observer, { projects });
     }
-    return transition(current, "guarded", this.#homeDir, this.#observer);
+    return transition(current, "guarded", directoryHandle, this.#homeDir, this.#observer);
   }
 
-  async #releaseAll(journal: BackendPublicationJournal, aborting: boolean): Promise<BackendPublicationJournal> {
+  async #releaseAll(
+    journal: BackendPublicationJournal,
+    aborting: boolean,
+    directoryHandle: BackendPublicationDirectoryHandle,
+  ): Promise<BackendPublicationJournal> {
     const phase = aborting ? "abort-releasing" : "releasing" as const;
     let current = aborting
-      ? transition(journal, phase, this.#homeDir, this.#observer)
+      ? transition(journal, phase, directoryHandle, this.#homeDir, this.#observer)
       : journal;
     if (
       this.#driver.releaseRemoteGuard === undefined
@@ -2377,7 +2658,7 @@ export class BackendPublicationCoordinator {
     ) {
       return aborting
         ? current
-        : transition(current, "released", this.#homeDir, this.#observer);
+        : transition(current, "released", directoryHandle, this.#homeDir, this.#observer);
     }
     for (let index = 0; index < current.projects.length; index += 1) {
       let project = current.projects[index]!;
@@ -2394,7 +2675,7 @@ export class BackendPublicationCoordinator {
         if (authoritative.releasedAt !== null || authoritative.databaseExpired) {
           return fail("unexpected-state", "remote release fence successor is not active");
         }
-        current = transition(current, phase, this.#homeDir, this.#observer, {
+        current = transition(current, phase, directoryHandle, this.#homeDir, this.#observer, {
           projects: current.projects.map((entry, entryIndex) => entryIndex === index ? { ...entry, fence: authoritative } : entry),
         });
         project = current.projects[index]!;
@@ -2414,7 +2695,7 @@ export class BackendPublicationCoordinator {
           if (!sameFenceIdentity(persisted, authoritative) || BigInt(authoritative.fencingToken) <= BigInt(persisted.fencingToken)) {
             return fail("unexpected-state", "remote release reacquisition did not advance the fence");
           }
-          current = transition(current, phase, this.#homeDir, this.#observer, {
+          current = transition(current, phase, directoryHandle, this.#homeDir, this.#observer, {
             projects: current.projects.map((entry, entryIndex) => entryIndex === index ? { ...entry, fence: authoritative } : entry),
           });
           project = current.projects[index]!;
@@ -2430,33 +2711,36 @@ export class BackendPublicationCoordinator {
       if (!sameFenceIdentity(persisted, authoritative) || BigInt(authoritative.fencingToken) < BigInt(persisted.fencingToken)) {
         return fail("unexpected-state", "remote release fence generation changed");
       }
-      current = transition(current, phase, this.#homeDir, this.#observer, {
+      current = transition(current, phase, directoryHandle, this.#homeDir, this.#observer, {
         projects: current.projects.map((entry, entryIndex) => entryIndex === index ? { ...entry, fence: authoritative } : entry),
       });
     }
     return aborting
-      ? transition(current, "abort-releasing", this.#homeDir, this.#observer)
-      : transition(current, "released", this.#homeDir, this.#observer);
+      ? transition(current, "abort-releasing", directoryHandle, this.#homeDir, this.#observer)
+      : transition(current, "released", directoryHandle, this.#homeDir, this.#observer);
   }
 
-  async #publishMap(journal: BackendPublicationJournal): Promise<BackendPublicationJournal> {
-    const context = await this.#materialContext(journal);
+  async #publishMap(
+    journal: BackendPublicationJournal,
+    directoryHandle: BackendPublicationDirectoryHandle,
+  ): Promise<BackendPublicationJournal> {
+    const context = await this.#materialContext(journal, directoryHandle);
     const observed = await this.#observe(context);
     if (logicalWitnessMatches(observed.projectMap, journal.targetState.projectMap)) {
-      return transition(journal, "map-published", this.#homeDir, this.#observer, {
+      return transition(journal, "map-published", directoryHandle, this.#homeDir, this.#observer, {
         publishedProjectMapSha256: journal.intendedProjectMapSha256,
         targetState: { ...journal.targetState, projectMap: observed.projectMap },
       });
     }
     if (journal.phase === "map-publishing" && mutationWitnessMatches(observed.projectMap, journal.targetState.projectMap)) {
-      return transition(journal, "map-published", this.#homeDir, this.#observer, {
+      return transition(journal, "map-published", directoryHandle, this.#homeDir, this.#observer, {
         publishedProjectMapSha256: journal.intendedProjectMapSha256,
         targetState: { ...journal.targetState, projectMap: observed.projectMap },
       });
     }
     assertLogicalWitness(observed.projectMap, journal.sourceState.projectMap, "source project map");
     const publishing = journal.phase === "guarded"
-      ? transition(journal, "map-publishing", this.#homeDir, this.#observer)
+      ? transition(journal, "map-publishing", directoryHandle, this.#homeDir, this.#observer)
       : journal;
     await this.#mutate(
       { ...context, journal: publishing },
@@ -2467,30 +2751,33 @@ export class BackendPublicationCoordinator {
     );
     const after = await this.#observe({ ...context, journal: publishing });
     assertContentWitness(after.projectMap, journal.targetState.projectMap, "published project map");
-    return transition(publishing, "map-published", this.#homeDir, this.#observer, {
+    return transition(publishing, "map-published", directoryHandle, this.#homeDir, this.#observer, {
       publishedProjectMapSha256: journal.intendedProjectMapSha256,
       targetState: { ...journal.targetState, projectMap: after.projectMap },
     });
   }
 
-  async #publishConfig(journal: BackendPublicationJournal): Promise<BackendPublicationJournal> {
-    const context = await this.#materialContext(journal);
+  async #publishConfig(
+    journal: BackendPublicationJournal,
+    directoryHandle: BackendPublicationDirectoryHandle,
+  ): Promise<BackendPublicationJournal> {
+    const context = await this.#materialContext(journal, directoryHandle);
     const observed = await this.#observe(context);
     if (logicalWitnessMatches(observed.config, journal.targetState.config)) {
-      return transition(journal, "config-published", this.#homeDir, this.#observer, {
+      return transition(journal, "config-published", directoryHandle, this.#homeDir, this.#observer, {
         publishedConfigSha256: journal.intendedConfigSha256,
         targetState: { ...journal.targetState, config: observed.config },
       });
     }
     if (journal.phase === "config-publishing" && mutationWitnessMatches(observed.config, journal.targetState.config)) {
-      return transition(journal, "config-published", this.#homeDir, this.#observer, {
+      return transition(journal, "config-published", directoryHandle, this.#homeDir, this.#observer, {
         publishedConfigSha256: journal.intendedConfigSha256,
         targetState: { ...journal.targetState, config: observed.config },
       });
     }
     assertLogicalWitness(observed.config, journal.sourceState.config, "source config");
     const publishing = journal.phase === "map-published"
-      ? transition(journal, "config-publishing", this.#homeDir, this.#observer)
+      ? transition(journal, "config-publishing", directoryHandle, this.#homeDir, this.#observer)
       : journal;
     await this.#mutate(
       { ...context, journal: publishing },
@@ -2501,17 +2788,20 @@ export class BackendPublicationCoordinator {
     );
     const after = await this.#observe({ ...context, journal: publishing });
     assertContentWitness(after.config, journal.targetState.config, "published config");
-    return transition(publishing, "config-published", this.#homeDir, this.#observer, {
+    return transition(publishing, "config-published", directoryHandle, this.#homeDir, this.#observer, {
       publishedConfigSha256: journal.intendedConfigSha256,
       targetState: { ...journal.targetState, config: after.config },
     });
   }
 
-  async #restoreConfig(journal: BackendPublicationJournal): Promise<BackendPublicationJournal> {
-    const context = await this.#materialContext(journal);
+  async #restoreConfig(
+    journal: BackendPublicationJournal,
+    directoryHandle: BackendPublicationDirectoryHandle,
+  ): Promise<BackendPublicationJournal> {
+    const context = await this.#materialContext(journal, directoryHandle);
     const observed = await this.#observe(context);
     if (journal.phase === "config-restoring" && mutationWitnessMatches(observed.config, journal.sourceState.config)) {
-      return transition(journal, "map-restoring", this.#homeDir, this.#observer, {
+      return transition(journal, "map-restoring", directoryHandle, this.#homeDir, this.#observer, {
         sourceState: { ...journal.sourceState, config: observed.config },
       });
     }
@@ -2520,7 +2810,7 @@ export class BackendPublicationCoordinator {
         assertLogicalWitness(observed.config, journal.targetState.config, "config before restore");
       }
       const restoring = journal.phase === "aborting"
-        ? transition(journal, "config-restoring", this.#homeDir, this.#observer)
+        ? transition(journal, "config-restoring", directoryHandle, this.#homeDir, this.#observer)
         : journal;
       await this.#mutate(
         { ...context, journal: restoring },
@@ -2531,16 +2821,19 @@ export class BackendPublicationCoordinator {
       );
       const after = await this.#observe({ ...context, journal: restoring });
       assertContentWitness(after.config, journal.sourceState.config, "restored config");
-      return transition(restoring, "map-restoring", this.#homeDir, this.#observer);
+      return transition(restoring, "map-restoring", directoryHandle, this.#homeDir, this.#observer);
     }
-    return transition(journal, "map-restoring", this.#homeDir, this.#observer);
+    return transition(journal, "map-restoring", directoryHandle, this.#homeDir, this.#observer);
   }
 
-  async #restoreMap(journal: BackendPublicationJournal): Promise<BackendPublicationJournal> {
-    const context = await this.#materialContext(journal);
+  async #restoreMap(
+    journal: BackendPublicationJournal,
+    directoryHandle: BackendPublicationDirectoryHandle,
+  ): Promise<BackendPublicationJournal> {
+    const context = await this.#materialContext(journal, directoryHandle);
     const observed = await this.#observe(context);
     if (journal.phase === "map-restoring" && mutationWitnessMatches(observed.projectMap, journal.sourceState.projectMap)) {
-      return transition(journal, "abort-releasing", this.#homeDir, this.#observer, {
+      return transition(journal, "abort-releasing", directoryHandle, this.#homeDir, this.#observer, {
         sourceState: { ...journal.sourceState, projectMap: observed.projectMap },
       });
     }
@@ -2559,13 +2852,16 @@ export class BackendPublicationCoordinator {
       const after = await this.#observe({ ...context, journal: restoring });
       assertContentWitness(after.projectMap, journal.sourceState.projectMap, "restored project map");
     }
-    return transition(journal, "abort-releasing", this.#homeDir, this.#observer);
+    return transition(journal, "abort-releasing", directoryHandle, this.#homeDir, this.#observer);
   }
 
-  async #cleanupMaterial(journal: BackendPublicationJournal): Promise<void> {
+  async #cleanupMaterial(
+    journal: BackendPublicationJournal,
+    directoryHandle: BackendPublicationDirectoryHandle,
+  ): Promise<void> {
     let context: BackendPublicationDriverContext;
     try {
-      context = await this.#materialContext(journal);
+      context = await this.#materialContext(journal, directoryHandle);
     } catch (error) {
       // A crash after authenticated cleanup deleted the material but before
       // the terminal checkpoint leaves the durable abort-releasing phase.
@@ -2590,67 +2886,80 @@ export class BackendPublicationCoordinator {
     syncPrivateDirectory(backendPublicationDirectory(this.#homeDir));
   }
 
-  async #resumeUnlocked(): Promise<BackendPublicationJournal> {
-    let journal = readJournal(this.#homeDir);
+  async #resumeUnlocked(directoryHandle: BackendPublicationDirectoryHandle): Promise<BackendPublicationJournal> {
+    let journal = readJournalFromDirectory(this.#homeDir, directoryHandle);
     if (journal === null) return fail("publication-evidence-missing", "backend publication journal is missing");
     if (journal.phase === "completed" || journal.phase === "aborted") return journal;
     if (["aborting", "config-restoring", "map-restoring", "abort-releasing"].includes(journal.phase)) {
-      return this.#abortUnlocked();
+      return this.#abortUnlocked(directoryHandle);
     }
     if (journal.phase === "preparing") {
-      const authenticated = authenticateMaterial(this.#homeDir, journal);
-      journal = transition(journal, "prepared", this.#homeDir, this.#observer, { recoveryReference: authenticated.reference });
+      const authenticated = authenticateMaterial(this.#homeDir, journal, directoryHandle, true);
+      journal = transition(
+        journal,
+        "prepared",
+        directoryHandle,
+        this.#homeDir,
+        this.#observer,
+        { recoveryReference: authenticated.reference },
+      );
     }
-    if (journal.phase === "prepared") journal = transition(journal, "acquiring", this.#homeDir, this.#observer);
-    if (journal.phase === "acquiring") journal = await this.#acquireAll(journal);
-    if (journal.phase === "guarded" || journal.phase === "map-publishing") journal = await this.#publishMap(journal);
-    if (journal.phase === "map-published" || journal.phase === "config-publishing") journal = await this.#publishConfig(journal);
-    if (journal.phase === "config-published") journal = transition(journal, "releasing", this.#homeDir, this.#observer);
-    if (journal.phase === "releasing") journal = await this.#releaseAll(journal, false);
+    if (journal.phase === "prepared") {
+      journal = transition(journal, "acquiring", directoryHandle, this.#homeDir, this.#observer);
+    }
+    if (journal.phase === "acquiring") journal = await this.#acquireAll(journal, directoryHandle);
+    if (journal.phase === "guarded" || journal.phase === "map-publishing") journal = await this.#publishMap(journal, directoryHandle);
+    if (journal.phase === "map-published" || journal.phase === "config-publishing") journal = await this.#publishConfig(journal, directoryHandle);
+    if (journal.phase === "config-published") {
+      journal = transition(journal, "releasing", directoryHandle, this.#homeDir, this.#observer);
+    }
+    if (journal.phase === "releasing") journal = await this.#releaseAll(journal, false, directoryHandle);
     // All valid forward phases above converge on released: a recovered
     // released journal skips the release call, while every earlier phase
     // advances through it. Finalize that invariant directly so an
     // unrecognized intermediate cannot be treated as a successful return.
-    const context = await this.#materialContext(journal);
+    const context = await this.#materialContext(journal, directoryHandle);
     this.#observer("before-finalize", context.recoveryReference.relativePath);
     if (this.#driver.retainCompletedMaterial !== undefined) await this.#driver.retainCompletedMaterial(context);
     this.#observer("after-finalize", context.recoveryReference.relativePath);
-    journal = transition(journal, "completed", this.#homeDir, this.#observer);
+    journal = transition(journal, "completed", directoryHandle, this.#homeDir, this.#observer);
     return journal;
   }
 
-  async #abortUnlocked(): Promise<BackendPublicationJournal> {
-    let journal = readJournal(this.#homeDir);
+  async #abortUnlocked(directoryHandle: BackendPublicationDirectoryHandle): Promise<BackendPublicationJournal> {
+    let journal = readJournalFromDirectory(this.#homeDir, directoryHandle);
     if (journal === null) return fail("publication-evidence-missing", "backend publication journal is missing");
     if (journal.phase === "completed" || journal.phase === "aborted") return journal;
     if (journal.phase === "abort-releasing") {
-      journal = await this.#releaseAll(journal, true);
+      journal = await this.#releaseAll(journal, true, directoryHandle);
     } else {
       if (journal.phase === "preparing" && journal.recoveryReference === null) {
         try {
-          const authenticated = authenticateMaterial(this.#homeDir, journal);
-          journal = transition(journal, "prepared", this.#homeDir, this.#observer, {
+          const authenticated = authenticateMaterial(this.#homeDir, journal, directoryHandle, true);
+          journal = transition(journal, "prepared", directoryHandle, this.#homeDir, this.#observer, {
             recoveryReference: authenticated.reference,
           });
         } catch (error) {
-          if (isMissing(error)) return transition(journal, "aborted", this.#homeDir, this.#observer);
+          if (isMissing(error)) {
+            return transition(journal, "aborted", directoryHandle, this.#homeDir, this.#observer);
+          }
           throw error;
         }
       }
       if (!["aborting", "config-restoring", "map-restoring"].includes(journal.phase)) {
-        journal = transition(journal, "aborting", this.#homeDir, this.#observer);
+        journal = transition(journal, "aborting", directoryHandle, this.#homeDir, this.#observer);
       }
       if (journal.phase === "aborting" || journal.phase === "config-restoring") {
-        journal = await this.#restoreConfig(journal);
+        journal = await this.#restoreConfig(journal, directoryHandle);
       }
       // Every non-terminal path reaches map-restoring here: restoreConfig
       // checkpoints it explicitly, while a recovered map-restoring journal is
       // already at that checkpoint. Continue the abort state machine
       // unconditionally so an unknown intermediate cannot be reported as safe.
-      journal = await this.#restoreMap(journal);
-      journal = await this.#releaseAll(journal, true);
+      journal = await this.#restoreMap(journal, directoryHandle);
+      journal = await this.#releaseAll(journal, true, directoryHandle);
     }
-    await this.#cleanupMaterial(journal);
-    return transition(journal, "aborted", this.#homeDir, this.#observer);
+    await this.#cleanupMaterial(journal, directoryHandle);
+    return transition(journal, "aborted", directoryHandle, this.#homeDir, this.#observer);
   }
 }

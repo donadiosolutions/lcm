@@ -8,6 +8,7 @@ import {
   mkdirSync,
   openSync,
   realpathSync,
+  rmdirSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
@@ -186,6 +187,7 @@ type SupervisorObservationBase = Readonly<{
   credentialDirectory?: string;
   credentialFiles?: readonly CredentialFileReference[];
   managerPid?: number;
+  controlGroup?: string;
   name?: string;
 }>;
 
@@ -295,7 +297,7 @@ export interface SupervisorDependencies {
   /** @internal Deterministic daemon-temp race seam for coverage tests. */
   readonly _daemonTempRaceForTesting?: (
     path: string,
-    phase: "before-open" | "before-manager",
+    phase: "before-open" | "before-rollback" | "before-manager",
   ) => void;
 }
 
@@ -727,6 +729,25 @@ class SupervisorCommandError extends Error {
   }
 }
 
+export const SUPERVISOR_DAEMON_TEMP_CREATION_WARNING =
+  "newly created daemon temp directory lacked required owner permissions, was removed, and retry should use an owner-preserving umask such as 0077";
+
+export class SupervisorDaemonTempCreationError extends Error {
+  constructor() {
+    super(SUPERVISOR_DAEMON_TEMP_CREATION_WARNING);
+    this.name = "SupervisorDaemonTempCreationError";
+  }
+}
+
+type DaemonTempCreationStat = Readonly<{
+  dev: bigint;
+  ino: bigint;
+  uid: bigint;
+  mode: bigint;
+  isDirectory: () => boolean;
+  isSymbolicLink: () => boolean;
+}>;
+
 function commandFailedError(reason?: SupervisorCommandFailureClass): Error {
   return new SupervisorCommandError(reason);
 }
@@ -1076,6 +1097,14 @@ function observationBase(spec: SupervisorSpec, values: Map<string, string>): Sup
   const storageBackend = metadata(values, "LCM_SUPERVISOR_STORAGE_BACKEND");
   const postgresCaFile = metadata(values, "LCM_POSTGRES_CA_FILE");
   const managerPid = parsePid(lookup(values, "MainPID", "pid", "PID", "process.pid", "ProcessID"));
+  const controlGroupValue = lookup(values, "ControlGroup");
+  const controlGroup = spec.kind === "systemd-user"
+    && typeof controlGroupValue === "string"
+    && Buffer.byteLength(controlGroupValue, "utf8") <= 4 * 1024
+    && /^\/(?:[A-Za-z0-9_.:@-]+\/)*[A-Za-z0-9_.:@-]+$/u.test(controlGroupValue)
+    && controlGroupValue.endsWith(`/${spec.systemdUnit}`)
+    ? controlGroupValue
+    : undefined;
   const launchEnvironmentDigest = metadata(values, "LCM_SUPERVISOR_ENV_DIGEST");
   const credentialDirectory = metadata(values, "LCM_CREDENTIAL_DIRECTORY");
   const credentialFiles = MANAGED_CREDENTIAL_NAMES.flatMap((name) => {
@@ -1099,6 +1128,7 @@ function observationBase(spec: SupervisorSpec, values: Map<string, string>): Sup
     ...(credentialDirectory === undefined ? {} : { credentialDirectory }),
     ...(credentialFiles.length === 0 ? {} : { credentialFiles: Object.freeze(credentialFiles) }),
     ...(managerPid === undefined ? {} : { managerPid }),
+    ...(controlGroup === undefined ? {} : { controlGroup }),
     name: spec.name,
   };
 }
@@ -2065,11 +2095,76 @@ function prepareManagedDaemonTempDirectory(
   raceFault?: SupervisorDependencies["_daemonTempRaceForTesting"],
 ): PrivateDirectoryHandle {
   const path = managedDaemonTempPath(spec.stateRoot);
+  let created = false;
   try {
     mkdirSync(path, { mode: 0o700 });
+    created = true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
       throw new Error("supervisor daemon temporary directory is unavailable");
+    }
+  }
+  if (created) {
+    let initial: DaemonTempCreationStat;
+    try {
+      initial = lstatSync(path, { bigint: true }) as unknown as DaemonTempCreationStat;
+    } catch {
+      throw new Error("supervisor daemon temporary directory validation could not be confirmed");
+    }
+    const initialMode = initial.mode & 0o7777n;
+    const ownerUid = expectedUid === undefined ? undefined : BigInt(expectedUid);
+    const clipped = initial.isDirectory()
+      && !initial.isSymbolicLink()
+      && ownerUid !== undefined
+      && initial.uid === ownerUid
+      && (initialMode & ~0o700n) === 0n
+      && initialMode !== 0o700n;
+    if (clipped) {
+      const canonicalRoot = resolve(spec.stateRoot);
+      const canonicalLeaf = managedDaemonTempPath(canonicalRoot);
+      let parent: DaemonTempCreationStat;
+      try {
+        parent = lstatSync(canonicalRoot, { bigint: true }) as unknown as DaemonTempCreationStat;
+        if (
+          !parent.isDirectory()
+          || parent.isSymbolicLink()
+          || realpathSync(canonicalRoot) !== canonicalRoot
+          || realpathSync(path) !== canonicalLeaf
+        ) throw new Error("canonical path validation failed");
+      } catch {
+        throw new Error("supervisor daemon temporary directory validation could not be confirmed");
+      }
+      raceFault?.(path, "before-rollback");
+      let current: DaemonTempCreationStat;
+      let currentParent: DaemonTempCreationStat;
+      let cleanupConfirmed = false;
+      try {
+        current = lstatSync(path, { bigint: true }) as unknown as DaemonTempCreationStat;
+        currentParent = lstatSync(canonicalRoot, { bigint: true }) as unknown as DaemonTempCreationStat;
+        const sameLeaf = current.dev === initial.dev
+          && current.ino === initial.ino
+          && current.uid === initial.uid
+          && current.isDirectory()
+          && !current.isSymbolicLink()
+          && (current.mode & 0o7777n) === initialMode;
+        const sameParent = currentParent.dev === parent.dev
+          && currentParent.ino === parent.ino
+          && currentParent.uid === parent.uid
+          && currentParent.isDirectory()
+          && !currentParent.isSymbolicLink()
+          && realpathSync(canonicalRoot) === canonicalRoot
+          && realpathSync(path) === canonicalLeaf;
+        if (sameLeaf && sameParent) {
+          rmdirSync(path);
+          cleanupConfirmed = true;
+        }
+      } catch {
+        cleanupConfirmed = false;
+      }
+      if (!cleanupConfirmed) {
+        throw new Error("supervisor daemon temporary directory cleanup could not be confirmed");
+      }
+      throw new SupervisorDaemonTempCreationError();
     }
   }
   raceFault?.(path, "before-open");
@@ -2139,7 +2234,7 @@ function systemdProbeArgs(spec: SupervisorSpec): readonly string[] {
     "--user",
     "show",
     "--no-pager",
-    `--property=LoadState,ActiveState,SubState,MainPID,Environment,ExecMainStartTimestamp,FragmentPath`,
+    `--property=LoadState,ActiveState,SubState,MainPID,ControlGroup,Environment,ExecMainStartTimestamp,FragmentPath`,
     spec.systemdUnit,
   ];
 }
@@ -2961,7 +3056,9 @@ export function createSupervisor(
         await settleLaunchdLabelReuse(operationDeadline);
         return startInternal(spec, true, operationDeadline);
       }
-      throw error instanceof SupervisorCommandError ? error : commandFailedError();
+      throw (error instanceof SupervisorCommandError || error instanceof SupervisorDaemonTempCreationError)
+        ? error
+        : commandFailedError();
     } finally {
       try {
         daemonTempHandle?.close();

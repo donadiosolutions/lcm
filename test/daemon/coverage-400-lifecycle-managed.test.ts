@@ -36,6 +36,7 @@ import {
   type DaemonLifecycleTestScope,
 } from "../../src/daemon/lifecycle-scope.js";
 import { RUNTIME_DIGEST } from "../../src/daemon/version.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 const roots: string[] = [];
 
@@ -287,6 +288,12 @@ function setRunningProbe(fixture: Fixture, pid = 4242): void {
     { managerPid: pid },
   ));
   writeFileSync(fixture.pidPath, String(pid));
+}
+
+function detachedSpawn(pid = 4242): typeof import("node:child_process").spawn {
+  const child = { pid, once: vi.fn(), unref: vi.fn() };
+  child.once.mockReturnValue(child);
+  return vi.fn(() => child) as never;
 }
 
 describe("issue 400 lifecycle managed preparation and utility boundaries", () => {
@@ -722,6 +729,814 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
 });
 
 describe("issue 400 managed ensure admission matrix", () => {
+  it("bounds a direct-start birth probe without starving authenticated diagnostics", async () => {
+    let now = 0;
+    const birthTimeouts: number[] = [];
+    const authenticated = vi.fn();
+    const fixture = createFixture({
+      platform: "freebsd",
+      isAlive: () => true,
+      spawn: detachedSpawn(),
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({}, 200),
+      ]),
+    });
+
+    const result = await ensureDaemon(optionsFor(fixture, {
+      _skipSpawn: false,
+      expectedRuntimeDigest: "a".repeat(64),
+      enforceUserManagerParent: false,
+      _platform: "freebsd",
+      _monotonicNowOverride: () => now,
+      _processStartTimeForTesting: (_pid, _observer, options) => {
+        const timeoutMs = options?.timeoutMs;
+        if (timeoutMs === undefined) return null;
+        birthTimeouts.push(timeoutMs!);
+        now += timeoutMs!;
+        return null;
+      },
+      _onAuthenticatedDaemonResult: authenticated,
+    }));
+
+    expect(result).toMatchObject({
+      connected: true,
+      spawned: true,
+      pid: 4242,
+      startMethod: "detached-spawn",
+    });
+    expect(birthTimeouts).toEqual([25]);
+    expect(fixture.seams.fetch).toHaveBeenCalledTimes(4);
+    expect(authenticated).not.toHaveBeenCalled();
+  });
+
+  it("caps successful direct-start birth samples and emits one stable witness", async () => {
+    let now = 0;
+    const birthTimeouts: number[] = [];
+    const authenticated = vi.fn();
+    const fixture = createFixture({
+      platform: "freebsd",
+      isAlive: () => true,
+      spawn: detachedSpawn(),
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({}, 200),
+      ]),
+    });
+
+    const result = await ensureDaemon(optionsFor(fixture, {
+      spawnTimeoutMs: 1_000,
+      _skipSpawn: false,
+      expectedRuntimeDigest: "a".repeat(64),
+      enforceUserManagerParent: false,
+      _platform: "freebsd",
+      _monotonicNowOverride: () => now,
+      _processStartTimeForTesting: (_pid, _observer, options) => {
+        const timeoutMs = options?.timeoutMs;
+        if (timeoutMs === undefined) return null;
+        birthTimeouts.push(timeoutMs!);
+        now += timeoutMs!;
+        return "birth";
+      },
+      _onAuthenticatedDaemonResult: authenticated,
+    }));
+
+    expect(result).toMatchObject({ connected: true, spawned: true, pid: 4242 });
+    expect(birthTimeouts).toEqual([100, 100]);
+    expect(authenticated).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["expired", 0, false, 2],
+    ["whose quarter floors to zero", 3.5, true, 4],
+  ] as const)("skips a managed-start birth budget %s", async (
+    _name,
+    remainingMs,
+    connected,
+    expectedFetches,
+  ) => {
+    let now = 0;
+    let fetchCalls = 0;
+    const processBirth = vi.fn(() => "birth");
+    const fixture = createFixture({ isAlive: () => true });
+    fixture.seams.fetch = vi.fn(async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) throw new Error("pre-start offline");
+      if (fetchCalls === 2) {
+        now = 100 - remainingMs;
+        return healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) });
+      }
+      if (fetchCalls === 3) {
+        return healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) });
+      }
+      return response({}, 200);
+    }) as never;
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+
+    const result = await ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _monotonicNowOverride: () => now,
+      _processStartTimeForTesting: processBirth,
+    }));
+
+    expect(result.connected).toBe(connected);
+    expect(processBirth).not.toHaveBeenCalled();
+    expect(fetchCalls).toBe(expectedFetches);
+  });
+
+  it("skips a sub-millisecond managed-start birth budget", async () => {
+    let now = 0;
+    let fetchCalls = 0;
+    const processBirth = vi.fn(() => "birth");
+    const fixture = createFixture({
+      isAlive: () => true,
+      sleep: async (ms) => { now += ms; },
+    });
+    fixture.seams.fetch = vi.fn(async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) throw new Error("pre-start offline");
+      now = 99.5;
+      return healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) });
+    }) as never;
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+
+    const result = await ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _monotonicNowOverride: () => now,
+      _processStartTimeForTesting: processBirth,
+    }));
+
+    expect(result).toMatchObject({ connected: false, refusalReason: "startup-failure" });
+    expect(processBirth).not.toHaveBeenCalled();
+    expect(fetchCalls).toBe(2);
+  });
+
+  it("skips the managed-reuse after-sample when its first birth is unavailable", async () => {
+    const authenticated = vi.fn();
+    const processBirth = vi.fn(() => null);
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({}, 200),
+      ]),
+    });
+    setRunningProbe(fixture, 4242);
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+
+    const result = await ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 4242,
+      _processStartTimeForTesting: processBirth,
+      _onAuthenticatedDaemonResult: authenticated,
+    }));
+
+    expect(result).toMatchObject({ connected: true, spawned: false, pid: 4242 });
+    expect(processBirth).toHaveBeenCalledOnce();
+    expect(authenticated).not.toHaveBeenCalled();
+  });
+
+  it("skips an after-sample when abort lands during managed diagnostics", async () => {
+    let aborted = false;
+    const signal = {
+      get aborted() { return aborted; },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as AbortSignal;
+    const accessResponse = {
+      get ok() {
+        aborted = true;
+        return true;
+      },
+      status: 200,
+      json: async () => ({}),
+    };
+    const processBirth = vi.fn(() => "birth");
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        accessResponse,
+      ]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+
+    const result = await ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _abortSignal: signal,
+      _processStartTimeForTesting: processBirth,
+    }));
+
+    expect(result).toMatchObject({ connected: true, spawned: true, pid: 4242 });
+    expect(processBirth).toHaveBeenCalledOnce();
+  });
+
+  it("converges a final publication contention for the newly admitted child", async () => {
+    let now = 0;
+    let publicationAssertions = 0;
+    const nativeResponse = new Response(JSON.stringify({
+      status: "ok",
+      version: "1",
+      storageBackend: "sqlite",
+      runtimeDigest: "a".repeat(64),
+      pid: 4242,
+      entrypoint: "/tmp/lcm-daemon-entrypoint.mjs",
+    }), { status: 200 });
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({ totalConnections: 0 }),
+        nativeResponse,
+      ]),
+      sleep: async (ms) => { now += ms; },
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    const options = optionsFor(fixture, {
+      _skipSpawn: false,
+      expectedRuntimeDigest: "a".repeat(64),
+      _monotonicNowOverride: () => now,
+      _sleepOverride: async (ms) => { now += ms; },
+      _assertBackendPublication: () => {
+        publicationAssertions += 1;
+        if (publicationAssertions === 2) {
+          throw new PrivateMutationLockContentionError("child sweep still holds publication lock");
+        }
+      },
+    });
+    Object.assign(options, {
+      _processStartTimeForTesting: () => "birth",
+      _readPrivateMutationLockOwnerForTesting: () => ({
+        version: 1,
+        pid: 4242,
+        processStartTime: "birth",
+        nonce: "a".repeat(32),
+      }),
+    });
+    vi.spyOn(performance, "now").mockReturnValue(0);
+    delete options._monotonicNowOverride;
+    await expect(ensureDaemon(options)).resolves.toMatchObject({
+      connected: true,
+      spawned: true,
+      pid: 4242,
+    });
+    expect(nativeResponse.bodyUsed).toBe(true);
+    expect(fixture.seams.fetch).toHaveBeenCalledTimes(5);
+    expect(publicationAssertions).toBe(3);
+    expect(fixture.start).toHaveBeenCalledOnce();
+  });
+
+  it("converges an authorized manager admission even when spawned is false", async () => {
+    let publicationAssertions = 0;
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({ totalConnections: 0 }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+      ]),
+    });
+    setRunningProbe(fixture, 4242);
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    const options = optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 4242,
+      _assertBackendPublication: () => {
+        publicationAssertions += 1;
+        if (publicationAssertions === 2) {
+          throw new PrivateMutationLockContentionError("authorized child sweep still holds publication lock");
+        }
+      },
+    });
+    Object.assign(options, {
+      _processStartTimeForTesting: () => "birth",
+      _readPrivateMutationLockOwnerForTesting: () => ({
+        version: 1,
+        pid: 4242,
+        processStartTime: "birth",
+        nonce: "a".repeat(32),
+      }),
+    });
+    await expect(ensureDaemon(options)).resolves.toMatchObject({
+      connected: true,
+      spawned: false,
+      pid: 4242,
+    });
+    expect(publicationAssertions).toBe(3);
+    expect(fixture.start).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the admission token rotates before retry", async () => {
+    let publicationAssertions = 0;
+    const contention = new PrivateMutationLockContentionError("rotated token contention");
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({ totalConnections: 0 }),
+      ]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    const options = optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _skipSpawn: false,
+      _processStartTimeForTesting: () => "birth",
+      _readPrivateMutationLockOwnerForTesting: () => ({
+        version: 1,
+        pid: 4242,
+        processStartTime: "birth",
+        nonce: "a".repeat(32),
+      }),
+      _assertBackendPublication: () => {
+        publicationAssertions += 1;
+        if (publicationAssertions === 2) {
+          writeFileSync(fixture.tokenPath, "rotated-token", { mode: 0o600 });
+          throw contention;
+        }
+      },
+    });
+
+    await expect(ensureDaemon(options)).rejects.toBe(contention);
+    expect(publicationAssertions).toBe(2);
+  });
+
+  it("declines convergence when the admission birth cannot be proved", async () => {
+    let publicationAssertions = 0;
+    const contention = new PrivateMutationLockContentionError("unknown birth contention");
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({ totalConnections: 0 }),
+      ]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _skipSpawn: false,
+      _processStartTimeForTesting: () => "birth",
+      _assertBackendPublication: () => {
+        publicationAssertions += 1;
+        if (publicationAssertions === 2) throw contention;
+      },
+    }))).rejects.toBe(contention);
+    expect(publicationAssertions).toBe(2);
+  });
+
+  it("preserves ordinary admission when the birth probe throws", async () => {
+    let birthReads = 0;
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({ totalConnections: 0 }),
+      ]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _skipSpawn: false,
+      _processStartTimeForTesting: () => {
+        birthReads += 1;
+        throw new Error("birth unavailable");
+      },
+    }))).resolves.toMatchObject({ connected: true, spawned: true, pid: 4242 });
+    expect(birthReads).toBe(1);
+  });
+
+  it("declines retry when the child birth changes after admission", async () => {
+    let birthReads = 0;
+    let publicationAssertions = 0;
+    const contention = new PrivateMutationLockContentionError("birth reuse contention");
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({ totalConnections: 0 }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+      ]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _skipSpawn: false,
+      _processStartTimeForTesting: () => birthReads++ < 2 ? "birth" : "reused-birth",
+      _readPrivateMutationLockOwnerForTesting: () => ({ version: 1, pid: 4242, processStartTime: "birth", nonce: "a".repeat(32) }),
+      _assertBackendPublication: () => {
+        publicationAssertions += 1;
+        if (publicationAssertions === 2) throw contention;
+      },
+    }))).rejects.toBe(contention);
+    expect(publicationAssertions).toBe(2);
+  });
+
+  it("uses the helper timeout to cancel a hanging health body", async () => {
+    vi.useFakeTimers();
+    try {
+      let fetchCalls = 0;
+      let retrySignal: AbortSignal | null | undefined;
+      let publicationAssertions = 0;
+      const contention = new PrivateMutationLockContentionError("helper timeout contention");
+      const fixture = createFixture({ isAlive: () => true });
+      fixture.seams.fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        fetchCalls += 1;
+        if (fetchCalls < 5) {
+          const values = [
+            new Error("pre-start offline"),
+            healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+            healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+            response({ totalConnections: 0 }),
+          ];
+          const value = values[fetchCalls - 1];
+          if (value instanceof Error) throw value;
+          return value;
+        }
+        retrySignal = init?.signal;
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }) as never;
+      const hangingJson = vi.spyOn(Response.prototype, "json").mockImplementation(
+        () => new Promise<never>(() => undefined),
+      );
+      fixture.probe
+        .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+        .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+      writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+      const pending = ensureDaemon(optionsFor(fixture, {
+        expectedRuntimeDigest: "a".repeat(64),
+        _skipSpawn: false,
+        _monotonicNowOverride: () => 0,
+        _processStartTimeForTesting: () => "birth",
+        _readPrivateMutationLockOwnerForTesting: () => ({ version: 1, pid: 4242, processStartTime: "birth", nonce: "a".repeat(32) }),
+        _assertBackendPublication: () => {
+          publicationAssertions += 1;
+          if (publicationAssertions === 2) throw contention;
+        },
+      }));
+      let observedError: unknown;
+      const handled = pending.then(() => undefined, (error: unknown) => { observedError = error; });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await handled;
+      expect(observedError).toBe(contention);
+      expect(hangingJson).toHaveBeenCalled();
+      expect(retrySignal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not invoke a doomed retry fetch after lifecycle abort", async () => {
+    let fetchCalls = 0;
+    let publicationAssertions = 0;
+    const contention = new PrivateMutationLockContentionError("pre-aborted retry");
+    const controller = new AbortController();
+    const fixture = createFixture({ isAlive: () => true });
+    fixture.seams.fetch = vi.fn(async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) throw new Error("pre-start offline");
+      if (fetchCalls === 2 || fetchCalls === 3) {
+        return healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) });
+      }
+      if (fetchCalls === 4) return response({ totalConnections: 0 });
+      return await new Promise<never>((_, reject) => reject(new Error("doomed fetch")));
+    }) as never;
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _skipSpawn: false,
+      _abortSignal: controller.signal,
+      _processStartTimeForTesting: () => "birth",
+      _readPrivateMutationLockOwnerForTesting: () => ({ version: 1, pid: 4242, processStartTime: "birth", nonce: "a".repeat(32) }),
+      _assertBackendPublication: () => {
+        publicationAssertions += 1;
+        if (publicationAssertions === 2) {
+          controller.abort();
+          throw contention;
+        }
+      },
+    }))).rejects.toBe(contention);
+    expect(fetchCalls).toBe(4);
+  });
+
+  it("rethrows the exact contention when abort interrupts convergence sleep", async () => {
+    let publicationAssertions = 0;
+    const contention = new PrivateMutationLockContentionError("aborted convergence");
+    const controller = new AbortController();
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({ totalConnections: 0 }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+      ]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    fixture.seams.sleep = async () => { controller.abort(); };
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    const options = optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _skipSpawn: false,
+      _abortSignal: controller.signal,
+      _processStartTimeForTesting: () => "birth",
+      _readPrivateMutationLockOwnerForTesting: () => ({
+        version: 1,
+        pid: 4242,
+        processStartTime: "birth",
+        nonce: "a".repeat(32),
+      }),
+      _sleepOverride: fixture.seams.sleep,
+      _assertBackendPublication: () => {
+        publicationAssertions += 1;
+        if (publicationAssertions === 2) throw contention;
+      },
+    });
+
+    await expect(ensureDaemon(options)).rejects.toBe(contention);
+    expect(publicationAssertions).toBe(2);
+  });
+
+  it("treats an explicit null admission birth as authoritative", async () => {
+    let birthReads = 0;
+    let publicationAssertions = 0;
+    const contention = new PrivateMutationLockContentionError("null admission birth");
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({ totalConnections: 0 }),
+      ]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _skipSpawn: false,
+      _processStartTimeForTesting: () => birthReads++ === 0 ? null : "birth",
+      _readPrivateMutationLockOwnerForTesting: () => ({
+        version: 1,
+        pid: 4242,
+        processStartTime: "birth",
+        nonce: "a".repeat(32),
+      }),
+      _assertBackendPublication: () => {
+        publicationAssertions += 1;
+        if (publicationAssertions === 2) throw contention;
+      },
+    }))).rejects.toBe(contention);
+    expect(publicationAssertions).toBe(2);
+    expect(birthReads).toBe(1);
+  });
+
+  it("blocks the next assertion when abort lands after convergence sleep", async () => {
+    let publicationAssertions = 0;
+    let sleepSettled = false;
+    const contention = new PrivateMutationLockContentionError("abort between retries");
+    const controller = new AbortController();
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({ totalConnections: 0 }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+      ]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    fixture.seams.sleep = async () => { sleepSettled = true; };
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _skipSpawn: false,
+      _abortSignal: controller.signal,
+      _monotonicNowOverride: () => {
+        if (sleepSettled) controller.abort();
+        return 0;
+      },
+      _processStartTimeForTesting: () => "birth",
+      _readPrivateMutationLockOwnerForTesting: () => ({
+        version: 1,
+        pid: 4242,
+        processStartTime: "birth",
+        nonce: "a".repeat(32),
+      }),
+      _sleepOverride: fixture.seams.sleep,
+      _assertBackendPublication: () => {
+        publicationAssertions += 1;
+        if (publicationAssertions === 2) throw contention;
+      },
+    }))).rejects.toBe(contention);
+    expect(publicationAssertions).toBe(2);
+  });
+
+  it("propagates a non-contention final publication error unchanged", async () => {
+    let publicationAssertions = 0;
+    const failure = new Error("ordinary final publication failure");
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({ totalConnections: 0 }),
+      ]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _skipSpawn: false,
+      _processStartTimeForTesting: () => "birth",
+      _readPrivateMutationLockOwnerForTesting: () => ({ version: 1, pid: 4242, processStartTime: "birth", nonce: "a".repeat(32) }),
+      _assertBackendPublication: () => {
+        publicationAssertions += 1;
+        if (publicationAssertions === 2) throw failure;
+      },
+    }))).rejects.toBe(failure);
+    expect(publicationAssertions).toBe(2);
+  });
+
+  it("preserves a non-abort sleep failure from convergence", async () => {
+    let publicationAssertions = 0;
+    const contention = new PrivateMutationLockContentionError("sleep failure contention");
+    const sleepFailure = new Error("sleep dependency failed");
+    const fixture = createFixture({
+      isAlive: () => true,
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({ totalConnections: 0 }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+      ]),
+    });
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    fixture.seams.sleep = async () => { throw sleepFailure; };
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _skipSpawn: false,
+      _processStartTimeForTesting: () => "birth",
+      _readPrivateMutationLockOwnerForTesting: () => ({
+        version: 1,
+        pid: 4242,
+        processStartTime: "birth",
+        nonce: "a".repeat(32),
+      }),
+      _sleepOverride: fixture.seams.sleep,
+      _assertBackendPublication: () => {
+        publicationAssertions += 1;
+        if (publicationAssertions === 2) throw contention;
+      },
+    }))).rejects.toBe(sleepFailure);
+    expect(publicationAssertions).toBe(2);
+  });
+
+  it("races a noncooperative convergence header fetch against lifecycle abort", async () => {
+    let publicationAssertions = 0;
+    let fetchCalls = 0;
+    const contention = new PrivateMutationLockContentionError("header abort contention");
+    const controller = new AbortController();
+    const fixture = createFixture({ isAlive: () => true });
+    fixture.seams.fetch = vi.fn(async () => {
+      fetchCalls += 1;
+      if (fetchCalls < 5) {
+        const values = [
+          new Error("pre-start offline"),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          response({ totalConnections: 0 }),
+        ];
+        const value = values[fetchCalls - 1];
+        if (value instanceof Error) throw value;
+        return value;
+      }
+      queueMicrotask(() => controller.abort());
+      return await new Promise<never>(() => undefined);
+    }) as never;
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _skipSpawn: false,
+      _abortSignal: controller.signal,
+      _processStartTimeForTesting: () => "birth",
+      _readPrivateMutationLockOwnerForTesting: () => ({ version: 1, pid: 4242, processStartTime: "birth", nonce: "a".repeat(32) }),
+      _assertBackendPublication: () => {
+        publicationAssertions += 1;
+        if (publicationAssertions === 2) throw contention;
+      },
+    }))).rejects.toBe(contention);
+    expect(publicationAssertions).toBe(2);
+  });
+
+  it("races a noncooperative convergence body against the combined timeout signal", async () => {
+    let publicationAssertions = 0;
+    let fetchCalls = 0;
+    const contention = new PrivateMutationLockContentionError("body abort contention");
+    const controller = new AbortController();
+    const fixture = createFixture({ isAlive: () => true });
+    fixture.seams.fetch = vi.fn(async () => {
+      fetchCalls += 1;
+      if (fetchCalls < 5) {
+        const values = [
+          new Error("pre-start offline"),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          response({ totalConnections: 0 }),
+        ];
+        const value = values[fetchCalls - 1];
+        if (value instanceof Error) throw value;
+        return value;
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => {
+          queueMicrotask(() => controller.abort());
+          return await new Promise<never>(() => undefined);
+        },
+      };
+    }) as never;
+    fixture.probe
+      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+      .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    await expect(ensureDaemon(optionsFor(fixture, {
+      expectedRuntimeDigest: "a".repeat(64),
+      _skipSpawn: false,
+      _abortSignal: controller.signal,
+      _processStartTimeForTesting: () => "birth",
+      _readPrivateMutationLockOwnerForTesting: () => ({ version: 1, pid: 4242, processStartTime: "birth", nonce: "a".repeat(32) }),
+      _assertBackendPublication: () => {
+        publicationAssertions += 1;
+        if (publicationAssertions === 2) throw contention;
+      },
+    }))).rejects.toBe(contention);
+    expect(publicationAssertions).toBe(2);
+  });
+
   it.each([
     ["manager timeout", "manager-timeout", "manager-unavailable"],
     ["stale configuration", "registered-stale-config", "stale-config"],
@@ -1587,6 +2402,45 @@ describe("issue 400 managed ensure admission matrix", () => {
       _skipSpawn: true,
     };
     await expect(ensureDaemon(ownerOptions)).resolves.toMatchObject({ connected: false, spawned: false });
+  });
+
+  it("admits the authenticated managed listener through its kernel cgroup witness when PID descriptors are unreadable", async () => {
+    const controlGroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/lcm-daemon-0123456789abcdef0123.service";
+    const socketProbe = vi.fn((command: string) => command === "/usr/bin/ss"
+      ? {
+          status: 0,
+          stdout: `LISTEN 0 511 127.0.0.1:${43_201} 0.0.0.0:* ino:12345 sk:1 cgroup:${controlGroup} <->\n`,
+          stderr: "",
+        }
+      : { status: 1, stdout: "", stderr: "unexpected command" });
+    const fixture = createFixture({
+      fetch: sequenceFetch([
+        healthy(4242),
+        healthy(4242),
+        response({}, 200),
+      ]),
+      isAlive: () => true,
+      spawnSync: socketProbe as never,
+    });
+    writeFileSync(fixture.pidPath, "4242");
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => observation(
+      spec,
+      "registered-running-valid",
+      { managerPid: 4242, controlGroup },
+    ));
+
+    const result = await ensureDaemon(optionsFor(fixture, {
+      _listeningPortsOverride: undefined,
+      _linuxSsPathOverride: "/usr/bin/ss",
+    } as Partial<EnsureDaemonOptions>));
+
+    expect(result).toMatchObject({
+      connected: true,
+      spawned: false,
+      pid: 4242,
+      startMethod: "systemd-user",
+    });
   });
 });
 

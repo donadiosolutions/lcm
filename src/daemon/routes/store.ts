@@ -1,5 +1,5 @@
 import { statSync } from "node:fs";
-import { projectDir, projectIdentity } from "../project.js";
+import { projectIdentity, projectPathsForIdentity } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { DaemonConfig } from "../config.js";
@@ -14,6 +14,7 @@ import {
   storageRouteFailureResponse,
   withProjectStorage,
 } from "./storage-lifecycle.js";
+import { BackendPublicationJournalError } from "../../storage/backend-publication.js";
 
 /** Cache entry for a per-project ScrubEngine. */
 interface ScrubCacheEntry {
@@ -48,6 +49,10 @@ export function createStoreHandler(
 ): RouteHandler {
   return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      sendJson(res, 400, { error: "invalid request body" });
+      return;
+    }
     const { text, tags = [], metadata = {} } = input;
 
     if (typeof text !== "string" || !text) {
@@ -76,18 +81,39 @@ export function createStoreHandler(
     try {
       // Reject an unbound project before local scrubber discovery. The
       // lifecycle helper repeats this resolution under its live token.
-      projectIdentity(projectPath, config.storage, context?.publicationLockToken);
+      const storageIdentity = projectIdentity(
+        projectPath,
+        config.storage,
+        context?.publicationLockToken,
+      );
+      const localIdentity = {
+        id: storageIdentity.localProjectId,
+        canonical: storageIdentity.canonical,
+        ...(storageIdentity.remoteProjectId === undefined
+          ? {}
+          : { remoteProjectId: storageIdentity.remoteProjectId }),
+      };
       const stagedFailure = stagedPostgreSqlFactoryUnavailableResponse(storageFactory, "store");
       if (stagedFailure) {
         sendJson(res, 503, stagedFailure);
         return;
       }
-      const scrubber = await getScrubEngine(config, projectDir(projectPath, context?.publicationLockToken));
+      const scrubber = await getScrubEngine(
+        config,
+        projectPathsForIdentity(localIdentity).dir,
+      );
       const scrubbedText = scrubber.scrub(text);
       const scrubbedTags = tags.map((tag: string) => scrubber.scrub(tag));
 
       const id = await withProjectStorage(
-        { config, cwd: projectPath, factory: storageFactory, context, mode: "create" },
+        {
+          config,
+          cwd: projectPath,
+          factory: storageFactory,
+          context,
+          mode: "create",
+          expectedIdentity: storageIdentity,
+        },
         async (project) => project.promotedMemory.insert({
           content: scrubbedText,
           tags: scrubbedTags,
@@ -100,6 +126,13 @@ export function createStoreHandler(
 
       sendJson(res, 200, { stored: true, id });
     } catch (err) {
+      if (err instanceof BackendPublicationJournalError) {
+        sendJson(res, 503, {
+          status: "blocked",
+          error: "backend publication admission blocked",
+        });
+        return;
+      }
       const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "store", storageFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);

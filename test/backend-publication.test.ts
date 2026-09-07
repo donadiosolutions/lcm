@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
@@ -156,6 +156,170 @@ async function withPatchedFsAsync<T>(
   }
 }
 
+type PublicationDirectoryGeneration = {
+  generation: number;
+  directory: string;
+  fd: number;
+  closed: number;
+  fstatPhases: string[];
+};
+
+async function withTrackedPublicationDirectoryGenerations<T>(
+  directories: readonly string[],
+  callback: (tracking: Readonly<{
+    records: PublicationDirectoryGeneration[];
+    active: (directory: string) => PublicationDirectoryGeneration[];
+    beginOperation: (directory: string) => void;
+    setEnabled: (enabled: boolean) => void;
+    setPhase: (directory: string, phase: string) => void;
+  }>) => Promise<T>,
+): Promise<T> {
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+  const originalClose = nodeFs.closeSync as (fd: number) => void;
+  const originalFstat = nodeFs.fstatSync as (...args: unknown[]) => unknown;
+  const trackedDirectories = new Set(directories);
+  const phases = new Map<string, string>();
+  const records: PublicationDirectoryGeneration[] = [];
+  const journalDescriptors: { directory: string; fd: number; closed: boolean }[] = [];
+  const pendingJournalPostFstats = new Map<string, number>();
+  const captureNextJournalAttempt = new Map<string, boolean>();
+  let enabled = true;
+  let nextGeneration = 1;
+  const active = (directory: string): PublicationDirectoryGeneration[] => records.filter(
+    (record) => record.directory === directory && record.closed === 0,
+  );
+
+  await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+    const journalDirectory = directories.find((directory) => path === join(directory, "journal.json"));
+    const captureJournal = journalDirectory !== undefined
+      && captureNextJournalAttempt.get(journalDirectory) === true;
+    if (captureJournal) captureNextJournalAttempt.set(journalDirectory, false);
+    const fd = originalOpen(path, ...args);
+    if (enabled && trackedDirectories.has(path)) {
+      records.push({
+        generation: nextGeneration,
+        directory: path,
+        fd,
+        closed: 0,
+        fstatPhases: [],
+      });
+      nextGeneration += 1;
+    } else if (captureJournal) {
+      journalDescriptors.push({ directory: journalDirectory, fd, closed: false });
+    }
+    return fd;
+  }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+    const record = [...records].reverse().find((candidate) => (
+      candidate.fd === fd && candidate.closed === 0
+    ));
+    const journal = [...journalDescriptors].reverse().find((candidate) => (
+      candidate.fd === fd && !candidate.closed
+    ));
+    originalClose(fd);
+    if (record !== undefined) record.closed += 1;
+    if (journal !== undefined) {
+      journal.closed = true;
+      pendingJournalPostFstats.set(
+        journal.directory,
+        (pendingJournalPostFstats.get(journal.directory) ?? 0) + 1,
+      );
+    }
+  }) as never, async () => withPatchedFsAsync("fstatSync", ((fd: number, ...args: unknown[]) => {
+    const observed = originalFstat(fd, ...args);
+    const record = [...records].reverse().find((candidate) => (
+      candidate.fd === fd && candidate.closed === 0
+    ));
+    if (record !== undefined) {
+      const pendingJournalPost = pendingJournalPostFstats.get(record.directory) ?? 0;
+      if (pendingJournalPost > 0) {
+        record.fstatPhases.push("journal");
+        pendingJournalPostFstats.set(record.directory, pendingJournalPost - 1);
+      } else {
+        record.fstatPhases.push(phases.get(record.directory) ?? "setup");
+      }
+    }
+    return observed;
+  }) as never, async () => callback({
+    records,
+    active,
+    beginOperation: (directory) => captureNextJournalAttempt.set(directory, true),
+    setEnabled: (nextEnabled) => { enabled = nextEnabled; },
+    setPhase: (directory, phase) => phases.set(directory, phase),
+  }))));
+}
+
+async function withTemporaryReboundPublicationMaterial(
+  home: string,
+  callback: () => unknown | Promise<unknown>,
+): Promise<Readonly<{ injected: boolean; restored: boolean; error: unknown }>> {
+  const publicationDirectory = backendPublicationDirectory(home);
+  const originalDirectory = `${publicationDirectory}.original`;
+  const materialPath = join(publicationDirectory, "publication-1.material");
+  const materialContent = readFileSync(materialPath);
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+  const originalClose = nodeFs.closeSync as (fd: number) => void;
+  let materialFd: number | undefined;
+  let injected = false;
+  let restored = false;
+  let error: unknown;
+  const restore = (): void => {
+    if (!injected || restored) return;
+    rmSync(publicationDirectory, { recursive: true, force: true });
+    renameSync(originalDirectory, publicationDirectory);
+    restored = true;
+  };
+
+  try {
+    nodeFs.openSync = ((path: string, ...args: unknown[]) => {
+      if (path !== materialPath || injected) return originalOpen(path, ...args);
+      injected = true;
+      renameSync(publicationDirectory, originalDirectory);
+      mkdirSync(publicationDirectory, { mode: 0o700 });
+      writeFileSync(materialPath, materialContent, { mode: 0o600 });
+      materialFd = originalOpen(path, ...args);
+      return materialFd;
+    }) as never;
+    nodeFs.closeSync = ((fd: number) => {
+      originalClose(fd);
+      if (fd === materialFd) {
+        materialFd = undefined;
+        restore();
+      }
+    }) as never;
+    syncBuiltinESMExports();
+    try {
+      await callback();
+    } catch (caught) {
+      error = caught;
+    }
+  } finally {
+    nodeFs.openSync = originalOpen;
+    nodeFs.closeSync = originalClose;
+    syncBuiltinESMExports();
+    restore();
+  }
+  return { injected, restored, error };
+}
+
+function rebindPublicationDirectoryWithEvidence(home: string): Readonly<{
+  originalDirectory: string;
+  journal: Buffer | undefined;
+}> {
+  const directory = backendPublicationDirectory(home);
+  const originalDirectory = `${directory}.checkpoint-original`;
+  const journalPath = backendPublicationJournalPath(home);
+  const journal = existsSync(journalPath) ? readFileSync(journalPath) : undefined;
+  renameSync(directory, originalDirectory);
+  mkdirSync(directory, { mode: 0o700 });
+  for (const name of ["journal.json", "publication-1.material"]) {
+    const source = join(originalDirectory, name);
+    if (existsSync(source)) writeFileSync(join(directory, name), readFileSync(source), { mode: 0o600 });
+  }
+  return { originalDirectory, journal };
+}
+
 function inputFor(materialInput: BackendPublicationRecoveryMaterial) {
   return {
     publicationId: "publication-1",
@@ -277,6 +441,71 @@ async function preparedFixture(): Promise<{
   return { home, input, fake };
 }
 
+type CoordinatorDriftCheckpoint =
+  | "preparing"
+  | "guarded"
+  | "map-publishing"
+  | "map-published"
+  | "config-publishing"
+  | "aborting"
+  | "config-restoring"
+  | "map-restoring"
+  | "abort-releasing"
+  | "released-replay"
+  | "released-forward";
+
+async function coordinatorDriftFixture(checkpoint: CoordinatorDriftCheckpoint): Promise<{
+  home: string;
+  fake: ReturnType<typeof makeDriver>;
+}> {
+  const home = makeHome();
+  const input = material();
+  const fake = makeDriver(input);
+  if (checkpoint === "preparing") {
+    await expect(coordinator(home, fake.driver, (event) => {
+      if (event === "after-material-seal") throw new Error("crash:park-preparing");
+    }).prepare(inputFor(input))).rejects.toThrow("crash:park-preparing");
+  } else {
+    await coordinator(home, fake.driver).prepare(inputFor(input));
+    if (checkpoint !== "released-forward") {
+      if (checkpoint === "config-restoring") fake.setState(targetState(input));
+      const aborting = ["aborting", "config-restoring", "map-restoring", "abort-releasing"].includes(checkpoint);
+      const parkedPhase = checkpoint === "released-replay" ? "released" : checkpoint;
+      const parked = coordinator(home, fake.driver, (event) => {
+        if (
+          event === "after-journal-write"
+          && readBackendPublicationJournal(home)?.phase === parkedPhase
+        ) throw new Error(`crash:park-${checkpoint}`);
+      });
+      await expect(aborting ? parked.abort() : parked.resume()).rejects.toThrow(`crash:park-${checkpoint}`);
+    }
+  }
+  expect(readBackendPublicationJournal(home)?.phase).toBe(
+    checkpoint === "released-forward"
+      ? "prepared"
+      : checkpoint === "released-replay" ? "released" : checkpoint,
+  );
+  fake.calls.length = 0;
+  vi.mocked(fake.driver.observeLocalState).mockClear();
+  vi.mocked(fake.driver.publishProjectMap).mockClear();
+  vi.mocked(fake.driver.publishConfig).mockClear();
+  vi.mocked(fake.driver.restoreConfig).mockClear();
+  vi.mocked(fake.driver.restoreProjectMap).mockClear();
+  return { home, fake };
+}
+
+function coordinatorDriverCallCounts(driver: BackendPublicationDriver): Record<string, number> {
+  return {
+    observeLocalState: vi.mocked(driver.observeLocalState).mock.calls.length,
+    publishProjectMap: vi.mocked(driver.publishProjectMap).mock.calls.length,
+    publishConfig: vi.mocked(driver.publishConfig).mock.calls.length,
+    restoreConfig: vi.mocked(driver.restoreConfig).mock.calls.length,
+    restoreProjectMap: vi.mocked(driver.restoreProjectMap).mock.calls.length,
+    retainCompletedMaterial: vi.mocked(driver.retainCompletedMaterial!).mock.calls.length,
+    cleanupAbortedMaterial: vi.mocked(driver.cleanupAbortedMaterial!).mock.calls.length,
+  };
+}
+
 async function expectJournalReadFailure(
   mutate: (journal: Record<string, unknown>) => Record<string, unknown>,
   reason: BackendPublicationJournalError["reason"] = "malformed-journal",
@@ -302,6 +531,801 @@ async function expectMaterialReadFailure(
 }
 
 describe("BackendPublicationCoordinator", () => {
+  it.each([
+    { boundary: "before-journal-read", operation: "prepare" },
+    { boundary: "before-journal-write", operation: "prepare" },
+    { boundary: "after-material-authenticate", operation: "prepare-post-auth" },
+    { boundary: "before-journal-read", operation: "resume" },
+    { boundary: "before-journal-write", operation: "abort" },
+    { boundary: "before-journal-read", operation: "recover" },
+    { boundary: "before-journal-write", operation: "awaited-local" },
+  ] as const)(
+    "rejects a $operation directory rebind at $boundary before checkpoint mutation",
+    async ({ boundary, operation }) => {
+      let home: string;
+      let fake: ReturnType<typeof makeDriver>;
+      if (operation === "prepare" || operation === "prepare-post-auth") {
+        home = makeHome();
+        fake = makeDriver(material());
+      } else if (operation === "resume" || operation === "abort") {
+        ({ home, fake } = await preparedFixture());
+      } else if (operation === "recover") {
+        ({ home, fake } = await coordinatorDriftFixture("preparing"));
+      } else {
+        ({ home, fake } = await coordinatorDriftFixture("guarded"));
+      }
+      const mutationsBefore = [...fake.calls];
+      const observationsBefore = vi.mocked(fake.driver.observeLocalState).mock.calls.length;
+      let rebound: ReturnType<typeof rebindPublicationDirectoryWithEvidence> | undefined;
+      const active = coordinator(home, fake.driver, (event) => {
+        if (rebound === undefined && event === boundary) {
+          rebound = rebindPublicationDirectoryWithEvidence(home);
+        }
+      });
+
+      const action = operation === "prepare" || operation === "prepare-post-auth"
+        ? active.prepare(inputFor(material()))
+        : operation === "abort"
+          ? active.abort()
+          : operation === "recover"
+            ? active.recoverPending()
+            : active.resume();
+      await expect(action).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: "backend publication directory changed during journal checkpoint: private directory changed during validation",
+      });
+
+      expect(rebound).toBeDefined();
+      const replacementJournalPath = backendPublicationJournalPath(home);
+      const originalJournalPath = join(rebound!.originalDirectory, "journal.json");
+      if (rebound!.journal === undefined) {
+        expect(existsSync(originalJournalPath)).toBe(false);
+        expect(existsSync(replacementJournalPath)).toBe(false);
+      } else {
+        expect(readFileSync(originalJournalPath)).toEqual(rebound!.journal);
+        expect(readFileSync(replacementJournalPath)).toEqual(rebound!.journal);
+      }
+      expect(fake.calls).toEqual(mutationsBefore);
+      expect(vi.mocked(fake.driver.observeLocalState).mock.calls.length).toBe(
+        observationsBefore + (operation === "awaited-local" ? 1 : operation.startsWith("prepare") ? 1 : 0),
+      );
+    },
+  );
+
+  it.each(["dev", "ino"] as const)(
+    "binds a checkpoint CAS read to the retained directory parent %s",
+    async (field) => {
+    const { home, fake } = await preparedFixture();
+    const directory = backendPublicationDirectory(home);
+    const journalPath = backendPublicationJournalPath(home);
+    const journalBefore = readFileSync(journalPath);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; ino: bigint; [key: string]: unknown };
+    let journalOpens = 0;
+    let injected = false;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === journalPath) journalOpens += 1;
+      return fd;
+    }) as never, async () => withPatchedFsAsync("statSync", ((
+      path: string,
+      options?: { bigint?: boolean },
+    ) => {
+      const observed = originalStat(path, options);
+      if (!injected && journalOpens === 2 && path === directory && options?.bigint === true) {
+        injected = true;
+        return { ...observed, [field]: observed[field] + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver).resume()).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: "backend publication journal parent does not match the retained checkpoint directory",
+      });
+    }));
+
+    expect(injected).toBe(true);
+    expect(readFileSync(journalPath)).toEqual(journalBefore);
+    expect(fake.calls).toEqual([]);
+    },
+  );
+
+  it.each(["dev", "ino", "gid"] as const)(
+    "rejects coherent checkpoint %s drift from the retained witness",
+    async (field) => {
+    const { home, fake } = await preparedFixture();
+    const directory = backendPublicationDirectory(home);
+    const journalPath = backendPublicationJournalPath(home);
+    const journalBefore = readFileSync(journalPath);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalFstat = nodeFs.fstatSync as (
+      fd: number,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; ino: bigint; mode: bigint; uid: bigint; gid: bigint; [key: string]: unknown };
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; ino: bigint; mode: bigint; uid: bigint; gid: bigint; [key: string]: unknown };
+    let directoryOpens = 0;
+    let operationFd: number | undefined;
+    let driftActive = false;
+    let descriptorInjected = false;
+    let pathInjected = false;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === directory) {
+        directoryOpens += 1;
+        if (directoryOpens === 2) operationFd = fd;
+      }
+      return fd;
+    }) as never, async () => withPatchedFsAsync("fstatSync", ((
+      fd: number,
+      options?: { bigint?: boolean },
+    ) => {
+      const observed = originalFstat(fd, options);
+      if (driftActive && fd === operationFd && options?.bigint === true) {
+        descriptorInjected = true;
+        return Object.assign(observed, { [field]: observed[field] + 1n });
+      }
+      return observed;
+    }) as never, async () => withPatchedFsAsync("statSync", ((
+      path: string,
+      options?: { bigint?: boolean },
+    ) => {
+      const observed = originalStat(path, options);
+      if (driftActive && path === directory && options?.bigint === true) {
+        pathInjected = true;
+        return Object.assign(observed, { [field]: observed[field] + 1n });
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver, (event) => {
+        if (event === "before-journal-read") driftActive = true;
+      }).resume()).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: "backend publication directory changed during journal checkpoint: private directory identity changed",
+      });
+    })));
+
+    expect(operationFd).toBeDefined();
+    expect(descriptorInjected).toBe(true);
+    expect(pathInjected).toBe(true);
+    expect(readFileSync(journalPath)).toEqual(journalBefore);
+    expect(fake.calls).toEqual([]);
+    },
+  );
+
+  it("rejects material whose parent identity diverges from the coordinator witness", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const materialPath = join(publicationDirectory, "publication-1.material");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; [key: string]: unknown };
+    let authenticationStarted = false;
+    let materialOpened = false;
+    let injected = false;
+    let directoryStatsAfterMaterial = 0;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      if (path === materialPath && authenticationStarted) materialOpened = true;
+      return originalOpen(path, ...args);
+    }) as never, async () => withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+      const observed = originalStat(path, options);
+      if (path === publicationDirectory && options?.bigint === true && materialOpened) {
+        directoryStatsAfterMaterial += 1;
+      }
+      if (path === publicationDirectory && options?.bigint === true && materialOpened && directoryStatsAfterMaterial === 1 && !injected) {
+        injected = true;
+        return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver, (event) => {
+        if (event === "before-material-authenticate") authenticationStarted = true;
+      }).prepare(inputFor(input))).rejects.toMatchObject({
+        reason: "unsafe-storage",
+      });
+    }));
+
+    expect(injected).toBe(true);
+    expect(readBackendPublicationJournal(home)).toMatchObject({ phase: "preparing" });
+    expect(fake.driver.publishProjectMap).not.toHaveBeenCalled();
+    expect(fake.driver.publishConfig).not.toHaveBeenCalled();
+  });
+
+  it("keeps the operation witness open across awaited driver work and closes it once", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalClose = nodeFs.closeSync as (fd: number) => void;
+    const opened: { fd: number; closed: number }[] = [];
+    const activeDescriptors = (): number => opened.filter(({ closed }) => closed === 0).length;
+    fake.driver.observeLocalState = vi.fn(async () => {
+      expect(activeDescriptors()).toBeGreaterThan(0);
+      await Promise.resolve();
+      expect(activeDescriptors()).toBeGreaterThan(0);
+      return sourceState(input);
+    });
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === publicationDirectory) opened.push({ fd, closed: 0 });
+      return fd;
+    }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+      const descriptor = [...opened].reverse().find((entry) => entry.fd === fd && entry.closed === 0);
+      if (descriptor !== undefined) descriptor.closed += 1;
+      originalClose(fd);
+    }) as never, async () => {
+      await coordinator(home, fake.driver).prepare(inputFor(input));
+    }));
+
+    expect(opened.length).toBeGreaterThan(0);
+    expect(opened.every(({ closed }) => closed === 1)).toBe(true);
+    expect(activeDescriptors()).toBe(0);
+  });
+
+  it("shares one live directory generation across journal and material authentication", async () => {
+    const home = makeHome();
+    const otherHome = makeHome();
+    const input = material();
+    const first = makeDriver(input);
+    const second = makeDriver(input);
+    const other = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const otherPublicationDirectory = backendPublicationDirectory(otherHome);
+    const operationGenerations = new Map<string, number>();
+    const liveAcrossAwait = new Set<number>();
+    let currentOperation: Readonly<{ label: string; directory: string }> | undefined;
+
+    await withTrackedPublicationDirectoryGenerations(
+      [publicationDirectory, otherPublicationDirectory],
+      async (tracking) => {
+        const captureOperationGeneration = (): PublicationDirectoryGeneration => {
+          expect(currentOperation).toBeDefined();
+          const active = tracking.active(currentOperation!.directory);
+          expect(active).toHaveLength(1);
+          const operation = active[0]!;
+          const prior = operationGenerations.get(currentOperation!.label);
+          if (prior === undefined) operationGenerations.set(currentOperation!.label, operation.generation);
+          else expect(operation.generation).toBe(prior);
+          return operation;
+        };
+        const instrumentDriver = (fake: ReturnType<typeof makeDriver>): void => {
+          const observe = fake.driver.observeLocalState;
+          fake.driver.observeLocalState = vi.fn(async (...args) => {
+            const operation = captureOperationGeneration();
+            expect(operation.closed).toBe(0);
+            await Promise.resolve();
+            expect(operation.closed).toBe(0);
+            expect(tracking.active(operation.directory)).toContain(operation);
+            liveAcrossAwait.add(operation.generation);
+            return observe(...args);
+          });
+        };
+        const runOperation = async <R>(
+          label: string,
+          directory: string,
+          action: (observer: (event: string) => void) => Promise<R>,
+        ): Promise<R> => {
+          let materialWindowStart: number | undefined;
+          currentOperation = { label, directory };
+          tracking.beginOperation(directory);
+          tracking.setPhase(directory, "operation");
+          try {
+            return await action((event) => {
+              if (event === "before-material-authenticate") {
+                captureOperationGeneration();
+                materialWindowStart = tracking.records.length;
+                tracking.setPhase(directory, "material");
+              } else if (event === "after-material-authenticate") {
+                expect(materialWindowStart, label).toBeDefined();
+                expect(tracking.records.length, label).toBe(materialWindowStart);
+                materialWindowStart = undefined;
+                tracking.setPhase(directory, "operation");
+              }
+            });
+          } finally {
+            tracking.setPhase(directory, "setup");
+            currentOperation = undefined;
+          }
+        };
+
+        instrumentDriver(first);
+        instrumentDriver(second);
+        instrumentDriver(other);
+        await runOperation("first-prepare", publicationDirectory, (observer) => (
+          coordinator(home, first.driver, observer).prepare(inputFor(input))
+        ));
+        expect(tracking.active(publicationDirectory)).toHaveLength(0);
+        await runOperation("first-resume", publicationDirectory, (observer) => (
+          coordinator(home, first.driver, observer).resume()
+        ));
+        expect(tracking.active(publicationDirectory)).toHaveLength(0);
+        await runOperation("second-prepare", publicationDirectory, (observer) => (
+          coordinator(home, second.driver, observer).prepare({
+            ...inputFor(input),
+            publicationId: "publication-2",
+          })
+        ));
+        expect(tracking.active(publicationDirectory)).toHaveLength(0);
+        await runOperation("other-prepare", otherPublicationDirectory, (observer) => (
+          coordinator(otherHome, other.driver, observer).prepare(inputFor(input))
+        ));
+        expect(tracking.active(otherPublicationDirectory)).toHaveLength(0);
+
+        const assertionOrder = [
+          "first-resume",
+          "first-prepare",
+          "second-prepare",
+          "other-prepare",
+        ] as const;
+        for (const label of assertionOrder) {
+          const generation = operationGenerations.get(label);
+          expect(generation, label).toBeDefined();
+          const record = tracking.records.find((candidate) => candidate.generation === generation);
+          expect(record, label).toBeDefined();
+          if (label === "first-resume") {
+            expect(record!.fstatPhases, label).toContain("journal");
+          } else if (label === "first-prepare" || label === "other-prepare") {
+            expect(record!.fstatPhases, label).not.toContain("journal");
+          }
+          expect(record!.fstatPhases, label).toContain("material");
+          expect(record!.closed, label).toBe(1);
+          expect(liveAcrossAwait, label).toContain(generation);
+        }
+        expect(operationGenerations.get("first-resume")).not.toBe(
+          operationGenerations.get("first-prepare"),
+        );
+        expect(operationGenerations.get("second-prepare")).not.toBe(
+          operationGenerations.get("first-resume"),
+        );
+        const homeGenerations = new Set(
+          tracking.records
+            .filter((record) => record.directory === publicationDirectory)
+            .map((record) => record.generation),
+        );
+        const otherHomeGenerations = tracking.records
+          .filter((record) => record.directory === otherPublicationDirectory)
+          .map((record) => record.generation);
+        expect(otherHomeGenerations.every((generation) => !homeGenerations.has(generation))).toBe(true);
+        expect(tracking.records.every((record) => record.closed === 1)).toBe(true);
+      },
+    );
+  });
+
+  it("rejects journal parent divergence before publication mutations", async () => {
+    const { home, fake } = await preparedFixture();
+    const publicationDirectory = backendPublicationDirectory(home);
+    const journalPath = backendPublicationJournalPath(home);
+    const journalBefore = readFileSync(journalPath);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; [key: string]: unknown };
+    let armed = false;
+    let injected = false;
+    vi.mocked(fake.driver.observeLocalState).mockClear();
+    vi.mocked(fake.driver.publishProjectMap).mockClear();
+    vi.mocked(fake.driver.publishConfig).mockClear();
+    vi.mocked(fake.driver.restoreConfig).mockClear();
+    vi.mocked(fake.driver.restoreProjectMap).mockClear();
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === journalPath && !injected) armed = true;
+      return fd;
+    }) as never, async () => withPatchedFsAsync("statSync", ((
+      path: string,
+      options?: { bigint?: boolean },
+    ) => {
+      const observed = originalStat(path, options);
+      if (armed && path === publicationDirectory && options?.bigint === true) {
+        armed = false;
+        injected = true;
+        return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver).resume()).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: "backend publication journal parent does not match the authenticated directory",
+      });
+    }));
+
+    expect(injected).toBe(true);
+    expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+    expect(fake.driver.publishProjectMap).not.toHaveBeenCalled();
+    expect(fake.driver.publishConfig).not.toHaveBeenCalled();
+    expect(fake.driver.restoreConfig).not.toHaveBeenCalled();
+    expect(fake.driver.restoreProjectMap).not.toHaveBeenCalled();
+    expect(readFileSync(journalPath)).toEqual(journalBefore);
+  });
+
+  it("rejects a coordinator material rebound before publication mutations", async () => {
+    const { home, fake } = await preparedFixture();
+    const publicationDirectory = backendPublicationDirectory(home);
+    vi.mocked(fake.driver.observeLocalState).mockClear();
+    vi.mocked(fake.driver.publishProjectMap).mockClear();
+    vi.mocked(fake.driver.publishConfig).mockClear();
+    vi.mocked(fake.driver.restoreConfig).mockClear();
+    vi.mocked(fake.driver.restoreProjectMap).mockClear();
+    let observed: Awaited<ReturnType<typeof withTemporaryReboundPublicationMaterial>> | undefined;
+
+    await withTrackedPublicationDirectoryGenerations([publicationDirectory], async (tracking) => {
+      tracking.setEnabled(false);
+      tracking.setPhase(publicationDirectory, "journal");
+      observed = await withTemporaryReboundPublicationMaterial(
+        home,
+        async () => {
+          tracking.setEnabled(true);
+          try {
+            return await coordinator(home, fake.driver).resume();
+          } finally {
+            tracking.setEnabled(false);
+          }
+        },
+      );
+      expect(tracking.records.length).toBeGreaterThan(0);
+      expect(tracking.records.every((record) => record.closed === 1)).toBe(true);
+    });
+
+    expect(observed).toMatchObject({ injected: true, restored: true });
+    expect(observed?.error).toBeInstanceOf(BackendPublicationJournalError);
+    expect(observed?.error).toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication recovery material parent does not match the authenticated directory",
+    });
+    expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+    expect(fake.driver.publishProjectMap).not.toHaveBeenCalled();
+    expect(fake.driver.publishConfig).not.toHaveBeenCalled();
+    expect(fake.driver.restoreConfig).not.toHaveBeenCalled();
+    expect(fake.driver.restoreProjectMap).not.toHaveBeenCalled();
+  });
+
+  it("closes the operation witness when awaited driver work rejects", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalClose = nodeFs.closeSync as (fd: number) => void;
+    const opened: { fd: number; closed: number }[] = [];
+    fake.driver.observeLocalState = vi.fn(async () => {
+      await Promise.resolve();
+      throw new Error("driver failed");
+    });
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === publicationDirectory) opened.push({ fd, closed: 0 });
+      return fd;
+    }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+      const descriptor = [...opened].reverse().find((entry) => entry.fd === fd && entry.closed === 0);
+      if (descriptor !== undefined) descriptor.closed += 1;
+      originalClose(fd);
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver).prepare(inputFor(input))).rejects.toThrow("driver failed");
+    }));
+
+    expect(opened.length).toBeGreaterThan(0);
+    expect(opened.every(({ closed }) => closed === 1)).toBe(true);
+  });
+
+  it("normalizes an operation witness open failure after directory setup", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    let publicationDirectoryOpens = 0;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      if (path === publicationDirectory) {
+        publicationDirectoryOpens += 1;
+        if (publicationDirectoryOpens === 2) {
+          throw Object.assign(new Error("operation descriptor unavailable"), { code: "EIO" });
+        }
+      }
+      return originalOpen(path, ...args);
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver).prepare(inputFor(input))).rejects.toMatchObject({
+        reason: "unsafe-storage",
+      });
+    });
+
+    expect(publicationDirectoryOpens).toBe(2);
+    expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+  });
+
+  it("rejects publication when the retained witness drifts at the return boundary", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; [key: string]: unknown };
+    let returnBoundary = false;
+    let injected = false;
+
+    await withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+      const observed = originalStat(path, options);
+      if (path === publicationDirectory && options?.bigint === true && returnBoundary && !injected) {
+        injected = true;
+        return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver, (event) => {
+        if (event === "after-prepared") returnBoundary = true;
+      }).prepare(inputFor(input))).rejects.toMatchObject({ reason: "unsafe-storage" });
+    });
+
+    expect(injected).toBe(true);
+    expect(readBackendPublicationJournal(home)).toMatchObject({ phase: "prepared" });
+  });
+
+  it("rejects coordinator metadata drift at the return boundary", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalFstat = nodeFs.fstatSync as (
+      fd: number,
+      options?: { bigint?: boolean },
+    ) => { gid: bigint; [key: string]: unknown };
+    let publicationDirectoryOpens = 0;
+    let operationFd: number | undefined;
+    let returnBoundary = false;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === publicationDirectory) {
+        publicationDirectoryOpens += 1;
+        if (publicationDirectoryOpens === 2) operationFd = fd;
+      }
+      return fd;
+    }) as never, async () => withPatchedFsAsync("fstatSync", ((fd: number, options?: { bigint?: boolean }) => {
+      const observed = originalFstat(fd, options);
+      if (returnBoundary && fd === operationFd && options?.bigint === true) {
+        return Object.assign(observed, { gid: observed.gid + 1n });
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver, (event) => {
+        if (event === "after-prepared") returnBoundary = true;
+      }).prepare(inputFor(input))).rejects.toMatchObject({ reason: "unsafe-storage" });
+    }));
+
+    expect(operationFd).toBeDefined();
+  });
+
+  it.each([
+    "preparing",
+    "abort-releasing",
+  ] as const)("does not swallow material ENOENT with %s directory drift", async (phase) => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    if (phase === "preparing") {
+      await expect(coordinator(home, fake.driver, (event) => {
+        if (event === "after-material-seal") throw new Error("crash:sealed");
+      }).prepare(inputFor(input))).rejects.toThrow("crash:sealed");
+      expect(readBackendPublicationJournal(home)?.phase).toBe("preparing");
+    } else {
+      await coordinator(home, fake.driver).prepare(inputFor(input));
+      await expect(coordinator(home, fake.driver, (event) => {
+        if (
+          event === "before-material-authenticate"
+          && readBackendPublicationJournal(home)?.phase === "abort-releasing"
+        ) throw new Error("crash:abort-releasing");
+      }).abort()).rejects.toThrow("crash:abort-releasing");
+      expect(readBackendPublicationJournal(home)?.phase).toBe("abort-releasing");
+    }
+
+    const publicationDirectory = backendPublicationDirectory(home);
+    const materialPath = join(publicationDirectory, "publication-1.material");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; [key: string]: unknown };
+    let materialOpenAttempted = false;
+    let injected = false;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      if (path === materialPath) {
+        materialOpenAttempted = true;
+        throw Object.assign(new Error("material missing"), { code: "ENOENT" });
+      }
+      return originalOpen(path, ...args);
+    }) as never, async () => withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+      const observed = originalStat(path, options);
+      if (path === publicationDirectory && options?.bigint === true && materialOpenAttempted && !injected) {
+        injected = true;
+        return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      await expect(coordinator(home, fake.driver).abort()).rejects.toMatchObject({ reason: "unsafe-storage" });
+    }));
+
+    expect(injected).toBe(true);
+    expect(readBackendPublicationJournal(home)?.phase).toBe(phase);
+  });
+
+  it.each([
+    { checkpoint: "preparing", targetPhase: "preparing", gate: "trailing", operation: "resume" },
+    { checkpoint: "preparing", targetPhase: "preparing", gate: "trailing", operation: "abort" },
+    { checkpoint: "guarded", targetPhase: "guarded", gate: "leading", operation: "resume" },
+    { checkpoint: "map-publishing", targetPhase: "map-publishing", gate: "leading", operation: "recover" },
+    { checkpoint: "map-published", targetPhase: "map-published", gate: "leading", operation: "resume" },
+    { checkpoint: "config-publishing", targetPhase: "config-publishing", gate: "leading", operation: "recover" },
+    { checkpoint: "aborting", targetPhase: "aborting", gate: "leading", operation: "abort" },
+    { checkpoint: "config-restoring", targetPhase: "config-restoring", gate: "leading", operation: "recover-abort" },
+    { checkpoint: "map-restoring", targetPhase: "map-restoring", gate: "leading", operation: "resume" },
+    { checkpoint: "abort-releasing", targetPhase: "abort-releasing", gate: "leading", operation: "recover" },
+    { checkpoint: "released-replay", targetPhase: "released", gate: "leading", operation: "resume" },
+    { checkpoint: "released-forward", targetPhase: "released", gate: "leading", operation: "resume" },
+  ] as const)(
+    "rejects $checkpoint $operation material-authentication drift before later writes",
+    async ({ checkpoint, targetPhase, gate, operation }) => {
+      const { home, fake } = await coordinatorDriftFixture(checkpoint);
+      const publicationDirectory = backendPublicationDirectory(home);
+      const journalPath = backendPublicationJournalPath(home);
+      const materialPath = join(publicationDirectory, "publication-1.material");
+      const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+      const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+      const originalClose = nodeFs.closeSync as (fd: number) => void;
+      const originalFstat = nodeFs.fstatSync as (
+        fd: number,
+        options?: { bigint?: boolean },
+      ) => { dev: bigint; [key: string]: unknown };
+      const originalStat = nodeFs.statSync as (
+        path: string,
+        options?: { bigint?: boolean },
+      ) => { dev: bigint; [key: string]: unknown };
+      const retained = vi.fn(async () => undefined);
+      const cleanup = vi.fn(async () => undefined);
+      fake.driver.retainCompletedMaterial = retained;
+      fake.driver.cleanupAbortedMaterial = cleanup;
+      const events: string[] = [];
+      const publicationDirectoryFds = new Set<number>();
+      let operationFd: number | undefined;
+      let driftActive = false;
+      let fstatInjected = false;
+      let statInjected = false;
+      let fstatDriftDev: bigint | undefined;
+      let statDriftDev: bigint | undefined;
+      let boundary: Readonly<{
+        journal: string;
+        checksumSha256: string;
+        material: Buffer;
+        calls: Record<string, number>;
+        mutations: readonly string[];
+        eventCount: number;
+      }> | undefined;
+      const captureBoundary = (): void => {
+        const journal = readBackendPublicationJournal(home);
+        if (journal === null) throw new Error("expected durable publication journal");
+        boundary = {
+          journal: readFileSync(journalPath, "utf8"),
+          checksumSha256: journal.checksumSha256,
+          material: readFileSync(materialPath),
+          calls: coordinatorDriverCallCounts(fake.driver),
+          mutations: [...fake.calls],
+          eventCount: events.length,
+        };
+      };
+      if (gate === "trailing") captureBoundary();
+
+      const observer = (event: string): void => {
+        events.push(event);
+        if (
+          gate === "leading"
+          && !driftActive
+          && event === "before-material-authenticate"
+          && readBackendPublicationJournal(home)?.phase === targetPhase
+        ) {
+          captureBoundary();
+          driftActive = true;
+        }
+      };
+      const invoke = async (): Promise<unknown> => {
+        const active = coordinator(home, fake.driver, observer);
+        if (operation === "abort") return active.abort();
+        if (operation === "recover") return active.recoverPending();
+        if (operation === "recover-abort") return active.recoverPending({ disposition: "abort" });
+        return active.resume();
+      };
+
+      let thrown: unknown;
+      await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+        const fd = originalOpen(path, ...args);
+        if (path === publicationDirectory) {
+          publicationDirectoryFds.add(fd);
+          operationFd ??= fd;
+        }
+        if (gate === "trailing" && path === materialPath && !driftActive) driftActive = true;
+        return fd;
+      }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+        publicationDirectoryFds.delete(fd);
+        originalClose(fd);
+      }) as never, async () => withPatchedFsAsync("fstatSync", ((fd: number, options?: { bigint?: boolean }) => {
+        const observed = originalFstat(fd, options);
+        if (driftActive && publicationDirectoryFds.has(fd) && options?.bigint === true) {
+          fstatInjected = true;
+          fstatDriftDev = observed.dev + 1n;
+          return Object.assign(observed, { dev: fstatDriftDev });
+        }
+        return observed;
+      }) as never, async () => withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+        const observed = originalStat(path, options);
+        if (driftActive && path === publicationDirectory && options?.bigint === true) {
+          statInjected = true;
+          statDriftDev = observed.dev + 1n;
+          return Object.assign(observed, { dev: statDriftDev });
+        }
+        return observed;
+      }) as never, async () => {
+        try {
+          await invoke();
+        } catch (error) {
+          thrown = error;
+        }
+      }))));
+
+      expect(thrown).toBeInstanceOf(BackendPublicationJournalError);
+      if (!(thrown instanceof BackendPublicationJournalError)) throw thrown;
+      expect(thrown.reason).toBe("unsafe-storage");
+      expect(fstatDriftDev).toBe(statDriftDev);
+      expect(thrown.message).toBe(
+        "backend publication directory changed during material authentication: private directory identity changed",
+      );
+      expect(operationFd).toBeDefined();
+      expect(fstatInjected).toBe(true);
+      expect(statInjected).toBe(true);
+      if (boundary === undefined) throw new Error("target material-authentication boundary was not reached");
+      expect(readFileSync(journalPath, "utf8")).toBe(boundary.journal);
+      expect(readBackendPublicationJournal(home)?.checksumSha256).toBe(boundary.checksumSha256);
+      expect(readFileSync(materialPath)).toEqual(boundary.material);
+      expect(coordinatorDriverCallCounts(fake.driver)).toEqual(boundary.calls);
+      expect(fake.calls).toEqual(boundary.mutations);
+      expect(events).toHaveLength(boundary.eventCount);
+      expect(retained).not.toHaveBeenCalled();
+      expect(cleanup).not.toHaveBeenCalled();
+    },
+  );
+
   it("journals preparing before sealing, authenticates material, and resumes to completion", async () => {
     const home = makeHome();
     const input = material();
@@ -1730,10 +2754,12 @@ describe("BackendPublicationCoordinator", () => {
     await expect(coordinator(home, fake.driver).resume()).rejects.toMatchObject({ reason: "malformed-journal" });
   });
 
-  it("rejects malformed journal fields, witnesses, references, fences, and projects", async () => {
-    const explicit = await preparedFixture();
-    rewriteJournal(explicit.home, (journal) => ({ ...journal, sourceState: null }));
-    expect(() => readBackendPublicationJournal(explicit.home)).toThrow("source state is malformed");
+  describe("rejects malformed journal fields, witnesses, references, fences, and projects", () => {
+    it("reports malformed source state", async () => {
+      const explicit = await preparedFixture();
+      rewriteJournal(explicit.home, (journal) => ({ ...journal, sourceState: null }));
+      expect(() => readBackendPublicationJournal(explicit.home)).toThrow("source state is malformed");
+    });
 
     const malformedCases: readonly [string, (journal: Record<string, unknown>) => Record<string, unknown>][] = [
       ["invalid fields", (journal) => ({ ...journal, version: 1 })],
@@ -1924,11 +2950,9 @@ describe("BackendPublicationCoordinator", () => {
         }],
       })],
     ];
-    for (const [label, mutate] of malformedCases) {
-      await expectJournalReadFailure(mutate).catch((error) => {
-        throw new Error(`${label}: ${String(error)}`);
-      });
-    }
+    it.each(malformedCases)("%s", async (_label, mutate) => {
+      await expectJournalReadFailure(mutate);
+    });
   });
 
   it("rejects every malformed persisted fence field", async () => {
@@ -2337,6 +3361,214 @@ describe("BackendPublicationCoordinator", () => {
     )).toThrowError(expect.objectContaining({ reason: "publication-evidence-missing" }));
   });
 
+  it("rejects SQLite admission when publication directory authentication is interrupted", async () => {
+    const home = makeHome();
+    const configPath = join(home, ".lcm", "config.json");
+    const publicationDirectory = backendPublicationDirectory(home);
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    mkdirSync(publicationDirectory, { mode: 0o700 });
+    const witness = configReadWitness(configPath);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalRealpath = nodeFs.realpathSync as (...args: unknown[]) => unknown;
+    let injected = false;
+    let admissionError: unknown;
+
+    await withPatchedFsAsync("realpathSync", ((path: string, ...args: unknown[]) => {
+      if (path === publicationDirectory && !injected) {
+        injected = true;
+        rmSync(publicationDirectory, { recursive: true });
+      }
+      return originalRealpath(path, ...args);
+    }) as never, async () => {
+      try {
+        assertBackendPublicationConfigReadAccess(configPath, "sqlite", witness);
+      } catch (error) {
+        admissionError = error;
+      }
+    });
+
+    expect(injected).toBe(true);
+    expect(admissionError).toBeInstanceOf(BackendPublicationJournalError);
+    expect(admissionError).toMatchObject({ reason: "unsafe-storage" });
+  });
+
+  it.each(["removed", "rebound"] as const)(
+    "retains the authenticated publication directory when it is %s between journal read and evidence enumeration",
+    (replacement) => {
+      const home = makeHome();
+      const configPath = join(home, ".lcm", "config.json");
+      const publicationDirectory = backendPublicationDirectory(home);
+      writeFileSync(configPath, "{}", { mode: 0o600 });
+      mkdirSync(publicationDirectory, { mode: 0o700 });
+      const witness = configReadWitness(configPath);
+      const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+      const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+      const originalReaddir = nodeFs.readdirSync as (...args: unknown[]) => unknown;
+      let publicationDirectoryOpens = 0;
+      let injected = false;
+      const replacePublicationDirectory = (): void => {
+        if (injected) return;
+        injected = true;
+        rmSync(publicationDirectory, { recursive: true });
+        if (replacement === "rebound") mkdirSync(publicationDirectory, { mode: 0o700 });
+      };
+
+      try {
+        // The current implementation reopens before enumeration; a corrected
+        // implementation may enumerate through the retained handle instead.
+        // Inject at whichever of those stable boundaries it reaches first.
+        nodeFs.openSync = ((path: string, ...args: unknown[]) => {
+          if (path === publicationDirectory) {
+            publicationDirectoryOpens += 1;
+            if (publicationDirectoryOpens > 1) replacePublicationDirectory();
+          }
+          return originalOpen(path, ...args);
+        }) as never;
+        nodeFs.readdirSync = ((...args: unknown[]) => {
+          replacePublicationDirectory();
+          return originalReaddir(...args);
+        }) as never;
+        syncBuiltinESMExports();
+
+        expect(() => assertBackendPublicationConfigReadAccess(
+          configPath,
+          "sqlite",
+          witness,
+        )).toThrowError(expect.objectContaining({
+          name: "BackendPublicationJournalError",
+          reason: "unsafe-storage",
+        }));
+        expect(injected).toBe(true);
+      } finally {
+        nodeFs.openSync = originalOpen;
+        nodeFs.readdirSync = originalReaddir;
+        syncBuiltinESMExports();
+      }
+    },
+  );
+
+  it("binds a present journal to the retained publication directory identity", async () => {
+    const { home } = await preparedFixture();
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; ino: bigint; [key: string]: unknown };
+    let publicationDirectoryStats = 0;
+
+    await withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+      const observed = originalStat(path, options);
+      if (path === publicationDirectory && options?.bigint === true) {
+        publicationDirectoryStats += 1;
+        if (publicationDirectoryStats === 3) return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      expect(() => readBackendPublicationJournal(home)).toThrowError(expect.objectContaining({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+      }));
+    });
+  });
+
+  it("normalizes retained directory revalidation failures after a journal read", async () => {
+    const { home } = await preparedFixture();
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; ino: bigint; [key: string]: unknown };
+    let publicationDirectoryStats = 0;
+
+    await withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+      const observed = originalStat(path, options);
+      if (path === publicationDirectory && options?.bigint === true) {
+        publicationDirectoryStats += 1;
+        if (publicationDirectoryStats === 4) return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      expect(() => readBackendPublicationJournal(home)).toThrowError(expect.objectContaining({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: expect.stringContaining("backend publication directory changed during journal read"),
+      }));
+    });
+  });
+
+  it("binds terminal material to the journal directory for lock-free config reads", async () => {
+    const { home, fake } = await preparedFixture();
+    await coordinator(home, fake.driver).resume();
+    const configPath = join(home, ".lcm", "config.json");
+    const witness = configReadWitness(configPath);
+    let admitted = false;
+
+    const observed = await withTemporaryReboundPublicationMaterial(home, () => {
+      assertBackendPublicationConfigReadAccess(configPath, "postgresql", witness);
+      admitted = true;
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(observed.restored).toBe(true);
+    expect(admitted).toBe(false);
+    expect(observed.error).toBeInstanceOf(BackendPublicationJournalError);
+    expect(observed.error).toMatchObject({ reason: "unsafe-storage" });
+  });
+
+  it("binds terminal material to the journal directory for locked consumers", async () => {
+    const { home, fake } = await preparedFixture();
+    await coordinator(home, fake.driver).resume();
+    let callbackRan = false;
+
+    const observed = await withTemporaryReboundPublicationMaterial(home, () => {
+      withBackendPublicationConsumerLock(home, () => {
+        callbackRan = true;
+      });
+    });
+
+    expect(observed.injected).toBe(true);
+    expect(observed.restored).toBe(true);
+    expect(callbackRan).toBe(false);
+    expect(observed.error).toBeInstanceOf(BackendPublicationJournalError);
+    expect(observed.error).toMatchObject({ reason: "unsafe-storage" });
+  });
+
+  it("normalizes retained directory drift during terminal material authentication", async () => {
+    const { home, fake } = await preparedFixture();
+    await coordinator(home, fake.driver).resume();
+    const configPath = join(home, ".lcm", "config.json");
+    const witness = configReadWitness(configPath);
+    const publicationDirectory = backendPublicationDirectory(home);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalStat = nodeFs.statSync as (
+      path: string,
+      options?: { bigint?: boolean },
+    ) => { dev: bigint; ino: bigint; [key: string]: unknown };
+    let publicationDirectoryStats = 0;
+
+    await withPatchedFsAsync("statSync", ((path: string, options?: { bigint?: boolean }) => {
+      const observed = originalStat(path, options);
+      if (path === publicationDirectory && options?.bigint === true) {
+        publicationDirectoryStats += 1;
+        if (publicationDirectoryStats === 5) return { ...observed, dev: observed.dev + 1n };
+      }
+      return observed;
+    }) as never, async () => {
+      expect(() => assertBackendPublicationConfigReadAccess(
+        configPath,
+        "postgresql",
+        witness,
+      )).toThrowError(expect.objectContaining({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: expect.stringContaining("changed during material authentication"),
+      }));
+    });
+    expect(publicationDirectoryStats).toBeGreaterThanOrEqual(5);
+  });
+
   it("validates lock-free reads against terminal evidence and the exact config witness", async () => {
     const { home, fake } = await preparedFixture();
     await coordinator(home, fake.driver).resume();
@@ -2410,6 +3642,48 @@ describe("revocable mutation permits", () => {
     expect(statSync(home).mode & 0o7777).toBe(0o755);
   });
 
+  it("keeps the backend publication lock valid across unrelated sibling entry churn", () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-consumer-ctime-churn-parent-"));
+    const home = join(parent, "home");
+    mkdirSync(home, { mode: 0o755 });
+    roots.push(parent);
+
+    const beforeParent = statSync(parent, { bigint: true });
+    const beforeHome = statSync(home, { bigint: true });
+    const parentCanonical = resolve(realpathSync(parent));
+    const homeCanonical = resolve(realpathSync(home));
+
+    withBackendPublicationConsumerLock(home, () => {
+      const sibling = join(parent, "unrelated-sibling");
+      mkdirSync(sibling, { mode: 0o700 });
+      rmSync(sibling, { recursive: true, force: true });
+
+      const afterParent = statSync(parent, { bigint: true });
+      const afterHome = statSync(home, { bigint: true });
+      expect(afterParent.dev).toBe(beforeParent.dev);
+      expect(afterParent.ino).toBe(beforeParent.ino);
+      expect(afterParent.uid).toBe(beforeParent.uid);
+      expect(afterParent.gid).toBe(beforeParent.gid);
+      expect(Number(afterParent.mode & 0o7777n)).toBe(Number(beforeParent.mode & 0o7777n));
+      expect(afterHome.dev).toBe(beforeHome.dev);
+      expect(afterHome.ino).toBe(beforeHome.ino);
+      expect(afterHome.uid).toBe(beforeHome.uid);
+      expect(afterHome.gid).toBe(beforeHome.gid);
+      expect(resolve(realpathSync(parent))).toBe(parentCanonical);
+      expect(resolve(realpathSync(home))).toBe(homeCanonical);
+    });
+
+    const topology = openHomeLockTopology(home);
+    try {
+      expect(() => assertHomeLockTopology({
+        ...topology,
+        parentMode: topology.parentMode ^ 0o001,
+      })).toThrow("topology changed during validation");
+    } finally {
+      closeHomeLockTopology(topology);
+    }
+  });
+
   it("rejects unsafe or non-canonical HOME lock parents", () => {
     const unsafeParent = mkdtempSync(join(tmpdir(), "lcm-consumer-unsafe-parent-"));
     roots.push(unsafeParent);
@@ -2439,6 +3713,7 @@ describe("revocable mutation permits", () => {
     expect(() => withBackendPublicationConsumerLock(nonCanonicalHome, () => undefined))
       .toThrow("path is not canonical");
 
+    // POSIX-only fixture: this must exercise the real root-owned sticky /tmp parent.
     const stickyParentHome = mkdtempSync("/tmp/lcm-consumer-sticky-parent-");
     roots.push(stickyParentHome);
     withBackendPublicationConsumerLock(stickyParentHome, () => undefined);
@@ -2539,5 +3814,210 @@ describe("revocable mutation permits", () => {
       permit.assertActive();
     });
     expect(() => retained?.assertActive()).toThrow(PrivateMutationPermitRevokedError);
+  });
+});
+
+describe("backend publication directory link-count policy", () => {
+  type NlinkMutationEvidence = Readonly<{
+    beforeNlink: bigint;
+    afterNlink: bigint;
+    injectionCount: number;
+  }>;
+
+  async function withOneShotMaterialDirectoryNlink<T>(
+    home: string,
+    callback: (controls: Readonly<{
+      armAfterNextDirectoryFstat: () => void;
+      armOnSuccessfulMaterialOpen: () => void;
+    }>) => Promise<T>,
+  ): Promise<Readonly<{ result: T; evidence: NlinkMutationEvidence | undefined }>> {
+    const publicationDirectory = backendPublicationDirectory(home);
+    const materialPath = join(publicationDirectory, "publication-1.material");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalClose = nodeFs.closeSync as (fd: number) => void;
+    const originalFstat = nodeFs.fstatSync as (
+      fd: number,
+      options?: { bigint?: boolean },
+    ) => {
+      dev: bigint;
+      ino: bigint;
+      mode: bigint;
+      uid: bigint;
+      gid: bigint;
+      nlink: bigint;
+      isDirectory: () => boolean;
+      [key: string]: unknown;
+    };
+    const directoryFds = new Set<number>();
+    let armMode: "idle" | "after-next-directory-fstat" | "on-material-open" | "armed" | "done" = "idle";
+    let lastDirectoryFstatFd: number | undefined;
+    let targetFd: number | undefined;
+    let injectionCount = 0;
+    let evidence: NlinkMutationEvidence | undefined;
+
+    const controls = {
+      armAfterNextDirectoryFstat: (): void => {
+        expect(armMode).toBe("idle");
+        armMode = "after-next-directory-fstat";
+      },
+      armOnSuccessfulMaterialOpen: (): void => {
+        expect(armMode).toBe("idle");
+        armMode = "on-material-open";
+      },
+    } as const;
+
+    return withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === publicationDirectory) directoryFds.add(fd);
+      if (path === materialPath && armMode === "on-material-open") {
+        expect(lastDirectoryFstatFd).toBeDefined();
+        expect(directoryFds.has(lastDirectoryFstatFd!)).toBe(true);
+        targetFd = lastDirectoryFstatFd;
+        armMode = "armed";
+      }
+      return fd;
+    }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+      originalClose(fd);
+      directoryFds.delete(fd);
+    }) as never, async () => withPatchedFsAsync("fstatSync", ((
+      fd: number,
+      options?: { bigint?: boolean },
+    ) => {
+      const observed = originalFstat(fd, options);
+      if (!directoryFds.has(fd) || options?.bigint !== true) return observed;
+
+      lastDirectoryFstatFd = fd;
+      if (armMode === "after-next-directory-fstat") {
+        targetFd = fd;
+        armMode = "armed";
+        return observed;
+      }
+      if (armMode !== "armed" || fd !== targetFd) return observed;
+
+      const prototype = Object.getPrototypeOf(observed);
+      const beforeDescriptors = Object.getOwnPropertyDescriptors(observed);
+      const beforeNlink = observed.nlink;
+      const pathStat = statSync(publicationDirectory, { bigint: true });
+      expect(observed.isDirectory()).toBe(true);
+      expect(observed.dev).toBe(pathStat.dev);
+      expect(observed.ino).toBe(pathStat.ino);
+      Object.defineProperty(observed, "nlink", { value: beforeNlink + 1n });
+      const afterDescriptors = Object.getOwnPropertyDescriptors(observed);
+      delete beforeDescriptors.nlink;
+      delete afterDescriptors.nlink;
+      expect(Object.getPrototypeOf(observed)).toBe(prototype);
+      expect(afterDescriptors).toEqual(beforeDescriptors);
+      injectionCount += 1;
+      evidence = { beforeNlink, afterNlink: observed.nlink, injectionCount };
+      armMode = "done";
+      return observed;
+    }) as never, async () => {
+      const result = await callback(controls);
+      return { result, evidence };
+    })));
+  }
+
+  function expectNlinkMutation(evidence: NlinkMutationEvidence | undefined): void {
+    expect(evidence).toBeDefined();
+    expect(evidence?.afterNlink).toBe(evidence!.beforeNlink + 1n);
+    expect(evidence?.injectionCount).toBe(1);
+  }
+
+  async function sealedPreparingFixture(): Promise<{
+    home: string;
+    input: BackendPublicationRecoveryMaterial;
+    fake: ReturnType<typeof makeDriver>;
+  }> {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    await expect(coordinator(home, fake.driver, (event) => {
+      if (event === "after-material-seal") throw new Error("crash:after-material-seal");
+    }).prepare(inputFor(input))).rejects.toThrow("crash:after-material-seal");
+    expect(readBackendPublicationJournal(home)?.phase).toBe("preparing");
+    return { home, input, fake };
+  }
+
+  it("allows prepare to authenticate across directory nlink churn", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+
+    const observed = await withOneShotMaterialDirectoryNlink(home, async (controls) => {
+      const journal = await coordinator(home, fake.driver, (event) => {
+        if (event === "before-material-authenticate") controls.armAfterNextDirectoryFstat();
+      }).prepare(inputFor(input));
+      return journal;
+    });
+
+    expect(observed.result.phase).toBe("prepared");
+    expect(fake.calls).toEqual([]);
+    expectNlinkMutation(observed.evidence);
+  });
+
+  it("allows prepared resume material context across directory nlink churn", async () => {
+    const { home, fake } = await preparedFixture();
+
+    const observed = await withOneShotMaterialDirectoryNlink(home, async (controls) => {
+      controls.armOnSuccessfulMaterialOpen();
+      return coordinator(home, fake.driver).resume();
+    });
+
+    expect(observed.result.phase).toBe("completed");
+    expect(fake.calls).toEqual(["publish-map", "publish-config"]);
+    expectNlinkMutation(observed.evidence);
+  });
+
+  it("allows preparing resume across directory nlink churn", async () => {
+    const { home, fake } = await sealedPreparingFixture();
+
+    const observed = await withOneShotMaterialDirectoryNlink(home, async (controls) => {
+      controls.armOnSuccessfulMaterialOpen();
+      return coordinator(home, fake.driver).resume();
+    });
+
+    expect(observed.result.phase).toBe("completed");
+    expect(fake.calls).toEqual(["publish-map", "publish-config"]);
+    expectNlinkMutation(observed.evidence);
+  });
+
+  it("allows preparing abort across directory nlink churn", async () => {
+    const { home, fake } = await sealedPreparingFixture();
+
+    const observed = await withOneShotMaterialDirectoryNlink(home, async (controls) => {
+      controls.armOnSuccessfulMaterialOpen();
+      return coordinator(home, fake.driver).abort();
+    });
+
+    expect(observed.result.phase).toBe("aborted");
+    expect(fake.calls).toEqual([]);
+    expect(existsSync(join(backendPublicationDirectory(home), "publication-1.material"))).toBe(false);
+    expectNlinkMutation(observed.evidence);
+  });
+
+  it("keeps completed consumer material authentication strict", async () => {
+    const { home, fake } = await preparedFixture();
+    await coordinator(home, fake.driver).resume();
+    let controlAdmitted = false;
+    withBackendPublicationConsumerLock(home, () => {
+      controlAdmitted = true;
+    });
+    expect(controlAdmitted).toBe(true);
+
+    let mutatedAdmitted = false;
+    const observed = await withOneShotMaterialDirectoryNlink(home, async (controls) => {
+      controls.armOnSuccessfulMaterialOpen();
+      expect(() => withBackendPublicationConsumerLock(home, () => {
+        mutatedAdmitted = true;
+      })).toThrowError(expect.objectContaining({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+        message: expect.stringContaining("changed during material authentication"),
+      }));
+    });
+
+    expect(mutatedAdmitted).toBe(false);
+    expectNlinkMutation(observed.evidence);
   });
 });

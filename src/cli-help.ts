@@ -157,12 +157,12 @@ const HELP: Record<string, CommandHelp> = {
     options: [
       ["--limit N", "Max results per layer (default: 5)"],
       ["--layer <name>", "Layer to search: episodic or promoted (repeatable)"],
-      ["--tag <tag>", "Filter to entries that include all specified tags (repeatable)"],
+      ["--tag <tag>", "Filter promoted entries by all specified tags; episodic history remains unfiltered (repeatable)"],
     ],
     examples: [
       ["lcm search \"authentication decision\"", "Search both memory layers for auth-related context"],
       ["lcm search \"sqlite migration\" --layer episodic", "Search only episodic memory"],
-      ["lcm search \"hook failure\" --tag type:solution", "Filter by tag"],
+      ["lcm search \"hook failure\" --layer promoted --tag type:solution", "Filter promoted entries by tag"],
     ],
   },
 
@@ -172,13 +172,14 @@ const HELP: Record<string, CommandHelp> = {
     options: [
       ["--mode <mode>", "Search mode: full_text (default) or regex"],
       ["--scope <scope>", "Scope: messages, summaries, or both (default: both)"],
-      ["--since <iso>", "Only include matches on or after this ISO timestamp"],
+      ["--since <iso>", "Inclusive lower bound: YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm), normalized UTC year 0001-9999; malformed or out-of-range values return HTTP 400"],
     ],
     examples: [
       ["lcm grep \"ECONNREFUSED\"", "Search for an exact error string"],
       ["lcm grep \"createDaemon|startMcpServer\" --mode regex", "Regex search across history"],
       ["lcm grep \"migration\" --scope summaries", "Search only summaries"],
     ],
+    notes: "The optional --since value is inclusive and must use YYYY-MM-DDTHH:mm:ss with optional 1-3 fractional digits and a Z or +/-HH:mm timezone. After offset normalization, the UTC year must be 0001-9999. Omit it to include all history; malformed or out-of-range values return HTTP 400 with invalid since.",
   },
 
   describe: {
@@ -391,13 +392,13 @@ const HELP: Record<string, CommandHelp> = {
 
   export: {
     summary: "Export promoted knowledge to a portable JSON file (secrets scrubbed).",
-    usage: "lcm export [--all] [--tags <tags>] [--since <date>] [--output <file>]",
+    usage: "lcm export [--all] [--tags <tags>] [--since <date>] [--output <file>] [--format <format>]",
     options: [
       ["--all", "Export all projects (one file per project, auto-named)"],
       ["--tags <tags>", "Only export entries that have all these comma-separated tags"],
       ["--since <date>", "Only export entries created on or after this ISO date (e.g. 2026-01-01)"],
       ["--output <file>", "Write output to file instead of stdout"],
-      ["--format <format>", "Output format: json (default)"],
+      ["--format <format>", "Output format: json only (default)"],
     ],
     examples: [
       ["lcm export", "Print current project knowledge to stdout"],
@@ -406,7 +407,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm export --tags decision,architecture", "Only export entries tagged with both tags"],
       ["lcm export --all", "Export all projects to auto-named JSON files"],
     ],
-    notes: "Secrets are automatically scrubbed using the project's sensitive patterns before export. The JSON format is: { version, exportedAt, projectCwd, entries: [{content, tags, confidence, createdAt, sessionId}] }.",
+    notes: "Secrets are automatically scrubbed using the project's sensitive patterns before export. Only the json format is supported; other --format values are rejected before export work starts. The JSON format is: { version, exportedAt, projectCwd, entries: [{content, tags, confidence, createdAt, sessionId}] }.",
   },
 
   "import-knowledge": {

@@ -1,7 +1,20 @@
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import type { DaemonConfig } from "../config.js";
-import { projectIdentity, projectPaths } from "../project.js";
+import {
+  MAX_PROJECT_METADATA_BYTES,
+  ensureProjectDirForIdentity,
+  projectIdentity,
+  projectPathsForIdentity,
+} from "../project.js";
+import {
+  assertPrivateDirectoryEntry,
+  atomicWritePrivateFile,
+  openPrivateDirectory,
+  PrivateDirectoryTopologyError,
+  PrivateFileCollisionError,
+  readBoundedRegularFileWithStat,
+  type PrivateDirectoryHandle,
+} from "../../security-files.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import { shouldPromote } from "../../promotion/detector.js";
@@ -64,6 +77,144 @@ function isInvocationCancellation(error: unknown): boolean {
   return error instanceof InvocationCoordinatorError && error.code === "cancelled";
 }
 
+function isCriticalMetadataError(error: unknown): boolean {
+  return error instanceof PrivateDirectoryTopologyError
+    || (
+      error !== null
+      && typeof error === "object"
+      && "name" in error
+      && error.name === "PrivateDirectoryTopologyError"
+    )
+    || isAbortError(error)
+    || isInvocationCancellation(error)
+    || error instanceof BackendPublicationJournalError;
+}
+
+function errorCode(error: unknown): string | undefined {
+  return error !== null && typeof error === "object" && "code" in error
+    && typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
+
+const METADATA_TOPOLOGY_ERROR =
+  "project directory topology changed before metadata publication";
+
+type RetainedMetadataDirectory = Readonly<{
+  path: string;
+  handle: PrivateDirectoryHandle;
+}>;
+
+type MetadataDirectoryChain = readonly [
+  RetainedMetadataDirectory,
+  RetainedMetadataDirectory,
+  RetainedMetadataDirectory,
+];
+
+function metadataTopologyError(cause?: unknown): PrivateDirectoryTopologyError {
+  return cause === undefined
+    ? new PrivateDirectoryTopologyError(METADATA_TOPOLOGY_ERROR)
+    : new PrivateDirectoryTopologyError(METADATA_TOPOLOGY_ERROR, { cause });
+}
+
+function metadataDirectoryPaths(
+  paths: Readonly<{ dir: string; metaPath: string }>,
+  projectId: string,
+): readonly [string, string, string] {
+  const leafPath = paths.dir;
+  const projectsPath = dirname(leafPath);
+  const rootPath = dirname(projectsPath);
+  if (
+    !isAbsolute(leafPath)
+    || !isAbsolute(paths.metaPath)
+    || basename(leafPath) !== projectId
+    || basename(projectsPath) !== "projects"
+    || paths.metaPath !== join(leafPath, "meta.json")
+  ) {
+    throw metadataTopologyError();
+  }
+  return [rootPath, projectsPath, leafPath];
+}
+
+function assertMetadataDirectoryEntries(
+  entries: readonly RetainedMetadataDirectory[],
+): void {
+  try {
+    for (const entry of entries) {
+      assertPrivateDirectoryEntry(entry.handle, entry.path, entry.handle.witness.uid);
+    }
+  } catch (error) {
+    throw metadataTopologyError(error);
+  }
+}
+
+function closeMetadataDirectories(
+  entries: readonly RetainedMetadataDirectory[],
+  primary?: Readonly<{ error: unknown }>,
+): void {
+  const cleanupErrors: unknown[] = [];
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index]!;
+    try {
+      entry.handle.close();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (primary !== undefined) {
+    if (isCriticalMetadataError(primary.error) || cleanupErrors.length === 0) {
+      throw primary.error;
+    }
+    throw new AggregateError(
+      [primary.error, ...cleanupErrors],
+      "project metadata publication and directory cleanup failed",
+      { cause: primary.error },
+    );
+  }
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length > 1) {
+    throw new AggregateError(cleanupErrors, "project metadata directory cleanup failed");
+  }
+}
+
+function openMetadataDirectoryChain(
+  paths: Readonly<{ dir: string; metaPath: string }>,
+  projectId: string,
+  expectedUid: number | undefined,
+): MetadataDirectoryChain {
+  const directoryPaths = metadataDirectoryPaths(paths, projectId);
+  const entries: RetainedMetadataDirectory[] = [];
+  try {
+    for (const path of directoryPaths) {
+      let handle: PrivateDirectoryHandle;
+      try {
+        handle = openPrivateDirectory(path, { expectedUid });
+      } catch (error) {
+        const code = errorCode(error);
+        if (
+          !isCriticalMetadataError(error)
+          && (code === "EMFILE" || code === "ENFILE" || code === "ENOSPC")
+        ) throw error;
+        throw metadataTopologyError(error);
+      }
+      entries.push({ path, handle });
+      assertMetadataDirectoryEntries(entries);
+    }
+    return [entries[0]!, entries[1]!, entries[2]!];
+  } catch (error) {
+    let primary = error;
+    if (!isCriticalMetadataError(error)) {
+      try {
+        assertMetadataDirectoryEntries(entries);
+      } catch (topologyError) {
+        primary = topologyError;
+      }
+    }
+    closeMetadataDirectories(entries, { error: primary });
+    throw primary;
+  }
+}
+
 export function createPromoteHandler(
   config: DaemonConfig,
   storageFactory?: StorageBackendFactory,
@@ -83,6 +234,10 @@ export function createPromoteHandler(
 
     try {
       const input = JSON.parse(body || "{}") as PromoteRequestBody;
+      if (input === null || typeof input !== "object" || Array.isArray(input)) {
+        sendJson(res, 400, { error: "invalid request body" });
+        return;
+      }
       const { dry_run = false } = input;
 
       if (!input.cwd) {
@@ -146,13 +301,24 @@ export function createPromoteHandler(
       }
 
       throwIfAborted(signal);
-      const paths = projectPaths(cwd, context?.publicationLockToken);
-      projectIdentity(cwd, config.storage, context?.publicationLockToken);
-      mkdirSync(dirname(paths.metaPath), { recursive: true });
+      const storageIdentity = projectIdentity(
+        cwd,
+        config.storage,
+        context?.publicationLockToken,
+      );
+      const localIdentity = {
+        id: storageIdentity.localProjectId,
+        canonical: storageIdentity.canonical,
+        ...(storageIdentity.remoteProjectId === undefined
+          ? {}
+          : { remoteProjectId: storageIdentity.remoteProjectId }),
+      };
+      const paths = projectPathsForIdentity(localIdentity);
+      const projectDir = ensureProjectDirForIdentity(localIdentity, { writeMetadata: false });
       throwIfAborted(signal);
       const scrubber = await ScrubEngine.forProject(
         config.security.sensitivePatterns,
-        dirname(paths.metaPath),
+        projectDir,
       );
       throwIfAborted(signal);
 
@@ -183,6 +349,7 @@ export function createPromoteHandler(
           factory: storageFactory,
           context: storageContext,
           mode: "existing",
+          expectedIdentity: storageIdentity,
           beforeClose: commitCloseBarrier.waitForZero,
         },
         async (project) => {
@@ -276,16 +443,77 @@ export function createPromoteHandler(
         try {
           await withCommitAdmission(async () => {
             const writeMetadata = (): void => {
-              const metaPath = paths.metaPath;
-              let meta: Record<string, unknown> = {};
+              const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+              const chain = openMetadataDirectoryChain(paths, localIdentity.id, expectedUid);
+              const parent = chain[2].handle;
+              let primary: Readonly<{ error: unknown }> | undefined;
               try {
-                meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+                try {
+                  let meta: Record<string, unknown> = {};
+                  let metadataMissing = false;
+                  assertMetadataDirectoryEntries(chain);
+                  let observed: ReturnType<typeof readBoundedRegularFileWithStat> | undefined;
+                  try {
+                    observed = readBoundedRegularFileWithStat(paths.metaPath, {
+                      allowedRoot: paths.dir,
+                      maxBytes: MAX_PROJECT_METADATA_BYTES,
+                      expectedUid,
+                      requireSingleLink: true,
+                    });
+                  } catch (error) {
+                    if (errorCode(error) !== "ENOENT") throw error;
+                    metadataMissing = true;
+                    assertMetadataDirectoryEntries(chain);
+                  }
+                  if (observed !== undefined) {
+                    if (
+                      observed.parentDev !== parent.witness.dev
+                      || observed.parentIno !== parent.witness.ino
+                    ) {
+                      throw metadataTopologyError();
+                    }
+                    const parsed: unknown = JSON.parse(observed.content);
+                    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+                      throw new Error("invalid project metadata");
+                    }
+                    meta = parsed as Record<string, unknown>;
+                  }
+                  meta.cwd = paths.canonical;
+                  meta.lastPromote = new Date().toISOString();
+                  const serialized = JSON.stringify(meta, null, 2) + "\n";
+                  if (Buffer.byteLength(serialized, "utf8") > MAX_PROJECT_METADATA_BYTES) {
+                    throw new Error("project metadata exceeds size limit");
+                  }
+                  assertMetadataDirectoryEntries(chain);
+                  try {
+                    if (metadataMissing) {
+                      atomicWritePrivateFile(
+                        paths.metaPath,
+                        serialized,
+                        {},
+                        parent,
+                        { requireAbsent: true },
+                      );
+                    } else {
+                      atomicWritePrivateFile(paths.metaPath, serialized, {}, parent);
+                    }
+                  } catch (error) {
+                    if (error instanceof PrivateFileCollisionError) {
+                      throw metadataTopologyError(error);
+                    }
+                    throw error;
+                  }
+                  assertMetadataDirectoryEntries(chain);
+                } catch (error) {
+                  if (isCriticalMetadataError(error)) throw error;
+                  assertMetadataDirectoryEntries(chain);
+                  throw error;
+                }
               } catch (error) {
-                if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+                primary = { error };
+              } finally {
+                closeMetadataDirectories(chain, primary);
               }
-              meta.cwd = paths.canonical;
-              meta.lastPromote = new Date().toISOString();
-              writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
             };
             if (context?.withPublicationAdmission !== undefined) {
               await context.withPublicationAdmission(() => writeMetadata());
@@ -294,9 +522,7 @@ export function createPromoteHandler(
             }
           });
         } catch (error) {
-          if (isAbortError(error) || isInvocationCancellation(error) || error instanceof BackendPublicationJournalError) {
-            throw error;
-          }
+          if (isCriticalMetadataError(error)) throw error;
           // Meta persistence remains best-effort for ordinary filesystem failures.
         }
         throwIfAborted(signal);

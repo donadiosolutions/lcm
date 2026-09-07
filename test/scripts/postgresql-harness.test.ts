@@ -1,5 +1,7 @@
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, win32 } from "node:path";
 import { Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -36,6 +38,7 @@ import {
   createSingleFlightOperation,
   discoverHarnessRuns,
   harnessErrorDetails,
+  harnessDirectoryFromRecord,
   isValidProcessBirthFingerprint,
   isMissingDockerObjectError,
   ownershipLabels,
@@ -56,6 +59,7 @@ import {
   validateRunNames,
   writeHarnessDiagnostic,
 } from "../../scripts/postgresql-harness.mjs";
+import { createTestTempDirectory } from "../../scripts/test-temp-root.mjs";
 import { postgresqlVitestCacheDir } from "../../vitest.postgresql.config.js";
 
 const testBootId = "12345678-1234-1234-1234-123456789abc";
@@ -70,6 +74,479 @@ function missingContainerError(name: string) {
 }
 
 describe("PostgreSQL harness utilities", () => {
+  it("authenticates owned harness directories under finite fallback parents", () => {
+    const record = {
+      Mounts: [{
+        Destination: "/run/lcm-harness",
+        Type: "bind",
+        RW: false,
+        Source: "/var/tmp/lcm-postgresql-harness-owned",
+      }],
+    };
+    const realpath = (path: string) => path;
+    expect(harnessDirectoryFromRecord(record, {
+      environment: {},
+      candidateParents: ["/var/tmp", "/unrelated"],
+      realpath,
+    })).toBe("/var/tmp/lcm-postgresql-harness-owned");
+    expect(harnessDirectoryFromRecord({
+      Mounts: [{ ...record.Mounts[0], Source: "/home/unrelated/lcm-postgresql-harness-owned" }],
+    }, {
+      environment: { TMPDIR: "/worker-scratch" },
+      candidateParents: ["/unrelated"],
+      realpath,
+    })).toBeUndefined();
+  });
+
+  it("uses the explicit nested harness parent and rejects outer worker scratch", () => {
+    const realpath = (path: string) => path;
+    const mount = (source: string) => ({ Mounts: [{
+      Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+    }] });
+    const environment = {
+      LCM_TEST_HARNESS_TMPDIR: "/original",
+      TMPDIR: "/worker-scratch",
+    };
+    expect(harnessDirectoryFromRecord(mount("/original/lcm-postgresql-harness-owned"), {
+      environment,
+      realpath,
+    })).toBe("/original/lcm-postgresql-harness-owned");
+    expect(harnessDirectoryFromRecord(mount("/worker-scratch/lcm-postgresql-harness-owned"), {
+      environment,
+      realpath,
+    })).toBeUndefined();
+  });
+
+  it("uses the selected handoff and valid original snapshot only", () => {
+    const mount = (source: string) => ({ Mounts: [{
+      Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+    }] });
+    const environment = {
+      LCM_TEST_HARNESS_TMPDIR: "/original",
+      LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS: JSON.stringify({
+        version: 1,
+        parents: ["/ambient-original"],
+      }),
+      TMPDIR: "/worker-scratch",
+    };
+    const realpath = (path: string) => path;
+    expect(harnessDirectoryFromRecord(mount("/ambient-original/lcm-postgresql-harness-snapshot"), {
+      environment,
+      realpath,
+    })).toBe("/ambient-original/lcm-postgresql-harness-snapshot");
+    expect(harnessDirectoryFromRecord(mount("/worker-scratch/lcm-postgresql-harness-snapshot"), {
+      environment,
+      realpath,
+    })).toBeUndefined();
+    expect(harnessDirectoryFromRecord(mount("/var/tmp/lcm-postgresql-harness-fallback"), {
+      environment,
+      realpath,
+    })).toBeUndefined();
+  });
+
+  it("authenticates every retained Windows parent and the selected handoff", () => {
+    const mount = (source: string) => ({ Mounts: [{
+      Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+    }] });
+    const environment = {
+      LCM_TEST_HARNESS_TMPDIR: "E:\\SelectedHandoff",
+      LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS: JSON.stringify({
+        version: 1,
+        parents: ["C:\\OriginalTemp", "D:\\OriginalTmp", "E:\\InjectedRoot"],
+      }),
+      TEMP: "C:\\WorkerScratch",
+      TMP: "C:\\WorkerScratch",
+    };
+    const realpath = (path: string) => path;
+    const accepted = [
+      "C:\\OriginalTemp\\lcm-postgresql-harness-original-temp",
+      "D:\\OriginalTmp\\lcm-postgresql-harness-original-tmp",
+      "E:\\InjectedRoot\\lcm-postgresql-harness-injected-root",
+      "E:\\SelectedHandoff\\lcm-postgresql-harness-selected-handoff",
+    ];
+    for (const source of accepted) {
+      expect(harnessDirectoryFromRecord(mount(source), {
+        environment,
+        realpath,
+        platformName: "win32",
+      })).toBe(source);
+    }
+    expect(harnessDirectoryFromRecord(
+      mount("c:\\originaltemp\\lcm-postgresql-harness-case-variant"),
+      { environment, realpath, platformName: "win32" },
+    )).toBe("c:\\originaltemp\\lcm-postgresql-harness-case-variant");
+
+    const rejected = [
+      "C:\\WorkerScratch\\lcm-postgresql-harness-worker",
+      "C:\\Windows\\lcm-postgresql-harness-system-root",
+      "D:\\Other\\lcm-postgresql-harness-unrelated",
+    ];
+    for (const source of rejected) {
+      expect(harnessDirectoryFromRecord(mount(source), {
+        environment,
+        realpath,
+        platformName: "win32",
+      })).toBeUndefined();
+    }
+  });
+
+  it.each(["\\RootRelative", "/RootRelative"])(
+    "rejects root-relative Windows handoff %j",
+    (handoff) => {
+      const source = `${handoff}\\lcm-postgresql-harness-root-relative`;
+      const record = { Mounts: [{
+        Destination: "/run/lcm-harness",
+        Type: "bind",
+        RW: false,
+        Source: source,
+      }] };
+      expect(harnessDirectoryFromRecord(record, {
+        environment: { LCM_TEST_HARNESS_TMPDIR: handoff },
+        platformName: "win32",
+        realpath: (path: string) => path,
+      })).toBeUndefined();
+    },
+  );
+
+  it.each(["\\RootRelative", "/RootRelative", "C:DriveRelative"])(
+    "treats snapshot with unqualified Windows parent %j as absent",
+    (invalidParent) => {
+      const mount = (source: string) => ({ Mounts: [{
+        Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+      }] });
+      const environment = {
+        LCM_TEST_HARNESS_TMPDIR: "E:\\SelectedHandoff",
+        LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS: JSON.stringify({
+          version: 1,
+          parents: ["C:\\OriginalTemp", invalidParent],
+        }),
+        SystemRoot: "C:\\Windows",
+        TEMP: "D:\\WorkerScratch",
+        TMP: "D:\\WorkerScratch",
+      };
+      const realpath = (path: string) => path;
+
+      for (const source of [
+        `${invalidParent}\\lcm-postgresql-harness-invalid`,
+        "C:\\OriginalTemp\\lcm-postgresql-harness-original",
+        "D:\\WorkerScratch\\lcm-postgresql-harness-live",
+      ]) {
+        expect(harnessDirectoryFromRecord(mount(source), {
+          environment,
+          platformName: "win32",
+          realpath,
+        })).toBeUndefined();
+      }
+      for (const source of [
+        "E:\\SelectedHandoff\\lcm-postgresql-harness-selected",
+        "C:\\Windows\\Temp\\lcm-postgresql-harness-fallback",
+      ]) {
+        expect(harnessDirectoryFromRecord(mount(source), {
+          environment,
+          platformName: "win32",
+          realpath,
+        })).toBe(source);
+      }
+    },
+  );
+
+  it("requires the selected handoff when Windows snapshot is missing", () => {
+    const mount = (source: string) => ({ Mounts: [{
+      Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+    }] });
+    const environment = {
+      LCM_TEST_HARNESS_TMPDIR: "E:\\SelectedHandoff",
+      TEMP: "C:\\OriginalTemp",
+      TMP: "D:\\OriginalTmp",
+    };
+    const realpath = (path: string) => path;
+    expect(harnessDirectoryFromRecord(
+      mount("E:\\SelectedHandoff\\lcm-postgresql-harness-selected"),
+      { environment, realpath, platformName: "win32" },
+    )).toBe("E:\\SelectedHandoff\\lcm-postgresql-harness-selected");
+    for (const source of [
+      "C:\\OriginalTemp\\lcm-postgresql-harness-original-temp",
+      "D:\\OriginalTmp\\lcm-postgresql-harness-original-tmp",
+      "C:\\WorkerScratch\\lcm-postgresql-harness-worker",
+      "C:\\Windows\\Temp\\lcm-postgresql-harness-fallback",
+    ]) {
+      expect(harnessDirectoryFromRecord(mount(source), {
+        environment: { ...environment, TEMP: "C:\\WorkerScratch", TMP: "C:\\WorkerScratch" },
+        realpath,
+        platformName: "win32",
+      })).toBeUndefined();
+    }
+  });
+
+  it.each([
+    [undefined, "C:\\Windows\\Temp\\lcm-postgresql-harness-fallback", "C:\\Windows\\Temp\\lcm-postgresql-harness-fallback"],
+    [JSON.stringify({ version: 1, parents: [] }), "C:\\Windows\\Temp\\lcm-postgresql-harness-fallback", undefined],
+  ])("distinguishes missing and valid-empty Windows snapshots", (snapshot, fallback, expected) => {
+    const mount = (source: string) => ({ Mounts: [{
+      Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+    }] });
+    const environment = {
+      LCM_TEST_HARNESS_TMPDIR: "E:\\SelectedHandoff",
+      LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS: snapshot,
+      SystemRoot: "C:\\Windows",
+      TEMP: "C:\\WorkerScratch",
+      TMP: "C:\\WorkerScratch",
+    };
+    const realpath = (path: string) => path;
+    expect(harnessDirectoryFromRecord(mount(fallback), {
+      environment,
+      realpath,
+      platformName: "win32",
+    })).toBe(expected);
+    expect(harnessDirectoryFromRecord(
+      mount("E:\\SelectedHandoff\\lcm-postgresql-harness-selected"),
+      { environment, realpath, platformName: "win32" },
+    )).toBe("E:\\SelectedHandoff\\lcm-postgresql-harness-selected");
+    for (const source of [
+      "C:\\OriginalTemp\\lcm-postgresql-harness-original-temp",
+      "D:\\OriginalTmp\\lcm-postgresql-harness-original-tmp",
+      "C:\\WorkerScratch\\lcm-postgresql-harness-worker",
+    ]) {
+      expect(harnessDirectoryFromRecord(mount(source), {
+        environment,
+        realpath,
+        platformName: "win32",
+      })).toBeUndefined();
+    }
+  });
+
+  it("uses platform fallbacks for a missing snapshot and preserves native Windows paths", () => {
+    const mount = (source: string) => ({ Mounts: [{
+      Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+    }] });
+    const realpath = (path: string) => path;
+    expect(harnessDirectoryFromRecord(mount("/var/tmp/lcm-postgresql-harness-fallback"), {
+      environment: { LCM_TEST_HARNESS_TMPDIR: "/original" },
+      realpath,
+      platformName: "linux",
+    })).toBe("/var/tmp/lcm-postgresql-harness-fallback");
+    const windowsEnvironment = {
+      LCM_TEST_HARNESS_TMPDIR: "C:\\Harness",
+      SystemRoot: "C:\\Windows",
+      TEMP: "C:\\WorkerScratch",
+      TMP: "C:\\WorkerScratch",
+    };
+    expect(harnessDirectoryFromRecord(
+      mount("C:\\Harness\\lcm-postgresql-harness-native"),
+      { environment: windowsEnvironment, realpath, platformName: "win32" },
+    )).toBe("C:\\Harness\\lcm-postgresql-harness-native");
+    expect(harnessDirectoryFromRecord(
+      mount("\\\\server\\share\\lcm-postgresql-harness-unc"),
+      {
+        environment: {
+          LCM_TEST_HARNESS_TMPDIR: "\\\\server\\share",
+          LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS: JSON.stringify({
+            version: 1,
+            parents: ["\\\\server\\share"],
+          }),
+        },
+        realpath,
+        platformName: "win32",
+      },
+    )).toBe("\\\\server\\share\\lcm-postgresql-harness-unc");
+    expect(harnessDirectoryFromRecord(
+      mount("C:\\Windows\\Temp\\lcm-postgresql-harness-fallback"),
+      { environment: windowsEnvironment, realpath, platformName: "win32" },
+    )).toBe("C:\\Windows\\Temp\\lcm-postgresql-harness-fallback");
+    expect(harnessDirectoryFromRecord(
+      mount("C:\\Windows\\lcm-postgresql-harness-owned"),
+      { environment: windowsEnvironment, realpath, platformName: "win32" },
+    )).toBeUndefined();
+    expect(harnessDirectoryFromRecord(
+      mount("D:\\Other\\lcm-postgresql-harness-unrelated"),
+      { environment: windowsEnvironment, realpath, platformName: "win32" },
+    )).toBeUndefined();
+    expect(harnessDirectoryFromRecord(
+      mount("C:\\WorkerScratch\\lcm-postgresql-harness-worker"),
+      { environment: windowsEnvironment, realpath, platformName: "win32" },
+    )).toBeUndefined();
+    expect(harnessDirectoryFromRecord(
+      mount("C:\\WorkerScratch\\lcm-postgresql-harness-worker"),
+      {
+        environment: {
+          ...windowsEnvironment,
+          LCM_TEST_HARNESS_ORIGINAL_TEMP_PARENTS: "malformed",
+        },
+        realpath,
+        platformName: "win32",
+        temporaryRoot: () => {
+          throw new Error("nested authentication must not recapture live roots");
+        },
+      },
+    )).toBeUndefined();
+    expect(win32.dirname("C:\\Harness\\lcm-postgresql-harness-native"))
+      .toBe("C:\\Harness");
+  });
+
+  it("rejects an empty handoff and a bare or unrelated directory", () => {
+    const mount = (source: string) => ({ Mounts: [{
+      Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+    }] });
+    const realpath = (path: string) => path;
+    expect(harnessDirectoryFromRecord(mount("/cwd/lcm-postgresql-harness-empty"), {
+      environment: { LCM_TEST_HARNESS_TMPDIR: "" },
+      realpath,
+      platformName: "linux",
+    })).toBeUndefined();
+    expect(harnessDirectoryFromRecord(mount("/var/tmp/lcm-postgresql-harness-unrelated"), {
+      environment: { LCM_TEST_HARNESS_TMPDIR: "/var/tmp/lcm-postgresql-harness-unrelated" },
+      realpath,
+      platformName: "linux",
+    })).toBe("/var/tmp/lcm-postgresql-harness-unrelated");
+    expect(harnessDirectoryFromRecord(mount("/home/unrelated/lcm-postgresql-harness-unrelated"), {
+      environment: { LCM_TEST_HARNESS_TMPDIR: "/var/tmp" },
+      realpath,
+      platformName: "linux",
+    })).toBeUndefined();
+  });
+
+  it("keeps harness allocation and orphan authentication on absolute handoffs", () => {
+    const mount = (source: string) => ({ Mounts: [{
+      Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: source,
+    }] });
+    const relativeEnvironment = { LCM_TEST_HARNESS_TMPDIR: "relative-parent" };
+    const relativeRealpath = vi.fn((path: string) => path);
+    const relativeCreate = vi.fn(() => "relative-parent/lcm-postgresql-harness-owned");
+
+    expect(() => createTestTempDirectory({
+      environment: relativeEnvironment,
+      explicitVariable: "LCM_TEST_HARNESS_TMPDIR",
+      realpath: relativeRealpath,
+      markerProbe: () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
+      createDirectory: relativeCreate,
+      secureDirectory: vi.fn(),
+    })).toThrow(/LCM_TEST_HARNESS_TMPDIR.*absolute/iu);
+    expect(relativeRealpath).not.toHaveBeenCalled();
+    expect(relativeCreate).not.toHaveBeenCalled();
+    expect(harnessDirectoryFromRecord(
+      mount("relative-parent/lcm-postgresql-harness-owned"),
+      { environment: relativeEnvironment, realpath: (path: string) => path },
+    )).toBeUndefined();
+
+    const parent = "/private/harness-parent";
+    const directory = `${parent}/lcm-postgresql-harness-owned`;
+    const environment = { LCM_TEST_HARNESS_TMPDIR: parent };
+    expect(createTestTempDirectory({
+      environment,
+      explicitVariable: "LCM_TEST_HARNESS_TMPDIR",
+      realpath: (path: string) => path,
+      markerProbe: () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); },
+      createDirectory: () => directory,
+      secureDirectory: vi.fn(),
+    })).toEqual({ root: directory, parent });
+    expect(harnessDirectoryFromRecord(
+      mount(directory),
+      { environment, realpath: (path: string) => path },
+    )).toBe(directory);
+  });
+
+  it("classifies and reclaims an owned alternate-parent harness directory", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "lcm-bug-840-auth-parent-"));
+    const directory = mkdtempSync(join(parent, "lcm-postgresql-harness-"));
+    const runId = "e".repeat(32);
+    const names = createRunNames(runId);
+    const owner = {
+      pid: 987654,
+      birth: "linux:12345678-1234-1234-1234-123456789abc:987654",
+      scope: testOwnerScope,
+    };
+    const records = new Map([
+      [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
+      [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
+      [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
+    ]);
+    const dockerRunner = vi.fn(async (args: string[]) => {
+      if (args[1] === "ls") {
+        const type = args[0] === "container" ? "container" : args[0];
+        return {
+          stdout: [...records.keys()]
+            .filter((key) => key.startsWith(`${type}:`))
+            .map((key) => key.slice(type.length + 1)).join("\n"),
+          stderr: "",
+        };
+      }
+      if (args[1] === "inspect") {
+        const type = args[0];
+        const name = args[2];
+        const labels = records.get(`${type}:${name}`);
+        if (!labels) throw missingContainerError(name);
+        return {
+          stdout: JSON.stringify([type === "container"
+            ? {
+              Config: { Labels: labels },
+              State: { Running: false },
+              Mounts: [{
+                Destination: "/run/lcm-harness",
+                Type: "bind",
+                RW: false,
+                Source: directory,
+              }],
+            }
+            : { Labels: labels }]),
+          stderr: "",
+        };
+      }
+      const type = args[0] === "container" ? "container" : args[0];
+      records.delete(`${type}:${args.at(-1)}`);
+      return { stdout: "", stderr: "" };
+    });
+    const environment = {
+      LCM_TEST_HARNESS_TMPDIR: parent,
+      TMPDIR: join(parent, "worker-scratch"),
+    };
+    try {
+      const discovered = await discoverHarnessRuns({
+        dockerRunner,
+        environment,
+        realpath: (path: string) => path,
+        processProbe: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+        readScope: () => testOwnerScope,
+        delay: vi.fn(),
+      });
+      expect(discovered).toMatchObject([{ runId, classification: "stale" }]);
+      expect(discovered[0].resources.find((resource) => resource.kind === "database")?.harnessDirectory)
+        .toBe(directory);
+
+      const reclaimed = await reclaimProvenOrphans({
+        dockerRunner,
+        environment,
+        realpath: (path: string) => path,
+        processProbe: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+        readScope: () => testOwnerScope,
+        delay: vi.fn(),
+        removeDirectory: (path: string) => rmSync(path, { recursive: true, force: true }),
+      });
+      expect(reclaimed).toMatchObject([{ runId, classification: "stale" }]);
+      expect(() => lstatSync(directory)).toThrow();
+
+      const unrelated = await discoverHarnessRuns({
+        dockerRunner: vi.fn(async (args: string[]) => {
+          if (args[1] === "ls") return { stdout: args[0] === "container" ? names.container : "", stderr: "" };
+          return {
+            stdout: JSON.stringify([{
+              Config: { Labels: ownershipLabels(runId, "database", owner) },
+              State: { Running: false },
+              Mounts: [{ Destination: "/run/lcm-harness", Type: "bind", RW: false, Source: "/unrelated/lcm-postgresql-harness-foreign" }],
+            }]),
+            stderr: "",
+          };
+        }),
+        environment,
+        realpath: (path: string) => path,
+        processProbe: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+        readScope: () => testOwnerScope,
+      });
+      expect(unrelated[0].resources[0].harnessDirectory).toBeUndefined();
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
   it("resolves a bounded signal-probe readiness timeout", () => {
     expect(resolveSignalProbeReadinessTimeout({})).toBe(
       DEFAULT_SIGNAL_PROBE_READINESS_TIMEOUT_MS,

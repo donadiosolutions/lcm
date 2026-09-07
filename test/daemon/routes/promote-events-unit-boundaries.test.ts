@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EventRow, PatternReinforcementStats } from "../../../src/hooks/events-db.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
+import { BackendPublicationJournalError } from "../../../src/storage/backend-publication.js";
 import { StorageOperationError } from "../../../src/storage/errors.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 
@@ -24,7 +25,16 @@ const mocks = vi.hoisted(() => ({
   log: vi.fn(),
   send: vi.fn(),
   scrub: vi.fn((text: string) => text),
-  identity: vi.fn(() => ({ id: "pid", canonical: "/cwd" })),
+  identity: vi.fn((cwd: string) => ({
+    id: "pid",
+    localProjectId: "pid",
+    canonical: cwd,
+    remoteProjectId: "pid",
+    machineId: "machine",
+  })),
+  projectPaths: vi.fn((identity: { id: string; canonical?: string; remoteProjectId?: string }) => ({
+    dir: `/projects/${identity.id}`,
+  })),
   openOutbox: vi.fn(),
   scrubberFactory: vi.fn(),
   eventsPath: vi.fn(() => "/events.db"),
@@ -61,6 +71,7 @@ vi.mock("../../../src/daemon/validate-cwd.js", () => ({
 vi.mock("../../../src/daemon/project.js", () => ({
   projectDir: () => "/project",
   projectIdentity: mocks.identity,
+  projectPathsForIdentity: mocks.projectPaths,
 }));
 vi.mock("../../../src/storage/index.js", () => ({
   createStorageBackendFactory: async () => ({ openProject: mocks.openProject, close: mocks.closeFactory }),
@@ -132,6 +143,7 @@ describe("promote-events unit boundaries", () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockClear();
     mocks.events.mockReturnValue([]);
+    mocks.mark.mockImplementation(() => undefined);
     mocks.reinforcement.mockReturnValue({ totalCount: 0, distinctSessions: 0 });
     mocks.observeMissingCwd.mockReturnValue({
       parked: false,
@@ -145,7 +157,13 @@ describe("promote-events unit boundaries", () => {
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
     mocks.scrubberFactory.mockResolvedValue({ scrub: mocks.scrub });
-    mocks.identity.mockReturnValue({ id: "pid", canonical: "/cwd" });
+    mocks.identity.mockImplementation((cwd: string) => ({
+      id: "pid",
+      localProjectId: "pid",
+      canonical: cwd,
+      remoteProjectId: "pid",
+      machineId: "machine",
+    }));
     mocks.eventsPath.mockReturnValue("/events.db");
     mocks.existingEventsPath.mockReturnValue(undefined);
     mocks.closeProject.mockResolvedValue(undefined);
@@ -255,6 +273,7 @@ describe("promote-events unit boundaries", () => {
       storageBackend: "postgresql",
     });
     expect(mocks.openOutbox).toHaveBeenCalledOnce();
+    expect(mocks.scrubberFactory).not.toHaveBeenCalled();
   });
 
   it("prepares the local outbox before selected PostgreSQL admission", async () => {
@@ -338,6 +357,133 @@ describe("promote-events unit boundaries", () => {
     expect(sequence.indexOf("scrubber")).toBeLessThan(sequence.indexOf("admission"));
     expect(sequence.indexOf("admission")).toBeLessThan(sequence.indexOf("project-open"));
     expect(sequence.indexOf("project-open")).toBeLessThan(sequence.indexOf("repository-batch"));
+  });
+
+  it("pairs a PostgreSQL-shaped preflight identity with scrubber paths and admission", async () => {
+    const preflight = {
+      id: "remote-1",
+      localProjectId: "local-1",
+      canonical: "/cwd",
+      remoteProjectId: "remote-1",
+      machineId: "machine-1",
+    };
+    const admitted = { ...preflight, selectedPath: "/alias", machineId: "other-machine" };
+    mocks.identity.mockReturnValueOnce(preflight).mockReturnValueOnce(admitted);
+    mocks.events.mockReturnValueOnce([event({ data: "paired identity" })]);
+
+    await expect(promoteEventsForCwd(
+      postgresqlConfig,
+      "/cwd",
+      "/events.db",
+      { openProject: mocks.openProject, close: mocks.closeFactory } as never,
+    )).resolves.toMatchObject({ promoted: 1, errors: 0 });
+
+    expect(mocks.projectPaths).toHaveBeenCalledWith({
+      id: "local-1",
+      canonical: "/cwd",
+      remoteProjectId: "remote-1",
+    });
+    expect(mocks.scrubberFactory).toHaveBeenCalledWith(
+      postgresqlConfig.security.sensitivePatterns,
+      "/projects/local-1",
+    );
+    expect(mocks.openProject).toHaveBeenCalledWith(
+      admitted,
+      undefined,
+      expect.any(AbortSignal),
+    );
+  });
+
+  it.each(["id", "localProjectId", "canonical", "remoteProjectId"] as const)(
+    "maps direct journal admission %s drift to an unlogged 503 response",
+    async (field) => {
+      const preflight = {
+        id: "remote-1",
+        localProjectId: "local-1",
+        canonical: "/cwd",
+        remoteProjectId: "remote-1",
+        machineId: "machine-1",
+      };
+      mocks.identity.mockReturnValueOnce(preflight).mockReturnValueOnce({
+        ...preflight,
+        [field]: `${preflight[field]}-drift`,
+      });
+      mocks.events.mockReturnValueOnce([event({ data: "drift" })]);
+      const response = {} as never;
+
+      await createPromoteEventsHandler(postgresqlConfig, {
+        backend: "postgresql",
+        openProject: mocks.openProject,
+        close: mocks.closeFactory,
+      } as never)(
+        {} as never,
+        response,
+        JSON.stringify({ cwd: "/cwd" }),
+      );
+
+      expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+        status: "blocked",
+        error: "backend publication admission blocked",
+      });
+      expect(mocks.log).not.toHaveBeenCalled();
+      expect(mocks.openProject).not.toHaveBeenCalled();
+      expect(mocks.mark).not.toHaveBeenCalled();
+    },
+  );
+
+  it("stops an all-project drain on journal admission drift and leaves later projects untouched", async () => {
+    const a = {
+      id: "a",
+      localProjectId: "a",
+      canonical: "/a",
+      remoteProjectId: "a",
+      machineId: "machine",
+    };
+    const b = {
+      id: "b",
+      localProjectId: "b",
+      canonical: "/b",
+      remoteProjectId: "b",
+      machineId: "machine",
+    };
+    const c = {
+      id: "c",
+      localProjectId: "c",
+      canonical: "/c",
+      remoteProjectId: "c",
+      machineId: "machine",
+    };
+    mocks.collect.mockReturnValueOnce([
+      { projectId: "a", cwd: "/a", path: "/a.db", metadataMissing: false, captured: 1, unprocessed: 1, errors: 0, lastCapture: "2026", file: "a.db" },
+      { projectId: "b", cwd: "/b", path: "/b.db", metadataMissing: false, captured: 1, unprocessed: 1, errors: 0, lastCapture: "2026", file: "b.db" },
+      { projectId: "c", cwd: "/c", path: "/c.db", metadataMissing: false, captured: 1, unprocessed: 1, errors: 0, lastCapture: "2026", file: "c.db" },
+    ]);
+    let eventsCalls = 0;
+    mocks.events.mockImplementation(() => {
+      eventsCalls++;
+      return eventsCalls === 1 || eventsCalls === 3
+        ? [event({ event_id: eventsCalls === 1 ? 1 : 2, data: eventsCalls === 1 ? "a" : "b" })]
+        : [];
+    });
+    mocks.identity.mockImplementation((cwd: string) => {
+      if (cwd === "/a") return a;
+      if (cwd === "/b" && mocks.identity.mock.calls.filter(([path]) => path === "/b").length === 1) return b;
+      if (cwd === "/b") return { ...b, canonical: "/b-drift" };
+      return c;
+    });
+
+    const response = {} as never;
+    await createPromoteAllEventsHandler(postgresqlConfig)({} as never, response, "");
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    expect(mocks.closeFactory).toHaveBeenCalledOnce();
+    expect(mocks.mark).toHaveBeenCalledWith([1]);
+    expect(mocks.openProject).toHaveBeenCalledTimes(2);
+    expect(mocks.identity.mock.calls.some(([cwd]) => cwd === "/c")).toBe(false);
+    expect(mocks.log).not.toHaveBeenCalled();
   });
 
   it("escapes typed PostgreSQL event failures as sanitized route storage responses", async () => {
@@ -432,10 +578,167 @@ describe("promote-events unit boundaries", () => {
     mocks.events.mockReturnValueOnce([]);
     await expect(drainEventsForCwd(config, "/cwd", "/events.db"))
       .resolves.toMatchObject({ batches: 0, message: "no unprocessed events" });
+    expect(mocks.identity).toHaveBeenCalledTimes(1);
+    expect(mocks.openProject).toHaveBeenCalledTimes(1);
     expect(mocks.openOutbox.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.identity.mock.invocationCallOrder[0]);
     expect(mocks.identity.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.openProject.mock.invocationCallOrder[0]);
+  });
+
+  it("commits the first batch before rejecting a later canonical identity drift", async () => {
+    const first = event({ event_id: 101, data: "first batch" });
+    const second = event({ event_id: 202, data: "second batch" });
+    const identityA = {
+      id: "remote-a",
+      localProjectId: "local-a",
+      canonical: "/cwd",
+      remoteProjectId: "remote-a",
+      machineId: "machine-a",
+    };
+    const identityB = {
+      id: "remote-b",
+      localProjectId: "local-b",
+      canonical: "/cwd",
+      remoteProjectId: "remote-b",
+      machineId: "machine-b",
+    };
+    const identityBDrift = { ...identityB, canonical: "/drifted-cwd" };
+    const pending = [first, second];
+    const identityCalls = [identityA, identityA, identityB, identityBDrift];
+    mocks.events.mockImplementation(() => pending.length === 0 ? [] : [pending[0]]);
+    mocks.mark.mockImplementation((processedIds: number[]) => {
+      for (const processedId of processedIds) {
+        const index = pending.findIndex(({ event_id }) => event_id === processedId);
+        if (index >= 0) pending.splice(index, 1);
+      }
+    });
+    mocks.identity.mockImplementation(() => identityCalls.shift()!);
+
+    await expect(drainEventsForCwd(config, "/cwd", "/events.db"))
+      .rejects.toSatisfy((error: unknown) =>
+        error instanceof BackendPublicationJournalError
+        && error.reason === "unexpected-state");
+
+    expect(pending.map(({ event_id }) => event_id)).toEqual([second.event_id]);
+    expect(mocks.mark).toHaveBeenCalledOnce();
+    expect(mocks.mark).toHaveBeenCalledWith([first.event_id]);
+    expect(mocks.events).toHaveBeenCalledTimes(2);
+    expect(mocks.identity.mock.results.map(({ value }) => value)).toEqual([
+      identityA,
+      identityA,
+      identityB,
+      identityBDrift,
+    ]);
+    expect(mocks.identity).toHaveBeenCalledTimes(4);
+    expect(mocks.scrubberFactory).toHaveBeenCalledTimes(2);
+    expect(mocks.openProject).toHaveBeenCalledOnce();
+    expect(mocks.openProject).toHaveBeenCalledWith(
+      identityA,
+      undefined,
+      expect.any(AbortSignal),
+    );
+    expect(mocks.closeEvents).toHaveBeenCalledOnce();
+    expect(mocks.closeFactory).toHaveBeenCalledOnce();
+  });
+
+  it("resolves fresh identities for each batch and the empty terminator", async () => {
+    const first = event({ event_id: 301, data: "identity A" });
+    const second = event({ event_id: 302, data: "identity B" });
+    const identityA = {
+      id: "remote-a",
+      localProjectId: "local-a",
+      canonical: "/cwd",
+      remoteProjectId: "remote-a",
+      machineId: "machine-a",
+    };
+    const identityB = {
+      id: "remote-b",
+      localProjectId: "local-b",
+      canonical: "/cwd",
+      remoteProjectId: "remote-b",
+      machineId: "machine-b",
+    };
+    const identityC = {
+      id: "remote-c",
+      localProjectId: "local-c",
+      canonical: "/cwd",
+      remoteProjectId: "remote-c",
+      machineId: "machine-c",
+    };
+    const pending = [first, second];
+    const identityCalls = [identityA, identityA, identityB, identityB, identityC];
+    mocks.events.mockImplementation(() => pending.length === 0 ? [] : [pending[0]]);
+    mocks.mark.mockImplementation((processedIds: number[]) => {
+      for (const processedId of processedIds) {
+        const index = pending.findIndex(({ event_id }) => event_id === processedId);
+        if (index >= 0) pending.splice(index, 1);
+      }
+    });
+    mocks.identity.mockImplementation(() => identityCalls.shift()!);
+
+    await expect(drainEventsForCwd(config, "/cwd", "/events.db"))
+      .resolves.toMatchObject({
+        batches: 2,
+        promoted: 2,
+        message: "drained all unprocessed events",
+      });
+
+    expect(mocks.identity.mock.results.map(({ value }) => value)).toEqual([
+      identityA,
+      identityA,
+      identityB,
+      identityB,
+      identityC,
+    ]);
+    expect(mocks.projectPaths.mock.calls.map(([identity]) => identity)).toEqual([
+      {
+        id: identityA.localProjectId,
+        canonical: identityA.canonical,
+        remoteProjectId: identityA.remoteProjectId,
+      },
+      {
+        id: identityB.localProjectId,
+        canonical: identityB.canonical,
+        remoteProjectId: identityB.remoteProjectId,
+      },
+    ]);
+    expect(mocks.scrubberFactory).toHaveBeenNthCalledWith(
+      1,
+      config.security.sensitivePatterns,
+      "/projects/local-a",
+    );
+    expect(mocks.scrubberFactory).toHaveBeenNthCalledWith(
+      2,
+      config.security.sensitivePatterns,
+      "/projects/local-b",
+    );
+    expect(mocks.openProject).toHaveBeenNthCalledWith(
+      1,
+      identityA,
+      undefined,
+      expect.any(AbortSignal),
+    );
+    expect(mocks.openProject).toHaveBeenNthCalledWith(
+      2,
+      identityB,
+      undefined,
+      expect.any(AbortSignal),
+    );
+    expect(mocks.openProject).toHaveBeenNthCalledWith(
+      3,
+      identityC,
+      undefined,
+      expect.any(AbortSignal),
+    );
+    expect(mocks.openProject).toHaveBeenCalledTimes(3);
+    expect(mocks.mark.mock.calls.map(([processedIds]) => processedIds)).toEqual([
+      [first.event_id],
+      [second.event_id],
+    ]);
+    expect(mocks.mark).toHaveBeenCalledTimes(2);
+    expect(mocks.closeEvents).toHaveBeenCalledOnce();
+    expect(mocks.closeFactory).toHaveBeenCalledOnce();
   });
 
   it("uses but does not close an injected process storage factory", async () => {
@@ -449,7 +752,13 @@ describe("promote-events unit boundaries", () => {
     );
 
     expect(mocks.openProject).toHaveBeenCalledWith(
-      { id: "pid", canonical: "/cwd" },
+      expect.objectContaining({
+        id: "pid",
+        localProjectId: "pid",
+        canonical: "/cwd",
+        remoteProjectId: "pid",
+        machineId: "machine",
+      }),
       undefined,
       expect.any(AbortSignal),
     );
@@ -477,7 +786,13 @@ describe("promote-events unit boundaries", () => {
       { publicationLockToken },
     );
     expect(mocks.openProject).toHaveBeenCalledWith(
-      { id: "pid", canonical: "/cwd" },
+      expect.objectContaining({
+        id: "pid",
+        localProjectId: "pid",
+        canonical: "/cwd",
+        remoteProjectId: "pid",
+        machineId: "machine",
+      }),
       publicationLockToken,
       expect.any(AbortSignal),
     );
@@ -499,7 +814,13 @@ describe("promote-events unit boundaries", () => {
     )).resolves.toMatchObject({ message: "no unprocessed events" });
 
     expect(mocks.openProject).toHaveBeenCalledWith(
-      { id: "pid", canonical: "/cwd" },
+      expect.objectContaining({
+        id: "pid",
+        localProjectId: "pid",
+        canonical: "/cwd",
+        remoteProjectId: "pid",
+        machineId: "machine",
+      }),
       publicationLockToken,
       expect.any(AbortSignal),
     );
@@ -675,21 +996,88 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.mark).toHaveBeenCalledWith(expect.arrayContaining([1, 2, 3, 4, 5, 6, 8, 9]));
   });
 
-  it("keeps local reinforcement read failures in SQLite per-event best-effort handling", async () => {
+  it("retries reinforcement for a same-pattern sibling after a per-event SQLite failure", async () => {
     const failure = new Error("reinforcement read failed");
     mocks.events.mockReturnValueOnce([
-      event({ event_id: 1, category: "file", type: "file", data: "reinforcement failure", priority: 3 }),
+      event({
+        event_id: 1,
+        session_id: "first-session",
+        category: "file",
+        type: "file",
+        data: "reinforcement failure",
+        priority: 3,
+      }),
+      event({
+        event_id: 2,
+        session_id: "second-session",
+        category: "file",
+        type: "file",
+        data: "reinforcement failure",
+        priority: 3,
+      }),
     ]);
-    mocks.reinforcement.mockImplementationOnce(() => { throw failure; });
+    mocks.reinforcement
+      .mockImplementationOnce(() => { throw failure; })
+      .mockReturnValueOnce({ totalCount: 3, distinctSessions: 2 });
 
     await expect(promoteEventsForCwd(config, "/cwd", "/events.db"))
-      .resolves.toMatchObject({ promoted: 0, skipped: 0, errors: 1 });
+      .resolves.toEqual({ promoted: 1, skipped: 0, correlated: 0, errors: 1 });
+    expect(mocks.reinforcement).toHaveBeenCalledTimes(2);
+    expect(mocks.log).toHaveBeenCalledOnce();
     expect(mocks.log).toHaveBeenCalledWith(
       "promote-events",
       failure,
-      { cwd: "/cwd", sessionId: "session" },
+      { cwd: "/cwd", sessionId: "first-session" },
+    );
+    expect(mocks.dedup).toHaveBeenCalledOnce();
+    expect(mocks.mark).toHaveBeenCalledOnce();
+    expect(mocks.mark).toHaveBeenLastCalledWith([2]);
+  });
+
+  it("retries every same-pattern sibling when reinforcement lookups keep failing", async () => {
+    const firstFailure = new Error("first reinforcement read failed");
+    const secondFailure = new Error("second reinforcement read failed");
+    mocks.events.mockReturnValueOnce([
+      event({
+        event_id: 1,
+        session_id: "first-session",
+        category: "file",
+        type: "file",
+        data: "reinforcement failure",
+        priority: 3,
+      }),
+      event({
+        event_id: 2,
+        session_id: "second-session",
+        category: "file",
+        type: "file",
+        data: "reinforcement failure",
+        priority: 3,
+      }),
+    ]);
+    mocks.reinforcement
+      .mockImplementationOnce(() => { throw firstFailure; })
+      .mockImplementationOnce(() => { throw secondFailure; });
+
+    await expect(promoteEventsForCwd(config, "/cwd", "/events.db"))
+      .resolves.toEqual({ promoted: 0, skipped: 0, correlated: 0, errors: 2 });
+    expect(mocks.reinforcement).toHaveBeenCalledTimes(2);
+    expect(mocks.log).toHaveBeenCalledTimes(2);
+    expect(mocks.log).toHaveBeenNthCalledWith(
+      1,
+      "promote-events",
+      firstFailure,
+      { cwd: "/cwd", sessionId: "first-session" },
+    );
+    expect(mocks.log).toHaveBeenNthCalledWith(
+      2,
+      "promote-events",
+      secondFailure,
+      { cwd: "/cwd", sessionId: "second-session" },
     );
     expect(mocks.dedup).not.toHaveBeenCalled();
+    expect(mocks.mark).toHaveBeenCalledOnce();
+    expect(mocks.mark).toHaveBeenLastCalledWith([]);
   });
 
   it("scopes tier 3 eligibility to the current project attribution", async () => {

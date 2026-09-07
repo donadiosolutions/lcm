@@ -51,10 +51,10 @@ jobs:
         uses: ./.github/actions/setup-ci
 
       - name: Type-check
-        run: npm run typecheck
+        run: pnpm run typecheck
 
       - name: Run tests
-        run: npm run test:ci
+        run: pnpm run test:ci
         env:
           LCM_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -72,7 +72,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Build
-        run: npm run build
+        run: pnpm run build
 
       - name: Check for workspace artifacts
         run: |
@@ -113,7 +113,7 @@ jobs:
           stage-postgresql: "true"
 
       - name: Run isolated PostgreSQL 18 conformance harness
-        run: npm run test:postgresql
+        run: pnpm run test:postgresql
 
   linux-systemd:
     name: Linux Ubuntu 24.04 user-systemd integration
@@ -130,13 +130,35 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "25.9.0"
-          cache: npm
+
+      - name: Bootstrap verified pnpm
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bootstrap_root="$(mktemp -d "$RUNNER_TEMP/lcm-pnpm.XXXXXX")"
+          pnpm_bin="$(node scripts/bootstrap-pnpm.mjs --destination "$bootstrap_root/pnpm")"
+          printf '%s\n' "$pnpm_bin" >> "$GITHUB_PATH"
+          printf 'npm_config_store_dir=%s\n' "$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"
+
+      - name: Locate pnpm store
+        id: pnpm-store
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          store_path="$(pnpm store path)"
+          printf 'path=%s\n' "$store_path" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-25.9.0-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}
 
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Build package
-        run: npm run build
+        run: pnpm run build
 
       - name: Run real user-systemd integration
         env:
@@ -146,9 +168,13 @@ jobs:
           LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR: ${{ runner.temp }}/lcm-systemd-${{ github.run_id }}-${{ github.run_attempt }}
           LCM_LIFECYCLE_DAEMON_PORT: "48322"
           LCM_LIFECYCLE_EXPECTED_SCOPES: "1"
+          LCM_RUNTIME_PATHS_SYSTEMD_INTEGRATION: "1"
+          LCM_RUNTIME_PATHS_SYSTEMD_RUN_ROOT: ${{ runner.temp }}/lcm-runtime-paths-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -Eeuo pipefail
           barrier_dir="$LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR"
+          runtime_root="$LCM_RUNTIME_PATHS_SYSTEMD_RUN_ROOT"
+          sudo install -d -o root -g root -m 1777 -- "$runtime_root"
           cleanup() {
             set +e
             if [[ -d "$barrier_dir" ]]; then
@@ -164,6 +190,9 @@ jobs:
               done < <(find "$barrier_dir" -maxdepth 1 -type f -name '*.ready' -print)
               rm -rf -- "$barrier_dir"
             fi
+            if [[ -d "$runtime_root" ]]; then
+              sudo rm -rf -- "$runtime_root"
+            fi
           }
           trap cleanup EXIT
           systemd_state="$(systemctl --user is-system-running || true)"
@@ -171,12 +200,13 @@ jobs:
             running|degraded) ;;
             *) echo "Unexpected user-systemd state: $systemd_state" >&2; exit 1 ;;
           esac
-          npx vitest run \
+          pnpm exec vitest run \
             test/daemon/lifecycle-isolation.test.ts \
             test/daemon/lifecycle-systemd.integration.test.ts \
             test/daemon/systemd-credential-loader.test.ts \
             --testNamePattern "uses and removes one exact run-owned transient unit|starts and admits a healthy managed unit with exact identity and cleanup|restarts a wedged registered unit through systemd without legacy signal fallback|recreates a terminal clean-exit unit after a registered-not-running observation|refuses stale manager identity before mutation and never falls back to legacy signals|refuses clean-environment drift before admitting an existing unit"
-          npx vitest run \
+          pnpm exec vitest run test/runtime-paths-systemd.integration.test.ts
+          pnpm exec vitest run \
             test/daemon/systemd-credential-loader.test.ts \
             --testNamePattern "observes the real user-systemd LoadCredential modes"
 
@@ -195,13 +225,35 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "25.9.0"
-          cache: npm
+
+      - name: Bootstrap verified pnpm
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bootstrap_root="$(mktemp -d "$RUNNER_TEMP/lcm-pnpm.XXXXXX")"
+          pnpm_bin="$(node scripts/bootstrap-pnpm.mjs --destination "$bootstrap_root/pnpm")"
+          printf '%s\n' "$pnpm_bin" >> "$GITHUB_PATH"
+          printf 'npm_config_store_dir=%s\n' "$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"
+
+      - name: Locate pnpm store
+        id: pnpm-store
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          store_path="$(pnpm store path)"
+          printf 'path=%s\n' "$store_path" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-25.9.0-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}
 
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Probe descriptor-relative runtime migration
-        run: npx vitest run test/runtime-paths.test.ts --testNamePattern "uses actual platform semantics for nested legacy migration"
+        run: pnpm exec vitest run test/runtime-paths.test.ts --testNamePattern "uses actual platform semantics for nested legacy migration"
 
       - name: Run launchd integration path
         env:
@@ -260,7 +312,7 @@ jobs:
           rm -rf -- "$resource_root"
           mkdir -p -- "$resource_root"
           chmod 0700 "$resource_root"
-          npx vitest run test/daemon/lifecycle-launchd.integration.test.ts 2>&1 \
+          pnpm exec vitest run test/daemon/lifecycle-launchd.integration.test.ts 2>&1 \
             | tee "$out_file"
           # After the worker exits, the marker must hold the exact current-run
           # evidence and the single derived product label, or nothing is

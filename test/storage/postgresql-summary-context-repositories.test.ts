@@ -39,17 +39,31 @@ function executor(implementation: QueryImplementation): PostgreSqlSummaryContext
   query: ReturnType<typeof vi.fn>;
   transaction: ReturnType<typeof vi.fn>;
   savepoint: ReturnType<typeof vi.fn>;
+  transactionOptions: PostgreSqlQueryOptions[];
+  savepointOptions: PostgreSqlQueryOptions[];
 } {
   const query = vi.fn(implementation);
+  const transactionOptions: PostgreSqlQueryOptions[] = [];
+  const savepointOptions: PostgreSqlQueryOptions[] = [];
   const db = {
     transactionScope: "active" as const,
     query,
     savepoint: vi.fn(async (
       callback: Parameters<PostgreSqlSummaryContextScopedExecutor["savepoint"]>[0],
-    ) => callback({ query })),
+      options: Parameters<PostgreSqlSummaryContextScopedExecutor["savepoint"]>[1],
+    ) => {
+      savepointOptions.push(options);
+      return callback({ query });
+    }),
     transaction: vi.fn(async (
       callback: Parameters<PostgreSqlSummaryContextExecutor["transaction"]>[0],
-    ) => callback(db)),
+      options: Parameters<PostgreSqlSummaryContextExecutor["transaction"]>[1],
+    ) => {
+      transactionOptions.push(options);
+      return callback(db);
+    }),
+    transactionOptions,
+    savepointOptions,
   } as unknown as PostgreSqlSummaryContextExecutor & {
     query: ReturnType<typeof vi.fn>;
     transaction: ReturnType<typeof vi.fn>;
@@ -63,14 +77,21 @@ function scopedExecutor(
 ): PostgreSqlSummaryContextScopedExecutor & {
   query: ReturnType<typeof vi.fn>;
   savepoint: ReturnType<typeof vi.fn>;
+  savepointOptions: PostgreSqlQueryOptions[];
 } {
   const query = vi.fn(implementation);
+  const savepointOptions: PostgreSqlQueryOptions[] = [];
   return {
     transactionScope: "active",
     query,
     savepoint: vi.fn(async (
       callback: Parameters<PostgreSqlSummaryContextScopedExecutor["savepoint"]>[0],
-    ) => callback({ query })),
+      options: Parameters<PostgreSqlSummaryContextScopedExecutor["savepoint"]>[1],
+    ) => {
+      savepointOptions.push(options);
+      return callback({ query });
+    }),
+    savepointOptions,
   };
 }
 
@@ -978,6 +999,157 @@ describe("PostgreSQL large-file repository", () => {
 });
 
 describe("PostgreSQL summary/context transaction seams", () => {
+  it("carries fence machine identity through central contexts and omits it when unfenced", async () => {
+    const fencedRoot = executor((config) => {
+      if (config.text.includes("FROM lcm.summaries")) return result([summaryRow]);
+      if (config.text.includes("transaction_isolation")) {
+        return result([{ transaction_isolation: "read committed" }]);
+      }
+      if (config.text.includes("current_setting('lock_timeout')")) {
+        return result([{ setting: "7s" }]);
+      }
+      if (config.text.includes("set_config(")
+          || config.text.includes("pg_advisory_xact_lock")) {
+        return result([]);
+      }
+      if (config.text.includes("FROM lcm.fenced_leases")
+          && config.text.includes("SELECT 1")) {
+        return result([{ locked: 1 }]);
+      }
+      if (config.text.includes("SELECT fencing_token")) {
+        return result([{ fencing_token: "1", validated_at: "2026-01-01T00:00:00.000Z" }]);
+      }
+      if (config.text.includes("INSERT INTO lcm.summaries")) {
+        return result([{ ...summaryRow, file_ids: [] }]);
+      }
+      return result([]);
+    });
+    const fenced = new PostgreSqlSummaryRepository(fencedRoot, projectId, {
+      fence: {
+        machineId,
+        processId: "process-a",
+        operation: "compact",
+        fencingToken: 1n,
+      },
+    });
+    await expect(fenced.getSummary("summary-a")).resolves.toMatchObject({
+      summaryId: "summary-a",
+    });
+    await fenced.insertSummary({
+      summaryId: "summary-a",
+      conversationId: 41,
+      kind: "leaf",
+      content: "summary",
+      tokenCount: 1,
+    });
+    for (const [, options] of fencedRoot.query.mock.calls) {
+      expect(options).toMatchObject({
+        projectId,
+        machineId,
+      });
+      expect(["summaries", "coordination"]).toContain(options.domain);
+    }
+    expect(fencedRoot.transactionOptions).toHaveLength(1);
+    expect(fencedRoot.transactionOptions[0]).toMatchObject({
+      domain: "summaries",
+      projectId,
+      machineId,
+    });
+
+    const fencedScoped = scopedExecutor((config) => {
+      if (config.text.includes("transaction_isolation")) {
+        return result([{ transaction_isolation: "read committed" }]);
+      }
+      const prelude = mutationPrelude(config);
+      if (prelude) return prelude;
+      if (config.text.includes("INSERT INTO lcm.summaries")) {
+        return result([{ ...summaryRow, file_ids: [] }]);
+      }
+      if (config.text.includes("FROM lcm.fenced_leases")
+          && config.text.includes("SELECT 1")) {
+        return result([{ locked: 1 }]);
+      }
+      if (config.text.includes("SELECT fencing_token")) {
+        return result([{ fencing_token: "1", validated_at: "2026-01-01T00:00:00.000Z" }]);
+      }
+      return result([]);
+    });
+    await new PostgreSqlSummaryRepository(fencedScoped, projectId, {
+      fence: {
+        machineId,
+        processId: "process-a",
+        operation: "compact",
+        fencingToken: 1n,
+      },
+    }).insertSummary({
+      summaryId: "summary-a",
+      conversationId: 41,
+      kind: "leaf",
+      content: "summary",
+      tokenCount: 1,
+    });
+    for (const options of fencedScoped.savepointOptions) {
+      expect(options).toMatchObject({
+        domain: "summaries",
+        projectId,
+        machineId,
+      });
+    }
+    for (const [, options] of fencedScoped.query.mock.calls) {
+      expect(options).toMatchObject({
+        projectId,
+        machineId,
+      });
+      expect(["summaries", "coordination"]).toContain(options.domain);
+    }
+
+    const fencedFileRoot = executor((config) =>
+      config.text.includes("INSERT INTO lcm.large_files")
+        ? result([largeFileRow])
+        : result([]));
+    await new PostgreSqlLargeFileRepository(fencedFileRoot, projectId, {
+      fence: {
+        machineId,
+        processId: "process-a",
+        operation: "compact",
+        fencingToken: 1n,
+      },
+    }).insertLargeFile({
+      fileId: "file-a",
+      conversationId: 41,
+      storageUri: "s3://bucket/key",
+    });
+    expect(fencedFileRoot.transactionOptions).toHaveLength(1);
+    expect(fencedFileRoot.transactionOptions[0]).toMatchObject({
+      domain: "large-files",
+      operation: "insertLargeFile",
+      projectId,
+      machineId,
+    });
+
+    const unfencedShared = executor((config) => {
+      if (config.text.includes("FROM lcm.context_items")) return result([]);
+      if (config.text.includes("FROM lcm.large_files")) return result([]);
+      return result([]);
+    });
+    await new PostgreSqlContextRepository(unfencedShared, projectId)
+      .getContextItems(41);
+    await new PostgreSqlLargeFileRepository(unfencedShared, projectId)
+      .getLargeFilesByConversation(41);
+    for (const [, options] of unfencedShared.query.mock.calls) {
+      expect(options).not.toHaveProperty("machineId");
+    }
+
+    const unfenced = executor((config) => config.text.includes("FROM lcm.summaries")
+      ? result([summaryRow])
+      : result([]));
+    await new PostgreSqlSummaryRepository(unfenced, projectId)
+      .getSummary("summary-a");
+    for (const [, options] of unfenced.query.mock.calls) {
+      expect(options).not.toHaveProperty("machineId");
+    }
+  });
+
   it("uses savepoints and asserts read committed for scoped mutations", async () => {
     const scoped = scopedExecutor((config) => {
       if (config.text.includes("transaction_isolation")) {
@@ -1048,6 +1220,64 @@ describe("PostgreSQL summary/context transaction seams", () => {
     );
     await expect(repository.getSummary("summary-a"))
       .rejects.toMatchObject({ code: "STORAGE_TRANSACTION_SCOPE" });
+  });
+
+  it("validates fenced machine IDs before any executor access", () => {
+    const constructors = [
+      (db: ReturnType<typeof executor>, fence: never) =>
+        new PostgreSqlSummaryRepository(db, projectId, { fence }),
+      (db: ReturnType<typeof executor>, fence: never) =>
+        new PostgreSqlContextRepository(db, projectId, { fence }),
+      (db: ReturnType<typeof executor>, fence: never) =>
+        new PostgreSqlLargeFileRepository(db, projectId, { fence }),
+    ];
+    const invalidMachineIds: unknown[] = [
+      "opaque-caller-id",
+      "018f22c4-6d2a-4f10-8a4c-6b8d3e5f9030",
+      "018f22c4-6d2a-7f10-ca4c-6b8d3e5f9030",
+      ` ${machineId}`,
+      `${machineId} `,
+      "",
+      "   ",
+      1,
+      "bad\0machine",
+      "\ud800",
+    ];
+
+    for (const create of constructors) {
+      for (const invalidMachineId of invalidMachineIds) {
+        const db = executor(() => {
+          throw new Error("executor must not be accessed");
+        });
+        const fence = {
+          machineId: invalidMachineId,
+          processId: "process-a",
+          operation: "compact",
+          fencingToken: 1n,
+        } as never;
+        let caught: unknown;
+        try {
+          create(db, fence);
+        } catch (error) {
+          caught = error;
+        }
+        expect(caught).toBeInstanceOf(PostgreSqlSummaryContextDataError);
+        expect(caught).toMatchObject({
+          domain: "summaries",
+          operation: "construct",
+          field: "machine_id",
+        });
+        const serialized = JSON.stringify(caught);
+        expect(serialized).not.toContain("machineId");
+        expect(serialized).not.toContain("executor must not be accessed");
+        if (typeof invalidMachineId === "string" && invalidMachineId.length > 0) {
+          expect(serialized).not.toContain(invalidMachineId);
+          expect(serialized).not.toContain(JSON.stringify(invalidMachineId).slice(1, -1));
+        }
+        expect(db.query).not.toHaveBeenCalled();
+        expect(db.transaction).not.toHaveBeenCalled();
+      }
+    }
   });
 });
 
@@ -1718,6 +1948,214 @@ describe("PostgreSQL summary/context defensive branches", () => {
     expect(error).toBeInstanceOf(PostgreSqlStorageOperationError);
     expect(error).toMatchObject({ sqlState: null });
     expect(JSON.stringify(error)).not.toContain("secret");
+  });
+
+  it("maps fenced aborts and driver cancellations with a safe machine context", async () => {
+    const fence = {
+      machineId,
+      processId: "process-a",
+      operation: "compact",
+      fencingToken: 1n,
+    } as const;
+    const direct = new PostgreSqlSummaryRepository(
+      executor((_config, options) => {
+        throw new PostgreSqlStorageOperationError(
+          "STORAGE_OPERATION_FAILED",
+          {
+            domain: options.domain,
+            operation: options.operation,
+            projectId: options.projectId,
+            machineId: options.machineId,
+          },
+          null,
+          false,
+        );
+      }),
+      projectId,
+      { fence },
+    );
+    const directError = await direct.getSummary("summary-a")
+      .catch((error: unknown) => error);
+    expect(directError).toMatchObject({
+      projectId,
+      domain: "summaries",
+      operation: "getSummary",
+      machineId,
+      sqlState: null,
+      retryable: false,
+    });
+
+    const driverError = Object.assign(
+      new Error("private SQL cancellation with bound secret postgres://url"),
+      {
+        code: "57014",
+        detail: "private detail",
+        schema: "private_schema",
+        table: "private_table",
+        routine: "private_routine",
+        address: "10.0.0.9",
+      },
+    );
+    const driver = new PostgreSqlSummaryRepository(
+      executor(() => { throw driverError; }),
+      projectId,
+      { fence },
+    );
+    const driverMapped = await driver.getSummary("summary-a")
+      .catch((error: unknown) => error);
+    expect(driverMapped).toMatchObject({
+      projectId,
+      domain: "summaries",
+      operation: "getSummary",
+      machineId,
+      sqlState: "57014",
+      retryable: false,
+    });
+    const serialized = JSON.stringify(driverMapped);
+    expect(Object.keys(JSON.parse(serialized)).sort()).toEqual([
+      "backend",
+      "code",
+      "domain",
+      "machineId",
+      "message",
+      "name",
+      "operation",
+      "projectId",
+      "retryable",
+      "sqlState",
+    ]);
+    for (const canary of [
+      "private SQL cancellation",
+      "bound secret",
+      "postgres://url",
+      "private detail",
+      "private_schema",
+      "private_table",
+      "private_routine",
+      "10.0.0.9",
+    ]) {
+      expect(serialized).not.toContain(canary);
+    }
+
+    const contextDriver = new PostgreSqlContextRepository(
+      executor((_config, options) => { throw driverError; }),
+      projectId,
+      { fence },
+    );
+    const contextMapped = await contextDriver.getContextItems(41)
+      .catch((error: unknown) => error);
+    expect(contextMapped).toMatchObject({
+      projectId,
+      domain: "context",
+      operation: "getContextItems",
+      machineId,
+      sqlState: "57014",
+      retryable: false,
+    });
+    const contextSerialized = JSON.stringify(contextMapped);
+    expect(Object.keys(JSON.parse(contextSerialized)).sort()).toEqual([
+      "backend",
+      "code",
+      "domain",
+      "machineId",
+      "message",
+      "name",
+      "operation",
+      "projectId",
+      "retryable",
+      "sqlState",
+    ]);
+    for (const canary of [
+      "private SQL cancellation",
+      "bound secret",
+      "postgres://url",
+      "private detail",
+      "private_schema",
+      "private_table",
+      "private_routine",
+      "10.0.0.9",
+    ]) {
+      expect(contextSerialized).not.toContain(canary);
+    }
+  });
+
+  it("normalizes fenced machine IDs across all repository diagnostics", async () => {
+    const canonical = machineId;
+    const uppercase = machineId.toUpperCase();
+    const directRead = [
+      async (db: ReturnType<typeof executor>, fence: never) =>
+        new PostgreSqlSummaryRepository(db, projectId, { fence })
+          .getSummary("summary-a"),
+      async (db: ReturnType<typeof executor>, fence: never) =>
+        new PostgreSqlContextRepository(db, projectId, { fence })
+          .getContextItems(41),
+      async (db: ReturnType<typeof executor>, fence: never) =>
+        new PostgreSqlLargeFileRepository(db, projectId, { fence })
+          .getLargeFile("file-a"),
+    ];
+
+    for (const machine of [canonical, uppercase]) {
+      for (const read of directRead) {
+        const fence = {
+          machineId: machine,
+          processId: "process-a",
+          operation: "compact",
+          fencingToken: 1n,
+        } as never;
+        const directDb = executor((_config, options) => {
+          throw new PostgreSqlStorageOperationError(
+            "STORAGE_OPERATION_FAILED",
+            {
+              domain: options.domain,
+              operation: options.operation,
+              projectId: options.projectId,
+              machineId: options.machineId,
+            },
+            null,
+            false,
+          );
+        });
+        const directError = await read(directDb, fence)
+          .catch((error: unknown) => error);
+        expect(directError).toMatchObject({ machineId: canonical });
+        expect(JSON.stringify(directError)).toContain(`"machineId":"${canonical}"`);
+
+        const driverDb = executor(() => {
+          throw Object.assign(new Error("private cancellation"), {
+            code: "57014",
+          });
+        });
+        const driverError = await read(driverDb, fence)
+          .catch((error: unknown) => error);
+        expect(driverError).toMatchObject({
+          machineId: canonical,
+          sqlState: "57014",
+          retryable: false,
+        });
+        expect(JSON.stringify(driverError)).toContain(`"machineId":"${canonical}"`);
+      }
+    }
+
+    const callerFence = {
+      machineId: uppercase,
+      processId: "process-a",
+      operation: "compact",
+      fencingToken: 1n,
+    };
+    const snapshotDb = executor((config, options) => {
+      expect(options.machineId).toBe(canonical);
+      return config.text.includes("FROM lcm.summaries")
+        ? result([summaryRow])
+        : result([]);
+    });
+    const snapshotRepository = new PostgreSqlSummaryRepository(
+      snapshotDb,
+      projectId,
+      { fence: callerFence },
+    );
+    callerFence.machineId = "opaque-caller-id";
+    await expect(snapshotRepository.getSummary("summary-a"))
+      .resolves.toMatchObject({ summaryId: "summary-a" });
   });
 
   it("classifies corrupt identities, missing targets, and conversation races", async () => {

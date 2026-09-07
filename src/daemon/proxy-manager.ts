@@ -68,8 +68,8 @@ export function createClaudeCliProxyManager(opts: ProxyManagerOptions): ProxyMan
   }
 
   async function waitForHealth(): Promise<boolean> {
-    const deadline = Date.now() + opts.startupTimeoutMs;
-    while (Date.now() < deadline) {
+    const deadline = performance.now() + opts.startupTimeoutMs;
+    while (performance.now() < deadline) {
       const { ok, isClaudeServer } = await checkHealth();
       if (ok && isClaudeServer) return true;
       if (ok && !isClaudeServer) return false; // foreign process on port

@@ -168,9 +168,8 @@ describe("daemon server", () => {
       body: "{}",
     });
     expect(response.status).toBe(503);
-    await expect(response.json()).resolves.toEqual({
-      status: "blocked",
-      error: "backend publication admission blocked",
+    await expect(response.json()).resolves.toMatchObject({
+      backendDiagnostics: { backend: "sqlite", classification: "unavailable", publication: "unavailable" },
     });
 
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -186,7 +185,7 @@ describe("daemon server", () => {
     const defaultConfigPath = join(defaultLcmDir, "config.json");
     const alternateConfigPath = join(alternateLcmDir, "config.json");
     mkdirSync(defaultLcmDir, { recursive: true, mode: 0o700 });
-    mkdirSync(join(alternateLcmDir, "backend-publication"), { recursive: true, mode: 0o700 });
+    mkdirSync(alternateLcmDir, { recursive: true, mode: 0o700 });
     writeFileSync(defaultConfigPath, "{}\n", { mode: 0o600 });
     writeFileSync(alternateConfigPath, "{}\n", { mode: 0o600 });
     const caPath = join(tempHome!, "alternate-postgres-ca.pem");
@@ -283,9 +282,8 @@ describe("daemon server", () => {
         body: "{}",
       });
       expect(response.status).toBe(503);
-      await expect(response.json()).resolves.toEqual({
-        status: "blocked",
-        error: "backend publication admission blocked",
+      await expect(response.json()).resolves.toMatchObject({
+        backendDiagnostics: { backend: "sqlite", classification: "stale-publication", publication: "unavailable" },
       });
     } finally {
       if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
@@ -570,7 +568,7 @@ describe("daemon server", () => {
     }
   });
 
-  it("starts with selected PostgreSQL storage and preserves staged diagnostic gates", async () => {
+  it("starts with selected PostgreSQL storage and exposes observational diagnostics", async () => {
     const scanForTranscripts = vi.fn(async () => undefined);
     const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
     const caPath = join(tempHome!, "postgres-ca.pem");
@@ -597,6 +595,10 @@ describe("daemon server", () => {
       },
     );
     config.restoration.promptSearchMaxResults = 0;
+    mkdirSync(join(tempHome!, ".lcm"), { recursive: true, mode: 0o700 });
+    chmodSync(join(tempHome!, ".lcm"), 0o700);
+    mkdirSync(join(tempHome!, ".lcm", "projects"), { recursive: true, mode: 0o700 });
+    chmodSync(join(tempHome!, ".lcm", "projects"), 0o700);
     daemon = await createDaemon(config, {
       _scanForTranscripts: scanForTranscripts,
       _assertBackendPublication: () => undefined,
@@ -666,6 +668,8 @@ describe("daemon server", () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(request.body),
       });
+      if (request.path === "/promote") {
+      }
       expect(response.status).toBe(409);
       const identityRequired = await response.json() as Record<string, unknown>;
       expect(identityRequired).toEqual({
@@ -753,6 +757,10 @@ describe("daemon server", () => {
         body: { cwd: tempHome },
       },
     ];
+    chmodSync(join(tempHome!, ".lcm", "projects"), 0o700);
+    const stagedProjectDir = projectDir(tempHome!);
+    mkdirSync(stagedProjectDir, { recursive: true, mode: 0o700 });
+    chmodSync(stagedProjectDir, 0o700);
     for (const request of stagedProjectRequests) {
       const response = await fetch(`http://127.0.0.1:${port}${request.path}`, {
         method: "POST",
@@ -789,13 +797,14 @@ describe("daemon server", () => {
             }
           : {}),
       });
-      expect(response.status).toBe(503);
+      expect(response.status).toBe(200);
       const unavailable = await response.json() as Record<string, unknown>;
-      expect(unavailable).toEqual({
-        code: "STORAGE_BACKEND_STAGED",
-        error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
-        storageBackend: "postgresql",
+      expect(unavailable).toMatchObject({
+        backendDiagnostics: { backend: "postgresql", classification: "stale-publication", publication: "unavailable" },
       });
+      expect(unavailable).not.toHaveProperty("project");
+      expect(unavailable).not.toHaveProperty("messages");
+      expect(unavailable).not.toHaveProperty("backendDiagnostics.metrics");
       expect(JSON.stringify(unavailable)).not.toContain("secret");
     }
   });
@@ -822,7 +831,8 @@ describe("daemon server", () => {
   it("watches map.json and reformats valid user edits", async () => {
     const project = mkdtempSync(join(tmpdir(), "lcm-map-watch-project-"));
     const hash = hashProjectPath(normalizeProjectPath(project));
-    mkdirSync(join(homedir(), ".lcm"), { recursive: true });
+    mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
+    chmodSync(join(homedir(), ".lcm"), 0o700);
     const mapPath = projectMapPath();
     writeFileSync(mapPath, JSON.stringify({ [hash]: { canonical: project, aliases: [] } }), { mode: 0o600 });
 
@@ -856,7 +866,8 @@ describe("daemon server", () => {
     const canonical = mkdtempSync(join(tmpdir(), "lcm-scan-canonical-"));
     const alias = mkdtempSync(join(tmpdir(), "lcm-scan-alias-"));
     const hash = hashProjectPath(normalizeProjectPath(canonical));
-    mkdirSync(join(homedir(), ".lcm"), { recursive: true });
+    mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
+    chmodSync(join(homedir(), ".lcm"), 0o700);
     writeFileSync(projectMapPath(), JSON.stringify({
       [hash]: { canonical: normalizeProjectPath(canonical), aliases: [normalizeProjectPath(alias)] },
     }, null, 2) + "\n", { mode: 0o600 });
@@ -880,7 +891,8 @@ describe("daemon server", () => {
 
   it("falls back to meta cwd while map.json is temporarily invalid", () => {
     const canonical = mkdtempSync(join(tmpdir(), "lcm-scan-invalid-map-"));
-    mkdirSync(join(homedir(), ".lcm"), { recursive: true });
+    mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
+    chmodSync(join(homedir(), ".lcm"), 0o700);
     writeFileSync(projectMapPath(), "{not-json");
     clearProjectMapCache();
 
@@ -916,7 +928,7 @@ describe("daemon server", () => {
     const configPath = join(homedir(), ".lcm", "config.json");
     mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
     writeFileSync(configPath, "{}\n", { mode: 0o600 });
-    mkdirSync(join(homedir(), ".lcm", "projects", hash), { recursive: true });
+    mkdirSync(join(homedir(), ".lcm", "projects", hash), { recursive: true, mode: 0o700 });
     writeFileSync(join(homedir(), ".lcm", "projects", hash, "meta.json"), JSON.stringify({ cwd: normalizedCanonical }, null, 2) + "\n");
     writeFileSync(projectMapPath(), JSON.stringify({
       [hash]: { canonical: normalizedCanonical, aliases: [normalizedAlias] },
@@ -937,11 +949,18 @@ describe("daemon server", () => {
       JSON.stringify({ message: { role: "assistant", content: [{ type: "text", text: "Alias scan answer" }] } }),
     ].join("\n") + "\n");
 
-    const observedTokens: Array<object | undefined> = [];
+    const identityTokens: Array<object | undefined> = [];
     const admissionTokens: object[] = [];
+    const originalProjectIdentity = projectModule.projectIdentity as (...args: unknown[]) => unknown;
+    vi.spyOn(projectModule, "projectIdentity").mockImplementation(((...args: unknown[]) => {
+      const publicationLockToken = args[2] as object | undefined;
+      if (identityTokens.at(-1) !== publicationLockToken) {
+        identityTokens.push(publicationLockToken);
+      }
+      return originalProjectIdentity(...args);
+    }) as typeof projectModule.projectIdentity);
     const originalProjectPaths = projectModule.projectPaths;
     vi.spyOn(projectModule, "projectPaths").mockImplementation((cwd, publicationLockToken) => {
-      if (observedTokens.at(-1) !== publicationLockToken) observedTokens.push(publicationLockToken);
       if (publicationLockToken !== undefined && admissionTokens.at(-1) !== publicationLockToken) {
         admissionTokens.push(publicationLockToken);
       }
@@ -957,7 +976,7 @@ describe("daemon server", () => {
     const transactionSpy = vi.spyOn(SqliteProjectStorage.prototype, "transaction").mockImplementation(async function (callback) {
       const index = transactionIndex++;
       transactionStarted[index]?.resolve({
-        discoveryToken: observedTokens.at(-2),
+        discoveryToken: identityTokens.at(-2),
         admissionToken: admissionTokens.at(-1),
       });
       await releaseTransaction[index]?.promise;
@@ -1081,6 +1100,51 @@ describe("daemon idle timeout", () => {
 });
 
 describe("daemon auth", () => {
+  it("rejects null bodies across authenticated route admission modes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-expand-body-"));
+    const lcmDir = join(dir, ".lcm");
+    const configPath = join(lcmDir, "config.json");
+    const tokenPath = join(lcmDir, "daemon.token");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    chmodSync(lcmDir, 0o700);
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    ensureAuthToken(tokenPath);
+    const config = loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } });
+    const authDaemon = await createDaemon(config, {
+      publicationConfigPath: configPath,
+      tokenPath,
+      _testIdentity: testIdentity,
+      _assertBackendPublication: () => undefined,
+    });
+
+    try {
+      const headers = {
+        Authorization: `Bearer ${readAuthToken(tokenPath)!}`,
+        "Content-Type": "application/json",
+      };
+      for (const path of ["/expand", "/promote-events/notify", "/review-stale"]) {
+        const shapeResponse = await fetch(`http://127.0.0.1:${authDaemon.address().port}${path}`, {
+          method: "POST",
+          headers,
+          body: "null",
+        });
+        expect(shapeResponse.status, path).toBe(400);
+        await expect(shapeResponse.json(), path).resolves.toEqual({ error: "invalid request body" });
+      }
+
+      const syntaxResponse = await fetch(`http://127.0.0.1:${authDaemon.address().port}/expand`, {
+        method: "POST",
+        headers,
+        body: "{",
+      });
+      expect(syntaxResponse.status).toBe(500);
+      await expect(syntaxResponse.json()).resolves.toMatchObject({ error: expect.any(String) });
+    } finally {
+      await authDaemon.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("maps an unbuffered public-health payload error without exposing details", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-authsrv-public-health-error-"));
     const lcmDir = join(dir, ".lcm");

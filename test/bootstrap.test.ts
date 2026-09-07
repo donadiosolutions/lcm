@@ -1,11 +1,15 @@
 import { afterAll, describe, it, expect, vi } from "vitest";
-import { chmodSync, existsSync as fsExistsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync as fsExistsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, writeFileSync as fsWriteFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EnsureCoreDeps } from "../src/bootstrap.js";
 import { DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_RETRY_POLICY, parseDaemonConfig } from "../src/daemon/config.js";
 import { canonicalHookCommand, mergeClaudeSettings } from "../src/installer/settings.js";
 import * as storageBackend from "../src/storage/backend.js";
+import * as backendPublication from "../src/storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "../src/private-mutation-lock.js";
+import { createPublicationConvergence, withPublicationAdmissionRetry } from "../src/storage/publication-convergence.js";
+import { PACKAGED_RUNTIME_ENTRYPOINT, PKG_VERSION, RUNTIME_DIGEST } from "../src/daemon/version.js";
 
 const defaultDaemon = vi.hoisted(() => vi.fn().mockResolvedValue({ connected: true }));
 const homeMock = vi.hoisted(() => ({ homeDir: "" }));
@@ -39,6 +43,105 @@ function makeDeps(overrides: Partial<EnsureCoreDeps> = {}): EnsureCoreDeps {
 }
 
 describe("ensureCore", () => {
+  it("threads one publication admission wrapper through every core edge", async () => {
+    const admission = vi.fn(async <T>(step: () => T | Promise<T>) => await step());
+    const ensureRuntimeHome = vi.fn();
+    const ensureDaemon = vi.fn().mockResolvedValue({ connected: true });
+    const deps = makeDeps({
+      ensureRuntimeHome,
+      _withPublicationAdmissionRetry: admission,
+      ensureDaemon,
+    });
+    const { ensureCoreEndpoint } = await import("../src/bootstrap.js");
+    await expect(ensureCoreEndpoint(deps)).resolves.toMatchObject({ connected: true });
+    expect(admission).toHaveBeenCalledTimes(3);
+    expect(ensureRuntimeHome).toHaveBeenCalledOnce();
+    expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+      _withPublicationAdmissionRetry: admission,
+    }));
+  });
+
+  it("retries each real bootstrap admission edge without replaying settings or daemon effects", async () => {
+    const publicationVersion = PKG_VERSION ?? "test-version";
+    const publicationEntrypoint = PACKAGED_RUNTIME_ENTRYPOINT ?? "/opt/lcm.mjs";
+    const publicationRuntimeDigest = RUNTIME_DIGEST ?? "a".repeat(64);
+    let now = 0;
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: {
+        pid: process.pid,
+        version: publicationVersion,
+        storageBackend: "sqlite",
+        entrypoint: publicationEntrypoint,
+        runtimeDigest: publicationRuntimeDigest,
+      },
+      deps: {
+        now: () => now,
+        sleep: async (ms) => { now += ms; },
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth",
+        fetch: vi.fn(async () => ({
+          ok: true,
+          json: async () => ({ status: "ok", pid: process.pid, version: publicationVersion,
+            storageBackend: "sqlite", entrypoint: publicationEntrypoint,
+            runtimeDigest: publicationRuntimeDigest }),
+        })) as unknown as typeof globalThis.fetch,
+        lockPath: "/tmp/bootstrap-publication.lock",
+      },
+    });
+    const ensureRuntimeHome = vi.fn();
+    const ensureDaemon = vi.fn().mockResolvedValue({ connected: true });
+    const settingsPath = join(publicationHome, ".claude", "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({}), { mode: 0o600 });
+    let runtimeAttempts = 0;
+    let configLockAttempts = 0;
+    let configCallbackCalls = 0;
+    let storageAttempts = 0;
+    const originalConfigLock = backendPublication.withBackendPublicationConfigLock;
+    const select = vi.spyOn(storageBackend, "selectStorageBackend").mockImplementation((config) => {
+      storageAttempts += 1;
+      if (storageAttempts === 1) throw new PrivateMutationLockContentionError("storage busy");
+      return { backend: config.backend };
+    });
+    const configLock = vi.spyOn(backendPublication, "withBackendPublicationConfigLock")
+      .mockImplementation((path, callback, permit) => {
+        configLockAttempts += 1;
+        if (configLockAttempts === 1) throw new PrivateMutationLockContentionError("config busy");
+        return originalConfigLock(path, (token) => {
+          configCallbackCalls += 1;
+          return callback(token);
+        }, permit);
+      });
+    const admission = <T>(step: () => T | Promise<T>): Promise<T> => withPublicationAdmissionRetry(step, convergence);
+    const deps = makeDeps({
+      settingsPath,
+      ensureRuntimeHome: vi.fn(() => {
+        if (runtimeAttempts++ === 0) throw new PrivateMutationLockContentionError("home busy");
+        ensureRuntimeHome();
+      }),
+      _withPublicationAdmissionRetry: admission,
+      ensureDaemon,
+      existsSync: vi.fn((path: string) => path === settingsPath),
+      readFileSync: vi.fn((path: string) => path === settingsPath ? fsReadFileSync(path, "utf-8") : "{}"),
+      writeFileSync: vi.fn((path: string, content: string) => {
+        fsWriteFileSync(path, content, { mode: 0o600 });
+        if (path.endsWith("config.json")) chmodSync(path, 0o600);
+      }),
+    });
+    try {
+      await expect((await import("../src/bootstrap.js")).ensureCoreEndpoint(deps)).resolves.toMatchObject({ connected: true });
+      expect(ensureRuntimeHome).toHaveBeenCalledOnce();
+      expect(ensureDaemon).toHaveBeenCalledOnce();
+      expect(configLockAttempts).toBe(2);
+      expect(configCallbackCalls).toBe(1);
+      expect(storageAttempts).toBe(2);
+    } finally {
+      select.mockRestore();
+      configLock.mockRestore();
+    }
+  });
+
   it("uses the default secure-root, durable writer, and daemon seams", async () => {
     const runtimeRoot = join(homedir(), ".lcm");
     const configPath = join(runtimeRoot, "config.json");

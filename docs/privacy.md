@@ -9,6 +9,79 @@ stored, what leaves your machine, and how to control sensitive data.
 With the default SQLite backend, all storage is on your machine:
 
 - **`~/.lcm/projects/{hash}/db.sqlite`** — Conversation messages, summaries, and promoted long-term memory for each project. The hash is a SHA-256 of the project directory path.
+- **`~/.lcm/projects/{hash}/meta.json`** — Local project identity and route
+  timestamps. During preliminary project-directory initialization with
+  metadata writing enabled, LCM reads at most 1 MiB from a single-link regular
+  file whose owner matches the private LCM directory. Oversized, linked,
+  non-regular, or owner-mismatched metadata is rejected before its contents are
+  parsed or rewritten. Missing metadata is created; malformed or non-object
+  metadata is rebuilt; valid metadata with the current project path is left
+  unchanged; and valid metadata with a different path is replaced atomically
+  with mode `0600`. The serialized UTF-8 representation, including indentation
+  and its terminating newline, must also fit within 1 MiB. If publication would
+  exceed that limit, LCM reports `project metadata exceeds size limit` before
+  writing and preserves an existing `meta.json` unchanged.
+
+  To recover, inspect `~/.lcm/projects/{hash}/meta.json` and reduce optional
+  metadata until the serialized file fits. You can instead back up and remove
+  only `meta.json` so LCM regenerates it on the next initialization; the project
+  history in `db.sqlite` is preserved. If metadata restored as another user
+  blocks initialization, correct its ownership or use the same metadata-only
+  recovery. Separately, final successful ingest and compact
+  timestamp updates use the same size, regular-file, and single-link checks as
+  a best-effort write, and require a matching owner when the process user ID is
+  available. Malformed, oversized, linked, non-regular, or owner-mismatched
+  metadata is left unchanged by those final timestamp updates.
+  `lcm import-knowledge` uses a separate create-only path. When metadata is
+  missing, it atomically publishes the complete project identity with mode
+  `0600` and tightens the project directory to mode `0700`. Existing metadata
+  is never replaced by import, including malformed files and dangling symbolic
+  links. Import still completes when such an entry is preserved, but malformed
+  or dangling metadata is not automatically repaired and may keep the project
+  from being discovered by `lcm export --all` until you correct or
+  remove that entry.
+  Promote opens the snapshotted LCM root, `projects` directory, and project
+  directory separately before reading `meta.json`. It retains and reasserts all
+  three directory entries through parsing and publication. A successful bounded
+  read is accepted only when the reader's sampled parent device and inode match
+  the retained project directory. A symlink visible during chain acquisition,
+  or persistent directory-entry replacement detected at a later sample, fails
+  closed. Promotion database work and a metadata update completed before a
+  post-publication failure are not rolled back. The guarantee begins when the
+  metadata phase acquires this chain, so an independently valid private
+  hierarchy substituted before that phase can be admitted. When promotion
+  retains the metadata parent, the atomic writer reasserts that parent after
+  creating its temporary file, before writing content, and again immediately
+  before rename or exclusive link. It also requires the temporary pathname to
+  still identify the regular file it created. Observed drift at either point
+  refuses publication. These checks are bounded observations rather than an
+  atomic pin on the parent pathname: they do not detect every transient
+  replacement or prevent a change during publication. If rename or link returns
+  and the following parent check fails, the error outcome is `published`; this
+  means the operation completed, not that it reached the retained directory. If
+  rename or a non-collision link attempt throws and the parent check also fails,
+  the outcome is `unknown`. Either outcome means bytes may have been published
+  and must not authorize automatic rollback or retry.
+
+  When `meta.json` is missing, promotion creates it only if the retained project
+  directory still has no destination entry at publication. A restored file or
+  concurrent creation is refused with the existing topology error and is not
+  overwritten. This portable create briefly links the complete private file at
+  both its temporary and final names; a concurrent bounded reader can fail
+  closed during that interval. The earlier missing-file observation is not
+  proof of historical absence. Calls without a retained parent and the bounded
+  pathname windows described above remain outside the guarantee; these checks
+  do not provide descriptor-relative pathname mutation.
+
+  A post-link cleanup or single-link verification failure reports
+  `private file link completed, but published file topology is not trusted`.
+  The completed `meta.json` can remain linked to a hidden
+  `.meta.json.*.tmp` name, with link count two, and later metadata admission
+  will refuse it. Before retrying, inspect both entries with an inode-reporting
+  tool such as `ls -li`. If they have the same inode and the expected owner,
+  mode, and content, remove only the hidden temporary name, then verify that
+  `meta.json` has link count one and mode `0600`. If those identities do not
+  match, preserve both entries and investigate rather than deleting either one.
 - **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
 - **`~/.lcm/daemon.pid`** — Daemon process ID (transient).
@@ -32,7 +105,7 @@ that you configure explicitly:
 |-----------------------------|----------------------|
 | `disabled` (default) | Nothing |
 | `claude-process` | Messages sent to Anthropic via the `claude` CLI (your Claude subscription) |
-| `codex-process` | Messages sent to OpenAI through the `codex` CLI and its per-call loopback Responses gateway (your OpenAI subscription) |
+| `codex-process` | Messages sent through the Codex CLI and its per-call loopback Responses gateway to the effective Codex `openai_base_url` (or the existing token-class default when absent or `null`) |
 | `anthropic` | Messages sent to Anthropic API (your API key) |
 | `openai` | Messages sent to OpenAI API (your API key) |
 
@@ -48,13 +121,16 @@ prompt-cache key. The payload explicitly uses `tools: []`,
 `stream: true` in the standard Responses dialect. Responses Lite instead uses
 an explicit empty `additional_tools` inventory and omits top-level `tools`.
 Both dialects discard inherited prompt/input/tools state; `include` and
-`stream_options` are omitted. Managed
-authentication is forwarded only through an explicit header allowlist, and the
-gateway selects the exact endpoint described in [configuration](configuration.md):
-`sk-`-prefixed bearer credentials use the public OpenAI route, while other
-managed bearers use the ChatGPT route even when account ID is absent. A supplied
-account ID is forwarded but is not the sole route classifier. It never persists
-or logs credentials,
+`stream_options` are omitted. Managed authentication is forwarded only through
+an explicit header allowlist, and a configured Codex `openai_base_url` is
+authoritative for both bearer classes. When that value is absent or `null`,
+`sk-`-prefixed bearer credentials use the public OpenAI route while other
+managed bearers use the ChatGPT route, even when account ID is absent. A
+configured endpoint may receive the managed bearer, account identifier, and
+allowlisted Codex metadata, including over cleartext HTTP; use HTTPS when the
+endpoint supports it. Resolution reads the on-disk Codex configuration from
+the LCM process's inherited environment and working directory, rather than
+from a live parent session profile. It never persists or logs credentials,
 raw request bodies, prompts, or upstream response bodies. If authentication,
 request shape, routing, streaming, or gateway shutdown is ambiguous, the
 compaction fails closed. The selected provider's retention policy still
@@ -199,9 +275,62 @@ The `Security` section of the doctor output shows:
 
 ## Safe local diagnostics
 
+- The `/describe` and `/expand` compatibility handlers sanitize fallback error
+  messages before handing them to the daemon response layer, which sanitizes
+  top-level error strings again before serialization. They retain their legacy
+  HTTP `200` status and null-result response shape. SQLite details become a
+  `database constraint error`. Host-local POSIX, Windows, and UNC paths become
+  `<path>`; quoted paths may contain spaces, while unquoted paths stop at
+  whitespace so arbitrary trailing prose remains intact. File URLs preserve
+  their scheme and authority spelling while replacing a non-root path after
+  the authority with `<path>`, including an initial Windows drive. A quote
+  immediately before the `file` scheme lets the redacted path contain spaces
+  until the matching quote or a newline. Empty and root-only file URLs remain
+  unchanged. Unmatched or path-wrapping brackets in file URLs do not stop path
+  redaction; valid bracketed IPv6 authorities, including zone IDs, remain
+  intact. When a closing path-wrapping bracket is immediately followed by a
+  slash or backslash path segment, that adjacent segment is also redacted in
+  the same pass. In unquoted file URLs, whitespace and the existing path
+  delimiters, including later colons, `?`, and `#`, end the redacted span, so
+  text after those delimiters can remain visible. Before the first path
+  separator, semicolons, commas, apostrophes, closing parentheses, and closing
+  braces remain part of an exact `file://` authority; after the path begins,
+  those characters retain their existing path and prose delimiter behavior.
+  A quote immediately before the `file` scheme establishes a quote boundary,
+  and its matching quote still terminates the URL. Before the first path
+  separator, an apostrophe inside an unquoted or double-quoted authority, or a
+  double quote inside an unquoted or apostrophe-quoted authority, remains
+  conservatively classified as authority text so a following local path is
+  redacted. Quotes after a file URL path begins, double quotes in non-file URLs
+  or structured text, and ordinary quoted local paths retain their existing
+  boundaries. Ordinary HTTP and HTTPS URLs retain their authorities, slashes,
+  and paths. In an unquoted exact
+  `file://` URL with no path, a `?` or `#` outside still-open brackets ends the
+  file URL authority classification. Following text is classified from fresh
+  state: a nested non-file URL remains intact, while standalone POSIX, Windows,
+  and UNC paths retain redaction. The first backslash-based path also remains
+  redacted across forward slashes and file-authority punctuation (semicolons,
+  commas, apostrophes, closing parentheses, and closing braces). Whitespace, a
+  freshly recognized URL, or other URL-ending punctuation ends that context. A
+  recognizable nested exact `file://` path is also redacted. An exact
+  case-insensitive `file://` literal immediately after `?`, `#`, `&`, or `=`
+  inside any URL starts a nested file URL. Once an outer URL has entered its
+  query or fragment, the same literal also starts a nested file URL after any
+  character other than an ASCII letter, including query value wrappers,
+  punctuation, and digits. ASCII-letter-glued names such as `profile://` and
+  `xfile://` remain ordinary URL text. LCM preserves the outer URL and replaces
+  only the nested file path. When recognized nested `file://` literals are
+  adjacent within an outer URL query or fragment, each unquoted literal ends
+  the preceding redacted path and keeps its complete scheme for independent
+  redaction. A quoted path still consumes a nested scheme through its matching
+  closing quote. This bounded rule does not decode percent-encoded schemes or
+  recognize `file://` text in an ordinary URL path. Outer-quoted pathless file
+  URLs retain their conservative file-path classification through `?` and `#`,
+  so a nested non-file URL in that quoted span may still be redacted as a path.
+  There are no configuration options for this defense-in-depth behavior.
 - Hook project paths retain leading and trailing whitespace. Directories whose names differ only by that whitespace remain separate LCM projects.
 - Hook errors are attached to a project sidecar only when the reported working directory is an existing directory. Invalid paths are recorded in the bounded fallback log without creating project metadata.
-- `lcm stats` and verbose `lcm doctor` remove terminal control sequences and line breaks from persisted text before displaying it. SQLite content is not modified by display sanitization.
+- Stats, status, pool diagnostics, and doctor use an allowlisted backend snapshot. They omit recalled-text previews (`topRecalled`), memory and transcript payloads, raw errors, SQL values, URLs, role names, CA paths, and arbitrary local paths. Verbose diagnostics retain the same boundary. Only observed numeric aggregates, safe identifiers, classified states, and fixed guidance are exposed. SQLite content is not modified; necessary WAL/SHM read coordination may occur. See [observational diagnostics](cli.md#observational-diagnostics).
 - Sidecar scans return a single aggregate truncation record when their time or database limit is reached, so diagnostic responses remain bounded even if the events directory contains many files.
 
 ## Summary

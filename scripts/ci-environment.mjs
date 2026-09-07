@@ -13,12 +13,13 @@ import {
   readlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { POSTGRES_IMAGE, POSTGRESQL_HARNESS_IMAGES } from "./postgresql-images.mjs";
 
 export const CI_CACHE_FORMAT = "v1";
+export const NODE_DEPENDENCY_CACHE_FORMAT = "v2";
 export const NODE_VERSION = "22.20.0";
 export const POSTGRES_TEMPLATE_DATABASE = "lcm_harness_template";
 export const POSTGRES_TEMPLATE_MARKER = "lcm-postgresql-template-v1";
@@ -39,8 +40,10 @@ export const POSTGRES_TEMPLATE_INPUT_PATHS = Object.freeze([
 ]);
 export const NODE_DEPENDENCY_INPUT_PATHS = Object.freeze([
   join(repositoryRoot, "package.json"),
-  join(repositoryRoot, "package-lock.json"),
+  join(repositoryRoot, "pnpm-lock.yaml"),
   join(repositoryRoot, ".npmrc"),
+  join(repositoryRoot, "pnpm-workspace.yaml"),
+  join(repositoryRoot, "scripts", "bootstrap-pnpm.mjs"),
 ]);
 
 export function sha256Files(paths) {
@@ -82,22 +85,24 @@ export function cacheMetadata(environment = process.env) {
     dependencyDigest,
     imageDigest,
     templateDigest,
-    nodeModulesKey: `lcm-node-modules-${CI_CACHE_FORMAT}-${runnerOs}-${runnerArch}-node-${NODE_VERSION}-${dependencyDigest}`,
+    nodeModulesKey: `lcm-node-modules-${NODE_DEPENDENCY_CACHE_FORMAT}-${runnerOs}-${runnerArch}-node-${NODE_VERSION}-${dependencyDigest}`,
     imagesKey: `lcm-postgresql-images-${CI_CACHE_FORMAT}-${runnerOs}-${runnerArch}-${imageDigest}`,
     templateKey: `lcm-postgresql-template-${CI_CACHE_FORMAT}-${runnerOs}-${runnerArch}-${templateDigest}`,
   };
 }
 
-function walkPackageMetadata(directoryDescriptor, relativeDirectory = "", entries = []) {
+// Metadata is read only through held directory descriptors. Link validation below
+// operates on this inventory and never follows links through the filesystem.
+function walkPackageMetadata(directoryDescriptor, relativeDirectory = "", entries = new Map()) {
   const directory = `/proc/self/fd/${directoryDescriptor}`;
   for (const directoryEntry of readdirSync(directory, { withFileTypes: true })
     .sort((left, right) => compareInventoryNames(left.name, right.name))) {
     const { name } = directoryEntry;
-    if (name === ".lcm-ci-cache.json") continue;
+    if (relativeDirectory === "" && name === ".lcm-ci-cache.json") continue;
     const path = join(directory, name);
     const relativePath = join(relativeDirectory, name).split(sep).join("/");
     if (directoryEntry.isSymbolicLink()) {
-      entries.push(`link\0${relativePath}\0${readlinkSync(path)}`);
+      entries.set(relativePath, { type: "link", target: readlinkSync(path) });
       continue;
     }
 
@@ -109,19 +114,95 @@ function walkPackageMetadata(directoryDescriptor, relativeDirectory = "", entrie
       );
       const stat = fstatSync(descriptor);
       if (stat.isDirectory()) {
+        entries.set(relativePath, { type: "directory" });
         walkPackageMetadata(descriptor, relativePath, entries);
-      } else if (name === "package.json") {
+      } else {
         if (!stat.isFile()) {
           throw new Error(`dependency inventory entry is not a regular file: ${relativePath}`);
         }
-        const digest = createHash("sha256").update(readFileSync(descriptor)).digest("hex");
-        entries.push(`file\0${relativePath}\0${digest}`);
+        const metadata = name === "package.json"
+          || relativePath === ".modules.yaml"
+          || relativePath === ".pnpm/lock.yaml"
+          || relativePath === ".pnpm-workspace-state-v1.json";
+        const contents = metadata ? readFileSync(descriptor) : undefined;
+        entries.set(relativePath, { type: "file", contents });
       }
     } finally {
       if (descriptor !== undefined) closeSync(descriptor);
     }
   }
   return entries;
+}
+
+function inventoryTarget(entries, path) {
+  const pending = path.split("/");
+  const resolved = [];
+  let links = 0;
+  while (pending.length > 0) {
+    const part = pending.shift();
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (resolved.length === 0) throw new Error(`dependency link escapes node_modules: ${path}`);
+      resolved.pop();
+      continue;
+    }
+    const prefix = [...resolved, part].join("/");
+    const entry = entries.get(prefix);
+    if (!entry) throw new Error(`dependency link or required path is missing: ${prefix}`);
+    if (entry.type === "link") {
+      links += 1;
+      if (links > 64) throw new Error(`dependency link cycle or excessive depth: ${prefix}`);
+      if (isAbsolute(entry.target)) throw new Error(`dependency link escapes node_modules: ${prefix}`);
+      pending.unshift(...entry.target.split("/"));
+      continue;
+    }
+    if (pending.length > 0 && entry.type !== "directory") {
+      throw new Error(`dependency link traverses a non-directory: ${prefix}`);
+    }
+    resolved.push(part);
+  }
+  return resolved.length === 0 ? { type: "directory" } : entries.get(resolved.join("/"));
+}
+
+function requireInventoryMetadata(entries, path) {
+  const entry = entries.get(path);
+  if (entry?.type !== "file" || !entry.contents) {
+    throw new Error(`required pnpm metadata is missing or unsafe: ${path}`);
+  }
+  return entry.contents;
+}
+
+function validatePnpmInventory(entries) {
+  const manifest = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8"));
+  // This exact pnpm pin writes .modules.yaml using JSON.stringify. Do not import
+  // a YAML package: this check must run before dependencies are trusted.
+  const modules = JSON.parse(requireInventoryMetadata(entries, ".modules.yaml"));
+  if (modules.packageManager !== manifest.packageManager.split("+")[0]
+    || modules.nodeLinker !== "isolated" || modules.virtualStoreDir !== ".pnpm") {
+    throw new Error("cached pnpm installation has incompatible manager or linker metadata");
+  }
+  const installedLock = requireInventoryMetadata(entries, ".pnpm/lock.yaml");
+  if (!installedLock.equals(readFileSync(join(repositoryRoot, "pnpm-lock.yaml")))) {
+    throw new Error("cached pnpm installed lock does not match pnpm-lock.yaml");
+  }
+  for (const [path, entry] of entries) {
+    if (entry.type === "link") inventoryTarget(entries, path);
+    // Each package at either a root or virtual node_modules boundary must retain
+    // its own manifest, including transitives that are not root dependencies.
+    if ((entry.type === "directory" || entry.type === "link")
+      && /(?:^|\/node_modules\/)(?:@[^/]+\/)?[^.@/][^/]*$/u.test(path)) {
+      const packageManifest = inventoryTarget(entries, `${path}/package.json`);
+      if (packageManifest?.type !== "file" || !packageManifest.contents) {
+        throw new Error(`required pnpm package manifest is missing: ${path}`);
+      }
+    }
+  }
+  for (const name of Object.keys({ ...manifest.dependencies, ...manifest.devDependencies })) {
+    const packageManifest = inventoryTarget(entries, `${name}/package.json`);
+    if (packageManifest?.type !== "file" || !packageManifest.contents) {
+      throw new Error(`required pnpm dependency metadata is missing: ${name}`);
+    }
+  }
 }
 
 export function nodeModulesInventoryDigest(nodeModulesPath) {
@@ -135,9 +216,14 @@ export function nodeModulesInventoryDigest(nodeModulesPath) {
     if (!fstatSync(descriptor).isDirectory()) {
       throw new Error("dependency inventory root is not a directory");
     }
+    const entries = walkPackageMetadata(descriptor);
+    validatePnpmInventory(entries);
     const hash = createHash("sha256");
-    for (const entry of walkPackageMetadata(descriptor)) {
-      hash.update(`${entry}\0`, "utf8");
+    for (const [path, entry] of entries) {
+      if (entry.type === "link") hash.update(`link\0${path}\0${entry.target}\0`);
+      else if (entry.contents) {
+        hash.update(`file\0${path}\0`).update(entry.contents).update("\0");
+      }
     }
     return hash.digest("hex");
   } finally {
@@ -191,8 +277,9 @@ function readSecureMetadataFile(path, maximumBytes, label) {
 export function writeNodeModulesStamp(nodeModulesPath, environment = process.env) {
   const metadata = cacheMetadata(environment);
   const stamp = {
-    format: CI_CACHE_FORMAT,
+    format: NODE_DEPENDENCY_CACHE_FORMAT,
     dependencyDigest: metadata.dependencyDigest,
+    packageManager: JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")).packageManager,
     node: process.versions.node,
     platform: process.platform,
     arch: process.arch,
@@ -218,8 +305,9 @@ export function validateNodeModulesStamp(nodeModulesPath, environment = process.
     throw error;
   }
   const actual = {
-    format: CI_CACHE_FORMAT,
+    format: NODE_DEPENDENCY_CACHE_FORMAT,
     dependencyDigest: expected.dependencyDigest,
+    packageManager: JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")).packageManager,
     node: process.versions.node,
     platform: process.platform,
     arch: process.arch,

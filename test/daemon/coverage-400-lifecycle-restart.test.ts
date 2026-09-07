@@ -33,6 +33,8 @@ import { managedDaemonPath } from "../../src/daemon/managed-path.js";
 import {
   createSupervisor,
   managedLaunchEnvironmentDigest,
+  SUPERVISOR_DAEMON_TEMP_CREATION_WARNING,
+  SupervisorDaemonTempCreationError,
 } from "../../src/daemon/supervisor.js";
 
 type EnsureDaemonOptions = Parameters<typeof ensureDaemonProduction>[0];
@@ -299,6 +301,26 @@ function managedSupervisor(
   };
 }
 
+const SUPERVISOR_FAILURE_SECRET = "supervisor-secret-must-not-surface";
+const supervisorFailureCases: readonly [
+  string,
+  () => Error,
+  boolean,
+][] = [
+  ["the typed daemon-temp error", () => new SupervisorDaemonTempCreationError(), true],
+  ["an ordinary secret-bearing error", () => new Error(SUPERVISOR_FAILURE_SECRET), false],
+  ["a forged daemon-temp error", () => {
+    const error = new Error(SUPERVISOR_DAEMON_TEMP_CREATION_WARNING);
+    error.name = "SupervisorDaemonTempCreationError";
+    return error;
+  }, false],
+  ["a typed daemon-temp error with a mutated message", () => {
+    const error = new SupervisorDaemonTempCreationError();
+    error.message = SUPERVISOR_FAILURE_SECRET;
+    return error;
+  }, true],
+];
+
 const LEGACY_INVOCATION_ID = "1234567890abcdef1234567890abcdef";
 const CHANGED_LEGACY_INVOCATION_ID = "abcdef1234567890abcdef1234567890";
 
@@ -390,6 +412,7 @@ type LegacyFixtureConfig = Readonly<{
   alive?: boolean;
   stopBehavior?: "remove-pid" | "keep-alive" | "replace-pid" | "replace-unsafe" | "leave-pid" | "throw";
   startBehavior?: "throw";
+  startError?: Error;
   mutatePidBeforeSecondDiscovery?: boolean;
   discoveryThrows?: boolean;
   environment?: NodeJS.ProcessEnv;
@@ -464,6 +487,7 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
     return result;
   });
   if (config.startBehavior === "throw") supervisor.start.mockRejectedValue(new Error("stable start failed"));
+  if (config.startError !== undefined) supervisor.start.mockRejectedValue(config.startError);
   const publicHealth = config.publicHealth === null ? null : config.publicHealth ?? health(4242, { version: "1.4.1", ownerId: "legacy-owner" });
   const authenticatedHealth = config.authenticatedHealth === null
     ? null
@@ -559,6 +583,33 @@ function testScopeFixture(prefix = "scope-"): { root: string; scope: DaemonLifec
 }
 
 describe("ensureDaemon restart and terminal coverage", () => {
+  it.each(supervisorFailureCases)("classifies %s during managed ensure start", async (_name, createError, typed) => {
+    const dir = root("issue-944-ensure-start-");
+    const managed = managedSupervisor(spec => ({ kind: "absent", name: spec.name }));
+    managed.start.mockRejectedValue(createError());
+
+    const result = await ensure({
+      ...baseOptions(dir),
+      _skipSpawn: false,
+      enforceUserManagerParent: true,
+      _supervisorOverride: managed.supervisor,
+    });
+
+    expect(result).toMatchObject({
+      connected: false,
+      spawned: false,
+      refusalReason: "startup-failure",
+      warning: typed
+        ? SUPERVISOR_DAEMON_TEMP_CREATION_WARNING
+        : "managed daemon supervisor start failed",
+    });
+    expect(result.pid).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain(SUPERVISOR_FAILURE_SECRET);
+    expect(managed.start).toHaveBeenCalledOnce();
+    expect(managed.stopAndStart).not.toHaveBeenCalled();
+    expect(managed.supervisor.stopAndAwaitAbsent).not.toHaveBeenCalled();
+  });
+
   it("revalidates and terminates an authenticated daemon with a wrong Linux parent", async () => {
     const dir = root();
     const procRoot = join(dir, "proc");
@@ -1092,6 +1143,77 @@ describe("ensureDaemon restart and terminal coverage", () => {
 });
 
 describe("managed restart refusal and repair coverage", () => {
+  it.each(supervisorFailureCases)("classifies %s during stale-config repair", async (_name, createError, typed) => {
+    const dir = root("issue-944-stale-repair-");
+    const managed = managedSupervisor(spec => ({
+      kind: "registered-stale-config",
+      reason: "metadata-mismatch",
+      scopeDigest: spec.scopeDigest,
+      name: spec.name,
+    }));
+    managed.stopAndStart.mockRejectedValue(createError());
+    const ensureMock = vi.fn();
+
+    const result = await restart({
+      ...baseOptions(dir),
+      enforceUserManagerParent: true,
+      _supervisorOverride: managed.supervisor,
+      _ensureDaemonOverride: ensureMock,
+    });
+
+    expect(result).toMatchObject({
+      connected: false,
+      restarted: false,
+      refusalReason: "startup-failure",
+      warning: typed
+        ? SUPERVISOR_DAEMON_TEMP_CREATION_WARNING
+        : "managed daemon supervisor stale configuration repair failed",
+    });
+    expect(result.pid).toBeUndefined();
+    expect(result.stoppedPid).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain(SUPERVISOR_FAILURE_SECRET);
+    expect(managed.stopAndStart).toHaveBeenCalledOnce();
+    expect(ensureMock).not.toHaveBeenCalled();
+  });
+
+  it.each(supervisorFailureCases)("classifies %s during a live manager restart", async (_name, createError, typed) => {
+    const dir = root("issue-944-live-restart-");
+    writePid(dir, 200);
+    const managed = managedSupervisor(spec => ({
+      kind: "registered-running-valid",
+      managerPid: 200,
+      scopeDigest: spec.scopeDigest,
+      nonce: spec.nonce,
+      name: spec.name,
+    }));
+    managed.stopAndStart.mockRejectedValue(createError());
+    const ensureMock = vi.fn();
+
+    const result = await restart({
+      ...baseOptions(dir),
+      enforceUserManagerParent: true,
+      _supervisorOverride: managed.supervisor,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19_999],
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as unknown as FetchOverride,
+      _ensureDaemonOverride: ensureMock,
+    });
+
+    expect(result).toMatchObject({
+      connected: false,
+      restarted: false,
+      refusalReason: "startup-failure",
+      pid: 200,
+      warning: typed
+        ? SUPERVISOR_DAEMON_TEMP_CREATION_WARNING
+        : "managed daemon supervisor stop/start failed",
+    });
+    expect(result.stoppedPid).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain(SUPERVISOR_FAILURE_SECRET);
+    expect(managed.stopAndStart).toHaveBeenCalledOnce();
+    expect(ensureMock).not.toHaveBeenCalled();
+  });
+
   it("anchors restart admission to canonical state rather than caller cwd", async () => {
     const dir = root();
     const callerHome = homedir();
@@ -2234,6 +2356,23 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
       refusalReason: "startup-failure",
       stoppedPid: 4242,
     });
+    expect(fixture.supervisor.start).toHaveBeenCalledOnce();
+    expect(fixture.ensure).not.toHaveBeenCalled();
+  });
+
+  it.each(supervisorFailureCases)("classifies %s during stable start after legacy migration", async (_name, createError, typed) => {
+    const fixture = await runLegacyFixture({ startError: createError() });
+    expect(fixture.result).toMatchObject({
+      connected: false,
+      restarted: false,
+      refusalReason: "startup-failure",
+      stoppedPid: 4242,
+      warning: typed
+        ? SUPERVISOR_DAEMON_TEMP_CREATION_WARNING
+        : "stable daemon start failed after authenticated legacy migration",
+    });
+    expect(fixture.result.pid).toBeUndefined();
+    expect(JSON.stringify(fixture.result)).not.toContain(SUPERVISOR_FAILURE_SECRET);
     expect(fixture.supervisor.start).toHaveBeenCalledOnce();
     expect(fixture.ensure).not.toHaveBeenCalled();
   });

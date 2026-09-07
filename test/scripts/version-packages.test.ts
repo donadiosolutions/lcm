@@ -1,3 +1,7 @@
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   executeChecked,
@@ -72,7 +76,7 @@ describe("version-packages", () => {
     );
   });
 
-  it("runs the planned transition before versioning and lockfile synchronization", () => {
+  it("runs the planned transition before versioning without a lockfile rewrite", () => {
     const execute = vi.fn();
     runVersionPackages({
       channel: "beta",
@@ -81,7 +85,7 @@ describe("version-packages", () => {
       exists: () => false,
     });
 
-    expect(execute).toHaveBeenCalledTimes(3);
+    expect(execute).toHaveBeenCalledTimes(2);
     expect(execute.mock.calls[0][1]).toEqual([
       "/repo/node_modules/@changesets/cli/bin.js",
       "pre",
@@ -92,7 +96,6 @@ describe("version-packages", () => {
       "/repo/node_modules/@changesets/cli/bin.js",
       "version",
     ]);
-    expect(execute.mock.calls[2][1][0]).toMatch(/scripts\/sync-package-version\.mjs$/u);
   });
 
   it("uses the active beta without re-entering prerelease mode", () => {
@@ -105,7 +108,7 @@ describe("version-packages", () => {
       readFile: () => JSON.stringify({ mode: "pre", tag: "beta" }),
     });
 
-    expect(execute).toHaveBeenCalledTimes(2);
+    expect(execute).toHaveBeenCalledTimes(1);
     expect(execute.mock.calls[0][1]).toEqual([
       "/repo/node_modules/@changesets/cli/bin.js",
       "version",
@@ -125,4 +128,30 @@ describe("version-packages", () => {
       stdio: "inherit",
     });
   });
+});
+
+
+it.each(["auto", "beta"])("Changesets %s changes package versions without changing the pnpm graph", (channel) => {
+  const root = mkdtempSync(join(tmpdir(), "lcm-changeset-pnpm-"));
+  try {
+    mkdirSync(join(root, ".changeset"));
+    symlinkSync(fileURLToPath(new URL("../../node_modules", import.meta.url)), join(root, "node_modules"), "dir");
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "pnpm-release-fixture", version: "1.0.0" }));
+    writeFileSync(join(root, ".changeset/config.json"), JSON.stringify({
+      changelog: false, commit: false, fixed: [], linked: [], access: "public", baseBranch: "main", updateInternalDependencies: "patch", ignore: [],
+    }));
+    writeFileSync(join(root, ".changeset/change.md"), '---\n"pnpm-release-fixture": patch\n---\nFixture release.\n');
+    const lock = "lockfileVersion: '9.0'\nimporters:\n  .: {}\n";
+    writeFileSync(join(root, "pnpm-lock.yaml"), lock);
+    runVersionPackages({ channel, cwd: root });
+    expect(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version).toBe(channel === "beta" ? "1.0.1-beta.0" : "1.0.1");
+    expect(readFileSync(join(root, "pnpm-lock.yaml"), "utf8")).toBe(lock);
+    if (channel === "beta") {
+      runVersionPackages({ channel: "stable", cwd: root });
+      expect(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version).toBe("1.0.1");
+      expect(readFileSync(join(root, "pnpm-lock.yaml"), "utf8")).toBe(lock);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

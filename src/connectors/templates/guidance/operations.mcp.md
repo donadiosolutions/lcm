@@ -4,12 +4,13 @@
   Search broadly when injected context is absent or insufficient.
   - `query` is the natural-language search term [required]
   - `limit` optionally bounds the number of results
-  - `tags` optionally filters entries by all supplied tags
+  - `tags` optionally filters promoted entries by all supplied tags; episodic messages and summaries remain unfiltered. Select the promoted layer for tag-only recall; omitted or empty tags do not filter either layer.
 - `lcm_grep`
-  Search prior context for an exact text match.
-  - `query` is the exact term or phrase [required]
+  Search prior context using full-text or regular-expression matching.
+  - `query` is the keyword, phrase, or regex pattern to search, interpreted according to mode [required]
+  - `mode` optionally selects `full_text` or `regex`; it defaults to `full_text`. `full_text` performs literal/full-text matching, while `regex` interprets the query as a regex pattern
   - `sessionId` optionally limits the search to one session
-  - `since` optionally sets an ISO datetime lower bound
+  - `since` optionally sets an inclusive ISO datetime lower bound. Use `YYYY-MM-DDTHH:mm:ss` with optional 1-3 fractional digits and `Z` or `+/-HH:mm`; after offset normalization, UTC years must be 0001-9999. Omit it to include all history. Malformed or out-of-range values return `{ "error": "invalid since" }` (HTTP 400) before project or storage access.
 - `lcm_describe`
   Inspect a recalled node before retrieving more detail.
   - `nodeId` identifies the recalled node [required]

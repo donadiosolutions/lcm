@@ -8,6 +8,14 @@ const mocks = vi.hoisted(() => ({
   exists: vi.fn(() => true),
   read: vi.fn(() => "{}"),
   write: vi.fn(),
+  readMetadata: vi.fn(() => "{}"),
+  writeMetadata: vi.fn(),
+  closeMetadataDirectory: vi.fn(),
+  openMetadataDirectory: vi.fn(() => ({
+    fd: 1,
+    witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+    close: mocks.closeMetadataDirectory,
+  })),
   realpath: vi.fn((path: string) => path),
   getConnection: vi.fn(),
   closeConnection: vi.fn(),
@@ -25,8 +33,22 @@ const mocks = vi.hoisted(() => ({
   normalize: vi.fn((client: unknown) => client ?? "claude"),
   scrubCounts: vi.fn((content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 })),
   forProject: vi.fn(async () => ({ scrubWithCounts: mocks.scrubCounts })),
-  identity: vi.fn((cwd: string) => ({ id: "pid", canonical: cwd })),
+  identity: vi.fn((cwd: string) => ({
+    id: "pid",
+    localProjectId: "pid",
+    canonical: cwd,
+    machineId: "machine-id",
+    selectedPath: cwd,
+  })),
   ensureProject: vi.fn(),
+  ensureProjectForIdentity: vi.fn((identity: { id: string }) => `/lcm/projects/${identity.id}`),
+  pathsForIdentity: vi.fn((identity: { id: string; canonical: string; remoteProjectId?: string }) => ({
+    ...identity,
+    dir: `/lcm/projects/${identity.id}`,
+    dbPath: `/lcm/projects/${identity.id}/db.sqlite`,
+    metaPath: `/lcm/projects/${identity.id}/meta.json`,
+  })),
+  openProject: vi.fn(),
   send: vi.fn(),
   logError: vi.fn(),
 }));
@@ -48,10 +70,19 @@ vi.mock("../../../src/db/connection.js", () => ({
   withLcmConnectionLock: (_path: string, work: () => unknown) => work(),
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
+  MAX_PROJECT_METADATA_BYTES: 1024 * 1024,
   projectPaths: (cwd: string) => ({ id: "pid", dir: `${cwd}/project`, dbPath: `${cwd}/lcm.db`, metaPath: `${cwd}/meta.json`, canonical: cwd }),
+  projectPathsForIdentity: mocks.pathsForIdentity,
   projectIdentity: mocks.identity,
   ensureProjectDir: mocks.ensureProject,
+  ensureProjectDirForIdentity: mocks.ensureProjectForIdentity,
   isSafeTranscriptPath: mocks.safeTranscript,
+}));
+vi.mock("../../../src/security-files.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/security-files.js")>(),
+  readBoundedRegularFile: mocks.readMetadata,
+  atomicWritePrivateFile: mocks.writeMetadata,
+  openPrivateDirectory: mocks.openMetadataDirectory,
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/db/migration.js", () => ({ runLcmMigrations: mocks.migrate }));
@@ -69,7 +100,8 @@ vi.mock("../../../src/store/summary-store.js", () => ({
 }));
 vi.mock("../../../src/storage/index.js", () => ({
   createStorageBackendFactory: async () => ({
-    openProject: async () => {
+    openProject: async (...args: unknown[]) => {
+      mocks.openProject(...args);
       mocks.getConnection();
       const repositories = {
         conversations: {
@@ -129,6 +161,14 @@ describe("ingest persistence boundaries", () => {
     mocks.getConnection.mockReturnValue(db);
     mocks.exists.mockReturnValue(true);
     mocks.read.mockReturnValue("{}");
+    mocks.readMetadata.mockReturnValue("{}");
+    mocks.writeMetadata.mockImplementation(() => undefined);
+    mocks.closeMetadataDirectory.mockImplementation(() => undefined);
+    mocks.openMetadataDirectory.mockImplementation(() => ({
+      fd: 1,
+      witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+      close: mocks.closeMetadataDirectory,
+    }));
     mocks.sessionGet.mockReturnValue(undefined);
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.safeTranscript.mockImplementation((path: string) => path);
@@ -141,11 +181,30 @@ describe("ingest persistence boundaries", () => {
     mocks.normalize.mockImplementation((client: unknown) => client ?? "claude");
     mocks.scrubCounts.mockImplementation((content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }));
     mocks.forProject.mockImplementation(async () => ({ scrubWithCounts: mocks.scrubCounts }));
-    mocks.identity.mockImplementation((cwd: string) => ({ id: "pid", canonical: cwd }));
+    mocks.identity.mockImplementation((cwd: string) => ({
+      id: "pid",
+      localProjectId: "pid",
+      canonical: cwd,
+      machineId: "machine-id",
+      selectedPath: cwd,
+    }));
+    mocks.ensureProjectForIdentity.mockImplementation(identity => `/lcm/projects/${identity.id}`);
+    mocks.pathsForIdentity.mockImplementation(identity => ({
+      ...identity,
+      dir: `/lcm/projects/${identity.id}`,
+      dbPath: `/lcm/projects/${identity.id}/db.sqlite`,
+      metaPath: `/lcm/projects/${identity.id}/meta.json`,
+    }));
   });
 
   it("validates required fields and typed cwd failures", async () => {
     const handler = createIngestHandler(config);
+    for (const invalidBody of [null, [], "invalid"]) {
+      await handler({} as never, response, JSON.stringify(invalidBody));
+      expect(mocks.send).toHaveBeenLastCalledWith(response, 400, {
+        error: "invalid request body",
+      });
+    }
     await handler({} as never, response, "");
     expect(mocks.send).toHaveBeenLastCalledWith(response, 400, { error: "session_id and cwd are required" });
     mocks.validate.mockImplementationOnce(() => { throw new Error("bad cwd"); });
@@ -205,7 +264,7 @@ describe("ingest persistence boundaries", () => {
     const noSecurityConfig = { ...config, security: undefined };
     const handler = createIngestHandler(noSecurityConfig);
     mocks.scrubCounts.mockReturnValueOnce({ text: "redacted", gitleaks: 1, builtIn: 2, global: 3, project: 4 });
-    mocks.read.mockReturnValueOnce(JSON.stringify({ existing: true }));
+    mocks.readMetadata.mockReturnValueOnce(JSON.stringify({ existing: true }));
     await handler({} as never, response, JSON.stringify({ session_id: "redacted", cwd: "/ok", messages: [validMessage] }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
       ingested: 1,
@@ -213,14 +272,182 @@ describe("ingest persistence boundaries", () => {
       redacted: 10,
       redactedCategories: ["gitleaks", "built_in", "global", "project"],
     });
-    mocks.read.mockImplementationOnce(() => { throw new Error("metadata failed"); });
+    mocks.readMetadata.mockImplementationOnce(() => { throw new Error("metadata failed"); });
     await handler({} as never, response, JSON.stringify({ session_id: "metadata-failure", cwd: "/ok", messages: [validMessage] }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
-    mocks.read.mockImplementationOnce(() => {
+    mocks.readMetadata.mockImplementationOnce(() => {
       throw Object.assign(new Error("missing metadata"), { code: "ENOENT" });
     });
     await handler({} as never, response, JSON.stringify({ session_id: "metadata-absent", cwd: "/ok", messages: [validMessage] }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
+    expect(mocks.writeMetadata).toHaveBeenCalledTimes(2);
+  });
+
+  it("publishes bounded private metadata after a persisted ingest", async () => {
+    mocks.readMetadata.mockReturnValueOnce(JSON.stringify({ retained: true, lastCompact: "old" }));
+
+    await createIngestHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "private-meta", cwd: "/ok", messages: [validMessage] }),
+    );
+
+    expect(mocks.ensureProjectForIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "pid", canonical: "/ok" }),
+    );
+    expect(mocks.readMetadata).toHaveBeenCalledWith("/lcm/projects/pid/meta.json", {
+      allowedRoot: "/lcm/projects/pid",
+      maxBytes: 1024 * 1024,
+      expectedUid: process.getuid?.(),
+      requireSingleLink: true,
+    });
+    expect(mocks.openMetadataDirectory).toHaveBeenCalledWith("/lcm/projects/pid", {
+      expectedUid: process.getuid?.(),
+    });
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    const [path, serialized, options, parent] = mocks.writeMetadata.mock.calls[0] as [
+      string,
+      string,
+      Record<string, never>,
+      unknown,
+    ];
+    expect(path).toBe("/lcm/projects/pid/meta.json");
+    expect(options).toEqual({});
+    expect(parent).toEqual(expect.objectContaining({ fd: 1 }));
+    expect(JSON.parse(serialized)).toMatchObject({
+      retained: true,
+      lastCompact: "old",
+      cwd: "/ok",
+      lastIngest: expect.any(String),
+    });
+    expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(1024 * 1024);
+    expect(mocks.closeMetadataDirectory).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["malformed JSON", "{"],
+    ["null", "null"],
+    ["array", "[]"],
+    ["primitive", "42"],
+  ])("preserves %s metadata and keeps ingest successful", async (_label, content) => {
+    mocks.readMetadata.mockReturnValueOnce(content);
+
+    await createIngestHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: `invalid-${_label}`, cwd: "/ok", messages: [validMessage] }),
+    );
+
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.openMetadataDirectory).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
+  });
+
+  it("preserves rejected and oversized input metadata", async () => {
+    for (const error of [
+      new Error("metadata owner or topology is not trusted"),
+      new Error("file exceeds the configured size limit"),
+    ]) {
+      mocks.readMetadata.mockImplementationOnce(() => { throw error; });
+      await createIngestHandler(config)(
+        {} as never,
+        response,
+        JSON.stringify({ session_id: error.message, cwd: "/ok", messages: [validMessage] }),
+      );
+    }
+
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
+  });
+
+  it("bounds serialized metadata, closes the parent, and keeps failures best-effort", async () => {
+    mocks.readMetadata.mockReturnValueOnce(JSON.stringify({ retained: "é".repeat(524_288) }));
+    await createIngestHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "expanded-output", cwd: "/ok", messages: [validMessage] }),
+    );
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+
+    mocks.writeMetadata.mockImplementationOnce(() => { throw new Error("atomic publication failed"); });
+    mocks.closeMetadataDirectory.mockImplementationOnce(() => { throw new Error("close failed"); });
+    await createIngestHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "write-close", cwd: "/ok", messages: [validMessage] }),
+    );
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    expect(mocks.closeMetadataDirectory).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
+  });
+
+  it("keeps ingest successful when metadata directory cleanup alone fails", async () => {
+    mocks.closeMetadataDirectory.mockImplementationOnce(() => { throw new Error("close failed"); });
+
+    await createIngestHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "close-only", cwd: "/ok", messages: [validMessage] }),
+    );
+
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    expect(mocks.closeMetadataDirectory).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
+  });
+
+  it("keeps ingest successful when only the metadata writer fails", async () => {
+    mocks.writeMetadata.mockImplementationOnce(() => { throw new Error("atomic publication failed"); });
+
+    await createIngestHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "write-only", cwd: "/ok", messages: [validMessage] }),
+    );
+
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    expect(mocks.closeMetadataDirectory).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
+  });
+
+  it("accepts metadata at the exact byte limit when updated output stays bounded", async () => {
+    const template = {
+      retained: "",
+      cwd: "/ok",
+      lastIngest: "1970-01-01T00:00:00.000Z",
+    };
+    const fixedBytes = Buffer.byteLength(JSON.stringify(template, null, 2) + "\n", "utf8");
+    template.retained = "x".repeat(1024 * 1024 - fixedBytes);
+    const content = JSON.stringify(template, null, 2) + "\n";
+    expect(Buffer.byteLength(content, "utf8")).toBe(1024 * 1024);
+    mocks.readMetadata.mockReturnValueOnce(content);
+
+    await createIngestHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "exact-limit", cwd: "/ok", messages: [validMessage] }),
+    );
+
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    const serialized = mocks.writeMetadata.mock.calls[0]![1] as string;
+    expect(Buffer.byteLength(serialized, "utf8")).toBe(1024 * 1024);
+  });
+
+  it("supports metadata publication without process.getuid", async () => {
+    const originalGetuid = process.getuid;
+    Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+    try {
+      await createIngestHandler(config)(
+        {} as never,
+        response,
+        JSON.stringify({ session_id: "no-uid", cwd: "/ok", messages: [validMessage] }),
+      );
+    } finally {
+      Object.defineProperty(process, "getuid", { configurable: true, value: originalGetuid });
+    }
+    expect(mocks.readMetadata).toHaveBeenCalledWith(
+      "/lcm/projects/pid/meta.json",
+      expect.objectContaining({ expectedUid: undefined }),
+    );
   });
 
   it("returns a stable error without disclosing persistence details and releases connections", async () => {
@@ -302,8 +529,54 @@ describe("ingest persistence boundaries", () => {
       totalTokens: 7,
     });
     expect(mocks.getConnection).toHaveBeenCalledOnce();
-    expect(mocks.ensureProject.mock.invocationCallOrder[0])
+    expect(mocks.ensureProjectForIdentity.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.getConnection.mock.invocationCallOrder[0]);
+  });
+
+  it("keeps PostgreSQL project identity after final publication fails and retry is a no-op", async () => {
+    let metadata: Record<string, unknown> | undefined;
+    mocks.ensureProjectForIdentity.mockImplementation((
+      identity: { id: string; canonical: string },
+      options?: { writeMetadata?: boolean },
+    ) => {
+      if (options?.writeMetadata !== false) metadata = { cwd: identity.canonical };
+      return `/lcm/projects/${identity.id}`;
+    });
+    mocks.writeMetadata.mockImplementationOnce(() => {
+      expect(metadata).toEqual({ cwd: "/ok" });
+      throw new Error("atomic publication failed");
+    });
+    const factory = await createStorageBackendFactory(postgresqlConfig.storage);
+    const handler = createIngestHandler(postgresqlConfig, factory);
+
+    await handler({} as never, response, JSON.stringify({
+      session_id: "postgresql-publication-retry",
+      cwd: "/ok",
+      messages: [validMessage],
+    }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      ingested: 1,
+      totalTokens: 7,
+    });
+    expect(metadata).toEqual({ cwd: "/ok" });
+
+    mocks.sessionGet.mockReturnValue({ message_count: 1 });
+    await handler({} as never, response, JSON.stringify({
+      session_id: "postgresql-publication-retry",
+      cwd: "/ok",
+      messages: [validMessage],
+    }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      ingested: 0,
+      totalTokens: 0,
+    });
+    expect(metadata).toEqual({ cwd: "/ok" });
+    expect(mocks.ensureProjectForIdentity.mock.calls).toEqual([
+      [{ id: "pid", canonical: "/ok" }],
+      [{ id: "pid", canonical: "/ok" }],
+    ]);
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
   });
 
   it("keeps successful SQLite identity ahead of local persistence setup", async () => {
@@ -315,8 +588,8 @@ describe("ingest persistence boundaries", () => {
     }));
 
     expect(mocks.identity.mock.invocationCallOrder[0])
-      .toBeLessThan(mocks.ensureProject.mock.invocationCallOrder[0]);
-    expect(mocks.ensureProject.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.ensureProjectForIdentity.mock.invocationCallOrder[0]);
+    expect(mocks.ensureProjectForIdentity.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.forProject.mock.invocationCallOrder[0]);
     expect(mocks.forProject.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.getConnection.mock.invocationCallOrder[0]);
@@ -336,5 +609,112 @@ describe("ingest persistence boundaries", () => {
     expect(admission).toHaveBeenCalledOnce();
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 0, totalTokens: 0 });
     expect(mocks.getConnection).toHaveBeenCalledOnce();
+  });
+
+  it("blocks live identity drift after selecting scrubber patterns from the preflight identity", async () => {
+    const preflight = {
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      localProjectId: "local-hash-a",
+      canonical: "/work/project",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      machineId: "machine-id",
+      selectedPath: "/work/project",
+    };
+    const live = {
+      ...preflight,
+      canonical: "/work/different",
+    };
+    mocks.identity.mockReturnValueOnce(preflight).mockReturnValueOnce(live);
+    const order: string[] = [];
+    mocks.forProject.mockImplementationOnce(async () => {
+      order.push("scrubber");
+      return { scrubWithCounts: mocks.scrubCounts };
+    });
+    const admission = vi.fn(async (operation: (token: object) => Promise<unknown>) => {
+      order.push("admission");
+      return operation({});
+    });
+
+    await createIngestHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "drift", cwd: preflight.canonical, messages: [validMessage] }),
+      { withPublicationAdmission: admission, signal: new AbortController().signal },
+    );
+
+    const localIdentity = {
+      id: preflight.localProjectId,
+      canonical: preflight.canonical,
+      remoteProjectId: preflight.remoteProjectId,
+    };
+    expect(mocks.pathsForIdentity).toHaveBeenCalledWith(localIdentity);
+    expect(mocks.ensureProjectForIdentity).toHaveBeenCalledWith(localIdentity);
+    expect(mocks.forProject).toHaveBeenCalledWith(
+      config.security.sensitivePatterns,
+      `/lcm/projects/${preflight.localProjectId}`,
+    );
+    expect(order).toEqual(["scrubber", "admission"]);
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    expect(mocks.openProject).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.createBulk).not.toHaveBeenCalled();
+    expect(mocks.logError).not.toHaveBeenCalled();
+  });
+
+  it("blocks PostgreSQL remote-only drift even when there are no messages", async () => {
+    const preflight = {
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      localProjectId: "local-hash-empty",
+      canonical: "/work/empty",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      machineId: "machine-id",
+      selectedPath: "/work/empty",
+    };
+    const live = {
+      ...preflight,
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021",
+    };
+    mocks.identity.mockReturnValueOnce(preflight).mockReturnValueOnce(live);
+
+    await createIngestHandler(postgresqlConfig)(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "remote-drift-empty", cwd: preflight.canonical, messages: [] }),
+      { withPublicationAdmission: operation => operation({}) },
+    );
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    expect(mocks.openProject).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.logError).not.toHaveBeenCalled();
+  });
+
+  it("passes the matching preflight identity through the live storage open", async () => {
+    const identity = {
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      localProjectId: "local-hash-same",
+      canonical: "/work/same",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      machineId: "machine-id",
+      selectedPath: "/work/same",
+    };
+    mocks.identity.mockReturnValue(identity);
+
+    await createIngestHandler(postgresqlConfig)(
+      {} as never,
+      response,
+      JSON.stringify({ session_id: "same", cwd: identity.canonical, messages: [validMessage] }),
+      { withPublicationAdmission: operation => operation({}) },
+    );
+
+    expect(mocks.openProject).toHaveBeenCalledWith(identity, expect.any(Object), expect.any(AbortSignal));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
   });
 });

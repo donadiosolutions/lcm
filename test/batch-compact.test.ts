@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -14,7 +14,8 @@ const FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS = 15_000;
 
 function resetLcmHome(): void {
   rmSync(join(homedir(), ".lcm"), { recursive: true, force: true });
-  mkdirSync(join(homedir(), ".lcm"), { recursive: true });
+  mkdirSync(join(homedir(), ".lcm"), { recursive: true, mode: 0o700 });
+  chmodSync(join(homedir(), ".lcm"), 0o700);
   clearProjectMapCache();
 }
 
@@ -636,26 +637,26 @@ describe("batch compaction discovery", () => {
     expect(findUncompacted(100, true)).toEqual([]);
 
     const projectsDir = join(homedir(), ".lcm", "projects");
-    mkdirSync(projectsDir, { recursive: true });
+    mkdirSync(projectsDir, { recursive: true, mode: 0o700 });
     writeFileSync(join(projectsDir, "not-a-directory"), "ignored");
-    mkdirSync(join(projectsDir, "missing-db"));
+    mkdirSync(join(projectsDir, "missing-db"), { mode: 0o700 });
 
     const corruptMeta = join(projectsDir, "corrupt-meta");
-    mkdirSync(corruptMeta);
+    mkdirSync(corruptMeta, { mode: 0o700 });
     writeFileSync(join(corruptMeta, "db.sqlite"), "not sqlite");
     writeFileSync(join(corruptMeta, "meta.json"), "{");
 
     const missingCwd = join(projectsDir, "missing-cwd");
-    mkdirSync(missingCwd);
+    mkdirSync(missingCwd, { mode: 0o700 });
     writeFileSync(join(missingCwd, "db.sqlite"), "not sqlite");
     writeFileSync(join(missingCwd, "meta.json"), "{}");
 
     const missingMeta = join(projectsDir, "missing-meta");
-    mkdirSync(missingMeta);
+    mkdirSync(missingMeta, { mode: 0o700 });
     seedConversation(join(missingMeta, "db.sqlite"));
 
     const corruptDb = join(projectsDir, "corrupt-db");
-    mkdirSync(corruptDb);
+    mkdirSync(corruptDb, { mode: 0o700 });
     writeFileSync(join(corruptDb, "db.sqlite"), "not sqlite");
     writeFileSync(join(corruptDb, "meta.json"), JSON.stringify({ cwd: "/corrupt" }));
 

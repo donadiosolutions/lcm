@@ -24,6 +24,7 @@ import { StorageOperationError } from "../errors.js";
 import { composeAbortSignals } from "../../daemon/cancellation.js";
 import type {
   PostgreSqlConnectionSettings,
+  PostgreSqlDiagnosticPool,
   PostgreSqlQueryExecutor,
   PostgreSqlQueryOptions,
   PostgreSqlRuntimeHealth,
@@ -51,6 +52,7 @@ const LOCAL_PROJECT_ID_PATTERN = /^[0-9a-f]{64}$/u;
 export interface PostgreSqlFactoryRuntime
 extends PostgreSqlProjectStorageRuntime {
   health(): Promise<PostgreSqlRuntimeHealth>;
+  poolDiagnostics?(): PostgreSqlDiagnosticPool;
   close(): Promise<void>;
 }
 
@@ -339,6 +341,10 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
     );
     if (storage === null) throw initializationError(identity.id, "openProject");
     return storage;
+  }
+
+  getDiagnosticPool(): PostgreSqlDiagnosticPool | undefined {
+    return this.runtime.poolDiagnostics?.();
   }
 
   async health(): Promise<StorageHealth> {

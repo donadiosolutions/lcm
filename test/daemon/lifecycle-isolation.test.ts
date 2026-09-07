@@ -90,7 +90,7 @@ describe("systemd manager command-vector harness", () => {
       "--user",
       "show",
       "--no-pager",
-      "--property=LoadState,ActiveState,SubState,MainPID,Environment,ExecMainStartTimestamp,FragmentPath",
+      "--property=LoadState,ActiveState,SubState,MainPID,ControlGroup,Environment,ExecMainStartTimestamp,FragmentPath",
       unit,
     ] as const;
     const startArgs = ["--user", "--no-block", `--unit=${unit}`, "/usr/bin/env", "-i"] as const;
@@ -1239,6 +1239,7 @@ describe("daemon lifecycle test-scope validation", () => {
         _platform: "darwin",
         _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as never,
         _spawnOverride: vi.fn(() => child) as never,
+        _monotonicNowOverride: () => 0,
         _skipHealthWait: true,
       })).resolves.toMatchObject({
         connected: false,

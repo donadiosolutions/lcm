@@ -358,6 +358,8 @@ describe("lifecycle procfs and parent warnings", () => {
     const hijackedNetstat = vi.fn();
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "win32", hijackedNetstat as never, "/proc", undefined, null)).toEqual([]);
     expect(hijackedNetstat).not.toHaveBeenCalled();
+    expect(__lifecycleTestUtils.resolveLinuxSsPath((path) => path === "/usr/sbin/ss")).toBe("/usr/sbin/ss");
+    expect(__lifecycleTestUtils.resolveLinuxSsPath(() => false)).toBeNull();
 
     const linuxRoot = temp();
     mkdirSync(join(linuxRoot, "42", "fd"), { recursive: true });
@@ -378,6 +380,78 @@ describe("lifecycle procfs and parent warnings", () => {
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 3333)).toEqual([]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, linuxRoot, 3737)).toEqual([3737]);
     expect(__lifecycleTestUtils.findListeningTcpPorts(42, "linux", vi.fn() as never, join(linuxRoot, "missing"))).toEqual([]);
+
+    const cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/lcm-daemon-0123456789abcdef0123.service";
+    const cgroupSocketProbe = vi.fn(() => ({
+      status: 0,
+      stdout: `LISTEN 0 511 127.0.0.1:3737 0.0.0.0:* ino:12345 sk:1 cgroup:${cgroup} <->\n`,
+      stderr: "",
+    }));
+    const findWithCgroup = __lifecycleTestUtils.findListeningTcpPorts as unknown as (
+      pid: number,
+      platform: NodeJS.Platform,
+      spawnSyncImpl: typeof import("node:child_process").spawnSync,
+      procRoot: string,
+      targetPort: number,
+      windowsNetstatPath: string | null,
+      systemdControlGroup: string,
+      linuxSsPath: string | null,
+    ) => number[];
+    const unreadableRoot = temp();
+    mkdirSync(join(unreadableRoot, "42", "fd"), { recursive: true });
+    writeFileSync(join(unreadableRoot, "42", "fd", "7"), "not a descriptor link");
+    expect(findWithCgroup(42, "linux", cgroupSocketProbe as never, unreadableRoot, 3737, null, cgroup, "/usr/bin/ss")).toEqual([3737]);
+    expect(cgroupSocketProbe).toHaveBeenCalledWith(
+      "/usr/bin/ss",
+      ["-H", "-ltnpe4", "sport = :3737"],
+      expect.objectContaining({ shell: false, windowsHide: true }),
+    );
+
+    const mixedOwnership = vi.fn(() => ({
+      status: 0,
+      stdout: [
+        `LISTEN 0 511 127.0.0.1:3737 0.0.0.0:* ino:12345 sk:1 cgroup:${cgroup} <->`,
+        "LISTEN 0 511 127.0.0.1:3737 0.0.0.0:* ino:67890 sk:2 cgroup:/user.slice/foreign.service <->",
+      ].join("\n"),
+      stderr: "",
+    }));
+    expect(findWithCgroup(42, "linux", mixedOwnership as never, join(linuxRoot, "missing"), 3737, null, cgroup, "/usr/bin/ss")).toEqual([]);
+    expect(findWithCgroup(42, "linux", vi.fn() as never, join(linuxRoot, "missing"), 3737, null, "relative", "/usr/bin/ss")).toEqual([]);
+    expect(findWithCgroup(42, "linux", vi.fn() as never, join(linuxRoot, "missing"), 3737, null, cgroup, null)).toEqual([]);
+    expect(findWithCgroup(42, "linux", vi.fn() as never, join(linuxRoot, "missing"), 0, null, cgroup, "/usr/bin/ss")).toEqual([]);
+    expect(findWithCgroup(42, "linux", vi.fn() as never, join(linuxRoot, "missing"), 65_536, null, cgroup, "/usr/bin/ss")).toEqual([]);
+    expect(findWithCgroup(42, "linux", vi.fn() as never, join(linuxRoot, "missing"), Number.NaN, null, cgroup, "/usr/bin/ss")).toEqual([]);
+    expect(findWithCgroup(42, "linux", vi.fn() as never, join(linuxRoot, "missing"), 3737, null, "", "/usr/bin/ss")).toEqual([]);
+    expect(findWithCgroup(42, "linux", vi.fn() as never, join(linuxRoot, "missing"), 3737, null, `/${"x".repeat(4 * 1024)}`, "/usr/bin/ss")).toEqual([]);
+
+    for (const result of [
+      { status: 1, stdout: "", stderr: "failed" },
+      { status: 0, stdout: 1, stderr: "" },
+      { status: 0, stdout: "ESTAB 0 0 127.0.0.1:3737 127.0.0.1:40000", stderr: "" },
+      { status: 0, stdout: "LISTEN 0 511 127.0.0.1:3738 0.0.0.0:* cgroup:/foreign", stderr: "" },
+      { status: 0, stdout: "LISTEN 0 511 127.0.0.1:3737 0.0.0.0:* ino:1", stderr: "" },
+    ]) {
+      expect(findWithCgroup(
+        42,
+        "linux",
+        vi.fn(() => result) as never,
+        join(linuxRoot, "missing"),
+        3737,
+        null,
+        cgroup,
+        "/usr/bin/ss",
+      )).toEqual([]);
+    }
+    expect(findWithCgroup(
+      42,
+      "linux",
+      vi.fn(() => { throw new Error("socket diagnostics failed"); }) as never,
+      join(linuxRoot, "missing"),
+      3737,
+      null,
+      cgroup,
+      "/usr/bin/ss",
+    )).toEqual([]);
 
     expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: false, reason: "missing-pid" })).toContain("PID file missing");
     expect(__lifecycleTestUtils.parentInvariantWarning({ satisfies: false, available: false, pid: 42, reason: "dead-pid" })).toContain("PID 42 is not running");
@@ -576,6 +650,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
       const pidPath = join(dir, `${platform}.pid`); writeFileSync(pidPath, "999999");
       await expect(restartDaemon({
         port: 12, pidFilePath: pidPath, spawnTimeoutMs: 1, _platform: platform, _isProcessAliveOverride: () => true,
+        _linuxSsPathOverride: null,
         _fetchOverride: vi.fn().mockRejectedValue(new Error("down")),
       })).rejects.toThrow("not a verified LCM daemon");
     }
@@ -596,10 +671,13 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "20"); ensureAuthToken(join(dir, "daemon.token"));
     proc(root, 10, "Uid:\t1000\nPPid:\t1\n", "systemd --user");
     proc(root, 20, "Uid:\t1000\nPPid:\t10\n", "node lcm daemon start --foreground");
+    // observeHttpHealth owns a real wall-clock deadline independent of
+    // _monotonicNowOverride, so pin its nested clock for this 1 ms fixture.
+    vi.spyOn(performance, "now").mockReturnValue(0);
     const result = await ensureDaemon({
       port: 13, pidFilePath: pidPath, spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
       _procRoot: root, _uid: 1000, _isProcessAliveOverride: () => true, _fetchOverride: fetchHealthy(20) as never,
-      _listeningPortsOverride: () => [13], _monotonicNowOverride: () => 0, expectedVersion: "1",
+      _listeningPortsOverride: () => [13], _monotonicNowOverride: () => 0, _skipSpawn: true, expectedVersion: "1",
       _supervisorOverride: unavailableSupervisor(),
     });
     expect(result.connected).toBe(true); expect(result.warning).toBeUndefined();

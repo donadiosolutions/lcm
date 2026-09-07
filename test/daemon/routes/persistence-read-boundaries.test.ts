@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   stats: vi.fn(() => ({ projects: 0 })),
   promotedSearch: vi.fn(() => [] as unknown[]),
   recentSummaries: vi.fn(async () => [] as unknown[]),
+  getConversationBySessionId: vi.fn(async () => null),
   projectClose: vi.fn(async () => undefined),
   factoryClose: vi.fn(async () => undefined),
   openProject: vi.fn(),
@@ -48,7 +49,8 @@ vi.mock("../../../src/daemon/server.js", async (importOriginal) => ({
 }));
 vi.mock("../../../src/db/migration.js", () => ({ runLcmMigrations: mocks.migrate }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
-vi.mock("../../../src/retrieval.js", () => ({
+vi.mock("../../../src/retrieval.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/retrieval.js")>(),
   createRetrievalEngine: () => ({
     describe: mocks.describe,
     grep: mocks.grep,
@@ -70,8 +72,13 @@ vi.mock("../../../src/db/promoted.js", () => ({
 vi.mock("../../../src/storage/index.js", () => ({
   createStorageBackendFactory: mocks.createFactory,
 }));
-vi.mock("../../../src/stats.js", () => ({ collectStats: mocks.stats }));
+vi.mock("../../../src/stats.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/stats.js")>(), collectStats: mocks.stats,
+}));
 
+
+import { backendDiagnosticFailure } from "../../../src/storage/diagnostics.js";
+import { StatsUnavailableError } from "../../../src/stats.js";
 import { createDescribeHandler } from "../../../src/daemon/routes/describe.js";
 import { createExpandHandler } from "../../../src/daemon/routes/expand.js";
 import { createGrepHandler } from "../../../src/daemon/routes/grep.js";
@@ -167,8 +174,9 @@ describe("persistence read route boundaries", () => {
     mocks.stats.mockReturnValue({ projects: 0 });
     mocks.promotedSearch.mockReturnValue([]);
     mocks.recentSummaries.mockResolvedValue([]);
+    mocks.getConversationBySessionId.mockResolvedValue(null);
     const project = {
-      conversations: {}, summaries: { listRecentSummaries: mocks.recentSummaries },
+      conversations: { getConversationBySessionId: mocks.getConversationBySessionId }, summaries: { listRecentSummaries: mocks.recentSummaries },
       largeFiles: {}, lexicalSearch: { searchPromoted: mocks.promotedSearch },
       close: mocks.projectClose,
     };
@@ -192,9 +200,9 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { node: { id: "node" } });
     expect(mocks.projectClose).toHaveBeenCalled();
     expect(mocks.factoryClose).toHaveBeenCalled();
-    mocks.describe.mockRejectedValueOnce(new Error("describe broke"));
+    mocks.describe.mockRejectedValueOnce(new Error("SQLITE_CONSTRAINT at /private/describe.db"));
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
-    expectLast(200, { node: null, error: "describe broke" });
+    expectLast(200, { node: null, error: "database constraint error" });
     expect(mocks.projectClose).toHaveBeenCalled();
     mocks.describe.mockRejectedValueOnce("failure");
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
@@ -206,6 +214,79 @@ describe("persistence read route boundaries", () => {
     await invoke(createDescribeHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())), { nodeId: "n", cwd: "/ok" });
     expectLast(503, {
       ...storageFailure("summaries", "describe").toJSON(),
+    });
+  });
+
+  it("sanitizes nested file URLs in describe read errors", async () => {
+    mocks.describe.mockRejectedValueOnce(
+      new Error("read failed for https://outer.test/x?next=file://host.invalid/Users/canary/private.db"),
+    );
+    await invoke(createDescribeHandler(config), { nodeId: "n", cwd: "/ok" });
+    expectLast(200, {
+      node: null,
+      error: "read failed for https://outer.test/x?next=file://host.invalid<path>",
+    });
+  });
+
+  it("sanitizes nested file URLs in expand read errors", async () => {
+    mocks.expand.mockRejectedValueOnce(
+      new Error("expand failed for https://outer.test/x?next=file://host.invalid/Users/canary/private.db"),
+    );
+    await invoke(createExpandHandler(config), { nodeId: "n", cwd: "/ok" });
+    expect(mocks.expand).toHaveBeenCalled();
+    expectLast(200, {
+      expanded: null,
+      error: "expand failed for https://outer.test/x?next=file://host.invalid<path>",
+    });
+  });
+
+  it("preserves adjacent nested file URL schemes in describe wire errors", async () => {
+    mocks.describe.mockRejectedValueOnce(
+      new Error(
+        "read failed for https://outer.test/x?q=file://h.invalid/Users/a-file://h2.invalid/Users/b",
+      ),
+    );
+    await invoke(createDescribeHandler(config), { nodeId: "n", cwd: "/ok" });
+    expectLast(200, {
+      node: null,
+      error: "read failed for https://outer.test/x?q=file://h.invalid<path>file://h2.invalid<path>",
+    });
+  });
+
+  it("preserves adjacent nested file URL schemes in expand wire errors", async () => {
+    mocks.expand.mockRejectedValueOnce(
+      new Error(
+        "expand failed for https://outer.test/x?q=file://h.invalid/Users/a-file://h2.invalid/Users/b",
+      ),
+    );
+    await invoke(createExpandHandler(config), { nodeId: "n", cwd: "/ok" });
+    expect(mocks.expand).toHaveBeenCalled();
+    expectLast(200, {
+      expanded: null,
+      error: "expand failed for https://outer.test/x?q=file://h.invalid<path>file://h2.invalid<path>",
+    });
+  });
+
+  it("sanitizes adjacent post-bracket paths in describe read errors", async () => {
+    mocks.describe.mockRejectedValueOnce(
+      new Error("read failed for file://host.invalid[/Users/canary/one.db]/Users/canary/two.db"),
+    );
+    await invoke(createDescribeHandler(config), { nodeId: "n", cwd: "/ok" });
+    expectLast(200, {
+      node: null,
+      error: "read failed for file://host.invalid[<path>]<path>",
+    });
+  });
+
+  it("sanitizes adjacent post-bracket paths in expand read errors", async () => {
+    mocks.expand.mockRejectedValueOnce(
+      new Error("expand failed for file://host.invalid[/Users/canary/one.db]/Users/canary/two.db"),
+    );
+    await invoke(createExpandHandler(config), { nodeId: "n", cwd: "/ok" });
+    expect(mocks.expand).toHaveBeenCalled();
+    expectLast(200, {
+      expanded: null,
+      error: "expand failed for file://host.invalid[<path>]<path>",
     });
   });
 
@@ -244,9 +325,10 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { expanded: null, error: "project not found" });
     await invoke(handler, { nodeId: "n", cwd: "/ok", depth: 3 });
     expect(mocks.expand).toHaveBeenLastCalledWith({ summaryIds: ["n"], maxDepth: 3 });
-    mocks.expand.mockRejectedValueOnce(new Error("expand broke"));
+    expectLast(200, { expanded: ["node"] });
+    mocks.expand.mockRejectedValueOnce(new Error("expand failed at C:\\Users\\operator\\private.db"));
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
-    expectLast(200, { expanded: null, error: "expand broke" });
+    expectLast(200, { expanded: null, error: "expand failed at <path>" });
     expect(mocks.projectClose).toHaveBeenCalled();
     mocks.expand.mockRejectedValueOnce("failure");
     await invoke(handler, { nodeId: "n", cwd: "/ok" });
@@ -260,25 +342,226 @@ describe("persistence read route boundaries", () => {
     });
   });
 
+  it("rejects malformed expand depths before cwd and storage admission", async () => {
+    const malformed = [
+      '{"nodeId":"n","cwd":"/ok","depth":null}',
+      '{"nodeId":"n","cwd":"/ok","depth":"1"}',
+      '{"nodeId":"n","cwd":"/ok","depth":true}',
+      '{"nodeId":"n","cwd":"/ok","depth":false}',
+      '{"nodeId":"n","cwd":"/ok","depth":[]}',
+      '{"nodeId":"n","cwd":"/ok","depth":{}}',
+      '{"nodeId":"n","cwd":"/ok","depth":0}',
+      '{"nodeId":"n","cwd":"/ok","depth":-0}',
+      '{"nodeId":"n","cwd":"/ok","depth":-1}',
+      '{"nodeId":"n","cwd":"/ok","depth":1.5}',
+      '{"nodeId":"n","cwd":"/ok","depth":1e400}',
+      '{"nodeId":"n","cwd":"/ok","depth":-1e400}',
+      '{"nodeId":"n","depth":null}',
+      '{"nodeId":"n","cwd":"/bad","depth":1e400}',
+    ];
+    const handlers = [
+      createExpandHandler(config),
+      createExpandHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())),
+    ];
+
+    for (const handler of handlers) {
+      for (const body of malformed) {
+        mocks.send.mockClear();
+        mocks.writeHead.mockClear();
+        mocks.end.mockClear();
+        mocks.validate.mockClear();
+        mocks.projectIdentity.mockClear();
+        mocks.projectExists.mockClear();
+        mocks.openProject.mockClear();
+        mocks.createFactory.mockClear();
+        mocks.expand.mockClear();
+
+        await invoke(handler, body);
+
+        expectLast(400, { error: "invalid depth" });
+        expect(mocks.validate).not.toHaveBeenCalled();
+        expect(mocks.projectIdentity).not.toHaveBeenCalled();
+        expect(mocks.projectExists).not.toHaveBeenCalled();
+        expect(mocks.openProject).not.toHaveBeenCalled();
+        expect(mocks.createFactory).not.toHaveBeenCalled();
+        expect(mocks.expand).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it("rejects non-object expand bodies before cwd and storage admission", async () => {
+    const openExistingProject = vi.fn(async () => {
+      throw new Error("storage admission should not run for invalid body shape");
+    });
+    const factory = { ...postgresqlFactory(injectedFactory()), openExistingProject };
+    const handlers = [
+      createExpandHandler(config),
+      createExpandHandler(postgresqlConfig(), factory),
+    ];
+    const bodies = ["null", "[]", "\"text\"", "1", "true", "false"];
+
+    for (const handler of handlers) {
+      for (const body of bodies) {
+        mocks.send.mockClear();
+        mocks.writeHead.mockClear();
+        mocks.end.mockClear();
+        mocks.validate.mockClear();
+        mocks.projectIdentity.mockClear();
+        mocks.projectExists.mockClear();
+        mocks.openProject.mockClear();
+        mocks.createFactory.mockClear();
+        mocks.expand.mockClear();
+
+        await expect(invoke(handler, body)).resolves.toBeUndefined();
+
+        expectLast(400, { error: "invalid request body" });
+        expect(mocks.validate).not.toHaveBeenCalled();
+        expect(mocks.projectIdentity).not.toHaveBeenCalled();
+        expect(mocks.projectExists).not.toHaveBeenCalled();
+        expect(mocks.openProject).not.toHaveBeenCalled();
+        expect(mocks.createFactory).not.toHaveBeenCalled();
+        expect(mocks.expand).not.toHaveBeenCalled();
+        expect(openExistingProject).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it("preserves expand JSON syntax errors and object validation", async () => {
+    await expect(invoke(createExpandHandler(config), "{"))
+      .rejects.toBeInstanceOf(SyntaxError);
+
+    await invoke(createExpandHandler(config), "{}");
+    expectLast(400, { error: "nodeId is required" });
+  });
+
+  it("preserves nodeId precedence when depth is invalid", async () => {
+    const handler = createExpandHandler(config);
+    await invoke(handler, '{"cwd":"/bad","depth":null}');
+    expectLast(400, { error: "nodeId is required" });
+    expect(mocks.validate).not.toHaveBeenCalled();
+    expect(mocks.projectIdentity).not.toHaveBeenCalled();
+    expect(mocks.expand).not.toHaveBeenCalled();
+  });
+
+  it("forwards omitted and positive integer depths unchanged", async () => {
+    const handler = createExpandHandler(config);
+    for (const [body, expected] of [
+      ['{"nodeId":"n","cwd":"/ok"}', 1],
+      ['{"nodeId":"n","cwd":"/ok","depth":1}', 1],
+      ['{"nodeId":"n","cwd":"/ok","depth":2}', 2],
+      ['{"nodeId":"n","cwd":"/ok","depth":9007199254740991}', 9007199254740991],
+    ] as const) {
+      mocks.expand.mockClear();
+      await invoke(handler, body);
+      expectLast(200, { expanded: ["node"] });
+      expect(mocks.expand).toHaveBeenLastCalledWith({ summaryIds: ["n"], maxDepth: expected });
+    }
+  });
+
   it("covers grep validation, defaults, missing projects, success, and failure", async () => {
     const handler = createGrepHandler(config);
     await invoke(handler, "");
     expectLast(400, { error: "query is required" });
+    await invoke(handler, { query: "q", scope: "invalid" });
+    expectLast(400, { error: "invalid scope" });
+    mocks.validate.mockClear();
+    await invoke(handler, { query: "q", cwd: "/bad", scope: "invalid" });
+    expectLast(400, { error: "invalid scope" });
+    expect(mocks.validate).not.toHaveBeenCalled();
+    for (const mode of [null, 1, [], {}, "unknown"]) {
+      mocks.validate.mockClear();
+      const projectExistsCalls = mocks.projectExists.mock.calls.length;
+      await invoke(handler, { query: "q", cwd: "/bad", mode });
+      expectLast(400, { error: "invalid mode" });
+      expect(mocks.validate).not.toHaveBeenCalled();
+      expect(mocks.projectExists.mock.calls.length).toBe(projectExistsCalls);
+    }
+    mocks.validate.mockClear();
+    const projectExistsCalls = mocks.projectExists.mock.calls.length;
+    await invoke(handler, { query: "q", cwd: "/bad", mode: null, scope: "invalid" });
+    expectLast(400, { error: "invalid mode" });
+    expect(mocks.validate).not.toHaveBeenCalled();
+    expect(mocks.projectExists.mock.calls.length).toBe(projectExistsCalls);
+    await invoke(handler, { query: "q", scope: "all" });
+    expectLast(200, { matches: [] });
     await invoke(handler, { query: "q" });
     expectLast(200, { matches: [] });
     mocks.validate.mockImplementationOnce(() => { throw new Error("bad cwd"); });
     await invoke(handler, { query: "q", cwd: "/bad" });
     expectLast(200, { matches: [] });
+    mocks.validate.mockImplementationOnce(() => { throw new Error("bad cwd"); });
+    await invoke(handler, { query: "q", cwd: "/bad", sessionId: "session" });
+    expectLast(200, { matches: [] });
     mocks.projectExists.mockResolvedValueOnce(false);
     await invoke(handler, { query: "q", cwd: "/missing" });
     expectLast(200, { matches: [] });
+    mocks.projectExists.mockResolvedValueOnce(false);
+    await invoke(handler, { query: "q", cwd: "/missing", sessionId: "session" });
+    expectLast(200, { matches: [] });
     await invoke(handler, { query: "q", cwd: "/ok" });
     expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "both", since: undefined });
-    await invoke(handler, { query: "q", cwd: "/ok", mode: "regex", scope: "messages", since: "2025" });
-    expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "regex", scope: "messages", since: "2025" });
+    expect(mocks.getConversationBySessionId).not.toHaveBeenCalled();
+    await invoke(handler, { query: "q", cwd: "/ok", mode: "full_text", scope: "messages" });
+    expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "messages", since: undefined });
+    await invoke(handler, {
+      query: "q",
+      cwd: "/ok",
+      mode: "regex",
+      scope: "messages",
+      since: "2025-01-02T03:04:05.006+05:30",
+    });
+    expect(mocks.grep).toHaveBeenLastCalledWith({
+      query: "q",
+      mode: "regex",
+      scope: "messages",
+      since: new Date("2025-01-01T21:34:05.006Z"),
+    });
+    await invoke(handler, { query: "q", cwd: "/ok", scope: "summaries" });
+    expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "summaries", since: undefined });
+    await invoke(handler, { query: "q", cwd: "/ok", scope: "all" });
+    expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "both", since: undefined });
+    const sessionId = " exact-session-id ";
+    mocks.getConversationBySessionId.mockResolvedValueOnce({ conversationId: 42, sessionId } as never);
+    await invoke(handler, { query: "q", cwd: "/ok", sessionId, scope: "messages" });
+    expect(mocks.getConversationBySessionId).toHaveBeenLastCalledWith(sessionId);
+    expect(mocks.grep).toHaveBeenLastCalledWith({
+      query: "q", mode: "full_text", scope: "messages", since: undefined, conversationId: 42,
+    });
+    mocks.getConversationBySessionId.mockResolvedValueOnce(null);
+    mocks.grep.mockClear();
+    await invoke(handler, { query: "q", cwd: "/ok", sessionId: "unknown" });
+    expectLast(200, { messages: [], summaries: [], totalMatches: 0 });
+    expect(mocks.grep).not.toHaveBeenCalled();
+    const malformedSessionIds: unknown[] = [null, [], {}, false, 1, "", "   ", "bad\0session"];
+    for (const malformed of malformedSessionIds) {
+      mocks.validate.mockClear();
+      const openCalls = mocks.openProject.mock.calls.length;
+      await invoke(handler, { query: "q", cwd: "/ok", sessionId: malformed });
+      expectLast(400, { error: "invalid sessionId" });
+      expect(mocks.validate).not.toHaveBeenCalled();
+      expect(mocks.openProject.mock.calls.length).toBe(openCalls);
+    }
     mocks.grep.mockRejectedValueOnce(new Error("grep broke"));
     await invoke(handler, { query: "q", cwd: "/ok" });
     expectLast(200, { matches: [] });
+    mocks.getConversationBySessionId.mockRejectedValueOnce(new Error("session lookup broke"));
+    await invoke(handler, { query: "q", cwd: "/ok", sessionId: "lookup-failure" });
+    expectLast(200, { matches: [] });
+    expect(mocks.projectClose).toHaveBeenCalled();
+    const lookupStorageFailure = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      "/ok",
+      "conversations",
+      "getConversationBySessionId",
+    );
+    mocks.getConversationBySessionId.mockRejectedValueOnce(lookupStorageFailure);
+    await invoke(
+      createGrepHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())),
+      { query: "q", cwd: "/ok", sessionId: "lookup-storage-failure" },
+    );
+    expectLast(503, { ...lookupStorageFailure.toJSON() });
+    expect(mocks.projectClose).toHaveBeenCalled();
     await invoke(createGrepHandler(config, injectedFactory()), { query: "q", cwd: "/ok" });
     const failure = storageFailure("lexical-search", "grep");
     mocks.grep.mockRejectedValueOnce(failure);
@@ -286,6 +569,111 @@ describe("persistence read route boundaries", () => {
     expectLast(503, {
       ...failure.toJSON(),
     });
+  });
+
+  it("normalizes supported UTC years and rejects invalid since values before storage", async () => {
+    const handler = createGrepHandler(config);
+    const valid = [
+      ["0001-01-01T00:00:00Z", "0001-01-01T00:00:00.000Z"],
+      ["0000-12-31T23:00:00-01:00", "0001-01-01T00:00:00.000Z"],
+      ["0001-01-01T00:01:00+00:01", "0001-01-01T00:00:00.000Z"],
+      ["2024-02-29T23:59:59Z", "2024-02-29T23:59:59.000Z"],
+      ["2000-02-29T00:00:00Z", "2000-02-29T00:00:00.000Z"],
+      ["2025-01-01T00:00:00+23:59", "2024-12-31T00:01:00.000Z"],
+      ["2025-12-31T23:59:59.1-02:30", "2026-01-01T02:29:59.100Z"],
+      ["2025-06-15T12:34:56.999Z", "2025-06-15T12:34:56.999Z"],
+      ["9999-12-31T23:59:59.999Z", "9999-12-31T23:59:59.999Z"],
+      ["9999-12-31T23:58:59.999-00:01", "9999-12-31T23:59:59.999Z"],
+      ["9999-12-31T22:59:59.999-01:00", "9999-12-31T23:59:59.999Z"],
+    ] as const;
+
+    for (const [input, expected] of valid) {
+      await invoke(handler, { query: "q", cwd: "/ok", since: input });
+      const since = mocks.grep.mock.calls.at(-1)?.[0].since;
+      expect(since).toBeInstanceOf(Date);
+      expect((since as Date).toISOString()).toBe(expected);
+    }
+
+    mocks.getConversationBySessionId.mockResolvedValueOnce({ conversationId: 42 } as never);
+    await invoke(handler, {
+      query: "q",
+      cwd: "/ok",
+      sessionId: "session",
+      since: "2025-01-01T00:00:00Z",
+    });
+    const sessionSince = mocks.grep.mock.calls.at(-1)?.[0].since;
+    expect(sessionSince).toBeInstanceOf(Date);
+    expect((sessionSince as Date).toISOString()).toBe("2025-01-01T00:00:00.000Z");
+
+    await invoke(
+      createGrepHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())),
+      { query: "q", cwd: "/ok", since: "2025-01-01T00:00:00Z" },
+    );
+    const postgresqlSince = mocks.grep.mock.calls.at(-1)?.[0].since;
+    expect(postgresqlSince).toBeInstanceOf(Date);
+    expect((postgresqlSince as Date).toISOString()).toBe("2025-01-01T00:00:00.000Z");
+
+    const canonical = (postgresqlSince as Date).toISOString();
+    await invoke(handler, { query: "q", cwd: "/ok", since: canonical });
+    expect((mocks.grep.mock.calls.at(-1)?.[0].since as Date).toISOString()).toBe(canonical);
+
+    const malformed: unknown[] = [
+      null,
+      1,
+      [],
+      {},
+      "",
+      "   ",
+      "2025",
+      "2025-01-01",
+      "2025-01-01T00:00:00",
+      "2025-01-00T00:00:00Z",
+      "2025-01-01T00:00:00.1234Z",
+      "2025-01-01T00:00:00Zjunk",
+      "2025-00-01T00:00:00Z",
+      "2025-13-01T00:00:00Z",
+      "2025-02-29T00:00:00Z",
+      "1900-02-29T00:00:00Z",
+      "2024-02-30T00:00:00Z",
+      "2025-04-31T00:00:00Z",
+      "2025-01-01T24:00:00Z",
+      "2025-01-01T00:60:00Z",
+      "2025-01-01T00:00:60Z",
+      "2025-01-01T00:00:00+24:00",
+      "2025-01-01T00:00:00+00:60",
+      "0000-12-31T23:59:59.999Z",
+      "0001-01-01T00:00:00+00:01",
+      "0000-01-01T00:00:00Z",
+      "0000-02-29T00:00:00Z",
+      "0000-01-01T00:00:00+00:01",
+      "9999-12-31T23:59:00.000-00:01",
+      "9999-12-31T23:59:59.999-00:01",
+    ];
+    const handlers = [
+      handler,
+      createGrepHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())),
+    ];
+    for (const candidate of handlers) {
+      for (const since of malformed) {
+        mocks.validate.mockClear();
+        const openCalls = mocks.openProject.mock.calls.length;
+        const grepCalls = mocks.grep.mock.calls.length;
+        await invoke(candidate, { query: "q", cwd: "/bad", since });
+        expectLast(400, { error: "invalid since" });
+        expect(mocks.validate).not.toHaveBeenCalled();
+        expect(mocks.openProject.mock.calls.length).toBe(openCalls);
+        expect(mocks.grep.mock.calls.length).toBe(grepCalls);
+      }
+    }
+
+    await invoke(handler, {
+      query: "q",
+      cwd: "/bad",
+      sessionId: null,
+      since: "not-a-date",
+    });
+    expectLast(400, { error: "invalid sessionId" });
+    expect(mocks.validate).not.toHaveBeenCalled();
   });
 
   it("covers recent validation, missing projects, defaults, success, and failure", async () => {
@@ -327,27 +715,114 @@ describe("persistence read route boundaries", () => {
     });
   });
 
-  it("covers pool and aggregate stats success and failure payloads", async () => {
-    await invoke(createPoolStatsHandler(), {});
-    expectLast(200, { totalConnections: 0 });
-    mocks.poolStats.mockImplementationOnce(() => { throw new Error("pool broke"); });
-    await invoke(createPoolStatsHandler(), {});
-    expectLast(500, { error: "pool broke" });
-    mocks.poolStats.mockImplementationOnce(() => { throw "failure"; });
-    await invoke(createPoolStatsHandler(), {});
-    expectLast(500, { error: "pool stats failed" });
+  it("rejects malformed recent limits before cwd and storage admission", async () => {
+    const malformed = [
+      '{"limit":null}',
+      '{"cwd":"/bad","limit":null}',
+      '{"cwd":"/ok","limit":null}',
+      '{"cwd":"/ok","limit":"5"}',
+      '{"cwd":"/ok","limit":true}',
+      '{"cwd":"/ok","limit":{}}',
+      '{"cwd":"/ok","limit":[]}',
+      '{"cwd":"/ok","limit":0}',
+      '{"cwd":"/ok","limit":-0}',
+      '{"cwd":"/ok","limit":-1}',
+      '{"cwd":"/ok","limit":1.5}',
+      '{"cwd":"/ok","limit":1e400}',
+      '{"cwd":"/ok","limit":-1e400}',
+      '{"cwd":"/ok","limit":1001}',
+    ];
+    const handlers = [
+      createRecentHandler(config),
+      createRecentHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())),
+    ];
 
-    await invoke(createStatsHandler(), {});
+    for (const handler of handlers) {
+      for (const body of malformed) {
+        mocks.send.mockClear();
+        mocks.writeHead.mockClear();
+        mocks.end.mockClear();
+        mocks.validate.mockClear();
+        mocks.projectIdentity.mockClear();
+        mocks.projectExists.mockClear();
+        mocks.openProject.mockClear();
+        mocks.recentSummaries.mockClear();
+        mocks.createFactory.mockClear();
+
+        await invoke(handler, body);
+
+        expectLast(400, { error: "invalid limit" });
+        expect(mocks.validate).not.toHaveBeenCalled();
+        expect(mocks.projectIdentity).not.toHaveBeenCalled();
+        expect(mocks.projectExists).not.toHaveBeenCalled();
+        expect(mocks.openProject).not.toHaveBeenCalled();
+        expect(mocks.recentSummaries).not.toHaveBeenCalled();
+        expect(mocks.createFactory).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it("forwards bounded recent limits and preserves valid cwd fallbacks", async () => {
+    const handler = createRecentHandler(config);
+    for (const [body, expected] of [
+      [{ cwd: "/ok", limit: 1 }, 1],
+      [{ cwd: "/ok", limit: 5 }, 5],
+      [{ cwd: "/ok", limit: 1000 }, 1000],
+      [{ cwd: "/ok" }, 5],
+    ] as const) {
+      mocks.recentSummaries.mockClear();
+      await invoke(handler, body);
+      expectLast(200, { summaries: [] });
+      expect(mocks.recentSummaries).toHaveBeenLastCalledWith(expected);
+    }
+
+    mocks.recentSummaries.mockClear();
+    await invoke(handler, { limit: 1 });
+    expectLast(200, { summaries: [] });
+    expect(mocks.recentSummaries).not.toHaveBeenCalled();
+
+    mocks.validate.mockImplementationOnce(() => { throw new Error("bad cwd"); });
+    await invoke(handler, { cwd: "/bad", limit: 1 });
+    expectLast(200, { summaries: [] });
+    expect(mocks.recentSummaries).not.toHaveBeenCalled();
+  });
+
+  it("returns common diagnostic snapshots and sanitizes aggregate failures", async () => {
+    const diagnostics = backendDiagnosticFailure(new Error("private diagnostic canary"), "sqlite");
+    const factory = injectedFactory();
+    const controller = new AbortController();
+    mocks.stats.mockReturnValueOnce({ projects: 0, backendDiagnostics: diagnostics } as never);
+    await invoke(createPoolStatsHandler("/configured-home", factory), {}, { signal: controller.signal });
+    expectLast(200, { backendDiagnostics: diagnostics });
+    expect(mocks.stats).toHaveBeenCalledWith({ homeDir: "/configured-home", storageFactory: factory, signal: controller.signal });
+
+    await invoke(createStatsHandler("/configured-home", factory), {}, { signal: controller.signal });
     expectLast(200, { projects: 0 });
-    mocks.stats.mockImplementationOnce(() => { throw new Error("stats broke"); });
+    expect(mocks.stats).toHaveBeenCalledWith({ homeDir: "/configured-home", storageFactory: factory, signal: controller.signal });
+    mocks.stats.mockImplementationOnce(() => { throw new Error("private diagnostic canary"); });
     await invoke(createStatsHandler(), {});
-    expectLast(500, { error: "Stats collection failed" });
+    expectLast(200, { backendDiagnostics: backendDiagnosticFailure(new Error("unobserved")) });
+    mocks.stats.mockImplementationOnce(() => { throw new StatsUnavailableError(diagnostics); });
+    await invoke(createStatsHandler(), {});
+    expectLast(200, { backendDiagnostics: diagnostics });
+    expect(JSON.stringify(mocks.end.mock.calls)).not.toContain("private diagnostic canary");
   });
 
   it("covers layered search validation, filtering, failures, and disabled layers", async () => {
     const handler = createSearchHandler(config);
     await invoke(handler, "");
     expectLast(400, { error: "query is required" });
+    await invoke(handler, { query: "q", layers: ["invalid"] });
+    expectLast(400, { error: "invalid layers" });
+    await invoke(handler, { query: "q", layers: "episodic" });
+    expectLast(400, { error: "invalid layers" });
+    mocks.validate.mockClear();
+    await invoke(handler, { query: "q", cwd: "/bad", layers: ["invalid"] });
+    expectLast(400, { error: "invalid layers" });
+    expect(mocks.validate).not.toHaveBeenCalled();
+    await invoke(handler, { query: "q", layers: ["semantic"] });
+    expectLast(200, { episodic: [], promoted: [] });
+    expect(mocks.promotedSearch).not.toHaveBeenCalled();
     mocks.validate.mockImplementationOnce(() => { throw new Error("bad cwd"); });
     await invoke(handler, { query: "q", cwd: "/bad" });
     expectLast(400, { error: "bad cwd" });
@@ -361,18 +836,40 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { episodic: [], promoted: [] });
 
     mocks.grep.mockResolvedValueOnce({
-      messages: [{ id: "match", tags: ["a", "b"] }, { id: "wrong", tags: ["b"] }],
-      summaries: [{ id: "untagged", tags: "a" }],
+      messages: [
+        { messageId: 1, conversationId: 2, role: "user", snippet: "first", createdAt: new Date("2025-01-02") },
+        { messageId: 2, conversationId: 2, role: "user", snippet: "second", createdAt: new Date("2025-01-01") },
+      ],
+      summaries: [{ summaryId: "untagged", conversationId: 2, kind: "leaf", snippet: "summary", createdAt: new Date("2024-12-31") }],
       matches: [],
     });
     mocks.promotedSearch.mockResolvedValueOnce([{ id: "promoted" }]);
-    await invoke(handler, { query: "q", cwd: "/ok", tags: ["a"], limit: 1 });
-    expectLast(200, { episodic: [{ id: "match", tags: ["a", "b"] }], promoted: [{ id: "promoted" }] });
-    expect(mocks.promotedSearch).toHaveBeenLastCalledWith("q", 1, ["a"]);
+    await invoke(handler, { query: "q", cwd: "/ok", tags: ["a"], limit: 2 });
+    expectLast(200, {
+      episodic: [
+        { messageId: 1, conversationId: 2, role: "user", snippet: "first", createdAt: "2025-01-02T00:00:00.000Z" },
+        { messageId: 2, conversationId: 2, role: "user", snippet: "second", createdAt: "2025-01-01T00:00:00.000Z" },
+      ],
+      promoted: [{ id: "promoted" }],
+    });
+    expect(mocks.grep).toHaveBeenLastCalledWith({ query: "q", mode: "full_text", scope: "both", limit: 50 });
+    expect(mocks.promotedSearch).toHaveBeenLastCalledWith("q", 2, ["a"]);
 
-    mocks.grep.mockResolvedValueOnce({ messages: [{ id: "all" }], summaries: [], matches: [] });
+    mocks.promotedSearch.mockResolvedValueOnce([{ id: "legacy-promoted" }]);
+    await invoke(handler, { query: "q", cwd: "/ok", layers: ["semantic"] });
+    expectLast(200, { episodic: [], promoted: [{ id: "legacy-promoted" }] });
+    expect(mocks.promotedSearch).toHaveBeenLastCalledWith("q", 5, undefined);
+
+    mocks.grep.mockResolvedValueOnce({
+      messages: [{ messageId: 3, conversationId: 2, role: "user", snippet: "all", createdAt: new Date("2025-01-03") }],
+      summaries: [],
+      matches: [],
+    });
     await invoke(handler, { query: "q", cwd: "/ok", tags: [], layers: ["episodic"] });
-    expectLast(200, { episodic: [{ id: "all" }], promoted: [] });
+    expectLast(200, {
+      episodic: [{ messageId: 3, conversationId: 2, role: "user", snippet: "all", createdAt: "2025-01-03T00:00:00.000Z" }],
+      promoted: [],
+    });
     await invoke(handler, { query: "q", cwd: "/ok", tags: "invalid", layers: [] });
     expectLast(200, { episodic: [], promoted: [] });
 
@@ -431,6 +928,19 @@ describe("persistence read route boundaries", () => {
       await invoke(handler, body);
     }
 
+    expect(openExistingProject).not.toHaveBeenCalled();
+  });
+
+  it("rejects invalid search contracts before cwd or storage admission", async () => {
+    const openExistingProject = vi.fn(async () => {
+      throw new Error("storage admission should not run for invalid contract");
+    });
+    const factory = { ...postgresqlFactory(injectedFactory()), openExistingProject };
+    mocks.validate.mockClear();
+    await invoke(createSearchHandler(postgresqlConfig(), factory), { query: "q", cwd: "/bad", layers: ["nope"] });
+    await invoke(createGrepHandler(postgresqlConfig(), factory), { query: "q", cwd: "/bad", scope: "nope" });
+    expectLast(400, { error: "invalid scope" });
+    expect(mocks.validate).not.toHaveBeenCalled();
     expect(openExistingProject).not.toHaveBeenCalled();
   });
 

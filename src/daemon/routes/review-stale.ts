@@ -26,6 +26,10 @@ export function createReviewStaleHandler(config: DaemonConfig, storageFactory?: 
       sendJson(res, 400, { error: "Invalid JSON body" });
       return;
     }
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      sendJson(res, 400, { error: "invalid request body" });
+      return;
+    }
 
     if (!input.cwd) {
       sendJson(res, 400, { error: "cwd is required" });

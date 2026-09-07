@@ -41,20 +41,21 @@
   ],
   "scripts": {
     "build": "tsc",
-    "postbuild": "mkdir -p dist/src/prompts && cp -r src/prompts/*.yaml dist/src/prompts/ && rm -rf dist/src/connectors/templates && rm -f dist/src/connectors/operation-catalog.js dist/src/connectors/operation-catalog.d.ts dist/src/connectors/operation-catalog.js.map && mkdir -p dist/src/connectors/templates && cp -r src/connectors/templates/. dist/src/connectors/templates/ && mkdir -p dist/src/storage/postgresql/migrations && cp src/storage/postgresql/migrations/*.sql dist/src/storage/postgresql/migrations/ && cp installer/setup.sh dist/installer/setup.sh && npm run build:runtime && npm run verify:native-transcript-package && npm run verify:postgresql-package",
+    "postbuild": "mkdir -p dist/src/prompts && cp -r src/prompts/*.yaml dist/src/prompts/ && rm -rf dist/src/connectors/templates && rm -f dist/src/connectors/operation-catalog.js dist/src/connectors/operation-catalog.d.ts dist/src/connectors/operation-catalog.js.map && mkdir -p dist/src/connectors/templates && cp -r src/connectors/templates/. dist/src/connectors/templates/ && mkdir -p dist/src/storage/postgresql/migrations && cp src/storage/postgresql/migrations/*.sql dist/src/storage/postgresql/migrations/ && cp installer/setup.sh dist/installer/setup.sh && pnpm run build:runtime && pnpm run verify:native-transcript-package && pnpm run verify:postgresql-package",
     "build:runtime": "node scripts/build-runtime.mjs",
-    "prepublishOnly": "npm run build",
+    "prepublishOnly": "pnpm run build",
     "changeset": "changeset",
     "lint": "eslint .",
-    "release:verify": "npm test && npm run verify:consumer-topology && npm pack --dry-run",
+    "release:verify": "pnpm run test && pnpm run verify:consumer-topology && npm pack --dry-run",
     "test": "vitest run --dir test",
     "test:ci": "vitest run --dir test --coverage --coverage.reporter=lcov --coverage.reporter=text --reporter=default --reporter=junit",
-    "test:postgresql": "npm run build && node scripts/postgresql-harness.mjs",
+    "test:postgresql": "pnpm run build && node scripts/postgresql-harness.mjs",
     "typecheck": "tsc --noEmit && tsc --project tsconfig.postgresql-conformance.json",
     "verify:consumer-topology": "node scripts/verify-consumer-topology.mjs",
     "verify:native-transcript-package": "node scripts/verify-native-transcript-package.mjs && tsc --project tsconfig.native-transcript-package.json",
     "verify:postgresql-package": "node scripts/verify-postgresql-package.mjs && tsc --project tsconfig.postgresql-package.json",
-    "version-packages": "node scripts/version-packages.mjs"
+    "version-packages": "node scripts/version-packages.mjs",
+    "update:patterns": "node --experimental-strip-types scripts/update-gitleaks-patterns.ts"
   },
   "dependencies": {
     "@hono/node-server": "2.0.12",
@@ -76,7 +77,7 @@
     "body-parser": "2.3.0",
     "esbuild": "0.28.1",
     "eslint": "10.8.0",
-    "fast-uri": "4.1.2",
+    "fast-uri": "4.1.4",
     "openai": "7.3.0",
     "typescript": "6.0.3",
     "typescript-eslint": "8.65.0",
@@ -94,9 +95,6 @@
       "optional": true
     }
   },
-  "overrides": {
-    "read-yaml-file": "2.1.0"
-  },
   "publishConfig": {
     "access": "public"
   },
@@ -107,5 +105,6 @@
   "homepage": "https://github.com/donadiosolutions/lcm#readme",
   "bugs": {
     "url": "https://github.com/donadiosolutions/lcm/issues"
-  }
+  },
+  "packageManager": "pnpm@10.34.5+sha512.a4ee05f2f73658255bd6a89859c065a45c28a57daefae2c893a168ee2b73168c37b91e83e57ea67654ad03f03031746430e8bce38e362e042605fb8abc80192e"
 }

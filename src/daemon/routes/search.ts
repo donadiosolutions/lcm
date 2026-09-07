@@ -1,7 +1,11 @@
 import type { DaemonConfig } from "../config.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
-import { createRetrievalEngine } from "../../retrieval.js";
+import {
+  createRetrievalEngine,
+  normalizeSearchLayers,
+  normalizeSearchLimit,
+} from "../../retrieval.js";
 import { validateCwd } from "../validate-cwd.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
 import { StorageOperationError } from "../../storage/errors.js";
@@ -13,14 +17,28 @@ import {
 export function createSearchHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
-    const { query, limit = 5, layers, tags } = input;
-    const activeLayers: string[] = layers ?? ["episodic", "promoted"];
-    const filterTags: string[] | undefined = Array.isArray(tags) && tags.length > 0 ? tags : undefined;
-
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      sendJson(res, 400, { error: "invalid request body" });
+      return;
+    }
+    const { query, limit, layers, tags } = input;
     if (!query) {
       sendJson(res, 400, { error: "query is required" });
       return;
     }
+
+    const normalizedLimit = normalizeSearchLimit(limit);
+    if (normalizedLimit === null) {
+      sendJson(res, 400, { error: "invalid limit" });
+      return;
+    }
+
+    const activeLayers = normalizeSearchLayers(layers);
+    if (!activeLayers) {
+      sendJson(res, 400, { error: "invalid layers" });
+      return;
+    }
+    const filterTags: string[] | undefined = Array.isArray(tags) && tags.length > 0 ? tags : undefined;
 
     let cwd: string | undefined;
     if (input.cwd) {
@@ -44,15 +62,14 @@ export function createSearchHandler(config: DaemonConfig, storageFactory?: Stora
             if (activeLayers.includes("episodic")) {
               try {
                 const retrieval = createRetrievalEngine(project);
-                const episodicResult = await retrieval.grep({ query, mode: "full_text", scope: "both" });
+                const episodicResult = await retrieval.grep({
+                  query,
+                  mode: "full_text",
+                  scope: "both",
+                  limit: Math.max(50, normalizedLimit),
+                });
                 const allMatches = [...episodicResult.messages, ...episodicResult.summaries];
-                const episodicMatches = filterTags
-                  ? allMatches.filter((m) => {
-                      const t = (m as Record<string, unknown>).tags;
-                      return Array.isArray(t) && filterTags.every(ft => t.includes(ft));
-                    })
-                  : allMatches;
-                episodic = episodicMatches.slice(0, limit);
+                episodic = allMatches.slice(0, normalizedLimit);
               } catch (error) {
                 if (config.storage.backend === "postgresql" && error instanceof StorageOperationError) throw error;
               }
@@ -61,7 +78,7 @@ export function createSearchHandler(config: DaemonConfig, storageFactory?: Stora
             // Promoted: FTS5 search across promoted memories
             if (activeLayers.includes("promoted")) {
               try {
-                promoted = await project.lexicalSearch.searchPromoted(query, limit, filterTags);
+                promoted = await project.lexicalSearch.searchPromoted(query, normalizedLimit, filterTags);
               } catch (error) {
                 if (config.storage.backend === "postgresql" && error instanceof StorageOperationError) throw error;
               }

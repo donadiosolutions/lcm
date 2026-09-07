@@ -46,8 +46,8 @@ lcm doctor
 
 On Linux, an upgrade from LCM v1.4.1 to v1.4.2 can leave one authenticated
 legacy transient systemd service running while the new stable service name is
-absent. The first `lcm doctor` after the upgrade, or an explicit
-`lcm daemon restart`, performs a one-time migration only when the manager PID,
+absent. An explicit `lcm daemon restart` performs a one-time migration only
+when the manager PID,
 systemd invocation ID, canonical PID/token files, authenticated health
 identity, older same-line version, process entrypoint, and loopback listener
 all agree. A changing, ambiguous, symlinked, malformed, or unauthorized
@@ -74,7 +74,7 @@ start a second daemon manually during an upgrade.
 The hook commands and MCP server use absolute paths into the installed npm
 package. LCM owns the MCP entry's `type`, `command`, and `args`; `env` and any
 other compatible user- or Claude-managed options, sibling MCP servers, and
-unrelated settings are preserved across installation and doctor repair. When
+unrelated settings are preserved across installation. When
 normalizing an HTTP or SSE entry to `stdio`, LCM removes the incompatible
 `url`, `headers`, and `transport` fields. `lcm doctor` validates the native
 configuration and managed daemon; repair or reinstall with `lcm install`.
@@ -83,9 +83,11 @@ The published CLI contains its MCP SDK build graph in `dist/lcm.mjs`. Consumer
 installations therefore do not receive a second external SDK, Express, or AJV
 dependency path from LCM. The exact SDK, `body-parser`, and `fast-uri` versions
 used to build that runtime remain pinned with lockfile integrity in the source
-package. LCM builds with `fast-uri` 4.1.2; AJV retains its nested patched
-`fast-uri` 3.1.5 dependency path, without exposing a second URI parser path in
-consumer installations.
+package. LCM builds with `fast-uri` 4.1.4; AJV retains its nested patched
+`fast-uri` 3.1.7 dependency path, and Express and `body-parser` resolve `qs`
+6.16.0. These releases include fixes for malformed URI authority components and
+query-string parsing advisories without exposing additional parser paths in
+consumer installations. Update LCM to receive the corrected bundled runtime.
 
 LCM's optional OpenAI integration requires the OpenAI SDK 7.3.0. The SDK is
 pinned as both a development dependency and an optional peer dependency; use
@@ -174,6 +176,16 @@ default CLI bundle with `lcm connectors install codex --transport cli`. The
 explicit MCP bundle does not retain or install the CLI-only managed
 `~/.codex/AGENTS.md` entry.
 
+On Linux, the nested native `codex mcp` commands receive the current user's
+session bus only when both values form one authenticated canonical pair:
+`XDG_RUNTIME_DIR=/run/user/<uid>` and
+`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus`. LCM verifies the
+runtime directory is canonical, owned by that user, and mode `0700`, and that
+the exact bus endpoint is a canonical user-owned socket. Missing, malformed,
+oversized, control-character-bearing, foreign-user, redirected, non-socket,
+or mismatched values are omitted together. Other process environment values
+remain outside the native-command allowlist.
+
 Connector install and removal protect filesystem-backed project and home
 targets with Linux proc-descriptor-anchored traversal. Existing parent
 directories are authenticated without following intermediate symlinks; missing
@@ -181,7 +193,9 @@ parents are then created one component at a time. The selected project root or
 captured home root may itself be a symlink, but a redirected descendant parent
 (including an in-root alias) is refused before connector files, native MCP
 state, or the stored transport choice are mutated. Public results and errors
-continue to use ordinary display paths.
+continue to use ordinary display paths. Removal failure lists and rollback
+diagnostics apply the same redaction and do not expose retained
+`/proc/self/fd` operation paths or an unsanitized nested error cause.
 
 This guarantee is intentionally Linux-specific. Filesystem-backed connector
 install/remove refuse on macOS, other non-Linux platforms, or when strict
@@ -189,9 +203,50 @@ directory/no-follow/nonblocking flags or `/proc/self/fd` descriptor lookup are
 unavailable. Manual/no-write guidance, `lcm install`, `lcm doctor`, connector
 listing, inventory inspection, and verified legacy read-only branches remain
 usable. The traversal uses proc descriptors; it is not portable `openat` and
-does not provide a final-leaf linearizable unlink or a portable
-descriptor-relative compare-and-swap guarantee (the separate #713 and #681
-contracts remain unchanged).
+does not provide portable descriptor-relative compare-and-swap. Generic durable
+configuration writes use an unconditional atomic rename after a bounded safety
+preflight; their application locks coordinate cooperating LCM writers but are
+not an operating-system compare-and-swap against arbitrary same-UID edits.
+The legacy `expectedContentSha256` option is rejected before mutation. Callers
+that need conditional replacement must use a protocol-specific operation; see
+the [architecture contract](architecture.md#portable-durable-file-writes).
+
+Within that Linux boundary, LCM stages every replacement in a private,
+mode-0700 transaction directory. Before the public link exists, it creates an
+immutable publication certificate containing SHA-256, exact size, full
+permission/special-mode bits, and canonical decimal device/inode identities.
+Existing leaves are claimed by an atomic rename and exact certificate
+validation; complete candidates are published with a no-replace hard link.
+Neither the public alias nor the retained private alias can become authority
+after publication: a peer edit or chmod of both aliases fails certificate
+verification and is preserved. LCM never truncates, writes, or chmods a public
+leaf or its original inode. A wholly LCM-owned skill, rules file, or Codex
+hooks file is physically removed after a validated claim. Historical empty
+skills/rules and `{}` hooks remain recognized as neutral, not installed, and
+reinstallable; removing one again is a no-op.
+
+Connector leaves and requested replacements are limited to 4 MiB (4,194,304
+bytes). LCM rejects an oversized leaf before allocating a read buffer or
+starting a transaction, so the public connector path remains untouched.
+
+Rollback is receipt-bound and namespace-only. It moves the current public entry
+only when its immutable certificate still matches, then copies the stable
+initial hold into a newly certified restore candidate and publishes that
+candidate with a no-replace hard link. The original inode and any external hard
+links are not restored; rollback guarantees logical bytes, exact size, and full
+mode on a logically new inode. Concurrent edits, chmods, replacements,
+symlinks, directories, and aliases are preserved; a non-linkable or mismatched
+entry remains at a named recovery path and reports `rollback incomplete`.
+Compensation runs in reverse mutation order and never recursively deletes
+unknown files. Existing-leaf replacement has a short intentional `ENOENT`
+window between claim and candidate publication, so a concurrent reader such as
+Codex may briefly observe the hooks file as absent. The guarantee is
+synchronous pathname-race preservation, not crash consistency: a process kill
+or power loss may leave a transaction directory for manual inspection. A
+same-inode write that changes A to B and back to A before observation is
+necessarily indistinguishable from no change. This is Linux
+`/proc/self/fd` anchoring, not portable `openat`, and it does not resolve the
+generic durable-write contract in #681 or the #715 parent-path boundaries.
 
 The default native Codex MCP runner can inspect canonical state, but automatic
 `codex mcp add/remove` is refused because the child process mutates ordinary
@@ -408,9 +463,13 @@ setting.
 These environment values are used by the daemon and MCP runtime as well as
 direct programmatic callers. Run `lcm daemon restart` after changing the
 selection or credentials so the managed daemon constructs a fresh verified
-factory. The CLI/import-export activation and parity work remain tracked by
-#618; stats, pool diagnostics, status, and doctor presentation remain tracked
-by #619.
+factory. CLI/import-export activation and parity remain tracked by #618.
+Stats, pool diagnostics, status, and doctor inspect the selected backend through
+a [shared observational snapshot](cli.md#observational-diagnostics). They report
+verified readiness or a sanitized failure state without opening projects for
+writes, running migrations, or falling back to SQLite. Missing metrics remain
+unavailable, and local outbox counts remain local even when PostgreSQL is
+selected. These diagnostics do not start or restart the daemon.
 
 ### Provisioning a PostgreSQL database
 
@@ -601,7 +660,8 @@ synthesized from the trusted packaged daemon entrypoint and fixed system
 directories so the service sees the same provider search path that `lcm doctor`
 checks, even when the command was invoked through a user-level wrapper. Default
 managed lifecycle calls use that same packaged entrypoint in their manager
-arguments, keeping start, doctor, and restart admission on one stable identity.
+arguments, keeping start and restart admission on one stable identity. Doctor
+observes that same packaged runtime identity without invoking lifecycle work.
 Service identity metadata and credential-file markers are passed as
 names and paths only. API keys and database URLs are never copied into argv,
 unit properties, plist contents, or logs; the daemon reads them from the
@@ -672,10 +732,10 @@ Supplying a valid daemon bearer token returns the full storage-backed health
 diagnostic; supplying an invalid credential returns `401`. Embedded and test
 callers that intentionally create a daemon without a token retain the full
 health response. `lcm doctor` treats public health as liveness only and uses the
-authenticated post-validation health result to decide whether passive-learning
-queues can drain, both when validating an already-running managed daemon and
-after starting one. Authenticated healthy storage is ready, authenticated
-storage is unavailable, and a missing or unreadable managed-daemon token leaves
+authenticated health result from an already-running managed daemon to decide
+whether passive-learning queues can drain. Doctor never starts one.
+Authenticated healthy storage is ready, authenticated unhealthy storage is
+unavailable, and a missing or unreadable managed-daemon token leaves
 readiness unverified. In that unverified state, doctor warns that access to the
 daemon token and authenticated diagnostics must be restored before it can
 promise that queued events will drain. Embedded and test-only tokenless servers
@@ -685,7 +745,8 @@ Before sending the bearer token or admitting a daemon for ordinary use,
 lifecycle checks require the public `/health` PID and installed version, a
 recognized active storage backend, the PID file, process liveness, and exact
 `127.0.0.1` listener ownership to agree. Authenticated full health and
-`/stats/pool` then prove diagnostic access and the entrypoint identity. An
+`/stats/pool` then verify authenticated access; the entrypoint identity is
+checked through authenticated health, while pool diagnostics omit paths. An
 occupied port with missing or unverifiable identity is rejected rather than
 trusted. Daemons that predate backend identity are recognized as SQLite-only,
 so selecting PostgreSQL cannot silently reuse an existing SQLite process.
@@ -752,10 +813,12 @@ user can read or modify that user's files and runtime state. Private file modes,
 canonical paths, authenticated metadata, and manager identity checks reduce
 accidental or cross-user access without providing capability-style isolation.
 
-The MCP handshake check is time-bounded. If its helper process exits early,
-stops accepting input, or encounters a pipe error, `lcm doctor` reports the
-diagnostic as a warning and continues instead of waiting indefinitely or
-crashing.
+Doctor inspects MCP registration and static protocol capability without
+spawning an MCP server. Live protocol readiness is explicitly not probed.
+After repairing registration with `lcm install` or
+`lcm connectors install <agent> --transport mcp`, verify tool availability in
+the intended agent; starting that agent's MCP connection is an operational
+action separate from doctor.
 
 Stored `daemon.port` values must be integers from `1` through `65535`; this includes values written with `lcm config set`. Port `0` is reserved for internal runtime overrides used by tests to request ephemeral binding and is not a valid `config.json` value because lifecycle commands must be able to reconnect to the configured port. `daemon.idleTimeoutMs` must be an integer from `0` through `86400000` milliseconds; `0` disables the idle timer.
 
@@ -766,17 +829,46 @@ in the same source, while runtime overrides continue to take precedence over
 stored configuration. `lcm config get` and `lcm config set` accept the legacy
 path and report its canonical `dedupCandidateLimit` spelling.
 
-When `lcm doctor` finds a malformed `mcpServers.lcm` value inside an otherwise
-valid settings object, it replaces that entry with the minimal managed fields.
-Malformed JSON, a non-object settings root, or a malformed `mcpServers`
-container fails closed and must be corrected before repair. Other fields are
-preserved when the settings root and server map are valid JSON objects.
+When `lcm doctor` finds a malformed `mcpServers.lcm` value, it reports the
+finding and recommends explicit repair with `lcm install`. It never writes
+settings, hooks, managed guidance, or remediation markers. Malformed JSON, a
+non-object settings root, or a malformed `mcpServers` container must be
+corrected before installation can repair the entry. The installer preserves
+other fields when the settings root and server map are valid JSON objects.
 
 Hook error fallback logs write to `~/.lcm/logs/events.log`.
 
 ## Local filesystem protection
 
 LCM keeps `~/.lcm` and its project, event, and temporary directories accessible only to the current user (`0700`). Configuration, metadata, database, token, map, backup, and lock files use private file permissions (`0600`). Existing LCM roots are tightened during startup and installation.
+
+Before `/promote` reads project scrub patterns or opens project storage, it
+authenticates the private LCM root and project directory. Promotion refuses a
+directory with the wrong owner or exact mode, a symlink, or topology that
+changes during validation.
+
+Project directories are admitted one component at a time. An existing
+`~/.lcm/projects` or `~/.lcm/projects/<id>` entry is authenticated and is never
+repaired by changing its mode; symlinks, wrong types, wrong owners, and modes
+other than `0700` are rejected. If a confirmed owner-held real directory has
+only an unsafe mode, repair it explicitly with `chmod 0700 <path>` and retry.
+Directories created by LCM are tightened through their retained descriptor;
+an owner-read-stripping umask can prevent that descriptor from being opened and
+fails closed with `EACCES`. Restore a usable umask and remove only the
+untrusted child after confirming its ownership before retrying.
+
+If project-directory admission or permission tightening fails, LCM retains
+that failure as the cause while it closes acquired directory handles. When the
+same child handle also fails to close, the reported error attaches both
+failures and LCM still attempts to close retained ancestor handles.
+
+The admission and metadata publication checks provide a bounded observed
+topology guarantee: they reject unsafe state observed at each boundary,
+including symlinks and replaced device/inode identities. Portable pathname
+operations cannot prevent a same-user namespace substitution after the final
+check, and retained descriptor evidence ends when the helper returns and closes
+its handles. A later replacement is therefore a new observation rather than a
+claim of kernel-atomic namespace protection.
 
 Session restore locks use a SHA-256 digest of the agent session ID under `~/.lcm/tmp`; session IDs are never used as path components. LCM reads restored `AGENTS.md` and `CLAUDE.md` instructions only from regular, non-symlink files inside their expected roots, with a combined 1 MiB limit. Unsafe instruction files are skipped.
 Cached instructions are isolated by local project, machine, client, agent
@@ -911,9 +1003,20 @@ The accepted values depend on the configured provider:
 OpenAI Chat Completions does not accept reasoning effort. Individual provider
 CLI versions and models may support only some otherwise valid values. LCM passes
 the control through and treats the provider as authoritative, including
-provider-accepted fallback behavior. A rejection produces a bounded diagnostic
-with the provider, model, effort, and fast-mode state; prompts and credentials
-are omitted.
+provider-accepted fallback behavior. A Codex process rejection is classified
+from a bounded terminal stderr window when it contains an explicit known
+phrase: usage or rate limit (wait and retry, or choose another available
+model), authentication failure (sign in again or check authentication), an
+unavailable model (select an accessible supported model), or an invalid
+request (check the model, controls, or CLI compatibility). Only the final
+16 KiB of stderr is retained for this best-effort classification, so an older
+diagnostic can be omitted when later output exceeds that window. Unknown,
+empty, and otherwise unrecognized failures retain the existing bounded
+compatibility diagnostic with the provider, model, effort, and fast-mode state;
+prompts, credentials, and provider response details are omitted. Codex usage
+and authentication failures observed as upstream 429 and 401 responses from
+LCM's loopback Responses gateway use the same safe categories without exposing
+provider detail.
 
 The intersection applies only to `llm.reasoningEffort` stored with
 `llm.provider: "auto"`, because that value must work for either process provider.
@@ -935,6 +1038,14 @@ without enabling Codex strict configuration validation. This keeps unrelated,
 forward-compatible fields in the user's Codex configuration from becoming fatal
 to compaction while still applying the requested controls to the spawned
 summarizer.
+
+When Codex compaction cannot start because the `codex` executable is missing or
+cannot be found on `PATH`, LCM reports that directly and includes an example
+installation command. Install the Codex CLI (for example, with
+`npm install -g @openai/codex`) and make sure the directory containing the
+executable is on the environment `PATH` used by the LCM daemon, then retry the
+compaction. Other endpoint-discovery and protocol failures keep the generic
+safe diagnostic so provider output and local paths are not exposed.
 
 `llm.maxConcurrency` controls the number of manual compact requests that may be
 in flight at once. It defaults to `1` and accepts only integer values from `1`
@@ -981,7 +1092,32 @@ replacement. If that proof is unavailable, the command remains in draining
 state, reports the unproved condition, and fails closed rather than signaling an
 unknown process or claiming that cancellation completed.
 
-Codex-process compaction uses a private, one-use loopback Responses gateway for
+Codex-process compaction first asks a one-shot Codex `app-server` process for
+the effective `openai_base_url` in the current LCM process context. The resolver
+uses only the `config/read` result, keeps its JSONL stdin open until that
+response arrives, and accepts an absent or explicit `null` value as the normal
+token-class default. A configured absolute `http://` or `https://` URL is
+validated in memory, has trailing slashes normalized, and receives exactly one
+`/responses` suffix. Credentials, query or fragment delimiters, whitespace,
+controls, malformed protocol data, oversized output, unsupported values, and
+timeouts fail closed before any upstream request. Cleartext HTTP is accepted
+for configured private proxy parity; use HTTPS when the endpoint supports it.
+
+The validated endpoint is authoritative for both managed bearer classes. When
+it is absent or `null`, the existing `sk-` API and ChatGPT bearer defaults are
+preserved. The resolver never logs or persists the surrounding Codex
+configuration, endpoint contents, or authentication data.
+Once the endpoint has been validated and the one-shot app-server has provably
+settled, that endpoint remains authoritative regardless of its exit status or
+child termination signal. A caller `AbortSignal` cancellation that arrives
+during this owned teardown still rejects with `AbortError` after settlement and
+discards the validated endpoint.
+When resolution fails, is aborted, or times out, LCM removes the published
+process witness after the child and its owned process group are proven settled.
+If settlement cannot be proven, LCM retains the witness for reconciliation and
+fails closed.
+
+Codex-process compaction then uses a private, one-use loopback Responses gateway for
 each summarize call. The gateway binds only to `127.0.0.1` on an ephemeral port
 and exposes a high-entropy capability path that accepts one exact
 `POST /<capability>/responses` request. Codex runs from an empty per-call temporary
@@ -998,12 +1134,13 @@ Only the validated model, reasoning controls, and supported service tier are
 retained from Codex's request. `instructions`, `previous_response_id`,
 `client_metadata`, `prompt_cache_key`, `include`, and `stream_options` are not
 forwarded. The gateway requires one managed `Authorization: Bearer ...`
-header. A bearer token beginning with `sk-` selects only
-`https://api.openai.com/v1/responses`; any other valid managed bearer selects
-only `https://chatgpt.com/backend-api/codex/responses`, whether or not a
-`ChatGPT-Account-Id` is present. A valid account ID is forwarded when supplied,
-but its absence does not select the public API route. Redirects and ambiguous
-request or shutdown outcomes fail closed.
+header. A bearer token beginning with `sk-` selects the configured endpoint
+when one was resolved; otherwise it selects only
+`https://api.openai.com/v1/responses`. Any other valid managed bearer follows
+the same configured endpoint, or falls back to only
+`https://chatgpt.com/backend-api/codex/responses`. A valid account ID is
+forwarded when supplied, but its absence does not select the public API route.
+Redirects and ambiguous request or shutdown outcomes fail closed.
 
 Gateway success follows the Responses protocol rather than an exact Codex CLI
 version or HTTP transport EOF. LCM accepts only a complete, well-formed
@@ -1055,6 +1192,8 @@ Claude process, or Codex process request. The default OpenAI-only retry policy i
 internal retries and applies this one bounded exponential-backoff policy, so
 configured attempt counts remain exact. Process providers do not retry because
 relaunching a CLI process could duplicate expensive work.
+
+Codex compaction spends one monotonic `llm.requestTimeoutMs` budget across config discovery, gateway startup, and execution.
 
 With `llm.provider` set to `auto`, the timeout follows the effective process
 provider: manual batch compaction resolves to Claude, while Claude and Codex
@@ -1218,6 +1357,34 @@ Run `lcm stats --verbose` to see a summary of stale memory candidates across all
 ## Database management
 
 Each project's SQLite database lives at `~/.lcm/projects/<sha256-of-project-path>/db.sqlite`. The per-project path is derived automatically from the working directory.
+
+LCM authenticates the immediate parent directory before opening a persistent
+SQLite database, including pooled project databases, hook event sidecars, and
+the standalone hook sequence checkpoint. The parent must be a real directory
+rather than a symbolic link, must be owned by the current user, and must be
+readable so LCM can retain a directory descriptor while it checks the database
+path. An unsafe or replaced parent is refused before LCM creates a database,
+changes permissions, or reuses a pooled connection.
+
+Create-capable opens make missing parent components one at a time and set each
+new component to mode `0700`. They also safely repair an authenticated existing
+database parent to `0700`. Generic existing-only probes validate the parent
+without changing its mode; `EventsDb.openExisting` retains its existing repair
+behavior and tightens its authenticated parent to `0700`. A missing parent in
+an existing-only probe remains a normal not-found result and is not created.
+
+Pre-existing aliases in ancestors above the immediate database parent remain
+supported and are not modified. SQLite itself uses pathnames for its database
+and sidecar files, so LCM checks the retained parent identity at observable
+open, permission, initialization, and pooling boundaries; these checks are not
+a kernel-atomic guarantee against another process substituting a path through
+a writable ancestor between system calls.
+
+Database paths retain normal filesystem semantics when an ancestor alias is
+followed by `..`: LCM authenticates and opens the directory reached by the
+kernel. Existing-only SQLite URI opens first resolve the admitted database leaf
+through the filesystem so URL dot-segment normalization cannot select a
+different lexical database.
 
 ### Inspecting the database
 

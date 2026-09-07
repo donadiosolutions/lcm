@@ -43,9 +43,11 @@ the daemon never opens a project SQLite database as fallback. Request
 cancellation closes the active project, and daemon shutdown aborts and drains
 background consumers before closing the shared factory. The local SQLite hook
 outbox and metadata-only transcript quarantine remain local and are not
-general caches or activation paths. CLI/import-export remains #618-owned,
-while stats, pool diagnostics, status, and doctor presentation remain
-#619-owned. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for table ownership,
+general caches or activation paths. CLI/import-export remains #618-owned.
+Stats, pool diagnostics, status, and doctor use a shared sanitized,
+[observational snapshot](cli.md#observational-diagnostics) for both backends.
+Its publication checks authenticate matching evidence before and after probes;
+they do not provide a transaction-wide authority guarantee. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for table ownership,
 integrity, indexes, retention, extension policy, and recovery implications.
 
 ## Storage repository architecture
@@ -71,8 +73,9 @@ update or deletion operation. Embedded backfill code receives
 `ProjectStorage`. The production PostgreSQL factory, runtime, migration
 runner, identity repository, and isolated test-database lease support the
 daemon's selected project-storage routes. CLI/import-export and portable
-transfer remain #618-owned, while aggregate stats, status, pool diagnostics,
-and doctor parity remain #619-owned. Selecting `postgresql` never falls back to
+transfer remain #618-owned. Aggregate stats, status, pool diagnostics, and
+doctor use a separate read-only diagnostic path with classified outcomes and
+no operational project opens or migrations. Selecting `postgresql` never falls back to
 SQLite. See
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md) for the
 local-scrubbing, checkpoint, quarantine, and rollback boundaries.
@@ -108,7 +111,16 @@ values into public errors. Aborted active queries are cancelled by a bounded,
 one-shot TLS client using the checked-out backend PID; an uncertain target
 connection is destroyed rather than returned to the pool. Sanitized PostgreSQL
 cancellation errors retain scoped project and machine identity while excluding
-SQL text, query values, and driver details.
+SQL text, query values, and driver details. Machine-owning coordination
+operations and explicitly fence-bound summary, context, and shared-core
+operations preserve that machine identity in query and transaction cancellation
+context; a bound fence machine ID must be a UUIDv7, is accepted
+case-insensitively, and is stored in canonical lowercase. Invalid fence
+machine IDs fail synchronously during repository construction with a sanitized
+`machine_id` data error that never serializes the supplied value. Deliberately
+unfenced project readers remain machine-less. The
+sanitization boundary continues to exclude SQL, bound values, raw driver
+details, and transport metadata.
 
 Ordered SQL files are packaged in `dist` and checked against an explicit
 SHA-256 manifest before execution. The runner takes a database-scoped
@@ -242,6 +254,12 @@ repositories are bound to that project. Application code depends on these
 interfaces, while the SQLite adapter alone owns `DatabaseSync`, migrations,
 SQLite feature probes, FTS5 details, and connection pooling.
 
+Persistent SQLite opens revalidate the database pathname immediately after the
+SQLite handle opens and fail closed before changing file permissions or running
+initialization PRAGMAs. A final identity comparison before pooling also covers
+databases created by that open and rejects pathname changes detected during
+initialization.
+
 The project scope groups operations by domain:
 
 | `ProjectStorage` repository | Responsibility |
@@ -280,9 +298,10 @@ raw driver errors, SQL text, or bound values. Operation failures follow the same
 rule: useful diagnostics may name the backend, project identity, and repository
 domain, but secret-bearing and dialect-specific details remain inside the
 adapter and logs' existing safety boundaries.
-Once factory shutdown begins, an in-flight factory health probe reports the
-closed state and exposes no runtime detail, even if the underlying probe later
-settles with a healthy, unavailable, or failed result.
+For PostgreSQL and SQLite, once factory shutdown begins, an in-flight factory
+health probe reports only the closed state and exposes no project or runtime
+detail, even if an underlying probe later settles healthy, unavailable, or
+failed. Factory shutdown does not wait for otherwise unbounded health probes.
 For PostgreSQL and SQLite, once project shutdown begins, project health reports
 the closed state with the project identity and exposes no query detail, even if
 its probe settles later. A failed SQLite project close clears the in-progress
@@ -395,6 +414,27 @@ prune completion requires either a successful exact delete or missing-row
 readback. A present nonterminal, mismatched, or quarantined row is never treated
 as pruned. The worker and its operator CLI remain a separate explicit delivery
 path; they do not replace or weaken #617's daemon project-storage routing.
+
+### Portable durable file writes
+
+`atomicWritePrivateFileDurable` has an intentionally narrow portable contract.
+With `requireAbsent: true`, it fully writes, fsyncs, and mode-tightens a
+temporary inode, then uses an exclusive same-directory hard link for durable
+no-clobber creation. Without `requireAbsent`, it performs the bounded existing
+file safety preflight and then publishes the completed candidate with an
+unconditional same-directory atomic rename. The preflight rejects an unsafe,
+oversized, non-regular, wrong-owner, or multiply linked destination, but it is
+not a descriptor-relative mutation and does not close a same-UID replacement
+race after the final check.
+
+The helper rejects the legacy `expectedContentSha256` option, including when
+its value is `null` or `undefined`, before opening the parent, creating a
+temporary path, or writing. Callers that need conditional replacement must own
+a protocol-specific operation and recovery grammar, such as the migration
+manifest publication protocol. Application locks coordinate cooperating LCM
+writers only; they cannot constrain an arbitrary same-UID, non-cooperating
+editor. This contract therefore makes no portable pathname-CAS claim and
+documents the remaining same-UID limitation explicitly.
 
 ## Data model
 
@@ -642,10 +682,11 @@ When summaries are too compressed for a task, agents use `lcm_expand` to recover
 
 ### How it works
 
-1. Agent calls `lcm_expand` with a `nodeId` (summary ID) and optional `depth`.
-2. lcm traverses the DAG from the given node, following parent links down to source messages.
-3. Source message content is assembled and returned to the agent (capped by `LCM_MAX_EXPAND_TOKENS`).
-4. The agent receives the full decompressed content for the requested depth.
+1. An agent calls the daemon-backed `lcm_expand` MCP tool or `lcm expand <nodeId>` CLI command. Both use `POST /expand` with a `nodeId` and an optional positive-integer `depth` (default: `1`; no maximum).
+2. LCM descends child links from the requested node for the requested number of levels. The response contains child and descendant summaries as snippets of up to 200 characters, together with `citedIds`. Results are accumulated for the requested levels rather than returned as a nested tree.
+3. This HTTP surface does not request raw source messages and does not pass a token cap, so `LCM_MAX_EXPAND_TOKENS` does not apply to it. A leaf therefore contributes no source-message content.
+
+The separate `buildExpansionToolDefinition` helper is an unregistered TypeBox tool definition and is not used by the shipped MCP server. If an integration registers that helper, it supports an explicit `tokenCap` and optional `includeMessages`, resolving the cap against the configured `maxExpandTokens` value (including `LCM_MAX_EXPAND_TOKENS`).
 
 For broader recall, agents can first use `lcm_grep` or `lcm_search` to find relevant summary IDs, then call `lcm_expand` on the results that need more detail.
 

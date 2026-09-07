@@ -41,6 +41,8 @@ import {
   ensureDaemon as ensureDaemonProduction,
 } from "../../src/daemon/lifecycle.js";
 import type { DaemonLifecycleHermeticTestSeams } from "../../src/daemon/lifecycle-scope.js";
+import { createPublicationConvergence, withPublicationAdmissionRetry } from "../../src/storage/publication-convergence.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 type EnsureDaemonOptions = Parameters<typeof ensureDaemonProduction>[0];
 type SpawnOverride = NonNullable<EnsureDaemonOptions["_spawnOverride"]>;
@@ -143,6 +145,54 @@ function ensureDaemon(options: EnsureDaemonOptions): ReturnType<typeof ensureDae
 }
 
 describe("mocked lifecycle identity boundaries", () => {
+
+  it("wraps lifecycle publication assertions without replaying startup", async () => {
+    const admission = vi.fn(async <T>(step: () => T | Promise<T>) => await step());
+    const result = await ensureDaemon({
+      ...base(),
+      _withPublicationAdmissionRetry: admission,
+    });
+    expect(admission).toHaveBeenCalledTimes(2);
+    expect(result.spawned).toBe(false);
+  });
+
+  it("retries a real pre-assertion contention while running lifecycle startup once", async () => {
+    let now = 0;
+    const convergence = createPublicationConvergence({
+      port: 1,
+      identity: {
+        pid: process.pid,
+        version: "1",
+        storageBackend: "sqlite",
+        entrypoint: "/opt/lcm.mjs",
+        runtimeDigest: "a".repeat(64),
+      },
+      deps: {
+        now: () => now,
+        sleep: async (ms) => { now += ms; },
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth",
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+          status: "ok", pid: process.pid, version: "1", storageBackend: "sqlite",
+          entrypoint: "/opt/lcm.mjs", runtimeDigest: "a".repeat(64),
+        }) })) as unknown as typeof globalThis.fetch,
+        lockPath: join(runtimeRoot, "publication.lock"),
+      },
+    });
+    let assertions = 0;
+    const admission = <T>(step: () => T | Promise<T>): Promise<T> => withPublicationAdmissionRetry(step, convergence);
+    const result = await ensureDaemon({
+      ...base(),
+      _withPublicationAdmissionRetry: admission,
+      _assertBackendPublication: () => {
+        assertions += 1;
+        if (assertions === 1) throw new PrivateMutationLockContentionError("pre busy");
+      },
+    });
+    expect(result.spawned).toBe(false);
+    expect(assertions).toBe(3);
+  });
 
   it("does not terminate when a verified retry PID changes identity before signaling", async () => {
     let daemonCommandReads = 0;

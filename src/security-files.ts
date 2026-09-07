@@ -52,6 +52,48 @@ export type PrivateDirectoryHandle = Readonly<{
   close: () => void;
 }>;
 
+/** A retained private-directory path no longer names its authenticated inode. */
+export class PrivateDirectoryTopologyError extends Error {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super(message, options);
+    this.name = "PrivateDirectoryTopologyError";
+  }
+}
+
+/** A create-if-absent private publication found an existing destination. */
+export class PrivateFileCollisionError extends PrivateDirectoryTopologyError {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super(message, options);
+    this.name = "PrivateFileCollisionError";
+  }
+}
+
+export type PrivateFilePublicationOutcome = "published" | "unknown";
+
+/** A publication attempt and retained-parent topology check could not agree. */
+export class PrivateFilePublicationTopologyError extends PrivateDirectoryTopologyError {
+  readonly outcome: PrivateFilePublicationOutcome;
+  readonly topologyError: PrivateDirectoryTopologyError;
+
+  constructor(
+    outcome: PrivateFilePublicationOutcome,
+    topologyError: PrivateDirectoryTopologyError,
+    cause: unknown,
+    operation: "rename" | "link" = "rename",
+  ) {
+    super(
+      outcome === "published"
+        ? operation === "rename"
+          ? "private file rename completed, but retained parent topology is not trusted"
+          : "private file link completed, but published file topology is not trusted"
+        : `private file publication outcome is unknown because ${operation} and retained parent topology checks failed`,
+      { cause },
+    );
+    this.outcome = outcome;
+    this.topologyError = topologyError;
+  }
+}
+
 type BigIntDirectoryStat = Readonly<{
   isDirectory: () => boolean;
   mode: bigint;
@@ -98,29 +140,51 @@ function currentUid(): number | undefined {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
 }
 
-/**
- * Open and retain a private directory without following a symlink at the
- * final component.  The descriptor is checked before the pathname is used
- * again, and the pathname is required to still identify that same inode.
- */
-export function openPrivateDirectory(
+function errorCode(error: unknown): string | undefined {
+  return error !== null && typeof error === "object" && "code" in error
+    && typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
+
+type PrivateDirectoryOpenOptions = Readonly<{
+  expectedUid?: number;
+}>;
+
+type PrivateDirectoryAuthenticationOptions = PrivateDirectoryOpenOptions & Readonly<{
+  /** @internal Creation-only path that authenticates type/owner before fchmod. */
+  allowUntrustedMode?: boolean;
+}>;
+
+const PRIVATE_DIRECTORY_OPEN_FLAGS = constants.O_RDONLY
+  | constants.O_DIRECTORY
+  | constants.O_NOFOLLOW
+  | constants.O_NONBLOCK;
+
+function openPrivateDirectoryDescriptor(path: string): number {
+  return openSync(path, PRIVATE_DIRECTORY_OPEN_FLAGS);
+}
+
+function authenticateOpenPrivateDirectory(
   path: string,
-  options: {
-    readonly expectedUid?: number;
-  } = {},
+  fd: number,
+  options: PrivateDirectoryAuthenticationOptions,
 ): PrivateDirectoryHandle {
-  const fd = openSync(
-    path,
-    constants.O_RDONLY
-      | constants.O_DIRECTORY
-      | constants.O_NOFOLLOW
-      | constants.O_NONBLOCK,
-  );
   let closed = false;
   try {
     const stat = directoryStat(fd);
     const expectedUid = options.expectedUid ?? currentUid();
-    assertPrivateDirectoryStat(stat, expectedUid);
+    if (options.allowUntrustedMode) {
+      if (!stat.isDirectory()) throw new Error("path is not a directory");
+      if (
+        expectedUid !== undefined
+        && (!Number.isSafeInteger(expectedUid) || Number(stat.uid) !== expectedUid)
+      ) {
+        throw new Error("private directory owner is not trusted");
+      }
+    } else {
+      assertPrivateDirectoryStat(stat, expectedUid);
+    }
     const canonicalPath = realpathSync(path);
     const pathStat = statSync(canonicalPath, { bigint: true }) as unknown as BigIntDirectoryStat;
     if (pathStat.dev !== stat.dev || pathStat.ino !== stat.ino) {
@@ -137,10 +201,63 @@ export function openPrivateDirectory(
         }
       },
     };
+  } catch (authenticationError) {
+    try {
+      closeSync(fd);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [authenticationError, cleanupError],
+        "private directory authentication and cleanup failed",
+        { cause: authenticationError },
+      );
+    }
+    throw authenticationError;
+  }
+}
+
+/**
+ * Open and retain a private directory without following a symlink at the
+ * final component.  The descriptor is checked before the pathname is used
+ * again, and the pathname is required to still identify that same inode.
+ */
+export function openPrivateDirectory(
+  path: string,
+  options: PrivateDirectoryOpenOptions = {},
+): PrivateDirectoryHandle {
+  return authenticateOpenPrivateDirectory(path, openPrivateDirectoryDescriptor(path), options);
+}
+
+/**
+ * Open a directory created by the caller before mode tightening.  This is
+ * deliberately separate from openPrivateDirectory so existing callers never
+ * relax the exact-0700 authentication policy.
+ */
+export function openPrivateDirectoryForCreation(
+  path: string,
+  options: PrivateDirectoryOpenOptions = {},
+): PrivateDirectoryHandle {
+  return authenticateOpenPrivateDirectory(path, openPrivateDirectoryDescriptor(path), {
+    ...options,
+    allowUntrustedMode: true,
+  });
+}
+
+/**
+ * Open an optional private directory while distinguishing initial absence
+ * from interruption after its descriptor has been acquired.
+ */
+export function openPrivateDirectoryIfExists(
+  path: string,
+  options: PrivateDirectoryOpenOptions = {},
+): PrivateDirectoryHandle | undefined {
+  let fd: number;
+  try {
+    fd = openPrivateDirectoryDescriptor(path);
   } catch (error) {
-    closeSync(fd);
+    if (errorCode(error) === "ENOENT") return undefined;
     throw error;
   }
+  return authenticateOpenPrivateDirectory(path, fd, options);
 }
 
 /** Revalidate a retained private directory descriptor and its pathname. */
@@ -162,6 +279,35 @@ export function assertPrivateDirectory(
     throw new Error("private directory witness changed");
   }
   return actual;
+}
+
+/**
+ * Authenticate the exact directory entry without following its final path
+ * component, against a descriptor retained by the caller.
+ */
+export function assertPrivateDirectoryEntry(
+  handle: PrivateDirectoryHandle,
+  path: string,
+  expectedUid: number | undefined = currentUid(),
+): PrivateDirectoryWitness {
+  try {
+    const stat = directoryStat(handle.fd);
+    assertPrivateDirectoryStat(stat, expectedUid);
+    const entry = lstatSync(path, { bigint: true }) as unknown as BigIntDirectoryStat;
+    if (!entry.isDirectory()) throw new Error("private directory entry is not a directory");
+    if (Number(entry.mode & 0o7777n) !== PRIVATE_DIRECTORY_MODE) {
+      throw new Error("private directory entry mode is not trusted");
+    }
+    if (entry.uid !== stat.uid) {
+      throw new Error("private directory entry owner is not trusted");
+    }
+    if (entry.dev !== stat.dev || entry.ino !== stat.ino) {
+      throw new Error("private directory entry changed during validation");
+    }
+    return privateDirectoryWitness(stat);
+  } catch (error) {
+    throw new PrivateDirectoryTopologyError("private directory topology is not trusted", { cause: error });
+  }
 }
 
 /** Flush a private directory through a descriptor with strict open flags. */
@@ -364,6 +510,27 @@ function unlinkPrivateFileIfIdentityMatches(
   ) return false;
   unlink(path);
   return true;
+}
+
+function assertPrivateTemporaryFileIdentity(
+  path: string,
+  expected: PrivateFileIdentity,
+): void {
+  try {
+    const current = lstatSync(path, { bigint: true }) as unknown as BigIntFileStat;
+    if (
+      !current.isFile()
+      || current.dev !== expected.dev
+      || current.ino !== expected.ino
+    ) {
+      throw new Error("private temporary file changed during validation");
+    }
+  } catch (error) {
+    throw new PrivateDirectoryTopologyError(
+      "private temporary file topology is not trusted",
+      { cause: error },
+    );
+  }
 }
 
 function validateBoundedBigIntFileMetadata(
@@ -739,6 +906,7 @@ export function atomicWritePrivateFile(
   operations: {
     readonly close?: typeof closeSync;
     readonly fchmod?: typeof fchmodSync;
+    readonly link?: typeof linkSync;
     readonly open?: typeof openSync;
     readonly random?: (size: number) => Buffer;
     readonly remove?: typeof rmSync;
@@ -746,9 +914,145 @@ export function atomicWritePrivateFile(
     readonly sync?: typeof fsyncSync;
     readonly write?: typeof writeFileSync;
   } = {},
+  parent?: PrivateDirectoryHandle,
+  options: Readonly<{ requireAbsent?: boolean }> = {},
 ): void {
   const directory = dirname(path);
-  ensurePrivateDirectory(directory);
+  if (options.requireAbsent) {
+    if (parent === undefined) {
+      throw new Error("exclusive private publication requires a retained parent");
+    }
+    assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+    const parentIdentity = {
+      dev: BigInt(parent.witness.dev),
+      ino: BigInt(parent.witness.ino),
+    };
+    const tempPath = join(
+      directory,
+      `.${basename(path)}.${(operations.random ?? randomBytes)(12).toString("hex")}.tmp`,
+    );
+    let ownsTempPath = false;
+    let published = false;
+    let tempIdentity: PrivateFileIdentity | undefined;
+    let primaryError: unknown;
+    try {
+      let fd: number;
+      try {
+        fd = (operations.open ?? openSync)(tempPath, "wx", PRIVATE_FILE_MODE);
+      } catch (error) {
+        try {
+          assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+        } catch {
+          throw new PrivateDirectoryTopologyError(
+            "private directory topology is not trusted after temporary file open failed",
+            { cause: error },
+          );
+        }
+        throw error;
+      }
+      ownsTempPath = true;
+      try {
+        tempIdentity = privateFileIdentity(
+          fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
+          parentIdentity,
+        );
+        assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+        (operations.write ?? writeFileSync)(fd, content, "utf-8");
+        (operations.fchmod ?? fchmodSync)(fd, PRIVATE_FILE_MODE);
+        (operations.sync ?? fsyncSync)(fd);
+      } finally {
+        (operations.close ?? closeSync)(fd);
+      }
+      assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+      assertPrivateTemporaryFileIdentity(tempPath, tempIdentity);
+      try {
+        (operations.link ?? linkSync)(tempPath, path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          throw new PrivateFileCollisionError(
+            "private file was created concurrently",
+            { cause: error },
+          );
+        }
+        try {
+          assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+        } catch (topologyError) {
+          throw new PrivateFilePublicationTopologyError(
+            "unknown",
+            topologyError as PrivateDirectoryTopologyError,
+            error,
+            "link",
+          );
+        }
+        throw error;
+      }
+      published = true;
+      const removed = unlinkPrivateFileIfIdentityMatches(
+        tempPath,
+        tempIdentity,
+        (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+        undefined,
+        2n,
+      );
+      if (!removed) {
+        throw new Error("private exclusive publication temp cleanup was not completed");
+      }
+      ownsTempPath = false;
+      assertPrivateFileSingleLink(path, tempIdentity);
+      assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+    } catch (error) {
+      primaryError = error;
+      if (
+        published
+        && !(error instanceof PrivateFileCollisionError)
+        && !(error instanceof PrivateFilePublicationTopologyError)
+      ) {
+        let topologyError: PrivateDirectoryTopologyError | undefined;
+        try {
+          assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+        } catch (observedTopologyError) {
+          topologyError = observedTopologyError as PrivateDirectoryTopologyError;
+        }
+        primaryError = new PrivateFilePublicationTopologyError(
+          "published",
+          topologyError ?? new PrivateDirectoryTopologyError(
+            "private file link publication topology is not trusted",
+            { cause: error },
+          ),
+          error,
+          "link",
+        );
+      } else if (!(error instanceof PrivateDirectoryTopologyError)) {
+        try {
+          assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+        } catch (topologyError) {
+          primaryError = topologyError;
+        }
+      }
+    } finally {
+      if (ownsTempPath && tempIdentity !== undefined) {
+        try {
+          unlinkPrivateFileIfIdentityMatches(
+            tempPath,
+            tempIdentity,
+            (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+            undefined,
+            published ? 2n : 1n,
+          );
+        } catch { /* preserve the exclusive publication failure */ }
+      }
+    }
+    if (primaryError !== undefined) throw primaryError;
+    return;
+  }
+  if (parent === undefined) {
+    ensurePrivateDirectory(directory);
+  } else {
+    assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+  }
+  const parentIdentity = parent === undefined
+    ? undefined
+    : { dev: BigInt(parent.witness.dev), ino: BigInt(parent.witness.ino) };
   const tempPath = join(
     directory,
     `.${basename(path)}.${(operations.random ?? randomBytes)(12).toString("hex")}.tmp`,
@@ -756,21 +1060,69 @@ export function atomicWritePrivateFile(
   let ownsTempPath = false;
   let tempIdentity: PrivateFileIdentity | undefined;
   try {
-    const fd = (operations.open ?? openSync)(tempPath, "wx", PRIVATE_FILE_MODE);
-    ownsTempPath = true;
-    tempIdentity = privateFileIdentity(
-      fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
-      privatePathIdentity(directory),
-    );
+    let fd: number;
     try {
+      fd = (operations.open ?? openSync)(tempPath, "wx", PRIVATE_FILE_MODE);
+    } catch (error) {
+      if (parent !== undefined) {
+        try {
+          assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+        } catch {
+          throw new PrivateDirectoryTopologyError(
+            "private directory topology is not trusted after temporary file open failed",
+            { cause: error },
+          );
+        }
+      }
+      throw error;
+    }
+    ownsTempPath = true;
+    try {
+      tempIdentity = privateFileIdentity(
+        fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
+        parentIdentity ?? privatePathIdentity(directory),
+      );
+      if (parent !== undefined) {
+        assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+      }
       (operations.write ?? writeFileSync)(fd, content, "utf-8");
       (operations.fchmod ?? fchmodSync)(fd, PRIVATE_FILE_MODE);
       (operations.sync ?? fsyncSync)(fd);
     } finally {
       (operations.close ?? closeSync)(fd);
     }
-    (operations.rename ?? renameSync)(tempPath, path);
+    if (parent !== undefined) {
+      assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+      assertPrivateTemporaryFileIdentity(tempPath, tempIdentity);
+    }
+    try {
+      (operations.rename ?? renameSync)(tempPath, path);
+    } catch (error) {
+      if (parent !== undefined) {
+        try {
+          assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+        } catch (topologyError) {
+          throw new PrivateFilePublicationTopologyError(
+            "unknown",
+            topologyError as PrivateDirectoryTopologyError,
+            error,
+          );
+        }
+      }
+      throw error;
+    }
     ownsTempPath = false;
+    if (parent !== undefined) {
+      try {
+        assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+      } catch (topologyError) {
+        throw new PrivateFilePublicationTopologyError(
+          "published",
+          topologyError as PrivateDirectoryTopologyError,
+          topologyError,
+        );
+      }
+    }
   } finally {
     if (ownsTempPath && tempIdentity !== undefined) {
       unlinkPrivateFileIfIdentityMatches(
@@ -1031,8 +1383,6 @@ export type DurablePrivateWriteOptions = Readonly<{
   expectedUid?: number;
   /** Require the destination to be absent rather than replacing it. */
   requireAbsent?: boolean;
-  /** Bind replacement to the content observed by the caller while locked. */
-  expectedContentSha256?: string | null;
   /** Bound the precondition read independently of the replacement size. */
   maxExistingBytes?: number;
   /** Authenticated owner-only mode to place on the temporary descriptor before publication. */
@@ -1041,24 +1391,28 @@ export type DurablePrivateWriteOptions = Readonly<{
   random?: (size: number) => Buffer;
 }>;
 
-function sha256Bytes(value: string | Uint8Array): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
 /**
  * Publish a bounded private file durably in one directory.
  *
  * The parent is retained and revalidated for the complete operation.  The
  * temporary inode is fully written, mode-tightened, and fsynced before it is
- * linked or renamed into place; the parent is then fsynced as well.  Callers
- * that replace an existing file should supply the hash observed under their
- * mutation lock so an external edit fails closed before publication.
+ * linked or renamed into place; the parent is then fsynced as well.
+ * `requireAbsent` uses an exclusive hard link for portable no-clobber create.
+ * Without it, publication is an unconditional same-directory rename after
+ * the bounded existing-file safety preflight.  Parent and leaf checks reject
+ * observed unsafe state but are not descriptor-relative mutation and cannot
+ * close a same-UID substitution after the final check.  Application locks
+ * serialize cooperating LCM writers only; callers needing conditional
+ * replacement must own a protocol-specific operation and recovery grammar.
  */
 export function atomicWritePrivateFileDurable(
   path: string,
   content: string | Uint8Array,
   options: DurablePrivateWriteOptions = {},
 ): void {
+  if (Object.hasOwn(options, "expectedContentSha256")) {
+    throw new Error("conditional durable replacement is unsupported; use a protocol-specific operation");
+  }
   const finalMode = options.finalMode ?? PRIVATE_FILE_MODE;
   if (!isOwnerOnlyFileMode(finalMode)) {
     throw new Error("private durable publication mode must be owner-only");
@@ -1070,27 +1424,22 @@ export function atomicWritePrivateFileDurable(
     dev: BigInt(parent.witness.dev),
     ino: BigInt(parent.witness.ino),
   };
-  const expected = options.expectedContentSha256;
   const current = (() => {
     try {
-      const observed = readBoundedRegularFileWithStat(path, {
+      readBoundedRegularFileWithStat(path, {
         allowedRoot: directory,
         maxBytes: options.maxExistingBytes ?? Math.max(Buffer.byteLength(content), 1) + 1,
         expectedUid,
         allowedModes: OWNER_ONLY_FILE_MODES,
         requireSingleLink: true,
       });
-      return sha256Bytes(observed.content);
+      return true;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
       throw error;
     }
   })();
-  if (expected !== undefined && current !== expected) {
-    parent.close();
-    throw new Error("private file changed before durable publication");
-  }
-  if (options.requireAbsent && current !== null) {
+  if (options.requireAbsent && current) {
     parent.close();
     throw new Error("private file already exists");
   }

@@ -2,6 +2,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { StorageOperationError } from "../../../src/storage/errors.js";
 import { BackendPublicationJournalError } from "../../../src/storage/backend-publication.js";
+import {
+  PrivateDirectoryTopologyError,
+  PrivateFilePublicationTopologyError,
+} from "../../../src/security-files.js";
 import { makeMockStorageFactory } from "./mock-storage-factory.js";
 import {
   createInvocationCoordinator,
@@ -15,6 +19,23 @@ const mocks = vi.hoisted(() => ({
   exists: vi.fn(() => true),
   read: vi.fn(() => "{}"),
   write: vi.fn(),
+  readMetadata: vi.fn(() => "{}"),
+  readMetadataWithStat: vi.fn(),
+  metadataResult: vi.fn((content: string, parentDev = "1", parentIno = "1") => {
+    const result = { content, mtimeMs: 0 };
+    Object.defineProperties(result, {
+      parentDev: { value: parentDev, enumerable: false },
+      parentIno: { value: parentIno, enumerable: false },
+    });
+    return result as typeof result & { parentDev: string; parentIno: string };
+  }),
+  writeMetadata: vi.fn(),
+  assertDirectoryEntry: vi.fn(),
+  openDirectory: vi.fn(() => ({
+    fd: 1,
+    witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+    close: vi.fn(),
+  })),
   mkdir: vi.fn(),
   getConnection: vi.fn(() => ({})),
   closeConnection: vi.fn(),
@@ -34,6 +55,21 @@ const mocks = vi.hoisted(() => ({
   projectExists: vi.fn(async () => true),
   createFactory: vi.fn(),
   dedupObserver: vi.fn(),
+  ensureProjectDir: vi.fn(() => "/private/project"),
+  scrubForProject: vi.fn(async () => ({ scrub: (text: string) => mocks.scrub(text) })),
+  identity: vi.fn((cwd: string) => ({
+    id: "pid",
+    localProjectId: "pid",
+    canonical: cwd,
+    machineId: "machine-id",
+    selectedPath: cwd,
+  })),
+  pathsForIdentity: vi.fn((identity: { id: string; canonical: string; remoteProjectId?: string }) => ({
+    ...identity,
+    dir: `/lcm/projects/${identity.id}`,
+    dbPath: `/lcm/projects/${identity.id}/db.sqlite`,
+    metaPath: `/lcm/projects/${identity.id}/meta.json`,
+  })),
 }));
 
 vi.mock("node:fs", async (importOriginal) => ({
@@ -45,7 +81,18 @@ vi.mock("node:fs", async (importOriginal) => ({
 }));
 vi.mock("../../../src/daemon/project.js", () => ({
   projectPaths: (cwd: string) => ({ id: "pid", dbPath: `${cwd}/lcm.db`, metaPath: `${cwd}/meta.json`, canonical: cwd }),
-  projectIdentity: (cwd: string) => ({ id: "pid", canonical: cwd }),
+  projectPathsForIdentity: mocks.pathsForIdentity,
+  projectIdentity: mocks.identity,
+  ensureProjectDirForIdentity: mocks.ensureProjectDir,
+  MAX_PROJECT_METADATA_BYTES: 1024 * 1024,
+}));
+vi.mock("../../../src/security-files.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/security-files.js")>(),
+  readBoundedRegularFile: mocks.readMetadata,
+  readBoundedRegularFileWithStat: mocks.readMetadataWithStat,
+  atomicWritePrivateFile: mocks.writeMetadata,
+  assertPrivateDirectoryEntry: mocks.assertDirectoryEntry,
+  openPrivateDirectory: mocks.openDirectory,
 }));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/db/connection.js", () => ({ getLcmConnection: mocks.getConnection, closeLcmConnection: mocks.closeConnection }));
@@ -57,7 +104,7 @@ vi.mock("../../../src/promotion/detector.js", () => ({ shouldPromote: mocks.shou
 vi.mock("../../../src/promotion/dedup.js", () => ({ deduplicateAndInsert: mocks.dedup }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validate }));
 vi.mock("../../../src/scrub.js", () => ({
-  ScrubEngine: { forProject: async () => ({ scrub: mocks.scrub }) },
+  ScrubEngine: { forProject: mocks.scrubForProject },
 }));
 vi.mock("../../../src/storage/index.js", () => ({ createStorageBackendFactory: mocks.createFactory }));
 
@@ -66,12 +113,46 @@ import { createPromoteHandler } from "../../../src/daemon/routes/promote.js";
 const config = loadDaemonConfig("/tmp/promote-boundaries");
 const response = {} as never;
 
+function makeDirectoryHandle(close = vi.fn()) {
+  return {
+    fd: 1,
+    witness: { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" },
+    close,
+  };
+}
+
+function queueMetadataDirectoryChain(closes: Partial<Record<"root" | "projects" | "leaf", () => void>> = {}) {
+  const root = makeDirectoryHandle(vi.fn(closes.root ?? (() => undefined)));
+  const projects = makeDirectoryHandle(vi.fn(closes.projects ?? (() => undefined)));
+  const leaf = makeDirectoryHandle(vi.fn(closes.leaf ?? (() => undefined)));
+  mocks.openDirectory
+    .mockReturnValueOnce(root)
+    .mockReturnValueOnce(projects)
+    .mockReturnValueOnce(leaf);
+  return { root, projects, leaf };
+}
+
 describe("promote persistence boundaries", () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockClear();
     mocks.exists.mockReturnValue(true);
     mocks.projectExists.mockResolvedValue(true);
     mocks.read.mockReturnValue("{}");
+    mocks.readMetadata.mockReturnValue("{}");
+    mocks.readMetadataWithStat.mockReset();
+    mocks.readMetadataWithStat.mockImplementation((path: string, options: unknown) =>
+      mocks.metadataResult(mocks.readMetadata(path, options), "1", "1"));
+    mocks.openDirectory.mockReset();
+    mocks.openDirectory.mockImplementation(() => makeDirectoryHandle());
+    mocks.assertDirectoryEntry.mockReset();
+    mocks.assertDirectoryEntry.mockReturnValue({
+      mode: 0o700,
+      uid: 0,
+      gid: 0,
+      nlink: "1",
+      dev: "1",
+      ino: "1",
+    });
     mocks.getConnection.mockReturnValue({});
     mocks.conversations.mockResolvedValue([]);
     mocks.summaries.mockResolvedValue([]);
@@ -79,6 +160,21 @@ describe("promote persistence boundaries", () => {
     mocks.shouldPromote.mockReturnValue({ promote: false, tags: [], confidence: 0 });
     mocks.dedup.mockResolvedValue(undefined);
     mocks.dedupObserver.mockReset();
+    mocks.ensureProjectDir.mockReturnValue("/private/project");
+    mocks.scrubForProject.mockResolvedValue({ scrub: (text: string) => mocks.scrub(text) });
+    mocks.identity.mockImplementation((cwd: string) => ({
+      id: "pid",
+      localProjectId: "pid",
+      canonical: cwd,
+      machineId: "machine-id",
+      selectedPath: cwd,
+    }));
+    mocks.pathsForIdentity.mockImplementation(identity => ({
+      ...identity,
+      dir: `/lcm/projects/${identity.id}`,
+      dbPath: `/lcm/projects/${identity.id}/db.sqlite`,
+      metaPath: `/lcm/projects/${identity.id}/meta.json`,
+    }));
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
     mocks.createFactory.mockImplementation(async () => makeMockStorageFactory({
@@ -94,6 +190,37 @@ describe("promote persistence boundaries", () => {
       transaction: mocks.transaction,
       close: mocks.projectClose,
     });
+  });
+
+  it("authenticates the sidecar directory before scrubber setup", async () => {
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
+
+    expect(mocks.ensureProjectDir).toHaveBeenCalledOnce();
+    expect(mocks.ensureProjectDir).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "pid", canonical: "/ok" }),
+      { writeMetadata: false },
+    );
+    expect(mocks.scrubForProject).toHaveBeenCalledWith(
+      config.security.sensitivePatterns,
+      "/private/project",
+    );
+    expect(mocks.ensureProjectDir.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.scrubForProject.mock.invocationCallOrder[0]!);
+    expect(mocks.mkdir).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the private sidecar directory is untrusted", async () => {
+    mocks.ensureProjectDir.mockImplementationOnce(() => {
+      throw new Error("private directory mode is not trusted");
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "private directory mode is not trusted",
+    });
+    expect(mocks.scrubForProject).not.toHaveBeenCalled();
+    expect(mocks.openProject).not.toHaveBeenCalled();
   });
 
   it("compares stored prefixes with the same scrubbed content used for insertion", async () => {
@@ -146,7 +273,10 @@ describe("promote persistence boundaries", () => {
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok", dry_run: true }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { processed: 2, promoted: 1, conversations: 1 });
     expect(mocks.dedup).not.toHaveBeenCalled();
-    expect(mocks.write).not.toHaveBeenCalled();
+    expect(mocks.openDirectory).not.toHaveBeenCalled();
+    expect(mocks.readMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
   });
 
   it("inserts promoted summaries, ignores individual failures, and updates metadata", async () => {
@@ -157,17 +287,164 @@ describe("promote persistence boundaries", () => {
     ]);
     mocks.shouldPromote.mockReturnValue({ promote: true, tags: ["depth"], confidence: 0.25 });
     mocks.dedup.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("duplicate failed"));
-    mocks.read.mockReturnValueOnce(JSON.stringify({ existing: true }));
+    mocks.readMetadata.mockReturnValueOnce(JSON.stringify({ existing: true }));
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { processed: 2, promoted: 1, conversations: 1 });
-    expect(mocks.write).toHaveBeenCalledOnce();
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    expect(mocks.readMetadata).toHaveBeenCalledWith("/lcm/projects/pid/meta.json", {
+      allowedRoot: "/lcm/projects/pid",
+      maxBytes: 1024 * 1024,
+      expectedUid: process.getuid?.(),
+      requireSingleLink: true,
+    });
+    const [metadataPath, serialized] = mocks.writeMetadata.mock.calls[0] as [string, string];
+    expect(metadataPath).toBe("/lcm/projects/pid/meta.json");
+    expect(JSON.parse(serialized)).toMatchObject({ existing: true, cwd: "/ok" });
+    expect(JSON.parse(serialized).lastPromote).toEqual(expect.any(String));
+    expect(serialized.endsWith("\n")).toBe(true);
 
     mocks.exists.mockReturnValueOnce(true);
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
-    expect(mocks.write).toHaveBeenCalledTimes(2);
-    mocks.read.mockImplementationOnce(() => { throw new Error("meta failed"); });
+    expect(mocks.writeMetadata).toHaveBeenCalledTimes(2);
+    mocks.readMetadata.mockImplementationOnce(() => { throw new Error("meta failed"); });
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { processed: 0, promoted: 0, conversations: 0 });
+  });
+
+  it("retains and reasserts the complete metadata directory chain", async () => {
+    const chain = queueMetadataDirectoryChain();
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/chain" }));
+
+    expect(mocks.openDirectory.mock.calls.slice(0, 3)).toEqual([
+      ["/lcm", { expectedUid: process.getuid?.() }],
+      ["/lcm/projects", { expectedUid: process.getuid?.() }],
+      ["/lcm/projects/pid", { expectedUid: process.getuid?.() }],
+    ]);
+    expect(mocks.assertDirectoryEntry.mock.calls.slice(-6)).toEqual([
+      [chain.root, "/lcm", 0],
+      [chain.projects, "/lcm/projects", 0],
+      [chain.leaf, "/lcm/projects/pid", 0],
+      [chain.root, "/lcm", 0],
+      [chain.projects, "/lcm/projects", 0],
+      [chain.leaf, "/lcm/projects/pid", 0],
+    ]);
+    expect(mocks.writeMetadata).toHaveBeenCalledWith(
+      "/lcm/projects/pid/meta.json",
+      expect.any(String),
+      {},
+      chain.leaf,
+    );
+    expect(chain.leaf.close.mock.invocationCallOrder[0])
+      .toBeLessThan(chain.projects.close.mock.invocationCallOrder[0]!);
+    expect(chain.projects.close.mock.invocationCallOrder[0])
+      .toBeLessThan(chain.root.close.mock.invocationCallOrder[0]!);
+  });
+
+  it.each([
+    ["unexpected projects component", "/lcm/not-projects/pid", "/lcm/not-projects/pid/meta.json"],
+    ["unexpected leaf component", "/lcm/projects/other", "/lcm/projects/other/meta.json"],
+    ["unexpected metadata leaf", "/lcm/projects/pid", "/lcm/projects/pid/other.json"],
+    ["unexpected relative metadata chain", "projects/pid", "projects/pid/meta.json"],
+  ])("rejects an %s before opening directories", async (_label, dir, metaPath) => {
+    mocks.pathsForIdentity.mockReturnValueOnce({
+      id: "pid",
+      canonical: "/unexpected",
+      dir,
+      dbPath: `${dir}/db.sqlite`,
+      metaPath,
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/unexpected" }));
+
+    expect(mocks.openDirectory).not.toHaveBeenCalled();
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it("does not create a missing projects directory and closes the acquired root", async () => {
+    const root = makeDirectoryHandle();
+    mocks.openDirectory
+      .mockReturnValueOnce(root)
+      .mockImplementationOnce(() => {
+        throw Object.assign(new Error("projects missing"), { code: "ENOENT" });
+      });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/missing-projects" }));
+
+    expect(mocks.mkdir).not.toHaveBeenCalled();
+    expect(root.close).toHaveBeenCalledOnce();
+    expect(mocks.openDirectory).toHaveBeenCalledTimes(2);
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it("keeps an acquisition assertion critical while attempting cleanup", async () => {
+    const close = vi.fn(() => { throw new Error("root close failed"); });
+    const root = makeDirectoryHandle(close);
+    mocks.openDirectory.mockReturnValueOnce(root);
+    mocks.assertDirectoryEntry.mockImplementationOnce(() => {
+      throw new PrivateDirectoryTopologyError("root entry changed", {
+        cause: Object.assign(new Error("resource-coded assertion cause"), { code: "EMFILE" }),
+      });
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/assert-root" }));
+
+    expect(mocks.openDirectory).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it("promotes partial-chain drift over an ordinary resource open failure", async () => {
+    const root = makeDirectoryHandle();
+    mocks.openDirectory
+      .mockReturnValueOnce(root)
+      .mockImplementationOnce(() => {
+        throw Object.assign(new Error("projects descriptors exhausted"), { code: "EMFILE" });
+      });
+    mocks.assertDirectoryEntry.mockImplementation(() => {
+      if (mocks.assertDirectoryEntry.mock.calls.length === 2) {
+        throw new PrivateDirectoryTopologyError("root changed during projects open");
+      }
+      return { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" };
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/partial-drift" }));
+
+    expect(root.close).toHaveBeenCalledOnce();
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it("attempts every metadata directory close when multiple closes fail", async () => {
+    const closeOrder: string[] = [];
+    const chain = queueMetadataDirectoryChain({
+      root: () => { closeOrder.push("root"); throw new Error("root close failed"); },
+      projects: () => { closeOrder.push("projects"); throw new Error("projects close failed"); },
+      leaf: () => { closeOrder.push("leaf"); },
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/close-all" }));
+
+    expect(closeOrder).toEqual(["leaf", "projects", "root"]);
+    expect(chain.leaf.close).toHaveBeenCalledOnce();
+    expect(chain.projects.close).toHaveBeenCalledOnce();
+    expect(chain.root.close).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
   });
 
   it("normalizes typed and untyped failures and closes acquired connections", async () => {
@@ -183,9 +460,471 @@ describe("promote persistence boundaries", () => {
   });
 
   it("creates metadata when the file is absent", async () => {
-    mocks.read.mockImplementationOnce(() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); });
+    mocks.readMetadata.mockImplementationOnce(() => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); });
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ok" }));
-    expect(mocks.write).toHaveBeenCalledOnce();
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+
+    const closeError = new Error("metadata parent close failed");
+    queueMetadataDirectoryChain({ leaf: () => { throw closeError; } });
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/cleanup-only" }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it.each([
+    ["malformed JSON", "{"],
+    ["null metadata", "null"],
+    ["array metadata", "[]"],
+    ["primitive metadata", "42"],
+  ])("leaves %s unchanged and keeps promotion successful", async (_label, content) => {
+    mocks.readMetadata.mockReturnValueOnce(content);
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/invalid" }));
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it("skips metadata publication when the bounded reader rejects an existing file", async () => {
+    mocks.readMetadata.mockImplementationOnce(() => {
+      throw new Error("metadata owner or topology is not trusted");
+    });
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/invalid" }));
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it.each([
+    ["bounded read", () => mocks.readMetadata.mockImplementationOnce(() => {
+      throw new Error("metadata read failed");
+    })],
+    ["JSON parse", () => mocks.readMetadata.mockReturnValueOnce("{")],
+    ["metadata shape", () => mocks.readMetadata.mockReturnValueOnce("[]")],
+    ["serialized size", () => mocks.readMetadata.mockReturnValueOnce(
+      JSON.stringify({ existing: "é".repeat(524_288) }),
+    )],
+  ])("revalidates and closes the admitted parent after an ordinary %s failure", async (_label, fail) => {
+    const chain = queueMetadataDirectoryChain();
+    fail();
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ordinary-failure" }));
+
+    expect(mocks.openDirectory.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.readMetadata.mock.invocationCallOrder[0]!);
+    expect(mocks.assertDirectoryEntry.mock.calls.slice(-3)).toEqual([
+      [chain.root, "/lcm", 0],
+      [chain.projects, "/lcm/projects", 0],
+      [chain.leaf, "/lcm/projects/pid", 0],
+    ]);
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(chain.root.close).toHaveBeenCalledOnce();
+    expect(chain.projects.close).toHaveBeenCalledOnce();
+    expect(chain.leaf.close).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it.each([
+    ["bounded read", () => mocks.readMetadata.mockImplementationOnce(() => {
+      throw new Error("file changed during validation");
+    })],
+    ["JSON parse", () => mocks.readMetadata.mockReturnValueOnce("{")],
+    ["metadata shape", () => mocks.readMetadata.mockReturnValueOnce("[]")],
+    ["serialized size", () => mocks.readMetadata.mockReturnValueOnce(
+      JSON.stringify({ existing: "é".repeat(524_288) }),
+    )],
+  ])("fails closed when ordinary %s failure reveals a replaced parent", async (_label, fail) => {
+    const chain = queueMetadataDirectoryChain();
+    fail();
+    mocks.assertDirectoryEntry.mockImplementation(() => {
+      if (mocks.assertDirectoryEntry.mock.calls.length === 10) {
+        throw new PrivateDirectoryTopologyError("private directory topology is not trusted", {
+          cause: Object.assign(new Error("resource-coded assertion cause"), { code: "EMFILE" }),
+        });
+      }
+      return { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" };
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/replaced-parent" }));
+
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(chain.root.close).toHaveBeenCalledOnce();
+    expect(chain.projects.close).toHaveBeenCalledOnce();
+    expect(chain.leaf.close).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it("preserves a critical read primary without assertion masking", async () => {
+    const chain = queueMetadataDirectoryChain();
+    const topologyError = new PrivateDirectoryTopologyError("critical metadata read");
+    mocks.readMetadata.mockImplementationOnce(() => {
+      throw topologyError;
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/critical-read" }));
+
+    expect(mocks.assertDirectoryEntry).toHaveBeenCalledTimes(9);
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(chain.root.close).toHaveBeenCalledOnce();
+    expect(chain.projects.close).toHaveBeenCalledOnce();
+    expect(chain.leaf.close).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "critical metadata read",
+    });
+  });
+
+  it("preserves assertion failure when retained-parent cleanup also fails", async () => {
+    const close = vi.fn(() => { throw new Error("metadata parent close failed"); });
+    const chain = queueMetadataDirectoryChain({ leaf: close });
+    mocks.readMetadata.mockImplementationOnce(() => {
+      throw new Error("metadata read failed");
+    });
+    mocks.assertDirectoryEntry.mockImplementation(() => {
+      if (mocks.assertDirectoryEntry.mock.calls.length === 10) {
+        throw new PrivateDirectoryTopologyError("parent replaced");
+      }
+      return { mode: 0o700, uid: 0, gid: 0, nlink: "1", dev: "1", ino: "1" };
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/assertion-close" }));
+
+    expect(close).toHaveBeenCalledOnce();
+    expect(chain.projects.close).toHaveBeenCalledOnce();
+    expect(chain.root.close).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it("keeps ordinary read and cleanup failures best-effort", async () => {
+    const close = vi.fn(() => {
+      throw new Error("metadata parent close failed");
+    });
+    const chain = queueMetadataDirectoryChain({ leaf: close });
+    mocks.readMetadata.mockImplementationOnce(() => {
+      throw new Error("metadata read failed");
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/ordinary-close" }));
+
+    expect(mocks.assertDirectoryEntry.mock.calls.slice(-3)).toEqual([
+      [chain.root, "/lcm", 0],
+      [chain.projects, "/lcm/projects", 0],
+      [chain.leaf, "/lcm/projects/pid", 0],
+    ]);
+    expect(close).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it("covers platforms without process.getuid while preserving bounded read options", async () => {
+    const originalGetuid = process.getuid;
+    Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+    try {
+      await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/no-uid" }));
+    } finally {
+      Object.defineProperty(process, "getuid", { configurable: true, value: originalGetuid });
+    }
+    expect(mocks.readMetadata).toHaveBeenCalledWith("/lcm/projects/pid/meta.json", {
+      allowedRoot: "/lcm/projects/pid",
+      maxBytes: 1024 * 1024,
+      expectedUid: undefined,
+      requireSingleLink: true,
+    });
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["device", "2", "1"],
+    ["inode", "1", "2"],
+  ])("fails closed when the sampled metadata parent %s differs", async (_field, parentDev, parentIno) => {
+    const chain = queueMetadataDirectoryChain();
+    mocks.readMetadataWithStat.mockReturnValueOnce(
+      mocks.metadataResult(JSON.stringify({ injected: true }), parentDev, parentIno),
+    );
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/sampled-parent" }));
+
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).toHaveBeenCalledTimes(9);
+    expect(chain.root.close).toHaveBeenCalledOnce();
+    expect(chain.projects.close).toHaveBeenCalledOnce();
+    expect(chain.leaf.close).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it("accepts matching non-enumerable sampled parent identity", async () => {
+    const observed = mocks.metadataResult(JSON.stringify({ retained: true }));
+    expect(Object.keys(observed)).not.toContain("parentDev");
+    expect(Object.keys(observed)).not.toContain("parentIno");
+    mocks.readMetadataWithStat.mockReturnValueOnce(observed);
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/matching-parent" }));
+
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    const [, serialized] = mocks.writeMetadata.mock.calls[0] as [string, string];
+    expect(JSON.parse(serialized)).toMatchObject({ retained: true, cwd: "/matching-parent" });
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it("bounds serialized metadata by bytes and keeps the promotion result", async () => {
+    mocks.readMetadata.mockReturnValueOnce(JSON.stringify({ existing: "é".repeat(524_288) }));
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/oversized" }));
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it("keeps a writer rejection best-effort", async () => {
+    mocks.writeMetadata.mockImplementationOnce(() => { throw new Error("publish failed"); });
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/writer-error" }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it.each([
+    ["root", "EMFILE", 0],
+    ["projects", "ENFILE", 1],
+    ["leaf", "ENOSPC", 2],
+  ] as const)(
+    "keeps promotion successful when the %s metadata directory open fails with direct %s",
+    async (_component, code, priorHandles) => {
+      const opened = [makeDirectoryHandle(), makeDirectoryHandle()];
+      for (let index = 0; index < priorHandles; index += 1) {
+        mocks.openDirectory.mockReturnValueOnce(opened[index]!);
+      }
+      const resourceError = Object.assign(new Error(`metadata directory ${code}`), { code });
+      mocks.openDirectory.mockImplementationOnce(() => { throw resourceError; });
+
+      await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/resource" }));
+
+      expect(mocks.readMetadata).not.toHaveBeenCalled();
+      expect(mocks.writeMetadata).not.toHaveBeenCalled();
+      for (const handle of opened.slice(0, priorHandles)) {
+        expect(handle.close).toHaveBeenCalledOnce();
+      }
+      expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+        processed: 0,
+        promoted: 0,
+        conversations: 0,
+      });
+    },
+  );
+
+  it("keeps a metadata-parent resource failure best-effort through publication admission", async () => {
+    const resourceError = Object.assign(new Error("metadata parent unavailable"), { code: "EMFILE" });
+    mocks.openDirectory.mockImplementationOnce(() => { throw resourceError; });
+    const withPublicationAdmission = vi.fn(
+      async <T>(operation: (token: object) => Promise<T> | T): Promise<T> => operation({}),
+    );
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/resource-admission" }), {
+      withPublicationAdmission,
+    });
+
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
+    expect(mocks.readMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
+    });
+  });
+
+  it.each([
+    ["ENOENT", Object.assign(new Error("metadata parent missing"), { code: "ENOENT" })],
+    ["ELOOP", Object.assign(new Error("metadata parent loop"), { code: "ELOOP" })],
+    ["ENOTDIR", Object.assign(new Error("metadata parent is not a directory"), { code: "ENOTDIR" })],
+    ["ENOMEM", Object.assign(new Error("metadata parent allocation failed"), { code: "ENOMEM" })],
+    ["owner rejection", new Error("metadata parent owner is not trusted")],
+    ["mode rejection", new Error("metadata parent mode is not trusted")],
+    ["unknown error", new Error("metadata parent failed")],
+    [
+      "non-resource code with a resource cause",
+      Object.assign(
+        new Error("metadata parent failed", {
+          cause: Object.assign(new Error("descriptor exhaustion"), { code: "EMFILE" }),
+        }),
+        { code: "EIO" },
+      ),
+    ],
+    [
+      "unknown error with a resource cause",
+      new Error("metadata parent failed", {
+        cause: Object.assign(new Error("descriptor exhaustion"), { code: "ENFILE" }),
+      }),
+    ],
+  ])("fails closed for metadata parent open %s", async (_label, parentError) => {
+    mocks.openDirectory.mockImplementationOnce(() => { throw parentError; });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/parent-failure" }));
+
+    expect(mocks.readMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it.each([
+    [
+      "typed topology",
+      Object.assign(new PrivateDirectoryTopologyError("typed topology"), { code: "EMFILE" }),
+    ],
+    [
+      "named topology",
+      Object.assign(new Error("named topology"), {
+        code: "ENFILE",
+        name: "PrivateDirectoryTopologyError",
+      }),
+    ],
+    [
+      "cancellation",
+      Object.assign(createAbortError(), { code: "ENOSPC" }),
+    ],
+  ])("keeps a resource-coded %s failure critical", async (_label, topologyError) => {
+    mocks.openDirectory.mockImplementationOnce(() => { throw topologyError; });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/critical-resource" }));
+
+    expect(mocks.readMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+  });
+
+  it("keeps a resource-coded publication admission failure blocked", async () => {
+    const admissionError = Object.assign(
+      new BackendPublicationJournalError("unexpected-state", "publication changed"),
+      { code: "ENOSPC" },
+    );
+    const withPublicationAdmission = vi.fn()
+      .mockImplementationOnce(async (operation: (token: object) => Promise<unknown> | unknown) => operation({}))
+      .mockRejectedValueOnce(admissionError);
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/critical-admission" }), {
+      withPublicationAdmission,
+    });
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
+    expect(mocks.openDirectory).not.toHaveBeenCalled();
+    expect(mocks.readMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+  });
+
+  it("does not swallow a topology failure while reopening metadata parent", async () => {
+    mocks.openDirectory.mockImplementationOnce(() => {
+      throw new PrivateDirectoryTopologyError("project directory topology changed");
+    });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/topology" }));
+
+    expect(mocks.readMetadata).not.toHaveBeenCalled();
+    expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "project directory topology changed before metadata publication",
+    });
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+  });
+
+  it("keeps publication-outcome topology failures critical", async () => {
+    const topologyError = new PrivateDirectoryTopologyError("retained parent changed");
+    const publicationError = new PrivateFilePublicationTopologyError(
+      "published",
+      topologyError,
+      topologyError,
+    );
+    mocks.writeMetadata.mockImplementationOnce(() => { throw publicationError; });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/published-topology" }));
+
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "private file rename completed, but retained parent topology is not trusted",
+    });
+  });
+
+  it("preserves a topology primary when metadata-parent cleanup also fails", async () => {
+    const topologyError = new PrivateDirectoryTopologyError("topology primary");
+    const closeError = new Error("metadata parent close failed");
+    const closeOrder: string[] = [];
+    const firstChain = queueMetadataDirectoryChain({
+      root: () => { closeOrder.push("root"); },
+      projects: () => { closeOrder.push("projects"); },
+      leaf: () => { closeOrder.push("leaf"); throw closeError; },
+    });
+    mocks.writeMetadata.mockImplementationOnce(() => { throw topologyError; });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/topology-close" }));
+
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "topology primary" });
+    expect(closeOrder).toEqual(["leaf", "projects", "root"]);
+    expect(firstChain.root.close).toHaveBeenCalledOnce();
+    expect(firstChain.projects.close).toHaveBeenCalledOnce();
+    expect(firstChain.leaf.close).toHaveBeenCalledOnce();
+
+    queueMetadataDirectoryChain({ leaf: () => { throw closeError; } });
+    mocks.writeMetadata.mockImplementationOnce(() => { throw topologyError; });
+    const withPublicationAdmission = vi.fn(async <T>(operation: (token: object) => Promise<T> | T): Promise<T> => operation({}));
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/topology-close-admission" }), {
+      withPublicationAdmission,
+    });
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "topology primary" });
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps metadata cleanup failures best-effort while preserving writer errors", async () => {
+    const closeError = new Error("metadata parent close failed");
+    queueMetadataDirectoryChain({ leaf: () => { throw closeError; } });
+    mocks.writeMetadata.mockImplementationOnce(() => { throw new Error("metadata writer failed"); });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/cleanup" }));
+
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
       processed: 0,
       promoted: 0,
@@ -657,7 +1396,7 @@ describe("promote persistence boundaries", () => {
       } satisfies RouteExecutionContext,
     );
 
-    expect(mocks.write).toHaveBeenCalledOnce();
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
     expect(mocks.send).toHaveBeenLastCalledWith(response, 499, {
       status: "cancelled",
       error: "promote cancelled",
@@ -682,7 +1421,7 @@ describe("promote persistence boundaries", () => {
       { withPublicationAdmission } satisfies RouteExecutionContext,
     );
     expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
-    expect(mocks.write).toHaveBeenCalledOnce();
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
   });
 
   it("returns the coordinator cancellation response when a commit permit is refused", async () => {
@@ -730,6 +1469,84 @@ describe("promote persistence boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
       status: "blocked",
       error: "backend publication admission blocked",
+    });
+  });
+
+  it("blocks live identity drift after selecting scrubber patterns from the preflight identity", async () => {
+    const preflight = {
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      localProjectId: "local-hash-a",
+      canonical: "/work/project",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      machineId: "machine-id",
+      selectedPath: "/work/project",
+    };
+    const live = {
+      ...preflight,
+      localProjectId: "local-hash-b",
+    };
+    mocks.identity.mockReturnValueOnce(preflight).mockReturnValueOnce(live);
+    const order: string[] = [];
+    mocks.scrubForProject.mockImplementationOnce(async () => {
+      order.push("scrubber");
+      return { scrub: mocks.scrub };
+    });
+    const admission = vi.fn(async (operation: (token: object) => Promise<unknown>) => {
+      order.push("admission");
+      return operation({});
+    });
+
+    await createPromoteHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ cwd: preflight.canonical }),
+      { withPublicationAdmission: admission, signal: new AbortController().signal },
+    );
+
+    const localIdentity = {
+      id: preflight.localProjectId,
+      canonical: preflight.canonical,
+      remoteProjectId: preflight.remoteProjectId,
+    };
+    expect(mocks.pathsForIdentity).toHaveBeenCalledWith(localIdentity);
+    expect(mocks.ensureProjectDir).toHaveBeenCalledWith(localIdentity, { writeMetadata: false });
+    expect(mocks.scrubForProject).toHaveBeenCalledWith(
+      config.security.sensitivePatterns,
+      "/private/project",
+    );
+    expect(order).toEqual(["scrubber", "admission"]);
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    expect(mocks.openProject).not.toHaveBeenCalled();
+    expect(mocks.dedup).not.toHaveBeenCalled();
+    expect(mocks.writeMetadata).not.toHaveBeenCalled();
+  });
+
+  it("passes the matching preflight identity through the live storage open", async () => {
+    const identity = {
+      id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      localProjectId: "local-hash-same",
+      canonical: "/work/same",
+      remoteProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020",
+      machineId: "machine-id",
+      selectedPath: "/work/same",
+    };
+    mocks.identity.mockReturnValue(identity);
+
+    await createPromoteHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ cwd: identity.canonical, dry_run: true }),
+      { withPublicationAdmission: operation => operation({}) },
+    );
+
+    expect(mocks.openProject).toHaveBeenCalledWith(identity, expect.any(Object), expect.any(AbortSignal));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, {
+      processed: 0,
+      promoted: 0,
+      conversations: 0,
     });
   });
 

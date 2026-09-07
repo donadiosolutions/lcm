@@ -95,6 +95,10 @@ export function createRestoreHandler(
   return async (_req, res, body, routeContext) => {
     try {
       const input = JSON.parse(body || "{}");
+      if (input === null || typeof input !== "object" || Array.isArray(input)) {
+        sendJson(res, 400, { error: "invalid request body" });
+        return;
+      }
       const { session_id, source } = input;
       const client = normalizeTranscriptClient(input.client);
       let cwd: string | undefined;

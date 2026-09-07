@@ -5,6 +5,7 @@ import { createRetrievalEngine } from "../../retrieval.js";
 import { ExpansionOrchestrator } from "../../expansion.js";
 import { validateCwd } from "../validate-cwd.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
+import { sanitizeError } from "../safe-error.js";
 import {
   storageRouteFailureResponse,
   withProjectStorage,
@@ -13,10 +14,19 @@ import {
 export function createExpandHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
   return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      sendJson(res, 400, { error: "invalid request body" });
+      return;
+    }
     const { nodeId, depth = 1 } = input;
 
     if (!nodeId) {
       sendJson(res, 400, { error: "nodeId is required" });
+      return;
+    }
+
+    if (typeof depth !== "number" || !Number.isInteger(depth) || depth < 1) {
+      sendJson(res, 400, { error: "invalid depth" });
       return;
     }
 
@@ -48,7 +58,10 @@ export function createExpandHandler(config: DaemonConfig, storageFactory?: Stora
         sendJson(res, storageFailure.status, storageFailure.body);
         return;
       }
-      sendJson(res, 200, { expanded: null, error: err instanceof Error ? err.message : "expansion failed" });
+      sendJson(res, 200, {
+        expanded: null,
+        error: err instanceof Error ? sanitizeError(err.message) : "expansion failed",
+      });
     }
   };
 }

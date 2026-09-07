@@ -715,6 +715,90 @@ describe("portable record stream public seam", () => {
     expectDeepFrozen(manifest);
   });
 
+  it("classifies negative-zero manifest counts before checksum canonicalization", () => {
+    const input = makeManifestInput();
+    const domains = input.domains as PortableDomainManifest[];
+    const invalid = {
+      ...input,
+      domains: domains.map((entry, index) => index === 0
+        ? { ...entry, recordCount: -0 }
+        : entry),
+    };
+    invalid.contentSha256 = aggregateContentSha256(
+      PORTABLE_RECORD_SCHEMA_SHA256,
+      invalid.domains.map((entry) => entry.prefixSha256),
+    );
+
+    expectSanitizedCode(() => createPortableManifest(invalid as never), "malformed-manifest");
+
+    const forgedManifest = withManifestChecksum(invalid) as unknown as PortableManifest;
+    expectSanitizedCode(() => serializePortableManifest(forgedManifest), "malformed-manifest");
+    expectSanitizedCode(() => negotiatePortableManifest(forgedManifest), "malformed-manifest");
+    expectSanitizedCode(() => createPortableBatch(createBatchInput(forgedManifest, "machines", {
+      predecessor: null,
+      records: [records.machines[0]],
+      complete: true,
+    })), "malformed-manifest");
+
+    const wire = `${referenceCanonicalJson(forgedManifest).replace('"recordCount":0', '"recordCount":-0')}\n`;
+    expectSanitizedCode(
+      () => parsePortableManifest(Buffer.from(wire, "utf8")),
+      "malformed-manifest",
+    );
+  });
+
+  it("keeps negative-zero checkpoint verification classified as checkpoint-mismatch", () => {
+    const manifest = makeManifest();
+    const batch = asPortableBatch(createPortableBatch(createBatchInput(manifest, "machines", {
+      predecessor: null,
+      records: [records.machines[0]],
+      complete: true,
+    })));
+    const input = makeManifestInput();
+    const domains = input.domains as PortableDomainManifest[];
+    const invalid = {
+      ...input,
+      domains: domains.map((entry, index) => index === 0
+        ? { ...entry, recordCount: -0 }
+        : entry),
+    };
+    invalid.contentSha256 = aggregateContentSha256(
+      PORTABLE_RECORD_SCHEMA_SHA256,
+      invalid.domains.map((entry) => entry.prefixSha256),
+    );
+    const forgedManifest = withManifestChecksum(invalid) as unknown as PortableManifest;
+
+    expectCode(
+      () => verifyPortableCheckpoint(batch.checkpoint, forgedManifest),
+      "checkpoint-mismatch",
+    );
+  });
+
+  it("keeps negative-zero record payloads classified as malformed-record", () => {
+    const value = {
+      memoryId: "memory-763",
+      content: "negative-zero record test",
+      metadata: { source: "bug-763" },
+      sourceProjectId: null,
+      sourceSummaryId: null,
+      sessionId: "session-763",
+      depth: 0,
+      confidence: -0,
+      createdAt: TIMESTAMP,
+      archivedAt: null,
+    };
+    const input = {
+      domain: "promoted-memories" as const,
+      ordinal: 0,
+      value,
+      context: { projectIdentity: PROJECT_IDENTITY },
+    };
+    const valid = createPortableRecord({ ...input, value: { ...value, confidence: 0 } } as never);
+    expect(valid.value).toMatchObject({ memoryId: "memory-763", confidence: 0 });
+
+    expectSanitizedCode(() => createPortableRecord(input as never), "malformed-record");
+  });
+
   it("requires one canonical six-digit UTC capturedAt dialect", () => {
     const canonical = makeSourceDescription({ capturedAt: "2026-08-13T12:34:56.789000Z" });
     expect(() => createPortableManifest(makeManifestInput(canonical) as never)).not.toThrow();
@@ -1179,6 +1263,23 @@ describe("portable record stream public seam", () => {
   it("still reads available zero-record domains", async () => {
     const source = new FakePortableSource({ ...records, "passive-events": [] });
     const stream = await createPortableRecordStream(source);
+    const manifest = stream.describe();
+    const expectedPrefix = initialDomainPrefix(PORTABLE_RECORD_SCHEMA_SHA256, "passive-events");
+    const domainManifest = manifest.domains.find((entry) => entry.domain === "passive-events");
+    expect(domainManifest).toEqual({
+      domain: "passive-events",
+      domainVersion: 1,
+      coverage: {
+        state: "available",
+        evidenceSha256: referenceSha256(["task-2-coverage", "passive-events", "available"]),
+      },
+      recordCount: 0,
+      prefixSha256: expectedPrefix,
+    });
+    expect(manifest).toMatchObject({
+      version: 1,
+      schemaSha256: PORTABLE_RECORD_SCHEMA_SHA256,
+    });
     const verifyBaseline = source.verifyCalls.length;
     const pageBaseline = source.pageCalls.length;
     const batch = await stream.readBatch({
@@ -1186,12 +1287,66 @@ describe("portable record stream public seam", () => {
       maxRecords: 1,
       maxBytes: PORTABLE_LIMITS.maxBatchBytes,
     });
-    expect(batch.records).toEqual([]);
-    expect(batch.framedBytes).toBe(0);
-    expect(batch.complete).toBe(true);
+
+    const checkpointBody = {
+      version: 1 as const,
+      manifestSha256: manifest.manifestSha256,
+      domain: "passive-events" as const,
+      nextOrdinal: 0,
+      recordCount: 0,
+      prefixSha256: expectedPrefix,
+      lastRecordIdentitySha256: null,
+      lastRecordSha256: null,
+      previousCheckpointSha256: null,
+      complete: true,
+    };
+    expect(batch).toEqual({
+      version: 1,
+      manifestSha256: manifest.manifestSha256,
+      domain: "passive-events",
+      records: [],
+      framedBytes: 0,
+      complete: true,
+      priorCheckpointSha256: null,
+      checkpoint: {
+        ...checkpointBody,
+        checkpointSha256: referenceSha256(checkpointBody),
+      },
+    });
+    expect(batch.checkpoint.checkpointSha256).toBe(referenceSha256(checkpointBody));
     expect(source.verifyCalls).toHaveLength(verifyBaseline + 2);
     expect(source.pageCalls).toHaveLength(pageBaseline + 1);
-    expect(source.pageCalls.at(-1)).toMatchObject({ domain: "passive-events", afterOrdinal: 0, includePredecessor: false });
+    expect(source.pageCalls.slice(pageBaseline)).toEqual([{
+      domain: "passive-events",
+      afterOrdinal: 0,
+      includePredecessor: false,
+      maxRecords: PORTABLE_LIMITS.maxBatchRecords,
+      maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+    }]);
+    expect(source.verifyCalls.slice(verifyBaseline)).toEqual([
+      {
+        sourceIdentitySha256: manifest.source.sourceIdentitySha256,
+        sourceWitnessSha256: manifest.source.sourceWitnessSha256,
+        contentSha256: manifest.contentSha256,
+        manifestSha256: manifest.manifestSha256,
+      },
+      {
+        sourceIdentitySha256: manifest.source.sourceIdentitySha256,
+        sourceWitnessSha256: manifest.source.sourceWitnessSha256,
+        contentSha256: manifest.contentSha256,
+        manifestSha256: manifest.manifestSha256,
+      },
+    ]);
+    expectDeepFrozen(batch);
+    expectDeepFrozen(batch.records);
+    expectDeepFrozen(batch.checkpoint);
+    expect(() => (batch.records as PortableRecord[]).push(records.messages[0])).toThrow();
+    expect(() => {
+      (batch as unknown as { domain: PortableDomain }).domain = "messages";
+    }).toThrow();
+    expect(() => {
+      (batch.checkpoint as unknown as { nextOrdinal: number }).nextOrdinal = 1;
+    }).toThrow();
     await stream.close();
   });
 
@@ -1997,6 +2152,57 @@ describe("portable record stream public seam", () => {
     expect(parsePortableCheckpoint(serializePortableCheckpoint(checkpoint))).toEqual(checkpoint);
     expect(verifyPortableCheckpoint(checkpoint, manifest as never)).toEqual(checkpoint);
     expectDeepFrozen(checkpoint);
+  });
+
+  it("rejects negative-zero checkpoint counts across direct and wire APIs", () => {
+    const domain: PortableDomain = "native-transcripts";
+    const sourceRecords = { ...records, [domain]: [] } as Record<PortableDomain, readonly PortableRecord[]>;
+    const source = makeSourceDescription({
+      coverage: makeCoverage({ [domain]: coverageEvidence(domain, "authoritative-empty") } as never),
+    });
+    const manifest = makeManifest(source, sourceRecords);
+    const checkpoint = asPortableBatch(createPortableBatch(createBatchInput(manifest, domain, {
+      predecessor: null,
+      records: [],
+      complete: true,
+    }))).checkpoint;
+
+    expect(Object.is(checkpoint.nextOrdinal, -0)).toBe(false);
+    expect(Object.is(checkpoint.recordCount, -0)).toBe(false);
+    expect(parsePortableCheckpoint(serializePortableCheckpoint(checkpoint))).toEqual(checkpoint);
+    expect(verifyPortableCheckpoint(checkpoint, manifest)).toEqual(checkpoint);
+
+    const mutations = [
+      ["nextOrdinal", { nextOrdinal: -0 }],
+      ["recordCount", { recordCount: -0 }],
+      ["both counts", { nextOrdinal: -0, recordCount: -0 }],
+    ] as const;
+    for (const [, overrides] of mutations) {
+      const invalid = withCheckpointChecksum(checkpoint, overrides);
+      expectCode(() => serializePortableCheckpoint(invalid), "checkpoint-mismatch");
+      expectCode(() => verifyPortableCheckpoint(invalid, manifest), "checkpoint-mismatch");
+    }
+
+    const serialized = Buffer.from(serializePortableCheckpoint(checkpoint), "utf8");
+    const wireMutations = [
+      ["nextOrdinal", [['"nextOrdinal":0', '"nextOrdinal":-0']]],
+      ["recordCount", [['"recordCount":0', '"recordCount":-0']]],
+      ["both counts", [
+        ['"nextOrdinal":0', '"nextOrdinal":-0'],
+        ['"recordCount":0', '"recordCount":-0'],
+      ]],
+    ] as const;
+    for (const [, replacements] of wireMutations) {
+      let mutatedText = serialized.toString("utf8");
+      for (const [positiveZeroToken, negativeZeroToken] of replacements) {
+        mutatedText = mutatedText.replace(positiveZeroToken, negativeZeroToken);
+        expect(mutatedText).toContain(negativeZeroToken);
+      }
+      expectCode(
+        () => parsePortableCheckpoint(Buffer.from(mutatedText, "utf8")),
+        "checkpoint-mismatch",
+      );
+    }
   });
 
   it("rejects checkpoint serialization tampering and replay across manifests or domains", () => {

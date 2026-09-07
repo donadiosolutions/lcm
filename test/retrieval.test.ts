@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { createRetrievalEngine, RetrievalEngine } from "../src/retrieval.js";
+import {
+  CANONICAL_GREP_MODES,
+  DEFAULT_GREP_MODE,
+  createRetrievalEngine,
+  normalizeGrepMode,
+  RetrievalEngine,
+} from "../src/retrieval.js";
 import type { ConversationStore, MessageRecord } from "../src/store/conversation-store.js";
 import type { SummaryRecord, SummaryStore } from "../src/store/summary-store.js";
 
@@ -186,6 +192,18 @@ describe("RetrievalEngine grep", () => {
   const oldSummary = { summaryId: "sum_old", conversationId: 1, kind: "leaf", snippet: "old", createdAt: now };
   const newSummary = { ...oldSummary, summaryId: "sum_new", snippet: "new", createdAt: new Date(now.getTime() + 1) };
 
+  it("exposes immutable canonical modes and normalizes only omitted mode", () => {
+    expect(CANONICAL_GREP_MODES).toEqual(["full_text", "regex"]);
+    expect(Object.isFrozen(CANONICAL_GREP_MODES)).toBe(true);
+    expect(DEFAULT_GREP_MODE).toBe("full_text");
+    expect(normalizeGrepMode(undefined)).toBe("full_text");
+    expect(normalizeGrepMode("full_text")).toBe("full_text");
+    expect(normalizeGrepMode("regex")).toBe("regex");
+    for (const input of [null, 1, [], {}, "unknown"]) {
+      expect(normalizeGrepMode(input)).toBeNull();
+    }
+  });
+
   it.each(["messages", "summaries", "both"] as const)("searches and sorts %s scope", async (scope) => {
     const { engine, conversation, summaries } = stores({
       conversation: { searchMessages: vi.fn(async () => [oldMessage, newMessage]) },
@@ -197,6 +215,36 @@ describe("RetrievalEngine grep", () => {
     if (scope !== "messages") expect(result.summaries.map((item) => item.snippet)).toEqual(["new", "old"]);
     expect(conversation.searchMessages).toHaveBeenCalledTimes(scope === "summaries" ? 0 : 1);
     expect(summaries.searchSummaries).toHaveBeenCalledTimes(scope === "messages" ? 0 : 1);
+  });
+
+  it("rejects an invalid runtime scope instead of treating it as both", async () => {
+    const { engine, conversation, summaries } = stores();
+    await expect(engine.grep({ query: "q", mode: "regex", scope: "invalid" as never })).rejects.toThrow("Invalid grep scope");
+    expect(conversation.searchMessages).not.toHaveBeenCalled();
+    expect(summaries.searchSummaries).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "invalid", null])("rejects invalid runtime mode %j before stores", async (mode) => {
+    const { engine, conversation, summaries } = stores();
+    await expect(engine.grep({ query: "q", mode: mode as never, scope: "messages" })).rejects.toThrow("Invalid grep mode");
+    expect(conversation.searchMessages).not.toHaveBeenCalled();
+    expect(summaries.searchSummaries).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "all", "invalid"]) ("rejects invalid runtime scope %j before stores", async (scope) => {
+    const { engine, conversation, summaries } = stores();
+    await expect(engine.grep({ query: "q", mode: "full_text", scope: scope as never })).rejects.toThrow("Invalid grep scope");
+    expect(conversation.searchMessages).not.toHaveBeenCalled();
+    expect(summaries.searchSummaries).not.toHaveBeenCalled();
+  });
+
+  it.each(
+    CANONICAL_GREP_MODES.flatMap((mode) => ["messages", "summaries", "both"].map((scope) => [mode, scope] as const)),
+  )("passes %s mode to intended %s stores", async (mode, scope) => {
+    const { engine, conversation, summaries } = stores();
+    await engine.grep({ query: "q", mode, scope });
+    if (scope !== "summaries") expect(conversation.searchMessages).toHaveBeenCalledWith(expect.objectContaining({ mode }));
+    if (scope !== "messages") expect(summaries.searchSummaries).toHaveBeenCalledWith(expect.objectContaining({ mode }));
   });
 });
 

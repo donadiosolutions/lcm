@@ -1,14 +1,25 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { ConfigValidationError } from "../../src/daemon/config.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import { createPublicationConvergence } from "../../src/storage/publication-convergence.js";
+import { readBoundedRegularFile } from "../../src/security-files.js";
 
 const FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC =
   "lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.";
 
 const state = vi.hoisted(() => ({
+  diagnostics: {
+    backend: "sqlite", classification: "healthy", remediation: "No action required.",
+    publication: "ready", tls: "not-applicable", schema: "ready",
+    extensions: "not-applicable", search: "ready",
+    pool: { origin: "local", status: "ready", total: 0, idle: 0 },
+    project: { scope: "aggregate", status: "ready" },
+    identity: { status: "not-applicable" }, outbox: { status: "ready", captured: 0 },
+  },
   exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
   printHelp: vi.fn(),
   ensureDaemon: vi.fn(async () => ({ connected: true, spawned: false, restartedForParent: false, pid: 42 })),
@@ -105,6 +116,8 @@ const state = vi.hoisted(() => ({
   runtimePidPath: "/lcm/daemon.pid",
   runtimeTokenPath: "/lcm/daemon.token",
   migrateLegacyHome: vi.fn(),
+  install: vi.fn(async () => undefined),
+  createInstallerPublicationConvergence: vi.fn(),
   ensureAuthToken: vi.fn(),
   createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }) })),
 }));
@@ -206,7 +219,11 @@ vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
 } }));
 vi.mock("../../src/daemon/server.js", () => ({ createDaemon: state.createDaemon }));
 vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: state.ensureAuthToken, readAuthToken: state.readAuthToken }));
-vi.mock("../../src/stats.js", () => ({ collectStats: vi.fn(() => ({ ok: true })), printStats: vi.fn() }));
+vi.mock("../../src/stats.js", () => ({
+  collectStats: vi.fn(() => ({ messages: 0, summaries: 0, promotedCount: 0, backendDiagnostics: state.diagnostics })), printStats: vi.fn(),
+  StatsUnavailableError: class extends Error { constructor(readonly diagnostics: unknown) { super("Statistics unavailable."); } },
+}));
+vi.mock("../../src/storage/diagnostics.js", () => ({ collectBackendDiagnostics: vi.fn(async () => state.diagnostics), backendDiagnosticFailure: () => state.diagnostics }));
 vi.mock("../../src/doctor/doctor.js", () => ({ runDoctor: vi.fn(async () => state.doctorResults), printResults: vi.fn() }));
 vi.mock("../../src/diagnose.js", () => ({ diagnose: vi.fn(async () => ({ ok: true })), formatDiagnoseResult: vi.fn(() => "diagnosed") }));
 vi.mock("../../src/sensitive.js", () => ({ handleSensitive: vi.fn(async () => ({ stdout: state.sensitiveStdout, exitCode: 0 })) }));
@@ -262,7 +279,10 @@ vi.mock("../../src/config-manager.js", () => ({
   readConnectorTransport: vi.fn(() => state.storedCodexTransport),
   readConnectorTransportSnapshot: vi.fn(() => state.storedCodexTransport),
 }));
-vi.mock("../../installer/install.js", () => ({ install: vi.fn(async () => undefined) }));
+vi.mock("../../installer/install.js", () => ({
+  install: state.install,
+  createInstallerPublicationConvergence: state.createInstallerPublicationConvergence,
+}));
 vi.mock("../../installer/uninstall.js", () => ({ uninstall: vi.fn(async () => undefined) }));
 vi.mock("../../installer/dry-run-deps.js", () => ({ DryRunServiceDeps: class {} }));
 vi.mock("../../src/import.js", () => ({
@@ -309,6 +329,29 @@ type RootBootstrapTestSeams = {
   attempt?: (attempt: number) => void;
 };
 
+function makeTestConvergence(
+  readOwner: () => { version: 1; pid: number; processStartTime: string; nonce: string } =
+    () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+) {
+  let now = 0;
+  return createPublicationConvergence({
+    port: 3737,
+    identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+    deps: {
+      now: () => now,
+      sleep: async (delayMs: number) => { now += delayMs; },
+      readToken: () => "token",
+      readOwner,
+      processBirth: () => "birth",
+      lockPath: "/tmp/publication.lock",
+      fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+        status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite",
+        entrypoint: "/daemon", runtimeDigest: "runtime",
+      }) })) as unknown as typeof globalThis.fetch,
+    },
+  });
+}
+
 async function invoke(args: string[], seams?: RootBootstrapTestSeams): Promise<Error | undefined> {
   try {
     await runCli(["node", "lcm", ...args], seams);
@@ -320,11 +363,19 @@ async function invoke(args: string[], seams?: RootBootstrapTestSeams): Promise<E
 
 beforeEach(() => {
   vi.clearAllMocks();
+  state.createInstallerPublicationConvergence.mockResolvedValue(undefined);
+  state.install.mockResolvedValue(undefined);
   fakeStdin.on.mockReset();
   fakeStdin.destroy.mockReset();
   fakeStdin.isTTY = true;
   state.ensureDaemon.mockResolvedValue({ connected: true, spawned: false, restartedForParent: false, pid: 42 });
-  state.health.mockResolvedValue(true);
+  state.health.mockReset().mockResolvedValue(true);
+  state.post.mockReset().mockImplementation(async (path: string) => path === "/status" ? ({
+    daemon: { version: "1.0.0", uptime: 5, port: 3737 },
+    backendDiagnostics: state.diagnostics,
+    project: { messageCount: 2, summaryCount: 1, promotedCount: 1 },
+  }) : ({ ok: true, promoted: 1, processed: 1, skipped: 0, errors: 0, processedProjects: 1 }));
+  state.get.mockReset().mockResolvedValue({ backendDiagnostics: state.diagnostics } as never);
   state.authToken = "test-token";
   state.installed = [];
   state.codexMcpInspection = { state: "absent" };
@@ -379,6 +430,343 @@ afterEach(() => {
 });
 
 describe("runCli registration and help dispatch", () => {
+  it("creates one convergence and passes it to top-level install", async () => {
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      deps: {
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth",
+        lockPath: "/tmp/publication.lock",
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({ status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+
+    await invoke(["install"]);
+
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+    expect(state.install).toHaveBeenCalledWith(undefined, convergence);
+  });
+
+  it("forwards an undefined convergence to top-level install", async () => {
+    await invoke(["install"]);
+
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+    expect(state.install).toHaveBeenCalledWith(undefined, undefined);
+  });
+
+  it.each([["doctor"], ["stats"], ["stats", "--pool"], ["status"]])("observes diagnostics without root migration %#", async (...args) => {
+    await invoke(args);
+    expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
+    expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+  });
+
+  it("keeps nested connector installation on ordinary migration", async () => {
+    state.createInstallerPublicationConvergence.mockImplementation(() => {
+      throw new Error("nested connector install must not create convergence");
+    });
+    const migrate = vi.fn();
+
+    expect(await invoke(["connectors", "install", "codex"], {
+      migrate,
+      sleep: async (_delayMs: number) => undefined,
+    })).toBeUndefined();
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.installConnector).toHaveBeenCalledWith(
+      "codex",
+      undefined,
+      process.cwd(),
+      { persistTransport: false, queryCodexMcp: false },
+    );
+    expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
+  });
+
+  it("reuses the preAction convergence for config reads and prints once", async () => {
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      deps: {
+        sleep: async () => undefined,
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth",
+        lockPath: "/tmp/publication.lock",
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+          status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite",
+          entrypoint: "/daemon", runtimeDigest: "runtime",
+        }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.configGetValue.mockImplementationOnce(() => { throw contention; });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await invoke(["config", "get", "llm.provider"]);
+
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+    expect(state.migrateLegacyHome).toHaveBeenCalledOnce();
+    expect(state.configGetValue).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledOnce();
+  });
+
+  it("preserves the original action contention when the shared deadline expires", async () => {
+    let now = 0;
+    let sleeps = 0;
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      deps: {
+        now: () => now,
+        sleep: async () => { sleeps += 1; now = sleeps === 1 ? 1_990 : 2_000; },
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth",
+        lockPath: "/tmp/publication.lock",
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+          status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite",
+          entrypoint: "/daemon", runtimeDigest: "runtime",
+        }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.migrateLegacyHome.mockImplementationOnce(() => { throw contention; }).mockImplementationOnce(() => undefined);
+    state.configGetValue.mockImplementationOnce(() => { throw contention; });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    expect((await invoke(["config", "get", "llm.provider"]))?.message).toBe("exit:1");
+    expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
+    expect(state.configGetValue).toHaveBeenCalledOnce();
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it("does not retry action contention for a foreign lock owner", async () => {
+    const convergence = makeTestConvergence(() => ({
+      version: 1, pid: 99, processStartTime: "foreign", nonce: "b".repeat(32),
+    }));
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.configGetValue.mockImplementationOnce(() => { throw contention; });
+
+    expect((await invoke(["config", "get", "llm.provider"]))?.message).toBe("exit:1");
+    expect(state.configGetValue).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["machine", "show"],
+    ["project", "list"],
+    ["project", "show"],
+    ["config", "get", "llm.provider"],
+    ["events", "status"],
+    ["events", "validate"],
+    ["events", "quarantine"],
+    ["sensitive", "list"],
+    ["sensitive", "test", "value"],
+    ["export"],
+  ])("admits selected local read %# through the convergence gate", async (...args) => {
+    state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.migrateLegacyHome.mockImplementationOnce(() => { throw contention; }).mockImplementationOnce(() => undefined);
+    state.showMachine.mockReturnValue({ version: 1, machineId: "machine", displayName: "test" });
+    state.listProjects.mockResolvedValue({ local: [], remote: null });
+    state.showProject.mockResolvedValue({ hash: "hash", entry: { canonical: "/project", aliases: [] }, remote: null });
+    await invoke(args);
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+    expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["machine", "register"],
+    ["project", "link", "target"],
+    ["config", "set", "llm.provider", "openai"],
+    ["events", "promote"],
+    ["sensitive", "add", "PATTERN"],
+  ])("keeps mutation action %# outside the read convergence gate", async (...args) => {
+    state.migrateLegacyHome.mockImplementation(() => undefined);
+    await invoke(args);
+    expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
+  });
+
+  it("pins sensitive variadic parsing and preserves mutation migration", async () => {
+    state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+    await invoke(["sensitive", "--", "list"]);
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+
+    state.createInstallerPublicationConvergence.mockClear();
+    await invoke(["sensitive"]);
+    await invoke(["sensitive", "unknown"]);
+    expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
+
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.migrateLegacyHome.mockImplementation(() => { throw contention; });
+    expect(await invoke(["sensitive", "add", "PATTERN"])).toBe(contention);
+    expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
+  });
+
+  it("does not write stdout when a sensitive read has an empty result", async () => {
+    state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+    state.sensitiveStdout = "";
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      expect((await invoke(["sensitive", "list"]))?.message).toBe("exit:0");
+      expect(output).not.toHaveBeenCalled();
+    } finally {
+      state.sensitiveStdout = "sensitive";
+    }
+  });
+
+  it("retries project list and show preparation while preserving one result", async () => {
+    state.createInstallerPublicationConvergence.mockImplementation(async () => makeTestConvergence());
+    state.listProjects.mockImplementationOnce(() => { throw new PrivateMutationLockContentionError("busy"); })
+      .mockResolvedValue({ local: [], remote: null });
+    state.showProject.mockImplementationOnce(() => { throw new PrivateMutationLockContentionError("busy"); })
+      .mockResolvedValue({ hash: "hash", entry: { canonical: "/project", aliases: [] }, remote: null });
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const list = await invoke(["project", "list", "--json"]);
+    const show = await invoke(["project", "show", "--json"]);
+    expect(list).toBeUndefined();
+    expect(show).toBeUndefined();
+    expect(state.listProjects).toHaveBeenCalledTimes(2);
+    expect(state.showProject).toHaveBeenCalledTimes(2);
+    expect(output).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries sensitive preparation without replaying output", async () => {
+    state.createInstallerPublicationConvergence.mockImplementation(async () => makeTestConvergence());
+    const sensitiveModule = await import("../../src/sensitive.js");
+    vi.mocked(sensitiveModule.handleSensitive).mockImplementationOnce(async () => { throw new PrivateMutationLockContentionError("busy"); });
+    await invoke(["sensitive", "list"]);
+    expect(sensitiveModule.handleSensitive).toHaveBeenCalledTimes(2);
+
+  });
+
+  it("passes the captured convergence to export exactly once", async () => {
+    const convergence = makeTestConvergence();
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+    const portable = await import("../../src/portable-knowledge.js");
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await invoke(["export", "--output", "out.json"]);
+
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+    expect(portable.exportKnowledge).toHaveBeenCalledOnce();
+    expect(portable.exportKnowledge.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({ _publicationConvergence: convergence, output: "out.json" }),
+    );
+    expect(log).toHaveBeenCalledWith("  Exported 1 entries to out.json");
+  });
+
+  it("passes one captured convergence to each export-all target", async () => {
+    const convergence = makeTestConvergence();
+    state.createInstallerPublicationConvergence.mockResolvedValue(convergence);
+    state.entries = [{ name: "project", isDirectory: () => true }];
+    state.fileText = JSON.stringify({ cwd: "/project" });
+    const portable = await import("../../src/portable-knowledge.js");
+
+    await invoke(["export", "--all"]);
+
+    expect(portable.exportKnowledge).toHaveBeenCalledOnce();
+    expect(portable.exportKnowledge.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({ _publicationConvergence: convergence }),
+    );
+  });
+
+  describe.each([
+    ["contention", () => new PrivateMutationLockContentionError("publication busy")],
+    ["journal", () => new BackendPublicationJournalError("unsafe-storage", "private evidence")],
+  ] as const)("export %s admission failures", (_kind, makeError) => {
+    it.each([
+      ["stdout", ["export"]],
+      ["output file", ["export", "--output", "out.json"]],
+      ["all projects", ["export", "--all"]],
+    ])("fails %s without success output or replay", async (_mode, args) => {
+      const failure = makeError();
+      state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+      state.entries = [{ name: "project", isDirectory: () => true }];
+      state.fileText = JSON.stringify({ cwd: "/project" });
+      state.exportError = failure;
+      const portable = await import("../../src/portable-knowledge.js");
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+      const result = await invoke(args);
+
+      expect(result).toBe(failure);
+      expect(() => handleCliError(result)).toThrow("exit:1");
+      expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
+        failure instanceof BackendPublicationJournalError
+          ? FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC : failure.message,
+      );
+      expect(portable.exportKnowledge).toHaveBeenCalledOnce();
+      expect(log).not.toHaveBeenCalled();
+      expect(stdout).not.toHaveBeenCalled();
+      expect(stderr).not.toHaveBeenCalled();
+    });
+
+    it("fails reconciliation before exporting or claiming a total", async () => {
+      const failure = makeError();
+      state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+      state.entries = [{ name: "project", isDirectory: () => true }];
+      state.fileText = JSON.stringify({ cwd: "/project" });
+      state.reconcileWorktrees.mockImplementation(() => { throw failure; });
+      const portable = await import("../../src/portable-knowledge.js");
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const result = await invoke(["export", "--all"]);
+
+        expect(result).toBe(failure);
+        expect(() => handleCliError(result)).toThrow("exit:1");
+        expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
+          failure instanceof BackendPublicationJournalError
+            ? FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC : failure.message,
+        );
+        expect(state.reconcileWorktrees.mock.calls.length).toBe(
+          failure instanceof PrivateMutationLockContentionError ? 40 : 1,
+        );
+        expect(portable.exportKnowledge).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+        expect(stderr).not.toHaveBeenCalled();
+      } finally {
+        state.reconcileWorktrees.mockImplementation(path => ({ targetHash: path, canonical: path }));
+      }
+    });
+
+    it("keeps prior all-project output once but fails without a success total", async () => {
+      const failure = makeError();
+      state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+      state.entries = [
+        { name: "first", isDirectory: () => true },
+        { name: "second", isDirectory: () => true },
+      ];
+      state.fileText = JSON.stringify({ cwd: "/candidate" });
+      state.reconcileWorktrees
+        .mockReturnValueOnce({ targetHash: "first", canonical: "/first" })
+        .mockReturnValueOnce({ targetHash: "second", canonical: "/second" });
+      const portable = await import("../../src/portable-knowledge.js");
+      vi.mocked(portable.exportKnowledge)
+        .mockResolvedValueOnce(state.portableResult)
+        .mockRejectedValueOnce(failure);
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+      const result = await invoke(["export", "--all"]);
+
+      expect(result).toBe(failure);
+      expect(() => handleCliError(result)).toThrow("exit:1");
+      expect(diagnostic).toHaveBeenCalledOnce();
+      expect(portable.exportKnowledge).toHaveBeenCalledTimes(2);
+      expect(log).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("/first: 1 entries"));
+    });
+  });
+
   it("retries transient root bootstrap contention for an ordinary command", async () => {
     vi.useFakeTimers();
     const contention = new actualRuntimePaths.BootstrapLockContentionError(
@@ -486,6 +874,10 @@ describe("runCli registration and help dispatch", () => {
     expect(consoleError).toHaveBeenNthCalledWith(2, configError.message);
     expect(consoleError).toHaveBeenNthCalledWith(3, backendError.message);
     expect(consoleError).toHaveBeenNthCalledWith(4, contentionError.message);
+    const publicationContention = new PrivateMutationLockContentionError("publication contention");
+    expect(() => handleCliError(publicationContention)).toThrow("exit:1");
+    expect(consoleError).toHaveBeenNthCalledWith(5, publicationContention.message);
+    expect(consoleError).toHaveBeenCalledTimes(5);
     expect(stdout).toHaveBeenCalledWith("out");
     expect(stderr).toHaveBeenCalledWith("err");
     const runner = vi.fn(async () => undefined);
@@ -519,6 +911,58 @@ describe("runCli registration and help dispatch", () => {
     expect(rendered).not.toContain("/tmp/private");
     expect(rendered).not.toContain("https://user:password");
     expect(rendered).not.toContain("\\u001b");
+  });
+
+  it("renders the installer snapshot drift throw as one fixed diagnostic", async () => {
+    const installer = await vi.importActual<typeof import("../../installer/install.js")>("../../installer/install.js");
+    const home = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-installer-drift-"));
+    const root = join(home, ".lcm");
+    const configPath = join(root, "config.json");
+    const content = '{"daemon":{}}';
+    actualFs.mkdirSync(root, { mode: 0o700 });
+    actualFs.writeFileSync(configPath, content, { mode: 0o600 });
+    const readSnapshot = vi.fn()
+      .mockReturnValueOnce({
+        content,
+        witness: { presence: "present", rawSha256: "a", byteLength: Buffer.byteLength(content), dev: "1", ino: "2", mtimeMs: 0 },
+      })
+      .mockReturnValueOnce({
+        content,
+        witness: { presence: "present", rawSha256: "b", byteLength: Buffer.byteLength(content), dev: "1", ino: "2", mtimeMs: 0 },
+      });
+    const deps = {
+      spawnSync: vi.fn(),
+      readFileSync: vi.fn(),
+      writeFileSync: vi.fn(),
+      mkdirSync: vi.fn(),
+      existsSync: actualFs.existsSync,
+      promptUser: vi.fn(),
+      ensureLcmHome: vi.fn(),
+      readBoundedRegularFile,
+      _forceLockFreePublicationReadForTesting: true,
+      _readDaemonConfigRawSnapshot: readSnapshot,
+      _assertBackendPublicationConfigReadAccess: vi.fn(() => ({ journalChecksumSha256: null })),
+    } satisfies import("../../installer/install.js").ServiceDeps;
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      let thrown: unknown;
+      try {
+        installer.prepareInstallConfig(deps, configPath);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(BackendPublicationJournalError);
+      expect(readSnapshot).toHaveBeenCalledTimes(2);
+      expect(deps.writeFileSync).not.toHaveBeenCalled();
+      expect(() => handleCliError(thrown)).toThrow("exit:1");
+      expect(diagnostic).toHaveBeenCalledTimes(1);
+      expect(diagnostic).toHaveBeenCalledWith(FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC);
+      const rendered = JSON.stringify(diagnostic.mock.calls);
+      expect(rendered).not.toContain("configuration changed during lock-free publication admission");
+      expect(rendered).not.toContain("BackendPublicationJournalError");
+    } finally {
+      actualFs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("waits for the stdin timeout when a pipe never closes", async () => {
@@ -694,7 +1138,8 @@ describe("runCli daemon-backed and utility actions", () => {
     });
     const migrate = vi.fn();
     const sleep = vi.fn(async (_delayMs: number) => undefined);
-    const root = actualFs.mkdtempSync("/tmp/lcm-cli-concurrent-");
+    const root = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-concurrent-"));
+    expect(dirname(root)).toBe(tmpdir());
     actualFs.mkdirSync(join(root, ".lcm"), { recursive: true });
     const previousRuntime = {
       home: state.runtimeHome,
@@ -728,6 +1173,52 @@ describe("runCli daemon-backed and utility actions", () => {
     }
   });
 
+  it("runs legacy migration before routing store through an authenticated healthy daemon", async () => {
+    state.health.mockResolvedValue({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+    const root = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-store-"));
+    actualFs.mkdirSync(join(root, ".lcm"), { recursive: true });
+    const previousRuntime = {
+      home: state.runtimeHome,
+      pid: state.runtimePidPath,
+      token: state.runtimeTokenPath,
+    };
+    state.runtimeHome = root;
+    state.runtimePidPath = join(root, ".lcm", "daemon.pid");
+    state.runtimeTokenPath = join(root, ".lcm", "daemon.token");
+
+    try {
+      expect(await invoke(["store", "memory", "--tag", "project:lcm"], {
+        migrate,
+        sleep,
+      })).toBeUndefined();
+
+      expect(migrate).toHaveBeenCalledOnce();
+      expect(state.ensureDaemon).not.toHaveBeenCalled();
+      expect(state.health).toHaveBeenCalledOnce();
+      expect(migrate.mock.invocationCallOrder[0])
+        .toBeLessThan(state.health.mock.invocationCallOrder[0]!);
+      expect(state.post).toHaveBeenCalledWith("/store", {
+        cwd: process.cwd(),
+        text: "memory",
+        tags: ["project:lcm"],
+        metadata: {},
+      });
+    } finally {
+      state.runtimeHome = previousRuntime.home;
+      state.runtimePidPath = previousRuntime.pid;
+      state.runtimeTokenPath = previousRuntime.token;
+      actualFs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("falls back to one authenticated migration when the read fast path cannot authorize", async () => {
     state.health.mockResolvedValue({ status: "ok", storageBackend: "postgresql" });
     const migrate = vi.fn();
@@ -737,6 +1228,25 @@ describe("runCli daemon-backed and utility actions", () => {
 
     expect(migrate).toHaveBeenCalledOnce();
     expect(state.ensureDaemon).toHaveBeenCalledOnce();
+  });
+
+  it("falls back to authenticated migration when store preflight cannot authorize", async () => {
+    state.health.mockResolvedValue({ status: "ok", storageBackend: "postgresql" });
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+
+    expect(await invoke(["store", "memory"], { migrate, sleep })).toBeUndefined();
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.health).toHaveBeenCalledOnce();
+    expect(state.ensureDaemon).toHaveBeenCalledOnce();
+    expect(migrate.mock.invocationCallOrder[0])
+      .toBeLessThan(state.health.mock.invocationCallOrder[0]!);
+    expect(state.health.mock.invocationCallOrder[0])
+      .toBeLessThan(state.ensureDaemon.mock.invocationCallOrder[0]!);
+    expect(state.post).toHaveBeenCalledWith("/store", expect.objectContaining({
+      text: "memory",
+    }));
   });
 
   it("never authorizes the read fast path from public health without a token", async () => {
@@ -825,17 +1335,15 @@ describe("runCli daemon-backed and utility actions", () => {
     for (const args of pureCases) await invoke(args, { migrate, sleep });
 
     expect(migrate).not.toHaveBeenCalled();
+    expect(state.createInstallerPublicationConvergence).not.toHaveBeenCalled();
   });
 
   it("keeps mutation and unclassified actions on the migration path", async () => {
     const migrate = vi.fn();
     const sleep = vi.fn(async (_delayMs: number) => undefined);
     const mutationCases = [
-      ["store", "text"],
       ["daemon", "start"],
       ["daemon", "restart"],
-      ["stats"],
-      ["doctor"],
       ["config", "get", "daemon.port"],
       ["machine", "show"],
       ["events", "status"],
@@ -852,6 +1360,7 @@ describe("runCli daemon-backed and utility actions", () => {
   });
 
   it("propagates private mutation-lock contention from the routed migration", async () => {
+    state.health.mockResolvedValue({ status: "ok", storageBackend: "postgresql" });
     const contention = new PrivateMutationLockContentionError("publication lock is busy");
     const migrate = vi.fn(() => { throw contention; });
 
@@ -859,11 +1368,106 @@ describe("runCli daemon-backed and utility actions", () => {
       migrate,
       sleep: async (_delayMs: number) => undefined,
     })).rejects.toBe(contention);
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.health).not.toHaveBeenCalled();
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+  });
+
+  it("rejects unauthenticated legacy coexistence before healthy store admission", async () => {
+    state.health.mockResolvedValue({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "sqlite",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
+    const rejection = new Error("legacy and active LCM homes coexist without authenticated migration evidence");
+    const migrate = vi.fn(() => { throw rejection; });
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+
+    let observed: unknown;
+    try {
+      await runCli(["node", "lcm", "store", "text"], { migrate, sleep });
+    } catch (error) {
+      observed = error;
+    }
+
+    expect(observed).toBe(rejection);
+    expect(observed).toMatchObject({
+      message: "legacy and active LCM homes coexist without authenticated migration evidence",
+    });
+
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(state.health).not.toHaveBeenCalled();
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+  });
+
+  it("defers verified PostgreSQL store mutation admission to the daemon", async () => {
+    const root = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-store-pg-"));
+    const lcmDir = join(root, ".lcm");
+    const caFile = join(root, "ca.pem");
+    actualFs.mkdirSync(lcmDir, { recursive: true });
+    actualFs.writeFileSync(join(lcmDir, "config.json"), JSON.stringify({
+      storage: { backend: "postgresql" },
+    }));
+    actualFs.writeFileSync(caFile, "test-ca\n");
+    const previousRuntime = {
+      home: state.runtimeHome,
+      pid: state.runtimePidPath,
+      token: state.runtimeTokenPath,
+    };
+    const previousEnv = {
+      url: process.env.LCM_POSTGRES_URL,
+      caFile: process.env.LCM_POSTGRES_CA_FILE,
+      migrationRole: process.env.LCM_POSTGRES_MIGRATION_ROLE,
+    };
+    state.runtimeHome = root;
+    state.runtimePidPath = join(lcmDir, "daemon.pid");
+    state.runtimeTokenPath = join(lcmDir, "daemon.token");
+    state.storageBackend = "postgresql";
+    process.env.LCM_POSTGRES_URL = "postgresql://lcm:secret@localhost:5432/lcm";
+    process.env.LCM_POSTGRES_CA_FILE = caFile;
+    process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_migrator";
+    state.health.mockResolvedValue({
+      status: "healthy",
+      version: "1.4.2",
+      storageBackend: "postgresql",
+      entrypoint: "/daemon",
+      runtimeDigest: "runtime",
+    });
+    const migrate = vi.fn();
+    const sleep = vi.fn(async (_delayMs: number) => undefined);
+
+    try {
+      expect(await invoke(["store", "memory"], { migrate, sleep })).toBeUndefined();
+      expect(state.health).toHaveBeenCalledOnce();
+      expect(migrate).toHaveBeenCalledOnce();
+      expect(state.ensureDaemon).not.toHaveBeenCalled();
+      expect(state.post).toHaveBeenCalledWith("/store", expect.objectContaining({
+        text: "memory",
+      }));
+      expect(migrate.mock.invocationCallOrder[0])
+        .toBeLessThan(state.health.mock.invocationCallOrder[0]!);
+    } finally {
+      state.runtimeHome = previousRuntime.home;
+      state.runtimePidPath = previousRuntime.pid;
+      state.runtimeTokenPath = previousRuntime.token;
+      if (previousEnv.url === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = previousEnv.url;
+      if (previousEnv.caFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = previousEnv.caFile;
+      if (previousEnv.migrationRole === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE;
+      else process.env.LCM_POSTGRES_MIGRATION_ROLE = previousEnv.migrationRole;
+      actualFs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it.each([
     ["search", "needle", "--limit", "2", "--layer", "episodic", "--tag", "decision"],
-    ["grep", "needle", "--mode", "regex", "--scope", "messages", "--since", "2026-01-01"],
+    ["grep", "needle", "--mode", "regex", "--scope", "messages", "--since", "2026-01-01T00:00:00Z"],
     ["describe", "node"], ["expand", "node", "--depth", "2"], ["store", "memory", "--tag", "one"],
   ])("dispatches memory action %#", async (...args) => {
     expect(await invoke(args)).toBeUndefined();
@@ -896,7 +1500,6 @@ describe("runCli daemon-backed and utility actions", () => {
     ["describe", "node"],
     ["expand", "node"],
     ["store", "memory"],
-    ["stats", "--pool"],
     ["events", "promote"],
   ])("rejects daemon-backed command %# before lifecycle mutation when PostgreSQL is selected", async (...args) => {
     state.storageBackend = "postgresql";
@@ -911,7 +1514,7 @@ describe("runCli daemon-backed and utility actions", () => {
 
   it.each([
     ["config", "get", "llm.provider", "--effective"], ["config", "set", "llm.provider", "openai", "--json"],
-    ["status"], ["status", "--json"], ["stats"], ["stats", "--pool"], ["stats", "--pool", "--json"],
+    ["status"], ["status", "--json"], ["stats"], ["stats", "--json"], ["stats", "--pool"], ["stats", "--pool", "--json"],
     ["diagnose"], ["diagnose", "--all", "--verbose", "--json"], ["sensitive", "list"],
     ["connectors", "list"], ["connectors", "list", "--format", "json", "--global"],
     ["connectors", "install", "codex"], ["connectors", "remove", "codex"],
@@ -928,10 +1531,111 @@ describe("runCli daemon-backed and utility actions", () => {
 });
 
 describe("runCli orchestration actions", () => {
-  it("refuses normal stats when the effective backend is unavailable", async () => {
-    state.loadConfig.mockReturnValueOnce({ storage: { backend: "postgresql" } });
+  it.each([
+    { json: false, localHealthy: false }, { json: true, localHealthy: false },
+    { json: false, localHealthy: true }, { json: true, localHealthy: true },
+  ])("retains authenticated daemon up after backend status refusal (json=$json, localHealthy=$localHealthy)", async ({ json, localHealthy }) => {
+    const root = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-status-refusal-"));
+    actualFs.mkdirSync(join(root, ".lcm"), { recursive: true });
+    state.runtimeHome = root;
+    state.health.mockResolvedValue({
+      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+      entrypoint: "/daemon", runtimeDigest: "runtime", uptime: 7,
+    });
+    const statsModule = await import("../../src/stats.js");
+    const classification = localHealthy ? "healthy" : "stale-publication";
+    const diagnostic = { ...state.diagnostics, classification };
+    state.post.mockRejectedValueOnce(Object.assign(new Error("private refusal canary"), { statusCode: 503 }));
+    // The transport exposes statusCode only. Backend facts are freshly observed
+    // locally, which may already be healthy after the earlier remote refusal.
+    if (localHealthy) vi.mocked(statsModule.collectStats).mockResolvedValueOnce({
+      messages: 0, summaries: 0, promotedCount: 0, backendDiagnostics: diagnostic,
+    } as never);
+    else vi.mocked(statsModule.collectStats).mockRejectedValueOnce(new statsModule.StatsUnavailableError(diagnostic as never));
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      expect(await invoke(json ? ["status", "--json"] : ["status"])).toBeUndefined();
+      expect(state.post).toHaveBeenCalledWith("/status", { cwd: process.cwd() }, { timeoutMs: 2000 });
+      if (json) {
+        expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toMatchObject({
+          daemon: { status: "up", version: "1.4.2", uptime: 7, port: 3737 },
+          backendDiagnostics: { classification },
+          diagnosticSource: "local",
+        });
+      } else {
+        expect(log).toHaveBeenCalledWith("Daemon: up");
+        expect(log).toHaveBeenCalledWith("Diagnostics source: local observation after daemon status request failed.");
+        expect(log).toHaveBeenCalledWith(expect.stringContaining(`Classification: ${classification}`));
+      }
+      expect(JSON.stringify([stdout.mock.calls, log.mock.calls])).not.toContain("private refusal canary");
+      expect(state.ensureDaemon).not.toHaveBeenCalled();
+      expect(state.restartDaemon).not.toHaveBeenCalled();
+      expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    } finally {
+      actualFs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 
-    await expect(runCli(["node", "lcm", "stats"])).rejects.toBeInstanceOf(BackendPublicationJournalError);
+  it.each(["status", "pool", "stats"])("renders complete safe backend facts for %s failures", async (kind) => {
+    state.authToken = null;
+    const statsModule = await import("../../src/stats.js");
+    vi.mocked(statsModule.collectStats).mockRejectedValueOnce(new statsModule.StatsUnavailableError({
+      ...state.diagnostics, classification: "permission-denied", remediation: "private-action-canary",
+    } as never));
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const args = kind === "pool" ? ["stats", "--pool"] : [kind];
+    expect((await invoke(args))?.message).toBe(kind === "stats" ? "exit:1" : undefined);
+    const text = log.mock.calls.map(call => call.join(" ")).join("\n");
+    for (const label of ["Storage backend:", "Classification:", "Publication:", "TLS:", "Schema:", "Extensions:", "Search:", "Pool:", "Project:", "Machine identity:", "Outbox:", "Action:"]) {
+      expect(text).toContain(label);
+    }
+    expect(text).toContain("permission-denied");
+    expect(text).not.toContain("private-action-canary");
+  });
+
+  it.each([["stats"], ["stats", "--json"]])("renders classified statistics failures without payloads %#", async (...args) => {
+    const statsModule = await import("../../src/stats.js");
+    const diagnostic = { ...state.diagnostics, classification: "permission-denied" };
+    vi.mocked(statsModule.collectStats).mockRejectedValueOnce(new statsModule.StatsUnavailableError(diagnostic as never));
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    expect((await invoke(args))?.message).toBe("exit:1");
+    expect(statsModule.printStats).not.toHaveBeenCalled();
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    if (args.includes("--json")) expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toEqual({ backendDiagnostics: diagnostic });
+    else expect(log).toHaveBeenCalledWith(expect.stringContaining("permission-denied"));
+  });
+
+  it.each(["status", "pool", "stats"])("keeps %s unavailable output classified and secret-free", async (kind) => {
+    const statsModule = await import("../../src/stats.js");
+    state.authToken = null;
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const args = kind === "pool" ? ["stats", "--pool"] : [kind];
+    for (const failure of [new statsModule.StatsUnavailableError(state.diagnostics as never), new Error("postgres://private-canary")]) {
+      vi.mocked(statsModule.collectStats).mockRejectedValueOnce(failure);
+      const outcome = await invoke([...args, "--json"]);
+      expect(outcome?.message).toBe(kind === "stats" ? "exit:1" : undefined);
+      expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toHaveProperty("backendDiagnostics");
+      expect(String(stdout.mock.calls.at(-1)?.[0])).not.toContain("private-canary");
+    }
+    vi.mocked(statsModule.collectStats).mockRejectedValueOnce(new statsModule.StatsUnavailableError(state.diagnostics as never));
+    await invoke(args);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("Storage backend:"));
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+  });
+
+  it("renders a boolean pool recovery latch without serializing paths", async () => {
+    const statsModule = await import("../../src/stats.js");
+    state.authToken = null;
+    vi.mocked(statsModule.collectStats).mockResolvedValueOnce({ backendDiagnostics: {
+      ...state.diagnostics, pool: { ...state.diagnostics.pool, failed: true },
+    } } as never);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    expect(await invoke(["stats", "--pool"])).toBeUndefined();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("failed: true"));
   });
 
   it.each(["start", "restart"])("runs managed daemon %s with staged PostgreSQL storage", async (action) => {
@@ -1081,6 +1785,61 @@ describe("runCli orchestration actions", () => {
       expect.objectContaining({ tags: ["one", "two"] }),
     );
   });
+
+  it.each(["yaml", "", "JSON", " json ", "json\u0000"])(
+    "rejects unsupported export format %j before export effects",
+    async format => {
+      const portable = await import("../../src/portable-knowledge.js");
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+      const result = await invoke(["export", "--format", format, "--all", "--output", "kept.json"]);
+
+      expect(result?.message).toBe("exit:1");
+      expect(error).toHaveBeenCalledExactlyOnceWith("Invalid --format: only json is supported.");
+      expect(log).not.toHaveBeenCalled();
+      expect(stdout).not.toHaveBeenCalled();
+      expect(state.loadConfig).not.toHaveBeenCalled();
+      expect(state.reconcileWorktrees).not.toHaveBeenCalled();
+      expect(portable.exportKnowledge).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects an unsupported export format before PostgreSQL preparation", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    state.storageBackend = "postgresql";
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await invoke(["export", "--format", "yaml"]);
+
+    expect(result?.message).toBe("exit:1");
+    expect(error).toHaveBeenCalledExactlyOnceWith("Invalid --format: only json is supported.");
+    expect(state.loadConfig).not.toHaveBeenCalled();
+    expect(portable.exportKnowledge).not.toHaveBeenCalled();
+  });
+
+  it("keeps export help ahead of format validation", async () => {
+    const portable = await import("../../src/portable-knowledge.js");
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await invoke(["export", "--format", "yaml", "--help"]);
+
+    expect(result?.message).toBe("exit:0");
+    expect(state.printHelp).toHaveBeenCalledExactlyOnceWith("export");
+    expect(error).not.toHaveBeenCalled();
+    expect(state.loadConfig).not.toHaveBeenCalled();
+    expect(portable.exportKnowledge).not.toHaveBeenCalled();
+  });
+
+  it.each([["export"], ["export", "--format", "json"]])(
+    "accepts the %s export format path",
+    async (...args) => {
+      const portable = await import("../../src/portable-knowledge.js");
+      await expect(invoke(args)).resolves.toBeUndefined();
+      expect(portable.exportKnowledge).toHaveBeenCalledOnce();
+    },
+  );
 
   it.each([
     ["compact", "--dry-run"],
@@ -1299,55 +2058,28 @@ describe("runCli failure and alternate presentation branches", () => {
     state.authToken = null;
     state.health.mockReset().mockResolvedValue(null);
     expect(await invoke(["status"])).toBeUndefined();
-    expect(log).toHaveBeenCalledWith("daemon: down · provider: openai");
+    expect(log).toHaveBeenCalledWith("Daemon: down");
 
     expect(await invoke(["status", "--json"])).toBeUndefined();
-    expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toEqual({
-      daemon: { status: "down" },
+    expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toMatchObject({
+      daemon: { status: "down" }, backendDiagnostics: state.diagnostics,
     });
-    expect(state.health).toHaveBeenCalledTimes(2);
+    expect(state.health).not.toHaveBeenCalled();
 
     state.get.mockRejectedValueOnce(new Error("pool failed"));
-    expect((await invoke(["stats", "--pool"]))?.message).toBe("exit:1");
+    expect(await invoke(["stats", "--pool"])).toBeUndefined();
     state.get.mockRejectedValueOnce("pool failed");
-    expect((await invoke(["stats", "--pool"]))?.message).toBe("exit:1");
+    expect(await invoke(["stats", "--pool"])).toBeUndefined();
   });
 
-  it("reports a staged PostgreSQL daemon as up with unavailable storage", async () => {
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  it("does not trust staged or mismatched daemon identity for diagnostics", async () => {
     const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-    const stagedHealth = {
-      status: "unavailable",
-      version: "1.4.1",
-      storageBackend: "postgresql",
-      uptime: 10,
-      pid: 1234,
-      storage: { status: "unavailable" },
-    };
     state.storageBackend = "postgresql";
-
-    state.health.mockResolvedValueOnce(stagedHealth).mockResolvedValueOnce(stagedHealth);
-    expect(await invoke(["status"])).toBeUndefined();
-    const text = log.mock.calls.map(([message]) => String(message)).join("\n");
-    expect(text).toContain("Daemon: up");
-    expect(text).toContain("Storage: postgresql (unavailable)");
-    expect(text).not.toContain("Project:");
-    expect(state.post).not.toHaveBeenCalled();
-
-    log.mockClear();
-    state.health.mockResolvedValueOnce(stagedHealth).mockResolvedValueOnce(stagedHealth);
+    state.health.mockResolvedValue({ status: "unavailable", version: "other", storageBackend: "postgresql" });
     expect(await invoke(["status", "--json"])).toBeUndefined();
-    expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toEqual({
-      daemon: {
-        status: "up",
-        version: "1.4.1",
-        uptime: 10,
-        port: 3737,
-        storageBackend: "postgresql",
-        storageStatus: "unavailable",
-      },
-    });
+    expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toMatchObject({ daemon: { status: "down" } });
     expect(state.post).not.toHaveBeenCalled();
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
   });
 
   it("runs the supported PostgreSQL migration command in text and JSON modes", async () => {
@@ -1869,7 +2601,8 @@ describe("runCli failure and alternate presentation branches", () => {
       runtime: process.env.XDG_RUNTIME_DIR,
       owner: process.env.LCM_DAEMON_OWNER_ID,
     };
-    const homeDir = actualFs.mkdtempSync("/tmp/lcm-cli-owned-home-");
+    const homeDir = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-owned-home-"));
+    expect(dirname(homeDir)).toBe(tmpdir());
     const runtimeDir = `${homeDir}/runtime`;
     const entrypoint = `${runtimeDir}/owned-lcm.mjs`;
     actualFs.mkdirSync(runtimeDir, { recursive: true });
@@ -1920,7 +2653,8 @@ describe("runCli failure and alternate presentation branches", () => {
       runtime: process.env.XDG_RUNTIME_DIR,
       owner: process.env.LCM_DAEMON_OWNER_ID,
     };
-    const root = actualFs.mkdtempSync("/tmp/lcm-cli-symlink-");
+    const root = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-symlink-"));
+    expect(dirname(root)).toBe(tmpdir());
     const homeDir = `${root}/home`;
     const runtimeDir = `${homeDir}/runtime`;
     const stateTarget = `${root}/canonical-target-state`;
@@ -2068,6 +2802,19 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(stderr).toHaveBeenCalledWith(
       "  Warning: could not reconcile /unavailable: source vanished\n",
     );
+  });
+
+  it("keeps ordinary export failures as per-project warnings", async () => {
+    state.exportError = new Error("export failed");
+    state.entries = [{ name: "project", isDirectory: () => true }];
+    state.fileText = JSON.stringify({ cwd: "/project" });
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    expect(await invoke(["export", "--all"])).toBeUndefined();
+
+    expect(stderr).toHaveBeenCalledExactlyOnceWith("  Warning: export failed\n");
+    expect(log).toHaveBeenCalledExactlyOnceWith("\n  Total: 0 entries exported");
   });
 
   it("renders TTY summaries for compact and import", async () => {
@@ -2235,9 +2982,9 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(await invoke(["status"])).toBeUndefined();
     state.health.mockResolvedValueOnce(false);
     expect(await invoke(["status", "--json"])).toBeUndefined();
-    state.get.mockResolvedValueOnce({ totalConnections: 1, activeConnections: 0, idleConnections: 1, connections: [{ refs: 0, status: "idle", path: "/idle" }] });
+    state.get.mockResolvedValueOnce({ backendDiagnostics: state.diagnostics } as never);
     expect(await invoke(["stats", "--pool"])).toBeUndefined();
-    state.get.mockResolvedValueOnce({ totalConnections: 0, activeConnections: 0, idleConnections: 0, connections: [] });
+    state.get.mockResolvedValueOnce({ backendDiagnostics: state.diagnostics } as never);
     expect(await invoke(["stats", "--pool"])).toBeUndefined();
   });
 

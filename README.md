@@ -250,13 +250,23 @@ flowchart LR
 
 | Tool | Purpose |
 |---|---|
-| `lcm_search` | Hybrid search across episodic memory (SQLite) and semantic memory |
-| `lcm_grep` | Regex or full-text search across raw messages and summaries |
+| `lcm_search` | Hybrid search across episodic and promoted memory (`layers` defaults to both) |
+| `lcm_grep` | Regex or full-text search across raw messages and summaries (`mode` defaults to `full_text`; `scope` defaults to `both`) |
 | `lcm_expand` | Decompress a summary node into its source content by traversing the DAG |
 | `lcm_describe` | Inspect metadata and lineage of a memory node (depth, token count, parent/child links) |
 | `lcm_store` | Persist durable memory manually with optional tags |
 | `lcm_stats` | Show token savings, compression ratios, and usage statistics |
 | `lcm_doctor` | Diagnose daemon, hooks, MCP registration, and summarizer setup |
+
+The canonical `lcm_search` layers are `episodic` and `promoted`; the deprecated
+`semantic` input alias is accepted for compatibility but is not advertised.
+The canonical `lcm_grep` scopes are `messages`, `summaries`, and `both`; the
+deprecated `all` input alias maps to `both` and is likewise not advertised.
+The canonical `lcm_grep` modes are `full_text` and `regex`; omitted `mode`
+defaults to `full_text`. Use `mode: 'regex'` when the query should be treated
+as a regular expression.
+The package `SearchResult.promoted` type matches the daemon's existing runtime
+response; the previously published `semantic` property was never populated.
 
 ## CLI
 
@@ -275,6 +285,7 @@ lcm -V                     # version
 # Memory inspection
 lcm search "query"        # search episodic and promoted memory
 lcm grep "pattern"        # search messages and summaries
+lcm grep "config\\.threshold" --mode regex # regex search
 lcm describe <nodeId>      # inspect metadata for a memory node
 lcm expand <nodeId>        # expand a summary node into source detail
 lcm store "content"       # persist a durable memory entry
@@ -569,20 +580,33 @@ The [PostgreSQL summary, context, and large-file guide](src/storage/postgresql/r
 defines graph, coverage, context-range, ordering, lock/fence, grant, query-plan,
 diagnostic, and recovery semantics.
 
-Issue #617 activates daemon and MCP project-storage routing. CLI/import-export
-and portable transfer remain #618-owned; aggregate stats, pool diagnostics,
-status, and doctor parity remain #619-owned. Those limitations do not weaken
-the daemon's publication, identity, cancellation, shutdown, or privacy gates.
+Daemon and MCP project-storage routing and observational diagnostics support
+the selected backend. Stats, pool diagnostics, status, and doctor share a
+[sanitized backend snapshot](docs/cli.md#observational-diagnostics); diagnostics
+do not repair state or expose stored content. CLI/import-export and portable
+transfer remain #618-owned. Publication, identity, cancellation, shutdown, and
+privacy gates continue to apply.
 
 ## Development
 
+Repository development uses the exact pnpm version and SHA-512 integrity pin in
+`package.json`. Node remains the runtime; published packages are installed with
+npm. Bootstrap the verified manager locally rather than installing pnpm globally:
+
 ```bash
-npm install
-npm run build
-npx vitest
-npx tsc --noEmit
-npm run test:postgresql
+mkdir -p .superpowers/pnpm
+pnpm_bootstrap_root="$(mktemp -d "$PWD/.superpowers/pnpm/run.XXXXXXXX")"
+pnpm_bin="$(node scripts/bootstrap-pnpm.mjs --destination "$pnpm_bootstrap_root/verified")"
+export PATH="$pnpm_bin:$PATH"
+pnpm install --frozen-lockfile
+pnpm run build
+pnpm exec vitest
+pnpm run typecheck
+pnpm run test:postgresql
 ```
+
+See [Development](docs/development.md) for dependency changes, focused tests,
+source installation, and `pnpm run update:patterns`.
 
 The PostgreSQL command owns an exact PostgreSQL 18 container and all temporary
 TLS, network, volume, credential, and database resources. See

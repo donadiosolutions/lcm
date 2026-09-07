@@ -16,6 +16,7 @@ import {
   fsyncSync,
   fstatSync,
   openSync,
+  readdirSync,
   linkSync,
   lstatSync,
   realpathSync,
@@ -35,12 +36,18 @@ import {
   atomicWritePrivateFileDurable,
   atomicWritePrivateFileExclusive,
   assertPrivateDirectory,
+  assertPrivateDirectoryEntry,
   copyRegularFilePrivateExclusive,
   consumeAuthenticatedWriterAlias,
   consumeBoundedRegularFile,
   deleteRegularFile,
   ensurePrivateDirectory,
   openPrivateDirectory,
+  openPrivateDirectoryForCreation,
+  openPrivateDirectoryIfExists,
+  PrivateDirectoryTopologyError,
+  PrivateFileCollisionError,
+  PrivateFilePublicationTopologyError,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
@@ -89,6 +96,997 @@ function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T)
 }
 
 describe("private filesystem primitives", () => {
+  it("publishes through a borrowed parent without repairing or closing it", () => {
+    const root = makeRoot();
+    chmodSync(root, 0o700);
+    const parent = openPrivateDirectory(root);
+    let closed = false;
+    const borrowed = { ...parent, close: () => { closed = true; } };
+    try {
+      const target = join(root, "metadata.json");
+      atomicWritePrivateFile(target, "content", {}, borrowed);
+      expect(readFileSync(target, "utf8")).toBe("content");
+      expect(statSync(target).mode & 0o777).toBe(0o600);
+      expect(statSync(root).mode & 0o777).toBe(0o700);
+      expect(closed).toBe(false);
+      expect(assertPrivateDirectoryEntry(parent, root, parent.witness.uid).dev).toBe(parent.witness.dev);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("publishes an absent destination exclusively through a retained parent", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    try {
+      atomicWritePrivateFile(target, "content", {}, parent, { requireAbsent: true });
+
+      expect(readFileSync(target, "utf8")).toBe("content");
+      expect(statSync(target).mode & 0o777).toBe(0o600);
+      expect(fsStatSync(target).nlink).toBe(1);
+      expect(readdirSync(root).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toEqual([]);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("requires a retained parent for exclusive atomic publication", () => {
+    const root = makeRoot();
+    const target = join(root, "metadata.json");
+
+    expect(() => atomicWritePrivateFile(
+      target,
+      "content",
+      {},
+      undefined,
+      { requireAbsent: true },
+    )).toThrow("retained parent");
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("refuses to replace an exclusive destination in a retained parent", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    writeFileSync(target, "winner", { mode: 0o600 });
+    try {
+      expect(() => atomicWritePrivateFile(
+        target,
+        "loser",
+        {},
+        parent,
+        { requireAbsent: true },
+      )).toThrow(PrivateFileCollisionError);
+      expect(readFileSync(target, "utf8")).toBe("winner");
+      expect(readdirSync(root).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toEqual([]);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("keeps destination collision classified when exclusive cleanup also fails", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const cleanupFailure = Object.assign(new Error("cleanup denied"), { code: "EACCES" });
+    writeFileSync(target, "winner", { mode: 0o600 });
+    try {
+      let observed: unknown;
+      try {
+        atomicWritePrivateFile(target, "loser", {
+          remove: () => { throw cleanupFailure; },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        observed = error;
+      }
+      expect(observed).toBeInstanceOf(PrivateFileCollisionError);
+      expect(readFileSync(target, "utf8")).toBe("winner");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("keeps destination collision classified when the parent also changes", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    const target = join(active, "metadata.json");
+    writeFileSync(target, "winner", { mode: 0o600 });
+    const parent = openPrivateDirectory(active);
+    const collision = Object.assign(new Error("destination exists"), { code: "EEXIST" });
+    let thrown: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "loser", {
+          link: () => {
+            renameSync(active, displaced);
+            renameSync(replacement, active);
+            throw collision;
+          },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(PrivateFileCollisionError);
+      expect(thrown).not.toBeInstanceOf(PrivateFilePublicationTopologyError);
+      expect((thrown as Error).cause).toBe(collision);
+      expect(readFileSync(join(displaced, "metadata.json"), "utf8")).toBe("winner");
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("propagates non-collision exclusive link failures and cleans its temp", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const denied = Object.assign(new Error("link denied"), { code: "EACCES" });
+    try {
+      expect(() => atomicWritePrivateFile(target, "content", {
+        link: () => { throw denied; },
+      }, parent, { requireAbsent: true })).toThrow(denied);
+      expect(existsSync(target)).toBe(false);
+      expect(readdirSync(root).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toEqual([]);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("preserves a non-collision link failure when temporary cleanup also fails", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const denied = Object.assign(new Error("link denied"), { code: "EACCES" });
+    try {
+      let observed: unknown;
+      try {
+        atomicWritePrivateFile(target, "content", {
+          link: () => { throw denied; },
+          remove: () => { throw new Error("cleanup denied"); },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        observed = error;
+      }
+      expect(observed).toBe(denied);
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("reports exclusive temporary cleanup failure after publication", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const denied = Object.assign(new Error("cleanup denied"), { code: "EACCES" });
+    try {
+      let thrown: unknown;
+      try {
+        atomicWritePrivateFile(target, "content", {
+          remove: () => { throw denied; },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(PrivateFilePublicationTopologyError);
+      expect(thrown).toMatchObject({
+        message: "private file link completed, but published file topology is not trusted",
+        outcome: "published",
+        topologyError: expect.any(PrivateDirectoryTopologyError),
+        cause: denied,
+      });
+      expect(readFileSync(target, "utf8")).toBe("content");
+      expect(fsStatSync(target).nlink).toBe(2);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("keeps exclusive temporary-name collisions ordinary and preserves the owner", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"12".repeat(12)}.tmp`);
+    writeFileSync(tempPath, "concurrent owner", { mode: 0o600 });
+    try {
+      let observed: unknown;
+      try {
+        atomicWritePrivateFile(target, "content", {
+          random: () => Buffer.alloc(12, 0x12),
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        observed = error;
+      }
+      expect(observed).toMatchObject({ code: "EEXIST" });
+      expect(observed).not.toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(readFileSync(tempPath, "utf8")).toBe("concurrent owner");
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("rejects retained-parent drift during exclusive publication", () => {
+    const root = makeRoot();
+    const replacement = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    try {
+      expect(() => atomicWritePrivateFile(target, "content", {
+        link: (from, to) => {
+          linkSync(from, to);
+          rmSync(root, { recursive: true, force: true });
+          symlinkSync(replacement, root);
+        },
+      }, parent, { requireAbsent: true })).toThrow(PrivateDirectoryTopologyError);
+      expect(existsSync(join(replacement, "metadata.json"))).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("refuses exclusive parent replacement after temp open before writing", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    const target = join(active, "metadata.json");
+    const displacedTemp = join(displaced, `.metadata.json.${"61".repeat(12)}.tmp`);
+    const parent = openPrivateDirectory(active);
+    let writeCalled = false;
+    let linkCalled = false;
+    try {
+      expect(() => atomicWritePrivateFile(target, "payload", {
+        random: () => Buffer.alloc(12, 0x61),
+        open: ((candidate: string, flags: string, mode: number) => {
+          const fd = openSync(candidate, flags, mode);
+          renameSync(active, displaced);
+          renameSync(replacement, active);
+          return fd;
+        }) as typeof openSync,
+        write: (() => { writeCalled = true; }) as typeof writeFileSync,
+        link: (() => { linkCalled = true; }) as typeof linkSync,
+      }, parent, { requireAbsent: true })).toThrow(PrivateDirectoryTopologyError);
+      expect(writeCalled).toBe(false);
+      expect(linkCalled).toBe(false);
+      expect(readFileSync(displacedTemp, "utf8")).toBe("");
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("preserves an exclusive temp-open failure when parent topology also changes", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    const parent = openPrivateDirectory(active);
+    const openError = new Error("exclusive open failed");
+    let thrown: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(join(active, "metadata.json"), "payload", {
+          open: () => {
+            renameSync(active, displaced);
+            renameSync(replacement, active);
+            throw openError;
+          },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(thrown).not.toBeInstanceOf(PrivateFilePublicationTopologyError);
+      expect((thrown as Error).cause).toBe(openError);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("closes the exclusive temp descriptor when identity sampling fails", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const samplingError = new Error("exclusive temp identity failed");
+    const originalFstat = fstatSync;
+    let tempFd: number | undefined;
+    let closed = false;
+    try {
+      expect(() => withPatchedFs(
+        "fstatSync",
+        ((fd: number, options?: unknown) => {
+          if (fd === tempFd && (options as { bigint?: boolean } | undefined)?.bigint === true) {
+            throw samplingError;
+          }
+          return originalFstat(fd, options as never);
+        }) as typeof fstatSync,
+        () => atomicWritePrivateFile(target, "payload", {
+          open: ((candidate: string, flags: string, mode: number) => {
+            tempFd = openSync(candidate, flags, mode);
+            return tempFd;
+          }) as typeof openSync,
+          close: ((fd: number) => {
+            closeSync(fd);
+            closed = true;
+          }) as typeof closeSync,
+        }, parent, { requireAbsent: true }),
+      )).toThrow(samplingError);
+      expect(closed).toBe(true);
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("keeps pre-link write failure topology plain when the parent also changes", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    const parent = openPrivateDirectory(active);
+    let thrown: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(join(active, "metadata.json"), "payload", {
+          write: (() => {
+            renameSync(active, displaced);
+            renameSync(replacement, active);
+            throw new Error("exclusive write failed");
+          }) as typeof writeFileSync,
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(thrown).not.toBeInstanceOf(PrivateFilePublicationTopologyError);
+      expect(existsSync(join(displaced, "metadata.json"))).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("refuses a substituted exclusive temp before link", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"62".repeat(12)}.tmp`);
+    const displacedTemp = join(root, "writer-owned-exclusive.tmp");
+    let linkCalled = false;
+    try {
+      expect(() => atomicWritePrivateFile(target, "payload", {
+        random: () => Buffer.alloc(12, 0x62),
+        close: ((fd: number) => {
+          closeSync(fd);
+          renameSync(tempPath, displacedTemp);
+          writeFileSync(tempPath, "substitute", { mode: 0o600 });
+        }) as typeof closeSync,
+        link: (() => { linkCalled = true; }) as typeof linkSync,
+      }, parent, { requireAbsent: true })).toThrow(PrivateDirectoryTopologyError);
+      expect(linkCalled).toBe(false);
+      expect(existsSync(target)).toBe(false);
+      expect(readFileSync(tempPath, "utf8")).toBe("substitute");
+      expect(readFileSync(displacedTemp, "utf8")).toBe("payload");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("reports a published link outcome after post-link parent drift", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    const target = join(active, "metadata.json");
+    const parent = openPrivateDirectory(active);
+    let thrown: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "payload", {
+          link: (from, to) => {
+            linkSync(from, to);
+            renameSync(active, displaced);
+            renameSync(replacement, active);
+          },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(PrivateFilePublicationTopologyError);
+      expect(thrown).toMatchObject({
+        message: "private file link completed, but published file topology is not trusted",
+        outcome: "published",
+        topologyError: expect.any(PrivateDirectoryTopologyError),
+        cause: { message: "private exclusive publication temp cleanup was not completed" },
+      });
+      expect(readFileSync(join(displaced, "metadata.json"), "utf8")).toBe("payload");
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("reports a published outcome when exclusive single-link verification fails", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const originalLstat = lstatSync;
+    let thrown: unknown;
+    try {
+      try {
+        withPatchedFs(
+          "lstatSync",
+          ((candidate: string, options?: unknown) => {
+            const result = originalLstat(candidate, options as never);
+            if (
+              candidate === target
+              && (options as { bigint?: boolean } | undefined)?.bigint === true
+            ) return Object.assign(result, { nlink: 2n });
+            return result;
+          }) as typeof lstatSync,
+          () => atomicWritePrivateFile(
+            target,
+            "content",
+            {},
+            parent,
+            { requireAbsent: true },
+          ),
+        );
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(PrivateFilePublicationTopologyError);
+      expect(thrown).toMatchObject({
+        message: "private file link completed, but published file topology is not trusted",
+        outcome: "published",
+        topologyError: expect.any(PrivateDirectoryTopologyError),
+        cause: { message: expect.stringContaining("single-link") },
+      });
+      expect(readFileSync(target, "utf8")).toBe("content");
+      expect(fsStatSync(target).nlink).toBe(1);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("reports an unknown link outcome when link and parent checks fail", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    const target = join(active, "metadata.json");
+    const parent = openPrivateDirectory(active);
+    const linkError = new Error("link outcome unavailable");
+    let thrown: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "payload", {
+          link: () => {
+            renameSync(active, displaced);
+            renameSync(replacement, active);
+            throw linkError;
+          },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(PrivateFilePublicationTopologyError);
+      expect(thrown).toMatchObject({
+        message: "private file publication outcome is unknown because link and retained parent topology checks failed",
+        outcome: "unknown",
+        topologyError: expect.any(PrivateDirectoryTopologyError),
+        cause: linkError,
+      });
+      expect(existsSync(target)).toBe(false);
+      expect(existsSync(join(displaced, "metadata.json"))).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("rejects borrowed publication when the parent entry is replaced by a symlink", () => {
+    const root = makeRoot();
+    const replacement = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    rmSync(root, { recursive: true, force: true });
+    symlinkSync(replacement, root);
+    try {
+      expect(() => atomicWritePrivateFile(target, "content", {}, parent)).toThrow();
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("preserves the temp-open failure as the cause when parent topology also changes", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    const parent = openPrivateDirectory(active);
+    const openError = new Error("open failed");
+    let thrown: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(join(active, "metadata.json"), "content", {
+          open: () => {
+            renameSync(active, displaced);
+            renameSync(replacement, active);
+            throw openError;
+          },
+        }, parent);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(thrown).not.toBeInstanceOf(PrivateFilePublicationTopologyError);
+      expect((thrown as Error).cause).toBe(openError);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("refuses parent replacement before the actual temp open without writing payload", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    const target = join(active, "metadata.json");
+    const tempPath = join(active, `.metadata.json.${"11".repeat(12)}.tmp`);
+    writeFileSync(join(replacement, "metadata.json"), "replacement sentinel", { mode: 0o600 });
+    const parent = openPrivateDirectory(active);
+    let closeCalled = false;
+    let writeCalled = false;
+    let renameCalled = false;
+    try {
+      expect(() => atomicWritePrivateFile(target, "payload", {
+        random: () => Buffer.alloc(12, 0x11),
+        open: ((candidate: string, flags: string, mode: number) => {
+          renameSync(active, displaced);
+          renameSync(replacement, active);
+          return openSync(candidate, flags, mode);
+        }) as typeof openSync,
+        write: (() => {
+          writeCalled = true;
+        }) as typeof writeFileSync,
+        close: ((fd: number) => {
+          closeCalled = true;
+          closeSync(fd);
+        }) as typeof closeSync,
+        rename: (() => {
+          renameCalled = true;
+        }) as typeof renameSync,
+      }, parent)).toThrow(PrivateDirectoryTopologyError);
+      expect(closeCalled).toBe(true);
+      expect(writeCalled).toBe(false);
+      expect(renameCalled).toBe(false);
+      expect(readFileSync(tempPath, "utf8")).toBe("");
+      expect(readFileSync(target, "utf8")).toBe("replacement sentinel");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("refuses parent replacement after the actual temp open without writing payload", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    const target = join(active, "metadata.json");
+    const displacedTemp = join(displaced, `.metadata.json.${"22".repeat(12)}.tmp`);
+    writeFileSync(join(replacement, "metadata.json"), "replacement sentinel", { mode: 0o600 });
+    const parent = openPrivateDirectory(active);
+    let closeCalled = false;
+    let writeCalled = false;
+    let renameCalled = false;
+    try {
+      expect(() => atomicWritePrivateFile(target, "payload", {
+        random: () => Buffer.alloc(12, 0x22),
+        open: ((candidate: string, flags: string, mode: number) => {
+          const fd = openSync(candidate, flags, mode);
+          renameSync(active, displaced);
+          renameSync(replacement, active);
+          return fd;
+        }) as typeof openSync,
+        write: (() => {
+          writeCalled = true;
+        }) as typeof writeFileSync,
+        close: ((fd: number) => {
+          closeCalled = true;
+          closeSync(fd);
+        }) as typeof closeSync,
+        rename: (() => {
+          renameCalled = true;
+        }) as typeof renameSync,
+      }, parent)).toThrow(PrivateDirectoryTopologyError);
+      expect(closeCalled).toBe(true);
+      expect(writeCalled).toBe(false);
+      expect(renameCalled).toBe(false);
+      expect(readFileSync(displacedTemp, "utf8")).toBe("");
+      expect(readFileSync(target, "utf8")).toBe("replacement sentinel");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it.each(["write", "close"] as const)(
+    "refuses parent drift during temp %s before rename",
+    (boundary) => {
+      const sandbox = makeRoot();
+      const active = join(sandbox, "active");
+      const displaced = join(sandbox, "displaced");
+      const replacement = join(sandbox, "replacement");
+      mkdirSync(active, { mode: 0o700 });
+      mkdirSync(replacement, { mode: 0o700 });
+      writeFileSync(join(replacement, "metadata.json"), "replacement sentinel", { mode: 0o600 });
+      const target = join(active, "metadata.json");
+      const randomByte = boundary === "write" ? 0x55 : 0x56;
+      const displacedTemp = join(
+        displaced,
+        `.metadata.json.${randomByte.toString(16).repeat(12)}.tmp`,
+      );
+      const parent = openPrivateDirectory(active);
+      let swapped = false;
+      let renameCalled = false;
+      const swapParent = (): void => {
+        if (swapped) return;
+        swapped = true;
+        renameSync(active, displaced);
+        renameSync(replacement, active);
+      };
+      const operations = boundary === "write"
+        ? {
+            write: ((fd: number, data: string) => {
+              writeFileSync(fd, data, "utf8");
+              swapParent();
+            }) as typeof writeFileSync,
+          }
+        : {
+            close: ((fd: number) => {
+              closeSync(fd);
+              swapParent();
+            }) as typeof closeSync,
+          };
+      try {
+        expect(() => atomicWritePrivateFile(target, "payload", {
+          ...operations,
+          random: () => Buffer.alloc(12, randomByte),
+          rename: (() => {
+            renameCalled = true;
+          }) as typeof renameSync,
+        }, parent)).toThrow(PrivateDirectoryTopologyError);
+        expect(renameCalled).toBe(false);
+        expect(readFileSync(target, "utf8")).toBe("replacement sentinel");
+        expect(readFileSync(displacedTemp, "utf8")).toBe("payload");
+        expect(statSync(displacedTemp).mode & 0o777).toBe(0o600);
+      } finally {
+        parent.close();
+      }
+    },
+  );
+
+  it("refuses a substituted temp leaf before rename and preserves every file", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"33".repeat(12)}.tmp`);
+    const displacedTemp = join(root, "writer-owned.tmp");
+    writeFileSync(target, "original", { mode: 0o600 });
+    let renameCalled = false;
+    let thrown: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "payload", {
+          random: () => Buffer.alloc(12, 0x33),
+          close: ((fd: number) => {
+            closeSync(fd);
+            renameSync(tempPath, displacedTemp);
+            writeFileSync(tempPath, "substitute", { mode: 0o600 });
+          }) as typeof closeSync,
+          rename: (() => {
+            renameCalled = true;
+          }) as typeof renameSync,
+        }, parent);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(thrown).not.toBeInstanceOf(PrivateFilePublicationTopologyError);
+      expect(renameCalled).toBe(false);
+      expect(readFileSync(target, "utf8")).toBe("original");
+      expect(readFileSync(tempPath, "utf8")).toBe("substitute");
+      expect(readFileSync(displacedTemp, "utf8")).toBe("payload");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("refuses a missing temp leaf before rename and preserves the destination", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"34".repeat(12)}.tmp`);
+    writeFileSync(target, "original", { mode: 0o600 });
+    let renameCalled = false;
+    let thrown: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "payload", {
+          random: () => Buffer.alloc(12, 0x34),
+          close: ((fd: number) => {
+            closeSync(fd);
+            unlinkSync(tempPath);
+          }) as typeof closeSync,
+          rename: (() => {
+            renameCalled = true;
+          }) as typeof renameSync,
+        }, parent);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(thrown).not.toBeInstanceOf(PrivateFilePublicationTopologyError);
+      expect(renameCalled).toBe(false);
+      expect(existsSync(tempPath)).toBe(false);
+      expect(readFileSync(target, "utf8")).toBe("original");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("reports published when rename returns before retained-parent drift is observed", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    writeFileSync(join(replacement, "metadata.json"), "replacement sentinel", { mode: 0o600 });
+    const target = join(active, "metadata.json");
+    const parent = openPrivateDirectory(active);
+    let thrown: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "payload", {
+          rename: (from, to) => {
+            renameSync(from, to);
+            renameSync(active, displaced);
+            renameSync(replacement, active);
+          },
+        }, parent);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(PrivateFilePublicationTopologyError);
+      expect(thrown).toMatchObject({
+        name: "PrivateDirectoryTopologyError",
+        outcome: "published",
+        topologyError: expect.any(PrivateDirectoryTopologyError),
+        cause: expect.any(PrivateDirectoryTopologyError),
+      });
+      expect((thrown as PrivateFilePublicationTopologyError).cause)
+        .toBe((thrown as PrivateFilePublicationTopologyError).topologyError);
+      expect(readFileSync(join(displaced, "metadata.json"), "utf8")).toBe("payload");
+      expect(statSync(join(displaced, "metadata.json")).mode & 0o777).toBe(0o600);
+      expect(readFileSync(target, "utf8")).toBe("replacement sentinel");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("reports unknown and preserves the rename cause when commit and topology both fail", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    writeFileSync(join(replacement, "metadata.json"), "replacement sentinel", { mode: 0o600 });
+    const target = join(active, "metadata.json");
+    const parent = openPrivateDirectory(active);
+    const renameError = new Error("rename reported failure after commit");
+    let thrown: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "payload", {
+          rename: (from, to) => {
+            renameSync(from, to);
+            renameSync(active, displaced);
+            renameSync(replacement, active);
+            throw renameError;
+          },
+        }, parent);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(PrivateFilePublicationTopologyError);
+      expect(thrown).toMatchObject({
+        name: "PrivateDirectoryTopologyError",
+        outcome: "unknown",
+        topologyError: expect.any(PrivateDirectoryTopologyError),
+      });
+      expect((thrown as Error).message).toBe(
+        "private file publication outcome is unknown because rename and retained parent topology checks failed",
+      );
+      expect((thrown as Error).cause).toBe(renameError);
+      expect(readFileSync(join(displaced, "metadata.json"), "utf8")).toBe("payload");
+      expect(statSync(join(displaced, "metadata.json")).mode & 0o777).toBe(0o600);
+      expect(readFileSync(target, "utf8")).toBe("replacement sentinel");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("preserves the exact ordinary rename failure and cleans its owned temp", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"44".repeat(12)}.tmp`);
+    const renameError = new Error("ordinary rename failure");
+    writeFileSync(target, "original", { mode: 0o600 });
+    let thrown: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "content", {
+          random: () => Buffer.alloc(12, 0x44),
+          rename: () => { throw renameError; },
+        }, parent);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBe(renameError);
+      expect(existsSync(tempPath)).toBe(false);
+      expect(readFileSync(target, "utf8")).toBe("original");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("rejects borrowed entries whose mode, owner, or inode no longer matches", () => {
+    const root = makeRoot();
+    const other = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const modeAlias = join(root, "mode-alias");
+    const ownerAlias = join(root, "owner-alias");
+    mkdirSync(modeAlias, { mode: 0o755 });
+    mkdirSync(ownerAlias, { mode: 0o700 });
+    const originalLstat = lstatSync;
+    try {
+      let modeError: unknown;
+      try {
+        withPatchedFs(
+        "lstatSync",
+        ((path: string, options?: unknown) => {
+          if (path === modeAlias) {
+            return {
+              isDirectory: () => true,
+              mode: 0o40755n,
+              uid: BigInt(parent.witness.uid),
+              dev: BigInt(parent.witness.dev),
+              ino: BigInt(parent.witness.ino),
+            };
+          }
+          return originalLstat(path, options as never);
+        }) as typeof lstatSync,
+        () => assertPrivateDirectoryEntry(parent, modeAlias),
+        );
+      } catch (error) {
+        modeError = error;
+      }
+      expect(modeError).toMatchObject({
+        name: "PrivateDirectoryTopologyError",
+        cause: { message: "private directory entry mode is not trusted" },
+      });
+      let ownerError: unknown;
+      try {
+        withPatchedFs(
+        "lstatSync",
+        ((path: string, options?: unknown) => {
+          if (path === ownerAlias) {
+            return {
+              isDirectory: () => true,
+              mode: 0o40700n,
+              uid: BigInt(parent.witness.uid + 1),
+              dev: BigInt(parent.witness.dev),
+              ino: BigInt(parent.witness.ino),
+            };
+          }
+          return originalLstat(path, options as never);
+        }) as typeof lstatSync,
+        () => assertPrivateDirectoryEntry(parent, ownerAlias),
+        );
+      } catch (error) {
+        ownerError = error;
+      }
+      expect(ownerError).toMatchObject({
+        name: "PrivateDirectoryTopologyError",
+        cause: { message: "private directory entry owner is not trusted" },
+      });
+      expect(() => assertPrivateDirectoryEntry(parent, other)).toThrow(/topology/i);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("rejects same-inode symlink evidence at the borrowed parent seam", () => {
+    const root = makeRoot();
+    const alias = join(root, "alias");
+    const parent = openPrivateDirectory(root);
+    symlinkSync(root, alias);
+    try {
+      expect(() => assertPrivateDirectoryEntry(parent, alias)).toThrow(/topology/i);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("fails creation admission on an invalid type or owner", () => {
+    const root = makeRoot();
+    const originalFstat = fstatSync;
+    try {
+      expect(() => openPrivateDirectoryForCreation(root, {
+        expectedUid: Number.NaN,
+      })).toThrow("private directory owner is not trusted");
+      expect(() => withPatchedFs(
+        "fstatSync",
+        ((fd: number, options?: unknown) => {
+          if ((options as { bigint?: boolean } | undefined)?.bigint === true) {
+            return { isDirectory: () => false };
+          }
+          return originalFstat(fd, options as never);
+        }) as typeof fstatSync,
+        () => openPrivateDirectoryForCreation(root),
+      )).toThrow("path is not a directory");
+      expect(() => withPatchedFs(
+        "fstatSync",
+        ((fd: number, options?: unknown) => {
+          if ((options as { bigint?: boolean } | undefined)?.bigint === true) {
+            return { isDirectory: () => true, uid: 999999n, mode: 0o40700n };
+          }
+          return originalFstat(fd, options as never);
+        }) as typeof fstatSync,
+        () => openPrivateDirectoryForCreation(root),
+      )).toThrow("private directory owner is not trusted");
+    } finally {
+      chmodSync(root, 0o700);
+    }
+  });
+
+  it("permits creation admission when process owner lookup is unavailable", () => {
+    const root = makeRoot();
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    try {
+      Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+      const handle = openPrivateDirectoryForCreation(root);
+      handle.close();
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
+  });
+
   it("consumes an authenticated writer alias while retaining the final inode", () => {
     const { aliasPath, finalPath } = writerAliasFixture();
 
@@ -472,6 +1470,159 @@ describe("private filesystem primitives", () => {
     expect(() => syncPrivateDirectory(path, { expectedUid })).not.toThrow();
   });
 
+  it.each([
+    ["strict", openPrivateDirectory, new Error("strict authentication failed")],
+    ["creation", openPrivateDirectoryForCreation, { code: 123 }],
+    ["optional", openPrivateDirectoryIfExists, undefined],
+  ] as const)("preserves the exact %s directory authentication failure after cleanup", (
+    _label,
+    openDirectory,
+    authenticationFailure,
+  ) => {
+    const root = makeRoot();
+    chmodSync(root, 0o700);
+    const originalClose = closeSync;
+    let closeCalls = 0;
+    let caught: unknown = Symbol("did not throw");
+
+    withPatchedFs(
+      "fstatSync",
+      (() => { throw authenticationFailure; }) as typeof fstatSync,
+      () => withPatchedFs(
+        "closeSync",
+        ((fd: number) => {
+          closeCalls += 1;
+          originalClose(fd);
+        }) as typeof closeSync,
+        () => {
+          try {
+            openDirectory(root);
+          } catch (error) {
+            caught = error;
+          }
+        },
+      ),
+    );
+
+    expect(caught).toBe(authenticationFailure);
+    expect(closeCalls).toBe(1);
+  });
+
+  it.each([
+    ["strict", openPrivateDirectory, new Error("strict authentication failed")],
+    ["creation", openPrivateDirectoryForCreation, { code: 123 }],
+    ["optional", openPrivateDirectoryIfExists, undefined],
+  ] as const)("reports both %s directory authentication and cleanup failures", (
+    _label,
+    openDirectory,
+    authenticationFailure,
+  ) => {
+    const root = makeRoot();
+    chmodSync(root, 0o700);
+    const originalClose = closeSync;
+    const cleanupFailure = new Error("descriptor cleanup failed");
+    let closeCalls = 0;
+    let caught: unknown = Symbol("did not throw");
+
+    withPatchedFs(
+      "fstatSync",
+      (() => { throw authenticationFailure; }) as typeof fstatSync,
+      () => withPatchedFs(
+        "closeSync",
+        ((fd: number) => {
+          closeCalls += 1;
+          originalClose(fd);
+          throw cleanupFailure;
+        }) as typeof closeSync,
+        () => {
+          try {
+            openDirectory(root);
+          } catch (error) {
+            caught = error;
+          }
+        },
+      ),
+    );
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    const aggregate = caught as AggregateError;
+    expect(aggregate.message).toBe("private directory authentication and cleanup failed");
+    expect(aggregate.errors).toHaveLength(2);
+    expect(aggregate.errors[0]).toBe(authenticationFailure);
+    expect(aggregate.errors[1]).toBe(cleanupFailure);
+    expect(Object.hasOwn(aggregate, "cause")).toBe(true);
+    expect(aggregate.cause).toBe(authenticationFailure);
+    expect(closeCalls).toBe(1);
+  });
+
+  it("returns undefined only when an optional directory is absent before acquisition", () => {
+    const root = makeRoot();
+    const initialAbsence = Object.assign(new Error("initial absence"), { code: "ENOENT" });
+
+    expect(withPatchedFs(
+      "openSync",
+      (() => { throw initialAbsence; }) as typeof openSync,
+      () => openPrivateDirectoryIfExists(root),
+    )).toBeUndefined();
+  });
+
+  it.each([false, true])("throws post-acquisition optional-directory ENOENT (cleanup failure: %s)", (
+    cleanupFails,
+  ) => {
+    const root = makeRoot();
+    chmodSync(root, 0o700);
+    const authenticationFailure = Object.assign(new Error("post-acquisition absence"), { code: "ENOENT" });
+    const cleanupFailure = new Error("descriptor cleanup failed");
+    const originalClose = closeSync;
+    let closeCalls = 0;
+    let caught: unknown = Symbol("did not throw");
+
+    withPatchedFs(
+      "realpathSync",
+      (() => { throw authenticationFailure; }) as typeof realpathSync,
+      () => withPatchedFs(
+        "closeSync",
+        ((fd: number) => {
+          closeCalls += 1;
+          originalClose(fd);
+          if (cleanupFails) throw cleanupFailure;
+        }) as typeof closeSync,
+        () => {
+          try {
+            openPrivateDirectoryIfExists(root);
+          } catch (error) {
+            caught = error;
+          }
+        },
+      ),
+    );
+
+    if (cleanupFails) {
+      expect(caught).toBeInstanceOf(AggregateError);
+      const aggregate = caught as AggregateError;
+      expect(aggregate.errors).toHaveLength(2);
+      expect(aggregate.errors[0]).toBe(authenticationFailure);
+      expect(aggregate.errors[1]).toBe(cleanupFailure);
+      expect(aggregate.cause).toBe(authenticationFailure);
+    } else {
+      expect(caught).toBe(authenticationFailure);
+    }
+    expect(closeCalls).toBe(1);
+  });
+
+  it.each([undefined, { code: 123 }])("preserves optional directory-open failures without a string code: %j", (failure) => {
+    const root = makeRoot();
+    let caught: unknown = Symbol("did not throw");
+    withPatchedFs("openSync", () => { throw failure; }, () => {
+      try {
+        openPrivateDirectoryIfExists(root);
+      } catch (error) {
+        caught = error;
+      }
+    });
+    expect(caught).toBe(failure);
+  });
+
   it("rejects a non-directory descriptor, an unexpected owner, and a changed witness", () => {
     const root = makeRoot();
     const file = join(root, "file");
@@ -569,7 +1720,42 @@ describe("private filesystem primitives", () => {
     expect(() => openPrivateDirectory(path)).toThrow();
   });
 
-  it("durably publishes an exclusive file and binds replacements to their observed bytes", () => {
+  it("rejects legacy conditional publication before a pathname replacement can be overwritten", () => {
+    const root = makeRoot();
+    const path = join(root, "durable.json");
+    const initial = "initial\n";
+    const candidate = "candidate\n";
+    writeFileSync(path, initial, { mode: 0o600 });
+    const initialStat = lstatSync(path);
+    const expectedContentSha256 = createHash("sha256").update(initial).digest("hex");
+    const temporaryPath = join(root, `.durable.json.${"11".repeat(12)}.tmp`);
+    let renameCalls = 0;
+    const originalRename = renameSync;
+
+    expect(() => withPatchedFs(
+      "renameSync",
+      ((from: string, to: string) => {
+        renameCalls += 1;
+        expect(to).toBe(path);
+        unlinkSync(path);
+        writeFileSync(path, "same-uid replacement\n", { mode: 0o600 });
+        return originalRename(from, to);
+      }) as typeof renameSync,
+      () => atomicWritePrivateFileDurable(path, candidate, {
+        expectedContentSha256,
+        random: () => Buffer.alloc(12, 0x11),
+      } as never),
+    )).toThrow("conditional durable replacement is unsupported; use a protocol-specific operation");
+
+    expect(renameCalls).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe(initial);
+    const finalStat = lstatSync(path);
+    expect(finalStat.dev).toBe(initialStat.dev);
+    expect(finalStat.ino).toBe(initialStat.ino);
+    expect(existsSync(temporaryPath)).toBe(false);
+  });
+
+  it("durably publishes an exclusive file and rejects legacy conditional options", () => {
     const root = makeRoot();
     const path = join(root, "durable.json");
     atomicWritePrivateFileDurable(path, "first", { requireAbsent: true });
@@ -577,15 +1763,16 @@ describe("private filesystem primitives", () => {
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(() => atomicWritePrivateFileDurable(path, "second", { requireAbsent: true }))
       .toThrow("already exists");
-    expect(() => atomicWritePrivateFileDurable(path, "second", {
-      expectedContentSha256: "0".repeat(64),
-    })).toThrow("changed before");
-
     const digest = createHash("sha256").update("first").digest("hex");
-    atomicWritePrivateFileDurable(path, "second", { expectedContentSha256: digest });
+    for (const expectedContentSha256 of [digest, "0".repeat(64), null, undefined]) {
+      expect(() => atomicWritePrivateFileDurable(path, "second", {
+        expectedContentSha256,
+      } as never)).toThrow("conditional durable replacement is unsupported; use a protocol-specific operation");
+      expect(readFileSync(path, "utf8")).toBe("first");
+    }
+    atomicWritePrivateFileDurable(path, "second");
     expect(readFileSync(path, "utf8")).toBe("second");
     expect(() => atomicWritePrivateFileDurable(path, "third", {
-      expectedContentSha256: digest,
       maxExistingBytes: 1,
     })).toThrow();
   });
@@ -803,6 +1990,28 @@ describe("private filesystem primitives", () => {
       },
     })).toThrow(failure);
     expect(readFileSync(target, "utf-8")).toBe("original");
+    expect(existsSync(tempPath)).toBe(false);
+  });
+
+  it("preserves an unborrowed rename failure and removes only its owned temporary file", () => {
+    const root = makeRoot();
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"ab".repeat(12)}.tmp`);
+    const failure = new Error("rename failed");
+    writeFileSync(target, "original", { mode: 0o600 });
+    let caught: unknown;
+
+    try {
+      atomicWritePrivateFile(target, "replacement", {
+        random: () => Buffer.alloc(12, 0xab),
+        rename: () => { throw failure; },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBe(failure);
+    expect(readFileSync(target, "utf8")).toBe("original");
     expect(existsSync(tempPath)).toBe(false);
   });
 

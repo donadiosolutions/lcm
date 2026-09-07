@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -764,7 +765,7 @@ describe("systemd-user supervisor", () => {
     const movedRoot = `${root}-moved`;
     roots.push(movedRoot);
     let redirected = false;
-    const race = (path: string, phase: "before-open" | "before-manager"): void => {
+    const race = (path: string, phase: "before-open" | "before-rollback" | "before-manager"): void => {
       if (phase !== "before-open" || redirected) return;
       redirected = true;
       renameSync(root, movedRoot);
@@ -788,7 +789,7 @@ describe("systemd-user supervisor", () => {
     const daemonTemp = join(root, "daemon-tmp");
     const redirect = makeRoot();
     let raced = false;
-    const race = (path: string, phase: "before-open" | "before-manager"): void => {
+    const race = (path: string, phase: "before-open" | "before-rollback" | "before-manager"): void => {
       if (phase !== "before-manager" || raced) return;
       raced = true;
       rmSync(path, { recursive: true, force: true });
@@ -1438,8 +1439,23 @@ describe("systemd-user supervisor", () => {
 
   it("derives the canonical user runtime root when XDG_RUNTIME_DIR is absent", async () => {
     const uid = typeof process.getuid === "function" ? process.getuid() : -1;
-    const runtimeRoot = uid < 0 ? "" : `/run/user/${uid}`;
-    if (uid < 0 || !existsSync(runtimeRoot) || (lstatSync(runtimeRoot).mode & 0o777) !== 0o700) return;
+    if (uid < 0) return;
+    const runtimeRoot = `/run/user/${uid}`;
+    let runtimeRootStats: ReturnType<typeof lstatSync>;
+    let canonicalRuntimeRoot: string;
+    try {
+      runtimeRootStats = lstatSync(runtimeRoot);
+      canonicalRuntimeRoot = realpathSync(runtimeRoot);
+    } catch {
+      return;
+    }
+    if (
+      !runtimeRootStats.isDirectory()
+      || runtimeRootStats.isSymbolicLink()
+      || canonicalRuntimeRoot !== runtimeRoot
+      || runtimeRootStats.uid !== uid
+      || (runtimeRootStats.mode & 0o777) !== 0o700
+    ) return;
     const root = makeRoot();
     const directory = createManagedCredentialDirectory(root, "systemd-runtime-fallback");
     const file = writeManagedCredentialFiles(directory, { OPENAI_API_KEY: "secret" })[0]!;
@@ -1473,7 +1489,12 @@ describe("systemd-user supervisor", () => {
   it("fails closed when the systemd runtime root for credentials is missing or untrusted", async () => {
     const root = makeRoot();
     let attemptIndex = 0;
-    const attempt = async (runtimeRoot: string, uid?: number, removeBeforeStart = false): Promise<void> => {
+    const attempt = async (
+      runtimeRoot: string,
+      uid?: number,
+      removeBeforeStart = false,
+      expectRuntimeRootPreserved = false,
+    ): Promise<void> => {
       attemptIndex += 1;
       const directory = createManagedCredentialDirectory(root, `systemd-runtime-${attemptIndex}`);
       const files = writeManagedCredentialFiles(directory, { OPENAI_API_KEY: "secret" });
@@ -1488,6 +1509,7 @@ describe("systemd-user supervisor", () => {
         credentialFiles: [{ name: "OPENAI_API_KEY", path: files[0] }],
       };
       const spec = createSupervisorSpec({ ...base, launchEnvironment: { XDG_RUNTIME_DIR: runtimeRoot } });
+      if (expectRuntimeRootPreserved) expect(spec.launchEnvironment?.XDG_RUNTIME_DIR).toBe(runtimeRoot);
       if (removeBeforeStart) rmSync(runtimeRoot, { recursive: true, force: true });
       const runner = fakeRunner([
         { code: 1, stderr: "Unit is not-found" },
@@ -1510,6 +1532,11 @@ describe("systemd-user supervisor", () => {
     chmodSync(untrusted, 0o755);
     await attempt(untrusted);
     await attempt(untrusted, -1);
+    const owned = makeRoot();
+    chmodSync(owned, 0o700);
+    const ownedStats = lstatSync(owned);
+    const mismatchedUid = ownedStats.uid === 2_147_483_647 ? 2_147_483_646 : 2_147_483_647;
+    await attempt(realpathSync(owned), mismatchedUid, false, true);
   });
 
   it("refuses stale/collision starts and cleans exact terminal units through manager stop", async () => {
@@ -1551,7 +1578,7 @@ describe("systemd-user supervisor", () => {
     ]);
     await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).stopAndAwaitAbsent(spec)).resolves.toBeUndefined();
     expect(runner.calls[2].args).toEqual(["--user", "reset-failed", spec.systemdUnit]);
-    expect(runner.calls[3].args).toEqual(["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,Environment,ExecMainStartTimestamp,FragmentPath", spec.systemdUnit]);
+    expect(runner.calls[3].args).toEqual(["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,ControlGroup,Environment,ExecMainStartTimestamp,FragmentPath", spec.systemdUnit]);
   });
 
   it("refuses a reset-failed failure other than exact not-found", async () => {
@@ -1899,13 +1926,14 @@ describe("systemd-user supervisor", () => {
     ].join(" ");
     const runner = fakeRunner([{
       code: 0,
-      stdout: `LoadState=loaded\nActiveState=active\nMainPID=515\nEnvironment=${environment}`,
+      stdout: `LoadState=loaded\nActiveState=active\nMainPID=515\nControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/${spec.systemdUnit}\nEnvironment=${environment}`,
     }]);
     await expect(createSupervisor("systemd-user", { run: runner.run, platform: "linux" }).probe(spec)).resolves.toMatchObject({
       kind: "registered-running-valid",
       managerPid: 515,
       scopeDigest: spec.scopeDigest,
       nonce: spec.nonce,
+      controlGroup: `/user.slice/user-1000.slice/user@1000.service/app.slice/${spec.systemdUnit}`,
     });
   });
 

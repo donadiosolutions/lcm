@@ -19,13 +19,20 @@ longer supported.
 If you are working from this repository directly instead of the published npm package:
 
 ```bash
-npm install
-npm run build
-npm link
+mkdir -p .superpowers/pnpm
+pnpm_bootstrap_root="$(mktemp -d "$PWD/.superpowers/pnpm/run.XXXXXXXX")"
+pnpm_bin="$(node scripts/bootstrap-pnpm.mjs --destination "$pnpm_bootstrap_root/verified")"
+export PATH="$pnpm_bin:$PATH"
+pnpm install --frozen-lockfile
+pnpm run build
 ```
 
-If you do not want a global link, run `node dist/lcm.mjs ...` instead of
-`lcm ...` in the commands below.
+Run `node dist/lcm.mjs ...` instead of `lcm ...` in the commands below to
+use the checkout directly. To install a built artifact globally, follow the
+exact-tarball procedure in [Development](development.md#install-a-built-checkout).
+The source-clone installer, `bash install.sh`, also bootstraps the verified
+pnpm pin and performs a frozen install and build before installing its Node
+launcher. It then runs `lcm install`.
 
 ## Install the VS Code connector
 
@@ -107,6 +114,14 @@ requires no TOML editing. Use
 bundle. The MCP bundle does not retain or install the CLI-only managed
 `~/.codex/AGENTS.md` entry. Explicit or stored CLI convergence may remove only
 the exact LCM-owned MCP registration.
+
+On Linux, LCM forwards the user-session bus to those nested commands only as
+the exact validated pair `XDG_RUNTIME_DIR=/run/user/<uid>` and
+`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus`. The runtime directory
+must be canonical, user-owned, and mode `0700`; the matching endpoint must be
+a canonical user-owned socket. LCM omits both values if either side is missing,
+malformed, oversized, redirected, foreign-owned, non-socket, or mismatched,
+and it does not inherit unrelated process environment variables.
 
 The hook connector installs these Codex events:
 

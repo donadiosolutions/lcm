@@ -1,7 +1,9 @@
 import { chmodSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { TestProject } from "vitest/node";
+import {
+  captureOriginalTemporaryParents,
+  createTestTempDirectory,
+} from "../../scripts/test-temp-root.mjs";
 
 export const RUNTIME_HOME_ROOT_CONTEXT = "lcmRuntimeHomeRoot";
 
@@ -16,7 +18,11 @@ export interface RuntimeHomeRunDependencies {
   readonly secureDirectory?: (path: string, mode: number) => void;
   readonly removeDirectory?: (path: string) => void;
   readonly environment?: NodeJS.ProcessEnv;
+  readonly platformName?: NodeJS.Platform;
   readonly temporaryRoot?: () => string;
+  readonly realpath?: (path: string) => string;
+  readonly markerProbe?: (path: string) => void;
+  readonly candidateParents?: string[];
 }
 
 export function createRuntimeHomeRun(
@@ -28,12 +34,40 @@ export function createRuntimeHomeRun(
   const removeDirectory = dependencies.removeDirectory
     ?? ((path) => rmSync(path, { recursive: true, force: true }));
   const environment = dependencies.environment ?? process.env;
-  const temporaryRoot = dependencies.temporaryRoot ?? tmpdir;
-  const parent = environment.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT ?? temporaryRoot();
-  const root = createDirectory(join(parent, "lcm-vitest-run-"));
-  secureDirectory(root, 0o700);
-  project.provide(RUNTIME_HOME_ROOT_CONTEXT, root);
-  return () => removeDirectory(root);
+  const platformName = dependencies.platformName ?? process.platform;
+  let capturedParents: string[] | undefined;
+  if (environment.LCM_TEST_HARNESS_TMPDIR === undefined) {
+    capturedParents = captureOriginalTemporaryParents(
+      environment,
+      platformName,
+      dependencies.temporaryRoot,
+    );
+  }
+  const allocation = createTestTempDirectory({
+    environment,
+    platformName,
+    prefix: "lcm-vitest-run-",
+    createDirectory,
+    secureDirectory,
+    removeDirectory,
+    realpath: dependencies.realpath,
+    markerProbe: dependencies.markerProbe,
+    candidateParents: dependencies.candidateParents
+      ?? (environment.LCM_TEST_VITEST_RUNTIME_ROOT_PARENT === undefined
+        ? capturedParents
+        : undefined),
+    temporaryRoot: dependencies.temporaryRoot,
+  });
+  try {
+    project.provide(RUNTIME_HOME_ROOT_CONTEXT, allocation.root);
+    if (environment.LCM_TEST_HARNESS_TMPDIR === undefined) {
+      environment.LCM_TEST_HARNESS_TMPDIR = allocation.parent;
+    }
+  } catch (error) {
+    removeDirectory(allocation.root);
+    throw error;
+  }
+  return () => removeDirectory(allocation.root);
 }
 
 export default function setup(project: TestProject): () => void {

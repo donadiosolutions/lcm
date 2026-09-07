@@ -428,6 +428,7 @@ function validateManifest(value: unknown, requireChecksum = true): PortableManif
       item.domain !== domain
       || item.domainVersion !== 1
       || !isSafeCount(item.recordCount)
+      || Object.is(item.recordCount, -0)
       || !isSha256(item.prefixSha256)
     ) fail("malformed-manifest");
     const coverage = validateCoverage(item.coverage);
@@ -509,6 +510,8 @@ function validateCheckpoint(value: unknown): PortableCheckpoint {
     || typeof object.domain !== "string"
     || !PORTABLE_RECORD_DOMAIN_ORDER.includes(object.domain as PortableDomain)
     || !isSafeCount(object.nextOrdinal)
+    || Object.is(object.nextOrdinal, -0)
+    || Object.is(object.recordCount, -0)
     || object.recordCount !== object.nextOrdinal
     || !isSha256(object.prefixSha256)
     || (object.lastRecordIdentitySha256 !== null && !isSha256(object.lastRecordIdentitySha256))

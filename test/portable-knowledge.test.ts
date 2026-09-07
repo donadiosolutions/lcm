@@ -1,4 +1,18 @@
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -27,6 +41,7 @@ import { lcmHomeDir } from "../src/runtime-paths.js";
 import { isLcmConnectionOpen } from "../src/db/connection.js";
 import { ScrubEngine } from "../src/scrub.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
+import { createPublicationConvergence } from "../src/storage/publication-convergence.js";
 
 const tempDirs: string[] = [];
 const originalHome = process.env.HOME;
@@ -208,6 +223,144 @@ describe("portable-knowledge — export", () => {
     const doc: ExportDocument = JSON.parse(readFileSync(outFile, "utf-8"));
     expect(doc.entries).toHaveLength(1);
     expect(doc.entries[0].content).toBe("Entry one");
+  });
+
+  it("supports an internal convergence runner while persisting once", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const outFile = join(makeTempDir(), "converged.json");
+    seedProject(baseDir, cwd, [{ content: "Converged entry", tags: ["note"] }]);
+
+    const result = await exportKnowledge(cwd, {
+      output: outFile,
+      skipScrub: true,
+      _lcmBaseDir: baseDir,
+      _publicationConvergence: createPublicationConvergence({ port: 3737 }),
+    });
+
+    expect(result.exported).toBe(1);
+    expect(JSON.parse(readFileSync(outFile, "utf-8")).entries).toHaveLength(1);
+  });
+
+  it("retries export gathering and writes only the winning document", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const outFile = join(makeTempDir(), "retried.json");
+    seedProject(baseDir, cwd, [{ content: "Retried entry", tags: ["note"] }]);
+    const migration = await import("../src/db/migration.js");
+    const contention = new (await import("../src/private-mutation-lock.js")).PrivateMutationLockContentionError("busy");
+    const runMigration = vi.spyOn(migration, "runLcmMigrations");
+    runMigration.mockImplementationOnce(() => { throw contention; });
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      deps: {
+        now: (() => { let value = 0; return () => value; })(),
+        sleep: async () => undefined,
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth",
+        lockPath: join(baseDir, "publication.lock"),
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+          status: "ok", pid: 42, version: "test", storageBackend: "sqlite",
+          entrypoint: "/daemon", runtimeDigest: "runtime",
+        }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    try {
+      const result = await exportKnowledge(cwd, {
+        output: outFile,
+        skipScrub: true,
+        _lcmBaseDir: baseDir,
+        _publicationConvergence: convergence,
+      });
+      expect(result.exported).toBe(1);
+      expect(runMigration).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(readFileSync(outFile, "utf-8")).entries).toHaveLength(1);
+    } finally {
+      runMigration.mockRestore();
+    }
+  });
+
+  it("retries export gathering before emitting one stdout document", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    seedProject(baseDir, cwd, [{ content: "stdout retry", tags: ["note"] }]);
+    const migration = await import("../src/db/migration.js");
+    const contention = new (await import("../src/private-mutation-lock.js")).PrivateMutationLockContentionError("busy");
+    const runMigration = vi.spyOn(migration, "runLcmMigrations");
+    runMigration.mockImplementationOnce(() => { throw contention; });
+    let now = 0;
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      deps: {
+        now: () => now, sleep: async (delayMs: number) => { now += delayMs; },
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth", lockPath: join(baseDir, "publication.lock"),
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+          status: "ok", pid: 42, version: "test", storageBackend: "sqlite",
+          entrypoint: "/daemon", runtimeDigest: "runtime",
+        }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await exportKnowledge(cwd, { skipScrub: true, _lcmBaseDir: baseDir, _publicationConvergence: convergence });
+      const documents = output.mock.calls.map(([value]) => String(value)).filter(value => value.includes('"version"'));
+      expect(documents).toHaveLength(1);
+      expect(JSON.parse(documents[0]!).entries).toHaveLength(1);
+      expect(runMigration).toHaveBeenCalledTimes(2);
+    } finally {
+      runMigration.mockRestore();
+    }
+  });
+
+  it.each([
+    ["stdout", "exhausted", false, true],
+    ["file", "exhausted", true, true],
+    ["stdout", "unauthenticated", false, false],
+    ["file", "unauthenticated", true, false],
+  ])("preserves %s on %s gather admission", async (_mode, _reason, toFile, authenticated) => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const outFile = join(makeTempDir(), "existing.json");
+    writeFileSync(outFile, "previous export");
+    seedProject(baseDir, cwd, [{ content: "blocked entry", tags: ["note"] }]);
+    const migration = await import("../src/db/migration.js");
+    const { PrivateMutationLockContentionError } = await import("../src/private-mutation-lock.js");
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    const runMigration = vi.spyOn(migration, "runLcmMigrations").mockImplementation(() => { throw contention; });
+    let now = 0;
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      deps: {
+        now: () => now, sleep: async (delayMs: number) => { now += delayMs; },
+        readToken: () => "token",
+        readOwner: () => ({ version: 1, pid: authenticated ? 42 : 99, processStartTime: "birth", nonce: "a".repeat(32) }),
+        processBirth: () => "birth", lockPath: join(baseDir, "publication.lock"),
+        fetch: vi.fn(async () => ({ ok: true, json: async () => ({
+          status: "ok", pid: 42, version: "test", storageBackend: "sqlite",
+          entrypoint: "/daemon", runtimeDigest: "runtime",
+        }) })) as unknown as typeof globalThis.fetch,
+      },
+    });
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await expect(exportKnowledge(cwd, {
+        output: toFile ? outFile : undefined,
+        skipScrub: true, _lcmBaseDir: baseDir, _publicationConvergence: convergence,
+      })).rejects.toBe(contention);
+      expect(output).not.toHaveBeenCalled();
+      expect(readFileSync(outFile, "utf-8")).toBe("previous export");
+      expect(runMigration).toHaveBeenCalledTimes(authenticated ? 40 : 1);
+      expect(now).toBe(authenticated ? 2000 : 0);
+    } finally {
+      runMigration.mockRestore();
+      output.mockRestore();
+    }
   });
 
   it("scrubs secrets by default", async () => {
@@ -595,7 +748,7 @@ describe("portable-knowledge — import", () => {
     db.close();
   });
 
-  it("writes meta.json on import so the project is visible to export --all", async () => {
+  it("privately writes meta.json on import so the project is visible to export --all", async () => {
     const baseDir = makeTempDir();
     const cwd = makeTempDir();
 
@@ -610,16 +763,21 @@ describe("portable-knowledge — import", () => {
       },
     ]);
 
-    await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir });
+    const originalUmask = process.umask(0o022);
+    try {
+      await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir });
+    } finally {
+      process.umask(originalUmask);
+    }
 
     // meta.json must exist so export --all can discover this project
     const projId = toProjectId(cwd);
     const metaPath = join(baseDir, "projects", projId, "meta.json");
     expect(existsSync(metaPath)).toBe(true);
 
-    const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-    expect(meta.cwd).toBe(cwd);
-    expect(readFileSync(metaPath, "utf-8").endsWith("\n")).toBe(true);
+    expect(readFileSync(metaPath, "utf-8")).toBe(`{\n  "cwd": ${JSON.stringify(cwd)}\n}\n`);
+    expect(statSync(metaPath).mode & 0o777).toBe(0o600);
+    expect(statSync(join(baseDir, "projects", projId)).mode & 0o777).toBe(0o700);
 
     // Verify the round-trip: export using the same project directory enumeration
     // that `lcm export --all` uses (scan projects/ for meta.json files).
@@ -657,16 +815,83 @@ describe("portable-knowledge — import", () => {
     expect(JSON.parse(readFileSync(metaPath, "utf-8"))).toEqual({ cwd });
   });
 
-  it("preserves an existing meta.json", async () => {
+  it("preserves existing meta.json bytes and mode", async () => {
     const baseDir = makeTempDir();
     const cwd = makeTempDir();
     const { projDir } = seedProject(baseDir, cwd, []);
     const metaPath = join(projDir, "meta.json");
-    writeFileSync(metaPath, JSON.stringify({ cwd, marker: "keep" }));
+    const existing = `${JSON.stringify({ cwd, marker: "keep malformed bytes" })}\ntrailing`;
+    writeFileSync(metaPath, existing);
+    chmodSync(metaPath, 0o640);
 
     await importKnowledge(cwd, makeDoc([]), { _lcmBaseDir: baseDir });
 
-    expect(JSON.parse(readFileSync(metaPath, "utf-8"))).toEqual({ cwd, marker: "keep" });
+    expect(readFileSync(metaPath, "utf-8")).toBe(existing);
+    expect(statSync(metaPath).mode & 0o777).toBe(0o640);
+  });
+
+  it("leaves a legacy fixed metadata temp file untouched", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const projDir = join(baseDir, "projects", toProjectId(cwd));
+    mkdirSync(projDir, { recursive: true, mode: 0o700 });
+    const legacyTempPath = join(projDir, "meta.json.tmp");
+    const sentinel = "legacy temporary metadata owner\n";
+    writeFileSync(legacyTempPath, sentinel, { mode: 0o600 });
+    const preservedTime = new Date("2000-01-02T03:04:05.000Z");
+    utimesSync(legacyTempPath, preservedTime, preservedTime);
+    const beforeMtimeMs = statSync(legacyTempPath).mtimeMs;
+
+    await importKnowledge(cwd, makeDoc([]), { _lcmBaseDir: baseDir });
+
+    expect(readFileSync(legacyTempPath, "utf-8")).toBe(sentinel);
+    expect(statSync(legacyTempPath).mtimeMs).toBe(beforeMtimeMs);
+  });
+
+  it("leaves a legacy fixed metadata temp symlink and its target untouched", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const projDir = join(baseDir, "projects", toProjectId(cwd));
+    mkdirSync(projDir, { recursive: true, mode: 0o700 });
+    const externalTarget = join(makeTempDir(), "external-target");
+    const sentinel = "external private fixture\n";
+    writeFileSync(externalTarget, sentinel, { mode: 0o600 });
+    const preservedTime = new Date("2001-02-03T04:05:06.000Z");
+    utimesSync(externalTarget, preservedTime, preservedTime);
+    const beforeMtimeMs = statSync(externalTarget).mtimeMs;
+    const legacyTempPath = join(projDir, "meta.json.tmp");
+    symlinkSync(externalTarget, legacyTempPath);
+
+    await importKnowledge(cwd, makeDoc([]), { _lcmBaseDir: baseDir });
+
+    expect(existsSync(legacyTempPath)).toBe(true);
+    expect(lstatSync(legacyTempPath).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(legacyTempPath)).toBe(externalTarget);
+    expect(readFileSync(externalTarget, "utf-8")).toBe(sentinel);
+    expect(statSync(externalTarget).mtimeMs).toBe(beforeMtimeMs);
+  });
+
+  it("preserves a dangling meta.json symlink and completes the import", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const projDir = join(baseDir, "projects", toProjectId(cwd));
+    mkdirSync(projDir, { recursive: true, mode: 0o700 });
+    const metaPath = join(projDir, "meta.json");
+    const danglingTarget = join(makeTempDir(), "missing-meta-target");
+    symlinkSync(danglingTarget, metaPath);
+    expect(existsSync(metaPath)).toBe(false);
+
+    const result = await importKnowledge(cwd, makeDoc([]), { _lcmBaseDir: baseDir });
+
+    expect(result).toEqual({
+      total: 0,
+      imported: 0,
+      skipped: 0,
+      dryRun: false,
+    });
+    expect(lstatSync(metaPath).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(metaPath)).toBe(danglingTarget);
+    expect(existsSync(danglingTarget)).toBe(false);
   });
 
   it.each([

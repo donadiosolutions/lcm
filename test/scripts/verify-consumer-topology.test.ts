@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -255,8 +255,37 @@ describe("verify-consumer-topology", () => {
     const run = vi.fn();
     expect(module.runIfDirect({ invokedPath: undefined, moduleUrl: "file:///script.mjs", run })).toBe(false);
     expect(module.runIfDirect({ invokedPath: "/other.mjs", moduleUrl: "file:///script.mjs", run })).toBe(false);
-    expect(module.runIfDirect({ invokedPath: scriptPath, moduleUrl: `file://${scriptPath}`, run })).toBe(true);
+    expect(module.runIfDirect({ invokedPath: scriptPath, moduleUrl: pathToFileURL(scriptPath).href, run })).toBe(true);
     expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires canonical file URLs for encoded native paths", async () => {
+    const module = await import(scriptPath);
+    const run = vi.fn();
+    const nativePath = resolve(repositoryRoot, "lcm checkout # %", "verify-consumer-topology.mjs");
+    const canonicalHref = pathToFileURL(nativePath).href;
+    const differentPath = resolve(repositoryRoot, "different checkout", "verify-consumer-topology.mjs");
+
+    expect(canonicalHref).toContain("%20");
+    expect(canonicalHref).toContain("%23");
+    expect(canonicalHref).toContain("%25");
+    expect(module.runIfDirect({ invokedPath: nativePath, moduleUrl: canonicalHref, run })).toBe(true);
+    expect(module.runIfDirect({ invokedPath: differentPath, moduleUrl: canonicalHref, run })).toBe(false);
+    expect(module.runIfDirect({ invokedPath: nativePath, moduleUrl: `file://${nativePath}`, run })).toBe(false);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("constructs canonical file URLs for Windows paths", () => {
+    const windowsPath = String.raw`C:\Users\a\dir with space\file#%.mjs`;
+    const expectedHref = "file:///C:/Users/a/dir%20with%20space/file%23%25.mjs";
+    const windowsHref = pathToFileURL(windowsPath, { windows: true }).href;
+
+    expect(windowsHref).toBe(expectedHref);
+    expect(windowsHref.startsWith("file:///C:/")).toBe(true);
+    expect(windowsHref).not.toContain("\\");
+    expect(windowsHref).toContain("%20");
+    expect(windowsHref).toContain("%23");
+    expect(windowsHref).toContain("%25");
   });
 
   it("isolates every packed CLI home and preserves unrelated environment", async () => {
@@ -469,6 +498,117 @@ describe("verify-consumer-topology", () => {
     }
   });
 
+  it("propagates an undefined cleanup failure after successful verification", async () => {
+    const module = await import(scriptPath);
+    const expectedResult = { verified: true };
+    const execute = vi.fn((scratch: string) => {
+      expect(existsSync(scratch)).toBe(true);
+      return expectedResult;
+    });
+    const cleanup = vi.fn(() => {
+      throw undefined;
+    });
+    const reporter = vi.fn();
+    let returned = false;
+    let caught = false;
+    let caughtError: unknown;
+    try {
+      try {
+        const result = module.runConsumerTopology({ execute, cleanup, reportCleanupFailure: reporter });
+        returned = true;
+        expect(result).toBe(expectedResult);
+      } catch (error) {
+        caught = true;
+        caughtError = error;
+      }
+      expect(caught).toBe(true);
+      expect(returned).toBe(false);
+      expect(caughtError).toBeUndefined();
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledWith(execute.mock.calls[0]![0]);
+      expect(reporter).not.toHaveBeenCalled();
+    } finally {
+      const scratch = execute.mock.calls[0]?.[0];
+      if (scratch) rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("reports an undefined cleanup failure after verification fails", async () => {
+    const module = await import(scriptPath);
+    const primaryError = new Error("verification failed");
+    const execute = vi.fn((scratch: string) => {
+      expect(existsSync(scratch)).toBe(true);
+      throw primaryError;
+    });
+    const cleanup = vi.fn(() => {
+      throw undefined;
+    });
+    const reporter = vi.fn();
+    let returned = false;
+    let caught = false;
+    let caughtError: unknown;
+    try {
+      try {
+        module.runConsumerTopology({ execute, cleanup, reportCleanupFailure: reporter });
+        returned = true;
+      } catch (error) {
+        caught = true;
+        caughtError = error;
+      }
+      expect(caught).toBe(true);
+      expect(returned).toBe(false);
+      expect(caughtError).toBe(primaryError);
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledWith(execute.mock.calls[0]![0]);
+      expect(reporter).toHaveBeenCalledTimes(1);
+      expect(reporter).toHaveBeenCalledWith(execute.mock.calls[0]![0], undefined);
+    } finally {
+      const scratch = execute.mock.calls[0]?.[0];
+      if (scratch) rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a primary undefined verification failure", async () => {
+    const module = await import(scriptPath);
+    const cleanupError = new Error("cleanup failed");
+    const reporterError = new Error("reporter failed");
+    const execute = vi.fn((scratch: string) => {
+      expect(existsSync(scratch)).toBe(true);
+      throw undefined;
+    });
+    const cleanup = vi.fn(() => {
+      throw cleanupError;
+    });
+    const reporter = vi.fn(() => {
+      throw reporterError;
+    });
+    let returned = false;
+    let caught = false;
+    let caughtError: unknown = Symbol("unset");
+    try {
+      try {
+        module.runConsumerTopology({ execute, cleanup, reportCleanupFailure: reporter });
+        returned = true;
+      } catch (error) {
+        caught = true;
+        caughtError = error;
+      }
+      expect(caught).toBe(true);
+      expect(returned).toBe(false);
+      expect(caughtError).toBeUndefined();
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledWith(execute.mock.calls[0]![0]);
+      expect(reporter).toHaveBeenCalledTimes(1);
+      expect(reporter).toHaveBeenCalledWith(execute.mock.calls[0]![0], cleanupError);
+    } finally {
+      const scratch = execute.mock.calls[0]?.[0];
+      if (scratch) rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("keeps packed CLI failure diagnostics unchanged", async () => {
     const module = await import(scriptPath);
     const root = isolatedRoot("verify-errors-");
@@ -486,5 +626,85 @@ describe("verify-consumer-topology", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("consumer package manager boundary", () => {
+  it("builds with pnpm and packs and installs both consumers with npm", async () => {
+    const module = await import(scriptPath);
+    const scratch = isolatedRoot("verify-managers-");
+    const commands: Array<{ command: string; args: string[]; cwd: string; env?: NodeJS.ProcessEnv }> = [];
+    const logs: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((...values: unknown[]) => {
+      logs.push(values.join(" "));
+    });
+    try {
+      module.executeConsumerTopology(scratch, {
+        spawn: (command: string, args: string[], options: { cwd: string; env?: NodeJS.ProcessEnv }) => {
+          commands.push({ command, args, ...options });
+          if (args[0] === "pack") {
+            return { status: 0, stdout: JSON.stringify([{ filename: "lcm.tgz" }]), stderr: "" };
+          }
+          if (args[0] === "install") {
+            const packageRoot = join(options.cwd, "node_modules", "@donadiosolutions", "lcm");
+            mkdirSync(packageRoot, { recursive: true });
+            writeFileSync(join(packageRoot, "package.json"), JSON.stringify({
+              version: "1.0.0", dependencies: { "@hono/node-server": "2.0.12" },
+            }));
+            if (args.includes("body-parser@2.2.2")) {
+              for (const [name, version] of [["body-parser", "2.2.2"], ["fast-uri", "3.1.0"]]) {
+                const dependency = join(options.cwd, "node_modules", name!);
+                mkdirSync(dependency, { recursive: true });
+                writeFileSync(join(dependency, "package.json"), JSON.stringify({ version }));
+              }
+            }
+          }
+          return { status: 0, stdout: "1.0.0\n", stderr: "" };
+        },
+      });
+      const packageCommands = commands.filter(({ command }) => command !== process.execPath);
+      expect(packageCommands.map(({ command, args }) => [command, args[0]])).toEqual([
+        [process.platform === "win32" ? "pnpm.cmd" : "pnpm", "run"],
+        [process.platform === "win32" ? "npm.cmd" : "npm", "pack"],
+        [process.platform === "win32" ? "npm.cmd" : "npm", "install"],
+        [process.platform === "win32" ? "npm.cmd" : "npm", "install"],
+      ]);
+      expect(packageCommands[0]!.args).toEqual(["run", "build"]);
+      expect(packageCommands[0]!.env?.npm_config_ignore_scripts).toBe("false");
+      expect(packageCommands.slice(1).every(({ env }) => env?.npm_config_ignore_scripts === "true"))
+        .toBe(true);
+      expect(packageCommands.slice(2).every(({ cwd }) => isStrictDescendant(scratch, cwd))).toBe(true);
+      expect(commands.filter(({ command }) => command === process.execPath)).toHaveLength(4);
+      expect(logs).toContainEqual(expect.stringContaining("sdk-express-qs=6.16.0"));
+      expect(logs).toContainEqual(expect.stringContaining("sdk-body-parser-qs=6.16.0"));
+    } finally {
+      log.mockRestore();
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("stops before npm packing when the pnpm build fails", async () => {
+    const module = await import(scriptPath);
+    const scratch = isolatedRoot("verify-build-failure-");
+    const calls: string[] = [];
+    try {
+      expect(() => module.executeConsumerTopology(scratch, {
+        spawn: (command: string) => {
+          calls.push(command);
+          return { status: 1, stdout: "build output", stderr: "compiler failure" };
+        },
+      })).toThrow(/pnpm run build failed.*[\s\S]*compiler failure/u);
+      expect(calls).toEqual([process.platform === "win32" ? "pnpm.cmd" : "pnpm"]);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a consumer temporary directory within the repository configuration tree", async () => {
+    const module = await import(scriptPath);
+    const execute = vi.fn();
+    expect(() => module.runConsumerTopology({ temporaryRoot: repositoryRoot, execute }))
+      .toThrow("Consumer temporary root must be outside the repository");
+    expect(execute).not.toHaveBeenCalled();
   });
 });

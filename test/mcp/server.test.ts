@@ -1,9 +1,30 @@
+import { renderBackendDiagnostics } from "../../src/storage/diagnostic-renderer.js";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { __lcmMcpTestHooks, getMcpToolDefinitions, handleDaemonRequest } from "../../src/mcp/server.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import * as storageBackend from "../../src/storage/backend.js";
+import { DEFAULT_SEARCH_RESULT_LIMIT, MAX_SEARCH_RESULT_LIMIT } from "../../src/retrieval.js";
+import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { StatsUnavailableError } from "../../src/stats.js";
+import type { BackendDiagnosticSnapshot } from "../../src/storage/diagnostics.js";
+
+type LocalToolHandler = (request: { params: { name: string; arguments?: Record<string, unknown> } }) => Promise<{
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+}>;
+const localStatsMocks = vi.hoisted(() => ({
+  handlers: new Map<unknown, LocalToolHandler>(),
+  collectStats: vi.fn(),
+  post: vi.fn(),
+}));
+
+vi.mock("../../src/stats.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/stats.js")>();
+  return { ...actual, collectStats: localStatsMocks.collectStats };
+});
 
 const ensureDaemonMcpMock = vi.hoisted(() => vi.fn().mockResolvedValue({ connected: true, port: 9999, spawned: false }));
 
@@ -16,7 +37,7 @@ vi.mock("../../src/daemon/config.js", () => ({
 vi.mock("@modelcontextprotocol/sdk/server/index.js", () => ({
   Server: vi.fn().mockImplementation(function () {
     return {
-      setRequestHandler: vi.fn(),
+      setRequestHandler: vi.fn((schema: unknown, handler: LocalToolHandler) => localStatsMocks.handlers.set(schema, handler)),
       connect: vi.fn().mockResolvedValue(undefined),
     };
   }),
@@ -29,7 +50,7 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
 vi.mock("../../src/daemon/client.js", () => ({
   DaemonClient: vi.fn().mockImplementation(function () {
     return {
-      post: vi.fn(),
+      post: localStatsMocks.post,
     };
   }),
 }));
@@ -66,6 +87,50 @@ describe("MCP tool definitions", () => {
   it("lcm_search description mentions episodic", () => {
     const tool = getMcpToolDefinitions().find((t: any) => t.name === "lcm_search");
     expect(tool!.description).toContain("episodic");
+  });
+
+  it("advertises canonical search and grep contracts with defaults", () => {
+    const search = getMcpToolDefinitions().find((t: any) => t.name === "lcm_search") as any;
+    const grep = getMcpToolDefinitions().find((t: any) => t.name === "lcm_grep") as any;
+    expect(search.inputSchema.properties.layers.items.enum).toEqual(["episodic", "promoted"]);
+    expect(search.inputSchema.properties.layers.default).toEqual(["episodic", "promoted"]);
+    expect(search.inputSchema.properties.limit).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      maximum: MAX_SEARCH_RESULT_LIMIT,
+      default: DEFAULT_SEARCH_RESULT_LIMIT,
+    });
+    expect(grep.inputSchema.properties.scope.enum).toEqual(["messages", "summaries", "both"]);
+    expect(grep.inputSchema.properties.scope.default).toBe("both");
+    expect(grep.inputSchema.properties.mode.enum).toEqual(["full_text", "regex"]);
+    expect(grep.inputSchema.properties.mode.default).toBe("full_text");
+    expect(grep.inputSchema.properties.mode.description).toContain("full-text");
+    expect(grep.inputSchema.properties.mode.description).toContain("regex");
+    expect(grep.inputSchema.properties.since.description).toContain("inclusive");
+    expect(grep.inputSchema.properties.since.description).toContain("UTC years must be 0001-9999");
+    expect(grep.inputSchema.properties.since.description).toContain("HTTP 400");
+    expect(grep.inputSchema.properties.since.description).toContain("1-3 fractional digits");
+    expect(grep.inputSchema.properties.since.description).toContain("+/-HH:mm");
+    expect(grep.inputSchema.properties.query.description).toBe(
+      "Keyword, phrase, or pattern to search; interpretation follows mode (full_text by default, regex when selected)",
+    );
+    expect(search.description).toContain("promoted");
+    expect(search.description).not.toContain("Qdrant");
+    expect(search.description).not.toContain("semantic");
+    expect(search.inputSchema.properties.tags.description).toContain("promoted");
+    expect(search.inputSchema.properties.tags.description).toContain("episodic results remain unfiltered");
+  });
+
+  it("advertises the expand depth contract", () => {
+    const expand = getMcpToolDefinitions().find((t: any) => t.name === "lcm_expand") as any;
+    expect(expand.inputSchema.properties.depth).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      default: 1,
+    });
+    expect(expand.inputSchema.properties.depth).not.toHaveProperty("maximum");
+    expect(expand.inputSchema.properties.depth.description).toContain("positive integer");
+    expect(expand.inputSchema.properties.depth.description).toContain("default: 1");
   });
 
   it("lcm_store describes fields without embedding agent policy", () => {
@@ -119,7 +184,8 @@ describe("handleDaemonRequest", () => {
   });
 
   it("refuses a request whose publication scope is not canonical", async () => {
-    const home = mkdtempSync(join("/tmp", "lcm-mcp-publication-"));
+    const home = mkdtempSync(join(tmpdir(), "lcm-mcp-publication-"));
+    expect(dirname(home)).toBe(tmpdir());
     const publicationDir = join(home, ".lcm", "backend-publication");
     mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
     writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
@@ -583,5 +649,67 @@ describe("handleDaemonRequest spawn opts propagation", () => {
 
     expect(ensureDaemonSpy).not.toHaveBeenCalled();
     expect(client.post).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("local lcm_stats diagnostic failures", () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    localStatsMocks.handlers.clear();
+    localStatsMocks.collectStats.mockReset();
+    const { startMcpServer } = await import("../../src/mcp/server.js");
+    await startMcpServer();
+    // Connection startup is operational; the individual stats invocation is not.
+    ensureDaemonMcpMock.mockClear();
+  });
+
+  it.each(["unavailable", "permission-denied", "timeout", "stale-publication"] as const)(
+    "returns fixed %s observations without leaking exception data or invoking lifecycle",
+    async (classification) => {
+      const diagnostics: BackendDiagnosticSnapshot = {
+        backend: "postgresql", classification,
+        publication: "unverified", tls: "unverified", schema: "unavailable",
+        extensions: "unverified", search: "unverified",
+        pool: { origin: "diagnostic-probe", status: "unavailable" },
+        project: { scope: "aggregate", status: "unverified" }, identity: { status: "unverified" }, outbox: { status: "unverified" },
+        remediation: "Run `lcm doctor` and review the storage configuration.",
+      };
+      const canaries = [
+        "RAW_SQL_VALUE_CANARY", "PRIVATE_TRANSCRIPT_CANARY", SYNTHETIC_CREDENTIAL,
+        SYNTHETIC_PRIVATE_PATH, "postgresql://secret:password@private-host.example/db",
+      ];
+      const error = new StatsUnavailableError(diagnostics);
+      error.message = canaries.join(" ");
+      error.cause = new Error(canaries.join("\n"));
+      localStatsMocks.collectStats.mockRejectedValueOnce(error);
+
+      const result = await localStatsMocks.handlers.get(CallToolRequestSchema)!({
+        params: { name: "lcm_stats", arguments: { verbose: true } },
+      });
+
+      expect(result).toEqual({ content: [{
+        type: "text",
+        text: renderBackendDiagnostics(diagnostics),
+      }] });
+      for (const canary of canaries) expect(JSON.stringify(result)).not.toContain(canary);
+      expect(result.content[0].text).not.toContain("| Projects |");
+      expect(localStatsMocks.collectStats).toHaveBeenCalledExactlyOnceWith();
+      expect(ensureDaemonMcpMock).not.toHaveBeenCalled();
+      expect(localStatsMocks.post).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves structured MCP failure handling for unclassified stats errors", async () => {
+    localStatsMocks.collectStats.mockRejectedValueOnce(new Error(`password=${SYNTHETIC_CREDENTIAL}`));
+
+    const result = await localStatsMocks.handlers.get(CallToolRequestSchema)!({
+      params: { name: "lcm_stats" },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("password=<redacted>");
+    expect(result.content[0].text).not.toContain(SYNTHETIC_CREDENTIAL);
+    expect(ensureDaemonMcpMock).not.toHaveBeenCalled();
+    expect(localStatsMocks.post).not.toHaveBeenCalled();
   });
 });

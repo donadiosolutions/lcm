@@ -5,7 +5,7 @@
 
 ## Why a schema?
 
-Without a canonical schema, the same decision gets stored as `decision:X`, `category:decision`, or just `decision` — making `lcm_search` with tag filters unreliable. The canonical schema enforces consistent `<prefix>:<value>` pairs so any agent can construct a precise search filter.
+Without a canonical schema, the same decision gets stored as `decision:X`, `category:decision`, or just `decision` — making promoted `lcm_search` tag filters unreliable. The canonical schema enforces consistent `<prefix>:<value>` pairs so any agent can construct a precise promoted-layer search filter. Episodic messages and summaries remain searchable when tags are supplied, because tags apply only to promoted memories.
 
 ## Durable store guidance
 

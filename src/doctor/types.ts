@@ -1,32 +1,42 @@
+import type { BackendDiagnosticSnapshot } from "../storage/diagnostics.js";
+
 export interface CheckResult {
   name: string;
   category: string;
   status: "pass" | "warn" | "fail" | "skip";
   message: string;
-  fixApplied?: boolean;
+  backendDiagnostics?: BackendDiagnosticSnapshot;
 }
 
 export interface DoctorDeps {
+  collectBackendSnapshot: (homeDir: string) => Promise<BackendDiagnosticSnapshot>;
   existsSync: (path: string) => boolean;
   readFileSync: (path: string, encoding: string) => string;
-  writeFileSync: (path: string, content: string) => void;
-  mkdirSync: (path: string, opts?: { recursive: boolean }) => void;
-  lstatSync?: typeof import("node:fs").lstatSync;
-  readdirSync?: typeof import("node:fs").readdirSync;
   spawnSync: (cmd: string, args: string[], opts?: object) => { status: number | null; stdout: string; stderr: string };
   fetch: typeof globalThis.fetch;
   homedir: string;
-  platform: string;
+  platform: NodeJS.Platform;
   cwd?: string;
   /** Internal deterministic seam for the Linux managed-daemon executable path. */
   managedDaemonPath?: string;
-  /** Internal deterministic seam for exercising MCP handshake failures. */
-  _testMcpHandshake?: () => Promise<CheckResult>;
-  /** Internal seam for testing backend-publication admission independently. */
-  _assertBackendPublication?: (homeDir: string, backend: "sqlite" | "postgresql") => void;
-  /** Internal bounded config-read seam used by deterministic doctor tests. */
-  _readBoundedConfig?: (path: string, maxBytes: number) => string;
-  /** Test seam for transport-aware Claude guidance repair. */
+  /**
+   * Internal seam replacing the lock-free raw config snapshot reader inside
+   * the single production admission path. Tests use it to inject config bytes
+   * and deterministic descriptor witnesses.
+   */
+  _readDaemonConfigRawSnapshot?: typeof import("../daemon/config.js").readDaemonConfigRawSnapshot;
+  /**
+   * Internal seam replacing the lock-free publication read admission inside
+   * the single production admission path.
+   */
+  _assertPublicationReadAccess?: typeof import("../storage/backend-publication.js").assertBackendPublicationConfigReadAccess;
+  /** Internal seam invoked between the two lock-free config snapshots. */
+  _betweenConfigSnapshotsForTesting?: () => void;
+  /** Internal seam for the LCM root shape inspection used by deterministic tests. */
+  _lstatLcmRootForTesting?: typeof import("node:fs").lstatSync;
+  /** Internal packaged runtime digest seam used by deterministic tests. */
+  _expectedRuntimeDigestForTesting?: string;
+  /** Test seam for transport-aware Claude guidance validation. */
   _claudeTransport?: "cli" | "mcp";
   renderClaudeSkill?: (transport: "cli" | "mcp") => string;
 }

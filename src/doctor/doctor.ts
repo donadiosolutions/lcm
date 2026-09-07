@@ -1,17 +1,16 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, lstatSync, readdirSync } from "node:fs";
+import { renderBackendDiagnostics } from "../storage/diagnostic-renderer.js";
+import { existsSync, readFileSync, lstatSync } from "node:fs";
 import { homedir, platform } from "node:os";
-import { join, dirname, resolve } from "node:path";
-import { spawnSync, spawn } from "node:child_process";
+import { join, isAbsolute } from "node:path";
+import { spawnSync } from "node:child_process";
 import type { CheckResult, DoctorDeps } from "./types.js";
+import { collectStats, StatsUnavailableError } from "../stats.js";
+import { backendDiagnosticFailure, type BackendDiagnosticSnapshot } from "../storage/diagnostics.js";
 import {
   hasCanonicalClaudeMcpEntry,
   hasManagedClaudeSettings,
-  mergeClaudeMcpEntry,
   mergeClaudeSettings,
   REQUIRED_HOOKS,
-  ensureLcmMd,
-  installClaudeSkill,
-  removeClaudeLegacyAssets,
   resolveClaudeTransport,
 } from "../../installer/install.js";
 import { renderGuidance } from "../connectors/template-service.js";
@@ -21,7 +20,6 @@ import { collectEventStats, collectDetailedEventStats } from "../db/events-stats
 import { validateRegex } from "../store/regex-safety.js";
 import {
   configPath,
-  daemonPidPath,
   daemonTokenPath,
   lcmHomeDir,
   projectsDir,
@@ -31,18 +29,24 @@ import {
   normalizeProjectIdentityPath,
   normalizeProjectPath,
   projectMapPath,
-  readProjectMapSnapshot,
-  validateProjectMap,
-  type ProjectMapValidation,
+  type ProjectMap,
 } from "../project-map.js";
 import { packageExecutable, packageRootFor } from "../runtime-root.js";
-import { sanitizeTerminalText } from "../terminal-sanitize.js";
+import { readBoundedRegularFile, OWNER_ONLY_FILE_MODES } from "../security-files.js";
+import { normalizeUuidV7 } from "../machine-identity.js";
 import { managedDaemonPath } from "../daemon/managed-path.js";
+import { daemonEntrypointMatches } from "../daemon/lifecycle-scope.js";
+import { mapDaemonRefusalToRemediation } from "../daemon/remediation.js";
+import { RUNTIME_DIGEST } from "../daemon/version.js";
 import {
   ConfigValidationError,
   DEFAULT_DAEMON_PORT,
+  daemonConfigSnapshotWitnessEqual,
   parseDaemonConfig,
+  readDaemonConfigRawSnapshot,
   resolveDaemonConfigEnv,
+  type DaemonConfig,
+  type DaemonConfigRawSnapshot,
   type LlmRetryPolicy,
   type ResolvedStorageConfig,
 } from "../daemon/config.js";
@@ -50,22 +54,12 @@ import {
   isStagedPostgreSqlHealth,
   type StagedPostgreSqlHealthResponse,
 } from "../daemon/staged-postgresql.js";
-import { listWorktreeReconciliationJournals } from "../worktree-reconciliation.js";
 import {
-  clearDaemonNotice,
-  sanitizeDaemonRefusalReason,
-} from "../hooks/daemon-notice.js";
-import {
-  isDaemonRefusalReason,
-  mapDaemonRefusalToRemediation,
-  type DaemonRefusalReason,
-} from "../daemon/remediation.js";
-import {
-  assertBackendPublicationConfigAccess,
-  withBackendPublicationConfigLock,
+  assertBackendPublicationConfigReadAccess,
   BackendPublicationJournalError,
+  withBackendPublicationReadRoot,
 } from "../storage/backend-publication.js";
-import { readBoundedRegularFile } from "../security-files.js";
+
 
 const COLORS = {
   green: "\x1b[0;32m",
@@ -77,14 +71,19 @@ const COLORS = {
   nc: "\x1b[0m",
 };
 
+async function collectBackendSnapshot(homeDir: string): Promise<BackendDiagnosticSnapshot> {
+  try {
+    return (await collectStats({ homeDir })).backendDiagnostics;
+  } catch (error) {
+    return error instanceof StatsUnavailableError ? error.diagnostics : backendDiagnosticFailure(error);
+  }
+}
+
 function defaultDeps(): DoctorDeps {
   return {
+    collectBackendSnapshot,
     existsSync,
     readFileSync: (p, enc) => readFileSync(p, enc as BufferEncoding),
-    writeFileSync,
-    mkdirSync: (p, o) => mkdirSync(p, o),
-    lstatSync,
-    readdirSync,
     spawnSync: (cmd, args, opts) => {
       const r = spawnSync(cmd, args, { encoding: "utf-8", ...opts });
       return { status: r.status, stdout: r.stdout as string, stderr: r.stderr as string };
@@ -92,10 +91,6 @@ function defaultDeps(): DoctorDeps {
     fetch: globalThis.fetch,
     homedir: homedir(),
     platform: platform(),
-    _readBoundedConfig: (path, maxBytes) => readBoundedRegularFile(path, {
-      allowedRoot: dirname(path),
-      maxBytes,
-    }),
   };
 }
 
@@ -104,6 +99,7 @@ interface DoctorConfig {
   storageBackend: "sqlite" | "postgresql" | "unavailable";
   storage?: ResolvedStorageConfig;
   summarizer: string;
+  globalUserPatternCount?: number;
   apiMode?: string;
   reasoningEffort?: string;
   fastMode?: boolean;
@@ -115,7 +111,6 @@ interface DoctorConfig {
 
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
 const DAEMON_HEALTH_DEADLINE_MS = 2000;
-const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 
 function publicationAdmissionMessage(
   reason: BackendPublicationJournalError["reason"],
@@ -157,45 +152,17 @@ type DaemonStorageReadiness = "ready" | "unavailable" | "unverified";
 
 type DoctorDaemonHealth = StagedPostgreSqlHealthResponse & {
   readonly status?: string;
+  /** Authenticated health only: the daemon's resolved runtime entrypoint. */
+  readonly entrypoint?: string;
+  /** Authenticated health only: the packaged runtime digest. */
+  readonly runtimeDigest?: string;
 };
-
-type LifecycleResultWithRefusal = Readonly<{
-  refusalReason?: unknown;
-  warning?: unknown;
-}>;
-
-/**
- * Resolve one canonical state root for remediation marker operations.  The
- * marker is only a hint, so a missing root remains a safe, lexical fallback;
- * no lifecycle decision depends on this helper succeeding.
- */
-function daemonRemediationScope(homeDir: string): Readonly<{ scope: string; stateRoot: string }> {
-  const root = lcmHomeDir(homeDir);
-  try {
-    const canonical = realpathSync(root);
-    return { scope: canonical, stateRoot: canonical };
-  } catch {
-    const lexical = resolve(root);
-    return { scope: lexical, stateRoot: lexical };
-  }
-}
-
-function refusalReasonFrom(
-  value: unknown,
-  fallback: DaemonRefusalReason = "ambiguous",
-): DaemonRefusalReason {
-  const candidate = (value as LifecycleResultWithRefusal | null | undefined)?.refusalReason;
-  return isDaemonRefusalReason(candidate) ? candidate : fallback;
-}
-
-function remediationGuidance(reason: DaemonRefusalReason): string {
-  return mapDaemonRefusalToRemediation(sanitizeDaemonRefusalReason(reason)).message;
-}
 
 async function readRecognizedDaemonHealth(
   fetchFn: typeof globalThis.fetch,
   port: number,
-  token?: string | null,
+  token: string | null,
+  timeoutMs = DAEMON_HEALTH_DEADLINE_MS,
 ): Promise<DoctorDaemonHealth | null> {
   if (token === null) return null;
   const controller = new AbortController();
@@ -204,13 +171,13 @@ async function readRecognizedDaemonHealth(
     timeout = setTimeout(() => {
       controller.abort();
       reject(new Error("Daemon health check timed out"));
-    }, DAEMON_HEALTH_DEADLINE_MS);
+    }, timeoutMs);
   });
   try {
     return await Promise.race([
       (async () => {
         const res = await fetchFn(`http://127.0.0.1:${port}/health`, {
-          ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+          headers: { Authorization: `Bearer ${token}` },
           signal: controller.signal,
         });
         const health = await res.json() as DoctorDaemonHealth;
@@ -243,6 +210,56 @@ async function readDoctorAuthenticatedHealth(
     port,
     readDoctorDaemonToken(deps),
   );
+}
+
+type ExpectedDaemonIdentity = Readonly<{
+  pid: number;
+  version: string;
+  storageBackend: "sqlite" | "postgresql";
+  entrypoint: string;
+  runtimeDigest: string;
+}>;
+
+function daemonHealthMatchesIdentity(
+  health: DoctorDaemonHealth | null,
+  identity: ExpectedDaemonIdentity,
+  platform: NodeJS.Platform,
+): boolean {
+  return health !== null
+    && health.pid === identity.pid
+    && health.version === identity.version
+    && (health.storageBackend ?? "sqlite") === identity.storageBackend
+    && daemonEntrypointMatches(health.entrypoint, identity.entrypoint, platform)
+    && health.runtimeDigest === identity.runtimeDigest;
+}
+
+/**
+ * Build the identity doctor will require from token-authenticated health
+ * before trusting storage readiness. The PID comes from authenticated health;
+ * every remaining field is the identity this installation expects. Peer
+ * metadata cannot supply a missing local version or runtime digest.
+ */
+function expectedDaemonIdentity(
+  initialHealthPid: number | undefined,
+  config: DoctorConfig,
+  expectedVersion: string | undefined,
+  expectedEntrypoint: string,
+  expectedRuntimeDigest: string | undefined,
+): ExpectedDaemonIdentity | undefined {
+  if (
+    initialHealthPid === undefined
+    || expectedVersion === undefined
+    || expectedVersion.trim() === ""
+    || expectedRuntimeDigest === undefined
+    || (config.storageBackend !== "sqlite" && config.storageBackend !== "postgresql")
+  ) return undefined;
+  return {
+    pid: initialHealthPid,
+    version: expectedVersion,
+    storageBackend: config.storageBackend,
+    entrypoint: expectedEntrypoint,
+    runtimeDigest: expectedRuntimeDigest,
+  };
 }
 
 function storageReadinessFromHealth(
@@ -291,6 +308,30 @@ function recoverConfiguredPort(content: string): number {
   }
 }
 
+/**
+ * Every locked publication consumer opens the LCM root with O_NOFOLLOW, so a
+ * symlinked or non-directory root is never admitted. Mirror that rule for the
+ * lock-free doctor read so an unsafe root blocks admission before any repair.
+ * The inspection is a real filesystem lstat: injected file readers are byte
+ * sources only and cannot vouch for the root's shape.
+ */
+function assertLcmRootShape(homeDir: string, inspect: typeof lstatSync): void {
+  const root = join(homeDir, ".lcm");
+  let stat;
+  try {
+    stat = inspect(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw new BackendPublicationJournalError(
+      "unsafe-storage",
+      `LCM root cannot be inspected: ${(error as Error).message}`,
+    );
+  }
+  if (!stat.isDirectory()) {
+    throw new BackendPublicationJournalError("unsafe-storage", "LCM root is not a directory");
+  }
+}
+
 function backendCandidate(content: string): "sqlite" | "postgresql" {
   try {
     const parsed = JSON.parse(content) as { storage?: { backend?: unknown } };
@@ -300,201 +341,198 @@ function backendCandidate(content: string): "sqlite" | "postgresql" {
   }
 }
 
-function authenticateConfigPublication(
-  configPathValue: string,
-  deps: DoctorDeps,
-  backend: "sqlite" | "postgresql",
-  observedContent: string | null,
-  lockToken: object,
-): BackendPublicationJournalError | undefined {
-  try {
-    if (deps._assertBackendPublication !== undefined) {
-      deps._assertBackendPublication(deps.homedir, backend);
-    } else {
-      assertBackendPublicationConfigAccess(
-        configPathValue,
-        backend,
-        observedContent,
-        undefined,
-        lockToken,
-      );
-    }
-    return undefined;
-  } catch (error) {
-    if (!(error instanceof BackendPublicationJournalError)) throw error;
-    return error;
-  }
+function doctorConfigFromDaemonConfig(config: DaemonConfig): DoctorConfig {
+  return {
+    port: config.daemon.port,
+    storageBackend: config.storage.backend,
+    storage: config.storage,
+    summarizer: config.llm.provider,
+    globalUserPatternCount: config.security.sensitivePatterns.length,
+    apiMode: config.llm.apiMode,
+    reasoningEffort: config.llm.reasoningEffort,
+    fastMode: config.llm.fastMode,
+    requestTimeoutMs: config.llm.provider === "openai" ? config.llm.requestTimeoutMs : undefined,
+    retry: config.llm.provider === "openai" ? config.llm.retry : undefined,
+    publicationError: undefined,
+  };
 }
 
+/**
+ * Read a valid daemon configuration without taking the publication mutation
+ * lock. Doctor only needs a stable, authenticated snapshot for its admission
+ * decision; repairs and other writes retain their own exclusive locks. Two
+ * descriptor-bound snapshots and two journal admissions must agree, otherwise
+ * the read is refused as unexpected state rather than trusted.
+ */
 function loadConfig(deps: DoctorDeps): DoctorConfig {
   const resolvedConfigPath = configPath(deps.homedir);
-  try {
-    return withBackendPublicationConfigLock(resolvedConfigPath, (lockToken) => {
-      let content: string | undefined;
-      let publicationError: BackendPublicationJournalError | undefined;
-      try {
-        if (!deps.existsSync(resolvedConfigPath)) {
-          publicationError = authenticateConfigPublication(
-            resolvedConfigPath,
-            deps,
-            "sqlite",
-            null,
-            lockToken,
-          );
-          return {
-            port: DEFAULT_DAEMON_PORT,
-            storageBackend: "sqlite",
-            storage: { backend: "sqlite" },
-            summarizer: "disabled",
-            publicationError,
-          };
-        }
-        content = deps._readBoundedConfig!(resolvedConfigPath, MAX_CONFIG_BYTES);
-        const config = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
-        publicationError = authenticateConfigPublication(
-          resolvedConfigPath,
-          deps,
-          config.storage.backend,
-          content,
-          lockToken,
+  const readSnapshot = deps._readDaemonConfigRawSnapshot ?? readDaemonConfigRawSnapshot;
+  const assertReadAccess = deps._assertPublicationReadAccess ?? assertBackendPublicationConfigReadAccess;
+  return withBackendPublicationReadRoot(deps.homedir, (assertReadRoot) => {
+    const readVerifiedSnapshot = (): DaemonConfigRawSnapshot => {
+      assertReadRoot();
+      const snapshot = readSnapshot(resolvedConfigPath);
+      assertReadRoot();
+      return snapshot;
+    };
+    const assertVerifiedReadAccess = (
+      backend: "sqlite" | "postgresql",
+      snapshot: DaemonConfigRawSnapshot,
+    ): Readonly<{ journalChecksumSha256: string | null }> => {
+      assertReadRoot();
+      const admission = assertReadAccess(resolvedConfigPath, backend, snapshot.witness);
+      assertReadRoot();
+      return admission;
+    };
+    const runInterleavingSeam = (): void => {
+      assertReadRoot();
+      deps._betweenConfigSnapshotsForTesting?.();
+      assertReadRoot();
+    };
+    let first: DaemonConfigRawSnapshot | undefined;
+    let parsed: DaemonConfig | undefined;
+    try {
+      assertLcmRootShape(deps.homedir, deps._lstatLcmRootForTesting ?? lstatSync);
+      first = readVerifiedSnapshot();
+      parsed = parseDaemonConfig(first.content, undefined, resolveDaemonConfigEnv(process.env));
+      const firstAdmission = assertVerifiedReadAccess(parsed.storage.backend, first);
+      runInterleavingSeam();
+      const second = readVerifiedSnapshot();
+      if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
+        throw new BackendPublicationJournalError(
+          "unexpected-state",
+          "doctor config changed during lock-free read admission",
         );
+      }
+      const secondAdmission = assertVerifiedReadAccess(parsed.storage.backend, second);
+      if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
+        throw new BackendPublicationJournalError(
+          "unexpected-state",
+          "doctor backend publication changed during lock-free read admission",
+        );
+      }
+      if (first.witness.presence === "absent") {
+        // No configuration yet: the daemon would run on defaults, but doctor
+        // reports the summarizer as disabled until `lcm install` writes one.
         return {
-          port: config.daemon.port,
-          storageBackend: config.storage.backend,
-          storage: config.storage,
-          summarizer: config.llm.provider,
-          apiMode: config.llm.apiMode,
-          reasoningEffort: config.llm.reasoningEffort,
-          fastMode: config.llm.fastMode,
-          requestTimeoutMs: config.llm.provider === "openai" ? config.llm.requestTimeoutMs : undefined,
-          retry: config.llm.provider === "openai" ? config.llm.retry : undefined,
-          publicationError,
+          port: DEFAULT_DAEMON_PORT,
+          storageBackend: "sqlite",
+          storage: { backend: "sqlite" },
+          summarizer: "disabled",
+          publicationError: undefined,
         };
-      } catch (error) {
-        const validationError = error instanceof ConfigValidationError
-          ? error
-          : new ConfigValidationError("$", error instanceof Error ? error.message : String(error));
-        publicationError = content === undefined
-          ? new BackendPublicationJournalError(
-              "unsafe-storage",
-              "backend publication admission is blocked because config bytes could not be observed safely",
-            )
-          : authenticateConfigPublication(
-              resolvedConfigPath,
-              deps,
-              backendCandidate(content),
-              content,
-              lockToken,
-            );
+      }
+      return doctorConfigFromDaemonConfig(parsed);
+    } catch (error) {
+      if (error instanceof BackendPublicationJournalError) {
         return {
-          port: typeof content === "string" ? recoverConfiguredPort(content) : DEFAULT_DAEMON_PORT,
+          port: parsed?.daemon.port ?? DEFAULT_DAEMON_PORT,
+          storageBackend: "unavailable",
+          summarizer: "disabled",
+          publicationError: error,
+        };
+      }
+      const validationError = error instanceof ConfigValidationError
+        ? error
+        : new ConfigValidationError(
+          "$",
+          error instanceof Error ? error.message : String(error),
+        );
+      if (first !== undefined) {
+        // The bytes were observed safely; only validation failed. Doctor still
+        // authenticates publication evidence against the candidate backend so a
+        // blocked publication is reported even when the config is invalid, and
+        // still diagnoses the daemon on a recoverable port.
+        let publicationError: BackendPublicationJournalError | undefined;
+        try {
+          const candidateBackend = backendCandidate(first.content);
+          const firstAdmission = assertVerifiedReadAccess(candidateBackend, first);
+          runInterleavingSeam();
+          const second = readVerifiedSnapshot();
+          if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
+            throw new BackendPublicationJournalError(
+              "unexpected-state",
+              "doctor config changed during lock-free read admission",
+            );
+          }
+          const secondAdmission = assertVerifiedReadAccess(candidateBackend, second);
+          if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
+            throw new BackendPublicationJournalError(
+              "unexpected-state",
+              "doctor backend publication changed during lock-free read admission",
+            );
+          }
+        } catch (admissionError) {
+          if (!(admissionError instanceof BackendPublicationJournalError)) throw admissionError;
+          publicationError = admissionError;
+        }
+        return {
+          port: recoverConfiguredPort(first.content),
           storageBackend: "unavailable",
           summarizer: "disabled",
           validationError,
           publicationError,
         };
       }
-    });
-  } catch (error) {
-    if (!(error instanceof BackendPublicationJournalError)) throw error;
-    return {
-      port: DEFAULT_DAEMON_PORT,
-      storageBackend: "unavailable",
-      summarizer: "disabled",
-      publicationError: error,
-    };
-  }
-}
-
-function checkProjectMap(results: CheckResult[], deps: DoctorDeps): void {
-  let validation: ProjectMapValidation;
-  try {
-    validation = validateProjectMap({ homeDir: deps.homedir, fix: true });
-  } catch (err) {
-    results.push({
-      name: "project-map",
-      category: "Project Map",
-      status: "fail",
-      message: `${projectMapPath(deps.homedir)}: ${err instanceof Error ? err.message : String(err)}`,
-    });
-    return;
-  }
-
-  if (!validation.ok) {
-    results.push({
-      name: "project-map",
-      category: "Project Map",
-      status: "fail",
-      message: `${validation.path}: ${validation.errors.join("; ")}`,
-    });
-    return;
-  }
-
-  if (validation.fixApplied) {
-    const detail = validation.warnings.length > 0
-      ? validation.warnings.join("; ")
-      : "formatted map.json";
-    const backup = validation.backupPath ? `; backup: ${validation.backupPath}` : "";
-    results.push({
-      name: "project-map",
-      category: "Project Map",
-      status: "warn",
-      message: `${detail}${backup}`,
-      fixApplied: true,
-    });
-    return;
-  }
-
-  const count = validation.map ? Object.keys(validation.map).length : 0;
-  const mapExists = existsSync(validation.path);
-  results.push({
-    name: "project-map",
-    category: "Project Map",
-    status: "pass",
-    message: !mapExists
-      ? "map.json not created yet"
-      : `${count} mapped project${count === 1 ? "" : "s"}`,
+      return {
+        port: DEFAULT_DAEMON_PORT,
+        storageBackend: "unavailable",
+        summarizer: "disabled",
+        validationError,
+        publicationError: new BackendPublicationJournalError(
+          "unsafe-storage",
+          "backend publication admission is blocked because config bytes could not be observed safely",
+        ),
+      };
+    }
   });
 }
 
-function checkWorktreeReconciliations(results: CheckResult[], deps: DoctorDeps): void {
-  try {
-    const journals = listWorktreeReconciliationJournals(deps.homedir);
-    const blocked = journals.filter((journal) => journal.phase === "blocked");
-    const partial = journals.filter((journal) =>
-      journal.phase !== "blocked" && journal.phase !== "completed");
-    const completed = journals.filter((journal) => journal.phase === "completed");
-    if (blocked.length > 0) {
-      results.push({
-        name: "worktree-reconciliation",
-        category: "Project Map",
-        status: "fail",
-        message: `${blocked.length} blocked; run lcm project reconcile-worktrees to retry`,
+/** Read a bounded private map without consumer locks, repair, or metadata backfill. */
+function readDoctorProjectMap(homeDir: string): ProjectMap | null {
+  return withBackendPublicationReadRoot(homeDir, assertRoot => {
+    assertRoot();
+    let content: string;
+    try {
+      content = readBoundedRegularFile(projectMapPath(homeDir), {
+        allowedRoot: lcmHomeDir(homeDir), maxBytes: 4 * 1024 * 1024, allowedModes: OWNER_ONLY_FILE_MODES,
       });
-    } else if (partial.length > 0) {
-      results.push({
-        name: "worktree-reconciliation",
-        category: "Project Map",
-        status: "warn",
-        message: `${partial.length} partial; run lcm project reconcile-worktrees to resume`,
-      });
-    } else {
-      results.push({
-        name: "worktree-reconciliation",
-        category: "Project Map",
-        status: "pass",
-        message: completed.length > 0
-          ? `${completed.length} completed reconciliation${completed.length === 1 ? "" : "s"}`
-          : "no pending worktree reconciliations",
-      });
+    } catch (error) {
+      assertRoot();
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
     }
-  } catch (error) {
-    results.push({
-      name: "worktree-reconciliation",
-      category: "Project Map",
-      status: "fail",
-      message: String(error),
-    });
+    assertRoot();
+    const parsed: unknown = JSON.parse(content);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Invalid project map");
+    const map: ProjectMap = {};
+    const owners = new Map<string, string>();
+    for (const [hash, value] of Object.entries(parsed)) {
+      if (!/^[a-f0-9]{64}$/u.test(hash) || !value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid project map");
+      const entry = value as Record<string, unknown>;
+      if (typeof entry.canonical !== "string" || !isAbsolute(entry.canonical)
+        || !Array.isArray(entry.aliases) || !entry.aliases.every(alias => typeof alias === "string" && isAbsolute(alias))
+        || (entry.remoteProjectId !== undefined && (typeof entry.remoteProjectId !== "string" || normalizeUuidV7(entry.remoteProjectId) === null))) throw new Error("Invalid project map");
+      for (const path of [entry.canonical, ...entry.aliases] as string[]) {
+        const normalized = normalizeProjectPath(path);
+        if (owners.has(normalized) && owners.get(normalized) !== hash) throw new Error("Ambiguous project map");
+        owners.set(normalized, hash);
+      }
+      map[hash] = { canonical: entry.canonical, aliases: entry.aliases as string[] };
+    }
+    return map;
+  });
+}
+
+function checkProjectMap(results: CheckResult[], deps: DoctorDeps): void {
+  try {
+    const map = readDoctorProjectMap(deps.homedir);
+    const count = Object.keys(map ?? {}).length;
+    results.push({ name: "project-map", category: "Project Map", status: "pass",
+      message: map === null ? "map.json not created yet" : `${count} mapped project${count === 1 ? "" : "s"}; static validation only` });
+  } catch {
+    results.push({ name: "project-map", category: "Project Map", status: "fail",
+      message: "Project map is invalid, ambiguous, or unreadable. Run: lcm project list" });
   }
 }
 
@@ -509,7 +547,7 @@ function diagnosticProjectPatternsPath(cwd: string, homeDir: string): string {
   }
   let hash = hashProjectPath(canonical);
   try {
-    const matches = Object.entries(readProjectMapSnapshot(homeDir))
+    const matches = Object.entries(readDoctorProjectMap(homeDir) ?? {})
       .filter(([, entry]) => (
         normalizeProjectPath(entry.canonical) === canonical
         || [entry.canonical, ...entry.aliases]
@@ -572,163 +610,8 @@ function addCodexProcessChecks(results: CheckResult[], deps: DoctorDeps, daemonP
 }
 
 
-function testMcpHandshake(): Promise<CheckResult> {
-  return new Promise((resolve) => {
-    const initMsg = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "doctor", version: "0.1" } } });
-    const listMsg = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
-
-    // Resolve the binary relative to this file so it works outside Claude Code's PATH
-    const binPath = packagedRuntimePath();
-    const child = spawn(process.execPath, [binPath, "mcp"], { stdio: ["pipe", "pipe", "ignore"] });
-    let stdout = "";
-    let finished = false;
-    let stopRequested = false;
-    let termination: Promise<void> | undefined;
-    let recordChildClose!: () => void;
-    const childClosed = new Promise<void>((resolveChildClose) => {
-      recordChildClose = resolveChildClose;
-    });
-    const timers = new Set<ReturnType<typeof setTimeout>>();
-
-    const resultFromOutput = (): CheckResult => {
-      for (const line of stdout.split(/\r?\n/)) {
-        try {
-          const parsed = JSON.parse(line) as { id?: unknown; result?: { tools?: unknown } };
-          if (parsed.id !== 2 || !Array.isArray(parsed.result?.tools)) continue;
-          const count = parsed.result.tools.length;
-          return { name: "mcp-handshake-lcm", category: "MCP Servers", status: count === 7 ? "pass" : "warn", message: `lcm: ${count}/7 tools` };
-        } catch {}
-      }
-      return { name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "lcm: 0/7 tools" };
-    };
-
-    const finish = (result: CheckResult): void => {
-      if (finished) return;
-      finished = true;
-      for (const timer of timers) clearTimeout(timer);
-      timers.clear();
-      resolve(result);
-    };
-
-    const childIsLive = (): boolean => child.exitCode === null && child.signalCode === null;
-    const signalChild = (signal: NodeJS.Signals): boolean => {
-      if (!childIsLive()) return true;
-      try { return child.kill(signal); } catch { return false; }
-    };
-    const waitForClose = async (timeoutMs: number): Promise<void> => {
-      let resolveTimeout!: () => void;
-      const timeout = new Promise<void>((resolve) => {
-        resolveTimeout = resolve;
-      });
-      const timer = setTimeout(resolveTimeout, timeoutMs);
-      await Promise.race([
-        childClosed,
-        timeout,
-      ]);
-      clearTimeout(timer);
-    };
-    const abandonChild = (): void => {
-      try { child.stdin.destroy(); } catch {}
-      try { child.stdout.destroy(); } catch {}
-      try { child.unref(); } catch {}
-    };
-    const stopChild = (): Promise<void> => {
-      stopRequested = true;
-      if (!childIsLive()) return Promise.resolve();
-      termination ??= (async () => {
-        const termSent = signalChild("SIGTERM");
-        if (termSent && childIsLive()) await waitForClose(250);
-        if (childIsLive()) {
-          signalChild("SIGKILL");
-          await waitForClose(250);
-        }
-        if (childIsLive()) abandonChild();
-      })();
-      return termination;
-    };
-    const stopChildForPipeFailure = (): void => {
-      if (finished) return;
-      void stopChild();
-    };
-    const stdinIsWritable = (): boolean => !finished
-      && !stopRequested
-      && childIsLive()
-      && child.stdin.writable
-      && !child.stdin.destroyed
-      && !child.stdin.writableEnded;
-
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.stdout.on("error", stopChildForPipeFailure);
-    child.on("close", () => {
-      recordChildClose();
-      finish(resultFromOutput());
-    });
-    child.on("error", () => {
-      if (stopRequested) return;
-      finish({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "Could not spawn MCP process" });
-    });
-    child.stdin.on("error", stopChildForPipeFailure);
-    child.stdin.on("close", () => {
-      if (!child.stdin.writableEnded) stopChildForPipeFailure();
-    });
-
-    timers.add(setTimeout(() => {
-      void (async () => {
-        try {
-          await stopChild();
-        } finally {
-          finish(resultFromOutput());
-        }
-      })();
-    }, 6000));
-
-    // Send initialize, wait 300ms, then send tools/list, then close stdin after 500ms
-    if (!stdinIsWritable()) {
-      stopChildForPipeFailure();
-      return;
-    }
-    timers.add(setTimeout(() => {
-      if (!stdinIsWritable()) {
-        stopChildForPipeFailure();
-        return;
-      }
-      timers.add(setTimeout(() => {
-        if (!stdinIsWritable()) {
-          stopChildForPipeFailure();
-          return;
-        }
-        try {
-          child.stdin.end();
-        } catch {
-          stopChildForPipeFailure();
-        }
-      }, 500));
-      try {
-        child.stdin.write(listMsg + "\n");
-      } catch {
-        stopChildForPipeFailure();
-      }
-    }, 300));
-    try {
-      child.stdin.write(initMsg + "\n");
-    } catch {
-      stopChildForPipeFailure();
-    }
-  });
-}
-
 function packagedRuntimePath(): string {
   return packageExecutable(import.meta.url, 3);
-}
-
-function formatTimeAgo(date: Date): string {
-  const ms = Math.max(0, Date.now() - date.getTime());
-  if (ms === 0) return "just now";
-  const mins = Math.floor(ms / 60_000);
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
 }
 
 async function checkPassiveLearning(
@@ -738,6 +621,7 @@ async function checkPassiveLearning(
   daemonStorageReadiness: DaemonStorageReadiness,
   repairBlocked: boolean,
   publicationBlocked: boolean,
+  homeDir: string,
 ): Promise<void> {
   if (repairBlocked) {
     results.push({
@@ -750,20 +634,10 @@ async function checkPassiveLearning(
     });
     return;
   }
-  const statsOptions = { timeoutMs: 2000, maxDbs: options.eventsMaxDbs, pruneOrphanSidecars: true };
+  const statsOptions = { homeDir, timeoutMs: 2000, maxDbs: options.eventsMaxDbs, pruneOrphanSidecars: false };
   const stats = options.verbose
     ? await collectDetailedEventStats(statsOptions)
     : await collectEventStats(statsOptions);
-
-  if ((stats.prunedSidecars ?? 0) > 0) {
-    results.push({
-      name: "events-sidecar-prune",
-      category: "Passive Learning",
-      status: "pass",
-      message: `pruned ${stats.prunedSidecars} empty/stale orphan sidecar${stats.prunedSidecars === 1 ? "" : "s"}`,
-      fixApplied: true,
-    });
-  }
 
   // Capture check
   if (stats.captured === 0) {
@@ -779,21 +653,12 @@ async function checkPassiveLearning(
       status: "warn",
       message: `${stats.captured} events (${stats.unprocessed} unprocessed) — daemon is up but storage is unavailable; the queue cannot drain until storage is healthy`,
     });
-  } else if (
-    stats.unprocessed > 0
-    && daemonHealthy
-    && daemonStorageReadiness === "unverified"
-  ) {
-    results.push({
-      name: "events-capture",
-      category: "Passive Learning",
-      status: "warn",
-      message: `${stats.captured} events (${stats.unprocessed} unprocessed) — daemon is up but storage readiness could not be authenticated; restore access to the daemon token and authenticated diagnostics before the queue can be promised to drain`,
-    });
+  } else if (stats.unprocessed > 0 && !daemonHealthy) {
+    results.push({ name: "events-capture", category: "Passive Learning", status: "warn",
+      message: `${stats.captured} events (${stats.unprocessed} unprocessed) — daemon runtime identity is unverified; restore authenticated daemon health before expecting queue drain. Run: lcm daemon restart` });
   } else if (stats.unprocessed >= PASSIVE_BACKLOG_WARN_THRESHOLD) {
     const sidecarCount = stats.sidecarsWithUnprocessed ?? 0;
     const orphanCount = stats.orphanedSidecarsWithUnprocessed ?? 0;
-    if (daemonHealthy) {
       const scope = sidecarCount > 0
         ? ` across ${sidecarCount} project sidecar${sidecarCount === 1 ? "" : "s"}`
         : "";
@@ -807,12 +672,6 @@ async function checkPassiveLearning(
       } else {
         results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — daemon is up — run: lcm events promote --all` });
       }
-    } else {
-      results.push({
-        name: "events-capture", category: "Passive Learning", status: "warn",
-        message: `${stats.captured} events (${stats.unprocessed} unprocessed) — daemon may be offline — ${remediationGuidance("not-running")}`,
-      });
-    }
   } else {
     const pending = stats.unprocessed > 0
       ? `; ${stats.unprocessed} queued for automatic daemon processing`
@@ -856,602 +715,260 @@ async function checkPassiveLearning(
     }
   }
 
-  // Verbose: per-project breakdown
+  // Verbose diagnostics deliberately omit filenames, paths and raw event errors.
   if (options.verbose && "projects" in stats) {
     const detailed = stats as import("../db/events-stats.js").DetailedEventStats;
-    for (const p of detailed.projects) {
-      const safeFile = sanitizeTerminalText(p.file);
-      const safePath = sanitizeTerminalText(p.path);
-      if (p.pruned) {
-        results.push({ name: `events-project-${safeFile}`, category: "Passive Learning", status: "pass", message: `${safeFile.slice(0, 8)}… pruned: ${sanitizeTerminalText(p.pruneReason ?? "orphan sidecar")} — ${safePath}` });
-        continue;
-      }
-      if (p.scanError) {
-        results.push({ name: `events-project-${safeFile}`, category: "Passive Learning", status: "warn", message: `${safeFile.slice(0, 8)}… scan failed: ${sanitizeTerminalText(p.scanError)} — ${safePath}` });
-        continue;
-      }
-      if (p.scanSkipped) {
-        results.push({ name: `events-project-${safeFile}`, category: "Passive Learning", status: "skip", message: `${safeFile.slice(0, 8)}… scan skipped: ${sanitizeTerminalText(p.scanSkipped)} — ${safePath}` });
-        continue;
-      }
-      const ago = p.lastCapture ? formatTimeAgo(new Date(`${p.lastCapture.replace(" ", "T")}Z`)) : "never";
-      const projectLabel = p.cwd ?? (p.metadataMissing ? "metadata missing" : p.projectId);
-      results.push({ name: `events-project-${safeFile}`, category: "Passive Learning", status: "pass", message: `${safeFile.slice(0, 8)}… ${p.captured} events (${p.unprocessed} unprocessed) last: ${ago} — ${sanitizeTerminalText(projectLabel)}` });
-    }
-    if (detailed.recentErrors.length > 0) {
-      const errorLines = detailed.recentErrors.map(e =>
-        `  ${sanitizeTerminalText(e.created_at)} ${sanitizeTerminalText(e.hook)}: ${sanitizeTerminalText(e.error)}`
-      ).join("\n");
-      results.push({ name: "events-recent-errors", category: "Passive Learning", status: "warn", message: `Recent errors:\n${errorLines}` });
+    for (const [index, project] of detailed.projects.entries()) {
+      const status = project.scanError ? "warn" : project.scanSkipped ? "skip" : "pass";
+      const message = project.scanError ? "Sidecar scan failed"
+        : project.scanSkipped ? "Sidecar scan skipped by scan budget"
+        : `${project.captured} events (${project.unprocessed} unprocessed)`;
+      results.push({ name: `events-project-${index + 1}`, category: "Passive Learning", status, message });
     }
   }
 }
 
 export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: boolean | DoctorRunOptions = false): Promise<CheckResult[]> {
-  const mergedDeps = { ...defaultDeps(), ...overrides };
-  const deps = {
-    ...mergedDeps,
-    _readBoundedConfig: overrides?._readBoundedConfig
-      ?? (overrides?.readFileSync === undefined
-        ? mergedDeps._readBoundedConfig
-        : (path: string, maxBytes: number) => {
-          const content = mergedDeps.readFileSync(path, "utf-8");
-          if (Buffer.byteLength(content, "utf8") > maxBytes) {
-            throw new Error("file exceeds the configured size limit");
-          }
-          return content;
-        }),
-  };
+  const deps: DoctorDeps = { ...defaultDeps(), ...overrides };
   const options = normalizeDoctorOptions(doctorOptions);
   const results: CheckResult[] = [];
-  const config = loadConfig(deps);
-  const publicationBlocked = checkBackendPublicationAdmission(results, config);
-  const repairBlocked = publicationBlocked || config.validationError !== undefined;
-  const repairSkipMessage = publicationBlocked
-    ? "Skipped because backend publication admission is blocked"
-    : "Skipped because configuration validation failed; automatic repair is disabled";
-  const remediationScope = daemonRemediationScope(deps.homedir);
-
-  // ── Stack info ──
-  results.push({
-    name: "stack",
-    category: "Stack",
-    status: "pass",
-    message: `Storage: ${config.storageBackend}; ` + (config.validationError
-      ? `Summarizer: unavailable (${config.validationError.name}: ${config.validationError.message})`
-      : config.summarizer === "auto"
-      ? `Summarizer: auto (Claude->claude-process, Codex->codex-process); reasoning effort: ${config.reasoningEffort ?? "default"}; fast mode: ${config.fastMode ? "on" : "off"}`
-      : `Summarizer: ${config.summarizer}${config.apiMode ? `; API mode: ${config.apiMode}` : ""}${config.reasoningEffort && config.summarizer !== "claude-process" && config.summarizer !== "codex-process" ? `; reasoning effort: ${config.reasoningEffort}` : ""}` +
-        `${config.summarizer === "claude-process" || config.summarizer === "codex-process" ? `; reasoning effort: ${config.reasoningEffort ?? "default"}; fast mode: ${config.fastMode ? "on" : "off"}` : ""}` +
-        `${config.requestTimeoutMs !== undefined ? `; timeout: ${config.requestTimeoutMs}ms` : ""}` +
-        `${config.retry ? `; retry: ${config.retry.maxAttempts} attempts, ${config.retry.initialDelayMs}-${config.retry.maxDelayMs}ms x${config.retry.multiplier}` : ""}`),
-  });
-
-  // ── 1. Binary version ──
-  // dist/src/doctor/doctor.js → ../../.. → project root
-  const pkgPath = join(packageRootFor(import.meta.url, 3), "package.json");
-  let pkgVersion: string | undefined;
   try {
-    const pkg = JSON.parse(deps.readFileSync(pkgPath, "utf-8")) as { version?: unknown };
-    pkgVersion = typeof pkg.version === "string" ? pkg.version : undefined;
-    results.push({ name: "version", category: "Stack", status: pkgVersion ? "pass" : "warn", message: pkgVersion ? `v${pkgVersion}` : "Could not read version" });
-  } catch {
-    results.push({ name: "version", category: "Stack", status: "warn", message: "Could not read version" });
-  }
-
-  // ── 2. config.json ──
-  const resolvedConfigPath = configPath(deps.homedir);
-  if (deps.existsSync(resolvedConfigPath)) {
-    results.push(config.validationError
-      ? { name: "config", category: "Stack", status: "fail", message: `${resolvedConfigPath}: ${config.validationError.name}: ${config.validationError.message}` }
-      : { name: "config", category: "Stack", status: "pass", message: resolvedConfigPath });
-  } else {
-    results.push({ name: "config", category: "Stack", status: "fail", message: `Missing — run: lcm install` });
-  }
-
-  // ── Project path aliases ──
-  if (repairBlocked) {
-    results.push({ name: "project-map", category: "Project Map", status: "skip", message: repairSkipMessage });
-    results.push({ name: "worktree-reconciliation", category: "Project Map", status: "skip", message: repairSkipMessage });
-  } else {
-    checkProjectMap(results, deps);
-    checkWorktreeReconciliations(results, deps);
-  }
-
-  // ── Daemon ──
-  let daemonHealthy = false;
-  let daemonStorageReadiness: DaemonStorageReadiness = "unverified";
-  let daemonVersion: string | undefined;
-  let daemonPid: number | undefined;
-  const runtimePath = packagedRuntimePath();
-  const daemonSpawnArgs = [runtimePath, "daemon", "start", "--foreground"];
-  const clearRemediationMarker = (): void => {
-    clearDaemonNotice(remediationScope);
-  };
-  let initialHealthPid: number | undefined;
-  if (!publicationBlocked) {
-    try {
-      const h = await readRecognizedDaemonHealth(deps.fetch, config.port);
-      if (h) {
-        daemonHealthy = true;
-        daemonVersion = h.version;
-        initialHealthPid = h.pid;
-      }
-    } catch {}
-  }
-
-  if (publicationBlocked) {
+    const backendDiagnostics = await deps.collectBackendSnapshot(deps.homedir);
     results.push({
-      name: "daemon",
-      category: "Daemon",
-      status: "skip",
-      message: "Automatic daemon start, restart, and repair skipped because backend publication admission is blocked",
-      fixApplied: false,
+      name: "backend-health", category: "Storage",
+      status: backendDiagnostics.classification === "healthy" ? "pass"
+        : backendDiagnostics.classification === "degraded" ? "warn" : "fail",
+      message: renderBackendDiagnostics(backendDiagnostics),
+      backendDiagnostics,
     });
-  } else if (config.validationError || config.storageBackend === "unavailable") {
-    results.push(daemonHealthy
-      ? {
-          name: "daemon", category: "Daemon", status: "warn",
-          message: `localhost:${config.port} (up) — automatic validation and repair skipped because config is invalid`,
-          fixApplied: false,
-        }
-      : {
-          name: "daemon", category: "Daemon", status: "fail",
-          message: `localhost:${config.port} not responding — automatic start skipped because config is invalid\n     Fix: correct config.json; ${remediationGuidance("stale-config")}`,
-          fixApplied: false,
-        });
-  } else if (daemonHealthy) {
-    const pidFilePath = daemonPidPath(deps.homedir);
-    const versionMismatch = Boolean(pkgVersion && daemonVersion !== pkgVersion);
-    const daemonVersionLabel = daemonVersion ? `v${daemonVersion}` : "unknown version";
-    try {
-      const { ensureDaemon, restartDaemon } = await import("../daemon/lifecycle.js");
-      const lifecycleOptions = {
-        port: config.port,
-        pidFilePath,
-        spawnTimeoutMs: 10000,
-        expectedVersion: pkgVersion,
-        expectedStorageBackend: config.storageBackend,
-        spawnCommand: process.execPath,
-        spawnArgs: daemonSpawnArgs,
-        expectedEntrypoint: runtimePath,
-        enforceUserManagerParent: true,
-      };
-      let lifecycleResult = versionMismatch
-        ? await restartDaemon(lifecycleOptions)
-        : await ensureDaemon(lifecycleOptions);
-      const repairedStaleConfiguration = !versionMismatch
-        && !lifecycleResult.connected
-        && lifecycleResult.refusalReason === "stale-config";
-      if (repairedStaleConfiguration) {
-        lifecycleResult = await restartDaemon(lifecycleOptions);
-      }
-      if (lifecycleResult.connected) daemonPid = lifecycleResult.pid ?? initialHealthPid;
+    const config = loadConfig(deps);
+    const publicationBlocked = checkBackendPublicationAdmission(results, config);
+    const repairBlocked = publicationBlocked || config.validationError !== undefined;
+    const repairSkipMessage = publicationBlocked
+      ? "Skipped because backend publication admission is blocked"
+      : "Skipped because configuration validation failed; automatic repair is disabled";
 
-      let postRestartVersion: string | undefined;
-      let postRestartOk = false;
-      let postRestartStorageReadiness: DaemonStorageReadiness = "unverified";
-      if (lifecycleResult.connected) {
-        try {
-          const h = await readDoctorAuthenticatedHealth(deps, config.port);
-          if (h) {
-            postRestartOk = true;
-            postRestartStorageReadiness = storageReadinessFromHealth(h);
-            daemonStorageReadiness = postRestartStorageReadiness;
-            postRestartVersion = h.version;
-          }
-        } catch { /* non-fatal */ }
-      }
-
-      if (versionMismatch) {
-        const fixApplied = lifecycleResult.connected && postRestartOk && postRestartVersion === pkgVersion;
-        if (fixApplied) {
-          clearRemediationMarker();
-          const warning = lifecycleResult.warning ? `\n     Warning: ${lifecycleResult.warning}` : "";
-          results.push({
-            name: "daemon", category: "Daemon", status: "warn",
-            message: `localhost:${config.port} — restarted (${daemonVersionLabel} → v${pkgVersion})${warning}`,
-            fixApplied: true,
-          });
-          daemonHealthy = true;
-          daemonStorageReadiness = postRestartStorageReadiness;
-        } else if (lifecycleResult.connected) {
-          const runningVersionLabel = postRestartVersion ? `v${postRestartVersion}` : daemonVersionLabel;
-          results.push({
-            name: "daemon", category: "Daemon", status: "warn",
-            message: `localhost:${config.port} — version mismatch (${runningVersionLabel} running, v${pkgVersion} installed); restart did not fix mismatch\n     Fix: ${remediationGuidance(refusalReasonFrom(lifecycleResult, "not-running"))}`,
-            fixApplied: false,
-          });
-          daemonHealthy = false;
-          daemonStorageReadiness = "unverified";
-        } else {
-          results.push({
-            name: "daemon", category: "Daemon", status: "fail",
-            message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed); restart failed\n     Fix: ${remediationGuidance(refusalReasonFrom(lifecycleResult, "not-running"))}`,
-            fixApplied: false,
-          });
-          daemonHealthy = false;
-          daemonStorageReadiness = "unverified";
-        }
-      } else if (repairedStaleConfiguration && lifecycleResult.connected && postRestartOk) {
-        clearRemediationMarker();
-        const warning = lifecycleResult.warning ? `\n     Warning: ${lifecycleResult.warning}` : "";
-        results.push({
-          name: "daemon", category: "Daemon", status: "warn",
-          message: `localhost:${config.port} — stale configuration repaired; daemon restarted${warning}`,
-          fixApplied: true,
-        });
-        daemonHealthy = true;
-        daemonStorageReadiness = postRestartStorageReadiness;
-      } else if (repairedStaleConfiguration && lifecycleResult.connected) {
-        results.push({
-          name: "daemon", category: "Daemon", status: "fail",
-          message: `localhost:${config.port} — stale configuration repair restarted the daemon, but authenticated health could not be verified after restart\n     Fix: ${remediationGuidance("stale-config")}`,
-          fixApplied: false,
-        });
-        daemonHealthy = false;
-        daemonStorageReadiness = "unverified";
-      } else if (!lifecycleResult.connected) {
-        results.push({
-          name: "daemon", category: "Daemon", status: "fail",
-          message: repairedStaleConfiguration
-            ? `localhost:${config.port} — stale configuration repair/restart failed\n     Fix: ${remediationGuidance(refusalReasonFrom(lifecycleResult, "stale-config"))}`
-            : `localhost:${config.port} — running daemon could not be validated or restarted\n     Fix: ${remediationGuidance(refusalReasonFrom(lifecycleResult, "not-running"))}`,
-          fixApplied: false,
-        });
-        daemonHealthy = false;
-        daemonStorageReadiness = "unverified";
-      } else if (lifecycleResult.restartedForParent) {
-        clearRemediationMarker();
-        const warning = lifecycleResult.warning ? `\n     Warning: ${lifecycleResult.warning}` : "";
-        results.push({
-          name: "daemon", category: "Daemon", status: "warn",
-          message: `localhost:${config.port} — restarted under user systemd${warning}`,
-          fixApplied: true,
-        });
-        daemonHealthy = true;
-        daemonStorageReadiness = postRestartStorageReadiness;
-      } else if (lifecycleResult.warning) {
-        clearRemediationMarker();
-        results.push({
-          name: "daemon", category: "Daemon", status: "warn",
-          message: `localhost:${config.port} (up)\n     Warning: ${lifecycleResult.warning}`,
-          fixApplied: false,
-        });
-        daemonHealthy = true;
-      } else {
-        clearRemediationMarker();
-        results.push({
-          name: "daemon",
-          category: "Daemon",
-          status: "pass",
-          message: `localhost:${config.port} (up)`,
-        });
-        daemonHealthy = true;
-      }
-    } catch {
-      daemonHealthy = false;
-      daemonStorageReadiness = "unverified";
-      if (versionMismatch) {
-        results.push({ name: "daemon", category: "Daemon", status: "warn",
-          message: `localhost:${config.port} — version mismatch (${daemonVersionLabel} running, v${pkgVersion} installed)\n     Fix: ${remediationGuidance("not-running")}` });
-      } else {
-        results.push({ name: "daemon", category: "Daemon", status: "warn",
-          message: `localhost:${config.port} — daemon validation failed\n     Fix: ${remediationGuidance("not-running")}` });
-      }
-    }
-  } else {
-    // Auto-fix: try ensureDaemon
-    try {
-      const { ensureDaemon } = await import("../daemon/lifecycle.js");
-      const ensureResult = await ensureDaemon({
-        port: config.port,
-        pidFilePath: daemonPidPath(deps.homedir),
-        spawnTimeoutMs: 10000,
-        expectedVersion: pkgVersion,
-        expectedStorageBackend: config.storageBackend,
-        spawnCommand: process.execPath,
-        spawnArgs: daemonSpawnArgs,
-        expectedEntrypoint: runtimePath,
-        enforceUserManagerParent: true,
-      });
-      if (ensureResult.connected) {
-        clearRemediationMarker();
-        daemonPid = ensureResult.pid;
-        const warning = ensureResult.warning ? `\n     Warning: ${ensureResult.warning}` : "";
-        results.push({ name: "daemon", category: "Daemon", status: "warn", message: `localhost:${config.port} — started${warning}`, fixApplied: true });
-        daemonHealthy = true;
-        try {
-          const h = await readDoctorAuthenticatedHealth(deps, config.port);
-          if (h) daemonStorageReadiness = storageReadinessFromHealth(h);
-        } catch { /* non-fatal */ }
-      } else {
-        results.push({
-          name: "daemon", category: "Daemon", status: "fail",
-          message: `localhost:${config.port} not responding\n     Fix: ${remediationGuidance(refusalReasonFrom(ensureResult, "not-running"))}`,
-        });
-      }
-    } catch {
-      results.push({
-        name: "daemon", category: "Daemon", status: "fail",
-        message: `localhost:${config.port} not responding\n     Fix: ${remediationGuidance("not-running")}`,
-      });
-    }
-  }
-
-  // ── Settings ──
-  if (repairBlocked) {
-    for (const name of ["hooks", "mcp-lcm", "lcm-md"] as const) {
-      results.push({ name, category: "Settings", status: "skip", message: repairSkipMessage });
-    }
-  } else {
-  const settingsPath = join(deps.homedir, ".claude", "settings.json");
-  const claudeTransport = deps._claudeTransport
-    ?? resolveClaudeTransport(configPath(deps.homedir));
-  const claudeSettingsExists = deps.existsSync(settingsPath);
-  let settingsData: unknown = {};
-  let settingsError: string | undefined;
-  let claudeSettingsManaged = false;
-  if (claudeSettingsExists) {
-    try {
-      settingsData = JSON.parse(deps.readFileSync(settingsPath, "utf-8"));
-      claudeSettingsManaged = hasManagedClaudeSettings(settingsData);
-    } catch (error) {
-      settingsError = error instanceof Error ? error.message : String(error);
-    }
-  }
-
-  let currentSettings: Record<string, unknown> | undefined;
-  let lcmBinary: string | undefined;
-  let claudeSettingsCleaned = false;
-  if (!claudeSettingsExists || (!settingsError && !claudeSettingsManaged)) {
+    // ── Stack info ──
     results.push({
-      name: "hooks",
-      category: "Settings",
+      name: "stack",
+      category: "Stack",
       status: "pass",
-      message: "Claude Code integration is not installed",
+      message: `Storage: ${config.storageBackend}; ` + (config.validationError
+        ? "Summarizer: unavailable (configuration validation failed)"
+        : config.summarizer === "auto"
+        ? `Summarizer: auto (Claude->claude-process, Codex->codex-process); reasoning effort: ${config.reasoningEffort ?? "default"}; fast mode: ${config.fastMode ? "on" : "off"}`
+        : `Summarizer: ${config.summarizer}${config.apiMode ? `; API mode: ${config.apiMode}` : ""}${config.reasoningEffort && config.summarizer !== "claude-process" && config.summarizer !== "codex-process" ? `; reasoning effort: ${config.reasoningEffort}` : ""}` +
+          `${config.summarizer === "claude-process" || config.summarizer === "codex-process" ? `; reasoning effort: ${config.reasoningEffort ?? "default"}; fast mode: ${config.fastMode ? "on" : "off"}` : ""}` +
+          `${config.requestTimeoutMs !== undefined ? `; timeout: ${config.requestTimeoutMs}ms` : ""}` +
+          `${config.retry ? `; retry: ${config.retry.maxAttempts} attempts, ${config.retry.initialDelayMs}-${config.retry.maxDelayMs}ms x${config.retry.multiplier}` : ""}`),
     });
-  } else if (settingsError) {
-    results.push({
-      name: "hooks",
-      category: "Settings",
-      status: "fail",
-      message: `Could not parse ${settingsPath}: ${settingsError}\n     Fix the JSON, then run: lcm install`,
-    });
-  } else {
-    try {
-      lcmBinary = runtimePath;
-      const merged = mergeClaudeSettings(settingsData, lcmBinary, process.execPath, claudeTransport) as Record<string, unknown>;
-      const beforeHooks = (settingsData as Record<string, unknown>)?.hooks;
-      if (JSON.stringify(beforeHooks) === JSON.stringify(merged.hooks)) {
-        if (JSON.stringify(settingsData) !== JSON.stringify(merged)) {
-          deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
-          claudeSettingsCleaned = true;
-        }
-        currentSettings = merged;
-        results.push({
-          name: "hooks",
-          category: "Settings",
-          status: "pass",
-          message: REQUIRED_HOOKS.map(h => `${h.event} \u2713`).join("  "),
-        });
-      } else {
-        deps.mkdirSync(dirname(settingsPath), { recursive: true });
-        deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
-        currentSettings = merged;
-        results.push({
-          name: "hooks",
-          category: "Settings",
-          status: "warn",
-          message: "Native Claude Code hooks were missing or stale — repaired automatically",
-          fixApplied: true,
-        });
-      }
-    } catch (error) {
-      results.push({
-        name: "hooks",
-        category: "Settings",
-        status: "fail",
-        message: `Could not manage native Claude Code hooks: ${error instanceof Error ? error.message : error}\n     Fix: lcm install`,
-      });
-    }
-  }
 
-  const mcpServers = currentSettings?.mcpServers as Record<string, unknown> | undefined;
-  if (!claudeSettingsExists || (!settingsError && !claudeSettingsManaged)) {
-    results.push({ name: "mcp-lcm", category: "Settings", status: "pass", message: "Claude Code integration is not installed" });
-  } else if (settingsError) {
-    results.push({
-      name: "mcp-lcm",
-      category: "Settings",
-      status: "fail",
-      message: `Could not parse ${settingsPath}: ${settingsError}\n     Fix the JSON, then run: lcm install`,
-    });
-  } else if (claudeTransport === "cli") {
-    if (lcmBinary && hasCanonicalClaudeMcpEntry(mcpServers?.lcm, lcmBinary)) {
+    // ── 1. Binary version ──
+    // dist/src/doctor/doctor.js → ../../.. → project root
+    const pkgPath = join(packageRootFor(import.meta.url, 3), "package.json");
+    let pkgVersion: string | undefined;
+    try {
+      const pkg = JSON.parse(deps.readFileSync(pkgPath, "utf-8")) as { version?: unknown };
+      pkgVersion = typeof pkg.version === "string" && /^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?(?:\+[a-zA-Z0-9.-]+)?$/u.test(pkg.version) && pkg.version.length <= 64 ? pkg.version : undefined;
+      results.push({ name: "version", category: "Stack", status: pkgVersion ? "pass" : "warn", message: pkgVersion ? `v${pkgVersion}` : "Could not read version" });
+    } catch {
+      results.push({ name: "version", category: "Stack", status: "warn", message: "Could not read version" });
+    }
+
+    // ── 2. config.json ──
+    const resolvedConfigPath = configPath(deps.homedir);
+    if (deps.existsSync(resolvedConfigPath)) {
+      results.push(config.validationError
+        ? { name: "config", category: "Stack", status: "fail", message: "Configuration validation failed. Correct config.json, then run: lcm doctor" }
+        : { name: "config", category: "Stack", status: "pass", message: "Configuration is valid" });
+    } else {
+      results.push({ name: "config", category: "Stack", status: "fail", message: `Missing — run: lcm install` });
+    }
+
+    const runtimePath = packagedRuntimePath();
+    const expectedRuntimeDigest = deps._expectedRuntimeDigestForTesting ?? RUNTIME_DIGEST;
+    let daemonHealthy = false;
+    let daemonStorageReadiness: DaemonStorageReadiness = "unverified";
+    let daemonPid: number | undefined;
+
+    if (repairBlocked) {
+      results.push({ name: "project-map", category: "Project Map", status: "skip", message: repairSkipMessage });
+    } else {
+      checkProjectMap(results, deps);
+    }
+    results.push({ name: "worktree-reconciliation", category: "Project Map", status: "skip",
+      message: "Not probed by observation-only diagnostics. Run: lcm project reconcile-worktrees" });
+
+    // Existing-daemon observations never invoke lifecycle operations or clear notices.
+    if (repairBlocked) {
+      results.push({ name: "daemon", category: "Daemon", status: "skip", message: repairSkipMessage });
+    } else {
       try {
-        const merged = structuredClone(currentSettings) as Record<string, unknown>;
-        const servers = merged.mcpServers as Record<string, unknown>;
-        delete servers.lcm;
-        if (Object.keys(servers).length === 0) delete merged.mcpServers;
-        deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
-        results.push({ name: "mcp-lcm", category: "Settings", status: "warn", message: "Removed the owned Claude MCP entry for CLI transport", fixApplied: true });
+        const health = await readDoctorAuthenticatedHealth(deps, config.port);
+        const identity = expectedDaemonIdentity(
+          health?.pid, config, pkgVersion, runtimePath, expectedRuntimeDigest,
+        );
+        if (health !== null && identity !== undefined && Number.isSafeInteger(identity.pid) && identity.pid > 0
+          && daemonHealthMatchesIdentity(health, identity, deps.platform)) {
+          daemonHealthy = true;
+          daemonPid = health.pid;
+          daemonStorageReadiness = storageReadinessFromHealth(health);
+          results.push({ name: "daemon", category: "Daemon", status: daemonStorageReadiness === "ready" ? "pass" : "warn",
+            message: daemonStorageReadiness === "ready" ? "Authenticated daemon version and runtime identity verified"
+              : "Authenticated daemon identity verified; storage is unavailable" });
+        } else {
+          results.push({ name: "daemon", category: "Daemon", status: "fail",
+            message: "Daemon health or installed runtime identity could not be authenticated. Run: lcm daemon restart" });
+        }
       } catch {
-        results.push({ name: "mcp-lcm", category: "Settings", status: "fail", message: "Owned Claude MCP entry could not be removed — run: lcm install" });
+        results.push({ name: "daemon", category: "Daemon", status: "fail",
+          message: `Daemon health is unavailable or timed out. ${mapDaemonRefusalToRemediation("ambiguous").message}` });
+      }
+    }
+
+    // ── Settings ──
+    if (repairBlocked) {
+      for (const name of ["hooks", "mcp-lcm", "lcm-md"] as const) {
+        results.push({ name, category: "Settings", status: "skip", message: repairSkipMessage });
       }
     } else {
-      results.push({ name: "mcp-lcm", category: "Settings", status: "pass", message: "Claude CLI transport does not use MCP" });
-    }
-  } else if (lcmBinary && hasCanonicalClaudeMcpEntry(mcpServers?.lcm, lcmBinary)) {
-    results.push(claudeSettingsCleaned
-      ? { name: "mcp-lcm", category: "Settings", status: "warn", message: "Removed the legacy lossless-claude MCP registration", fixApplied: true }
-      : { name: "mcp-lcm", category: "Settings", status: "pass", message: "mcpServers.lcm uses the npm-installed runtime" });
-  } else if (currentSettings && lcmBinary) {
+    const settingsPath = join(deps.homedir, ".claude", "settings.json");
+    const claudeTransport = deps._claudeTransport ?? resolveClaudeTransport(configPath(deps.homedir));
+    let settings: Record<string, unknown> | undefined;
+    let settingsInvalid = false;
     try {
-      const merged = mergeClaudeSettings(currentSettings, lcmBinary!, process.execPath, claudeTransport);
-      if (merged.mcpServers === null || typeof merged.mcpServers !== "object" || Array.isArray(merged.mcpServers)) {
-        merged.mcpServers = {};
+      if (deps.existsSync(settingsPath)) {
+        const parsed: unknown = JSON.parse(deps.readFileSync(settingsPath, "utf8"));
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) settingsInvalid = true;
+        else settings = parsed as Record<string, unknown>;
       }
-      merged.mcpServers.lcm = mergeClaudeMcpEntry(merged.mcpServers.lcm, lcmBinary);
-      deps.mkdirSync(dirname(settingsPath), { recursive: true });
-      deps.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
-      results.push({ name: "mcp-lcm", category: "Settings", status: "warn", message: "mcpServers.lcm was missing or stale — repaired automatically", fixApplied: true });
-    } catch {
-      results.push({ name: "mcp-lcm", category: "Settings", status: "fail", message: "mcpServers.lcm could not be repaired — run: lcm install" });
+    } catch { settingsInvalid = true; }
+    if (settingsInvalid) {
+      for (const name of ["hooks", "mcp-lcm", "lcm-md"]) results.push({ name, category: "Settings", status: "fail",
+        message: "Claude settings could not be read or parsed. Fix the JSON, then run: lcm install" });
+    } else if (!settings || !hasManagedClaudeSettings(settings)) {
+      for (const name of ["hooks", "mcp-lcm", "lcm-md"]) results.push({ name, category: "Settings", status: "pass",
+        message: "Claude Code integration is not installed" });
+    } else {
+      const desired = mergeClaudeSettings(settings, runtimePath, process.execPath, claudeTransport);
+      const hooksCurrent = JSON.stringify(settings.hooks) === JSON.stringify(desired.hooks);
+      results.push({ name: "hooks", category: "Settings", status: hooksCurrent ? "pass" : "warn",
+        message: hooksCurrent ? REQUIRED_HOOKS.map(h => `${h.event} ✓`).join("  ")
+          : "Native Claude Code hooks are missing or stale. Run: lcm install" });
+      const mcpServers = settings.mcpServers as Record<string, unknown> | undefined;
+      const canonicalMcp = hasCanonicalClaudeMcpEntry(mcpServers?.lcm, runtimePath);
+      const mcpCurrent = claudeTransport === "cli" ? !canonicalMcp : canonicalMcp;
+      results.push({ name: "mcp-lcm", category: "Settings", status: mcpCurrent ? "pass" : "warn",
+        message: mcpCurrent ? (claudeTransport === "cli" ? "Claude CLI transport does not use MCP" : "mcpServers.lcm uses the npm-installed runtime")
+          : "Claude MCP registration is missing or stale. Run: lcm install" });
+      const skillPath = join(deps.homedir, ".claude", "skills", "lcm-memory", "SKILL.md");
+      try {
+        const rendered = deps.renderClaudeSkill?.(claudeTransport) ?? renderGuidance("skill", claudeTransport);
+        const current = deps.existsSync(skillPath) && deps.readFileSync(skillPath, "utf8") === rendered;
+        results.push({ name: "lcm-md", category: "Settings", status: current ? "pass" : "warn",
+          message: current ? "canonical Claude lcm-memory skill is installed" : "Canonical Claude lcm-memory skill is missing or stale. Run: lcm install" });
+      } catch {
+        results.push({ name: "lcm-md", category: "Settings", status: "fail", message: "Claude lcm-memory skill could not be read. Run: lcm install" });
+      }
     }
-  } else {
-    results.push({ name: "mcp-lcm", category: "Settings", status: "fail", message: "mcpServers.lcm could not be validated — run: lcm install" });
-  }
+    }
 
-  // ── canonical lcm-memory skill ──
-  const skillPath = join(deps.homedir, ".claude", "skills", "lcm-memory", "SKILL.md");
-  const renderedSkill = deps.renderClaudeSkill?.(claudeTransport)
-    ?? renderGuidance("skill", claudeTransport);
-  if (!claudeSettingsExists || (!settingsError && !claudeSettingsManaged)) {
-    results.push({ name: "lcm-md", category: "Settings", status: "pass", message: "Claude Code integration is not installed" });
-  } else if (settingsError) {
-    results.push({ name: "lcm-md", category: "Settings", status: "fail", message: "lcm-memory skill could not be validated because Claude settings are malformed" });
-  } else {
-    try {
-      const skillExists = deps.existsSync(skillPath);
-      const skillCurrent = skillExists && (() => {
-        try { return deps.readFileSync(skillPath, "utf-8") === renderedSkill; } catch { return false; }
-      })();
-      if (skillCurrent) {
-        results.push({ name: "lcm-md", category: "Settings", status: "pass", message: "canonical Claude lcm-memory skill is installed" });
+    // ── Summarizer (conditional) ──
+    const effectiveDaemonPath = deps.managedDaemonPath
+      ?? daemonProcessPath(deps, daemonPid)
+      ?? managedDaemonPath(process.execPath, [process.argv[1]], deps.cwd);
+    if (config.summarizer === "auto") {
+      addClaudeProcessChecks(results, deps, effectiveDaemonPath);
+      addCodexProcessChecks(results, deps, effectiveDaemonPath);
+    } else if (config.summarizer === "claude-process") {
+      addClaudeProcessChecks(results, deps, effectiveDaemonPath);
+    } else if (config.summarizer === "codex-process") {
+      addCodexProcessChecks(results, deps, effectiveDaemonPath);
+    } else if (config.summarizer === "anthropic") {
+      if (process.env.ANTHROPIC_API_KEY) {
+        results.push({ name: "anthropic-key", category: "Summarizer", status: "pass", message: "ANTHROPIC_API_KEY set" });
       } else {
-        installClaudeSkill({
-          existsSync: deps.existsSync,
-          readFileSync: deps.readFileSync,
-          writeFileSync: deps.writeFileSync,
-          mkdirSync: deps.mkdirSync,
-          renderClaudeSkill: deps.renderClaudeSkill,
-        }, claudeTransport, deps.homedir);
-        results.push({ name: "lcm-md", category: "Settings", status: "warn", message: "canonical Claude lcm-memory skill repaired", fixApplied: true });
+        results.push({ name: "anthropic-key", category: "Summarizer", status: "warn", message: "ANTHROPIC_API_KEY not set in environment" });
       }
-      const { LCM_MD_CONTENT } = await import("../daemon/orientation.js");
-      removeClaudeLegacyAssets({
-        existsSync: deps.existsSync,
-        readFileSync: deps.readFileSync,
-        writeFileSync: deps.writeFileSync,
-        mkdirSync: deps.mkdirSync,
-        lstatSync: deps.lstatSync,
-        readdirSync: deps.readdirSync,
-      }, deps.homedir, LCM_MD_CONTENT);
-    } catch (err) {
-      results.push({ name: "lcm-md", category: "Settings", status: "fail", message: `lcm-memory skill repair failed: ${err instanceof Error ? err.message : String(err)} — run: lcm install` });
     }
-  }
-  }
 
-  // ── Summarizer (conditional) ──
-  const effectiveDaemonPath = deps.managedDaemonPath
-    ?? daemonProcessPath(deps, daemonPid)
-    ?? managedDaemonPath(process.execPath, [process.argv[1]], deps.cwd);
-  if (config.summarizer === "auto") {
-    addClaudeProcessChecks(results, deps, effectiveDaemonPath);
-    addCodexProcessChecks(results, deps, effectiveDaemonPath);
-  } else if (config.summarizer === "claude-process") {
-    addClaudeProcessChecks(results, deps, effectiveDaemonPath);
-  } else if (config.summarizer === "codex-process") {
-    addCodexProcessChecks(results, deps, effectiveDaemonPath);
-  } else if (config.summarizer === "anthropic") {
-    if (process.env.ANTHROPIC_API_KEY) {
-      results.push({ name: "anthropic-key", category: "Summarizer", status: "pass", message: "ANTHROPIC_API_KEY set" });
-    } else {
-      results.push({ name: "anthropic-key", category: "Summarizer", status: "warn", message: "ANTHROPIC_API_KEY not set in environment" });
-    }
-  }
+    results.push({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "skip",
+      message: "MCP protocol not probed: doctor observes static registration only. Run: lcm connectors doctor claude" });
 
-  // ── MCP handshake ──
-  if (daemonHealthy) {
-    try {
-      const handshake = deps._testMcpHandshake ?? testMcpHandshake;
-      const mcpResult = await handshake();
-      results.push(mcpResult);
-    } catch {
-      results.push({ name: "mcp-handshake-lcm", category: "MCP Servers", status: "warn", message: "Could not test MCP handshake" });
-    }
-  }
+    // ── Security ──
 
-  // ── Security ──
-
-  // Gitleaks health check: verify generated-patterns.js exists and exports non-empty array
-  const syncDate = readGitleaksSyncDate();
-  const gitleaksCount = GITLEAKS_PATTERNS.length;
-  if (gitleaksCount === 0) {
-    results.push({
-      name: "secret-detection",
-      category: "Security",
-      status: "fail",
-      message: "No gitleaks patterns were loaded (GITLEAKS_PATTERNS is empty) — run: npx tsx scripts/update-gitleaks-patterns.ts",
-    });
-  } else {
-    const syncNote = syncDate ? ` (synced ${syncDate})` : "";
-    results.push({
-      name: "secret-detection",
-      category: "Security",
-      status: "pass",
-      message: `Secret detection\n     Built-in patterns:  ${gitleaksCount} (gitleaks${syncNote}) + ${NATIVE_PATTERNS.length} (native)\n     Manage patterns:    lcm sensitive add/remove`,
-    });
-  }
-
-  const cwd = deps.cwd ?? process.cwd();
-  const patternsFile = diagnosticProjectPatternsPath(cwd, deps.homedir);
-  const projectPatterns = await ScrubEngine.loadProjectPatterns(patternsFile);
-
-  // Load global user patterns count for informational display
-  let globalUserPatternCount = 0;
-  try {
-    const { loadDaemonConfig } = await import("../daemon/config.js");
-    const globalConfigPath = configPath(deps.homedir);
-    const config = loadDaemonConfig(globalConfigPath);
-    globalUserPatternCount = config.security?.sensitivePatterns?.length ?? 0;
-  } catch {
-    // config may not exist
-  }
-
-  // User patterns: informational only (no warning for zero patterns)
-  if (projectPatterns.length > 0) {
-    const invalidPatterns: string[] = [];
-    for (const pat of projectPatterns) {
-      try { validateRegex(pat); } catch { invalidPatterns.push(pat); }
-    }
-    if (invalidPatterns.length > 0) {
+    // Gitleaks health check: verify generated-patterns.js exists and exports non-empty array
+    const syncDate = readGitleaksSyncDate();
+    const gitleaksCount = GITLEAKS_PATTERNS.length;
+    if (gitleaksCount === 0) {
       results.push({
-        name: "user-patterns",
+        name: "secret-detection",
         category: "Security",
-        status: "warn",
-        message: `User patterns:  ${globalUserPatternCount} global, ${projectPatterns.length} project (${invalidPatterns.length} invalid regex — will be skipped)`,
+        status: "fail",
+        message: "No gitleaks patterns were loaded (GITLEAKS_PATTERNS is empty) — run pnpm run update:patterns from an LCM source checkout",
       });
+    } else {
+      const syncNote = syncDate ? ` (synced ${syncDate})` : "";
+      results.push({
+        name: "secret-detection",
+        category: "Security",
+        status: "pass",
+        message: `Secret detection\n     Built-in patterns:  ${gitleaksCount} (gitleaks${syncNote}) + ${NATIVE_PATTERNS.length} (native)\n     Manage patterns:    lcm sensitive add/remove`,
+      });
+    }
+
+    const cwd = deps.cwd ?? process.cwd();
+    const patternsFile = diagnosticProjectPatternsPath(cwd, deps.homedir);
+    const projectPatterns = await ScrubEngine.loadProjectPatterns(patternsFile);
+
+    const globalUserPatternCount = config.globalUserPatternCount ?? 0;
+
+    // User patterns: informational only (no warning for zero patterns)
+    if (projectPatterns.length > 0) {
+      const invalidPatterns: string[] = [];
+      for (const pat of projectPatterns) {
+        try { validateRegex(pat); } catch { invalidPatterns.push(pat); }
+      }
+      if (invalidPatterns.length > 0) {
+        results.push({
+          name: "user-patterns",
+          category: "Security",
+          status: "warn",
+          message: `User patterns:  ${globalUserPatternCount} global, ${projectPatterns.length} project (${invalidPatterns.length} invalid regex — will be skipped)`,
+        });
+      } else {
+        results.push({
+          name: "user-patterns",
+          category: "Security",
+          status: "pass",
+          message: `User patterns:  ${globalUserPatternCount} global, ${projectPatterns.length} project`,
+        });
+      }
     } else {
       results.push({
         name: "user-patterns",
         category: "Security",
         status: "pass",
-        message: `User patterns:  ${globalUserPatternCount} global, ${projectPatterns.length} project`,
+        message: `User patterns:  ${globalUserPatternCount} global, 0 project`,
       });
     }
-  } else {
-    results.push({
-      name: "user-patterns",
-      category: "Security",
-      status: "pass",
-      message: `User patterns:  ${globalUserPatternCount} global, 0 project`,
-    });
-  }
 
-  // ── Passive Learning ──
-  // The hooks check above always reports pass or warn, so passive-learning
-  // diagnostics are always applicable by the time this point is reached.
-  await checkPassiveLearning(
-    results,
-    options,
-    daemonHealthy,
-    daemonStorageReadiness,
-    repairBlocked,
-    publicationBlocked,
-  );
+    // ── Passive Learning ──
+    // The hooks check above always reports pass or warn, so passive-learning
+    // diagnostics are always applicable by the time this point is reached.
+    await checkPassiveLearning(
+      results,
+      options,
+      daemonHealthy,
+      daemonStorageReadiness,
+      repairBlocked,
+      publicationBlocked,
+      deps.homedir,
+    );
+  } catch {
+    results.push({ name: "doctor-observation", category: "Diagnostics", status: "fail",
+      message: "Diagnostic observation failed. Review local permissions and configuration, then run: lcm doctor" });
+  }
 
   return results;
 }
@@ -1478,8 +995,7 @@ export function printResults(results: CheckResult[]): void {
       r.status === "warn" ? `${COLORS.yellow}⚠️ ${COLORS.nc}` :
       r.status === "skip" ? `${COLORS.dim}⏭️ ${COLORS.nc}` :
                             `${COLORS.red}❌${COLORS.nc}`;
-    const suffix = r.fixApplied ? ` ${COLORS.dim}(auto-fixed)${COLORS.nc}` : "";
-    console.log(`    ${icon} ${COLORS.dim}${r.name}${COLORS.nc}  ${r.message}${suffix}`);
+    console.log(`    ${icon} ${COLORS.dim}${r.name}${COLORS.nc}  ${r.message}`);
   }
 
   const pass = results.filter(r => r.status === "pass" && r.name !== "stack").length;
@@ -1517,8 +1033,7 @@ export function formatResultsPlain(results: CheckResult[]): string {
       lines.push("|---|---|");
       for (const r of tableItems) {
         const icon = r.status === "pass" ? "✅" : r.status === "warn" ? "⚠️" : r.status === "skip" ? "⏭️" : "❌";
-        const suffix = r.fixApplied ? " (auto-fixed)" : "";
-        lines.push(`| ${r.name} | ${icon} ${r.message}${suffix} |`);
+        lines.push(`| ${r.name} | ${icon} ${r.message} |`);
       }
     }
 

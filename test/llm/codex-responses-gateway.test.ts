@@ -239,6 +239,27 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(utils.upstreamUrlFor(chatAuthorization, { prompt: "x", _upstreamUrl: "http://test/one" })).toBe("http://test/one");
     expect(utils.upstreamUrlFor(chatAuthorization, { prompt: "x", _upstreamUrls: { chatgpt: "http://test/chat" } })).toBe("http://test/chat");
     expect(utils.upstreamUrlFor(apiAuthorization, { prompt: "x", _upstreamUrls: { api: "http://test/api" } })).toBe("http://test/api");
+    expect(utils.upstreamUrlFor(chatAuthorization, { prompt: "x", upstreamResponsesUrl: "http://proxy.test/v1/responses" })).toBe("http://proxy.test/v1/responses");
+    expect(utils.upstreamUrlFor(chatAuthorization, {
+      prompt: "x",
+      upstreamResponsesUrl: "http://127.0.0.1:31002/v1/responses",
+      _upstreamUrl: "http://127.0.0.1:31001/v1/responses",
+    })).toBe("http://127.0.0.1:31001/v1/responses");
+    expect(utils.upstreamUrlFor(apiAuthorization, {
+      prompt: "x",
+      upstreamResponsesUrl: "http://127.0.0.1:31002/v1/responses",
+      _upstreamUrl: "http://127.0.0.1:31001/v1/responses",
+    })).toBe("http://127.0.0.1:31001/v1/responses");
+    expect(utils.upstreamUrlFor(chatAuthorization, {
+      prompt: "x",
+      upstreamResponsesUrl: "http://127.0.0.1:31002/v1/responses",
+      _upstreamUrls: { chatgpt: "http://127.0.0.1:31003/v1/responses" },
+    })).toBe("http://127.0.0.1:31002/v1/responses");
+    expect(utils.upstreamUrlFor(apiAuthorization, {
+      prompt: "x",
+      upstreamResponsesUrl: "http://127.0.0.1:31002/v1/responses",
+      _upstreamUrls: { api: "http://127.0.0.1:31003/v1/responses" },
+    })).toBe("http://127.0.0.1:31002/v1/responses");
     expect(utils.upstreamUrlFor(chatAuthorization, { prompt: "x" })).toBe("https://chatgpt.com/backend-api/codex/responses");
     expect(utils.upstreamUrlFor(apiAuthorization, { prompt: "x" })).toBe("https://api.openai.com/v1/responses");
     expect(utils.safeResponseHeader(null)).toBeUndefined();
@@ -735,6 +756,100 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(body.store).toBe(false);
     expect(body.stream).toBe(true);
     expect(JSON.stringify(body)).not.toMatch(/ATTACK|secret|cache|unknown|tool-\d|additional_tools|lite-hostile/);
+  });
+
+  it("routes both authorization routes to the private fixture before the configured destination", async () => {
+    let privateFixtureCalls = 0;
+    let configuredDestinationCalls = 0;
+    const privateFixture = createServer(async (req, res) => {
+      privateFixtureCalls += 1;
+      await readBody(req);
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(`${FIRST_DELTA_SSE}${COMPLETED_SSE}`);
+    });
+    const configuredDestination = createServer(async (req, res) => {
+      configuredDestinationCalls += 1;
+      await readBody(req);
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(`${SECOND_DELTA_SSE}${COMPLETED_SSE}`);
+    });
+    upstreams.push(privateFixture, configuredDestination);
+    const privateUrl = await listen(privateFixture);
+    const configuredUrl = await listen(configuredDestination);
+    const chatGateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      upstreamResponsesUrl: configuredUrl,
+      _upstreamUrl: privateUrl,
+    });
+    const apiGateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      upstreamResponsesUrl: configuredUrl,
+      _upstreamUrl: privateUrl,
+    });
+    gateways.push(chatGateway, apiGateway);
+
+    const [chatResponse, apiResponse] = await Promise.all([
+      fetch(`${chatGateway.baseUrl}/responses`, {
+        method: "POST",
+        headers: { Authorization: "Bearer test-token" },
+        body: validBody(),
+      }),
+      fetch(`${apiGateway.baseUrl}/responses`, {
+        method: "POST",
+        headers: { Authorization: "Bearer sk-test-token" },
+        body: validBody(),
+      }),
+    ]);
+    const [chatBody, apiBody] = await Promise.all([
+      chatResponse.text(),
+      apiResponse.text(),
+    ]);
+
+    expect(chatResponse.status).toBe(200);
+    expect(apiResponse.status).toBe(200);
+    expect(chatBody).toBe(`${FIRST_DELTA_SSE}${COMPLETED_SSE}`);
+    expect(apiBody).toBe(`${FIRST_DELTA_SSE}${COMPLETED_SSE}`);
+    await expect(chatGateway.waitForCompletion()).resolves.toBeUndefined();
+    await expect(apiGateway.waitForCompletion()).resolves.toBeUndefined();
+    expect(chatGateway.requestCompleted).toBe(true);
+    expect(apiGateway.requestCompleted).toBe(true);
+    expect(privateFixtureCalls).toBe(2);
+    expect(configuredDestinationCalls).toBe(0);
+  });
+
+  it.each([
+    [429, "usage"],
+    [401, "authentication"],
+    [400, undefined],
+    [403, undefined],
+    [404, undefined],
+  ] as const)("latches only the safe upstream category for HTTP %s", async (status, category) => {
+    const { url: upstreamUrl } = await listenSimpleUpstream((_req, res) => {
+      res.writeHead(status, { "content-type": "text/plain" });
+      res.end("GPT-5.3-Codex-Spark 4:27 AM Bearer upstream-secret");
+    });
+    const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
+    gateways.push(gateway);
+
+    const response = await fetchGateway(gateway);
+    const responseBody = await response.text();
+    expect(response.status).toBe(502);
+    expect(responseBody).toBe("codex responses gateway request failed\n");
+    expect(gateway.upstreamFailureCategory).toBe(category);
+    expect(responseBody).not.toContain("upstream-secret");
+    expect(responseBody).not.toContain("GPT-5.3-Codex-Spark");
+  });
+
+  it("does not classify a network-level upstream failure", async () => {
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _upstreamUrl: "http://127.0.0.1:1/v1/responses",
+    });
+    gateways.push(gateway);
+    const response = await fetchGateway(gateway);
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("codex responses gateway request failed\n");
+    expect(gateway.upstreamFailureCategory).toBeUndefined();
   });
 
   it("preserves Responses Lite dialect while replacing its hostile additional_tools input", async () => {

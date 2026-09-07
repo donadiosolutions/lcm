@@ -3,7 +3,7 @@ import { eventsDbPath, existingEventsDbPath } from "../../db/events-path.js";
 import { deduplicateAndInsert } from "../../promotion/dedup.js";
 import { sendJson, type RouteExecutionContext, type RouteHandler } from "../server.js";
 import { isMissingCwdError, validateCwd } from "../validate-cwd.js";
-import { projectDir, projectIdentity } from "../project.js";
+import { projectIdentity, projectPathsForIdentity } from "../project.js";
 import type { DaemonConfig } from "../config.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
 import { collectEventSidecars } from "../../db/event-sidecars.js";
@@ -15,9 +15,13 @@ import {
 import {
   createStorageBackendFactory,
   type ProjectStorage,
+  type StorageIdentityContext,
   type StorageBackendFactory,
 } from "../../storage/index.js";
-import type { BackendPublicationLockToken } from "../../storage/backend-publication.js";
+import {
+  BackendPublicationJournalError,
+  type BackendPublicationLockToken,
+} from "../../storage/backend-publication.js";
 import {
   closeRouteStorage,
   storageRouteFailureResponse,
@@ -317,6 +321,10 @@ export function createPromoteEventsHandler(
 ): RouteHandler {
   return async (_req, res, body, context) => {
     const input = JSON.parse(body || "{}");
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      sendJson(res, 400, { error: "invalid request body" });
+      return;
+    }
 
     if (!input.cwd) {
       sendJson(res, 400, { error: "cwd is required" });
@@ -363,6 +371,13 @@ export function createPromoteEventsHandler(
           );
       sendJson(res, 200, result);
     } catch (error) {
+      if (error instanceof BackendPublicationJournalError) {
+        sendJson(res, 503, {
+          status: "blocked",
+          error: "backend publication admission blocked",
+        });
+        return;
+      }
       // Log detailed failure but avoid exposing internal error/stack info to the client
       await safeLogError("promote-events", error, { cwd });
       const storageFailure = storageRouteFailureResponse(
@@ -490,6 +505,7 @@ export function createPromoteAllEventsHandler(
             unprocessedBefore: sidecar.unprocessed,
           });
         } catch (error) {
+          if (error instanceof BackendPublicationJournalError) throw error;
           if (storageRouteFailureResponse(config.storage.backend, error, "promote-events-all", activeFactory)) {
             throw error;
           }
@@ -512,6 +528,13 @@ export function createPromoteAllEventsHandler(
 
       sendJson(res, 200, result);
     } catch (error) {
+      if (error instanceof BackendPublicationJournalError) {
+        sendJson(res, 503, {
+          status: "blocked",
+          error: "backend publication admission blocked",
+        });
+        return;
+      }
       await safeLogError("promote-events", error, {});
       const storageFailure = storageRouteFailureResponse(
         config.storage.backend,
@@ -593,6 +616,9 @@ async function drainEventsForCwdUnlocked(
     ));
     for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
       const prepared = await preparePromotionBatch(config, edb);
+      const expectedIdentity = prepared.events.length === 0
+        ? undefined
+        : projectIdentity(cwd, config.storage, effectiveToken);
       const batchResult = await runSelectedPromotionBatch(
         config,
         cwd,
@@ -600,7 +626,7 @@ async function drainEventsForCwdUnlocked(
         factory,
         executionContext,
         prepared,
-        effectiveToken,
+        expectedIdentity,
       );
       if (batchResult.message === "no unprocessed events") {
         result.message = result.batches === 0
@@ -678,22 +704,9 @@ async function promoteEventsForCwdUnlocked(
       undefined,
       effectiveToken,
     ));
-    if (prepared.events.length === 0) {
-      const empty = await runSelectedPromotionBatch(
-        config,
-        cwd,
-        edb,
-        factory,
-        executionContext,
-        prepared,
-        effectiveToken,
-      );
-      return empty;
-    }
-    const scrubber = await ScrubEngine.forProject(
-      config.security.sensitivePatterns,
-      projectDir(cwd, effectiveToken),
-    );
+    const expectedIdentity = prepared.events.length === 0
+      ? undefined
+      : projectIdentity(cwd, config.storage, effectiveToken);
     return await runSelectedPromotionBatch(
       config,
       cwd,
@@ -701,8 +714,7 @@ async function promoteEventsForCwdUnlocked(
       factory,
       executionContext,
       prepared,
-      effectiveToken,
-      scrubber,
+      expectedIdentity,
     );
   } finally {
     await closeRouteStorage(outboxFactory, ownedFactory);
@@ -711,12 +723,9 @@ async function promoteEventsForCwdUnlocked(
 
 type PreparedPromotionBatch = Readonly<{
   events: EventRow[];
-  reinforcementCache: Map<string, PreparedPatternReinforcement>;
+  reinforcementCache: Map<string, PatternReinforcementStats>;
+  reinforcementErrors: Map<EventRow["event_id"], unknown>;
 }>;
-
-type PreparedPatternReinforcement =
-  | { kind: "value"; value: PatternReinforcementStats }
-  | { kind: "error"; error: unknown };
 
 async function preparePromotionBatch(
   config: DaemonConfig,
@@ -724,33 +733,35 @@ async function preparePromotionBatch(
 ): Promise<PreparedPromotionBatch> {
   const events = await edb.getUnprocessed();
   if (events.length === 0) {
-    return { events, reinforcementCache: new Map() };
+    return {
+      events,
+      reinforcementCache: new Map(),
+      reinforcementErrors: new Map(),
+    };
   }
 
   correlateErrors(events);
   const thresholds = config.compaction.promotionThresholds;
-  const reinforcementCache = new Map<string, PreparedPatternReinforcement>();
+  const reinforcementCache = new Map<string, PatternReinforcementStats>();
+  const reinforcementErrors = new Map<EventRow["event_id"], unknown>();
   for (const event of events) {
     if (event.priority !== 3 || !AUTO_PROMOTABLE_PATTERN_CATEGORIES.has(event.category)) continue;
     const key = `${event.type}\u0000${event.category}\u0000${event.data}`;
     if (reinforcementCache.has(key)) continue;
     try {
-      reinforcementCache.set(key, {
-        kind: "value",
-        value: await edb.getPatternReinforcement(
-          event.type,
-          event.category,
-          event.data,
-          thresholds.insightsMaxAgeDays ?? 90,
-        ),
-      });
+      reinforcementCache.set(key, await edb.getPatternReinforcement(
+        event.type,
+        event.category,
+        event.data,
+        thresholds.insightsMaxAgeDays ?? 90,
+      ));
     } catch (error) {
       // Keep the local sidecar read outside selected storage admission while
       // preserving the prior per-event best-effort behavior.
-      reinforcementCache.set(key, { kind: "error", error });
+      reinforcementErrors.set(event.event_id, error);
     }
   }
-  return { events, reinforcementCache };
+  return { events, reinforcementCache, reinforcementErrors };
 }
 
 function cancelledPromotionResult(): PromoteResult {
@@ -770,25 +781,32 @@ async function runSelectedPromotionBatch(
   factory: StorageBackendFactory,
   context: PromotionExecutionContext | undefined,
   prepared: PreparedPromotionBatch,
-  publicationLockToken: BackendPublicationLockToken | undefined,
-  scrubber?: ScrubEngine,
+  expectedIdentity?: StorageIdentityContext & { readonly localProjectId: string },
 ): Promise<PromoteResult> {
   const activeScrubber = prepared.events.length === 0
     ? undefined
-    : scrubber ?? await ScrubEngine.forProject(
+    : await ScrubEngine.forProject(
       config.security.sensitivePatterns,
-      projectDir(cwd, publicationLockToken),
+      projectPathsForIdentity({
+        id: expectedIdentity!.localProjectId,
+        canonical: expectedIdentity!.canonical,
+        ...(expectedIdentity!.remoteProjectId === undefined
+          ? {}
+          : { remoteProjectId: expectedIdentity!.remoteProjectId }),
+      }).dir,
     );
+  const storageRequest = {
+    config,
+    cwd,
+    factory,
+    context,
+    mode: "create" as const,
+    ...(expectedIdentity === undefined ? {} : { expectedIdentity }),
+  };
   let result: PromoteResult | null;
   try {
     result = await withProjectStorage(
-      {
-        config,
-        cwd,
-        factory,
-        context,
-        mode: "create",
-      },
+      storageRequest,
       async project => {
         if (prepared.events.length === 0) {
           return {
@@ -808,6 +826,7 @@ async function runSelectedPromotionBatch(
           new Map(),
           prepared.events,
           prepared.reinforcementCache,
+          prepared.reinforcementErrors,
         );
       },
     );
@@ -828,7 +847,8 @@ async function promoteEventsBatch(
   scrubber: ScrubEngine,
   scrubCache: Map<string, string>,
   events: EventRow[],
-  reinforcementCache: Map<string, PreparedPatternReinforcement>,
+  reinforcementCache: Map<string, PatternReinforcementStats>,
+  reinforcementErrors: Map<EventRow["event_id"], unknown>,
 ): Promise<PromoteResult> {
   const result: PromoteResult = { promoted: 0, skipped: 0, correlated: 0, errors: 0 };
 
@@ -841,10 +861,11 @@ async function promoteEventsBatch(
           return EMPTY_REINFORCEMENT;
         }
 
+        if (reinforcementErrors.has(event.event_id)) {
+          throw reinforcementErrors.get(event.event_id);
+        }
         const key = `${event.type}\u0000${event.category}\u0000${event.data}`;
-        const prepared = reinforcementCache.get(key)!;
-        if (prepared.kind === "error") throw prepared.error;
-        return prepared.value;
+        return reinforcementCache.get(key)!;
       };
 
       const processedIds: number[] = [];

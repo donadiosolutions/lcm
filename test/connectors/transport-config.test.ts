@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   statSync,
@@ -19,7 +20,9 @@ import {
   readConnectorTransportSnapshot,
   setConnectorTransport,
 } from "../../src/config-manager.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { withBackendPublicationConfigLockAsync } from "../../src/storage/backend-publication.js";
+import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-publication-journal.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -74,6 +77,74 @@ describe("persisted connector transport configuration", () => {
     });
   });
 
+  it("reads the public transport accessor while the publication lock is held", async () => {
+    const { configPath } = makeHome({
+      version: 1,
+      connectors: { transports: { codex: "mcp" } },
+    });
+
+    await withBackendPublicationConfigLockAsync(configPath, async () => {
+      expect(readConnectorTransport(configPath, "codex")).toBe("mcp");
+    });
+  });
+
+  it("rejects a symlinked canonical LCM root before reading connector transport", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-transport-symlink-root-"));
+    temporaryDirectories.push(home);
+    const targetRoot = join(home, "target-lcm");
+    mkdirSync(targetRoot, { mode: 0o700 });
+    writeFileSync(join(targetRoot, "config.json"), JSON.stringify({
+      version: 1,
+      connectors: { transports: { codex: "mcp" } },
+    }), { mode: 0o600 });
+    symlinkSync(targetRoot, join(home, ".lcm"));
+
+    expect(() => readConnectorTransport(join(home, ".lcm", "config.json"), "codex"))
+      .toThrow();
+  });
+
+  it("rejects canonical LCM root identity drift between connector snapshots", () => {
+    const { home, configPath } = makeHome({
+      version: 1,
+      connectors: { transports: { codex: "mcp" } },
+    });
+    const root = join(home, ".lcm");
+    const retainedRoot = join(home, "retained-lcm");
+    const replacementRoot = join(home, "replacement-lcm");
+    mkdirSync(replacementRoot, { mode: 0o700 });
+    writeFileSync(join(replacementRoot, "config.json"), readFileSync(configPath), { mode: 0o600 });
+
+    expect(() => readConnectorTransportSnapshot(configPath, "codex", {
+      _afterFirstSnapshotForTesting: () => {
+        renameSync(root, retainedRoot);
+        renameSync(replacementRoot, root);
+      },
+    })).toThrow("private directory changed during validation");
+  });
+
+  it("rejects an unsafe canonical LCM root with publication state", () => {
+    const { home, configPath } = makeHome({
+      version: 1,
+      connectors: { transports: { codex: "mcp" } },
+    });
+    mkdirSync(join(home, ".lcm", "backend-publication"), { mode: 0o700 });
+    chmodSync(join(home, ".lcm"), 0o755);
+
+    expect(() => readConnectorTransportSnapshot(configPath, "codex"))
+      .toThrow("backend publication root is not private");
+  });
+
+  it("keeps transport mutations serialized while the publication lock is held", async () => {
+    const { configPath } = makeHome({ version: 1 });
+
+    await withBackendPublicationConfigLockAsync(configPath, async () => {
+      expect(() => setConnectorTransport(configPath, "codex", "cli"))
+        .toThrow(PrivateMutationLockContentionError);
+      expect(readConnectorTransportSnapshot(configPath, "codex")).toBeUndefined();
+    });
+    expect(readConnectorTransport(configPath, "codex")).toBeUndefined();
+  });
+
   it("rejects connector config drift between lock-free snapshots", () => {
     const { configPath } = makeHome({
       version: 1,
@@ -85,6 +156,43 @@ describe("persisted connector transport configuration", () => {
         writeFileSync(configPath, JSON.stringify({ version: 1 }), { mode: 0o600 });
       },
     })).toThrow("Configuration changed during lock-free connector transport inspection");
+  });
+
+  it("rejects malformed publication evidence introduced between snapshots", () => {
+    const { home, configPath } = makeHome({
+      version: 1,
+      connectors: { transports: { codex: "mcp" } },
+    });
+    const publicationDir = join(home, ".lcm", "backend-publication");
+    mkdirSync(publicationDir, { recursive: true, mode: 0o700 });
+
+    expect(() => readConnectorTransportSnapshot(configPath, "codex", {
+      _afterFirstSnapshotForTesting: () => {
+        writeFileSync(join(publicationDir, "journal.json"), "{", { mode: 0o600 });
+      },
+    })).toThrow("backend publication evidence is incomplete");
+  });
+
+  it("rejects valid terminal publication evidence that changes between snapshots", () => {
+    const content = JSON.stringify({ version: 1, connectors: { transports: { codex: "mcp" } } });
+    const { home, configPath } = makeHome();
+    writeFileSync(configPath, content, { mode: 0o600 });
+    const firstChecksum = writeAbortedTerminalPublicationJournal(home, "terminal-publication-a", content);
+
+    // Both journals are complete, authenticated terminal evidence for the
+    // same config bytes; only their checksums differ. The config witness
+    // therefore matches on both reads and the checksum inequality is the
+    // guard that refuses the snapshot.
+    expect(readConnectorTransportSnapshot(configPath, "codex")).toBe("mcp");
+    let secondChecksum: string | undefined;
+    expect(() => readConnectorTransportSnapshot(configPath, "codex", {
+      _afterFirstSnapshotForTesting: () => {
+        secondChecksum = writeAbortedTerminalPublicationJournal(home, "terminal-publication-b", content);
+      },
+    })).toThrow("Backend publication changed during lock-free connector transport inspection.");
+    expect(secondChecksum).toBeDefined();
+    expect(secondChecksum).not.toBe(firstChecksum);
+    expect(readConnectorTransportSnapshot(configPath, "codex")).toBe("mcp");
   });
 
   it("propagates non-absence failures from the initial connector snapshot probe", () => {

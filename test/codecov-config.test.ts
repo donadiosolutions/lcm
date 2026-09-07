@@ -50,16 +50,19 @@ const expectedComponents = [
   },
   {
     component_id: "unit-configuration-security",
-    name: "Unit - Configuration and Security",
+    name: "Unit - Configuration, Security, and Filesystem Topology",
     paths: [
       "^src/config-manager\\.ts$",
       "^src/config-projection\\.ts$",
       "^src/generated-patterns\\.ts$",
+      "^src/home-parent-auth\\.ts$",
       "^src/legacy-names\\.ts$",
+      "^src/private-mutation-lock\\.ts$",
       "^src/runtime-paths\\.ts$",
       "^src/runtime-root\\.ts$",
       "^src/scrub\\.ts$",
       "^src/secret-key\\.ts$",
+      // #1032 keeps retained-parent atomic-write outcome hardening in this owner.
       "^src/security-files\\.ts$",
       "^src/sensitive\\.ts$",
       "^src/shell-quote\\.ts$",
@@ -92,8 +95,12 @@ const expectedComponents = [
       "^src/daemon/orientation\\.ts$",
       "^src/daemon/project-queue\\.ts$",
       "^src/daemon/project\\.ts$",
+      // Monotonic proxy startup polling remains daemon-core-owned.
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
+      // Error sanitization, including #893 adjacent-path, #903 prefixed
+      // nested-file, #924 embedded-quote file-authority, and #1060 adjacent
+      // nested-file scheme preservation, remains daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -124,14 +131,23 @@ const expectedComponents = [
   {
     component_id: "unit-local-persistence",
     name: "Unit - Local Persistence",
+    // #898 applies required promoted tags before the caller result maximum while retaining local-persistence ownership.
+    // #898's guarded dual-JSON eligibility keeps this search in the same owner.
+    // #989 retains event-sidecar parent authentication in this owner.
     paths: ["src/db/", "src/storage/sqlite/", "src/store/"],
   },
   {
     component_id: "unit-storage-abstractions",
     name: "Unit - Storage Abstractions",
     paths: [
+      // #906 keeps bounded publication-convergence probe expiry and error
+      // selection in this storage-abstractions owner.
       "^src/storage/backend\\.ts$",
+      // #844 and #942 keep coordinator evidence, material, and checkpoint
+      // directory-witness authentication in this owner.
       "^src/storage/backend-publication\\.ts$",
+      // #910 keeps shared publication retry deadlines monotonic in this owner.
+      "^src/storage/publication-convergence\\.ts$",
       "^src/storage/capabilities\\.ts$",
       "^src/storage/contracts\\.ts$",
       "^src/storage/errors\\.ts$",
@@ -176,6 +192,8 @@ const expectedComponents = [
     component_id: "unit-memory-retrieval",
     name: "Unit - Memory and Retrieval",
     paths: [
+      // The #971 compact cwd client contract and #973 stats database admission
+      // remain memory/retrieval-owned.
       "src/memory/",
       "^src/expansion\\.ts$",
       "^src/retrieval\\.ts$",
@@ -201,26 +219,36 @@ const expectedComponents = [
     component_id: "unit-project-worktrees",
     name: "Unit - Projects and Worktrees",
     paths: [
+      // #1070 preserves post-commit topology diagnostics in this existing
+      // reconciliation owner.
+      // #974 keeps target-parent reconciliation hardening in this
+      // existing component.
       "^src/codex-project-resolution\\.ts$",
       "^src/git-project\\.ts$",
       "^src/machine-identity\\.ts$",
       "^src/portable-knowledge\\.ts$",
-      "^src/private-mutation-lock\\.ts$",
+      // #1049 keeps project metadata owner and single-link admission in this
+      // existing component; no taxonomy, status, or policy change.
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
+      // #1044 keeps the existing owner; no taxonomy, status, or policy change.
+      // #1048 keeps target metadata leaf authentication in this owner.
+      // #1069 preserves completed reconciliation evidence after retained
+      // directory cleanup failures in this existing component.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
   {
     component_id: "unit-diagnostics",
     name: "Unit - Diagnostics",
-    paths: ["^src/diagnose\\.ts$", "src/doctor/"],
+    paths: ["^src/diagnose\\.ts$", "^src/storage/diagnostics\\.ts$", "^src/storage/diagnostic-renderer\\.ts$", "^src/storage/diagnostic-project\\.ts$", "^src/storage/postgresql/diagnostics\\.ts$", "src/doctor/"],
   },
   {
     component_id: "integration-service-managers",
     name: "Integration - Service Managers and Legacy Migration",
     paths: [
       "^src/daemon/health-observation\\.ts$",
+      // #865 convergence and #966 birth-sample budgeting remain lifecycle-owned.
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",
@@ -449,7 +477,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(205);
+    expect(productionFiles).toHaveLength(215);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -479,10 +507,10 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(205);
+    expect(ownershipCounts.size).toBe(215);
   });
 
-  test("keeps response-fence and #700/#726/#737/#742 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -490,25 +518,131 @@ describe("Codecov configuration", () => {
     }
 
     const components = validateComponents(configuredComponents(config));
+    // #792 keeps grep session filtering and #794 grep-since validation in the
+    // existing route component. #862 keeps recent limit validation, #863
+    // keeps expand depth validation in the same daemon-routes component.
+    // #930 keeps expand body-shape validation in that component as well.
+    // #969 keeps the route-family and passive notification body-shape
+    // validation in their existing route and daemon-events components.
+    // #888 keeps private final ingest and compact metadata writes route-owned.
+    // #890 keeps bounded best-effort status metadata reads route-owned.
+    // #1003 keeps preliminary metadata admission daemon-core-owned.
+    // #1050 keeps bounded preliminary metadata serialization there too.
+    // #1032 keeps the shared private-file writer's retained-parent checks and
+    // publication outcomes configuration-security-owned.
+    // #947 keeps promote metadata-parent resource handling and fail-closed
+    // topology behavior in the existing daemon-routes component.
+    // #948 keeps promote metadata parent-first admission, sampled read binding,
+    // and retained identity revalidation in the daemon-routes component.
+    // #964 keeps the path-bound root/projects/leaf metadata lifetime there too.
+    // #1062 keeps retained-parent create-if-absent filesystem semantics in
+    // configuration-security and promote collision handling in daemon-routes.
+    // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
+    // #814 fresh-root descriptor and pre-handoff content checks remain
+    // configuration-security-owned.
     const expectedOwners = [
+      // #866 export admission failures and sensitive result emission stay CLI-owned.
+      // #1081 keeps unsupported export-format admission CLI-owned.
+      // #978 keeps compact replacement runtime-digest admission CLI-owned.
+      // #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
+      ["src/private-mutation-lock.ts", "unit-configuration-security"],
+      ["src/home-parent-auth.ts", "unit-configuration-security"],
+      // #1041 preserves bootstrap directory authentication errors when
+      // descriptor cleanup also fails in this existing owner.
+      ["src/runtime-paths.ts", "unit-configuration-security"],
+      ["src/security-files.ts", "unit-configuration-security"],
+      ["src/sensitive.ts", "unit-configuration-security"],
+      // #1049 keeps project metadata owner and single-link admission here.
+      ["src/project-map.ts", "unit-project-worktrees"],
+      // #889 keeps private import metadata publication in this owner.
+      ["src/portable-knowledge.ts", "unit-project-worktrees"],
+      // #866 stats config retries and journal failures, plus #973 project
+      // database admission, retain this owner.
+      ["src/stats.ts", "unit-memory-retrieval"],
+      ["src/connectors/codex-hooks.ts", "unit-connectors"],
       ["src/connectors/installer.ts", "unit-connectors"],
+      // #881 absent-config journal admission and #882 post-health identity
+      // fencing remain installer-owned.
+      ["installer/install.ts", "unit-installation"],
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
+      ["src/daemon/project.ts", "unit-daemon-core"],
       ["src/daemon/routes/compact.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/describe.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/expand.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/ingest.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/store.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/status.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/session-complete.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/review-stale.ts", "unit-daemon-routes"],
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
+      // #833 passive-event identity admission remains route-owned.
+      ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"],
+      // #793 search-limit validation, #863 expand depth validation, and #864
+      // search candidate recall remain owned by daemon routes.
+      ["src/daemon/routes/search.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/grep.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
+      ["src/daemon/routes/recent.ts", "unit-daemon-routes"],
+      ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/daemon/version.ts", "unit-daemon-core"],
+      // #885 keeps the shared missing-Codex diagnostic and its resolver
+      // identity handling within the existing LLM component. #934 keeps
+      // caller-cancellation handling during resolver teardown in this owner.
+      ["src/llm/codex-process.ts", "unit-llm-prompts"],
+      ["src/llm/codex-config.ts", "unit-llm-prompts"],
+      ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
+      ["src/llm/process-utils.ts", "unit-llm-prompts"],
+      // #997 keeps doctor publication retry deadlines monotonic in this owner.
+      // #619 keeps observational doctor refusal guidance in this owner.
+      ["src/doctor/doctor.ts", "unit-diagnostics"],
+      // #944/#950/#966 keep typed daemon-tmp diagnostics, authenticated restart
+      // convergence, and bounded birth samples in the service-manager component.
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
+      ["src/daemon/lifecycle.ts", "integration-service-managers"],
+      ["src/daemon/supervisor.ts", "integration-service-managers"],
+      // #837 consumer-admission descriptor cleanup remains storage-owned.
+      // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
+      ["src/migration/manifest-store.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
+      ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
+      ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
+      ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
+      // #989 event-sidecar parent authentication stays local-persistence-owned.
+      ["src/db/event-sidecars.ts", "unit-local-persistence"],
+      ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"],
+      ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"],
+      // #619 retained daemon pool observations stay diagnostics-owned.
+      ["src/storage/diagnostics.ts", "unit-diagnostics"],
+      ["src/storage/diagnostic-renderer.ts", "unit-diagnostics"],
+      ["src/storage/diagnostic-project.ts", "unit-diagnostics"],
+      ["src/storage/postgresql/diagnostics.ts", "unit-diagnostics"],
+      // #992 keeps pre-initialization SQLite leaf admission and final
+      // opened-identity fencing local-persistence-owned.
+      ["src/db/connection.ts", "unit-local-persistence"],
+      ["src/db/database-parent.ts", "unit-local-persistence"],
       ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
+      // #1020 keeps message timestamp mapping in the existing local-persistence
+      // component; conversation timestamps remain on their existing mapper.
+      ["src/store/conversation-store.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],
+      // #793 search-limit schema remains owned by MCP tools.
+      ["src/mcp/tools/lcm-search.ts", "unit-mcp"],
+      ["src/mcp/tools/lcm-grep.ts", "unit-mcp"],
+      // #863 expand-depth schema remains owned by MCP tools.
+      ["src/mcp/tools/lcm-expand.ts", "unit-mcp"],
+      // #972 search cwd client typing remains memory/retrieval-owned.
+      ["src/memory/index.ts", "unit-memory-retrieval"],
+      // #793 shared search-limit contract remains retrieval-owned.
+      ["src/retrieval.ts", "unit-memory-retrieval"],
     ] as const;
 
     for (const [file, expectedOwner] of expectedOwners) {

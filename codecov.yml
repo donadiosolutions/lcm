@@ -6,24 +6,49 @@ component_management:
     - component_id: "unit-cli"
       name: "Unit - CLI"
       paths:
-        # Keep the #691 routing and #726/#742 hook entrypoints exclusively in Unit - CLI.
+        # Keep the #691 routing, #734 healthy-daemon store routing, #726/#742
+        # hook entrypoints, and #866 publication-converged CLI reads exclusively
+        # in Unit - CLI, including export admission failures and sensitive output.
+        # #1081 keeps unsupported export-format admission CLI-owned.
+        # #978 keeps compact replacement runtime-digest admission CLI-owned.
+        # #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
     - component_id: "unit-installation"
       name: "Unit - Installation"
       paths:
+        # #881 keeps absent-config journal checksum admission installer-owned;
+        # #882 keeps post-health installer identity fencing in this owner.
         - "installer/"
         - "src/installer/"
         - "^src/bootstrap\\.ts$"
     - component_id: "unit-configuration-security"
-      name: "Unit - Configuration and Security"
+      name: "Unit - Configuration, Security, and Filesystem Topology"
       paths:
         # The #691 connector-doctor fallback uses the lock-free config snapshot here.
+        # #866 keeps sensitive read contention handling in this existing owner.
+        # #824 keeps connector snapshots and process-owner authentication in
+        # the same configuration-security component.
+        # #681 keeps durable configuration writes in this existing component.
+        # #722 distinguishes initial absence from interrupted validation in
+        # the shared authenticated-directory open seam.
+        # #814 retains the fresh-root descriptor and authenticates its
+        # pre-handoff content within this configuration-security boundary.
+        # #828 authenticates project-directory topology with retained
+        # no-follow descriptors and borrowed publication parents.
+        # #1032 adds early retained-parent refusal, temp-leaf binding, and
+        # truthful post-rename outcomes to the shared private-file writer.
+        # #1041 preserves bootstrap directory authentication errors when
+        # descriptor cleanup also fails.
+        # #1062 keeps retained-parent create-if-absent publication within the
+        # existing filesystem-topology owner.
         - "^src/config-manager\\.ts$"
         - "^src/config-projection\\.ts$"
         - "^src/generated-patterns\\.ts$"
+        - "^src/home-parent-auth\\.ts$"
         - "^src/legacy-names\\.ts$"
+        - "^src/private-mutation-lock\\.ts$"
         - "^src/runtime-paths\\.ts$"
         - "^src/runtime-root\\.ts$"
         - "^src/scrub\\.ts$"
@@ -38,6 +63,8 @@ component_management:
       name: "Unit - Connectors"
       paths:
         # Codex MCP absence classification (#716) remains connector-owned.
+        # Immutable publication certificates and alias-race compensation (#713)
+        # remain within this connector component.
         - "src/connectors/"
     - component_id: "unit-hooks"
       name: "Unit - Hooks"
@@ -47,7 +74,9 @@ component_management:
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
-        # Keep the #691 pre/post read-admission response fence, the #700 buffered-response cancellation fence, and runtime identity here.
+        # Keep the #691/#700 response fences, #701 terminal factory-close retry,
+        # runtime identity, #825 bounded project metadata, #1003 owner/single-link
+        # admission, and #1050 bounded preliminary serialization here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
@@ -58,8 +87,12 @@ component_management:
         - "^src/daemon/orientation\\.ts$"
         - "^src/daemon/project-queue\\.ts$"
         - "^src/daemon/project\\.ts$"
+        # Monotonic proxy startup polling remains daemon-core-owned.
         - "^src/daemon/proxy-manager\\.ts$"
         - "^src/daemon/remediation\\.ts$"
+        # Error sanitization, including #893 adjacent-path, #903 prefixed
+        # nested-file, #924 embedded-quote file-authority, and #1060 adjacent
+        # nested-file scheme preservation, remains daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -68,26 +101,63 @@ component_management:
     - component_id: "unit-daemon-routes"
       name: "Unit - Daemon Routes"
       paths:
-        # The #700 cancellation-aware open lifecycle and compact/restore response handling remain route-owned.
+        # The #700 cancellation-aware open lifecycle and compact/restore response
+        # handling remain route-owned; #703 describe/expand compatibility errors,
+        # #705 prompt-search surfacing-log failures, #709 search and grep routes,
+        # #710 grep mode, #792 session filtering, #793 search-limit validation,
+        # #794 grep-since validation, #825 bounded atomic promotion metadata,
+        # #888 bounded atomic ingest and compact metadata timestamps,
+        # #862 recent limit validation, #863 expand depth validation, #930
+        # expand body-shape validation, #969 route body-shape validation, and #864
+        # episodic search candidate recall, and #890 bounded best-effort status
+        # metadata reads,
+        # and #833 passive-event identity admission remain route-owned.
+        # #828 promotes topology failures through the route boundary while
+        # preserving ordinary best-effort metadata persistence.
+        # #947 keeps direct metadata-parent resource exhaustion best-effort
+        # while preserving fail-closed topology handling in the route owner.
+        # #948 admits the promote metadata parent before bounded reads, binds a
+        # successful read's sampled parent, and retains failure-path identity.
+        # #964 extends that retained metadata lifetime to the path-bound LCM
+        # root, projects directory, and project leaf without changing ownership.
+        # #1062 keeps missing promote metadata no-clobber handling route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
       paths:
+        # #969 promote-events notification body-shape validation remains
+        # daemon-events-owned.
         - "^src/daemon/passive-event-processor\\.ts$"
     - component_id: "unit-mcp"
       name: "Unit - MCP"
       paths:
+        # The #709 canonical search and grep MCP tools, #710 grep mode, #793
+        # search-limit schema, #794 grep-since schema, and #863 expand-depth
+        # schema remain MCP-owned.
         - "src/mcp/"
     - component_id: "unit-llm-prompts"
       name: "Unit - LLM, Responses, and Prompts"
       paths:
-        # The #779 authenticated Responses terminal gateway remains LLM-owned.
+        # The #779 authenticated Responses terminal gateway, #780 bounded
+        # Codex failure classification, #790 endpoint resolver, and #885
+        # missing-Codex diagnostic factory remain LLM-owned. #934 keeps
+        # caller-cancellation handling during resolver teardown here.
         - "src/llm/"
         - "src/prompts/"
     - component_id: "unit-local-persistence"
       name: "Unit - Local Persistence"
       paths:
-        # The #700 SQLite signal fences and single-owner cleanup remain local-persistence-owned.
+        # The #700 SQLite signal fences, #756 SQLite factory-health
+        # closed-dominance responsibility, #935 database-parent admission,
+        # and single-owner cleanup remain local-persistence-owned.
+        # #898 applies required promoted tags before the caller result maximum
+        # while retaining local-persistence ownership.
+        # #898's guarded dual-JSON eligibility keeps this search in the same owner.
+        # #989 retains event-sidecar parent authentication in this owner.
+        # #992 keeps pre-initialization SQLite leaf admission and final
+        # opened-identity fencing local-persistence-owned.
+        # #1020 keeps UTC message timestamp mapping in conversation-store-owned
+        # local persistence paths.
         - "src/db/"
         - "src/storage/sqlite/"
         - "src/store/"
@@ -95,8 +165,21 @@ component_management:
       name: "Unit - Storage Abstractions"
       paths:
         # Keep the #691 journal witness and incomplete-evidence admission seam, plus the #700 optional abort-signal project-open contract, here.
+        # #681 retains backend-publication durable-write ownership here.
+        # #722 retains one authenticated backend-publication directory identity
+        # across journal, evidence, and terminal recovery-material reads.
+        # #844 extends the coordinator's locked evidence/material reads with
+        # one operation-scoped directory witness and a fail-closed return check.
+        # #942 binds every coordinator checkpoint read and write boundary to
+        # that retained operation-scoped directory witness.
+        # #837 retains consumer-admission descriptor cleanup in this owner.
+        # #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
+        # #906 keeps bounded publication-convergence probe expiry and error
+        # selection in this storage-abstractions owner.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
+        # #910 keeps shared publication retry deadlines monotonic in this owner.
+        - "^src/storage/publication-convergence\\.ts$"
         - "^src/storage/capabilities\\.ts$"
         - "^src/storage/contracts\\.ts$"
         - "^src/storage/errors\\.ts$"
@@ -105,11 +188,13 @@ component_management:
         - "^src/storage/identity-context\\.ts$"
         - "^src/storage/index\\.ts$"
         - "^src/storage/portable-record\\.ts$"
+        # The #763 manifest and #816 checkpoint negative-zero taxonomies remain storage-abstractions-owned.
         - "^src/storage/portable-record-stream\\.ts$"
         - "^src/storage/postgresql/project-storage\\.ts$"
     - component_id: "unit-migration-cutover"
       name: "Unit - Migration and Cutover"
       paths:
+        # #681 leaves protocol-specific manifest replacement in this component.
         - "src/migration/"
     - component_id: "unit-local-event-storage"
       name: "Unit - Local Event Storage"
@@ -131,6 +216,11 @@ component_management:
     - component_id: "unit-memory-retrieval"
       name: "Unit - Memory and Retrieval"
       paths:
+        # The #709 SearchResult compatibility bridge, #793 search-limit and
+        # retrieval contracts, plus #971 compact cwd and #972 search cwd client
+        # contracts remain memory/retrieval-owned. #866 stats publication retries
+        # and fail-closed journal errors, plus #973 project database admission,
+        # stay in this owner.
         - "src/memory/"
         - "^src/expansion\\.ts$"
         - "^src/retrieval\\.ts$"
@@ -149,28 +239,53 @@ component_management:
     - component_id: "unit-project-worktrees"
       name: "Unit - Projects and Worktrees"
       paths:
+        # #1070 preserves post-commit topology diagnostics in this existing
+        # reconciliation owner.
+        # #974 keeps target-parent reconciliation hardening in this
+        # existing component.
+        # #866 export gather and project read preparation remain in this
+        # existing component.
         - "^src/codex-project-resolution\\.ts$"
         - "^src/git-project\\.ts$"
         - "^src/machine-identity\\.ts$"
+        # #889 keeps private import metadata publication in this owner.
         - "^src/portable-knowledge\\.ts$"
-        - "^src/private-mutation-lock\\.ts$"
+        # #1049 keeps project metadata owner and single-link admission in this
+        # existing component; no taxonomy, status, or policy change.
         - "^src/project-map\\.ts$"
         - "^src/worktree-reconciliation-fence\\.ts$"
+        # #1044 keeps the existing owner; no taxonomy, status, or policy change.
+        # #1048 keeps target metadata leaf authentication in this owner.
+        # #1069 preserves completed reconciliation evidence after retained
+        # directory cleanup failures in this existing component.
         - "^src/worktree-reconciliation\\.ts$"
     - component_id: "unit-diagnostics"
       name: "Unit - Diagnostics"
       paths:
         - "^src/diagnose\\.ts$"
+        # #619 retains authenticated daemon pool observations across probe failures.
+        - "^src/storage/diagnostics\\.ts$"
+        - "^src/storage/diagnostic-renderer\\.ts$"
+        - "^src/storage/diagnostic-project\\.ts$"
+        - "^src/storage/postgresql/diagnostics\\.ts$"
+        # #997 keeps doctor publication retry deadlines monotonic in this owner.
+        # #619 keeps observational doctor refusal guidance in this owner.
         - "src/doctor/"
     - component_id: "integration-service-managers"
       name: "Integration - Service Managers and Legacy Migration"
       paths:
         - "^src/daemon/health-observation\\.ts$"
-        # Lifecycle consumes the same canonical #691 entrypoint comparison as the CLI.
+        # Lifecycle consumes the same canonical #691 entrypoint comparison as the CLI and keeps #804's kernel-cgroup listener witness manager-owned.
+        # #865/#950 keep post-start and explicit-restart publication convergence
+        # inside the lifecycle owner, #944 keeps bounded daemon-tmp retry
+        # guidance within the supervisor/lifecycle boundary, and #966 keeps
+        # optional birth-sample budgeting in lifecycle admission. Their paired
+        # managed lifecycle tests remain this component's coverage boundary.
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"
         - "^src/daemon/managed-path\\.ts$"
+        # #786/#952 creation-only daemon-tmp rollback remains service-manager owned.
         - "^src/daemon/supervisor\\.ts$"
     - component_id: "integration-postgresql-runtime"
       name: "Integration - PostgreSQL Runtime"
@@ -208,6 +323,7 @@ component_management:
     - component_id: "integration-postgresql-memory"
       name: "Integration - PostgreSQL Memory"
       paths:
+        # The #760/#805 repository machine-identity context remains memory-owned.
         - "^src/storage/postgresql/memory-repositories\\.ts$"
         - "^src/storage/postgresql/summary-context-repositories\\.ts$"
     - component_id: "integration-postgresql-search"

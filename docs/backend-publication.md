@@ -11,9 +11,13 @@ This boundary is now consumed by the daemon and MCP project-storage routes.
 SQLite remains the default, while an explicitly published PostgreSQL selection
 becomes authoritative only after runtime readiness, machine identity, project
 binding, and terminal publication evidence all verify. Issue #618 still owns
-CLI/import-export and portable transfer; #619 still owns stats, pool
-diagnostics, status, and doctor parity. Those boundaries do not weaken daemon
-route admission or authorize a SQLite fallback.
+CLI/import-export and portable transfer. Stats, pool diagnostics, status, and
+doctor share an [observational backend snapshot](cli.md#observational-diagnostics).
+It authenticates publication/configuration evidence before and after probes;
+changed witnesses discard collected metrics and report `stale-publication`.
+This optimistic observation is not a transaction-wide authority guarantee.
+Diagnostics neither write publication evidence nor acquire mutation locks,
+and never authorize a SQLite fallback.
 
 ## Current backend boundaries
 
@@ -32,12 +36,29 @@ LCM keeps the following Epic #79 invariants:
   fails closed. LCM never treats a partially written configuration or project
   map as proof that a backend is active.
 - The publication boundary is the single coordination seam for active daemon
-  and MCP routing. Future #618/#619 work must consume it rather than introduce
-  a second lock, journal, or fencing protocol.
+  and MCP routing and observational diagnostics. CLI/import-export work must
+  consume it rather than introduce a second lock, journal, or fencing protocol.
 
 For ordinary SQLite installations, this machinery is dormant after the
 private state root is authenticated. It does not change SQLite's storage
 semantics or require a new dependency.
+
+When lifecycle starts or replaces a managed daemon, the final publication
+assertion may encounter the child daemon's initial passive sweep. LCM permits a
+bounded 2-second convergence window only for the exact authenticated child
+admitted by that lifecycle operation (including an authorized manager
+replacement). The window polls every 50 ms and rechecks the lock owner,
+process birth, token, and health identity without replaying startup or taking
+the publication lock across a wait. The initially authenticated daemon identity
+is the sole source for the retry's version, backend, entrypoint, and runtime
+digest expectations; none of those fields can be omitted from a captured
+identity. A token rotation, PID or birth mismatch, changed
+runtime/version/backend/entrypoint, missing or malformed owner,
+unknown publication home, health failure, timeout, cancellation, or any other
+non-contention error fails closed. Cancellation after contention rethrows the
+original typed contention error. Platforms where process birth cannot be
+obtained decline lifecycle convergence and retain the existing fail-closed
+behavior.
 
 ## What the admission boundary protects
 
@@ -98,7 +119,30 @@ root:
 
 The exact path is derived from the configured home for isolated installations;
 the default is under `~/.lcm`. Files are bounded, private, checksum-protected,
-and opened through descriptor- and ownership-aware filesystem seams.
+and opened through descriptor- and ownership-aware filesystem seams. Consumer
+admission retains one authenticated device/inode witness for the publication
+directory across the journal read, any evidence enumeration, and terminal
+recovery-material authentication. A present journal and its recovery material
+are accepted only when each exact parent device/inode matches that retained
+directory witness. Removing the directory or rebinding its pathname to another
+inode during admission is unsafe storage, not absent evidence.
+
+Coordinator operations use the same private publication-directory descriptor
+for their locked journal evidence reads, checkpoint compare-and-swap reads,
+and recovery-material authentication, including checkpoints issued after
+awaited driver work. Each checkpoint revalidates that retained identity before
+and after its observer boundaries and durable publication, and binds a present
+journal's observed parent device/inode to the same descriptor. The descriptor
+is revalidated before a successful operation return and is always closed when
+the operation settles. A directory identity or security drift is reported as
+unsafe storage; the preparing and abort-releasing missing-material recovery
+shortcuts remain limited to a genuine missing material file while the retained
+directory remains authenticated.
+
+Checkpoint publication still uses the pathname-based durable writer, and
+archive and material-cleanup mutations remain path-addressed. These checks do
+not provide descriptor-relative mutation or prevent a same-UID substitution
+after the generic writer's final pathname check.
 
 The implementation persists exactly these 16 phase literals:
 
@@ -191,22 +235,77 @@ The internal coordinator exposes `prepare`, `resume`, `abort`, and
 to the permit object and revoked when their callback ends, so an inherited
 asynchronous callback cannot reuse authority after a phase change or release.
 
-If a process dies at any checkpoint, the journal and material are recovery
-evidence. Do not edit, delete, rename, or bulk-clean the directory. The current
-command surface does not provide a general journal-editing command. Run
-`lcm doctor`, preserve its sanitized output, and let the owning publication
-recovery flow resume or abort the authenticated journal; rerun `lcm doctor`
-after the flow reaches a terminal state. Once the journal is terminal, restart
-the daemon to reload the selected backend. To roll back an active selection,
-publish a new authenticated publication targeting SQLite and restart; do not
-edit `config.json` or `map.json` independently. An ambiguous filesystem or
-database result is intentionally retained for inspection rather than silently
-repaired.
+If a process dies at any checkpoint, a present journal and its material are
+recovery evidence. Do not edit, delete, rename, or bulk-clean the directory.
+The current command surface does not provide a general journal-editing command.
+When an authenticated journal exists, run `lcm doctor`, preserve its sanitized
+output, and let the owning publication recovery flow resume or abort that
+journal; rerun `lcm doctor` after the flow reaches a terminal state. Once the
+journal is terminal, restart the daemon to reload the selected backend. To roll
+back an active selection, publish a new authenticated publication targeting
+SQLite and restart; do not edit `config.json` or `map.json` independently.
+
+When `~/.lcm/backend-publication/` exists without `journal.json`, including a
+private directory that is genuinely empty, follow [Journal-less publication
+evidence](#journal-less-publication-evidence). Do not try to resume or abort
+that state. An ambiguous filesystem or database result is intentionally
+retained for inspection rather than silently repaired.
 
 Consumers accept only an authenticated terminal journal with matching
 configuration, project-map, target-backend, recovery-material, and remote-fence
 witnesses. Missing evidence, unknown residue, checksum drift, active remote
-fences in a terminal record, and backend mismatch all remain blocked.
+fences in a terminal record, and backend mismatch all remain blocked. An
+existing private publication directory is evidence even when it is empty; an
+empty directory or one with recognized residue but no journal is incomplete
+evidence. Legacy SQLite compatibility applies only when the directory is
+confirmed absent at both the initial journal probe and the admission decision
+boundary. Preserve an empty or incomplete directory for diagnosis instead of
+deleting it to regain SQLite compatibility.
+
+### Journal-less publication evidence
+
+An existing private publication directory is evidence even when it is empty.
+If that directory has no `journal.json`, consumers and `lcm doctor` treat the
+state as incomplete publication evidence and keep admission blocked. The
+doctor diagnostic authenticates the blocked admission but does not prove
+interruption provenance, authorize removal, repair evidence, or provide a
+journal-less resume or abort. The diagnostic alone does not establish that
+this is the state: the same `publication-evidence-missing` reason can describe
+other missing-evidence conditions. Confirm this case with a non-mutating
+listing of the publication directory, observing that the directory exists and
+`journal.json` is absent.
+
+The internal coordinator cannot repair this state. Its `recoverPending()` scan
+returns `null` when no journal exists, meaning that it found no pending work;
+it does not repair the directory and does not throw for this condition. The
+`resume()` and `abort()` state machines require a journal and throw
+`publication-evidence-missing` when it is missing. These are activation-flow
+seams, not operator commands or safe absence probes; the coordinator's lock
+prologue can create the publication directory while it opens it. The unrelated
+`lcm machine recover` command recovers a PostgreSQL machine identity, not
+backend-publication evidence.
+
+Run `lcm doctor` and retain its sanitized diagnostic, then preserve the entire
+publication directory unchanged. Stop automated recovery attempts and file a
+[Question using the repository support form](https://github.com/donadiosolutions/lcm/issues/new?template=question.yml)
+with the following bounded, redacted context:
+
+- LCM version and operating system.
+- The exact sanitized `lcm doctor` diagnostic.
+- The operation that was interrupted and when it was observed.
+- A link or reference to issue #838 for the journal-less publication-evidence
+  case.
+
+Put these facts in the form's `Context` field. Do not include secrets,
+`journal.json`, material, `config.json`, `map.json`, fenced-lease rows, or
+other state dumps. There is no supported automatic or standalone CLI recovery
+for a journal-less publication directory. A maintainer must establish the
+interruption provenance and provide case-specific, evidence-safe recovery
+guidance before any mutation. Do not remove the directory, fabricate a
+journal, edit backend state, or restart the daemon as a bypass. Resume the
+ordinary doctor/retry sequence only after evidence has been safely restored or
+resolved and a valid terminal publication, or a legitimately absent directory,
+has been re-established through the supported owning flow.
 
 ## Hard limits and rejection behavior
 
@@ -237,6 +336,20 @@ The normal `lcm install` and bootstrap paths establish the root through one
 guarded TypeScript bootstrap operation. Do not pre-create a replacement root
 with an untrusted recursive `mkdir -p` or copy state into it by hand.
 
+During a first bootstrap, LCM retains the descriptor for the root it created
+and records the authenticated tree before handing control to backend
+publication consumers. The consumer-side tree is compared with that
+pre-handoff contract before LCM writes the direct-system-root parent witness.
+For a root created by the current operation, the contract is an empty tree;
+for a trusted root reused through an existing-directory compatibility path, the
+bounded authenticated contents present before handoff are retained. A root
+whose canonical path disappears, is rebound, changes owner or mode, or no
+longer matches its pre-handoff contents fails closed with the bootstrap handoff
+error. LCM preserves the root and its evidence for inspection; it does not
+recreate or automatically repair a replacement. After the concurrent
+operation is resolved, retrying revalidates the established root and its
+current evidence.
+
 The bootstrap checks the actual `$HOME` before creating state. `$HOME` must be
 an existing, non-symlink directory owned by the current user and must not be
 group- or world-writable. The active `~/.lcm` root is created as one final
@@ -246,6 +359,19 @@ publication directories reject symlink substitution and use directory-safe
 open flags where the platform provides them. Configuration reads and writes
 are bounded and descriptor-aware; a config symlink, non-regular file, or
 oversized file is rejected before mutation.
+
+If a bootstrap directory fails authentication after its descriptor is opened,
+LCM attempts to close that descriptor once. A successful close preserves the
+original authentication error. If the close also fails, the reported error
+preserves both failures and identifies the authentication error as its cause,
+so operators can diagnose the rejected directory without losing cleanup
+evidence.
+
+Read-only publication probes distinguish an absent root at the initial open
+from an authentication failure after that root was opened. The former remains
+compatible with legacy SQLite installations and is rechecked at later
+boundaries. The latter is unsafe storage and fails closed; diagnose the root's
+permissions, ownership, and filesystem state before retrying.
 
 Bootstrap admission also uses an owner-only, bounded lock file in the home
 directory. A lock record created by the current runtime includes the owner PID,
@@ -273,6 +399,22 @@ journal containing the exact witness for a full copy under the unpredictable
 into `~/.lcm/` and then creates the retained copy; the cross-device fallback
 keeps its authenticated staging copy. Source, staging, and target identities,
 hashes, ownership, and modes are rechecked at each non-terminal boundary.
+
+During `lcm install`, publication-lock admission is bounded and authenticated
+against the managed daemon already serving the configured home. The preflight
+migration, root preparation, absent-config creation, backend selection, and
+installer publication assertions share one lazily armed two-second monotonic
+elapsed window. Wall-clock corrections do not extend or shorten this
+publication retry duration.
+Lifecycle startup uses its own post-start child convergence window only after
+the exact authenticated child has been admitted.
+Only lock-acquisition callbacks are retried; writes, prompts, skill changes,
+and daemon startup remain outside those callbacks and therefore run once. A
+foreign, malformed, stale, or unverifiable owner, or any identity drift,
+fails closed. A bounded process-birth or authenticated-health probe that
+settles failed at or after the armed deadline preserves the original
+contention without another wait; the same failed evidence while time remains
+reports the later contention, and admission stays fail-closed in both cases.
 
 The terminal journal deliberately does not rehash mutable `~/.lcm/` content on
 later startups. Normal database, daemon, transcript, and configuration writes
@@ -353,6 +495,45 @@ The check is deliberately short-lived around each operation; it is not held
 across network calls, request bodies, model work, daemon spawning, or unrelated
 health waits.
 
+An explicit daemon restart authenticates publication lock contention at three
+separate assertions: before it changes the current daemon, at the replacement
+daemon's initial admission, and after the replacement has been admitted. LCM
+may wait up to two seconds for the authenticated current daemon's publication
+sweep and up to another two seconds shared by the replacement's initial and
+final assertions. Manager stop/start and daemon admission time do not consume
+these retry windows, so the maximum added contention wait is approximately four
+seconds. The replacement daemon's existing final-admission wait has its own
+independent two-second allowance, so a restart can spend approximately six
+seconds waiting if all three windows encounter contention. Each restart and
+ensure operation still runs once; only the blocked publication assertion is
+retried.
+
+The wait remains fail-closed. The current daemon must have a canonical owned
+PID and token, matching public and authenticated health, stable process-birth
+evidence, and the installed entrypoint. The replacement additionally must match
+the installed version, backend, entrypoint, and packaged-runtime digest. A
+replacement managed by systemd or launchd may briefly lack its PID file during
+its initial sweep, but only when the manager supplied the same positive PID
+reported by authenticated health. LCM does not wait when that manager PID is
+missing, health is unavailable or staged, the current daemon's owned PID is
+absent, or any PID, token, birth, owner, entrypoint, or runtime field changes.
+Lock-owner metadata only checks the independently authenticated PID; it never
+supplies restart authority.
+
+If identity capture is refused or a retry allowance expires, LCM preserves the
+original typed publication-contention error and the restart command fails. An
+ordinary publication error observed on a later assertion remains the reported
+failure even when the contention allowance has just expired.
+
+After a consumer operation, LCM attempts to release the temporary publication
+and root descriptors in that order. A single cleanup failure is reported
+directly when the operation succeeded; multiple cleanup failures are reported
+together in release order. If the operation and cleanup both fail, the
+reported error preserves the operation failure first, records it as the cause,
+and then includes every cleanup failure. Typed publication admission and lock
+contention failures retain their classification so callers remain fail-closed.
+Releasing those resources does not repair or change the publication state.
+
 - **Daemon and health:** an unresolved or inconsistent publication returns a
   sanitized HTTP `503` with `status: "blocked"` and no filesystem, SQL, URL,
   credential, or raw driver detail. A valid terminal PostgreSQL witness still
@@ -415,10 +596,15 @@ The safe operator sequence is therefore:
 2. Run `lcm doctor` and preserve its sanitized output. If the sidecar error log
    is unavailable, inspect the fixed-diagnostic record in
    `~/.lcm/logs/events.log`.
-3. Resolve the authenticated publication through its owning recovery or
-   publication flow; only that owner may complete or abort the evidence.
+3. If an authenticated `journal.json` is present, resolve the publication
+   through its owning recovery or publication flow; only that owner may
+   complete or abort the evidence. If the publication directory exists without
+   `journal.json`, including when it is empty, stop and follow [Journal-less
+   publication evidence](#journal-less-publication-evidence). The doctor
+   diagnostic alone does not choose between these cases.
 4. Rerun `lcm doctor`, then retry the hook or restart the managed daemon after
-   the publication reaches a terminal state. A structured PostToolUse
+   the publication reaches a terminal state or a legitimately absent directory
+   has been re-established by its owning flow. A structured PostToolUse
    `systemMessage` is an admission refusal to act on, not proof that selected
    state was accepted.
 
@@ -434,7 +620,8 @@ administrator. The runtime role must not own the schema or run migrations.
 The [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md)
 and [configuration guide](configuration.md#provisioning-a-postgresql-database)
 contain the complete deployment sequence. Applying that sequence enables the
-selected daemon project routes; #618 and #619 remain outside this boundary.
+selected daemon project routes and observational diagnostics. CLI/import-export
+activation remains tracked by #618.
 
 The final audit found the SQL changes already implemented for chore #408
 sufficient; this documentation lane required no additional SQL correction:

@@ -40,6 +40,10 @@ const MAX_SHORT_TRANSACTION_ATTEMPTS = 3;
 const SHORT_TRANSACTION_RETRY_SQLSTATES = new Set(["40001", "40P01"]);
 const INTEGRITY_SQLSTATES = new Set(["23503", "23505", "23514", "P0001"]);
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const UUIDV7_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 const SUMMARY_COLUMNS = `summary_id, conversation_id, kind, depth, content,
   token_count, earliest_at, latest_at, descendant_count,
@@ -729,6 +733,33 @@ function validateOpaqueText(
   }
 }
 
+function validateMachineId(
+  value: unknown,
+  projectId: string,
+): string {
+  if (
+    typeof value !== "string"
+    || value.includes("\0")
+    || containsMalformedUtf16(value)
+  ) {
+    throw new PostgreSqlSummaryContextDataError(
+      projectId,
+      "summaries",
+      "construct",
+      "machine_id",
+    );
+  }
+  if (!UUID_PATTERN.test(value) || !UUIDV7_PATTERN.test(value)) {
+    throw new PostgreSqlSummaryContextDataError(
+      projectId,
+      "summaries",
+      "construct",
+      "machine_id",
+    );
+  }
+  return value.toLowerCase();
+}
+
 class RepositoryCore {
   readonly signal: AbortSignal | undefined;
   readonly lockTimeoutMs: number;
@@ -741,7 +772,7 @@ class RepositoryCore {
   ) {
     this.signal = options.signal;
     this.lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
-    this.fence = options.fence === undefined
+    const fenceSnapshot = options.fence === undefined
       ? undefined
       : {
           machineId: options.fence.machineId,
@@ -773,34 +804,31 @@ class RepositoryCore {
         "project_id",
       );
     }
-    if (this.fence !== undefined) {
-      validateOpaqueText(
-        this.fence.machineId,
+    let canonicalFence = fenceSnapshot;
+    if (fenceSnapshot !== undefined) {
+      const canonicalMachineId = validateMachineId(
+        fenceSnapshot.machineId,
         projectId,
-        "summaries",
-        "construct",
-        "machine_id",
       );
       validateOpaqueText(
-        this.fence.processId,
+        fenceSnapshot.processId,
         projectId,
         "summaries",
         "construct",
         "owner_process_id",
       );
       validateOpaqueText(
-        this.fence.operation,
+        fenceSnapshot.operation,
         projectId,
         "summaries",
         "construct",
         "lease_operation",
       );
       if (
-        this.fence.machineId.trim() === ""
-        || this.fence.processId.trim() === ""
-        || this.fence.operation.trim() === ""
-        || typeof this.fence.fencingToken !== "bigint"
-        || this.fence.fencingToken < 1n
+        fenceSnapshot.processId.trim() === ""
+        || fenceSnapshot.operation.trim() === ""
+        || typeof fenceSnapshot.fencingToken !== "bigint"
+        || fenceSnapshot.fencingToken < 1n
       ) {
         throw new PostgreSqlSummaryContextDataError(
           projectId,
@@ -809,7 +837,12 @@ class RepositoryCore {
           "fence",
         );
       }
+      canonicalFence = {
+        ...fenceSnapshot,
+        machineId: canonicalMachineId,
+      };
     }
+    this.fence = canonicalFence;
   }
 
   context(
@@ -820,6 +853,9 @@ class RepositoryCore {
       domain,
       operation,
       projectId: this.projectId,
+      ...(this.fence === undefined
+        ? {}
+        : { machineId: this.fence.machineId }),
       ...(this.signal === undefined ? {} : { signal: this.signal }),
     };
   }

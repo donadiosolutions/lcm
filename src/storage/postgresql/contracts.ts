@@ -123,3 +123,19 @@ export interface PostgreSqlTestDatabaseLease {
   readonly runtimeUrl: string;
   drop(): Promise<void>;
 }
+
+/** Allowlisted public pg pool state, without connection settings or driver objects. */
+export interface PostgreSqlDiagnosticPool {
+  readonly configuredMax: number;
+  readonly total: number;
+  readonly idle: number;
+  readonly waiting: number;
+  readonly failed: boolean;
+}
+
+/** Owned probe seam; diagnostic callers never need mutation APIs. */
+export interface PostgreSqlDiagnosticRuntime extends PostgreSqlQueryExecutor {
+  health(signal?: AbortSignal): Promise<PostgreSqlRuntimeHealth>;
+  poolDiagnostics(): PostgreSqlDiagnosticPool;
+  close(): Promise<void>;
+}

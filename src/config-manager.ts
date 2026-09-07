@@ -23,7 +23,9 @@ import {
   assertBackendPublicationConfigReadAccess,
   assertBackendPublicationConfigMutation,
   assertBackendPublicationPermit,
+  backendPublicationHomeForConfigPath,
   captureBackendPublicationState,
+  withBackendPublicationReadRoot,
   withBackendPublicationConfigLockAsync,
   withBackendPublicationConfigLock,
   type BackendPublicationFileMutationContext,
@@ -248,10 +250,9 @@ function writeConfigAtomic(
 ): void {
   const directory = dirname(configPath);
   ensurePrivateDirectory(directory);
+  // The caller's observation selects exclusive create for an absent file;
+  // present-file publication is intentionally unconditional under the config lock.
   atomicWritePrivateFileDurable(configPath, content, {
-    expectedContentSha256: observedContent === null
-      ? null
-      : createHash("sha256").update(observedContent).digest("hex"),
     maxExistingBytes: MAX_CONFIG_BYTES,
     requireAbsent: observedContent === null,
     finalMode: 0o600,
@@ -334,9 +335,10 @@ export async function applyBackendPublicationConfigFile(
       }
     } else {
       const recoveryFile = input.file as Extract<BackendPublicationRecoveryFile, { presence: "present" }>;
+      // Coordinator witnesses are admission/recovery evidence, not portable
+      // CAS; the present-file durable write is unconditional under its locks.
       atomicWritePrivateFileDurable(configPath, candidateContent, {
         requireAbsent: before.presence === "absent",
-        expectedContentSha256: before.presence === "present" ? before.rawSha256 : null,
         maxExistingBytes: 4 * 1024 * 1024,
         finalMode: recoveryFile.mode,
       });
@@ -459,15 +461,13 @@ function persistConnectorTransportConfig(
   writeConfigAtomic(configPath, persistedContent, file.observedContent);
 }
 
-/** Read one validated stored connector transport under the configuration lock. */
+/** Read one validated stored connector transport through stable lock-free admission. */
 export function readConnectorTransport(configPath: string, agentId: string): ConnectorTransport | undefined {
-  return withBackendPublicationConfigLock(configPath, (lockToken) => {
-    const file = readConfigContent(configPath);
-    const stored = parseStoredConfig(file.content);
-    const backend = configBackend(file.content);
-    assertBackendPublicationConfigAccess(configPath, backend, file.observedContent, undefined, lockToken);
-    return readConnectorTransportFromStored(stored, agentId);
-  });
+  // Transport resolution is a read-only preflight used by connector installs.
+  // Keep it admissible while the managed daemon performs a publication: the
+  // lock-free snapshot path authenticates the publication and double-reads the
+  // descriptor, while reserving the exclusive lock for the later setter.
+  return readConnectorTransportSnapshot(configPath, agentId);
 }
 
 type ConnectorTransportSnapshotOptions = Readonly<{
@@ -521,21 +521,42 @@ function readConnectorConfigSnapshot(configPath: string): ConnectorConfigSnapsho
   }
 }
 
+function withConnectorTransportReadRoot<T>(
+  configPath: string,
+  callback: (assertReadRoot: () => void) => T,
+): T {
+  const homeDir = backendPublicationHomeForConfigPath(configPath);
+  if (homeDir === undefined) return callback(() => undefined);
+  return withBackendPublicationReadRoot(homeDir, callback);
+}
+
 /** Read one validated stored connector transport without taking the publication lock. */
 export function readConnectorTransportSnapshot(
   configPath: string,
   agentId: string,
   options: ConnectorTransportSnapshotOptions = {},
 ): ConnectorTransport | undefined {
-  const first = readConnectorConfigSnapshot(configPath);
-  const backend = configBackend(first.content);
-  assertBackendPublicationConfigReadAccess(configPath, backend, first.witness);
-  options._afterFirstSnapshotForTesting?.();
-  const second = readConnectorConfigSnapshot(configPath);
-  if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
-    throw new ConfigManagerError("Configuration changed during lock-free connector transport inspection.");
-  }
-  return readConnectorTransportFromStored(parseStoredConfig(second.content), agentId);
+  return withConnectorTransportReadRoot(configPath, (assertReadRoot) => {
+    assertReadRoot();
+    const first = readConnectorConfigSnapshot(configPath);
+    assertReadRoot();
+    const backend = configBackend(first.content);
+    const firstAdmission = assertBackendPublicationConfigReadAccess(configPath, backend, first.witness);
+    assertReadRoot();
+    options._afterFirstSnapshotForTesting?.();
+    assertReadRoot();
+    const second = readConnectorConfigSnapshot(configPath);
+    assertReadRoot();
+    if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
+      throw new ConfigManagerError("Configuration changed during lock-free connector transport inspection.");
+    }
+    const secondAdmission = assertBackendPublicationConfigReadAccess(configPath, backend, second.witness);
+    assertReadRoot();
+    if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
+      throw new ConfigManagerError("Backend publication changed during lock-free connector transport inspection.");
+    }
+    return readConnectorTransportFromStored(parseStoredConfig(second.content), agentId);
+  });
 }
 
 /** Persist one validated connector transport while retaining all other settings. */

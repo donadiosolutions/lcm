@@ -4,16 +4,20 @@ import {
   chmodSync as fsChmodSync,
   existsSync,
   cpSync,
+  fstatSync,
+  linkSync,
   mkdirSync as fsMkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
   writeFileSync as fsWriteFileSync,
 } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -23,6 +27,10 @@ import {
   closeLcmConnection,
   getPoolStats,
 } from "../src/db/connection.js";
+import {
+  PrivateMutationLockContentionError,
+  processStartTime,
+} from "../src/private-mutation-lock.js";
 import { clearGitProjectAnchorCache, resolveGitProjectAnchor } from "../src/git-project.js";
 import {
   clearProjectMapCache,
@@ -42,6 +50,7 @@ import { recoverMachineIdentity } from "../src/machine-identity.js";
 import type { ResolvedStorageConfig } from "../src/daemon/config.js";
 import { EventsDb } from "../src/hooks/events-db.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
+import * as securityFiles from "../src/security-files.js";
 
 const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
   backend: "postgresql",
@@ -82,6 +91,168 @@ function makePrivateFixtureDirectory(
 function writePrivateFixtureFile(path: string, content: string): void {
   fsWriteFileSync(path, content, { mode: PRIVATE_FILE_MODE });
   fsChmodSync(path, PRIVATE_FILE_MODE);
+}
+
+function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T): T {
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const original = nodeFs[name];
+  nodeFs[name] = replacement;
+  syncBuiltinESMExports();
+  try {
+    return callback();
+  } finally {
+    nodeFs[name] = original;
+    syncBuiltinESMExports();
+  }
+}
+
+type IsolatedDirectoryFaults = Readonly<{
+  targetDir: string;
+  mkdirErrorCode?: "EACCES" | "EEXIST";
+  failTargetFchmod?: boolean;
+  failTargetClose?: boolean;
+  failSnapshotDirectoryClose?: boolean;
+  failSnapshotDatabaseClose?: boolean;
+  replaceExistingTargetOnEntryCheck?: boolean;
+}>;
+
+async function importReconciliationWithDirectoryFaults(
+  faults: IsolatedDirectoryFaults,
+): Promise<{
+  module: typeof import("../src/worktree-reconciliation.js");
+  openDirectoryPaths: Set<string>;
+  openedDirectoryPaths: string[];
+  closedDirectoryPaths: string[];
+  remainingDescriptorPaths: () => string[];
+}> {
+  const descriptorPaths = new Map<number, string>();
+  const openDirectoryPaths = new Set<string>();
+  const openedDirectoryPaths: string[] = [];
+  const closedDirectoryPaths: string[] = [];
+  let targetCloseFailed = false;
+  let snapshotDirectoryCloseFailed = false;
+  let targetMkdirFailed = false;
+  let existingTargetReplaced = false;
+  vi.resetModules();
+  vi.doMock("node:fs", async () => {
+    const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+    return {
+      ...actual,
+      openSync: ((
+        path: Parameters<typeof actual.openSync>[0],
+        flags: Parameters<typeof actual.openSync>[1],
+        mode?: Parameters<typeof actual.openSync>[2],
+      ) => {
+        const fd = actual.openSync(path, flags, mode);
+        descriptorPaths.set(fd, String(path));
+        if (typeof flags === "number" && (flags & actual.constants.O_DIRECTORY) !== 0) {
+          openDirectoryPaths.add(String(path));
+          openedDirectoryPaths.push(String(path));
+        }
+        return fd;
+      }) as typeof actual.openSync,
+      mkdirSync: ((
+        path: Parameters<typeof actual.mkdirSync>[0],
+        options?: Parameters<typeof actual.mkdirSync>[1],
+      ) => {
+        if (
+          !targetMkdirFailed
+          && String(path) === faults.targetDir
+          && faults.mkdirErrorCode !== undefined
+        ) {
+          targetMkdirFailed = true;
+          if (faults.mkdirErrorCode === "EEXIST") {
+            actual.mkdirSync(path, options);
+          }
+          throw Object.assign(new Error(`injected ${faults.mkdirErrorCode} mkdir failure`), {
+            code: faults.mkdirErrorCode,
+          });
+        }
+        return actual.mkdirSync(path, options);
+      }) as typeof actual.mkdirSync,
+      fchmodSync: ((fd: number, mode: number) => {
+        if (faults.failTargetFchmod && descriptorPaths.get(fd) === faults.targetDir) {
+          throw new Error("injected target fchmod failure");
+        }
+        return actual.fchmodSync(fd, mode);
+      }) as typeof actual.fchmodSync,
+      lstatSync: ((
+        path: Parameters<typeof actual.lstatSync>[0],
+        options?: Parameters<typeof actual.lstatSync>[1],
+      ) => {
+        if (
+          faults.replaceExistingTargetOnEntryCheck
+          && !existingTargetReplaced
+          && String(path) === faults.targetDir
+        ) {
+          existingTargetReplaced = true;
+          actual.renameSync(faults.targetDir, `${faults.targetDir}.entry-check-displaced`);
+          actual.mkdirSync(faults.targetDir, { mode: PRIVATE_DIRECTORY_MODE });
+        }
+        return actual.lstatSync(path, options);
+      }) as typeof actual.lstatSync,
+      closeSync: ((fd: number) => {
+        const descriptorPath = descriptorPaths.get(fd);
+        descriptorPaths.delete(fd);
+        actual.closeSync(fd);
+        if (descriptorPath !== undefined && openDirectoryPaths.has(descriptorPath)) {
+          closedDirectoryPaths.push(descriptorPath);
+        }
+        if (
+          faults.failTargetClose
+          && !targetCloseFailed
+          && descriptorPath === faults.targetDir
+        ) {
+          targetCloseFailed = true;
+          throw new Error("injected target directory close failure");
+        }
+        if (
+          faults.failSnapshotDirectoryClose
+          && !snapshotDirectoryCloseFailed
+          && descriptorPath?.includes(".lcm-reconciliation-snapshot-")
+        ) {
+          snapshotDirectoryCloseFailed = true;
+          throw new Error("injected snapshot directory close failure");
+        }
+      }) as typeof actual.closeSync,
+    };
+  });
+  if (faults.failSnapshotDatabaseClose) {
+    vi.doMock("node:sqlite", async () => {
+      const actual = await vi.importActual<typeof import("node:sqlite")>("node:sqlite");
+      return {
+        ...actual,
+        DatabaseSync: class extends actual.DatabaseSync {
+          readonly #testPath: string;
+
+          constructor(...args: ConstructorParameters<typeof actual.DatabaseSync>) {
+            super(...args);
+            this.#testPath = String(args[0]);
+          }
+
+          override close(): void {
+            super.close();
+            if (this.#testPath.includes(".lcm-reconciliation-snapshot-")) {
+              throw new Error("injected snapshot database close failure");
+            }
+          }
+        },
+      };
+    });
+  }
+  return {
+    module: await import("../src/worktree-reconciliation.js"),
+    openDirectoryPaths,
+    openedDirectoryPaths,
+    closedDirectoryPaths,
+    remainingDescriptorPaths: () => [...descriptorPaths.values()],
+  };
+}
+
+function resetReconciliationModuleMocks(): void {
+  vi.doUnmock("node:fs");
+  vi.doUnmock("node:sqlite");
+  vi.resetModules();
 }
 
 function git(cwd: string, ...args: string[]): void {
@@ -213,6 +384,40 @@ function makeDatabase(path: string, sessionId: string, content: string, projectI
   ).run();
   runLcmMigrations(db);
   db.close();
+}
+
+function makeReconciliationLockFixture(home: string): {
+  readonly main: string;
+  readonly lock: string;
+} {
+  const { main, linked } = makeRepository(home);
+  const canonical = resolveGitProjectAnchor(main)!.canonical;
+  const targetHash = hashProjectPath(canonical);
+  const sourceHash = hashProjectPath(linked);
+  writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+    [targetHash]: { canonical, aliases: [] },
+    [sourceHash]: { canonical: linked, aliases: [] },
+  }, null, 2)}\n`);
+  clearProjectMapCache();
+  makeDatabase(
+    join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+    "monotonic-lock-wait",
+    "content",
+    sourceHash,
+  );
+  const reconciliationRoot = join(home, ".lcm", "reconciliations");
+  makePrivateFixtureDirectory(reconciliationRoot, { recursive: true });
+  const lock = join(reconciliationRoot, `${targetHash}.lock`);
+  const processBirth = processStartTime(process.pid);
+  if (processBirth === null) throw new Error("test process birth time is unavailable");
+  writePrivateFixtureFile(lock, `${JSON.stringify({
+    version: 1,
+    pid: process.pid,
+    processStartTime: processBirth,
+    nonce: "a".repeat(32),
+    createdAtMs: 1,
+  })}\n`);
+  return { main, lock };
 }
 
 function removeLegacyMainMetadataColumns(db: DatabaseSync): void {
@@ -547,6 +752,128 @@ function makeEventsReconciliation(root: string): {
     targetEvents: join(root, ".lcm", "events", `${targetHash}.db`),
     sourceEvents: join(root, ".lcm", "events", `${sourceHash}.db`),
   };
+}
+
+function makeProjectReconciliation(root: string): {
+  readonly main: string;
+  readonly targetHash: string;
+  readonly sourceHash: string;
+  readonly targetDir: string;
+  readonly sourceDir: string;
+  readonly targetPath: string;
+  readonly sourcePath: string;
+} {
+  const { main, linked } = makeRepository(root);
+  const canonical = resolveGitProjectAnchor(main)!.canonical;
+  const targetHash = hashProjectPath(canonical);
+  const sourceHash = hashProjectPath(linked);
+  writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+    [targetHash]: { canonical, aliases: [] },
+    [sourceHash]: { canonical: linked, aliases: [] },
+  }, null, 2)}\n`);
+  clearProjectMapCache();
+  const targetDir = join(root, ".lcm", "projects", targetHash);
+  const sourceDir = join(root, ".lcm", "projects", sourceHash);
+  return {
+    main,
+    targetHash,
+    sourceHash,
+    targetDir,
+    sourceDir,
+    targetPath: join(targetDir, "db.sqlite"),
+    sourcePath: join(sourceDir, "db.sqlite"),
+  };
+}
+
+function instrumentTargetReconciliationCommit(
+  onCommit: (target: DatabaseSync) => void,
+  options: {
+    readonly onBegin?: (target: DatabaseSync) => void;
+    readonly rollbackError?: Error;
+  } = {},
+): {
+  readonly restore: () => void;
+  readonly targetRollbackCount: () => number;
+} {
+  const originalExec = DatabaseSync.prototype.exec;
+  let reconciliationTarget: DatabaseSync | undefined;
+  let armedTarget: DatabaseSync | undefined;
+  let targetRollbackCount = 0;
+  let injected = false;
+  const execSpy = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(
+    function (this: DatabaseSync, sql: string): void {
+      const statement = sql.replace(/\s+/gu, " ").trim();
+      if (armedTarget === this && statement === "ROLLBACK") {
+        targetRollbackCount += 1;
+        if (options.rollbackError !== undefined) throw options.rollbackError;
+      }
+      const result = originalExec.call(this, sql);
+      if (statement.includes("CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources")) {
+        reconciliationTarget = this;
+      }
+      if (reconciliationTarget === this && statement === "BEGIN IMMEDIATE") {
+        armedTarget = this;
+        options.onBegin?.(this);
+      }
+      if (armedTarget === this && statement === "COMMIT" && !injected) {
+        injected = true;
+        onCommit(this);
+      }
+      return result;
+    },
+  );
+  return {
+    restore: () => execSpy.mockRestore(),
+    targetRollbackCount: () => targetRollbackCount,
+  };
+}
+
+function findTopologyError(error: unknown): unknown {
+  if (error !== null && typeof error === "object") {
+    if (error instanceof Error && error.name === "PrivateDirectoryTopologyError") return error;
+    if (error instanceof AggregateError) {
+      for (const nested of error.errors) {
+        const found = findTopologyError(nested);
+        if (found !== undefined) return found;
+      }
+    }
+    if ("cause" in error) return findTopologyError(error.cause);
+  }
+  return undefined;
+}
+
+async function importReconciliationWithTransactionMode(
+  mode: "missing" | "false",
+  rollbackError: Error,
+): Promise<typeof import("../src/worktree-reconciliation.js")> {
+  vi.resetModules();
+  vi.doMock("node:sqlite", async () => {
+    const actual = await vi.importActual<typeof import("node:sqlite")>("node:sqlite");
+    class OptionalTransactionDatabase extends actual.DatabaseSync {
+      constructor(...args: ConstructorParameters<typeof actual.DatabaseSync>) {
+        super(...args);
+        const target = this;
+        return new Proxy(target, {
+          get(database, property) {
+            if (property === "isTransaction") return mode === "missing" ? undefined : false;
+            const value = Reflect.get(database, property, target);
+            if (property !== "exec" || typeof value !== "function") {
+              return typeof value === "function" ? value.bind(target) : value;
+            }
+            return (sql: string): void => {
+              const result = value.call(target, sql);
+              if (sql.trim() === "ROLLBACK") {
+                throw rollbackError;
+              }
+              return result;
+            };
+          },
+        });
+      }
+    }
+    return { ...actual, DatabaseSync: OptionalTransactionDatabase };
+  });
+  return import("../src/worktree-reconciliation.js");
 }
 
 function setMissingCwdState(
@@ -1574,6 +1901,184 @@ describe("worktree reconciliation", () => {
     }]);
   });
 
+  it.each([
+    { label: "project merge", kind: "project", alreadyImported: false },
+    { label: "project already-imported merge", kind: "project", alreadyImported: true },
+    { label: "events merge", kind: "events", alreadyImported: false },
+    { label: "events already-imported merge", kind: "events", alreadyImported: true },
+  ] as const)(
+    "preserves a topology error after the $label COMMIT",
+    ({ kind, alreadyImported }) => {
+      let main: string;
+      let sourceHash = "";
+      let targetDir: string | undefined;
+      void (kind === "project"
+        ? (() => {
+          const fixture = makeProjectReconciliation(home);
+          main = fixture.main;
+          sourceHash = fixture.sourceHash;
+          targetDir = fixture.targetDir;
+          makeDatabase(fixture.sourcePath, "post-commit-project", "source", fixture.sourceHash);
+          if (alreadyImported) {
+            makeDatabase(fixture.targetPath, "post-commit-project-target", "target", fixture.targetHash);
+            const target = new DatabaseSync(fixture.targetPath);
+            target.exec(`
+              CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources (
+                source_hash TEXT PRIMARY KEY,
+                merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+              )
+            `);
+            target.prepare(
+              "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
+            ).run(fixture.sourceHash);
+            target.close();
+          }
+          return fixture.targetPath;
+        })()
+        : (() => {
+          const fixture = makeEventsReconciliation(home);
+          main = fixture.main;
+          sourceHash = hashProjectPath(join(home, "linked"));
+          makeVersionedEvents(fixture.sourceEvents);
+          if (alreadyImported) {
+            makeVersionedEvents(fixture.targetEvents);
+            const target = new DatabaseSync(fixture.targetEvents);
+            target.exec(`
+              CREATE TABLE IF NOT EXISTS worktree_reconciliation_sources (
+                source_hash TEXT PRIMARY KEY,
+                merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+              )
+            `);
+            target.prepare(
+              "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
+            ).run(sourceHash);
+            target.close();
+          }
+          return fixture.targetEvents;
+        })());
+      const displaced = kind === "project"
+        ? `${targetDir!}.post-commit-displaced`
+        : `${join(home, ".lcm", "events")}.post-commit-displaced`;
+      const instrumentation = instrumentTargetReconciliationCommit(() => {
+        if (kind === "project") {
+          renameSync(targetDir!, displaced);
+          makePrivateFixtureDirectory(targetDir!);
+        } else {
+          const eventsDir = join(home, ".lcm", "events");
+          renameSync(eventsDir, displaced);
+          makePrivateFixtureDirectory(eventsDir);
+        }
+      });
+      let caught: unknown;
+      try {
+        reconcileWorktrees(main);
+      } catch (error) {
+        caught = error;
+      } finally {
+        instrumentation.restore();
+      }
+
+      expect(caught).toBeInstanceOf(Error);
+      expect(String(caught)).toContain("private directory topology is not trusted");
+      expect(String(caught)).not.toContain("no transaction is active");
+      expect(findTopologyError(caught)).toMatchObject({
+        message: "private directory topology is not trusted",
+      });
+      if (caught instanceof AggregateError) {
+        expect(caught.cause).toBe(caught.errors[0]);
+      }
+      expect(instrumentation.targetRollbackCount()).toBe(0);
+      expect(listWorktreeReconciliationJournals()).toMatchObject([{
+        phase: "blocked",
+        reason: expect.stringContaining("private directory topology is not trusted"),
+      }]);
+      expect(existsSync(displaced)).toBe(true);
+    },
+  );
+
+  it("rolls back an active target transaction when a merge fails before COMMIT", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "pre-commit-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "pre-commit-target", "source", fixture.sourceHash);
+    const instrumentation = instrumentTargetReconciliationCommit(() => undefined);
+    let caught: unknown;
+    try {
+      reconcileWorktrees(fixture.main);
+    } catch (error) {
+      caught = error;
+    } finally {
+      instrumentation.restore();
+    }
+
+    expect(String(caught)).toContain("divergent conversation collision");
+    expect(instrumentation.targetRollbackCount()).toBe(1);
+  });
+
+  it("retains the pre-COMMIT merge error when target rollback also fails", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "rollback-failure-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "rollback-failure-target", "source", fixture.sourceHash);
+    const rollbackError = new Error("injected target rollback failure");
+    const instrumentation = instrumentTargetReconciliationCommit(
+      () => undefined,
+      { rollbackError },
+    );
+    let caught: unknown;
+    try {
+      reconcileWorktrees(fixture.main);
+    } catch (error) {
+      caught = error;
+    } finally {
+      instrumentation.restore();
+    }
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    const aggregate = caught as AggregateError;
+    expect(aggregate.errors[0]).toMatchObject({
+      message: expect.stringContaining("divergent conversation collision"),
+    });
+    expect(aggregate.errors[1]).toBe(rollbackError);
+    expect(aggregate.cause).toBe(aggregate.errors[0]);
+    expect(aggregate.message).toContain("divergent conversation collision");
+    expect(instrumentation.targetRollbackCount()).toBe(1);
+  });
+
+  it.each([
+    { label: "missing", value: "missing" },
+    { label: "explicitly inactive", value: "false" },
+  ] as const)(
+    "handles an $label optional isTransaction property",
+    async ({ value }) => {
+      const fixture = makeProjectReconciliation(home);
+      makeDatabase(fixture.targetPath, `optional-${value}-target`, "target", fixture.targetHash);
+      makeDatabase(fixture.sourcePath, `optional-${value}-target`, "source", fixture.sourceHash);
+      const rollbackError = new Error(`optional ${value} rollback failure`);
+      const isolated = await importReconciliationWithTransactionMode(value, rollbackError);
+      let caught: unknown;
+      try {
+        isolated.reconcileWorktrees(fixture.main);
+      } catch (error) {
+        caught = error;
+      } finally {
+        vi.doUnmock("node:sqlite");
+        vi.resetModules();
+      }
+
+      if (value === "missing") {
+        expect(caught).toBeInstanceOf(AggregateError);
+        const aggregate = caught as AggregateError;
+        expect(aggregate.errors[0]).toMatchObject({
+          message: expect.stringContaining("divergent conversation collision"),
+        });
+        expect(aggregate.errors[1]).toBe(rollbackError);
+        expect(aggregate.cause).toBe(aggregate.errors[0]);
+      } else {
+        expect(String(caught)).toContain("divergent conversation collision");
+        expect(String(caught)).not.toContain("optional false rollback failure");
+      }
+    },
+  );
+
   it("fails closed on divergent global bookkeeping identities", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
@@ -1875,6 +2380,947 @@ describe("worktree reconciliation", () => {
 
     expect(reconcileWorktrees(linked).status).toBe("completed");
     expect(readFileSync(metaPath, "utf8")).toBe(metadata);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it.each([
+    {
+      fault: "hard-linked",
+      storedCwd: "canonical",
+      expectedMessage: "file has multiple hard links",
+    },
+    {
+      fault: "hard-linked",
+      storedCwd: "stale",
+      expectedMessage: "file has multiple hard links",
+    },
+    {
+      fault: "foreign-owned",
+      storedCwd: "canonical",
+      expectedMessage: "file owner is not trusted",
+    },
+    {
+      fault: "foreign-owned",
+      storedCwd: "stale",
+      expectedMessage: "file owner is not trusted",
+    },
+  ] as const)(
+    "rejects $fault target metadata with a $storedCwd cwd before parsing or publication",
+    ({ fault, storedCwd, expectedMessage }) => {
+      const { main, linked } = makeRepository(home);
+      const canonical = resolveGitProjectAnchor(main)!.canonical;
+      const targetHash = hashProjectPath(canonical);
+      const sourceHash = hashProjectPath(linked);
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+        [targetHash]: { canonical, aliases: [] },
+        [sourceHash]: { canonical: linked, aliases: [] },
+      }, null, 2)}\n`);
+      clearProjectMapCache();
+      const targetDir = join(home, ".lcm", "projects", targetHash);
+      const sourceDir = join(home, ".lcm", "projects", sourceHash);
+      makePrivateFixtureDirectory(targetDir, { recursive: true });
+      const metaPath = join(targetDir, "meta.json");
+      const metadata = `${JSON.stringify({
+        cwd: storedCwd === "canonical" ? canonical : linked,
+        attackerValue: "must-not-be-read",
+      })}\n`;
+      writePrivateFixtureFile(metaPath, metadata);
+      makeDatabase(
+        join(sourceDir, "db.sqlite"),
+        `metadata-${fault}-${storedCwd}`,
+        "content",
+        sourceHash,
+      );
+      const externalLink = join(home, `external-${storedCwd}-metadata.json`);
+      if (fault === "hard-linked") linkSync(metaPath, externalLink);
+      const before = statSync(metaPath);
+      expect(before.nlink).toBe(fault === "hard-linked" ? 2 : 1);
+
+      const parseSpy = vi.spyOn(JSON, "parse");
+      const writeSpy = vi.spyOn(securityFiles, "atomicWritePrivateFile");
+      try {
+        const reconcile = () => reconcileWorktrees(linked);
+        if (fault === "foreign-owned") {
+          const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+          const originalFstat = nodeFs.fstatSync as typeof fstatSync;
+          expect(() => withPatchedFs("fstatSync", ((fd: number, options?: unknown) => {
+            const observed = originalFstat(fd, options as never);
+            if (observed.dev !== before.dev || observed.ino !== before.ino) return observed;
+            const foreign = Object.create(observed) as typeof observed;
+            Object.defineProperty(foreign, "uid", { value: before.uid + 1 });
+            return foreign;
+          }) as typeof fstatSync, reconcile)).toThrow(expectedMessage);
+        } else {
+          expect(reconcile).toThrow(expectedMessage);
+        }
+        expect(parseSpy.mock.calls.some(([content]) => content === metadata)).toBe(false);
+        expect(writeSpy.mock.calls.some(([path]) => path === metaPath)).toBe(false);
+      } finally {
+        writeSpy.mockRestore();
+        parseSpy.mockRestore();
+      }
+
+      const after = statSync(metaPath);
+      expect(readFileSync(metaPath, "utf8")).toBe(metadata);
+      expect(after.ino).toBe(before.ino);
+      expect(after.nlink).toBe(before.nlink);
+      if (fault === "hard-linked") {
+        expect(readFileSync(externalLink, "utf8")).toBe(metadata);
+        expect(statSync(externalLink).ino).toBe(before.ino);
+      }
+      expect(existsSync(sourceDir)).toBe(true);
+      expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+      expect(listWorktreeReconciliationJournals()).toMatchObject([{
+        phase: "blocked",
+        blockedFrom: "planned",
+        reason: expect.stringContaining(expectedMessage),
+      }]);
+      expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    },
+    FULL_SUITE_PROCESS_TEST_TIMEOUT_MS,
+  );
+
+  it("rejects target replacement before publishing patterns or metadata", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const displacedTarget = `${targetDir}.displaced`;
+    makePrivateFixtureDirectory(targetDir, { recursive: true });
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "target-parent-replacement",
+      "content",
+      sourceHash,
+    );
+    writePrivateFixtureFile(
+      join(home, ".lcm", "projects", sourceHash, "sensitive-patterns.txt"),
+      "SOURCE_PATTERN\n",
+    );
+    let replaced = false;
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (replaced || event !== "after-source-fence-commit-before-target-commit") return;
+        replaced = true;
+        renameSync(targetDir, displacedTarget);
+        makePrivateFixtureDirectory(targetDir);
+        writePrivateFixtureFile(join(targetDir, "meta.json"), JSON.stringify({
+          cwd: linked,
+          attackerValue: "must-not-be-read",
+        }));
+      },
+    })).toThrow("private directory topology is not trusted");
+
+    expect(readFileSync(join(targetDir, "meta.json"), "utf8")).toBe(JSON.stringify({
+      cwd: linked,
+      attackerValue: "must-not-be-read",
+    }));
+    expect(existsSync(join(targetDir, "sensitive-patterns.txt"))).toBe(false);
+    expect(existsSync(join(displacedTarget, "db.sqlite"))).toBe(true);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      blockedFrom: "planned",
+      reason: expect.stringContaining("private directory topology is not trusted"),
+    }]);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("refuses to remove a rebound snapshot pathname during cleanup", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const displacedTarget = `${targetDir}.snapshot-displaced`;
+    makePrivateFixtureDirectory(targetDir, { recursive: true });
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "snapshot-cleanup-replacement",
+      "content",
+      sourceHash,
+    );
+    let reboundSentinel = "";
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event !== "after-source-fence-commit-before-target-commit") return;
+        renameSync(targetDir, displacedTarget);
+        const snapshotName = readdirSync(displacedTarget)
+          .find((entry) => entry.startsWith(".lcm-reconciliation-snapshot-"));
+        expect(snapshotName).toBeDefined();
+        makePrivateFixtureDirectory(targetDir);
+        const reboundSnapshot = join(targetDir, snapshotName!);
+        makePrivateFixtureDirectory(reboundSnapshot);
+        reboundSentinel = join(reboundSnapshot, "must-survive");
+        writePrivateFixtureFile(reboundSentinel, "safe cleanup refusal\n");
+      },
+    })).toThrow(/private directory topology is not trusted/u);
+
+    expect(readFileSync(reboundSentinel, "utf8")).toBe("safe cleanup refusal\n");
+    expect(readdirSync(displacedTarget)).toEqual(expect.arrayContaining([
+      expect.stringMatching(/^\.lcm-reconciliation-snapshot-/u),
+    ]));
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("rejects replacement of the shared events parent before reopening the target", () => {
+    const { main, targetEvents, sourceEvents } = makeEventsReconciliation(home);
+    makeEventsV1(sourceEvents, "events-parent-replacement");
+    const eventsDir = join(home, ".lcm", "events");
+    const displacedEvents = `${eventsDir}.displaced`;
+    let replaced = false;
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (replaced || event !== "after-target-events-migration") return;
+        replaced = true;
+        renameSync(eventsDir, displacedEvents);
+        makePrivateFixtureDirectory(eventsDir);
+        writePrivateFixtureFile(sourceEvents, "replacement source placeholder\n");
+      },
+    })).toThrow("private directory topology is not trusted");
+
+    expect(existsSync(targetEvents)).toBe(false);
+    expect(existsSync(join(displacedEvents, targetEvents.slice(eventsDir.length + 1)))).toBe(true);
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      blockedFrom: "planned",
+    }]);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("rejects replacement of the projects ancestor before target commit", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const projects = join(home, ".lcm", "projects");
+    const displacedProjects = `${projects}.displaced`;
+    makeDatabase(
+      join(projects, sourceHash, "db.sqlite"),
+      "projects-ancestor-replacement",
+      "content",
+      sourceHash,
+    );
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event !== "after-source-fence-commit-before-target-commit") return;
+        renameSync(projects, displacedProjects);
+        makePrivateFixtureDirectory(join(projects, targetHash), { recursive: true });
+      },
+    })).toThrow("private directory topology is not trusted");
+
+    expect(existsSync(join(projects, targetHash, "meta.json"))).toBe(false);
+    expect(existsSync(join(displacedProjects, sourceHash, "db.sqlite"))).toBe(true);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("rejects replacement of the retained LCM root before target commit", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const root = join(home, ".lcm");
+    const displacedRoot = join(home, ".lcm-displaced");
+    makeDatabase(
+      join(root, "projects", sourceHash, "db.sqlite"),
+      "root-ancestor-replacement",
+      "content",
+      sourceHash,
+    );
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event !== "after-source-fence-commit-before-target-commit") return;
+        renameSync(root, displacedRoot);
+        makePrivateFixtureDirectory(join(root, "projects", targetHash), { recursive: true });
+        makePrivateFixtureDirectory(join(root, "events"), { recursive: true });
+      },
+    })).toThrow("private directory topology is not trusted");
+
+    expect(existsSync(join(root, "projects", targetHash, "meta.json"))).toBe(false);
+    expect(existsSync(join(displacedRoot, "projects", sourceHash, "db.sqlite"))).toBe(true);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("rejects target mode drift after admission", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    makePrivateFixtureDirectory(targetDir, { recursive: true });
+    const sourceDb = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    makeDatabase(sourceDb, "target-mode-drift", "content", sourceHash);
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event === "after-source-fence-commit-before-target-commit") {
+          fsChmodSync(targetDir, 0o755);
+        }
+      },
+    })).toThrow("private directory topology is not trusted");
+
+    expect(statSync(targetDir).mode & 0o777).toBe(0o755);
+    expect(existsSync(sourceDb)).toBe(true);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it.each([
+    { label: "target project", relative: ["projects", "target"] as const },
+    { label: "shared events", relative: ["events"] as const },
+  ])("refuses an existing unsafe $label parent without repairing its mode", ({ relative }) => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      `unsafe-${relative[0]}`,
+      "content",
+      sourceHash,
+    );
+    const unsafePath = relative[0] === "events"
+      ? join(home, ".lcm", "events")
+      : join(home, ".lcm", "projects", targetHash);
+    makePrivateFixtureDirectory(unsafePath, { recursive: true });
+    fsChmodSync(unsafePath, 0o777);
+
+    expect(() => reconcileWorktrees(main)).toThrow("private directory mode is not trusted");
+    expect(statSync(unsafePath).mode & 0o777).toBe(0o777);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("refuses a symlinked target parent without mutating its destination", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "symlinked-target-parent",
+      "content",
+      sourceHash,
+    );
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const outside = join(home, "symlink-target");
+    makePrivateFixtureDirectory(outside);
+    symlinkSync(outside, targetDir);
+
+    expect(() => reconcileWorktrees(main)).toThrow();
+    expect(existsSync(join(outside, "meta.json"))).toBe(false);
+    expect(existsSync(join(outside, "db.sqlite"))).toBe(false);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("revalidates the target before each source merge", () => {
+    const { main, linked } = makeRepository(home);
+    const linkedTwo = join(home, "linked-two");
+    git(main, "worktree", "add", "-qb", "linked-two", linkedTwo);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    const sourceTwoHash = hashProjectPath(linkedTwo);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+      [sourceTwoHash]: { canonical: linkedTwo, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "first-source",
+      "first",
+      sourceHash,
+    );
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceTwoHash, "db.sqlite"),
+      "second-source",
+      "second",
+      sourceTwoHash,
+    );
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const displacedTarget = `${targetDir}.between-sources`;
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event, source) => {
+        if (event !== "before-source-main-merge" || source?.hash !== sourceTwoHash) return;
+        renameSync(targetDir, displacedTarget);
+        makePrivateFixtureDirectory(targetDir);
+      },
+    })).toThrow("private directory topology is not trusted");
+
+    expect(existsSync(join(targetDir, "db.sqlite"))).toBe(false);
+    expect(existsSync(join(displacedTarget, "db.sqlite"))).toBe(true);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+    expect(listProjectMapEntries()).toHaveProperty(sourceTwoHash);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("rejects target replacement before source archival and map publication", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourceDb = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    makeDatabase(sourceDb, "pre-archive-replacement", "content", sourceHash);
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const displacedTarget = `${targetDir}.before-archive`;
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event !== "after-merge-before-archive") return;
+        renameSync(targetDir, displacedTarget);
+        makePrivateFixtureDirectory(targetDir);
+      },
+    })).toThrow("private directory topology is not trusted");
+
+    expect(existsSync(sourceDb)).toBe(true);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      blockedFrom: "merged",
+    }]);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("revalidates a retained target while resuming source archival", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourceDb = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    makeDatabase(sourceDb, "archive-resume-replacement", "content", sourceHash);
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event === "after-merge-before-archive") throw new Error("pause after merge");
+      },
+    })).toThrow("pause after merge");
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const displacedTarget = `${targetDir}.archive-resume`;
+    let replaced = false;
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (replaced || event !== "before-source-archive-rename") return;
+        replaced = true;
+        renameSync(targetDir, displacedTarget);
+        makePrivateFixtureDirectory(targetDir);
+      },
+    })).toThrow("private directory topology is not trusted");
+
+    expect(existsSync(sourceDb)).toBe(true);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("revalidates an archived target immediately before map publication", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    makePrivateFixtureDirectory(targetDir, { recursive: true });
+    const journalDir = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(journalDir, { recursive: true });
+    writePrivateFixtureFile(
+      join(journalDir, `${targetHash}.json`),
+      JSON.stringify({
+        version: 1,
+        targetHash,
+        canonical,
+        sourceHashes: [sourceHash],
+        pendingSourceHashes: [sourceHash],
+        aliases: [canonical, linked],
+        createdAt: "2026-09-06T00:00:00.000Z",
+        updatedAt: "2026-09-06T00:00:00.000Z",
+        archiveAt: "2026-09-06T00:00:00.000Z",
+        phase: "archived",
+        backupPaths: [],
+        sourceComponents: {
+          [sourceHash]: { projectDb: false, eventsDb: false, patterns: false },
+        },
+      }),
+    );
+    const displacedTarget = `${targetDir}.before-map`;
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event !== "before-project-map-publication") return;
+        renameSync(targetDir, displacedTarget);
+        makePrivateFixtureDirectory(targetDir);
+      },
+    })).toThrow("private directory topology is not trusted");
+
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      blockedFrom: "archived",
+    }]);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("keeps dry-run target admission read-only", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "target-admission-dry-run",
+      "content",
+      sourceHash,
+    );
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const eventsDir = join(home, ".lcm", "events");
+
+    expect(reconcileWorktrees(main, { dryRun: true }).status).toBe("planned");
+    expect(existsSync(targetDir)).toBe(false);
+    expect(existsSync(eventsDir)).toBe(false);
+  });
+
+  it("permits expected target and events link-count changes during reconciliation", () => {
+    const { main, linked } = makeRepository(home);
+    const linkedTwo = join(home, "linked-two");
+    git(main, "worktree", "add", "-qb", "linked-two", linkedTwo);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    const sourceTwoHash = hashProjectPath(linkedTwo);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+      [sourceTwoHash]: { canonical: linkedTwo, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    for (const [hash, session] of [
+      [sourceHash, "link-count-one"],
+      [sourceTwoHash, "link-count-two"],
+    ] as const) {
+      makeDatabase(join(home, ".lcm", "projects", hash, "db.sqlite"), session, session, hash);
+      makeEventsV1(join(home, ".lcm", "events", `${hash}.db`), session);
+    }
+
+    expect(reconcileWorktrees(main).status).toBe("completed");
+    expect(statSync(join(home, ".lcm", "projects", targetHash)).mode & 0o777).toBe(0o700);
+    expect(statSync(join(home, ".lcm", "events")).mode & 0o777).toBe(0o700);
+    expect(listProjectMapEntries()).toEqual({
+      [targetHash]: {
+        canonical,
+        aliases: expect.arrayContaining([linked, linkedTwo]),
+      },
+    });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("closes every retained directory descriptor after successful reconciliation", async () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "retained-directory-close",
+      "content",
+      sourceHash,
+    );
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const isolated = await importReconciliationWithDirectoryFaults({ targetDir });
+    try {
+      expect(isolated.module.reconcileWorktrees(main).status).toBe("completed");
+      expect([...isolated.openDirectoryPaths]).toEqual(expect.arrayContaining([
+        join(home, ".lcm"),
+        join(home, ".lcm", "projects"),
+        targetDir,
+        join(home, ".lcm", "events"),
+      ]));
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+      expect(isolated.closedDirectoryPaths.toSorted())
+        .toEqual(isolated.openedDirectoryPaths.toSorted());
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("preserves a primary observer failure while closing every retained handle", async () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "primary-and-close-failure",
+      "content",
+      sourceHash,
+    );
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir,
+      failTargetClose: true,
+    });
+    try {
+      let caught: unknown;
+      try {
+        isolated.module.reconcileWorktrees(main, {
+          _observer: (event) => {
+            if (event === "before-source-main-merge") {
+              throw new Error("primary observer failure");
+            }
+          },
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(AggregateError);
+      expect(String((caught as AggregateError).cause)).toContain("primary observer failure");
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("reports retained target cleanup failure after an otherwise completed operation", async () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    makePrivateFixtureDirectory(join(home, ".lcm", "projects", sourceHash), { recursive: true });
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir,
+      failTargetClose: true,
+    });
+    try {
+      expect(() => isolated.module.reconcileWorktrees(main)).toThrow(
+        "reconciliation target directory cleanup failed",
+      );
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+      const journalPath = join(home, ".lcm", "reconciliations", `${targetHash}.json`);
+      const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+        phase: string;
+        blockedFrom?: string;
+        reason?: string;
+      };
+      expect(journal.phase).toBe("completed");
+      expect(journal).not.toHaveProperty("blockedFrom");
+      expect(journal).not.toHaveProperty("reason");
+      expect(listProjectMapEntries()).toEqual({
+        [targetHash]: { canonical, aliases: [linked] },
+      });
+      expect(statSync(join(home, ".lcm", "projects", sourceHash)).isFile()).toBe(true);
+      expect(readdirSync(join(home, ".lcm", "oldprojects"))).toHaveLength(1);
+
+      const linkedB = join(home, "linked-b");
+      git(main, "worktree", "add", "-qb", "linked-b", linkedB);
+      const sourceBHash = hashProjectPath(linkedB);
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+        [targetHash]: listProjectMapEntries()[targetHash],
+        [sourceBHash]: { canonical: linkedB, aliases: [] },
+      }, null, 2)}\n`);
+      clearProjectMapCache();
+      makeDatabase(
+        join(home, ".lcm", "projects", sourceBHash, "db.sqlite"),
+        "fresh-retry",
+        "fresh retry content",
+        sourceBHash,
+      );
+
+      expect(isolated.module.reconcileWorktrees(main).status).toBe("completed");
+      expect(listProjectMapEntries()).toEqual({
+        [targetHash]: { canonical, aliases: expect.arrayContaining([linked, linkedB]) },
+      });
+      expect(listProjectMapEntries()).not.toHaveProperty(sourceBHash);
+      const targetDb = new DatabaseSync(
+        join(home, ".lcm", "projects", targetHash, "db.sqlite"),
+        { readOnly: true },
+      );
+      expect(targetDb.prepare(
+        "SELECT session_id FROM conversations WHERE session_id = 'fresh-retry'",
+      ).get()).toEqual({ session_id: "fresh-retry" });
+      targetDb.close();
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("blocks new work after a completed journal when it fails before completion", async () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    makePrivateFixtureDirectory(join(home, ".lcm", "projects", sourceHash), { recursive: true });
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir: join(home, ".lcm", "projects", targetHash),
+    });
+    try {
+      expect(isolated.module.reconcileWorktrees(main).status).toBe("completed");
+      const linkedB = join(home, "linked-b");
+      git(main, "worktree", "add", "-qb", "linked-b", linkedB);
+      const sourceBHash = hashProjectPath(linkedB);
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+        [targetHash]: listProjectMapEntries()[targetHash],
+        [sourceBHash]: { canonical: linkedB, aliases: [] },
+      }, null, 2)}\n`);
+      clearProjectMapCache();
+      makeDatabase(
+        join(home, ".lcm", "projects", sourceBHash, "db.sqlite"),
+        "pre-completion-failure",
+        "content",
+        sourceBHash,
+      );
+      expect(() => isolated.module.reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event === "before-source-main-merge") {
+            throw new Error("injected pre-completion failure");
+          }
+        },
+      })).toThrow("injected pre-completion failure");
+      const journal = JSON.parse(readFileSync(
+        join(home, ".lcm", "reconciliations", `${targetHash}.json`),
+        "utf8",
+      )) as {
+        phase: string;
+        blockedFrom?: string;
+        reason?: string;
+        sourceHashes: string[];
+      };
+      expect(journal.phase).toBe("blocked");
+      expect(journal.blockedFrom).toBe("planned");
+      expect(journal.reason).toContain("injected pre-completion failure");
+      expect(journal.sourceHashes).toEqual([sourceHash, sourceBHash]);
+      expect(listProjectMapEntries()).toHaveProperty(sourceBHash);
+      expect(existsSync(join(home, ".lcm", "projects", sourceBHash, "db.sqlite"))).toBe(true);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("blocks new work when a stale completed journal is observed before discovery", async () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    makePrivateFixtureDirectory(join(home, ".lcm", "projects", sourceHash), { recursive: true });
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const isolated = await importReconciliationWithDirectoryFaults({ targetDir });
+    try {
+      expect(isolated.module.reconcileWorktrees(main).status).toBe("completed");
+      const linkedB = join(home, "linked-b");
+      git(main, "worktree", "add", "-qb", "linked-b", linkedB);
+      const sourceBHash = hashProjectPath(linkedB);
+      writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+        [targetHash]: listProjectMapEntries()[targetHash],
+        [sourceBHash]: { canonical: linkedB, aliases: [] },
+      }, null, 2)}\n`);
+      clearProjectMapCache();
+      makeDatabase(
+        join(home, ".lcm", "projects", sourceBHash, "db.sqlite"),
+        "early-stale-completed-failure",
+        "content",
+        sourceBHash,
+      );
+      const journalPath = join(home, ".lcm", "reconciliations", `${targetHash}.json`);
+      expect(() => isolated.module.reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event !== "after-map-preflight") return;
+          const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+            phase: string;
+            sourceHashes: string[];
+            pendingSourceHashes: string[];
+          };
+          expect(journal.phase).toBe("completed");
+          expect(journal.sourceHashes).toEqual([sourceHash]);
+          expect(journal.pendingSourceHashes).toEqual([]);
+          throw new Error("injected stale-completed precompletion failure");
+        },
+      })).toThrow("injected stale-completed precompletion failure");
+      const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+        phase: string;
+        blockedFrom?: string;
+        reason?: string;
+        sourceHashes: string[];
+        pendingSourceHashes: string[];
+      };
+      expect(journal.phase).toBe("blocked");
+      expect(journal.blockedFrom).toBe("planned");
+      expect(journal.reason).toContain("injected stale-completed precompletion failure");
+      expect(journal.sourceHashes).toEqual([sourceHash]);
+      expect(journal.pendingSourceHashes).toEqual([]);
+      expect(listProjectMapEntries()).toHaveProperty(sourceBHash);
+      expect(existsSync(join(home, ".lcm", "projects", sourceBHash, "db.sqlite"))).toBe(true);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("closes an existing target handle when its post-open entry check detects drift", async () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    makePrivateFixtureDirectory(join(home, ".lcm", "projects", sourceHash), { recursive: true });
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    makePrivateFixtureDirectory(targetDir);
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir,
+      replaceExistingTargetOnEntryCheck: true,
+    });
+    try {
+      expect(() => isolated.module.reconcileWorktrees(main)).toThrow(
+        "private directory topology is not trusted",
+      );
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+      expect(existsSync(`${targetDir}.entry-check-displaced`)).toBe(true);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it.each([
+    { label: "an EEXIST creation race", mkdirErrorCode: "EEXIST" as const, completes: true },
+    { label: "a non-EEXIST creation failure", mkdirErrorCode: "EACCES" as const, completes: false },
+    { label: "a mode-tightening failure", failTargetFchmod: true, completes: false },
+    {
+      label: "mode-tightening and child-close failures",
+      failTargetFchmod: true,
+      failTargetClose: true,
+      completes: false,
+    },
+  ])("handles $label without leaking target admission descriptors", async (fault) => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    makePrivateFixtureDirectory(join(home, ".lcm", "projects", sourceHash), { recursive: true });
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir,
+      ...(fault.mkdirErrorCode ? { mkdirErrorCode: fault.mkdirErrorCode } : {}),
+      ...(fault.failTargetFchmod ? { failTargetFchmod: true } : {}),
+      ...(fault.failTargetClose ? { failTargetClose: true } : {}),
+    });
+    try {
+      if (fault.completes) {
+        expect(isolated.module.reconcileWorktrees(main).status).toBe("completed");
+      } else {
+        expect(() => isolated.module.reconcileWorktrees(main)).toThrow(/injected/u);
+      }
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("aggregates snapshot database and directory close failures", async () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "snapshot-close-failures",
+      "content",
+      sourceHash,
+    );
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir,
+      failSnapshotDatabaseClose: true,
+      failSnapshotDirectoryClose: true,
+    });
+    try {
+      expect(() => isolated.module.reconcileWorktrees(main)).toThrow(
+        "normalized reconciliation snapshot cleanup failed",
+      );
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+      expect(isolated.closedDirectoryPaths.some(
+        (path) => path.includes(".lcm-reconciliation-snapshot-"),
+      )).toBe(true);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
   }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("rejects a non-file canonical metadata path before map publication", () => {
@@ -4813,7 +6259,7 @@ describe("worktree reconciliation", () => {
       "eventsDb component appeared after the reconciliation snapshot",
     );
     expect(existsSync(recreatedEvents)).toBe(true);
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("never archives patterns that changed after they were merged", () => {
     const { main, linked } = makeRepository(home);
@@ -5126,6 +6572,7 @@ describe("worktree reconciliation", () => {
         expect(listProjectMapEntries()).toHaveProperty(sourceHash);
       }
     },
+    FULL_SUITE_PROCESS_TEST_TIMEOUT_MS,
   );
 
   it("journals the map backup before publishing the folded project map", () => {
@@ -5160,7 +6607,7 @@ describe("worktree reconciliation", () => {
       [targetHash]: { canonical, aliases: [linked] },
     });
     expect(reconcileWorktrees(main).status).toBe("completed");
-  });
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
   it("waits for a competing first-use reconciliation and then re-reads state", () => {
     const { main, linked } = makeRepository(home);
@@ -5210,6 +6657,109 @@ describe("worktree reconciliation", () => {
       _lockRetryDelayMs: 10,
     }).status).toBe("completed");
     expect(holder.exitCode === 0 || holder.exitCode === null).toBe(true);
+  });
+
+  it.each([
+    { name: "frozen", nextWallNow: () => 1_000 },
+    { name: "backward", nextWallNow: () => 1 },
+    { name: "forward", nextWallNow: () => Number.MAX_SAFE_INTEGER },
+  ])("keeps reconciliation lock waits monotonic across a $name wall-clock", ({ nextWallNow }) => {
+    const { main } = makeReconciliationLockFixture(home);
+    let monotonicNow = 0;
+    let wallNow = 1_000;
+    const waits: number[] = [];
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+    const atomicsWait = vi.spyOn(Atomics, "wait").mockImplementation((_array, _index, _value, timeout) => {
+      waits.push(timeout ?? 0);
+      if (waits.length > 10) throw new Error("reconciliation retry guard exceeded");
+      wallNow = nextWallNow();
+      monotonicNow += timeout ?? 0;
+      return "timed-out";
+    });
+    try {
+      expect(() => reconcileWorktrees(main, {
+        _lockWaitMs: 125,
+        _lockRetryDelayMs: 50,
+      })).toThrow(PrivateMutationLockContentionError);
+      expect(waits).toEqual([50, 50, 25]);
+      expect(performanceNow).toHaveBeenCalled();
+      expect(dateNow).toHaveBeenCalled();
+    } finally {
+      atomicsWait.mockRestore();
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("caps reconciliation retry waits and floors the final millisecond", () => {
+    const { main } = makeReconciliationLockFixture(home);
+    let monotonicNow = 0;
+    const waits: number[] = [];
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const atomicsWait = vi.spyOn(Atomics, "wait").mockImplementation((_array, _index, _value, timeout) => {
+      waits.push(timeout ?? 0);
+      if (waits.length > 10) throw new Error("reconciliation retry guard exceeded");
+      monotonicNow += waits.length === 1 ? 1.5 : timeout ?? 0;
+      return "timed-out";
+    });
+    try {
+      expect(() => reconcileWorktrees(main, {
+        _lockWaitMs: 2,
+        _lockRetryDelayMs: 50,
+      })).toThrow(PrivateMutationLockContentionError);
+      expect(waits).toEqual([2, 1]);
+    } finally {
+      atomicsWait.mockRestore();
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("tries immediately when the reconciliation lock budget is zero", () => {
+    const { main } = makeReconciliationLockFixture(home);
+    const performanceNow = vi.spyOn(performance, "now").mockReturnValue(0);
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const atomicsWait = vi.spyOn(Atomics, "wait").mockImplementation(() => {
+      throw new Error("zero-budget reconciliation must not wait");
+    });
+    try {
+      expect(() => reconcileWorktrees(main, { _lockWaitMs: 0 })).toThrow(
+        PrivateMutationLockContentionError,
+      );
+      expect(atomicsWait).not.toHaveBeenCalled();
+    } finally {
+      atomicsWait.mockRestore();
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
+  });
+
+  it("succeeds after a monotonic retry even when the wall clock jumps forward", () => {
+    const { main, lock } = makeReconciliationLockFixture(home);
+    let monotonicNow = 0;
+    let waits = 0;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const dateNow = vi.spyOn(Date, "now").mockReturnValueOnce(1_000)
+      .mockReturnValue(Number.MAX_SAFE_INTEGER);
+    const atomicsWait = vi.spyOn(Atomics, "wait").mockImplementation((_array, _index, _value, timeout) => {
+      waits += 1;
+      rmSync(lock);
+      monotonicNow += timeout ?? 0;
+      return "timed-out";
+    });
+    try {
+      expect(reconcileWorktrees(main, {
+        _lockWaitMs: 100,
+        _lockRetryDelayMs: 50,
+      }).status).toBe("completed");
+      expect(waits).toBe(1);
+    } finally {
+      atomicsWait.mockRestore();
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
   });
 
   it("holds the project-map mutation fence from preflight through publication", () => {
@@ -5462,6 +7012,76 @@ describe("worktree reconciliation", () => {
     }, null, 2)}\n`);
     clearProjectMapCache();
     expect(reconcileWorktrees(main, { dryRun: true }).status).toBe("not-needed");
+  });
+
+  it.each([
+    { name: "frozen", wallNow: () => 1_000_000 },
+    { name: "backward", wallNow: () => 999_000 },
+    { name: "forward", wallNow: () => Number.MAX_SAFE_INTEGER },
+  ])("keeps catalogue cache TTL monotonic across a $name wall-clock", ({ wallNow }) => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const identity = { id: hashProjectPath(canonical), canonical };
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [identity.id]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const codexDir = join(home, ".codex");
+    let catalogueWalks = 0;
+    const discoveryObserver = (path: string) => {
+      if (path === join(codexDir, "worktrees")) catalogueWalks += 1;
+    };
+    let monotonicNow = 0;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    let currentWallNow = 1_000_000;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => currentWallNow);
+    try {
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("not-needed");
+      const afterInitial = catalogueWalks;
+      expect(afterInitial).toBeGreaterThan(0);
+
+      monotonicNow = 999;
+      currentWallNow = wallNow();
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("completed");
+      expect(catalogueWalks).toBe(afterInitial);
+
+      monotonicNow = 1_000;
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("completed");
+      const afterRenewal = catalogueWalks;
+      expect(afterRenewal).toBeGreaterThan(afterInitial);
+
+      monotonicNow = 1_999;
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("completed");
+      expect(catalogueWalks).toBe(afterRenewal);
+
+      monotonicNow = 2_000;
+      expect(ensureWorktreeProjectReconciled(main, identity, {
+        _cacheTtlMs: 1_000,
+        _codexDir: codexDir,
+        _discoveryObserver: discoveryObserver,
+      }).status).toBe("completed");
+      expect(catalogueWalks).toBeGreaterThan(afterRenewal);
+      expect(performanceNow).toHaveBeenCalled();
+    } finally {
+      performanceNow.mockRestore();
+      dateNow.mockRestore();
+    }
   });
 
   it("bounds catalogue cache freshness and invalidates on state, identity, and clear", () => {

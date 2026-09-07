@@ -1,12 +1,19 @@
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, relative, resolve } from "node:path";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { load as loadYaml } from "js-yaml";
+import { createRequire } from "node:module";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
 import fastUri from "fast-uri";
 import pkg from "../package.json";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
+const repositoryRequire = createRequire(import.meta.url);
+const sdkServer = repositoryRequire.resolve("@modelcontextprotocol/sdk/server/index.js");
+const ajvManifest = createRequire(sdkServer).resolve("ajv/package.json");
+const nestedFastUri = createRequire(ajvManifest)("fast-uri") as typeof fastUri;
 const PACKAGE_INVENTORY_TEST_TIMEOUT_MS = 45_000;
 const PACKAGE_COMMAND_TIMEOUT_MS = 30_000;
 const FRESH_BUILD_TEST_TIMEOUT_MS = 90_000;
@@ -38,7 +45,7 @@ function npmPackInventory(): string[] {
     "dist/src/storage/postgresql.js",
   );
   if (!existsSync(transcriptRuntime) || !existsSync(postgresqlRuntime)) {
-    execFileSync("npm", ["run", "build"], {
+    execFileSync("pnpm", ["run", "build"], {
       cwd: repositoryRoot,
       encoding: "utf8",
       stdio: "pipe",
@@ -86,13 +93,13 @@ describe("package.json", () => {
       "node scripts/verify-native-transcript-package.mjs && tsc --project tsconfig.native-transcript-package.json",
     );
     expect(pkg.scripts.postbuild).toContain(
-      "npm run verify:native-transcript-package",
+      "pnpm run verify:native-transcript-package",
     );
     expect(pkg.scripts).toHaveProperty(
       "verify:postgresql-package",
       "node scripts/verify-postgresql-package.mjs && tsc --project tsconfig.postgresql-package.json",
     );
-    expect(pkg.scripts.postbuild).toContain("npm run verify:postgresql-package");
+    expect(pkg.scripts.postbuild).toContain("pnpm run verify:postgresql-package");
   });
   it("has anthropic sdk as optional peer dep", () => expect(pkg.peerDependencies).toHaveProperty("@anthropic-ai/sdk"));
   it("keeps the bundled MCP build graph out of published consumer dependencies", () => {
@@ -101,13 +108,13 @@ describe("package.json", () => {
     expect(pkg.dependencies).not.toHaveProperty("fast-uri");
     expect(pkg.devDependencies).toHaveProperty("@modelcontextprotocol/sdk", "1.30.0");
     expect(pkg.devDependencies).toHaveProperty("body-parser", "2.3.0");
-    expect(pkg.devDependencies).toHaveProperty("fast-uri", "4.1.2");
+    expect(pkg.devDependencies).toHaveProperty("fast-uri", "4.1.4");
     expect(pkg.dependencies).toHaveProperty("@hono/node-server", "2.0.12");
     expect(pkg.scripts).toHaveProperty(
       "verify:consumer-topology",
       "node scripts/verify-consumer-topology.mjs",
     );
-    expect(pkg.scripts["release:verify"]).toContain("npm run verify:consumer-topology");
+    expect(pkg.scripts["release:verify"]).toContain("pnpm run verify:consumer-topology");
   });
   it("rejects ambiguous URI authorities before Node URL consumers", () => {
     const base = "https://allowed.example/";
@@ -128,15 +135,53 @@ describe("package.json", () => {
       new URL(legitimateReference, base).href,
     );
   });
+  it.each([
+    ["direct", fastUri],
+    ["AJV nested", nestedFastUri],
+  ])("rejects malformed ports through the %s fast-uri seam", (_label, uri) => {
+    expect(() => uri.serialize({
+      scheme: "http",
+      host: "trusted.example",
+      port: "@127.0.0.1:8124",
+      path: "/app",
+    })).toThrow("URI port is malformed.");
+  });
+  it.each([
+    ["direct", fastUri],
+    ["AJV nested", nestedFastUri],
+  ])("keeps bracket-like userinfo out of the host through the %s fast-uri seam", (
+    _label,
+    uri,
+  ) => {
+    const parsed = uri.parse("http://[@127.0.0.1/app");
+    expect(parsed).not.toHaveProperty("error");
+    expect(parsed).toMatchObject({
+      host: "127.0.0.1",
+      userinfo: "[",
+    });
+  });
+  it.each([
+    ["direct", fastUri],
+    ["AJV nested", nestedFastUri],
+  ])("rejects an unclosed bracket in the host through the %s fast-uri seam", (
+    _label,
+    uri,
+  ) => {
+    expect(uri.parse("http://user@[@127.0.0.1:8123/admin")).toHaveProperty(
+      "error",
+      "URI host is malformed.",
+    );
+  });
   it("does not have pi-ai", () => expect(pkg.dependencies).not.toHaveProperty("@mariozechner/pi-ai"));
   it("does not have pi-agent-core", () => expect(pkg.dependencies).not.toHaveProperty("@mariozechner/pi-agent-core"));
 
   it("does not use prepack (breaks npm install from git without node_modules)", () => {
     expect(pkg.scripts).not.toHaveProperty("prepack");
+    expect(pkg.scripts).not.toHaveProperty("prepare");
   });
 
   it("uses prepublishOnly for build (only runs during npm publish)", () => {
-    expect(pkg.scripts).toHaveProperty("prepublishOnly", "npm run build");
+    expect(pkg.scripts).toHaveProperty("prepublishOnly", "pnpm run build");
   });
 
   it("uses exact, reproducible runtime bundle tooling", () => {
@@ -161,6 +206,14 @@ describe("package.json", () => {
       const paths = npmPackInventory();
       expect(paths).toEqual(
         expect.arrayContaining([
+          "dist/lcm.mjs",
+          "dist/installer/setup.sh",
+          ...readdirSync(resolve(repositoryRoot, "src/prompts"))
+            .filter((file) => file.endsWith(".yaml"))
+            .map((file) => `dist/src/prompts/${file}`),
+          ...readdirSync(resolve(repositoryRoot, "src/storage/postgresql/migrations"))
+            .filter((file) => file.endsWith(".sql"))
+            .map((file) => `dist/src/storage/postgresql/migrations/${file}`),
           "dist/src/storage/native-transcripts.d.ts",
           "dist/src/storage/native-transcripts.js",
           "dist/src/storage/postgresql.d.ts",
@@ -211,7 +264,7 @@ describe("package.json", () => {
         writeFileSync(retiredTemplate, "stale asset that a fresh build must remove\n");
       }
 
-      execFileSync("npm", ["run", "build"], {
+      execFileSync("pnpm", ["run", "build"], {
         cwd: repositoryRoot,
         encoding: "utf8",
         stdio: "pipe",
@@ -255,6 +308,72 @@ describe("package.json", () => {
       for (const version of Object.values(dependencies)) {
         expect(version).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
       }
+    }
+  });
+});
+
+
+describe("pnpm development configuration", () => {
+  it("uses one integrity-pinned manager and root-only build-script policy", () => {
+    expect(pkg.packageManager).toBe(
+      "pnpm@10.34.5+sha512.a4ee05f2f73658255bd6a89859c065a45c28a57daefae2c893a168ee2b73168c37b91e83e57ea67654ad03f03031746430e8bce38e362e042605fb8abc80192e",
+    );
+    expect(pkg.engines).not.toHaveProperty("pnpm");
+    expect(pkg).not.toHaveProperty("overrides");
+    expect(loadYaml(readFileSync(join(repositoryRoot, "pnpm-workspace.yaml"), "utf8"))).toEqual({
+      packages: ["."],
+      overrides: {
+        "ajv>fast-uri": "3.1.7",
+        qs: "6.16.0",
+        "read-yaml-file": "2.1.0",
+      },
+      onlyBuiltDependencies: ["esbuild", "fsevents"],
+    });
+    expect(pkg.scripts["update:patterns"]).toBe(
+      "node --experimental-strip-types scripts/update-gitleaks-patterns.ts",
+    );
+    expect(existsSync(join(repositoryRoot, "package-lock.json"))).toBe(false);
+  });
+
+  it("locks only the patched fast-uri and qs graph", () => {
+    const lock = loadYaml(
+      readFileSync(join(repositoryRoot, "pnpm-lock.yaml"), "utf8"),
+    ) as { packages: Record<string, unknown> };
+    const packageKeys = Object.keys(lock.packages);
+    expect(packageKeys).toEqual(expect.arrayContaining([
+      "fast-uri@3.1.7",
+      "fast-uri@4.1.4",
+      "qs@6.16.0",
+    ]));
+    expect(packageKeys).not.toEqual(expect.arrayContaining([
+      "fast-uri@3.1.5",
+      "fast-uri@4.1.2",
+      "qs@6.15.2",
+    ]));
+  });
+
+  it("rejects a mismatched manager before installation without switching versions", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-manager-mismatch-"));
+    try {
+      writeFileSync(join(directory, ".npmrc"), readFileSync(join(repositoryRoot, ".npmrc")));
+      writeFileSync(join(directory, "package.json"), JSON.stringify({
+        private: true,
+        packageManager: pkg.packageManager.replace("10.34.5", "10.34.4"),
+      }));
+      const result = spawnSync("pnpm", ["install", "--offline", "--ignore-scripts"], {
+        cwd: directory,
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status).not.toBe(0);
+      expect(result.stdout + result.stderr).toContain(
+        "This project is configured to use v10.34.4 of pnpm. Your current pnpm is v10.34.5",
+      );
+      expect(existsSync(join(directory, "node_modules"))).toBe(false);
+      expect(existsSync(join(directory, "pnpm-lock.yaml"))).toBe(false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 });

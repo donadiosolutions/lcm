@@ -126,9 +126,10 @@ printf '%s\\n' '${launchdFixtureToken}'
     { mode: 0o755 },
   );
   writeFileSync(
-    join(binRoot, "npx"),
+    join(binRoot, "pnpm"),
     `#!/bin/sh
 set -eu
+[ "$#" -eq 4 ] && [ "$1" = "exec" ] && [ "$2" = "vitest" ] && [ "$3" = "run" ] && [ "$4" = "test/daemon/lifecycle-launchd.integration.test.ts" ] || exit 97
 printf '%s %s\\n' "$LCM_LAUNCHD_EVIDENCE_TOKEN" "$LCM_LAUNCHD_FIXTURE_LABEL" > "$LCM_LAUNCHD_RESOURCE_ROOT/launchd.label"
 chmod 0600 "$LCM_LAUNCHD_RESOURCE_ROOT/launchd.label"
 cat "$LCM_LAUNCHD_FIXTURE_OUTPUT"
@@ -204,6 +205,54 @@ const expectedCodecovRunSteps = [
 ];
 
 describe("CI workflow", () => {
+  it("bootstraps verified pnpm before exact store caches and fresh native installs", () => {
+    const setup = loadYaml(readFileSync(
+      new URL("../.github/actions/setup-ci/action.yml", import.meta.url), "utf8",
+    )) as { runs: { steps: WorkflowStep[] } };
+    for (const [steps, nodeVersion] of [
+      [setup.runs.steps, "22.20.0"],
+      [workflow.jobs["linux-systemd"].steps, "25.9.0"],
+      [workflow.jobs["macos-launchd"].steps, "25.9.0"],
+    ] as const) {
+      const nodeIndex = steps.findIndex((step) => step.uses?.startsWith("actions/setup-node@"));
+      const bootstrapIndex = steps.findIndex((step) => step.name === "Bootstrap verified pnpm");
+      const locateIndex = steps.findIndex((step) => step.name === "Locate pnpm store");
+      const cacheIndex = steps.findIndex((step) => step.name === "Cache pnpm store");
+      expect(bootstrapIndex).toBe(nodeIndex + 1);
+      expect(locateIndex).toBe(bootstrapIndex + 1);
+      expect(cacheIndex).toBe(locateIndex + 1);
+      expect(steps[nodeIndex]?.with).toEqual({ "node-version": nodeVersion });
+      const bootstrap = steps[bootstrapIndex]?.run ?? "";
+      expect(bootstrap).toContain('mktemp -d "$RUNNER_TEMP/lcm-pnpm.XXXXXX"');
+      expect(bootstrap).toContain('node scripts/bootstrap-pnpm.mjs --destination "$bootstrap_root/pnpm"');
+      expect(bootstrap).toContain('"$pnpm_bin" >> "$GITHUB_PATH"');
+      expect(bootstrap).toContain("npm_config_store_dir=%s");
+      expect(bootstrap).toContain('"$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"');
+      expect(steps[locateIndex]?.run).toContain('store_path="$(pnpm store path)"');
+      expect(steps[cacheIndex]).toMatchObject({
+        uses: "actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306",
+        with: {
+          path: "${{ steps.pnpm-store.outputs.path }}",
+          key: `pnpm-store-v1-\${{ runner.os }}-\${{ runner.arch }}-node-${nodeVersion}-\${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}`,
+        },
+      });
+      expect(steps[cacheIndex]?.with).not.toHaveProperty("restore-keys");
+      if (steps !== setup.runs.steps) {
+        const installIndex = steps.findIndex((step) => step.name === "Install dependencies");
+        expect(installIndex).toBe(cacheIndex + 1);
+        expect(steps[installIndex]?.run).toBe("pnpm install --frozen-lockfile");
+        expect(steps[installIndex]?.if).toBeUndefined();
+        expect(steps.some((step) => step.with?.path === "node_modules")).toBe(false);
+      }
+    }
+    const install = setup.runs.steps.find((step) => step.name === "Install or validate Node dependencies");
+    expect(install?.run).toContain("pnpm install --frozen-lockfile");
+    expect(install?.run).toContain("validate-node-modules node_modules");
+    expect(install?.run).toContain("write-node-modules-stamp node_modules");
+    expect(install?.run).not.toMatch(/(?:npm ls|pnpm list)/u);
+    expect(source).not.toMatch(/\bnpm (?:ci|run)|\bnpx\b/u);
+  });
+
   it("runs both CodeQL workflows for protected main and maintenance pull requests", () => {
     expect(codeqlWorkflow.on).toEqual({
       push: { branches: ["main"] },
@@ -302,7 +351,7 @@ describe("CI workflow", () => {
 
   it("publishes the single test report artifact after the core test run", () => {
     const steps = workflow.jobs.core.steps;
-    const testCiSteps = steps.filter((step) => step.run === "npm run test:ci");
+    const testCiSteps = steps.filter((step) => step.run === "pnpm run test:ci");
     expect(testCiSteps).toHaveLength(1);
     expect(testCiSteps[0]?.env).toEqual({
       LCM_TEST_ARTIFACT_ROOT:
@@ -363,10 +412,10 @@ describe("CI workflow", () => {
     expect(node).toEqual({
       name: "Set up Node.js 25.9.0",
       uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
-      with: { "node-version": "25.9.0", cache: "npm" },
+      with: { "node-version": "25.9.0" },
     });
-    expect(install?.run).toBe("npm ci");
-    expect(build?.run).toBe("npm run build");
+    expect(install?.run).toBe("pnpm install --frozen-lockfile");
+    expect(build?.run).toBe("pnpm run build");
     expect(integration?.env).toEqual({
       LCM_SYSTEMD_CREDENTIAL_INTEGRATION: "1",
       LCM_LIFECYCLE_SYSTEMD_INTEGRATION: "1",
@@ -375,6 +424,9 @@ describe("CI workflow", () => {
         "${{ runner.temp }}/lcm-systemd-${{ github.run_id }}-${{ github.run_attempt }}",
       LCM_LIFECYCLE_DAEMON_PORT: "48322",
       LCM_LIFECYCLE_EXPECTED_SCOPES: "1",
+      LCM_RUNTIME_PATHS_SYSTEMD_INTEGRATION: "1",
+      LCM_RUNTIME_PATHS_SYSTEMD_RUN_ROOT:
+        "${{ runner.temp }}/lcm-runtime-paths-${{ github.run_id }}-${{ github.run_attempt }}",
     });
     expect(integration?.run).toMatch(
       /systemd_state="\$\(systemctl --user is-system-running \|\| true\)"[\s\S]*case "\$systemd_state" in[\s\S]*running\|degraded\)\s*;;[\s\S]*\*\)[\s\S]*exit 1/u,
@@ -382,6 +434,23 @@ describe("CI workflow", () => {
     expect(integration?.run).toContain("test/daemon/lifecycle-isolation.test.ts");
     expect(integration?.run).toContain("test/daemon/lifecycle-systemd.integration.test.ts");
     expect(integration?.run).toContain("test/daemon/systemd-credential-loader.test.ts");
+    expect(integration?.run).toContain("test/runtime-paths-systemd.integration.test.ts");
+    expect(integration?.run).toContain(
+      "pnpm exec vitest run test/runtime-paths-systemd.integration.test.ts",
+    );
+    expect(
+      integration?.run.match(/pnpm exec vitest run test\/runtime-paths-systemd\.integration\.test\.ts\b/gu),
+    ).toHaveLength(1);
+    expect(
+      integration?.run.match(/pnpm exec vitest run test\/runtime-paths-systemd\.integration\.test\.ts[^\n]*--testNamePattern/gu),
+    ).toBeNull();
+    expect(integration?.run).not.toContain("PrivateTmp=no");
+    expect(integration?.run).not.toContain("--system");
+    expect(integration?.run).not.toContain("PrivatePIDs=yes");
+    expect(integration?.run).not.toContain("--scope");
+    expect(integration?.run).not.toContain("/tmp:/tmp");
+    expect(integration?.run).not.toContain("map.includes");
+    expect(integration?.run).not.toContain("65534");
     expect(integration?.run).toContain(
       '--testNamePattern "observes the real user-systemd LoadCredential modes"',
     );
@@ -438,11 +507,11 @@ describe("CI workflow", () => {
     expect(node).toEqual({
       name: "Set up Node.js 25.9.0",
       uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
-      with: { "node-version": "25.9.0", cache: "npm" },
+      with: { "node-version": "25.9.0" },
     });
-    expect(install?.run).toBe("npm ci");
+    expect(install?.run).toBe("pnpm install --frozen-lockfile");
     expect(descriptorProbe?.run).toBe(
-      'npx vitest run test/runtime-paths.test.ts --testNamePattern "uses actual platform semantics for nested legacy migration"',
+      'pnpm exec vitest run test/runtime-paths.test.ts --testNamePattern "uses actual platform semantics for nested legacy migration"',
     );
     expect(integration?.env).toEqual({
       LCM_LAUNCHD_INTEGRATION: "1",
@@ -462,7 +531,7 @@ describe("CI workflow", () => {
     expect(run).toContain('LCM_LAUNCHD_EVIDENCE_TOKEN');
     // The run root must be cleared before the worker starts so no leaked
     // pre-existing marker or stale captured output can satisfy the gate.
-    const vitestIndex = run.indexOf("npx vitest run test/daemon/lifecycle-launchd.integration.test.ts");
+    const vitestIndex = run.indexOf("pnpm exec vitest run test/daemon/lifecycle-launchd.integration.test.ts");
     const trapIndex = run.indexOf("trap cleanup EXIT");
     expect(trapIndex).toBeGreaterThanOrEqual(0);
     expect(vitestIndex).toBeGreaterThan(0);
@@ -591,7 +660,7 @@ describe("CI workflow", () => {
     // The current-run token is generated before the worker and is never
     // printed. A marker without that token cannot authorize cleanup.
     const tokenIndex = run.indexOf('evidence_token="$(uuidgen)"');
-    const workerIndex = run.indexOf("npx vitest run test/daemon/lifecycle-launchd.integration.test.ts");
+    const workerIndex = run.indexOf("pnpm exec vitest run test/daemon/lifecycle-launchd.integration.test.ts");
     expect(tokenIndex).toBeGreaterThanOrEqual(0);
     expect(tokenIndex).toBeLessThan(workerIndex);
     expect(run).not.toContain('echo "$evidence_token"');
