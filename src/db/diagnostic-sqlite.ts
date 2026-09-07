@@ -15,6 +15,12 @@ function failure(code: string): Error {
   return Object.assign(new Error("SQLite diagnostic unavailable"), { code });
 }
 
+function diagnosticSqliteExecArgv(workerPath: string): string[] {
+  return workerPath.endsWith(".ts")
+    ? ["--experimental-strip-types", "--experimental-sqlite"]
+    : ["--experimental-sqlite"];
+}
+
 /**
  * Native SQLite stepping cannot be interrupted by Worker.terminate(). Use one
  * owned process so cancellation kills the native query as well as its JS work.
@@ -61,7 +67,7 @@ export function readDiagnosticSqlite(options: ReadDiagnosticSqliteOptions): Prom
         "dist/src/db/diagnostic-sqlite-worker.js", "src/db/diagnostic-sqlite-worker.ts");
       const parents = request.parents ?? [];
       child = fork(workerPath, ["--lcm-diagnostic-sqlite-worker"], {
-        execPath: process.execPath, execArgv: [], env: {}, serialization: "advanced",
+        execPath: process.execPath, execArgv: diagnosticSqliteExecArgv(workerPath), env: {}, serialization: "advanced",
         stdio: ["ignore", "ignore", "ignore", "ipc", ...parents.map(parent => parent.fd)],
       });
       child.on("error", () => finish(failure("DIAGNOSTIC_SQLITE_WORKER")));
@@ -121,7 +127,7 @@ function createSession(signal: AbortSignal): DiagnosticSqliteSession {
         const workerPath = packageAsset(import.meta.url, root,
           "dist/src/db/diagnostic-sqlite-worker.js", "src/db/diagnostic-sqlite-worker.ts");
         child = fork(workerPath, ["--lcm-diagnostic-sqlite-session"], {
-          execPath: process.execPath, execArgv: [], env: {}, serialization: "advanced",
+          execPath: process.execPath, execArgv: diagnosticSqliteExecArgv(workerPath), env: {}, serialization: "advanced",
           stdio: ["ignore", "ignore", "ignore", "ipc"],
         });
         child.on("error", () => close(failure("DIAGNOSTIC_SQLITE_WORKER")));
