@@ -54,6 +54,8 @@ const expectedComponents = [
     paths: [
       "^src/config-manager\\.ts$",
       "^src/config-projection\\.ts$",
+      // PR #791 keeps generated Gitleaks hostname-literal normalization in
+      // this existing configuration-security owner.
       "^src/generated-patterns\\.ts$",
       "^src/home-parent-auth\\.ts$",
       "^src/legacy-names\\.ts$",
@@ -237,6 +239,7 @@ const expectedComponents = [
       // directory cleanup failures in this existing component.
       // #1107 and #1109 keep pattern and journal leaf authentication in this
       // existing component; no taxonomy, status, or policy change.
+      // #1059 keeps retained journal-parent publication in this existing owner.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
@@ -250,7 +253,8 @@ const expectedComponents = [
     name: "Integration - Service Managers and Legacy Migration",
     paths: [
       "^src/daemon/health-observation\\.ts$",
-      // #865 convergence and #966 birth-sample budgeting remain lifecycle-owned.
+      // #865/#966 convergence and birth budgeting remain lifecycle-owned;
+      // #1073 bounds legacy PID/token evidence within that same owner.
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",
@@ -537,12 +541,15 @@ describe("Codecov configuration", () => {
     // #948 keeps promote metadata parent-first admission, sampled read binding,
     // and retained identity revalidation in the daemon-routes component.
     // #964 keeps the path-bound root/projects/leaf metadata lifetime there too.
+    // #1062 keeps retained-parent create-if-absent filesystem semantics in
+    // configuration-security and promote collision handling in daemon-routes.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     // #814 fresh-root descriptor and pre-handoff content checks remain
     // configuration-security-owned.
     const expectedOwners = [
       // #866 export admission failures and sensitive result emission stay CLI-owned.
       // #1081 keeps unsupported export-format admission CLI-owned.
+      // #1088 keeps unsupported connector-list-format admission CLI-owned.
       // #978 keeps compact replacement runtime-digest admission CLI-owned.
       // #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
       ["bin/lcm.ts", "unit-cli"],
