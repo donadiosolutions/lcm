@@ -10,6 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -103,6 +104,19 @@ const config = loadDaemonConfig("/tmp/promote-metadata-files");
 const response = {} as never;
 const tempDirs: string[] = [];
 const fixtureRoots: string[] = [];
+
+async function withPatchedFs<T>(name: string, replacement: unknown, callback: () => Promise<T>): Promise<T> {
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const original = nodeFs[name];
+  nodeFs[name] = replacement;
+  syncBuiltinESMExports();
+  try {
+    return await callback();
+  } finally {
+    nodeFs[name] = original;
+    syncBuiltinESMExports();
+  }
+}
 
 function resetProject(tempDir: string): void {
   const paths = {
@@ -253,6 +267,64 @@ describe("promote metadata files", () => {
       error: "project directory topology changed before metadata publication",
     });
     expect(readFileSync(metadataPath, "utf8")).toBe(winner);
+  });
+
+  it("keeps an unknown rename outcome critical when temporary cleanup also fails", async () => {
+    const admittedDir = tempDirs[0]!;
+    const displacedDir = `${admittedDir}-displaced`;
+    const replacementDir = `${admittedDir}-replacement`;
+    tempDirs.push(displacedDir, replacementDir);
+    const metadataPath = join(admittedDir, "meta.json");
+    const original = `${JSON.stringify({ retained: "original" }, null, 2)}\n`;
+    const replacement = `${JSON.stringify({ retained: "replacement" }, null, 2)}\n`;
+    writeFileSync(metadataPath, original, { encoding: "utf8", mode: 0o600 });
+    mkdirSync(replacementDir, { mode: 0o700 });
+    writeFileSync(join(replacementDir, "meta.json"), replacement, { encoding: "utf8", mode: 0o600 });
+    const renameError = new Error("rename outcome unavailable");
+    const cleanupError = Object.assign(new Error("cleanup parent lookup failed"), { code: "EIO" });
+    const originalLstat = lstatSync;
+    let drifted = false;
+    let driftChecks = 0;
+    mocks.metadataWriteOperations.mockReturnValue({
+      rename: (from: string, to: string) => {
+        renameSync(from, to);
+        renameSync(admittedDir, displacedDir);
+        renameSync(replacementDir, admittedDir);
+        drifted = true;
+        throw renameError;
+      },
+    });
+
+    await withPatchedFs(
+      "lstatSync",
+      ((path: string, options?: unknown) => {
+        if (path === admittedDir && drifted && ++driftChecks > 1) {
+          renameSync(admittedDir, replacementDir);
+          renameSync(displacedDir, admittedDir);
+          drifted = false;
+          throw cleanupError;
+        }
+        return originalLstat(path, options as never);
+      }) as typeof lstatSync,
+      () => createPromoteHandler(config, makeMockStorageFactory({
+        projectExists: mocks.projectExists,
+        openProject: mocks.openProject,
+        close: mocks.closeFactory,
+      }))({} as never, response, JSON.stringify({ cwd: "/integration/project" })),
+    );
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "private file publication outcome is unknown because rename and retained parent topology checks failed",
+    });
+    expect(JSON.parse(readFileSync(metadataPath, "utf8"))).toMatchObject({
+      retained: "original",
+      cwd: "/integration/project",
+      lastPromote: expect.any(String),
+    });
+    expect(readFileSync(join(replacementDir, "meta.json"), "utf8")).toBe(replacement);
+    expect(readdirSync(admittedDir).filter(
+      name => /^\.meta\.json\..+\.tmp$/u.test(name),
+    )).toEqual([]);
   });
 
   it("reports post-link cleanup failure and retains the complete destination", async () => {

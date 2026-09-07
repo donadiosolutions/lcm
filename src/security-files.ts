@@ -512,6 +512,28 @@ function unlinkPrivateFileIfIdentityMatches(
   return true;
 }
 
+function privateFilePublicationCleanupFailure(
+  primaryError: unknown,
+  cleanupError: unknown,
+): unknown {
+  const aggregate = new AggregateError(
+    [primaryError, cleanupError],
+    "private file publication and temporary cleanup failed",
+    { cause: primaryError },
+  );
+  if (primaryError instanceof PrivateFilePublicationTopologyError) {
+    return new PrivateFilePublicationTopologyError(
+      primaryError.outcome,
+      primaryError.topologyError,
+      aggregate,
+    );
+  }
+  if (primaryError instanceof PrivateDirectoryTopologyError) {
+    return new PrivateDirectoryTopologyError(primaryError.message, { cause: aggregate });
+  }
+  return aggregate;
+}
+
 function assertPrivateTemporaryFileIdentity(
   path: string,
   expected: PrivateFileIdentity,
@@ -1123,14 +1145,19 @@ export function atomicWritePrivateFile(
         );
       }
     }
-  } finally {
+  } catch (primaryError) {
     if (ownsTempPath && tempIdentity !== undefined) {
-      unlinkPrivateFileIfIdentityMatches(
-        tempPath,
-        tempIdentity,
-        (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
-      );
+      try {
+        unlinkPrivateFileIfIdentityMatches(
+          tempPath,
+          tempIdentity,
+          (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+        );
+      } catch (cleanupError) {
+        throw privateFilePublicationCleanupFailure(primaryError, cleanupError);
+      }
     }
+    throw primaryError;
   }
 }
 

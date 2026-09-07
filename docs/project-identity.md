@@ -176,6 +176,13 @@ or pattern merges may already have completed before this late metadata check,
 so a journal blocked from the planned phase does not promise rollback; the
 durable merge markers make the explicit retry resumable.
 
+Atomic metadata replacement also keeps a publication or directory-topology
+failure primary when cleanup of its authenticated temporary file fails. The
+publication outcome and topology evidence remain available, with the temporary
+cleanup failure attached as secondary evidence, so daemon routes continue to
+fail closed on an unknown or untrusted publication outcome. Identity-checked
+cleanup never removes a replacement directory entry.
+
 Reconciliation also fingerprints every mapped path so a repaired or remounted
 worktree invalidates a completed discovery result. An `ENOTDIR` observation for
 an unrelated map entry is recorded as stable unavailable evidence instead of
