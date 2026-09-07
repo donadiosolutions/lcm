@@ -61,6 +61,10 @@ for the read-only diagnostic and deliberate replacement procedure.
 only `json`; unsupported values are rejected before export work or output
 writes begin.
 
+`lcm connectors list` writes text by default. Its optional `--format` value
+accepts `text` or `json`; unsupported values are rejected before connector
+inventory is read or output is written.
+
 An unknown command writes an error and the complete command list to the
 terminal, completes both outputs, and then exits with status 1.
 
@@ -89,6 +93,14 @@ daemon is the owner of a private publication lock, the gate and the selected
 read preparation retry only the lock-acquisition callback. Output, exit status,
 and export file writes happen once after the callback succeeds. Mutation and
 lifecycle commands keep their existing admission and migration behavior.
+
+If home or legacy-entry authentication fails and closing its already-open
+descriptor also fails, LCM preserves both errors in order: the authentication
+or validation failure remains the primary cause, and the close failure remains
+available as cleanup evidence. An entry absent before it is opened is still
+treated as absent. Correct the primary trust failure before retrying; the
+cleanup evidence may also indicate a filesystem or descriptor problem that
+needs attention.
 
 The first authenticated health probe used to identify a retryable daemon can
 take up to two seconds. After the first qualifying contention, retries share a
@@ -303,7 +315,11 @@ considered within that same deadline. A timeout is reported even if a probe stal
 cleanup does not replace the primary failure classification. A diagnostic
 probe owns and closes its own resources, while a daemon's shared pool stays
 open. `lcm stats --pool` reports safe pool counts and whether they came from
-the daemon or a diagnostic probe. PostgreSQL observations include configured
+the daemon, a local SQLite process, or a diagnostic probe. SQLite total and
+idle counts are captured before project and outbox reads. They may remain
+available when either read times out, provided the publication and configuration
+still authenticate; the timed-out project, schema, and outbox facts remain
+unverified. PostgreSQL observations include configured
 maximum, total, idle, and waiting connections and the observed failure latch.
 Daemon pool counts are observed independently before the remote probe starts.
 They may remain available when that probe times out or fails, provided the
@@ -311,6 +327,11 @@ publication and configuration still authenticate. A ready pool observation
 means its counts were available; it does not establish remote backend health.
 The snapshot retains its failure classification and recovery action.
 Unavailable counts are omitted rather than reported as zero.
+
+Unexpected failures at the daemon statistics routes retain the configured
+backend name when it is known. Their snapshots contain only the standard
+classification and fixed recovery action; raw errors and partial metrics are
+discarded.
 
 Numeric statistics such as token totals, compression, recall counters, and
 local outbox counts are included only when observed. Partial or unavailable
@@ -397,6 +418,14 @@ These failures produce a nonzero exit status and are not reported as “Nothing 
 compact.” A failed scan does not mark any session as processed. Back up the
 reported project database, resolve the SQLite or schema error, and rerun the
 command; the still-eligible sessions will be discovered again.
+
+Before opening a project database, `lcm compact --all` accepts `meta.json` only
+as an owner-local, single-link regular file of at most 1 MiB. Unsafe or malformed
+metadata is reported as `project metadata is unreadable or malformed`; missing
+metadata retains its separate missing-file message. A concurrent atomic
+publication can briefly fail the single-link or descriptor checks, so retry
+after that activity settles. Persistent failures require restoring trusted
+project metadata; the command does not weaken admission or repair the file.
 
 ### Managed-daemon recovery
 

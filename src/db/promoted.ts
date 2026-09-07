@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { JsonObject, JsonValue } from "../storage/contracts.js";
+import { parseStoredTimestamp } from "./stored-timestamp.js";
 
 // A fresh one-term fallback match clears the default prompt-search minimum of
 // two while still leaving room for recency, affinity, and feedback penalties.
@@ -609,7 +610,8 @@ export class PromotedStore {
     for (const row of rows) {
       const surfacingCount = surfacingMap.get(row.id) ?? 0;
       const usageCount = usageMap.get(row.id) ?? 0;
-      const daysSinceCreated = Math.floor((Date.now() - Date.parse(row.created_at)) / (24 * 60 * 60 * 1000));
+      const createdAtMs = parseStoredTimestamp(row.created_at).getTime();
+      const daysSinceCreated = Math.floor((Date.now() - createdAtMs) / (24 * 60 * 60 * 1000));
 
       const surfacedWithoutUse = surfacingCount >= opts.staleSurfacingWithoutUseLimit && usageCount === 0;
       const purelyOld = surfacingCount === 0 && usageCount === 0;

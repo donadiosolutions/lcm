@@ -92,9 +92,9 @@ On first startup after upgrading from older releases, lcm automatically migrates
 
 SQLite promoted-memory content must be ordinary SQLite `TEXT` without an
 embedded NUL character (`U+0000`). The Node SQLite binding can return only the
-prefix of a scalar value when a legacy row contains that byte, so LCM refuses
-to publish, search, list, export, recall, or replay it into the promoted FTS
-index.
+prefix of a scalar value when a legacy row contains that byte. The promoted
+memory store refuses to publish, search, list, export, recall, or replay these
+selected values into its FTS index.
 The refusal uses a fixed error and does not include the memory text, ID, path,
 or query. NUL characters in JSON-escaped tags remain supported.
 
@@ -122,6 +122,11 @@ The query is an operator diagnostic only. Correct each selected row with an
 intended replacement through the repository API, then verify reads and search
 results before returning the database to service. If no replacement is known,
 preserve the backup and leave the row refused.
+
+Legacy worktree reconciliation uses a separate import path. Inspect and
+deliberately repair affected source rows before reconciling worktrees; this
+store guard does not protect that import path. The reconciliation limitation
+is tracked in [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
 
 No data is sent to any Long Context Manager (LCM) server. There is no telemetry.
 An explicitly configured PostgreSQL backend is a user-operated remote-primary
@@ -155,9 +160,12 @@ prompt-cache key. The payload explicitly uses `tools: []`,
 `tool_choice: "none"`, `parallel_tool_calls: false`, `store: false`, and
 `stream: true` in the standard Responses dialect. Responses Lite instead uses
 an explicit empty `additional_tools` inventory and omits top-level `tools`.
-Both dialects discard inherited prompt/input/tools state; `include` and
-`stream_options` are omitted. Managed authentication is forwarded only through
-an explicit header allowlist, and a configured Codex `openai_base_url` is
+For the exact `gpt-5.3-codex-spark` model, the gateway removes the Lite marker
+and always emits the standard payload with top-level `tools: []`; it retains
+only a validated reasoning `effort`. Other models preserve Codex's selected
+dialect. Both dialects discard inherited prompt/input/tools state; `include`
+and `stream_options` are omitted. Managed authentication is forwarded only
+through an explicit header allowlist, and a configured Codex `openai_base_url` is
 authoritative for both bearer classes. When that value is absent or `null`,
 `sk-`-prefixed bearer credentials use the public OpenAI route while other
 managed bearers use the ChatGPT route, even when account ID is absent. A
@@ -170,6 +178,13 @@ raw request bodies, prompts, or upstream response bodies. If authentication,
 request shape, routing, streaming, or gateway shutdown is ambiguous, the
 compaction fails closed. The selected provider's retention policy still
 applies to the minimized request sent outside the machine.
+
+For an upstream HTTP 400, the gateway may inspect at most 64 KiB of response
+body to recognize one exact structured Spark protocol rejection. It does not
+render, log, persist, or relay those bytes. Malformed, oversized, interrupted,
+or unknown responses receive a fixed generic upstream category, and the body
+stream is canceled. Other upstream status bodies are not parsed for protocol
+classification.
 
 The daemon's PostgreSQL project routes store scrubbed messages, summaries,
 promoted memories, and related repository data only after local validation and
@@ -200,6 +215,10 @@ manual-store content and tags, and portable exports/imports. It combines the
 bundled Gitleaks rules, built-in patterns, global `security.sensitivePatterns`,
 and the project's `sensitive-patterns.txt`. Previously captured passive events
 are scrubbed again before promotion.
+
+Bundled rules scoped to a service hostname match that literal hostname,
+including its dots. A lookalike hostname is not treated or redacted as that
+service; add a custom pattern when your environment intentionally uses one.
 
 For PostgreSQL native transcripts, the embedded caller must explicitly
 load and pass both effective custom-pattern arrays: global
@@ -345,20 +364,37 @@ The `Security` section of the doctor output shows:
   state: a nested non-file URL remains intact, while standalone POSIX, Windows,
   and UNC paths retain redaction. The first backslash-based path also remains
   redacted across forward slashes and file-authority punctuation (semicolons,
-  commas, apostrophes, closing parentheses, and closing braces). Whitespace, a
-  freshly recognized URL, or other URL-ending punctuation ends that context. A
-  recognizable nested exact `file://` path is also redacted. An exact
+  commas, apostrophes, closing parentheses, and closing braces). Brackets in
+  this restarted tail are tracked independently. A slash inside a still-open
+  bracket is conservatively treated as a path marker even when it follows a
+  word character, and a matched closing bracket keeps the context active so a
+  later backslash-based path is also redacted. Once the brackets are balanced,
+  ordinary word-adjacent slash text remains unchanged. Whitespace, an unmatched
+  closing bracket, a freshly recognized URL, or other URL-ending punctuation
+  ends the context and clears its bracket state. A recognizable nested exact
+  `file://` path is also redacted. An exact
   case-insensitive `file://` literal immediately after `?`, `#`, `&`, or `=`
   inside any URL starts a nested file URL. Once an outer URL has entered its
   query or fragment, the same literal also starts a nested file URL after any
   character other than an ASCII letter, including query value wrappers,
-  punctuation, and digits. ASCII-letter-glued names such as `profile://` and
-  `xfile://` remain ordinary URL text. LCM preserves the outer URL and replaces
-  only the nested file path. When recognized nested `file://` literals are
-  adjacent within an outer URL query or fragment, each unquoted literal ends
-  the preceding redacted path and keeps its complete scheme for independent
-  redaction. A quoted path still consumes a nested scheme through its matching
-  closing quote. This bounded rule does not decode percent-encoded schemes or
+  punctuation, and digits. At top level and in fresh query or fragment state,
+  ASCII-letter-glued names such as `profile://` and `xfile://` remain ordinary
+  URL text. Once an unquoted absolute path has started, an adjacent token whose
+  suffix is the exact case-insensitive `file://` spelling is conservatively
+  absorbed into the same redacted span. Its authority, including optional
+  userinfo, port, or bracketed host, and its following path are removed. This
+  can remove a non-secret host or port glued to a private path, preventing the
+  private tail from remaining visible after one sanitization pass. Ordinary
+  authority delimiters still end the absorbed span; later word-glued text is
+  classified independently and can remain visible even when it resembles a
+  local path. An opening `(` instead resumes the already active path scan, so
+  its following text remains in the redacted span. LCM preserves the outer URL
+  and replaces only the nested file path. When
+  recognized nested `file://` literals are adjacent within an outer URL query
+  or fragment, each unquoted literal ends the preceding redacted path and keeps
+  its complete scheme for independent redaction. A quoted path still consumes
+  a nested scheme through its matching closing quote. This bounded rule does
+  not decode percent-encoded schemes or
   recognize `file://` text in an ordinary URL path. Outer-quoted pathless file
   URLs retain their conservative file-path classification through `?` and `#`,
   so a nested non-file URL in that quoted span may still be redacted as a path.

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServerResponse } from "node:http";
 import { loadDaemonConfig, type DaemonConfig } from "../../../src/daemon/config.js";
+import { sanitizeError } from "../../../src/daemon/safe-error.js";
 import type { ProjectStorage, StorageBackendFactory } from "../../../src/storage/index.js";
 import { StorageOperationError } from "../../../src/storage/errors.js";
 import type { RouteExecutionContext } from "../../../src/daemon/server.js";
@@ -78,6 +79,7 @@ vi.mock("../../../src/stats.js", async (importOriginal) => ({
 
 
 import { backendDiagnosticFailure } from "../../../src/storage/diagnostics.js";
+import { BackendPublicationJournalError } from "../../../src/storage/backend-publication.js";
 import { StatsUnavailableError } from "../../../src/stats.js";
 import { createDescribeHandler } from "../../../src/daemon/routes/describe.js";
 import { createExpandHandler } from "../../../src/daemon/routes/expand.js";
@@ -265,6 +267,28 @@ describe("persistence read route boundaries", () => {
       expanded: null,
       error: "expand failed for https://outer.test/x?q=file://h.invalid<path>file://h2.invalid<path>",
     });
+  });
+
+  it("absorbs an adjacent file suffix in describe wire errors", async () => {
+    const message =
+      "read failed for https://outer.test/x?q=file://h.invalid/Users/afile://h2.invalid/Users/b";
+    const expected = "read failed for https://outer.test/x?q=file://h.invalid<path>";
+    mocks.describe.mockRejectedValueOnce(new Error(message));
+
+    expect(sanitizeError(message)).toBe(expected);
+    await invoke(createDescribeHandler(config), { nodeId: "n", cwd: "/ok" });
+    expectLast(200, { node: null, error: expected });
+  });
+
+  it("absorbs an adjacent file suffix in expand wire errors", async () => {
+    const message = "expand failed for file://host.invalid?x=a\\Users\\a-file://h2.invalid/Users/b";
+    const expected = "expand failed for file://host.invalid?x=a<path>";
+    mocks.expand.mockRejectedValueOnce(new Error(message));
+
+    expect(sanitizeError(message)).toBe(expected);
+    await invoke(createExpandHandler(config), { nodeId: "n", cwd: "/ok" });
+    expect(mocks.expand).toHaveBeenCalled();
+    expectLast(200, { expanded: null, error: expected });
   });
 
   it("sanitizes adjacent post-bracket paths in describe read errors", async () => {
@@ -806,6 +830,42 @@ describe("persistence read route boundaries", () => {
     await invoke(createStatsHandler(), {});
     expectLast(200, { backendDiagnostics: diagnostics });
     expect(JSON.stringify(mocks.end.mock.calls)).not.toContain("private diagnostic canary");
+  });
+
+  it("preserves configured backend identity across sanitized route failures", async () => {
+    const unavailableDiagnostics = backendDiagnosticFailure(new Error("private unavailable"), "sqlite");
+    const handlers = [
+      ["stats", createStatsHandler],
+      ["pool", createPoolStatsHandler],
+    ] as const;
+    const factories = [
+      ["sqlite", injectedFactory()],
+      ["postgresql", {...injectedFactory(),backend:"postgresql"} as StorageBackendFactory],
+      ["unavailable", undefined],
+    ] as const;
+    const failures = [
+      new Error("private error canary"),
+      {private:"non-error canary"},
+      new BackendPublicationJournalError("unexpected-state", "private publication canary"),
+    ];
+    for (const [_route, createHandler] of handlers) {
+      for (const [backend, factory] of factories) {
+        for (const failure of failures) {
+          mocks.stats.mockImplementationOnce(() => { throw failure; });
+          await invoke(createHandler("/configured-home", factory), {});
+          const expected = backendDiagnosticFailure(failure, backend);
+          expectLast(200, {backendDiagnostics:expected});
+          expect(expected.metrics).toBeUndefined();
+          expect(JSON.stringify(mocks.end.mock.calls.at(-1))).not.toMatch(/private|canary/);
+        }
+      }
+    }
+
+    for (const createHandler of [createStatsHandler,createPoolStatsHandler]) {
+      mocks.stats.mockImplementationOnce(() => { throw new StatsUnavailableError(unavailableDiagnostics); });
+      await invoke(createHandler("/configured-home", injectedFactory()), {});
+      expectLast(200, {backendDiagnostics:unavailableDiagnostics});
+    }
   });
 
   it("covers layered search validation, filtering, failures, and disabled layers", async () => {

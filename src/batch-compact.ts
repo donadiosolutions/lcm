@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, existsSync } from "node:fs";
+import { readdirSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { runLcmMigrations } from "./db/migration.js";
 import { closeLcmConnection, getLcmConnection } from "./db/connection.js";
@@ -15,6 +15,8 @@ import { normalizeProjectPath, projectMapPathsForHash } from "./project-map.js";
 import { loadDaemonConfig, type LlmApiMode, type LlmInvocationRequestPolicy, type LlmReasoningEffort, type LlmRetryPolicy } from "./daemon/config.js";
 import { MANUAL_COMPACT_FRESH_TAIL_COUNT } from "./compaction.js";
 import { selectStorageBackendForConfig } from "./storage/backend.js";
+import { MAX_PROJECT_METADATA_BYTES } from "./daemon/project.js";
+import { readBoundedRegularFile } from "./security-files.js";
 
 export interface UncompactedConversation {
   projectDir: string;
@@ -253,7 +255,12 @@ function discoverUncompacted(minTokens: number, readOnly = false, cwdFilter?: st
     }
     let metadata: unknown;
     try {
-      metadata = JSON.parse(readFileSync(metaPath, "utf-8")) as unknown;
+      metadata = JSON.parse(readBoundedRegularFile(metaPath, {
+        allowedRoot: projDir,
+        maxBytes: MAX_PROJECT_METADATA_BYTES,
+        expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+        requireSingleLink: true,
+      })) as unknown;
     } catch {
       if (metadataFailureMatchesCwdFilter(entry.name, cwdFilter)) {
         failures.push({ target: entry.name, message: "project metadata is unreadable or malformed" });

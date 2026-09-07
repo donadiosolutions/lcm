@@ -84,17 +84,27 @@ The database and passive-learning sidecar remain under:
 When a project hash is absent from `~/.lcm/map.json`, project listing and
 identity resolution can recover its canonical path from
 `~/.lcm/projects/<local-hash>/meta.json`. LCM accepts this metadata only from a
-regular file with one hard link. On platforms that expose the effective user
-ID, the file must also belong to that user. Ownership and link-count checks
-happen before LCM consumes the file contents.
+regular file no larger than 1 MiB with one hard link. On platforms that expose
+the effective user ID, the file must also belong to that user. Ownership,
+link-count, type, containment, and size checks happen before LCM consumes the
+file contents. Symlinks, FIFOs, directories, oversized files, foreign-owner
+files, and multiply linked files are rejected.
 
-Foreign-owner and multiply linked metadata is silently omitted from discovery;
-unrelated valid projects are still discovered, and existing map entries remain
-unchanged. LCM does not repair rejected metadata automatically. If a legitimate
-project is missing, restore an owner-local, single-link `meta.json` from trusted
-project state and rerun the project command. Avoid sharing the file or its
-`cwd` value in diagnostics unless needed, because local paths can identify
-users, organizations, and repositories; see [Privacy and data handling](privacy.md).
+These checks also protect Claude all-project imports, SQLite batch-compaction
+discovery, and the daemon's periodic Claude transcript scan. An import silently
+skips rejected metadata for that run, the periodic daemon scan tries again at
+its next interval, and `lcm compact --all` reports the project metadata as
+unreadable or malformed while continuing with trusted siblings. Existing map
+entries remain unchanged. LCM does not repair rejected metadata automatically.
+
+An atomic metadata publication can be rejected briefly while it has two links
+or while its descriptor metadata is changing. This is deliberate fail-closed
+behavior. Retry `lcm compact --all` after concurrent project activity settles;
+a persistently unsafe file must be restored as an owner-local, single-link
+`meta.json` from trusted project state before discovery can use it. Avoid
+sharing the file or its `cwd` value in diagnostics unless needed, because local
+paths can identify users, organizations, and repositories; see
+[Privacy and data handling](privacy.md).
 
 PostgreSQL adds an explicit identity layer. A registered machine has a UUIDv7,
 and a local project may be bound to a PostgreSQL project UUIDv7. The binding
@@ -130,8 +140,30 @@ remains safe.
 Each operation has an atomically replaced journal under
 `~/.lcm/reconciliations/`. The journal records discovery evidence, completed
 merge work, backup locations, aliases, and the last durable phase so an
-interrupted operation resumes instead of repeating committed work. LCM
-permanently fences legacy project and event databases against writes before
+interrupted operation resumes instead of repeating committed work. During each
+locked real attempt, LCM retains the authenticated LCM root and reconciliation
+journal directory, including while recording a blocked state. Each journal
+write verifies that retained parent before and after publication and fails
+closed when it detects identity or private-mode drift. Each retry authenticates
+a fresh directory chain; completed fast paths and `--dry-run` do not acquire
+writable journal state. Retryable lock contention is retried only while the
+retained chain remains stable. If contention coincides with journal-parent
+drift, LCM reports unsafe storage instead of retrying into the replacement;
+preserve the displaced entries and run `lcm doctor` before retrying.
+
+After source archival and project-map publication, a failure before the
+completed journal is durably published records a blocked journal from the
+archived phase and preserves the pending source hashes and backup evidence. A
+failure after durable completed publication leaves that completed journal in
+place, so a retry can return the published result without repeating merge or
+archival work. If an atomic completed-journal replacement reports an ambiguous
+topology outcome, LCM attempts to record a blocked result using the retained
+archived evidence. That recording can also fail if the retained parent is no
+longer trusted. The completed replacement may already exist, so preserve the
+journal and backups, run `lcm doctor`, and inspect the reported errors before
+retrying.
+
+LCM permanently fences legacy project and event databases against writes before
 committing their data to the canonical stores. After the merged databases pass
 foreign-key and FTS verification, the legacy project directory and event
 database sidecars move to timestamped private backups under
@@ -169,12 +201,23 @@ link (`file has multiple hard links`). A deliberate user-created hard link also
 blocks reconciliation by design. Preserve the refused inode for inspection,
 then copy its verified content into a newly created owner-only temporary file in
 the target directory and atomically replace the `meta.json` directory entry.
+Before replacement, LCM serializes the complete canonical metadata once and
+requires that serialized form, including its trailing newline, to fit within
+the 1 MiB UTF-8 limit. An oversized candidate fails with `project metadata
+exceeds size limit` and leaves the existing metadata file unchanged.
 Copying over the existing hard-linked path does not break the link and does not
 repair the refusal. Rerun `lcm project reconcile-worktrees` after replacement;
 `lcm doctor` reports the blocked journal but does not retry it. Target database
 or pattern merges may already have completed before this late metadata check,
 so a journal blocked from the planned phase does not promise rollback; the
 durable merge markers make the explicit retry resumable.
+
+Atomic metadata replacement also keeps a publication or directory-topology
+failure primary when cleanup of its authenticated temporary file fails. The
+publication outcome and topology evidence remain available, with the temporary
+cleanup failure attached as secondary evidence, so daemon routes continue to
+fail closed on an unknown or untrusted publication outcome. Identity-checked
+cleanup never removes a replacement directory entry.
 
 Reconciliation also fingerprints every mapped path so a repaired or remounted
 worktree invalidates a completed discovery result. An `ENOTDIR` observation for

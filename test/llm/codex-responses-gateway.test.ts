@@ -32,6 +32,9 @@ const LITE_DELTA_SSE = [
   "",
   "",
 ].join("\n");
+const SPARK_MODEL = "gpt-5.3-codex-spark";
+const SPARK_LITE_REJECTION =
+  "This model is not supported when using X-OpenAI-Internal-Codex-Responses-Lite.";
 
 type Capture = {
   body: unknown;
@@ -211,6 +214,10 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(() => utils.validatedReasoning({ effort: "bad" })).toThrow();
     expect(() => utils.validatedReasoning({ summary: "bad" })).toThrow();
     expect(() => utils.validatedReasoning({ context: "bad" })).toThrow();
+    expect(() => utils.buildPayload("prompt", {
+      model: SPARK_MODEL,
+      reasoning: { summary: "bad" },
+    }, true)).toThrow();
     expect(utils.validatedServiceTier(undefined)).toBeUndefined();
     expect(utils.validatedServiceTier("default")).toBe("default");
     expect(() => utils.validatedServiceTier("bad")).toThrow();
@@ -308,6 +315,46 @@ describe("Codex Responses zero-tools gateway", () => {
         { type: "message", role: "user" },
       ],
     });
+    expect(utils.buildPayload("prompt", {
+      model: SPARK_MODEL,
+      reasoning: { summary: "auto", context: "current_turn" },
+    }, true)).toEqual({
+      model: SPARK_MODEL,
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "prompt" }],
+      }],
+      tool_choice: "none",
+      parallel_tool_calls: false,
+      store: false,
+      stream: true,
+      tools: [],
+    });
+
+    const signal = new AbortController().signal;
+    await expect(utils.readBoundedUpstreamError(null, signal)).resolves.toBeUndefined();
+    await expect(utils.readBoundedUpstreamError(
+      new Response("[]").body as ReadableStream<Uint8Array>,
+      signal,
+    )).resolves.toBeUndefined();
+
+    for (const cancel of [
+      vi.fn(() => Promise.reject(new Error("cancel rejected"))),
+      vi.fn(() => { throw new Error("cancel threw"); }),
+    ]) {
+      const releaseLock = vi.fn();
+      const reader = {
+        read: vi.fn().mockResolvedValue({ done: true, value: undefined }),
+        cancel,
+        releaseLock,
+      };
+      await expect(utils.readBoundedUpstreamError({
+        getReader: () => reader,
+      } as unknown as ReadableStream<Uint8Array>, signal)).resolves.toBeUndefined();
+      expect(releaseLock).toHaveBeenCalledOnce();
+    }
+    await new Promise<void>(resolve => setImmediate(resolve));
   });
 
   it("covers backpressure, abort, and safe error response paths", async () => {
@@ -501,6 +548,71 @@ describe("Codex Responses zero-tools gateway", () => {
     );
   });
 
+  it.each([
+    ["spaced sentinel", "data: [DONE]\n\n"],
+    ["compact sentinel", "data:[DONE]\n\n"],
+    ["CRLF sentinel", "data: [DONE]\r\n\r\n"],
+    ["leading and trailing blank lines", "\n\ndata: [DONE]\n\n\n"],
+    ["unterminated sentinel", "data: [DONE]"],
+    ["one-byte prefix", "d"],
+    ["field prefix", "data:"],
+    ["value prefix", "data: [DO"],
+  ])("accepts one optional post-completion %s in the terminal chunk", (_label, suffix) => {
+    const observer = __codexResponsesGatewayTestUtils.createResponsesSseObserver();
+    observer.observe(new TextEncoder().encode(`${COMPLETED_SSE}${suffix}`));
+    expect(observer.terminalState).toBe("completed");
+  });
+
+  it("accepts a legal sentinel remainder when the completion event spans chunks", () => {
+    const observer = __codexResponsesGatewayTestUtils.createResponsesSseObserver();
+    const encoder = new TextEncoder();
+    observer.observe(encoder.encode(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"status":"compl',
+    ));
+    observer.observe(encoder.encode('eted"}}\n\ndata: [DONE]\n\n'));
+    expect(observer.terminalState).toBe("completed");
+  });
+
+  it("scans a large newline-only terminal remainder without rejecting completion", () => {
+    const observer = __codexResponsesGatewayTestUtils.createResponsesSseObserver();
+    observer.observe(new TextEncoder().encode(`${COMPLETED_SSE}${"\n".repeat(900_000)}`));
+    expect(observer.terminalState).toBe("completed");
+  });
+
+  it.each([
+    ["ordinary text", "post-terminal"],
+    ["second completion", COMPLETED_SSE],
+    ["failed event", 'event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed"}}\n\n'],
+    ["incomplete event", 'event: response.incomplete\ndata: {"type":"response.incomplete","response":{"status":"incomplete"}}\n\n'],
+    ["malformed JSON", "data: not-json\n\n"],
+    ["bare sentinel", "[DONE]"],
+    ["sentinel suffix", "data: [DONE] extra"],
+    ["two sentinels", "data: [DONE]\n\ndata: [DONE]\n\n"],
+    ["comment", ": comment"],
+    ["id field", "id: 1"],
+    ["retry field", "retry: 1"],
+    ["event field", "event: response.completed"],
+    ["quoted sentinel", 'data: "[DONE]"'],
+    ["case-varied sentinel", "data: [done]"],
+  ])("rejects a visible post-completion %s", (_label, suffix) => {
+    const observer = __codexResponsesGatewayTestUtils.createResponsesSseObserver();
+    observer.observe(new TextEncoder().encode(`${COMPLETED_SSE}${suffix}`));
+    expect(observer.terminalState).toBe("failed");
+  });
+
+  it("never lets a sentinel establish or repair semantic completion", () => {
+    const encoder = new TextEncoder();
+    const beforeCompletion = __codexResponsesGatewayTestUtils.createResponsesSseObserver();
+    beforeCompletion.observe(encoder.encode("data: [DONE]\n\n"));
+    expect(beforeCompletion.terminalState).toBe("failed");
+
+    const failed = __codexResponsesGatewayTestUtils.createResponsesSseObserver();
+    failed.observe(encoder.encode(
+      'event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed"}}\n\ndata: [DONE]\n\n',
+    ));
+    expect(failed.terminalState).toBe("failed");
+  });
+
   it("ends terminal relay without entering ordinary backpressure or awaiting upstream cancellation", async () => {
     const utils = __codexResponsesGatewayTestUtils;
     const encoder = new TextEncoder();
@@ -564,7 +676,7 @@ describe("Codex Responses zero-tools gateway", () => {
     const queuedSuffix = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(encoder.encode(COMPLETED_SSE));
-        controller.enqueue(new Uint8Array([0xc3]));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       },
       cancel() {
         queuedSuffixCancelled = true;
@@ -578,6 +690,24 @@ describe("Codex Responses zero-tools gateway", () => {
     )).resolves.toBeUndefined();
     expect(terminalOnlyResponse.end).toHaveBeenCalledWith(encoder.encode(COMPLETED_SSE));
     expect(queuedSuffixCancelled).toBe(true);
+  });
+
+  it("relays a coalesced optional sentinel unchanged and latches gateway completion", async () => {
+    const terminal = `${COMPLETED_SSE}data: [DONE]\n\n`;
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response(terminal, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+    gateways.push(gateway);
+
+    const response = await fetchGateway(gateway);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(terminal);
+    await expect(gateway.waitForCompletion()).resolves.toBeUndefined();
+    expect(gateway.requestCompleted).toBe(true);
   });
 
   it("keeps semantic completion when downstream close fires synchronously during terminal end", async () => {
@@ -820,10 +950,11 @@ describe("Codex Responses zero-tools gateway", () => {
   it.each([
     [429, "usage"],
     [401, "authentication"],
-    [400, undefined],
-    [403, undefined],
-    [404, undefined],
-  ] as const)("latches only the safe upstream category for HTTP %s", async (status, category) => {
+    [400, "upstream-request"],
+    [403, "upstream-request"],
+    [404, "upstream-request"],
+    [500, "upstream-request"],
+  ] as const)("latches a safe upstream category for HTTP %s", async (status, category) => {
     const { url: upstreamUrl } = await listenSimpleUpstream((_req, res) => {
       res.writeHead(status, { "content-type": "text/plain" });
       res.end("GPT-5.3-Codex-Spark 4:27 AM Bearer upstream-secret");
@@ -840,6 +971,225 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(responseBody).not.toContain("GPT-5.3-Codex-Spark");
   });
 
+  it("classifies only the exact structured Spark Lite rejection and keeps the response private", async () => {
+    const canary = "Bearer upstream-canary";
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+      error: {
+        message: SPARK_LITE_REJECTION,
+        type: "invalid_request_error",
+        code: "invalid_request_error",
+        param: "model",
+      },
+      canary,
+    }), { status: 400, headers: { "content-type": "application/json" } }));
+    const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: fetchImpl });
+    gateways.push(gateway);
+
+    const response = await fetch(`${gateway.baseUrl}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer managed-token",
+        "X-OpenAI-Internal-Codex-Responses-Lite": "true",
+      },
+      body: JSON.stringify({ model: SPARK_MODEL }),
+    });
+    const responseBody = await response.text();
+    expect(response.status).toBe(502);
+    expect(responseBody).toBe("codex responses gateway request failed\n");
+    expect(responseBody).not.toContain(canary);
+    expect(responseBody).not.toContain(SPARK_LITE_REJECTION);
+    expect(gateway.upstreamFailureCategory).toBe("model-protocol");
+
+    const replay = await fetchGateway(gateway);
+    expect(replay.status).toBe(409);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["near-miss message", {
+      error: {
+        message: SPARK_LITE_REJECTION.toLowerCase(),
+        type: "invalid_request_error",
+        code: "invalid_request_error",
+        param: "model",
+      },
+    }, SPARK_MODEL, true],
+    ["wrong code", {
+      error: {
+        message: SPARK_LITE_REJECTION,
+        type: "invalid_request_error",
+        code: "unsupported_model",
+        param: "model",
+      },
+    }, SPARK_MODEL, true],
+    ["wrong type", {
+      error: {
+        message: SPARK_LITE_REJECTION,
+        type: "request_error",
+        code: "invalid_request_error",
+        param: "model",
+      },
+    }, SPARK_MODEL, true],
+    ["wrong param", {
+      error: {
+        message: SPARK_LITE_REJECTION,
+        type: "invalid_request_error",
+        code: "invalid_request_error",
+        param: "input",
+      },
+    }, SPARK_MODEL, true],
+    ["non-object error", { error: SPARK_LITE_REJECTION }, SPARK_MODEL, true],
+    ["unrelated nesting", {
+      detail: {
+        message: SPARK_LITE_REJECTION,
+        type: "invalid_request_error",
+        code: "invalid_request_error",
+        param: "model",
+      },
+    }, SPARK_MODEL, true],
+    ["non-Spark model", {
+      error: {
+        message: SPARK_LITE_REJECTION,
+        type: "invalid_request_error",
+        code: "invalid_request_error",
+        param: "model",
+      },
+    }, "gpt-5.4", true],
+    ["standard Spark input", {
+      error: {
+        message: SPARK_LITE_REJECTION,
+        type: "invalid_request_error",
+        code: "invalid_request_error",
+        param: "model",
+      },
+    }, SPARK_MODEL, false],
+  ] as const)("keeps a 400 %s on the generic upstream category", async (_label, errorBody, model, lite) => {
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response(JSON.stringify(errorBody), { status: 400 }),
+    });
+    gateways.push(gateway);
+    const response = await fetch(`${gateway.baseUrl}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer managed-token",
+        ...(lite ? { "X-OpenAI-Internal-Codex-Responses-Lite": "true" } : {}),
+      },
+      body: JSON.stringify({ model }),
+    });
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("codex responses gateway request failed\n");
+    expect(gateway.upstreamFailureCategory).toBe("upstream-request");
+  });
+
+  it.each(["", "not-json", "{\"error\":"])(
+    "degrades an incomplete or malformed 400 body to a generic upstream category",
+    async (body) => {
+      const gateway = await createCodexResponsesGateway({
+        prompt: PROMPT,
+        _fetch: async () => new Response(body, { status: 400 }),
+      });
+      gateways.push(gateway);
+      const response = await fetchGateway(gateway);
+      expect(response.status).toBe(502);
+      expect(await response.text()).toBe("codex responses gateway request failed\n");
+      expect(gateway.upstreamFailureCategory).toBe("upstream-request");
+    },
+  );
+
+  it("degrades a 400 body reader failure to a generic upstream category", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error("UPSTREAM-CANARY"));
+      },
+    });
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response(body, { status: 400 }),
+    });
+    gateways.push(gateway);
+    const response = await fetchGateway(gateway);
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("codex responses gateway request failed\n");
+    expect(gateway.upstreamFailureCategory).toBe("upstream-request");
+  });
+
+  it("bounds and actually cancels an oversized 400 body after releasing its reader", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(64 * 1024 + 1));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response(body, { status: 400 }),
+    });
+    gateways.push(gateway);
+    const response = await fetchGateway(gateway);
+    expect(response.status).toBe(502);
+    expect(gateway.upstreamFailureCategory).toBe("upstream-request");
+    expect(cancelled).toBe(true);
+  });
+
+  it("releases and cancels a stalled 400 body when the gateway is closed", async () => {
+    let cancelled = false;
+    let markReadStarted!: () => void;
+    const readStarted = new Promise<void>(resolve => { markReadStarted = resolve; });
+    const reader = {
+      read: vi.fn(() => new Promise<ReadableStreamReadResult<Uint8Array>>(() => {})),
+      cancel: vi.fn(() => {
+        cancelled = true;
+        return new Promise<void>(() => {});
+      }),
+      releaseLock: vi.fn(),
+    };
+    const body = {
+      getReader: vi.fn(() => {
+        markReadStarted();
+        return reader;
+      }),
+      cancel: vi.fn(async () => {
+        cancelled = true;
+      }),
+    };
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => ({ ok: false, status: 400, body }) as unknown as Response,
+    });
+    gateways.push(gateway);
+    const pending = fetchGateway(gateway).catch(() => undefined);
+    await readStarted;
+    await gateway.close();
+    await pending;
+    await vi.waitFor(() => expect(cancelled).toBe(true));
+    expect(reader.cancel).toHaveBeenCalledOnce();
+    expect(reader.releaseLock).toHaveBeenCalledOnce();
+    expect(gateway.upstreamFailureCategory).toBe("upstream-request");
+  });
+
+  it.each([
+    [401, "authentication"],
+    [429, "usage"],
+    [500, "upstream-request"],
+  ] as const)("classifies HTTP %s without acquiring an upstream error-body reader", async (status, category) => {
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const getReader = vi.fn(() => { throw new Error("body reader must not be acquired"); });
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => ({ ok: false, status, body: { cancel, getReader } }) as unknown as Response,
+    });
+    gateways.push(gateway);
+    const response = await fetchGateway(gateway);
+    expect(response.status).toBe(502);
+    expect(gateway.upstreamFailureCategory).toBe(category);
+    expect(getReader).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it("does not classify a network-level upstream failure", async () => {
     const gateway = await createCodexResponsesGateway({
       prompt: PROMPT,
@@ -849,7 +1199,7 @@ describe("Codex Responses zero-tools gateway", () => {
     const response = await fetchGateway(gateway);
     expect(response.status).toBe(502);
     expect(await response.text()).toBe("codex responses gateway request failed\n");
-    expect(gateway.upstreamFailureCategory).toBeUndefined();
+    expect(gateway.upstreamFailureCategory).toBe("upstream-request");
   });
 
   it("preserves Responses Lite dialect while replacing its hostile additional_tools input", async () => {
@@ -921,6 +1271,124 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(body.stream).toBe(true);
     expect(JSON.stringify(body)).not.toMatch(/HOSTILE|lite-hostile|previous|metadata|cache|unknown/);
   });
+
+  it.each([true, false])(
+    "normalizes %s Lite input for exact Spark to standard Responses with effort-only reasoning",
+    async (responsesLite) => {
+      let capture: Capture | undefined;
+      const { url: upstreamUrl } = await listenSimpleUpstream(async (req, res) => {
+        capture = {
+          body: JSON.parse(await readBody(req)) as unknown,
+          headers: req.headers,
+          method: req.method ?? "",
+          url: req.url ?? "",
+        };
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(COMPLETED_SSE);
+      });
+      const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
+      gateways.push(gateway);
+
+      const response = await fetch(`${gateway.baseUrl}/responses`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer managed-token",
+          "X-Client-Request-Id": "spark-request",
+          ...(responsesLite ? { "X-OpenAI-Internal-Codex-Responses-Lite": "true" } : {}),
+        },
+        body: JSON.stringify({
+          model: ` ${SPARK_MODEL} `,
+          instructions: "HOSTILE-SPARK-INSTRUCTIONS",
+          input: [{ type: "additional_tools", role: "developer", tools: [{ name: "hostile" }] }],
+          tools: [{ type: "function", name: "hostile" }],
+          reasoning: { effort: "low", summary: "auto", context: "all_turns", unknown: "drop" },
+          service_tier: "priority",
+          previous_response_id: "spark-previous-secret",
+          prompt_cache_key: "spark-cache-secret",
+        }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(capture?.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
+      expect(capture?.headers["x-client-request-id"]).toBe("spark-request");
+      const body = capture?.body as Record<string, unknown>;
+      expect(body).toEqual({
+        model: SPARK_MODEL,
+        input: [{
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: PROMPT }],
+        }],
+        tool_choice: "none",
+        parallel_tool_calls: false,
+        store: false,
+        stream: true,
+        tools: [],
+        reasoning: { effort: "low" },
+        service_tier: "priority",
+      });
+      expect(JSON.stringify(body)).not.toMatch(/HOSTILE|additional_tools|previous|cache|summary|context/);
+    },
+  );
+
+  it("keeps a lookalike Spark slug on the non-Spark Lite contract", async () => {
+    let capture: Capture | undefined;
+    const { url: upstreamUrl } = await listenSimpleUpstream(async (req, res) => {
+      capture = {
+        body: JSON.parse(await readBody(req)) as unknown,
+        headers: req.headers,
+        method: req.method ?? "",
+        url: req.url ?? "",
+      };
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(COMPLETED_SSE);
+    });
+    const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _upstreamUrl: upstreamUrl });
+    gateways.push(gateway);
+    const response = await fetch(`${gateway.baseUrl}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer managed-token",
+        "X-OpenAI-Internal-Codex-Responses-Lite": "true",
+      },
+      body: JSON.stringify({ model: `${SPARK_MODEL}-preview`, reasoning: { summary: "auto" } }),
+    });
+    expect(response.status).toBe(200);
+    expect(capture?.headers["x-openai-internal-codex-responses-lite"]).toBe("true");
+    const body = capture?.body as Record<string, unknown>;
+    expect(body.input).toEqual([
+      { type: "additional_tools", role: "developer", tools: [] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: PROMPT }] },
+    ]);
+    expect(body.tools).toBeUndefined();
+    expect(body.reasoning).toEqual({ summary: "auto" });
+  });
+
+  it.each(["", "data: [DONE]\n\n"])(
+    "keeps non-Spark Lite completion behavior with optional sentinel %j",
+    async (suffix) => {
+      const terminal = `${COMPLETED_SSE}${suffix}`;
+      const gateway = await createCodexResponsesGateway({
+        prompt: PROMPT,
+        _fetch: async () => new Response(terminal, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      });
+      gateways.push(gateway);
+      const response = await fetch(`${gateway.baseUrl}/responses`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer managed-token",
+          "X-OpenAI-Internal-Codex-Responses-Lite": "true",
+        },
+        body: JSON.stringify({ model: "gpt-5.6" }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe(terminal);
+      expect(gateway.requestCompleted).toBe(true);
+    },
+  );
 
   it.each([
     ["GET", "method"],
