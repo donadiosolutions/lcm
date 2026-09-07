@@ -293,18 +293,23 @@ The `Security` section of the doctor output shows:
   existing path and prose delimiter behavior, and a matching quote closes the
   redacted path, even inside unmatched or path-wrapping brackets. The matching
   quote also stops that file URL from hiding a later standalone local path,
-  which is redacted in the same pass. A public URL glued directly after the
-  closing quote or bracket without whitespace may be conservatively redacted:
+  which is redacted in the same pass. A query or fragment after that closed
+  quoted path also redacts a root-relative Windows path beginning with a
+  backslash on the first pass, including after the closing wrapper. In an
+  unquoted file URL whose outer path was already redacted, a backslash path in
+  that URL's own query or fragment is also redacted while the file-URL context
+  remains active. Whitespace, URL-ending delimiters, and a nested non-file URL
+  can end that context; this does not extend backslash redaction to unrelated
+  text. A public URL glued directly after the closing quote or bracket without
+  whitespace may be conservatively redacted:
   `'file://host'['/private']https://pub.test/x` becomes
   `'file://host'['<path>']https:<path>`. If that glued URL is followed by a
   Windows drive path, the URL and drive path are redacted separately, as in
   `https:<path>\<path>`. Conservative redaction can also extend through unspaced
   query-tail continuations. Separating the following public URL with whitespace
-  preserves it byte-for-byte. A quoted path can contain spaces; redaction
-  continues to that matching quote, a newline, or EOF. Empty and root-only file
-  URLs remain unchanged. Unspaced text after an apparent pathless closing apostrophe can be
-  treated as continuing authority text, so an eventual path can cause
-  conservative redaction of that later text. Whitespace-separated following
+  preserves it byte-for-byte. Unspaced text after an apparent pathless closing
+  apostrophe can be treated as continuing authority text, so an eventual path
+  can cause conservative redaction of that later text. Whitespace-separated following
   prose or URLs are classified normally. Double quotes in non-file URLs or
   structured text and ordinary quoted local paths retain their existing
   boundaries. Ordinary HTTP and HTTPS URLs retain their authorities, slashes,

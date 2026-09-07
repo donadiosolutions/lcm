@@ -73,6 +73,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let restartedPathlessFile = false;
   let quotedPathEnded = false;
   let queryOrFragment = false;
+  let queryOrFragmentStart = -1;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
@@ -90,7 +91,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       queryOrFragment = false;
       continue;
     }
-    if (separator >= 0 && (char === "?" || char === "#")) queryOrFragment = true;
+    if (separator >= 0 && (char === "?" || char === "#")) {
+      queryOrFragment = true;
+      queryOrFragmentStart = index;
+    }
     const nestedFileSchemeStart = isNestedFileUrlStart(chars, index)
       ? index + 1
       : queryOrFragment &&
@@ -129,15 +133,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (
       separator >= 0 &&
       exactFileScheme &&
-      !foundFilePath &&
-      brackets === 0 &&
-      schemeQuote === 0 &&
+      (quotedPathEnded || (!foundFilePath && brackets === 0 && schemeQuote === 0)) &&
       (char === "?" || char === "#")
     ) {
-      // An unquoted pathless file URL has finished its authority. Scan the
+      // A pathless authority or a closed quoted path has ended. Scan its
       // query or fragment from fresh state so nested URLs and standalone paths
-      // retain their own classification.
+      // retain their own classification, including a leading backslash.
       separator = -1;
+      brackets = 0;
+      quotedPathEnded = false;
       exactFileScheme = false;
       foundFilePath = false;
       filePathBracketDepth = 0;
@@ -200,7 +204,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (char === "/" && !quotedPathEnded) authority[index] = 1;
       if (
         exactFileScheme &&
-        !foundFilePath &&
+        // After an unquoted outer path, only a backslash in its query or
+        // fragment starts another file path. The delimiter must belong to
+        // this URL, rather than an enclosing URL before its scheme separator.
+        (!foundFilePath || (queryOrFragmentStart > separator && char === "\\")) &&
         index > separator + 2 &&
         // Valid bracketed IP-literal authorities cannot contain a slash or backslash,
         // so the first such separator is the file URL path boundary even when

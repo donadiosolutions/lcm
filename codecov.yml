@@ -90,8 +90,9 @@ component_management:
         - "^src/daemon/remediation\\.ts$"
         # Error sanitization, including #893 adjacent-path, #903 prefixed
         # nested-file, #924 embedded-quote, #925/#1076 quoted-authority,
-        # bracketed path quote closure, and #1060 adjacent nested-file scheme
-        # preservation, remains daemon-core-owned.
+        # bracketed path quote closure, #1060 adjacent nested-file scheme
+        # preservation, and #1128 active file-query backslash paths, remains
+        # daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"

@@ -417,6 +417,60 @@ describe("sanitizeError", () => {
   });
 
   it.each([
+    ["'file://host'['/private']?\\Users\\SECRET", "'file://host'['<path>']?<path>"],
+    ["'file://host'['/private']#\\Users\\SECRET", "'file://host'['<path>']#<path>"],
+    ['"file://host["/private"]?\\Users\\SECRET', '"file://host["<path>"]?<path>'],
+    ['"file://host["/private"]#\\Users\\SECRET', '"file://host["<path>"]#<path>'],
+    ["'file://host'['/private'?\\Users\\SECRET", "'file://host'['<path>'?<path>"],
+    ['"file://host["/private"#\\Users\\SECRET', '"file://host["<path>"#<path>'],
+    ["'file://host'[['/private']]?\\C:\\Users\\SECRET", "'file://host'[['<path>']]?<path>"],
+    ["'file://host'['/private']#C:\\Users\\SECRET", "'file://host'['<path>']#<path>"],
+    ["'file://host'['/private']?\\\\server\\share\\SECRET", "'file://host'['<path>']?<path>"],
+  ] as const)("redacts backslash query tails after a closed quoted file path: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["file://host.invalid/Users/outer.db?x=[a]\\Users\\canary\\private.db", "file://host.invalid<path>?x=[a]<path>"],
+    ["file://host.invalid/Users/outer.db#x=[a]\\Users\\canary\\private.db", "file://host.invalid<path>#x=[a]<path>"],
+    ["file://host.invalid/Users/outer.db?\\Users\\SECRET", "file://host.invalid<path>?<path>"],
+    ["file://host.invalid/Users/outer.db#\\C:\\Users\\SECRET", "file://host.invalid<path>#<path>"],
+    ["file://host.invalid/Users/outer.db?C:\\Users\\SECRET", "file://host.invalid<path>?<path>"],
+    ["file://host.invalid/Users/outer.db#\\\\server\\share\\SECRET", "file://host.invalid<path>#<path>"],
+    ["file://host.invalid/Users/outer.db?x=[a\\Users\\SECRET", "file://host.invalid<path>?x=[a<path>"],
+    ["file://host.invalid[/Users/outer.db]?x=a\\Users\\SECRET", "file://host.invalid[<path>]?x=a<path>"],
+  ] as const)("redacts backslash query tails after an unquoted outer file path: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["ordinary?x=a\\Users\\literal", "ordinary?x=a\\Users\\literal"],
+    ["https://host.invalid/outer?x=[a]\\Users\\literal", "https://host.invalid/outer?x=[a]\\Users\\literal"],
+    ["file://host.invalid/outer[x]\\Users\\literal", "file://host.invalid<path>"],
+    ["file://host.invalid[/outer]x\\Users\\literal", "file://host.invalid[<path>]x\\Users\\literal"],
+    ["file://host.invalid/outer?x=a \\Users\\literal", "file://host.invalid<path>?x=a \\Users\\literal"],
+    ["file://host.invalid/outer?x=a|\\Users\\literal", "file://host.invalid<path>?x=a|\\Users\\literal"],
+    ["file://host.invalid/outer?x=a;\\Users\\literal", "file://host.invalid<path>?x=a;\\Users\\literal"],
+    ["file://host.invalid?x=[https://y.test/p]\\Users\\literal", "file://host.invalid?x=[https://y.test/p]\\Users\\literal"],
+    ["file://host.invalid/outer?x=[a]/public", "file://host.invalid<path>?x=[a]/public"],
+  ] as const)("keeps backslash query handling within its file URL context: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
+  });
+
+  it("preserves the deferred word-bearing query tail boundary", () => {
+    const result = sanitizeError("'file://host'['/private']?next/Users/SECRET");
+
+    expect(result).toBe("'file://host'['<path>']?next/Users/SECRET");
+    expect(sanitizeError(result)).toBe("'file://host'['<path>']?next<path>");
+  });
+
+  it.each([
     ["'file://host'[['/private']]#/Users/SECRET", "'file://host'[['<path>']]#<path>"],
     ['"file://host["/private"]?/Users/SECRET', '"file://host["<path>"]?<path>'],
     ["'file://host'[\\C:\\private']?/Users/SECRET", "'file://host'[<path>']?<path>"],
