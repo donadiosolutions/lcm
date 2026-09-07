@@ -92,6 +92,9 @@ runtime transactions retain their existing mode.
 
 A SQLite destination must be a new exclusively created file in an owner-only
 directory, or the exact generation recorded by an earlier transfer ledger.
+A resumed destination bounds every stored ledger control before SQLite returns
+it to the adapter; malformed oversized values fail closed without being
+materialized for parsing or comparison.
 A PostgreSQL destination must have the exact registered project, machines and
 complete alias set described by the source. Transfer records never register or
 rebind those identities. PostgreSQL holds a dedicated advisory lock and admits

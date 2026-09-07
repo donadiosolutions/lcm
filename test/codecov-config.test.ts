@@ -151,6 +151,7 @@ const expectedComponents = [
     // #1082 keeps SQLite promoted-content NUL admission and replay guards in
     // local persistence; this change does not alter component ownership.
     // #618 optional receipt schema admission stays local-persistence-owned.
+    // #1140 fixed transfer-ledger control bounds stay local-persistence-owned.
     paths: ["src/db/", "src/storage/sqlite/", "src/store/"],
   },
   {

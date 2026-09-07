@@ -231,14 +231,16 @@ owner-only mode (`0400`, `0500`, `0600`, or `0700`). Listing reconciliation
 state checks only regular files with journal-shaped names and stops if one
 fails authentication. Non-regular entries, including symlinks, directories,
 and FIFOs, are currently skipped by listing. Pattern files that LCM reads must
-be regular files with exactly one hard link; an existing non-regular source
-pattern entry can currently be treated as absent before reaching that reader.
-On platforms where Node.js exposes `process.getuid()`, both
-readers also require the file to be owned by the current user; the ownership
-check is skipped when that API is unavailable. Historical pattern permissions,
-including `0644`, are accepted for reads. When reconciliation creates or
-rewrites a pattern file, the new file uses owner-only mode `0600`; a no-op
-merge leaves an existing pattern file and its permissions unchanged.
+be regular files with exactly one hard link. Reconciliation refuses a present
+non-regular source `sensitive-patterns.txt` path before snapshot, merge, or
+archive verification; it never opens a directory, FIFO, socket, device, or
+other non-regular leaf to decide whether it is admissible. On platforms where
+Node.js exposes `process.getuid()`, both readers also require the file to be
+owned by the current user; the ownership check is skipped when that API is
+unavailable. Historical pattern permissions, including `0644`, are accepted
+for reads. When reconciliation creates or rewrites a pattern file, the new file
+uses owner-only mode `0600`; a no-op merge leaves an existing pattern file and
+its permissions unchanged.
 
 When a pattern read fails authentication, it blocks that use and publication of
 the folded project map. A later archive check can fail after the same verified
@@ -250,6 +252,16 @@ verified bytes into it, and atomically replacing the refused path. Do not
 repair a hard-linked file with `chmod`: that changes the shared inode and every
 external link while leaving the unsafe link count unchanged. Rerun
 `lcm project reconcile-worktrees` after replacing the file.
+
+For a refused non-regular source pattern path, inspect its type without reading
+through it, then remove it or replace it with a verified regular, single-link
+file before rerunning reconciliation. If the source directory was already
+moved, the blocked journal's backup paths identify the copy under
+`~/.lcm/oldprojects/`; repair the refused leaf there and retry the same command.
+This validation applies when a future reconciliation examines a live or
+archived source. A reconciliation completed by an older LCM version is not
+reopened or repaired automatically, so inspect its historical
+`~/.lcm/oldprojects/` backup directly when investigating an earlier run.
 
 Atomic metadata replacement also keeps a publication or directory-topology
 failure primary when cleanup of its authenticated temporary file fails. The
