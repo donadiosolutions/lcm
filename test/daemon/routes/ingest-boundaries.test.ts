@@ -5,6 +5,10 @@ import { createStorageBackendFactory } from "../../../src/storage/index.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 
 const mocks = vi.hoisted(() => ({
+  snapshotStream: vi.fn(async () => Buffer.from("{}")),
+  snapshotClose: vi.fn(async () => undefined),
+  snapshotAssert: vi.fn(async () => undefined),
+  snapshotOpen: vi.fn(async () => undefined),
   nativeAvailable: vi.fn(() => true),
   nativeBackfill: vi.fn(async () => undefined),
   closeQuarantine: vi.fn(async () => undefined),
@@ -136,14 +140,22 @@ vi.mock("../../../src/storage/index.js", () => ({
 }));
 vi.mock("../../../src/transcript-provider.js", () => ({
   normalizeTranscriptClient: mocks.normalize,
-  parseTranscriptForClient: mocks.parse,
+  parseTranscriptTextForClient: mocks.parse,
 }));
 vi.mock("../../../src/scrub.js", () => ({ ScrubEngine: { forProject: mocks.forProject, loadProjectPatterns: mocks.loadPatterns } }));
-vi.mock("../../../src/storage/native-transcript-ingest.js", () => ({
+vi.mock("../../../src/storage/native-transcript-ingest.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/storage/native-transcript-ingest.js")>(),
   CLAUDE_NATIVE_TRANSCRIPT_FORMAT: { clientName: "claude-code" },
   CODEX_NATIVE_TRANSCRIPT_FORMAT: { clientName: "codex" },
   createExactNativeTranscriptMessageResolver: () => ({}),
-  createFileNativeTranscriptSource: () => ({}),
+  createFileNativeTranscriptSource: () => ({ openSnapshot: async () => { await mocks.snapshotOpen(); return ({
+    metadata: { sizeBytes: 0, modifiedAtMs: 0, changedAtMs: 0 },
+    stream: async function* () { yield await mocks.snapshotStream(); },
+    digestPrefix: async () => "",
+    assertUnchanged: mocks.snapshotAssert,
+    assertByteRangesUnchanged: async () => undefined,
+    close: mocks.snapshotClose,
+  }); } }),
   runNativeTranscriptBackfill: mocks.nativeBackfill,
 }));
 vi.mock("../../../src/storage/local-transcript-quarantine.js", () => ({
@@ -174,6 +186,10 @@ const validMessage = { role: "user", content: "content", tokenCount: 2 };
 describe("ingest persistence boundaries", () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockClear();
+    mocks.snapshotStream.mockReset().mockResolvedValue(Buffer.from("{}"));
+    mocks.snapshotClose.mockReset().mockResolvedValue(undefined);
+    mocks.snapshotAssert.mockReset().mockResolvedValue(undefined);
+    mocks.snapshotOpen.mockReset().mockResolvedValue(undefined);
     mocks.getConnection.mockReturnValue(db);
     mocks.exists.mockReturnValue(true);
     mocks.read.mockReturnValue("{}");
@@ -193,7 +209,7 @@ describe("ingest persistence boundaries", () => {
     mocks.createBulk.mockImplementation(async (inputs: unknown[]) => inputs.map((_, index) => ({ messageId: index + 1 })));
     mocks.transaction.mockImplementation(async (operation: () => unknown) => operation());
     mocks.tokens.mockResolvedValue(7);
-    mocks.parse.mockReturnValue([]);
+    mocks.parse.mockReset().mockReturnValue([]);
     mocks.normalize.mockImplementation((client: unknown) => client ?? "claude");
     mocks.scrubCounts.mockImplementation((content: string) => ({ text: content, gitleaks: 0, builtIn: 0, global: 0, project: 0 }));
     mocks.forProject.mockImplementation(async () => ({ scrubWithCounts: mocks.scrubCounts }));
@@ -212,6 +228,72 @@ describe("ingest persistence boundaries", () => {
       metaPath: `/lcm/projects/${identity.id}/meta.json`,
     }));
   });
+
+  for (const boundary of ["open", "read", "stream", "parser", "scrubber", "native", "close"] as const) {
+    it(`preserves the primary ${boundary} failure and closes the bound source`, async () => {
+      const primary = new Error(`${boundary} failure`);
+      mocks.parse.mockReturnValue([validMessage]);
+      if (boundary === "open") mocks.snapshotOpen.mockRejectedValueOnce(primary);
+      if (boundary === "stream") mocks.snapshotStream.mockRejectedValueOnce(primary);
+      if (boundary === "read") mocks.snapshotAssert.mockRejectedValueOnce(primary);
+      if (boundary === "parser") mocks.parse.mockImplementationOnce(() => { throw primary; });
+      if (boundary === "scrubber") mocks.forProject.mockRejectedValueOnce(primary);
+      if (boundary === "native") mocks.nativeBackfill.mockRejectedValueOnce(primary);
+      mocks.snapshotClose.mockRejectedValueOnce(boundary === "close" ? primary : new Error("cleanup failure"));
+      await createIngestHandler(config)({} as never, response, JSON.stringify({ session_id: "failure", cwd: "/ok", transcript_path: "/safe" }));
+      expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed", code: "INGEST_FAILED" });
+      expect(mocks.logError).toHaveBeenCalledWith("ingest", primary, expect.anything());
+      expect(mocks.snapshotClose).toHaveBeenCalledTimes(boundary === "open" ? 0 : 1);
+      expect(mocks.snapshotOpen).toHaveBeenCalledTimes(1);
+    });
+  }
+
+  it("does not retry mutation before a trustworthy source witness exists", async () => {
+    const { NativeTranscriptSourceChangedError } = await import("../../../src/storage/native-transcript-ingest.js");
+    const primary = new NativeTranscriptSourceChangedError();
+    mocks.snapshotAssert.mockRejectedValueOnce(primary);
+    await createIngestHandler(config)({} as never, response, JSON.stringify({ session_id: "early-mutation", cwd: "/ok", transcript_path: "/safe" }));
+    expect(mocks.snapshotOpen).toHaveBeenCalledTimes(1);
+    expect(mocks.snapshotClose).toHaveBeenCalledTimes(1);
+    expect(mocks.createBulk).not.toHaveBeenCalled();
+    expect(mocks.logError).toHaveBeenCalledWith("ingest", primary, expect.anything());
+  });
+
+  it("cancels after source mutation without starting another attempt", async () => {
+    const { NativeTranscriptSourceChangedError } = await import("../../../src/storage/native-transcript-ingest.js");
+    const controller = new AbortController();
+    mocks.snapshotAssert.mockImplementationOnce(async () => {
+      controller.abort();
+      throw new NativeTranscriptSourceChangedError();
+    });
+    await createIngestHandler(config)({} as never, response, JSON.stringify({ session_id: "cancel", cwd: "/ok", transcript_path: "/safe" }), { signal: controller.signal });
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 499, { status: "cancelled", error: "ingest cancelled" });
+    expect(mocks.snapshotOpen).toHaveBeenCalledTimes(1);
+    expect(mocks.snapshotClose).toHaveBeenCalledTimes(1);
+    expect(mocks.logError).not.toHaveBeenCalled();
+  });
+
+  it("preserves an ordinary failure even when cancellation coincides", async () => {
+    const controller = new AbortController();
+    const primary = new Error("storage failure");
+    mocks.nativeBackfill.mockImplementationOnce(async () => { controller.abort(); throw primary; });
+    await createIngestHandler(config)({} as never, response, JSON.stringify({ session_id: "cancel", cwd: "/ok", transcript_path: "/safe" }), { signal: controller.signal });
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed", code: "INGEST_FAILED" });
+    expect(mocks.logError).toHaveBeenCalledWith("ingest", primary, expect.anything());
+  });
+
+  for (const state of [{}, { headersSent: true }, { writableEnded: true }, { destroyed: true }, { writable: false }]) {
+    it(`handles cancellation before opening with response state ${JSON.stringify(state)}`, async () => {
+      const controller = new AbortController();
+      controller.abort();
+      await createIngestHandler(config)({} as never, state as never, JSON.stringify({ session_id: "cancel", cwd: "/ok", transcript_path: "/safe" }), { signal: controller.signal });
+      expect(mocks.getConnection).not.toHaveBeenCalled();
+      expect(mocks.snapshotOpen).not.toHaveBeenCalled();
+      expect(mocks.logError).not.toHaveBeenCalled();
+      if (Object.keys(state).length === 0) expect(mocks.send).toHaveBeenCalledWith(state, 499, { status: "cancelled", error: "ingest cancelled" });
+      else expect(mocks.send).not.toHaveBeenCalled();
+    });
+  }
 
   it("uses default native patterns when no security configuration is supplied", async () => {
     mocks.parse.mockReturnValueOnce([validMessage]);
@@ -239,7 +321,7 @@ describe("ingest persistence boundaries", () => {
   });
 
   it("archives metadata-only input and fails a successful backfill whose cleanup fails", async () => {
-    mocks.parse.mockReturnValue([]);
+    mocks.parse.mockReset().mockReturnValue([]);
     mocks.closeQuarantine.mockRejectedValueOnce(new Error("cleanup failure"));
     await createIngestHandler(config)({} as never, response, JSON.stringify({ session_id: "native", cwd: "/ok", transcript_path: "/safe" }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed", code: "INGEST_FAILED" });
@@ -563,7 +645,7 @@ describe("ingest persistence boundaries", () => {
     });
     expect(mocks.safeTranscript).toHaveBeenCalled();
     expect(mocks.exists).toHaveBeenCalled();
-    expect(mocks.parse).toHaveBeenCalled();
+    expect(mocks.parse).not.toHaveBeenCalled();
   });
 
   it("reuses the admitted PostgreSQL project for non-empty ingestion", async () => {

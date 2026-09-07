@@ -47,6 +47,11 @@ export function parseTranscript(transcriptPath: string): ParsedMessage[] {
     return [];
   }
 
+  return parseTranscriptText(raw);
+}
+
+/** Parse already-bound transcript bytes without reopening a pathname. */
+export function parseTranscriptText(raw: string): ParsedMessage[] {
   const messages: ParsedMessage[] = [];
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();

@@ -312,3 +312,35 @@ Snapshot ingestion is skipped when daemon bootstrap cannot verify the configured
 ## Auto-heal
 
 All lcm hooks self-repair on each invocation: before dispatching, `validateAndFixHooks()` checks that all required hook entries remain registered in `~/.claude/settings.json` and re-adds any missing entries. This means lcm hooks survive `claude settings reset` or manual edits to the settings file.
+
+### Native ingest source changes and cancellation
+
+When `/ingest` receives a native transcript path, parsed messages and native
+archival use the same open file snapshot. LCM preserves exact source and message
+link checks. If a fully read and validated source changes during ingestion, LCM
+makes one fresh attempt only when the original byte prefix remains identical;
+appended bytes are allowed. Shrink or rewrite of that prefix fails the request.
+Mutation before the first complete validated snapshot is available also fails
+without an internal retry. For an eligible append,
+a stable second attempt completes without recording an ingest error. Inserted
+message and redaction counts include both attempts without duplicating committed
+messages. A source that changes again fails the request; a later hook event can
+resume native archival using the existing checkpoint.
+
+An initially missing or rejected transcript path retains the empty-input behavior.
+A source that disappears after path validation, or fails snapshot validation,
+fails closed. Validation now precedes parsed-message persistence for native paths,
+so an invalid source cannot first commit its parsed projection. Existing explicit
+`messages` requests retain their input behavior.
+
+Intentional request cancellation returns HTTP 499 with
+`{"status":"cancelled","error":"ingest cancelled"}` when the connection is still
+writable. Active storage work finishes before project resources close, including
+an already-running native snapshot and token query. Cancellation prevents another
+attempt and is not recorded as an ingest error. Ordinary storage, source, and
+linkage failures remain errors even if cancellation occurs at the same time.
+The snapshot is held in process memory, as with the previous whole-file parser;
+this is not a new total-size or execution-time limit.
+
+Previously retained ingest errors remain in diagnostic history. This repair does
+not remove historical errors or change their retention period.
