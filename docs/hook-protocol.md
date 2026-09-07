@@ -111,6 +111,26 @@ Invoked at the start of a Claude Code session. lcm restores recent summaries and
 
 Invoked when the Claude Code session ends. lcm ingests the completed session transcript and triggers passive-learning event promotion.
 
+After daemon admission, the hook reads one authenticated snapshot of its settings
+before sending the transcript for ingestion. Compaction and filter-notification
+settings changed while ingestion is in progress apply to the next invocation.
+If configuration cannot be admitted, the hook sends no ingest request and stores
+no transcript messages from that invocation. Ordinary configuration contention
+still permits session exit; it can occur before this snapshot is read.
+
+After ingesting a Claude transcript, lcm waits up to one second for the daemon
+to acknowledge its session-completion record. The daemon records the message
+count from stored history; repeating completion updates the same session record
+with the current stored count. This wait covers completion bookkeeping only.
+Compaction and promotion remain independent, best-effort background requests.
+
+Completion is best-effort when the daemon is unavailable, busy, or refuses
+publication admission. Ordinary completion failures still allow session exit.
+A timeout leaves persistence uncertain: the daemon may have committed the
+record before the acknowledgment was interrupted. Local publication-journal
+errors continue to fail closed. Codex Stop events remain turn-scoped and do not
+mark the session complete; their session-snapshot behavior is unchanged.
+
 **Stdin fields:**
 
 | Field | Type | Description |
