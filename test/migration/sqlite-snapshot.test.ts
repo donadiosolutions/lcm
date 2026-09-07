@@ -750,6 +750,175 @@ describe("authenticated SQLite snapshot artifacts", () => {
     }
   });
 
+  it.each(["main", "wal"])("rejects raw %s descriptor ABA before normalization", async (role) => {
+    const source = sourceFixture();
+    if (role === "main") source.openDatabases[0]!.close();
+    const fixture = await prepareFixture(source);
+    const sourceDirectory = join(fixture.authority.projectDbPath, "..");
+    const sourceEntries = readdirSync(sourceDirectory).sort();
+    const before = sourceEntries.map((entry) => {
+      const file = join(sourceDirectory, entry);
+      return { file, bytes: readFileSync(file), mode: statSync(file).mode };
+    });
+    const alternate = join(fixture.homeDir, "alternate.sqlite");
+    const database = new DatabaseSync(alternate);
+    databases.push(database);
+    database.exec(`${role === "wal" ? "PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;" : ""} CREATE TABLE project_data (value TEXT NOT NULL); INSERT INTO project_data VALUES ('attacker')`);
+    if (role === "main") database.close();
+    const replacement = readFileSync(`${alternate}${role === "wal" ? "-wal" : ""}`);
+    let swapped = false;
+    let restored = false;
+    let openedFd: number | undefined;
+    const outcome = await captureFixture(fixture, {
+      open: (path, flags, mode) => {
+        if (!swapped && mode === undefined && path.endsWith(`project.raw.sqlite${role === "wal" ? "-wal" : ""}`)) {
+          swapped = true;
+          renameSync(path, `${path}.owned`);
+          writeFileSync(path, replacement, { mode: 0o600 });
+          openedFd = openSync(path, flags);
+          // Restore the owned pathname immediately: only the actual open fd
+          // can reveal that the bytes being copied came from another inode.
+          rmSync(path);
+          renameSync(`${path}.owned`, path);
+          restored = true;
+          return openedFd;
+        }
+        return mode === undefined ? openSync(path, flags) : openSync(path, flags, mode);
+      },
+    }).then(() => {
+      const normalized = new DatabaseSync(join(generationDirectory(fixture.homeDir), "project.sqlite"), { readOnly: true });
+      try { return { sealedValue: normalized.prepare("SELECT value FROM project_data").get()!.value }; }
+      finally { normalized.close(); }
+    }, (error: unknown) => error);
+    expect(swapped).toBe(true);
+    expect(restored).toBe(true);
+    expect(openedFd).toBeDefined();
+    expect(readdirSync(sourceDirectory).sort()).toEqual(sourceEntries);
+    for (const original of before) {
+      expect(readFileSync(original.file)).toEqual(original.bytes);
+      expect(statSync(original.file).mode).toBe(original.mode);
+    }
+    expect(outcome).toMatchObject({ reason: "source-changed" });
+    expect(() => statSync(join(generationDirectory(fixture.homeDir), "witness.committed"))).toThrow();
+  });
+
+  it.each(["main", "wal"])("rejects %s bytes that differ between source authentication and the raw copy", async (role) => {
+    const fixture = await heldFixture();
+    const before = sourceState(fixture.authority);
+    let corruptNextRead = false;
+    let corrupted = false;
+    await expect(captureFixture(fixture, {
+      open: (path, flags, mode) => {
+        if (path.endsWith(`project.raw.sqlite${role === "wal" ? "-wal" : ""}`) && mode !== undefined) {
+          corruptNextRead = true;
+        }
+        return mode === undefined ? openSync(path, flags) : openSync(path, flags, mode);
+      },
+      read: (fd, buffer, offset, length, position) => {
+        const count = readSync(fd, buffer, offset, length, position);
+        if (corruptNextRead && !corrupted && count > 0) {
+          buffer[offset] = buffer[offset]! ^ 0xff;
+          corrupted = true;
+        }
+        return count;
+      },
+    })).rejects.toMatchObject({ reason: "source-changed" });
+    expect(corrupted).toBe(true);
+    expect(sourceState(fixture.authority)).toEqual(before);
+    expect(() => statSync(join(generationDirectory(fixture.homeDir), "witness.committed"))).toThrow();
+  });
+
+  it.each([
+    ...["size", "hash", "post-copy identity"].map((drift) => ({ role: "main", drift })),
+    ...["size", "hash", "post-copy identity"].map((drift) => ({ role: "wal", drift })),
+  ])("rejects raw $role descriptor $drift drift during normalization", async ({ role, drift }) => {
+    const fixture = await heldFixture();
+    const before = sourceState(fixture.authority);
+    let rawFd: number | undefined;
+    let rawFstatCalls = 0;
+    let injected = false;
+    await expect(captureFixture(fixture, {
+      open: (path, flags, mode) => {
+        if (!injected && path.endsWith(`project.raw.sqlite${role === "wal" ? "-wal" : ""}`) && mode === undefined) {
+          if (drift === "size") appendFileSync(path, "changed");
+          if (drift === "hash") {
+            const bytes = readFileSync(path);
+            bytes[0] = bytes[0]! ^ 0xff;
+            writeFileSync(path, bytes);
+          }
+          rawFd = openSync(path, flags);
+          injected = true;
+          return rawFd;
+        }
+        return mode === undefined ? openSync(path, flags) : openSync(path, flags, mode);
+      },
+      fstat: (fd) => {
+        const actual = fstatSync(fd, { bigint: true });
+        if (drift !== "post-copy identity" || fd !== rawFd || ++rawFstatCalls !== 2) return actual;
+        return new Proxy(actual, {
+          get: (stat, property) => property === "mtimeNs" ? stat.mtimeNs + 1n : Reflect.get(stat, property, stat),
+        });
+      },
+    })).rejects.toMatchObject({ reason: "source-changed" });
+    expect(injected).toBe(true);
+    expect(sourceState(fixture.authority)).toEqual(before);
+    expect(() => statSync(join(generationDirectory(fixture.homeDir), "witness.committed"))).toThrow();
+  });
+
+  it.each(["main", "wal"])("rejects growth beyond the authenticated raw %s descriptor EOF", async (role) => {
+    const fixture = await heldFixture();
+    const before = sourceState(fixture.authority);
+    let rawFd: number | undefined;
+    let injected = false;
+    await expect(captureFixture(fixture, {
+      open: (path, flags, mode) => {
+        const fd = mode === undefined ? openSync(path, flags) : openSync(path, flags, mode);
+        if (path.endsWith(`project.raw.sqlite${role === "wal" ? "-wal" : ""}`) && mode === undefined) rawFd = fd;
+        return fd;
+      },
+      read: (fd, buffer, offset, length, position) => {
+        if (!injected && fd === rawFd && length === 1) {
+          injected = true;
+          return 1;
+        }
+        return readSync(fd, buffer, offset, length, position);
+      },
+    })).rejects.toMatchObject({ reason: "source-changed" });
+    expect(injected).toBe(true);
+    expect(sourceState(fixture.authority)).toEqual(before);
+    expect(() => statSync(join(generationDirectory(fixture.homeDir), "witness.committed"))).toThrow();
+  });
+
+  it.each(["main", "wal"])("keeps a raw %s descriptor close failure terminal and closes every tracked descriptor", async (role) => {
+    const fixture = await heldFixture();
+    const before = sourceState(fixture.authority);
+    const descriptors = new Set<number>();
+    let rawFd: number | undefined;
+    let closeFailed = false;
+    await expect(captureFixture(fixture, {
+      open: (path, flags, mode) => {
+        const fd = mode === undefined ? openSync(path, flags) : openSync(path, flags, mode);
+        descriptors.add(fd);
+        if (path.endsWith(`project.raw.sqlite${role === "wal" ? "-wal" : ""}`) && mode === undefined) rawFd = fd;
+        return fd;
+      },
+      close: (fd) => {
+        closeSync(fd);
+        descriptors.delete(fd);
+        if (!closeFailed && fd === rawFd) {
+          closeFailed = true;
+          throw new Error("raw descriptor close failed");
+        }
+      },
+    })).rejects.toMatchObject({ reason: "snapshot-io" });
+    expect(closeFailed).toBe(true);
+    expect(descriptors).toEqual(new Set());
+    expect(sourceState(fixture.authority)).toEqual(before);
+    expect(await classifySqliteSnapshotArtifact("generation-1", { homeDir: fixture.homeDir }))
+      .toEqual({ state: "partial", generationId: "generation-1" });
+    expect(() => statSync(join(generationDirectory(fixture.homeDir), "witness.committed"))).toThrow();
+  });
+
   it("rejects a normalized leaf replaced by a hard link before writable SQLite inspection", async () => {
     const fixture = await heldFixture();
     let inspectionCalled = false;

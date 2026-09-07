@@ -706,35 +706,26 @@ function copySourceToExclusive(
   return fileIdentity(source.stat, hash.digest("hex"));
 }
 
-function copyPrivateFile(context: Context, source: string, destination: string): void {
+function copyPrivateFile(
+  context: Context,
+  source: string,
+  destination: string,
+  expected: SqliteSnapshotFileIdentity,
+): void {
   const sourceFd = context.ops.open(source, constants.O_RDONLY | constants.O_NOFOLLOW);
-  let destinationFd: number | undefined;
   try {
     const sourceStat = context.ops.fstat(sourceFd);
-    if (!sourceStat.isFile() || sourceStat.size > SOURCE_LIMIT) throw new InternalSnapshotError("unsafe");
-    destinationFd = context.ops.open(destination, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, CONTROL_MODE);
-    context.ownedFiles.set(destination, context.ops.fstat(destinationFd));
-    const buffer = Buffer.allocUnsafe(COPY_CHUNK);
-    let position = 0n;
-    while (position < sourceStat.size) {
-      const wanted = Number(sourceStat.size - position > BigInt(buffer.byteLength) ? BigInt(buffer.byteLength) : sourceStat.size - position);
-      const read = context.ops.read(sourceFd, buffer, 0, wanted, Number(position));
-      if (read <= 0) throw new InternalSnapshotError("changed");
-      let written = 0;
-      while (written < read) {
-        const count = context.ops.write(destinationFd, buffer, written, read - written, null);
-        if (count <= 0) throw new InternalSnapshotError("io");
-        written += count;
-      }
-      position += BigInt(read);
-    }
-    context.ops.fsync(destinationFd);
+    if (!sameInode(sourceStat, context.ownedFiles.get(source)!)) throw new InternalSnapshotError("changed");
+    validateSourceStat(sourceStat, SOURCE_LIMIT);
+    sourcePathMatches(context, source, sourceStat);
+    if (decimal(sourceStat.size) !== expected.size) throw new InternalSnapshotError("changed");
+    const copied = copySourceToExclusive(context, { path: source, fd: sourceFd, stat: sourceStat, maximum: SOURCE_LIMIT }, destination);
+    if (copied.sha256 !== expected.sha256) throw new InternalSnapshotError("changed");
+    const after = context.ops.fstat(sourceFd);
+    if (!sameFileIdentity(copied, fileIdentity(after, copied.sha256))) throw new InternalSnapshotError("changed");
+    sourcePathMatches(context, source, after);
   } finally {
-    closeDescriptors(
-      context,
-      destinationFd === undefined ? [sourceFd] : [sourceFd, destinationFd],
-      "private snapshot copy descriptor cleanup failed",
-    );
+    context.ops.close(sourceFd);
   }
 }
 
@@ -892,13 +883,17 @@ async function captureRole(
   const rawMainPath = join(destinationRoot, `${roleBase(role)}.raw.sqlite`);
   const rawWalPath = join(destinationRoot, `${roleBase(role)}.raw.sqlite-wal`);
   const authenticated = await authenticateSourceRoleBytes(context, role, databasePath, (files) => {
-    copySourceToExclusive(context, files.main, rawMainPath);
-    if (files.wal !== null) copySourceToExclusive(context, files.wal, rawWalPath);
-    return { walPresent: files.wal !== null };
+    const main = copySourceToExclusive(context, files.main, rawMainPath);
+    const wal = files.wal === null ? null : copySourceToExclusive(context, files.wal, rawWalPath);
+    return { main, wal, walPresent: wal !== null };
   });
   const normalizedMainPath = join(destinationRoot, `${roleBase(role)}.sqlite`);
-  copyPrivateFile(context, rawMainPath, normalizedMainPath);
-  if (authenticated.value.walPresent) copyPrivateFile(context, rawWalPath, `${normalizedMainPath}-wal`);
+  if (!sameFileIdentity(authenticated.value.main, authenticated.source.mainBefore)
+    || (authenticated.value.wal !== null && !sameFileIdentity(authenticated.value.wal, authenticated.source.walBefore!))) {
+    throw new InternalSnapshotError("changed");
+  }
+  copyPrivateFile(context, rawMainPath, normalizedMainPath, authenticated.source.mainBefore);
+  if (authenticated.value.walPresent) copyPrivateFile(context, rawWalPath, `${normalizedMainPath}-wal`, authenticated.source.walBefore!);
   const parentFd = context.ops.open(destinationRoot, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   let inspection: DatabaseInspection;
   try {
