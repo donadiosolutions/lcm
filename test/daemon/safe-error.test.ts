@@ -598,6 +598,7 @@ describe("sanitizeError", () => {
     ["/p\\C:\\E::\\SECRET", "<path>\\<path>"],
     ["/C:\\E::\\SECRET", "<path>"],
     ["/private/C:\\E::\\SECRET", "<path>"],
+    ["/C:\\dir/E::\\SECRET", "<path>"],
     ["D:\\E::\\SECRET", "<path>"],
     ["d:\\e::\\secret", "<path>"],
     ["\\\\host\\E::\\SECRET", "<path>"],
@@ -631,6 +632,7 @@ describe("sanitizeError", () => {
     ["fooC:\\E::\\SECRET", "fooC:\\E::\\SECRET"],
     ["https://pub.test/a::\\q", "https://pub.test/a::\\q"],
     ["https://[::1]/secret", "https://[::1]/secret"],
+    ["/p\\C:\\E::\\https://private.example/SECRET", "<path>\\<path>::\\https://private.example/SECRET"],
     ["/C:\\Users\\SECRET", "<path>"],
     ["/p\\D:\\E:\\SECRET", "<path>\\<path>"],
   ] as const)("preserves doubled-colon path rejection boundaries: %#", (input, expected) => {

@@ -5,6 +5,7 @@
 const PATH_WORD_PATTERN = /^[\p{L}\p{N}\p{M}]$/u;
 const URL_SCHEME_START_PATTERN = /^[A-Za-z]$/u;
 const URL_SCHEME_CHARACTER_PATTERN = /^[A-Za-z\d+.-]$/u;
+const URL_SCHEME_LITERAL_PATTERN = /^[A-Za-z][A-Za-z\d+.-]*:\/\//u;
 const FILE_SCHEME = "file";
 const WHITESPACE_PATTERN = /\s/u;
 const PATH_DELIMITERS = new Set(["#", "&", "=", "|", ",", ";", ":", "!", "?", ")", "]", "}", "'", '"', "<", ">"]);
@@ -327,7 +328,8 @@ function isDoubledDriveColonInPath(chars: readonly string[], index: number, wind
     chars[index + 1] === ":" &&
     chars[index + 2] === "\\" &&
     /^[A-Za-z]$/u.test(chars[index - 1] ?? "") &&
-    (boundary === "\\" || (windows && boundary === "/"))
+    (boundary === "\\" || (windows && boundary === "/")) &&
+    !URL_SCHEME_LITERAL_PATTERN.test(chars.slice(index + 3).join(""))
   );
 }
 
@@ -371,6 +373,7 @@ function scanAbsolutePath(
   quote?: string,
 ): { end: number; sawNonSeparator: boolean } {
   let index = start;
+  let windowsContext = windows;
   let parentheses = 0;
   let brackets = 0;
   let sawPathCharacter = false;
@@ -389,10 +392,11 @@ function scanAbsolutePath(
       continue;
     }
     if (char === ":" && chars[index + 1] === "\\" && isWindowsDrivePathStart(chars, index - 1)) {
+      windowsContext = true;
       index += 1;
       continue;
     }
-    if (isDoubledDriveColonInPath(chars, index, windows)) {
+    if (isDoubledDriveColonInPath(chars, index, windowsContext)) {
       index += 2;
       continue;
     }
@@ -437,7 +441,7 @@ function scanAbsolutePath(
       index = cursor;
       continue;
     }
-    if (char === "/" || (windows && char === "\\")) {
+    if (char === "/" || (windowsContext && char === "\\")) {
       sawPathCharacter = true;
       index += 1;
       continue;
@@ -449,7 +453,12 @@ function scanAbsolutePath(
       index += 1;
       continue;
     }
-    if (!windows && char === "\\" && (isUncPathStart(chars, index) || isWindowsDrivePathStart(chars, index + 1))) break;
+    if (
+      !windowsContext &&
+      char === "\\" &&
+      (isUncPathStart(chars, index) || isWindowsDrivePathStart(chars, index + 1))
+    )
+      break;
     if (char === "(" && sawPathCharacter) {
       parentheses += 1;
       sawNonSeparator = true;
