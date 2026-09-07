@@ -32,7 +32,7 @@ import { normalizeTranscriptClient, parseTranscriptTextForClient, type Transcrip
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
-import type { StorageBackendFactory } from "../../storage/index.js";
+import type { ProjectStorage, StorageBackendFactory } from "../../storage/index.js";
 import { createCommitCloseBarrier, storageRouteFailureResponse, withProjectStorage } from "./storage-lifecycle.js";
 import { isAbortError, throwIfAborted } from "../cancellation.js";
 import { BackendPublicationJournalError } from "../../storage/backend-publication.js";
@@ -128,101 +128,110 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
           })()
         : undefined;
 
-      const explicitScrubber = importNative === undefined ? await createScrubber(resolvedMessages) : undefined;
-      throwIfAborted(context?.signal);
-      const lifetime = createCommitCloseBarrier();
-      const ingest = await withProjectStorage(
-        {
-          config,
-          cwd,
-          factory: storageFactory,
-          context,
-          mode: "create",
-          expectedIdentity: storageIdentity,
-          beforeClose: lifetime.waitForZero,
-        },
-        async (project, signal) => {
-          const permit = lifetime.acquire(() => ({ release: () => undefined }));
-          try {
-            throwIfAborted(signal);
-            if (resolvedMessages.length === 0 && importNative === undefined) return null;
-            if (importNative !== undefined && project.nativeTranscripts === undefined) {
-              throw new Error("native transcript storage unavailable");
-            }
-            let accumulated: Awaited<ReturnType<typeof persist>> = null;
-            async function persist(messages: ParsedMessage[]) {
-              const resolvedMessages = messages;
-              const scrubber = explicitScrubber ?? await createScrubber(messages);
-              return await project.transaction(async (repositories) => {
-                if (resolvedMessages.length === 0) return null;
-                const row = await repositories.coordination.getSessionIngest(session_id);
-                if (row && resolvedMessages.length <= row.messageCount) return null;
+      const signal = context?.signal ?? new AbortController().signal;
+      async function persist(project: ProjectStorage, messages: ParsedMessage[], scrubber: ScrubEngine | undefined) {
+        const resolvedMessages = messages;
+        return await project.transaction(async (repositories) => {
+          if (resolvedMessages.length === 0) return null;
+          const row = await repositories.coordination.getSessionIngest(session_id);
+          if (row && resolvedMessages.length <= row.messageCount) return null;
 
-                const conversation = await repositories.conversations.getOrCreateConversation(session_id);
-                const storedCount = await repositories.conversations.getMessageCount(conversation.conversationId);
-                const newMessages = resolvedMessages.slice(storedCount);
-                if (newMessages.length === 0) return null;
+          const conversation = await repositories.conversations.getOrCreateConversation(session_id);
+          const storedCount = await repositories.conversations.getMessageCount(conversation.conversationId);
+          const newMessages = resolvedMessages.slice(storedCount);
+          if (newMessages.length === 0) return null;
 
-                const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
-                const inputs = newMessages.map((m, i) => {
-                  const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project: projectCount } = scrubber!.scrubWithCounts(m.content);
-                  totalCounts.gitleaks += gitleaks;
-                  totalCounts.builtIn += builtIn;
-                  totalCounts.global += globalCount;
-                  totalCounts.project += projectCount;
-                  return {
-                    conversationId: conversation.conversationId,
-                    seq: storedCount + i,
-                    role: m.role as "user" | "assistant" | "system" | "tool",
-                    content: scrubbedContent,
-                    tokenCount: m.tokenCount,
-                  };
-                });
-                const records = await repositories.conversations.createMessagesBulk(inputs);
-                await repositories.redactionAdmin.upsertCounts(totalCounts);
-                await repositories.context.appendContextMessages(
-                  conversation.conversationId,
-                  records.map((record) => record.messageId),
-                );
-                return { conversationId: conversation.conversationId, records, totalCounts };
-              });
+          const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
+          const inputs = newMessages.map((m, i) => {
+            const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project: projectCount } = scrubber!.scrubWithCounts(m.content);
+            totalCounts.gitleaks += gitleaks;
+            totalCounts.builtIn += builtIn;
+            totalCounts.global += globalCount;
+            totalCounts.project += projectCount;
+            return {
+              conversationId: conversation.conversationId,
+              seq: storedCount + i,
+              role: m.role as "user" | "assistant" | "system" | "tool",
+              content: scrubbedContent,
+              tokenCount: m.tokenCount,
+            };
+          });
+          const records = await repositories.conversations.createMessagesBulk(inputs);
+          await repositories.redactionAdmin.upsertCounts(totalCounts);
+          await repositories.context.appendContextMessages(
+            conversation.conversationId,
+            records.map((record) => record.messageId),
+          );
+          return { conversationId: conversation.conversationId, records, totalCounts };
+        });
+      }
+      let accumulated: Awaited<ReturnType<typeof persist>> = null;
+      let ingest: (NonNullable<Awaited<ReturnType<typeof persist>>> & { totalTokens: number }) | null = null;
+      let sourceWitness: { byteLength: number; sha256: string } | undefined;
+      let retryFailure: NativeTranscriptSourceChangedError | undefined;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        throwIfAborted(signal);
+        let snapshot: NativeTranscriptSourceSnapshot | undefined;
+        let closeSnapshot: (() => Promise<void>) | undefined;
+        let sourceClosed = false;
+        let attemptFailed = false;
+        let retryableFailure: NativeTranscriptSourceChangedError | undefined;
+        const closeSource = async () => {
+          if (sourceClosed) return;
+          sourceClosed = true;
+          try { await closeSnapshot?.(); } catch (error) {
+            if (retryableFailure !== undefined) {
+              throw new AggregateError([retryableFailure, error], "Native ingest source cleanup failed", { cause: retryableFailure });
             }
-            let sourceWitness: { byteLength: number; sha256: string } | undefined;
-            let retryFailure: NativeTranscriptSourceChangedError | undefined;
-            for (let attempt = 0; attempt < 2; attempt += 1) {
-              throwIfAborted(signal);
-              let snapshot: NativeTranscriptSourceSnapshot | undefined;
-              let closeSnapshot: (() => Promise<void>) | undefined;
-              let attemptFailed = false;
-              let retryableFailure: NativeTranscriptSourceChangedError | undefined;
+            if (!attemptFailed) throw error;
+          }
+        };
+        try {
+          let messages = resolvedMessages;
+          if (importNative !== undefined) {
+            snapshot = await createFileNativeTranscriptSource(dirname(importNative), basename(importNative)).openSnapshot();
+            closeSnapshot = snapshot.close.bind(snapshot);
+            // The route owns cleanup, including failures before backfill.
+            const bound = snapshot;
+            snapshot = {
+              metadata: bound.metadata,
+              stream: bound.stream.bind(bound),
+              digestPrefix: bound.digestPrefix.bind(bound),
+              assertUnchanged: bound.assertUnchanged.bind(bound),
+              assertByteRangesUnchanged: bound.assertByteRangesUnchanged.bind(bound),
+              close: async () => undefined,
+            };
+            if (sourceWitness !== undefined && (
+              snapshot.metadata.sizeBytes < sourceWitness.byteLength
+              || await snapshot.digestPrefix(sourceWitness.byteLength) !== sourceWitness.sha256
+            )) throw retryFailure;
+            const chunks: Buffer[] = [];
+            for await (const chunk of snapshot.stream()) chunks.push(Buffer.from(chunk));
+            await snapshot.assertUnchanged();
+            const bytes = Buffer.concat(chunks);
+            sourceWitness = { byteLength: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex") };
+            messages = parseTranscriptTextForClient(bytes.toString("utf8"), resolved.client!);
+          }
+          throwIfAborted(signal);
+          const scrubber = await createScrubber(messages);
+          throwIfAborted(signal);
+          const lifetime = createCommitCloseBarrier();
+          ingest = await withProjectStorage(
+            {
+              config, cwd, factory: storageFactory, context, mode: "create",
+              expectedIdentity: storageIdentity, beforeClose: lifetime.waitForZero,
+            },
+            async (project, signal) => {
+              const permit = lifetime.acquire(() => ({ release: () => undefined }));
               try {
-                let messages = resolvedMessages;
-                if (importNative !== undefined) {
-                  snapshot = await createFileNativeTranscriptSource(dirname(importNative), basename(importNative)).openSnapshot();
-                  closeSnapshot = snapshot.close.bind(snapshot);
-                  // The route owns cleanup, including failures before backfill.
-                  const bound = snapshot;
-                  snapshot = {
-                    metadata: bound.metadata,
-                    stream: bound.stream.bind(bound),
-                    digestPrefix: bound.digestPrefix.bind(bound),
-                    assertUnchanged: bound.assertUnchanged.bind(bound),
-                    assertByteRangesUnchanged: bound.assertByteRangesUnchanged.bind(bound),
-                    close: async () => undefined,
-                  };
-                  if (sourceWitness !== undefined && (
-                    snapshot.metadata.sizeBytes < sourceWitness.byteLength
-                    || await snapshot.digestPrefix(sourceWitness.byteLength) !== sourceWitness.sha256
-                  )) throw retryFailure;
-                  const chunks: Buffer[] = [];
-                  for await (const chunk of snapshot.stream()) chunks.push(Buffer.from(chunk));
-                  await snapshot.assertUnchanged();
-                  const bytes = Buffer.concat(chunks);
-                  sourceWitness = { byteLength: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex") };
-                  messages = parseTranscriptTextForClient(bytes.toString("utf8"), resolved.client!);
-                }
                 throwIfAborted(signal);
-                const persisted = await persist(messages);
+                if (resolvedMessages.length === 0 && importNative === undefined) return null;
+                if (importNative !== undefined && project.nativeTranscripts === undefined) {
+                  throw new Error("native transcript storage unavailable");
+                }
+                await snapshot?.assertUnchanged();
+                throwIfAborted(signal);
+                const persisted = await persist(project, messages, scrubber);
                 if (persisted) {
                   accumulated = accumulated === null ? persisted : {
                     conversationId: persisted.conversationId,
@@ -275,33 +284,33 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
                 }
 
                 throwIfAborted(signal);
-                break;
+                if (!accumulated) return null;
+                const totalTokens = await project.context.getContextTokenCount(accumulated.conversationId);
+                throwIfAborted(signal);
+                return { ...accumulated, totalTokens };
               } catch (error) {
                 attemptFailed = true;
-                if (!(error instanceof NativeTranscriptSourceChangedError) || attempt === 1) throw error;
-                throwIfAborted(signal);
-                if (sourceWitness === undefined) throw error;
-                retryFailure = error;
-                retryableFailure = error;
-              } finally {
-                try { await closeSnapshot?.(); } catch (error) {
-                  if (retryableFailure !== undefined) {
-                    throw new AggregateError([retryableFailure, error], "Native ingest source cleanup failed", { cause: retryableFailure });
-                  }
-                  if (!attemptFailed) throw error;
+                if (error instanceof NativeTranscriptSourceChangedError && attempt === 0 && !signal.aborted) {
+                  retryableFailure = error;
                 }
+                throw error;
+              } finally {
+                try { await closeSource(); } finally { permit.release(); }
               }
-            }
-            throwIfAborted(signal);
-            if (!accumulated) return null;
-            const totalTokens = await project.context.getContextTokenCount(accumulated.conversationId);
-            throwIfAborted(signal);
-            return { ...accumulated, totalTokens };
-          } finally {
-            permit.release();
-          }
-        },
-      );
+            },
+          );
+          break;
+        } catch (error) {
+          attemptFailed = true;
+          if (!(error instanceof NativeTranscriptSourceChangedError) || attempt === 1) throw error;
+          throwIfAborted(signal);
+          if (sourceWitness === undefined) throw error;
+          retryFailure = error;
+          retryableFailure = error;
+        } finally {
+          await closeSource();
+        }
+      }
 
       throwIfAborted(context?.signal);
       if (!ingest) {

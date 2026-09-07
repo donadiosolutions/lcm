@@ -3,6 +3,7 @@ import { appendFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, expect, it, vi } from "vitest";
+import { ScrubEngine } from "../../../src/scrub.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { createStorageBackendFactory } from "../../../src/storage/index.js";
 import { createIngestHandler } from "../../../src/daemon/routes/ingest.js";
@@ -14,7 +15,7 @@ vi.mock("../../../src/hooks/hook-errors.js", () => ({ safeLogError: logs.error }
 afterEach(() => vi.restoreAllMocks());
 
 for (const client of ["claude", "codex"] as const) {
-  for (const boundary of ["before-bind", "after-parsed", "during-backfill", "continuous", "metadata-retry"] as const) {
+  for (const boundary of ["before-bind", "during-preparation", "during-admission", "after-parsed", "during-backfill", "continuous", "metadata-retry"] as const) {
     it(`${client} keeps one source epoch across ${boundary}`, async () => {
       const cwd = mkdtempSync(join(tmpdir(), "native-append-"));
       const source = join(cwd, "transcript.jsonl");
@@ -31,10 +32,11 @@ for (const client of ["claude", "codex"] as const) {
       let opens = 0;
       let closes = 0;
       vi.spyOn(nativeSource, "createFileNativeTranscriptSource").mockImplementation((...args) => {
-        const source = createSource(...args);
+        const byteSource = createSource(...args);
         return { openSnapshot: async () => {
+          if (boundary === "before-bind" && opens === 0) appendFileSync(source, second);
           opens++;
-          const snapshot = await source.openSnapshot();
+          const snapshot = await byteSource.openSnapshot();
           const close = snapshot.close.bind(snapshot);
           snapshot.close = async () => { closes++; await close(); };
           return snapshot;
@@ -42,6 +44,14 @@ for (const client of ["claude", "codex"] as const) {
       });
       let appends = 0;
       let checkpoints = 0;
+      if (boundary === "during-preparation") {
+        const prepare = ScrubEngine.forProject.bind(ScrubEngine);
+        vi.spyOn(ScrubEngine, "forProject").mockImplementation(async (...args) => {
+          const scrubber = await prepare(...args);
+          if (appends++ === 0) appendFileSync(source, second);
+          return scrubber;
+        });
+      }
       vi.spyOn(factory, "openProject").mockImplementation(async (...args) => {
         const project = await open(...args);
         const append = () => {
@@ -49,7 +59,7 @@ for (const client of ["claude", "codex"] as const) {
           appendFileSync(source, boundary === "metadata-retry" ? '{"type":"metadata"}\n' : second);
           appends++;
         };
-        if (boundary === "before-bind") append();
+        if (boundary === "during-admission") append();
         if (boundary === "after-parsed" || boundary === "metadata-retry") {
           const transaction = project.transaction.bind(project);
           vi.spyOn(project, "transaction").mockImplementation(async (operation) => {

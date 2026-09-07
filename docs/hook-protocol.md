@@ -316,8 +316,10 @@ All lcm hooks self-repair on each invocation: before dispatching, `validateAndFi
 ### Native ingest source changes and cancellation
 
 When `/ingest` receives a native transcript path, parsed messages and native
-archival use the same open file snapshot. LCM preserves exact source and message
-link checks. If a fully read and validated source changes during ingestion, LCM
+archival use the same open file snapshot. Each attempt prepares parsed messages
+and its scrubber before requesting backend publication admission. Once admitted,
+LCM revalidates the snapshot before storing messages and preserves exact source
+and message link checks. If a fully read and validated source changes during ingestion, LCM
 makes one fresh attempt only when the original byte prefix remains identical;
 appended bytes are allowed. Shrink or rewrite of that prefix fails the request.
 Mutation before the first complete validated snapshot is available also fails
@@ -328,7 +330,10 @@ For an eligible append,
 a stable second attempt completes without recording an ingest error. Inserted
 message and redaction counts include both attempts without duplicating committed
 messages. A source that changes again fails the request; a later hook event can
-resume native archival using the existing checkpoint.
+resume native archival using the existing checkpoint. Before a retry prepares
+its input, the prior attempt finishes and releases its project resources and
+publication admission. The retry checks publication state and the original
+project identity again; a blocked publication or changed identity fails closed.
 
 An initially missing or rejected transcript path retains the empty-input behavior.
 A source that disappears after path validation, or fails snapshot validation,

@@ -229,6 +229,132 @@ describe("ingest persistence boundaries", () => {
     }));
   });
 
+  for (const client of ["claude", "codex"] as const) {
+    for (const outcome of ["success", "admission", "identity"] as const) {
+      it(`${client} prepares both attempts outside admission and handles ${outcome}`, async () => {
+        const { NativeTranscriptSourceChangedError } = await import("../../../src/storage/native-transcript-ingest.js");
+        const { BackendPublicationJournalError } = await import("../../../src/storage/backend-publication.js");
+        mocks.parse.mockReturnValue([validMessage]);
+        mocks.nativeBackfill.mockRejectedValueOnce(new NativeTranscriptSourceChangedError());
+        let admitted = false;
+        let attempts = 0;
+        let preparations = 0;
+        mocks.forProject.mockImplementation(async () => {
+          expect(admitted).toBe(false);
+          expect(mocks.closeConnection).toHaveBeenCalledTimes(preparations);
+          preparations++;
+          return { scrubWithCounts: mocks.scrubCounts };
+        });
+        const identity = mocks.identity("/ok");
+        mocks.identity.mockClear();
+        if (outcome === "identity") {
+          mocks.identity.mockReturnValueOnce(identity).mockReturnValueOnce(identity)
+            .mockReturnValueOnce({ ...identity, canonical: "/changed" });
+        }
+        const admission = async (operation: (token: object) => Promise<unknown>) => {
+          expect(preparations).toBe(++attempts);
+          if (attempts === 2 && outcome === "admission") {
+            throw new BackendPublicationJournalError("unexpected-state", "synthetic blocked publication");
+          }
+          admitted = true;
+          try { return await operation({}); } finally { admitted = false; }
+        };
+        await createIngestHandler(config)({} as never, response, JSON.stringify({
+          client, session_id: "native-admission", cwd: "/ok", transcript_path: "/safe",
+        }), { withPublicationAdmission: admission });
+        expect(preparations).toBe(2);
+        expect(mocks.snapshotOpen).toHaveBeenCalledTimes(2);
+        expect(mocks.snapshotClose).toHaveBeenCalledTimes(2);
+        expect(mocks.logError).not.toHaveBeenCalled();
+        if (outcome === "success") {
+          expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 2, totalTokens: 7 });
+          expect(mocks.createBulk).toHaveBeenCalledTimes(2);
+          expect(mocks.closeConnection).toHaveBeenCalledTimes(2);
+        } else {
+          expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+            status: "blocked", error: "backend publication admission blocked",
+          });
+          expect(mocks.createBulk).toHaveBeenCalledOnce();
+          expect(mocks.nativeBackfill).toHaveBeenCalledOnce();
+          expect(mocks.closeConnection).toHaveBeenCalledOnce();
+        }
+      });
+    }
+  }
+
+  it("prepares an appended parsed message outside the second admission after metadata-only input", async () => {
+    const { NativeTranscriptSourceChangedError } = await import("../../../src/storage/native-transcript-ingest.js");
+    mocks.parse.mockReturnValueOnce([]).mockReturnValueOnce([validMessage]);
+    mocks.nativeBackfill.mockRejectedValueOnce(new NativeTranscriptSourceChangedError());
+    let admitted = false;
+    let attempts = 0;
+    mocks.forProject.mockImplementationOnce(async () => {
+      expect(admitted).toBe(false);
+      expect(attempts).toBe(1);
+      expect(mocks.closeConnection).toHaveBeenCalledOnce();
+      return { scrubWithCounts: mocks.scrubCounts };
+    });
+    const admission = async (operation: (token: object) => Promise<unknown>) => {
+      attempts++;
+      admitted = true;
+      try { return await operation({}); } finally { admitted = false; }
+    };
+    await createIngestHandler(config)({} as never, response, JSON.stringify({
+      session_id: "metadata-append", cwd: "/ok", transcript_path: "/safe",
+    }), { withPublicationAdmission: admission });
+    expect(attempts).toBe(2);
+    expect(mocks.forProject).toHaveBeenCalledOnce();
+    expect(mocks.createBulk).toHaveBeenCalledOnce();
+    expect(mocks.snapshotClose).toHaveBeenCalledTimes(2);
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
+  });
+
+  it("closes its prepared source without writes when first publication admission blocks", async () => {
+    const { BackendPublicationJournalError } = await import("../../../src/storage/backend-publication.js");
+    mocks.parse.mockReturnValue([validMessage]);
+    const admission = async () => {
+      expect(mocks.forProject).toHaveBeenCalledOnce();
+      throw new BackendPublicationJournalError("unexpected-state", "synthetic malformed publication journal");
+    };
+    await createIngestHandler(config)({} as never, response, JSON.stringify({
+      session_id: "blocked-prepared", cwd: "/ok", transcript_path: "/safe",
+    }), { withPublicationAdmission: admission });
+    expect(mocks.getConnection).not.toHaveBeenCalled();
+    expect(mocks.createBulk).not.toHaveBeenCalled();
+    expect(mocks.nativeBackfill).not.toHaveBeenCalled();
+    expect(mocks.snapshotClose).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
+      status: "blocked", error: "backend publication admission blocked",
+    });
+  });
+
+  for (const boundary of ["preparation", "admission", "open"] as const) {
+    it(`closes its prepared source once on ${boundary} cancellation`, async () => {
+      const controller = new AbortController();
+      mocks.parse.mockReturnValue([validMessage]);
+      if (boundary === "preparation") mocks.forProject.mockImplementationOnce(async () => {
+        controller.abort();
+        return { scrubWithCounts: mocks.scrubCounts };
+      });
+      if (boundary === "open") mocks.getConnection.mockImplementationOnce(() => {
+        controller.abort();
+        return db;
+      });
+      const admission = async (operation: (token: object) => Promise<unknown>) => {
+        if (boundary === "admission") controller.abort();
+        return operation({});
+      };
+      await createIngestHandler(config)({} as never, response, JSON.stringify({
+        session_id: "prepare-cancel", cwd: "/ok", transcript_path: "/safe",
+      }), { signal: controller.signal, withPublicationAdmission: admission });
+      expect(mocks.snapshotOpen).toHaveBeenCalledOnce();
+      expect(mocks.snapshotClose).toHaveBeenCalledOnce();
+      expect(mocks.createBulk).not.toHaveBeenCalled();
+      expect(mocks.logError).not.toHaveBeenCalled();
+      expect(mocks.send).toHaveBeenLastCalledWith(response, 499, { status: "cancelled", error: "ingest cancelled" });
+    });
+  }
+
   for (const cleanup of ["source", "quarantine", "clean"] as const) {
     it(`handles retryable source mutation with ${cleanup} cleanup`, async () => {
       const { NativeTranscriptSourceChangedError } = await import("../../../src/storage/native-transcript-ingest.js");
@@ -246,7 +372,7 @@ describe("ingest persistence boundaries", () => {
       expect(mocks.snapshotClose).toHaveBeenCalledTimes(attempts);
       expect(mocks.closeQuarantine).toHaveBeenCalledTimes(attempts);
       expect(mocks.nativeBackfill).toHaveBeenCalledTimes(attempts);
-      expect(mocks.closeConnection).toHaveBeenCalledOnce();
+      expect(mocks.closeConnection).toHaveBeenCalledTimes(attempts);
       if (cleanup === "clean") {
         expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 0, totalTokens: 0 });
         expect(mocks.logError).not.toHaveBeenCalled();
@@ -714,7 +840,8 @@ describe("ingest persistence boundaries", () => {
     });
     expect(mocks.safeTranscript).toHaveBeenCalled();
     expect(mocks.exists).toHaveBeenCalled();
-    expect(mocks.parse).not.toHaveBeenCalled();
+    expect(mocks.parse).toHaveBeenCalledOnce();
+    expect(mocks.snapshotClose).toHaveBeenCalledOnce();
   });
 
   it("reuses the admitted PostgreSQL project for non-empty ingestion", async () => {
