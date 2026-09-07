@@ -100,7 +100,7 @@ describe("spawned timezone fixtures", () => {
     ).run("2024-03-10T04:30:00+02:00");
     db.prepare(
       "INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, file_ids, created_at) VALUES ('leaf', 1, 'leaf', 'summary', 1, '[]', ?)",
-    ).run("2024-03-10 02:30:00");
+    ).run("2024-03-09 00:00:00");
     db.prepare(
       "INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, file_ids, created_at) VALUES ('orphan', 1, 'condensed', 'orphan', 1, '[]', ?)",
     ).run("2024-03-10 02:30:00");
@@ -109,7 +109,7 @@ describe("spawned timezone fixtures", () => {
     ).run("2024-03-10T04:30:00+02:00");
     db.prepare(
       "INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count, file_ids, created_at) VALUES ('parent', 1, 'condensed', 'parent', 1, '[]', ?)",
-    ).run("2024-03-10 02:30:00");
+    ).run("2024-03-11 00:00:00");
     db.prepare("INSERT INTO summary_messages (summary_id, message_id, ordinal) VALUES ('leaf', 1, 0)").run();
     db.prepare("INSERT INTO summary_messages (summary_id, message_id, ordinal) VALUES ('offset-leaf', 2, 0)").run();
     db.prepare("INSERT INTO summary_parents (summary_id, parent_summary_id, ordinal) VALUES ('parent', 'leaf', 0)").run();
