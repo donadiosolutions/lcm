@@ -146,6 +146,25 @@ describe("SQLite canonical destination", () => {
     sql(f,db=>expect(db.prepare("SELECT count(*) AS count FROM transfer_batches").get()).toEqual({count:1}));
   });
 
+  it("bounds malformed fixed ledger control before validation", async () => {
+    const f=await fixture();const writer=await destination(f);const manifest=await admit(f,writer);
+    const field="schema_ready";
+    const oversized="x".repeat(PORTABLE_LIMITS.maxControlBytes+1);
+    sql(f,db=>db.prepare(`UPDATE transfer_runs SET ${field}=?`).run(oversized));
+    let largest=0;const get=StatementSync.prototype.get;
+    const spy=vi.spyOn(StatementSync.prototype,"get").mockImplementation(function(this:StatementSync,...args){
+      const row=get.apply(this,args);const value=row?.[field];
+      if(typeof value==="string")largest=Math.max(largest,Buffer.byteLength(value));
+      else if(value instanceof Uint8Array)largest=Math.max(largest,value.byteLength);
+      return row;
+    });
+    const failure=await writer.readProgress(manifest.manifestSha256).then(()=>undefined,error=>error);
+    spy.mockRestore();
+    expect(largest).toBeLessThanOrEqual(PORTABLE_LIMITS.maxControlBytes);
+    expect(failure).toMatchObject({code:"destination-conflict"});
+    sql(f,db=>expect(db.prepare(`SELECT length(CAST(${field} AS BLOB)) AS bytes FROM transfer_runs`).get()).toEqual({bytes:Buffer.byteLength(oversized)}));
+  });
+
   it("writes runtime data and verifies all real SQL domains", async () => {
     const f = await fixture();
     const result = await runPortableTransfer({ source: f.source, destination: await destination(f) });
