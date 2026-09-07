@@ -144,6 +144,7 @@ const expectedComponents = [
     // #1082 keeps SQLite promoted-content NUL admission and replay guards in
     // local persistence; this change does not alter component ownership.
     // #618 optional receipt schema admission stays local-persistence-owned.
+    // #622 keeps registered-project outbox preparation and admitted sidecar discovery here.
     paths: ["src/db/", "src/storage/sqlite/", "src/store/"],
   },
   {
@@ -183,9 +184,11 @@ const expectedComponents = [
   {
     component_id: "unit-local-event-storage",
     name: "Unit - Local Event Storage",
+    // #622 keeps outbox connection admission and current-schema validation here.
     paths: [
       "^src/storage/local-hook-event-sequence\\.ts$",
       "^src/storage/local-hook-outbox\\.ts$",
+      "^src/storage/local-hook-outbox-schema\\.ts$",
       "^src/storage/session-instructions\\.ts$",
     ],
   },
@@ -513,7 +516,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(236);
+    expect(productionFiles).toHaveLength(237);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -543,7 +546,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(236);
+    expect(ownershipCounts.size).toBe(237);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106 files in their intended components", () => {
@@ -651,6 +654,7 @@ describe("Codecov configuration", () => {
       // #837 consumer-admission descriptor cleanup remains storage-owned.
       // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
+      ["src/storage/local-hook-outbox-schema.ts", "unit-local-event-storage"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
       ["src/migration/maintenance.ts", "unit-migration-cutover"],
       ["src/migration/receipts.ts", "unit-migration-cutover"],

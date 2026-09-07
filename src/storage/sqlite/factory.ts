@@ -28,6 +28,7 @@ import { throwIfAborted } from "../../daemon/cancellation.js";
 import { readMachineIdentity } from "../../machine-identity.js";
 import { LocalHookEventSequenceAllocator } from "../local-hook-event-sequence.js";
 import { adoptMigrationReceiptEpoch } from "../../migration/receipts.js";
+import { SQLiteLocalHookOutboxFactory } from "../local-hook-outbox.js";
 import { withBackendPublicationAppendBarrierAsync, withBackendPublicationConsumerLock, assertBackendPublicationConsumerAccess } from "../backend-publication.js";
 
 export class SqliteStorageBackendFactory implements StorageBackendFactory {
@@ -150,6 +151,12 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
         if (machine?.machineId !== null && machine?.machineId !== undefined) {
           await withBackendPublicationAppendBarrierAsync(homeDir, async (token) => {
             assertBackendPublicationConsumerAccess({ homeDir, backend: "sqlite", lockToken: token });
+            const outboxFactory = new SQLiteLocalHookOutboxFactory();
+            try {
+              await outboxFactory.open(join(homeDir, ".lcm", "events", `${paths.id}.db`), {}, token);
+            } finally {
+              await outboxFactory.close();
+            }
             const allocator = new LocalHookEventSequenceAllocator(
               join(homeDir, ".lcm", "events", ".machine-sequence.sqlite"),
             );

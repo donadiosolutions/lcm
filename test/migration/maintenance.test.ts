@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, openSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, openSync, renameSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -32,6 +32,8 @@ import * as identityService from "../../src/identity-service.js";
 import { type IdentityRepository } from "../../src/identity-service.js";
 import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
 import { closeLcmConnection } from "../../src/db/connection.js";
+import * as connectionApi from "../../src/db/connection.js";
+import { appendLocalHookEvents } from "../../src/hooks/local-enqueue.js";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -139,6 +141,124 @@ async function heldSource(fixture: ReturnType<typeof enrollmentFixture>) {
 }
 
 describe("backend publication maintenance journal v3", () => {
+  it.each([false, true])("keeps the first public hook after empty enrollment durable across restart=%s", async (restart) => {
+    const fixture = enrollmentFixture();
+    vi.stubEnv("HOME", fixture.homeDir);
+    expect(existsSync(join(fixture.homeDir, ".lcm", "config.json"))).toBe(false);
+    const outboxPath = join(fixture.homeDir, ".lcm", "events", `${fixture.local.id}.db`);
+    expect(existsSync(outboxPath)).toBe(false);
+    await prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession });
+    const source = await heldSource(fixture);
+    await expect(appendLocalHookEvents({
+      cwd: fixture.cwd, sessionId: "first-hook", sourceHook: "PostToolUse",
+      events: [{ type: "decision", category: "decision", data: "first held event", priority: 1 }],
+    })).resolves.toEqual({ inserted: 1, pendingCount: 1 });
+    closeLcmConnection();
+    const authority = restart ? await withBackendPublicationAppendBarrierAsync(fixture.homeDir, (token) =>
+      authenticateSqliteMigrationSource(fixture.cwd, fixture.homeDir, token)) : source.authority;
+    const snapshot = await captureAuthenticatedSqliteMigrationSource(authority, source.options);
+    const page = JSON.parse(readFileSync(join(fixture.homeDir, ".lcm", "migration-evidence", "generation-1", snapshot.pages[0].name), "utf8"));
+    expect(snapshot.receiptReference.queueCutoff).toBe("0000000000000000000");
+    expect(page.records).toMatchObject([{ disposition: "retained" }]);
+    expect(page.records).toHaveLength(1);
+  });
+  it.each(["openProject", "openExistingProject"] as const)("prepares first-hook durability in ordinary registered %s", async (operation) => {
+    const fixture = enrollmentFixture();
+    vi.stubEnv("HOME", fixture.homeDir);
+    const factory = new SqliteStorageBackendFactory({ resolveProject: () => ({
+      id: fixture.local.id, dbPath: join(fixture.projectDir, "db.sqlite"),
+    }) });
+    const projectIdentity = { id: fixture.local.id, canonical: fixture.cwd };
+    if (operation === "openExistingProject") await (await factory.openProject(projectIdentity)).close();
+    const pending = identityApi.ensurePendingMachineIdentity("already registered", fixture.homeDir);
+    identityApi.finalizeMachineIdentity(pending.identity, REGISTERED_MACHINE, "already registered", fixture.homeDir);
+    try { await (await factory[operation](projectIdentity))!.close(); }
+    finally { await factory.close(); }
+    const source = await heldSource(fixture);
+    await expect(appendLocalHookEvents({ cwd: fixture.cwd, sessionId: "first", sourceHook: "PostToolUse",
+      events: [{ type: "decision", category: "decision", data: "ordinary startup first hook", priority: 1 }],
+    })).resolves.toEqual({ inserted: 1, pendingCount: 1 });
+    const snapshot = await captureAuthenticatedSqliteMigrationSource(source.authority, source.options);
+    expect(snapshot.receiptReference.firstMachineSequence).toBe("0000000000000000000");
+    expect(snapshot.receiptReference.queueCutoff).toBe("0000000000000000000");
+    expect(snapshot.pages[0].records).toBe(1);
+  });
+  it.each(["missing", "legacy"] as const)("rechecks queued %s outbox creation or migration after entering hold", async (kind) => {
+    const fixture = enrollmentFixture();
+    const path = join(fixture.homeDir, ".lcm", "events", `${fixture.local.id}.db`);
+    if (kind === "legacy") {
+      const db = new DatabaseSync(path);
+      db.exec("CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES(1)");
+      db.close();
+    }
+    const before = existsSync(path) ? readFileSync(path) : null;
+    const factory = new SQLiteLocalHookOutboxFactory();
+    let queued!: Promise<unknown>;
+    await withBackendPublicationAppendBarrierAsync(fixture.homeDir, async (token) => {
+      queued = factory.open(path);
+      // The open is invoked before the journal exists but must decide whether
+      // creation or migration is permitted only after acquiring admission.
+      await coordinator(fixture.homeDir).enterMaintenance(input(), token);
+    });
+    try { await expect(queued).rejects.toThrow(); }
+    finally { await factory.close(); }
+    expect(existsSync(path) ? readFileSync(path) : null).toEqual(before);
+  });
+  it.each(["open", "openExisting"] as const)("refuses %s during maintenance entry before connection initialization", async operation => {
+    const fixture = await populatedFixture();
+    const source = await heldSource(fixture);
+    const journalPath = publicationApi.backendPublicationJournalPath(fixture.homeDir);
+    const { checksumSha256: _checksum, ...body } = JSON.parse(readFileSync(journalPath, "utf8"));
+    body.phase = "maintenance-entering";
+    writeFileSync(journalPath, JSON.stringify({ ...body, checksumSha256: publicationApi.backendPublicationCanonicalSha256(body) }));
+    const path = source.authority.passiveEventsDbPath!;
+    const before = readFileSync(path);
+    const opening = vi.spyOn(connectionApi, "getExistingLcmConnection");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    try {
+      await expect(factory[operation](path)).rejects.toThrow("not ready for local append");
+      expect(opening).not.toHaveBeenCalled();
+      expect(readFileSync(path)).toEqual(before);
+    } finally { await factory.close(); }
+  });
+  it.each(["open", "openExisting"] as const)("defers actual %s connection initialization throughout capture", async (operation) => {
+    const fixture = await populatedFixture();
+    closeLcmConnection();
+    const source = await heldSource(fixture);
+    const outboxPath = source.authority.passiveEventsDbPath!;
+    const paths = [source.authority.projectDbPath, outboxPath, source.authority.machineSequenceDbPath]
+      .flatMap((path) => [path, `${path}-wal`, `${path}-shm`]);
+    const evidence = () => paths.map((path) => existsSync(path)
+      ? { path, bytes: readFileSync(path), mode: statSync(path).mode } : { path, absent: true });
+    let reached!: () => void;
+    let release!: () => void;
+    const paused = new Promise<void>((resolve) => { reached = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let once = false;
+    const capture = captureAuthenticatedSqliteMigrationSource(source.authority, { ...source.options, _operationsForTesting: {
+      observe: async (boundary) => {
+        if (!once && boundary === "before-private-inspection") { once = true; reached(); await gate; }
+      },
+    } });
+    await paused;
+    const before = evidence();
+    const opening = vi.spyOn(connectionApi, "getExistingLcmConnection");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const open = factory[operation](outboxPath);
+    try {
+      await Promise.resolve();
+      expect(opening).not.toHaveBeenCalled();
+      expect(evidence()).toEqual(before);
+    } finally {
+      release();
+      await Promise.allSettled([capture, open]);
+      await factory.close();
+    }
+    const snapshot = await capture;
+    expect(opening).toHaveBeenCalledWith(outboxPath, { tightenDatabaseParent: true,
+      expectedFileIdentity: { device: expect.any(Number), inode: expect.any(Number) } });
+    expect(snapshot.receiptReference.queueCutoff).toBe("0000000000000000000");
+  });
   it.each([false, true])("captures legal held appends with fresh cutoff after restart=%s", async (restart) => {
     const fixture = await populatedFixture();
     const source = await heldSource(fixture);
@@ -361,6 +481,10 @@ describe("backend publication maintenance journal v3", () => {
   it("authenticates mapped project identities, aliases and absent outboxes", async () => {
     const fixture = enrollmentFixture();
     await prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession });
+    // Historical inspection still represents an absent sidecar; preparation
+    // now creates one for projects that will accept held hooks.
+    closeLcmConnection();
+    rmSync(join(fixture.homeDir, ".lcm", "events", `${fixture.local.id}.db`));
     writeFileSync(projectMapPath(fixture.homeDir), JSON.stringify({ [fixture.local.id]: {
       canonical: fixture.cwd, aliases: [fixture.cwd, join(fixture.homeDir, "alias")], remoteProjectId: REGISTERED_MACHINE,
     } }), { mode: 0o600 });

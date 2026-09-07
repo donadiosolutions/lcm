@@ -45,6 +45,54 @@ async function grantIdentityRuntimePrivileges(database: PostgreSqlTestDatabase):
 }
 
 describe("SQLite migration enrollment against PostgreSQL 18", () => {
+  it("retains the first held hook from an empty zero-config enrollment after restart", async () => {
+    await withPostgreSqlTestDatabase("migration-first-held-hook", async database => {
+      await grantIdentityRuntimePrivileges(database);
+      const root = mkdtempSync(join(tmpdir(), "lcm-pg-first-held-hook-"));
+      try {
+        const cwd = join(root, "project");
+        mkdirSync(cwd, { mode: 0o700 });
+        const local = localProjectIdentity(cwd, root);
+        const project = join(root, ".lcm", "projects", local.id);
+        mkdirSync(project, { recursive: true, mode: 0o700 });
+        writeFileSync(join(project, "meta.json"), `${JSON.stringify({ cwd })}\n`, { mode: 0o600 });
+        vi.stubEnv("HOME", root);
+        vi.stubEnv("USERPROFILE", root);
+        const enrolled = await prepareSqliteMigrationEnrollment({ cwd, homeDir: root,
+          targetConfig: { backend: "postgresql", postgresql: { ...settings(database.runtimeUrl), migrationRole: "lcm_test_migrator" } },
+        });
+        const unused = async (): Promise<never> => { throw new Error("v2 driver must not run"); };
+        const driver: BackendPublicationDriver = { observeLocalState: unused, publishProjectMap: unused,
+          publishConfig: unused, restoreConfig: unused, restoreProjectMap: unused };
+        const source = await withBackendPublicationAppendBarrierAsync(root, async token => {
+          const authority = authenticateSqliteMigrationSource(cwd, root, token);
+          const expectedSourceBytes = await authenticateSqliteMigrationSourceBytes(authority, { homeDir: root, lockToken: token });
+          const held = await new BackendPublicationCoordinator({ homeDir: root, driver }).enterMaintenance({
+            publicationId: "first-hook-generation", generationId: "first-hook-generation",
+            sourceSelectionSha256: authority.sourceSelectionSha256, queueEvidenceSha256: expectedSourceBytes.checksumSha256,
+            roster: [{ machineId: enrolled.identity.machineId, queueCutoff: null, evidenceSha256: expectedSourceBytes.checksumSha256 }],
+          }, token);
+          return { authority, expectedSourceBytes, held };
+        });
+        expect(await appendLocalHookEvents({ cwd, sessionId: "first", sourceHook: "PostToolUse",
+          events: [{ type: "decision", category: "decision", data: "First receipt-era held event", priority: 1 }],
+        })).toEqual({ inserted: 1, pendingCount: 1 });
+        closeLcmConnection();
+        expect(new BackendPublicationCoordinator({ homeDir: root, driver }).inspectMaintenance()).toEqual(source.held);
+        const authority = await withBackendPublicationAppendBarrierAsync(root, token => authenticateSqliteMigrationSource(cwd, root, token));
+        const snapshot = await captureAuthenticatedSqliteMigrationSource(authority, { homeDir: root,
+          generationId: source.held.generationId, maintenanceChecksumSha256: source.held.checksumSha256,
+          expectedSourceBytes: source.expectedSourceBytes });
+        expect(snapshot.receiptReference).toMatchObject({ machineId: enrolled.identity.machineId,
+          firstMachineSequence: "0000000000000000000", queueCutoff: "0000000000000000000" });
+        const page = JSON.parse(readFileSync(join(root, ".lcm", "migration-evidence", source.held.generationId, snapshot.pages[0].name), "utf8"));
+        expect(page.records).toHaveLength(1);
+        expect(page.records).toMatchObject([{ disposition: "retained" }]);
+      } finally {
+        closeLcmConnection(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
   it("enrolls through PostgreSQL while preserving SQLite and sealing represented and pending input", async () => {
     await withPostgreSqlTestDatabase("migration-enrollment", async (database) => {
       await grantIdentityRuntimePrivileges(database);

@@ -113,6 +113,16 @@ publication lock. Finalization rechecks the original configuration and project
 identity, then adopts the forward receipt epoch under writer admission and the
 local append barrier. It never backfills ambiguous historical receipts.
 
+Preparation also initializes or validates that project's local event outbox
+before establishing its receipt epoch. An empty project needs no preliminary
+hook or configuration file: its first hook can append durably after maintenance
+is held. Ordinary SQLite project opens for a registered machine perform this
+same preparation. Outbox connection opening and schema initialization share the
+append barrier with capture, so they wait until a capture finishes. During the
+hold, an absent or outdated outbox is refused; capture and dry-run never repair
+it. Prepare the project successfully before authenticating its source and
+entering maintenance.
+
 A caller authenticates the SQLite source and source bytes, then enters held
 maintenance through the existing backend publication coordinator. The initial
 roster contains the verified machine, its last allocated sequence (or null

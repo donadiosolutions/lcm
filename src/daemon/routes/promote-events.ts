@@ -210,7 +210,7 @@ async function withLockedCwdPromotion<T>(
       return await onReady(resolvedCwd, sidecarPath);
     } catch (error) {
       if (!isMissingCwdError(error)) throw error;
-      return onUnavailable(await parkUnavailableCwdEventsUnlocked(sidecarPath));
+      return onUnavailable(await parkUnavailableCwdEventsUnlocked(sidecarPath, publicationLockToken));
     }
   });
 }
@@ -274,10 +274,11 @@ async function clearRecoveredMissingCwdState(
 
 async function parkUnavailableCwdEventsUnlocked(
   sidecarPath: string,
+  publicationLockToken?: BackendPublicationLockToken,
 ): Promise<PromoteResult> {
   const outboxFactory = new SQLiteLocalHookOutboxFactory();
   try {
-    const edb = await outboxFactory.openExisting(sidecarPath);
+    const edb = await outboxFactory.openExisting(sidecarPath, {}, publicationLockToken);
     if (!edb) return noSidecarParkingResult();
     const state = await edb.observeMissingCwd(
       Date.now(),
@@ -425,7 +426,8 @@ export function createPromoteAllEventsHandler(
         projects: [],
       };
 
-      const sidecars = await collectEventSidecars({ timeoutMs: 30_000, maxDbs: Number.MAX_SAFE_INTEGER });
+      const sidecars = await collectEventSidecars({ timeoutMs: 30_000, maxDbs: Number.MAX_SAFE_INTEGER,
+        publicationLockToken: context?.publicationLockToken });
       result.scanned = sidecars.length;
       result.sidecarsWithUnprocessed = sidecars.filter(sidecar => sidecar.unprocessed > 0).length;
 
@@ -604,10 +606,10 @@ async function drainEventsForCwdUnlocked(
   const outboxFactory = new SQLiteLocalHookOutboxFactory();
   let ownedFactory: StorageBackendFactory | undefined;
   try {
-    const edb = await outboxFactory.open(sidecarPath);
-    await edb.clearMissingCwd();
     const executionContext = promotionExecutionContext(publicationLockToken, context);
     const effectiveToken = executionContext?.publicationLockToken;
+    const edb = await outboxFactory.open(sidecarPath, {}, effectiveToken);
+    await edb.clearMissingCwd();
     const factory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
       config.storage,
       undefined,
@@ -693,11 +695,11 @@ async function promoteEventsForCwdUnlocked(
   const outboxFactory = new SQLiteLocalHookOutboxFactory();
   let ownedFactory: StorageBackendFactory | undefined;
   try {
-    const edb = await outboxFactory.open(sidecarPath);
-    await edb.clearMissingCwd();
-    const prepared = await preparePromotionBatch(config, edb);
     const executionContext = promotionExecutionContext(publicationLockToken, context);
     const effectiveToken = executionContext?.publicationLockToken;
+    const edb = await outboxFactory.open(sidecarPath, {}, effectiveToken);
+    await edb.clearMissingCwd();
+    const prepared = await preparePromotionBatch(config, edb);
     const factory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
       config.storage,
       undefined,

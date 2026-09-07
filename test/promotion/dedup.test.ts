@@ -6,6 +6,7 @@ import { getLcmConnection, closeLcmConnection } from "../../src/db/connection.js
 import { runLcmMigrations } from "../../src/db/migration.js";
 import { PromotedStore } from "../../src/db/promoted.js";
 import { deduplicateAndInsert } from "../../src/promotion/dedup.js";
+import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 
 const tempDirs: string[] = [];
 afterEach(() => {
@@ -52,6 +53,29 @@ function dedupDeps(db: ReturnType<typeof makeDb>, store: PromotedStore) {
 }
 
 describe("deduplicateAndInsert", () => {
+  it("keeps caller-owned repository insertion inside its real rollback transaction", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-dedup-transaction-"));
+    tempDirs.push(directory);
+    const factory = new SqliteStorageBackendFactory({ resolveProject: () => ({
+      id: "p1", dbPath: join(directory, "project.db"),
+    }) });
+    try {
+      const storage = await factory.openProject({ id: "p1", canonical: directory });
+      let insertedId!: string;
+      await expect(storage.transaction(async (repositories) => {
+        insertedId = await deduplicateAndInsert({
+          transaction: storage.transaction.bind(storage), repositories,
+          content: "Caller-owned transaction must atomically roll back this decision",
+          tags: ["decision"], depth: 0, confidence: 0.9,
+          thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+        });
+        expect(await repositories.promotedMemory.getById(insertedId)).toMatchObject({ id: insertedId });
+        throw new Error("rollback caller transaction");
+      })).rejects.toMatchObject({ operation: "transaction" });
+      expect(insertedId).toEqual(expect.any(String));
+      expect(await storage.promotedMemory.getById(insertedId)).toBeNull();
+    } finally { await factory.close(); }
+  });
   it.each(["repositories", "legacy"] as const)("merges exact ranked content through %s without lowering the fuzzy threshold", async mode => {
     const db = makeDb();
     const store = new PromotedStore(db);

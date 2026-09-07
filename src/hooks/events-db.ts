@@ -261,6 +261,7 @@ export class EventsDb {
   ): EventsDb | null {
     const connection = getExistingLcmConnection(dbPath, {
       tightenDatabaseParent: true,
+      ...(options._expectedFileIdentity === undefined ? {} : { expectedFileIdentity: options._expectedFileIdentity }),
     });
     if (connection === null) return null;
     return new EventsDb(dbPath, options, connection);

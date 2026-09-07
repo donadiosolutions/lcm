@@ -1,11 +1,13 @@
-import { EventsDb } from "../hooks/events-db.js";
+import { EventsDb, EVENTS_SCHEMA_VERSION } from "../hooks/events-db.js";
 import { basename, dirname, resolve } from "node:path";
 import {
   withBackendPublicationAppendBarrierAsync,
   withBackendPublicationConsumerLock,
   readBackendMaintenanceJournal,
+  type BackendPublicationLockToken,
 } from "./backend-publication.js";
 import { StorageOperationError } from "./errors.js";
+import { readCurrentLocalHookOutboxIdentity } from "./local-hook-outbox-schema.js";
 
 export interface LocalHookEvent {
   type: string;
@@ -176,6 +178,8 @@ export interface LocalHookOutboxOpenOptions {
   busyTimeoutMs?: number;
   /** @internal Refuse schema changes while migration maintenance is held. */
   _requireCurrentSchema?: boolean;
+  /** @internal Bind the authenticated private-copy schema preflight. */
+  _expectedFileIdentity?: Readonly<{ device: number; inode: number }>;
 }
 
 /**
@@ -192,57 +196,80 @@ export class SQLiteLocalHookOutboxFactory {
   async open(
     dbPath: string,
     options: LocalHookOutboxOpenOptions = {},
+    publicationLockToken?: BackendPublicationLockToken,
   ): Promise<LocalHookOutboxRepository> {
-    if (this.closed) {
-      throw new StorageOperationError(
-        "STORAGE_CLOSED",
-        "sqlite",
-        undefined,
-        "passive-events",
-        "open",
-      );
-    }
-
-    const homeDir = localOutboxHomeDir(dbPath);
-    const maintenance = homeDir === undefined ? null : readBackendMaintenanceJournal(homeDir);
-    if (maintenance !== null && maintenance.phase !== "maintenance-aborted") {
-      const database = EventsDb.openExisting(dbPath, { ...options, _requireCurrentSchema: true });
-      if (database === null) {
+    return this.withOpenAdmission(dbPath, () => {
+      if (this.closed) {
         throw new StorageOperationError(
-          "STORAGE_INITIALIZATION_FAILED",
+          "STORAGE_CLOSED",
           "sqlite",
           undefined,
           "passive-events",
           "open",
         );
       }
-      return this.register(database, dbPath);
-    }
-    return this.register(new EventsDb(dbPath, options), dbPath);
+
+      const homeDir = localOutboxHomeDir(dbPath);
+      const maintenance = homeDir === undefined ? null : readBackendMaintenanceJournal(homeDir);
+      if (maintenance !== null && maintenance.phase !== "maintenance-aborted") {
+        const database = this.openCurrentSchema(dbPath, options);
+        if (database === null) {
+          throw new StorageOperationError(
+            "STORAGE_INITIALIZATION_FAILED",
+            "sqlite",
+            undefined,
+            "passive-events",
+            "open",
+          );
+        }
+        return this.register(database, dbPath);
+      }
+      return this.register(new EventsDb(dbPath, options), dbPath);
+    }, publicationLockToken);
   }
 
   /** Open an existing local outbox without creating its file or parent directory. */
   async openExisting(
     dbPath: string,
     options: LocalHookOutboxOpenOptions = {},
+    publicationLockToken?: BackendPublicationLockToken,
   ): Promise<LocalHookOutboxRepository | null> {
-    if (this.closed) {
-      throw new StorageOperationError(
-        "STORAGE_CLOSED",
-        "sqlite",
-        undefined,
-        "passive-events",
-        "openExisting",
-      );
-    }
+    return this.withOpenAdmission(dbPath, () => {
+      if (this.closed) {
+        throw new StorageOperationError(
+          "STORAGE_CLOSED",
+          "sqlite",
+          undefined,
+          "passive-events",
+          "openExisting",
+        );
+      }
 
+      const homeDir = localOutboxHomeDir(dbPath);
+      const maintenance = homeDir === undefined ? null : readBackendMaintenanceJournal(homeDir);
+      const database = maintenance !== null && maintenance.phase !== "maintenance-aborted"
+        ? this.openCurrentSchema(dbPath, options)
+        : EventsDb.openExisting(dbPath, options);
+      return database === null ? null : this.register(database, dbPath);
+    }, publicationLockToken);
+  }
+
+  private async withOpenAdmission<T>(
+    dbPath: string,
+    callback: () => T,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<T> {
     const homeDir = localOutboxHomeDir(dbPath);
-    const maintenance = homeDir === undefined ? null : readBackendMaintenanceJournal(homeDir);
-    const database = EventsDb.openExisting(dbPath, {
-      ...options,
-      _requireCurrentSchema: maintenance !== null && maintenance.phase !== "maintenance-aborted",
+    return homeDir === undefined
+      ? callback()
+      : withBackendPublicationAppendBarrierAsync(homeDir, callback, publicationLockToken);
+  }
+
+  private openCurrentSchema(dbPath: string, options: LocalHookOutboxOpenOptions): EventsDb | null {
+    const identity = readCurrentLocalHookOutboxIdentity(dbPath, EVENTS_SCHEMA_VERSION);
+    return identity === null ? null : EventsDb.openExisting(dbPath, {
+      ...options, _requireCurrentSchema: true, _expectedFileIdentity: identity,
     });
-    return database === null ? null : this.register(database, dbPath);
   }
 
   private register(database: EventsDb, dbPath: string): LocalHookOutboxRepository {

@@ -153,7 +153,13 @@ admission even through handles opened earlier. Local hook append has one narrow
 capability: its installation-global sequence allocation and matching outbox
 insert share a short append barrier. Existing outboxes must already have the
 current schema; hook open cannot opportunistically migrate or create an outbox
-during maintenance. Claims, processing marks, retries, acknowledgements,
+during maintenance. Registered-project preparation creates and validates an
+empty outbox before adopting its receipt epoch, so its first held hook has a
+durable destination. Outbox opens share the append barrier with capture. During
+the hold, schema checks recover private copies of the main file and WAL, leaving
+the source and shared-memory sidecar untouched on schema refusal. The verified
+main-file identity is checked again before writable connection setup.
+Claims, processing marks, retries, acknowledgements,
 correlation updates, replay, missing-cwd updates, and pruning remain blocked.
 A valid version-2 publication, including an unfinished publication or the safe
 pre-journal directory state, does not block durable local enqueue. Existing

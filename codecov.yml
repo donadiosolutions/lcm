@@ -178,6 +178,8 @@ component_management:
         # Captured UTF-8 decoding and immutable-file authority remain local-persistence-owned.
         # #618 optional receipt schema admission stays local-persistence-owned.
         # Includes current-token scopes and independently admitted factory health.
+        # #622 keeps registered-project outbox preparation and admitted sidecar
+        # discovery in the existing local-persistence component.
         - "src/storage/sqlite/"
         - "src/store/"
     - component_id: "unit-storage-abstractions"
@@ -226,8 +228,10 @@ component_management:
     - component_id: "unit-local-event-storage"
       name: "Unit - Local Event Storage"
       paths:
+        # #622 keeps outbox connection admission and current-schema validation here.
         - "^src/storage/local-hook-event-sequence\\.ts$"
         - "^src/storage/local-hook-outbox\\.ts$"
+        - "^src/storage/local-hook-outbox-schema\\.ts$"
         - "^src/storage/session-instructions\\.ts$"
     - component_id: "unit-transcripts-import"
       name: "Unit - Transcripts and Import"
