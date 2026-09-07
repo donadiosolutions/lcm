@@ -349,6 +349,14 @@ include committed data in the live WAL; SQLite may create necessary `-wal` or
 checkpointing, journal-mode changes, repair, or sidecar deletion. If a safe
 read requires durable content changes, the diagnostic reports `unavailable`.
 
+For aggregate SQLite diagnostics, `Projects` counts only initialized project
+databases that exist and pass admission at the time of observation. Admitted
+project directories without a `db.sqlite` file, including metadata-only
+registrations, remain unchanged and are omitted from aggregate numeric totals.
+If every admitted project directory is uninitialized, the aggregate can be
+healthy with `Projects: 0`; this does not establish the health of the skipped
+registrations. Selecting an uninitialized project remains unavailable.
+
 The SQLite pathname API still leaves a narrow same-account swap-and-restore
 race between identity checks. Authentication checks surround opening and
 reading, but do not provide isolation from another process with the same

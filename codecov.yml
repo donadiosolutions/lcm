@@ -232,7 +232,8 @@ component_management:
         # retrieval contracts, plus #971 compact cwd and #972 search cwd client
         # contracts remain memory/retrieval-owned. #866 stats publication retries
         # and fail-closed journal errors, plus #973 project database admission,
-        # stay in this owner.
+        # stay in this owner. #1146 metadata-only aggregate diagnostics also
+        # remain memory/retrieval-owned.
         - "src/memory/"
         - "^src/expansion\\.ts$"
         - "^src/retrieval\\.ts$"
