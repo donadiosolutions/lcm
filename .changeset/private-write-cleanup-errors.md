@@ -2,5 +2,9 @@
 "@donadiosolutions/lcm": patch
 ---
 
-Preserve private-file write and publication failures as the primary diagnostic
-when descriptor, temporary-file, or retained-parent cleanup also fails.
+Preserve write/setup failures when temporary descriptor close also fails in
+atomic private-file writers. Retain temporary cleanup errors in ordinary
+replacement and non-durable exclusive creation, and ordered descriptor,
+temporary-file, and parent cleanup errors in durable writes. Existing
+best-effort temporary cleanup in retained-parent exclusive publication and
+`writePrivateFileExclusive` remains unchanged.
