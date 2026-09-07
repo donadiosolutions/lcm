@@ -52,6 +52,119 @@ function dedupDeps(db: ReturnType<typeof makeDb>, store: PromotedStore) {
 }
 
 describe("deduplicateAndInsert", () => {
+  it("deduplicates exact content even when the native rank is negative", async () => {
+    const searchPromoted = vi.fn().mockResolvedValue([{
+      id: "exact-id",
+      content: "exact content",
+      tags: ["existing"],
+      projectId: "p1",
+      sessionId: null,
+      confidence: 0.8,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      rank: -0.1,
+    }]);
+    const insert = vi.fn().mockResolvedValue("inserted");
+    const update = vi.fn().mockResolvedValue(undefined);
+    const archive = vi.fn().mockResolvedValue(undefined);
+    const repositories = {
+      lexicalSearch: { searchPromoted },
+      promotedMemory: { insert, update, archive },
+    };
+    const transaction = async <T>(callback: (value: typeof repositories) => Promise<T>) => callback(repositories);
+
+    await expect(deduplicateAndInsert({
+      transaction,
+      content: "exact content",
+      tags: ["incoming"],
+      sourceProjectId: "p1",
+      depth: 0,
+      confidence: 0.7,
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+    })).resolves.toBe("exact-id");
+    expect(insert).not.toHaveBeenCalled();
+    expect(update).toHaveBeenCalledWith("exact-id", {
+      confidence: 0.8,
+      tags: ["existing", "incoming"],
+    });
+  });
+
+  it("requires the negative threshold for nonidentical candidates", async () => {
+    const searchPromoted = vi.fn();
+    const insert = vi.fn().mockResolvedValue("inserted");
+    const update = vi.fn().mockResolvedValue(undefined);
+    const repositories = {
+      lexicalSearch: { searchPromoted },
+      promotedMemory: { insert, update, archive: vi.fn().mockResolvedValue(undefined) },
+    };
+    const transaction = async <T>(callback: (value: typeof repositories) => Promise<T>) => callback(repositories);
+    const base = {
+      transaction,
+      content: "incoming content",
+      tags: [],
+      sourceProjectId: "p1",
+      depth: 0,
+      confidence: 0.5,
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+    };
+    const candidate = {
+      id: "candidate",
+      content: "different content",
+      tags: [],
+      projectId: "p1",
+      sessionId: null,
+      confidence: 0.5,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+
+    searchPromoted.mockResolvedValueOnce([{ ...candidate, rank: -15 }]);
+    await expect(deduplicateAndInsert(base)).resolves.toBe("candidate");
+    searchPromoted.mockResolvedValueOnce([{ ...candidate, rank: -14.99 }]);
+    await expect(deduplicateAndInsert(base)).resolves.toBe("inserted");
+    searchPromoted.mockResolvedValueOnce([{ ...candidate, rank: 0 }]);
+    await expect(deduplicateAndInsert(base)).resolves.toBe("inserted");
+    searchPromoted.mockResolvedValueOnce([{ ...candidate, rank: 1 }]);
+    await expect(deduplicateAndInsert(base)).resolves.toBe("inserted");
+  });
+
+  it("uses owner scope only for PostgreSQL while preserving source scope elsewhere", async () => {
+    const searchPromoted = vi.fn().mockResolvedValue([]);
+    const insert = vi.fn().mockResolvedValue("inserted");
+    const repositories = {
+      lexicalSearch: { searchPromoted },
+      promotedMemory: {
+        insert,
+        update: vi.fn().mockResolvedValue(undefined),
+        archive: vi.fn().mockResolvedValue(undefined),
+      },
+    };
+    const transaction = async <T>(callback: (value: typeof repositories) => Promise<T>) => callback(repositories);
+    const base = {
+      transaction,
+      content: "owner scoped content",
+      tags: [],
+      sourceProjectId: "remote-project",
+      candidateScope: "owner" as const,
+      depth: 0,
+      confidence: 0.5,
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+    };
+
+    await deduplicateAndInsert({ ...base, backend: "postgresql" });
+    await deduplicateAndInsert({ ...base, backend: "sqlite" });
+    await deduplicateAndInsert(base);
+
+    expect(searchPromoted.mock.calls.map((call) => call[3])).toEqual([
+      undefined,
+      "remote-project",
+      "remote-project",
+    ]);
+    expect(insert.mock.calls.map((call) => call[0].sourceProjectId)).toEqual([
+      "remote-project",
+      "remote-project",
+      "remote-project",
+    ]);
+  });
+
   it("converges exact unranked fallback matches without merging partial lexical matches", async () => {
     const db = makeDb();
     const store = new PromotedStore(db, false);

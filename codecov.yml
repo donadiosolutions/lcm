@@ -128,6 +128,8 @@ component_management:
         # #964 extends that retained metadata lifetime to the path-bound LCM
         # root, projects directory, and project leaf without changing ownership.
         # #1062 keeps missing promote metadata no-clobber handling route-owned.
+        # #1158 keeps PostgreSQL passive promotion route behavior route-owned;
+        # deduplication implementation remains in unit-promotion below.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -249,6 +251,8 @@ component_management:
     - component_id: "unit-promotion"
       name: "Unit - Promotion"
       paths:
+        # #1153 exact-content identity and #1158 owner-scope selection remain
+        # owned by the deduplication helper; no component boundary changed.
         - "src/promotion/"
     - component_id: "unit-project-worktrees"
       name: "Unit - Projects and Worktrees"

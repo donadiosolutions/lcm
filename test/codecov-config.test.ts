@@ -593,6 +593,8 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
       // #833 passive-event identity admission remains route-owned.
+      // #1158 keeps passive PostgreSQL promotion route behavior here; its
+      // deduplication helper remains owned by unit-promotion.
       ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"],
       // #793 search-limit validation, #863 expand depth validation, and #864
       // search candidate recall remain owned by daemon routes.
@@ -601,6 +603,9 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
       ["src/daemon/routes/recent.ts", "unit-daemon-routes"],
       ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
+      // #1153 exact identity and #1158 backend-guarded owner scope remain
+      // within the existing promotion component.
+      ["src/promotion/dedup.ts", "unit-promotion"],
       // #1106 keeps its three discovery readers in their established owners.
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/import.ts", "unit-transcripts-import"],
