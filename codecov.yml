@@ -16,6 +16,7 @@ component_management:
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
+        - "^src/cli-storage\\.ts$"
     - component_id: "unit-installation"
       name: "Unit - Installation"
       paths:
@@ -164,6 +165,7 @@ component_management:
         # #1020 keeps UTC message timestamp mapping in conversation-store-owned
         # local persistence paths.
         - "src/db/"
+        # Captured UTF-8 decoding and immutable-file authority remain local-persistence-owned.
         - "src/storage/sqlite/"
         - "src/store/"
     - component_id: "unit-storage-abstractions"
@@ -195,6 +197,9 @@ component_management:
         - "^src/storage/portable-record\\.ts$"
         # The #763 manifest and #816 checkpoint negative-zero taxonomies remain storage-abstractions-owned.
         - "^src/storage/portable-record-stream\\.ts$"
+        # #618 shared canonical transfer and bounded validation index.
+        - "^src/storage/portable-transfer\\.ts$"
+        - "^src/storage/portable-index\\.ts$"
         - "^src/storage/postgresql/project-storage\\.ts$"
     - component_id: "unit-migration-cutover"
       name: "Unit - Migration and Cutover"
@@ -240,6 +245,7 @@ component_management:
     - component_id: "unit-promotion"
       name: "Unit - Promotion"
       paths:
+        # #1153 rank-independent exact deduplication remains promotion-owned.
         - "src/promotion/"
     - component_id: "unit-project-worktrees"
       name: "Unit - Projects and Worktrees"
@@ -254,6 +260,7 @@ component_management:
         - "^src/git-project\\.ts$"
         - "^src/machine-identity\\.ts$"
         # #889 keeps private import metadata publication in this owner.
+        # #618 knowledge provenance scoping remains owned by project/worktree operations.
         - "^src/portable-knowledge\\.ts$"
         # #1049 keeps project metadata owner and single-link admission in this
         # existing component; no taxonomy, status, or policy change.
@@ -305,7 +312,15 @@ component_management:
         - "^src/storage/postgresql/factory\\.ts$"
         - "^src/storage/postgresql/index\\.ts$"
         - "^src/storage/postgresql/runtime\\.ts$"
+        - "^src/storage/postgresql/snapshot-session\\.ts$"
         - "^src/storage/postgresql\\.ts$"
+    - component_id: "integration-postgresql-portable"
+      name: "Integration - PostgreSQL Portable Transfer"
+      paths:
+        # #618 canonical self-provenance stays in PostgreSQL portable transfer.
+        - "^src/storage/postgresql/portable-source\\.ts$"
+        - "^src/storage/postgresql/portable-destination\\.ts$"
+        - "^src/storage/postgresql/portable-mapping\\.ts$"
     - component_id: "integration-postgresql-schema"
       name: "Integration - PostgreSQL Schema"
       paths:

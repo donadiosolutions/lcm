@@ -41,7 +41,7 @@ const expectedComponents = [
   {
     component_id: "unit-cli",
     name: "Unit - CLI",
-    paths: ["bin/", "src/cli/", "^src/cli-help\\.ts$"],
+    paths: ["bin/", "src/cli/", "^src/cli-help\\.ts$", "^src/cli-storage\\.ts$"],
   },
   {
     component_id: "unit-installation",
@@ -161,6 +161,8 @@ const expectedComponents = [
       "^src/storage/index\\.ts$",
       "^src/storage/portable-record\\.ts$",
       "^src/storage/portable-record-stream\\.ts$",
+      "^src/storage/portable-transfer\\.ts$",
+      "^src/storage/portable-index\\.ts$",
       "^src/storage/postgresql/project-storage\\.ts$",
     ],
   },
@@ -217,6 +219,7 @@ const expectedComponents = [
   {
     component_id: "unit-promotion",
     name: "Unit - Promotion",
+    // #1153 rank-independent exact deduplication remains promotion-owned.
     paths: ["src/promotion/"],
   },
   {
@@ -230,6 +233,7 @@ const expectedComponents = [
       "^src/codex-project-resolution\\.ts$",
       "^src/git-project\\.ts$",
       "^src/machine-identity\\.ts$",
+      // #618 knowledge provenance scoping remains owned by project/worktree operations.
       "^src/portable-knowledge\\.ts$",
       // #1049 keeps project metadata owner and single-link admission in this
       // existing component; no taxonomy, status, or policy change.
@@ -273,7 +277,18 @@ const expectedComponents = [
       "^src/storage/postgresql/factory\\.ts$",
       "^src/storage/postgresql/index\\.ts$",
       "^src/storage/postgresql/runtime\\.ts$",
+      "^src/storage/postgresql/snapshot-session\\.ts$",
       "^src/storage/postgresql\\.ts$",
+    ],
+  },
+  {
+    component_id: "integration-postgresql-portable",
+    name: "Integration - PostgreSQL Portable Transfer",
+    paths: [
+      // #618 canonical self-provenance stays in PostgreSQL portable transfer.
+      "^src/storage/postgresql/portable-source\\.ts$",
+      "^src/storage/postgresql/portable-destination\\.ts$",
+      "^src/storage/postgresql/portable-mapping\\.ts$",
     ],
   },
   {
@@ -452,7 +467,7 @@ function forbiddenKeysIn(value: unknown, location = "config"): string[] {
 }
 
 describe("Codecov configuration", () => {
-  test("matches the literal 30-component ownership contract", () => {
+  test("matches the literal 31-component ownership contract", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -474,7 +489,7 @@ describe("Codecov configuration", () => {
     const componentNames = components.map((component) => component.name);
     const ownershipPaths = components.flatMap((component) => component.paths);
 
-    expect(components).toHaveLength(30);
+    expect(components).toHaveLength(31);
     expect(new Set(componentIds).size).toBe(componentIds.length);
     expect(new Set(componentNames).size).toBe(componentNames.length);
     expect(new Set(ownershipPaths).size).toBe(ownershipPaths.length);
@@ -483,7 +498,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(215);
+    expect(productionFiles).toHaveLength(230);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -513,7 +528,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(215);
+    expect(ownershipCounts.size).toBe(230);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964 files in their intended components", () => {

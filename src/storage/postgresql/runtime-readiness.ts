@@ -822,6 +822,76 @@ export const POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST: PostgreSqlRuntimePrivilegeMa
   optional: Object.freeze(optionalPrivileges.map(freezePrivilegeEntry)),
 });
 
+// Canonical transfer is admitted separately from ordinary runtime access. Its
+// complete transcript profile is mandatory, and receipts remain append-only.
+export const POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST: PostgreSqlRuntimePrivilegeManifest = Object.freeze({
+  version: 1,
+  required: Object.freeze([
+    ...requiredPrivileges,
+    ...optionalPrivileges,
+    ...expandRelationPrivileges([
+      ["transfer_runs", ["SELECT", "INSERT"]],
+      ["transfer_batches", ["SELECT", "INSERT"]],
+      ["transfer_identities", ["SELECT", "INSERT"]],
+    ]),
+    ...expandColumnPrivileges([
+      ["conversations", "bootstrapped_at", "INSERT"],
+      ["conversations", "created_at", "INSERT"],
+      ["conversations", "updated_at", "INSERT"],
+      ["messages", "created_at", "INSERT"],
+      ["message_parts", "part_id", "INSERT"],
+      ["message_parts", "is_ignored", "INSERT"],
+      ["message_parts", "is_synthetic", "INSERT"],
+      ["message_parts", "tool_status", "INSERT"],
+      ["message_parts", "tool_error", "INSERT"],
+      ["message_parts", "tool_title", "INSERT"],
+      ["message_parts", "patch_hash", "INSERT"],
+      ["message_parts", "patch_files", "INSERT"],
+      ["message_parts", "file_mime", "INSERT"],
+      ["message_parts", "file_name", "INSERT"],
+      ["message_parts", "file_url", "INSERT"],
+      ["message_parts", "subtask_prompt", "INSERT"],
+      ["message_parts", "subtask_desc", "INSERT"],
+      ["message_parts", "subtask_agent", "INSERT"],
+      ["message_parts", "step_reason", "INSERT"],
+      ["message_parts", "step_cost", "INSERT"],
+      ["message_parts", "step_tokens_in", "INSERT"],
+      ["message_parts", "step_tokens_out", "INSERT"],
+      ["message_parts", "snapshot_hash", "INSERT"],
+      ["message_parts", "compaction_auto", "INSERT"],
+      ["large_files", "created_at", "INSERT"],
+      ["summaries", "created_at", "INSERT"],
+      ["context_items", "created_at", "INSERT"],
+      ["promoted_memories", "memory_id", "INSERT"],
+      ["promoted_memories", "created_at", "INSERT"],
+      ["promoted_memories", "archived_at", "INSERT"],
+      ["recall_surfacing", "surfaced_at", "INSERT"],
+      ["session_ingest_log", "completed_at", "INSERT"],
+      ["session_instructions", "updated_at", "INSERT"],
+      ["ingest_checkpoints", "last_source_ordinal", "INSERT"],
+      ["ingest_checkpoints", "imported_count", "INSERT"],
+      ["ingest_checkpoints", "skipped_count", "INSERT"],
+      ["ingest_checkpoints", "quarantined_count", "INSERT"],
+      ["ingest_checkpoints", "revision", "INSERT"],
+      ["ingest_checkpoints", "checkpoint", "INSERT"],
+      ["ingest_checkpoints", "updated_at", "INSERT"],
+      ["passive_event_inbox", "status", "INSERT"],
+      ["passive_event_inbox", "received_at", "INSERT"],
+      ["passive_event_inbox", "next_attempt_at", "INSERT"],
+      ["passive_event_inbox", "applied_at", "INSERT"],
+      ["passive_event_inbox", "quarantined_at", "INSERT"],
+      ["passive_event_inbox", "quarantine_reason", "INSERT"],
+    ]),
+    ...expandColumnPrivileges([
+      ["transfer_runs", "state", "UPDATE"],
+      ["transfer_runs", "current_domain", "UPDATE"],
+      ["transfer_runs", "checkpoint_bytes", "UPDATE"],
+      ["transfer_runs", "checkpoint_sha256", "UPDATE"],
+    ]),
+  ].map(freezePrivilegeEntry)),
+  optional: Object.freeze([]),
+});
+
 export type PostgreSqlRuntimeReadinessFailureReason =
   | "invalid-expected-owner"
   | "runtime-role-policy"
@@ -2484,6 +2554,7 @@ function actualAclIdentity(
 
 async function inspectSchemaAcl(
   executor: PostgreSqlQueryExecutor,
+  manifest: PostgreSqlRuntimePrivilegeManifest,
   runtimeRole: string,
   signal: AbortSignal | undefined,
 ): Promise<void> {
@@ -2518,8 +2589,8 @@ async function inspectSchemaAcl(
     values: [["lcm", "public"]],
   }, readinessOptions("inspectSchemaAcl", signal));
   const entries = [
-    ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required,
-    ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional,
+    ...manifest.required,
+    ...manifest.optional,
   ];
   const required = new Set<string>();
   const allowed = new Set<string>();
@@ -2555,6 +2626,7 @@ async function inspectSchemaAcl(
 
 async function inspectRelationAcl(
   executor: PostgreSqlQueryExecutor,
+  manifest: PostgreSqlRuntimePrivilegeManifest,
   runtimeRole: string,
   snapshot: PostgreSqlSchemaSnapshot,
   signal: AbortSignal | undefined,
@@ -2604,7 +2676,7 @@ async function inspectRelationAcl(
     }
   }
   const requiredIdentities = new Map<string, string>();
-  for (const entry of POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required) {
+  for (const entry of manifest.required) {
     if (entry.kind !== "relation" && entry.kind !== "sequence") continue;
     const relationKind = entry.kind === "relation" ? "table" : "sequence";
     const objectIdentity = `${relationKind}|${entry.object.replace(/^lcm\./u, "")}`;
@@ -2614,7 +2686,7 @@ async function inspectRelationAcl(
     );
   }
   const optionalIdentities = new Map<string, string>();
-  for (const entry of POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional) {
+  for (const entry of manifest.optional) {
     if (entry.kind !== "relation") continue;
     const objectIdentity = `table|${entry.object.replace(/^lcm\./u, "")}`;
     optionalIdentities.set(
@@ -2651,6 +2723,7 @@ async function inspectRelationAcl(
 
 async function inspectColumnAcl(
   executor: PostgreSqlQueryExecutor,
+  manifest: PostgreSqlRuntimePrivilegeManifest,
   runtimeRole: string,
   snapshot: PostgreSqlSchemaSnapshot,
   signal: AbortSignal | undefined,
@@ -2683,7 +2756,7 @@ async function inspectColumnAcl(
     values: [snapshot.tableIdentities.map((table) => `table|${table}`)],
   }, readinessOptions("inspectColumnAcl", signal));
   const requiredIdentities = new Map<string, string>();
-  for (const entry of POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required) {
+  for (const entry of manifest.required) {
     if (entry.kind !== "column" || entry.column === undefined) continue;
     requiredIdentities.set(
       privilegeKey(entry),
@@ -2691,7 +2764,7 @@ async function inspectColumnAcl(
     );
   }
   const optionalIdentities = new Map<string, string>();
-  for (const entry of POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional) {
+  for (const entry of manifest.optional) {
     if (entry.kind !== "column" || entry.column === undefined) continue;
     optionalIdentities.set(
       privilegeKey(entry),
@@ -2723,6 +2796,7 @@ async function inspectColumnAcl(
 
 async function inspectFunctionAcl(
   executor: PostgreSqlQueryExecutor,
+  manifest: PostgreSqlRuntimePrivilegeManifest,
   runtimeRole: string,
   snapshot: PostgreSqlSchemaSnapshot,
   signal: AbortSignal | undefined,
@@ -2734,7 +2808,7 @@ async function inspectFunctionAcl(
         const [, name, args] = identity.split("|");
         return `lcm.${name}(${args})`;
       }),
-    ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required
+    ...manifest.required
       .filter(({ kind }) => kind === "function")
       .map(({ object }) => object),
   ];
@@ -2789,8 +2863,8 @@ async function inspectFunctionAcl(
     values: [functionIdentities],
   }, readinessOptions("inspectFunctionAcl", signal));
   const entries = [
-    ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required,
-    ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional,
+    ...manifest.required,
+    ...manifest.optional,
   ].filter(({ kind }) => kind === "function");
   const expectedExtensions = new Map<string, string | null>();
   for (const functionIdentity of functionIdentities) {
@@ -2843,18 +2917,19 @@ async function inspectFunctionAcl(
 function definitionQuery(
   snapshot: PostgreSqlSchemaSnapshot,
   runtimeRole: string,
+  manifest: PostgreSqlRuntimePrivilegeManifest,
 ): QueryConfig<unknown[]> {
   const expectations = getPostgreSqlSchemaSnapshotExpectations(snapshot);
-  const relationSanctions = POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required
-    .concat(POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional)
+  const relationSanctions = manifest.required
+    .concat(manifest.optional)
     .filter(({ kind }) => kind === "relation" || kind === "sequence")
     .map((entry) => (
       `${entry.kind === "relation" ? "table" : "sequence"}|${
         entry.object.replace(/^lcm\./u, "")
       }|${entry.privilege}`
     ));
-  const columnSanctions = POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required
-    .concat(POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional)
+  const columnSanctions = manifest.required
+    .concat(manifest.optional)
     .filter(({ kind }) => kind === "column")
     .map((entry) => `${entry.object.replace(/^lcm\./u, "")}|${entry.column}|${entry.privilege}`);
   return {
@@ -3455,12 +3530,13 @@ function definitionQuery(
 
 async function inspectDefinitions(
   executor: PostgreSqlQueryExecutor,
+  manifest: PostgreSqlRuntimePrivilegeManifest,
   runtimeRole: string,
   snapshot: PostgreSqlSchemaSnapshot,
   signal: AbortSignal | undefined,
 ): Promise<number> {
   const result = await executor.query<DefinitionRow, unknown[]>(
-    definitionQuery(snapshot, runtimeRole),
+    definitionQuery(snapshot, runtimeRole, manifest),
     readinessOptions("inspectSchemaDefinitions", signal),
   );
   const row = result.rows[0];
@@ -3566,23 +3642,26 @@ async function inspectDefinitions(
   return expectations.definitionObjectCount;
 }
 
-function allPrivilegeEntries(): readonly PostgreSqlRuntimePrivilegeEntry[] {
+function allPrivilegeEntries(
+  manifest: PostgreSqlRuntimePrivilegeManifest,
+): readonly PostgreSqlRuntimePrivilegeEntry[] {
   return [
-    ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required,
-    ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional,
+    ...manifest.required,
+    ...manifest.optional,
   ];
 }
 
 async function inspectEffectivePrivileges(
   executor: PostgreSqlQueryExecutor,
+  manifest: PostgreSqlRuntimePrivilegeManifest,
   runtimeRole: string,
   snapshot: PostgreSqlSchemaSnapshot,
   optionalPrivilegesPresent: boolean,
   signal: AbortSignal | undefined,
 ): Promise<void> {
-  const entries = allPrivilegeEntries();
-  const required = POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required;
-  const optional = POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional;
+  const entries = allPrivilegeEntries(manifest);
+  const required = manifest.required;
+  const optional = manifest.optional;
   const tableObjects = snapshot.relationAclIdentities
     .filter((identity) => identity.startsWith("table|"))
     .map((identity) => `lcm.${identity.slice(identity.indexOf("|") + 1)}`);
@@ -3803,8 +3882,9 @@ async function inspectEffectivePrivileges(
   }
 }
 
-export async function verifyPostgreSqlRuntimeSchema(
+async function verifyPostgreSqlSchema(
   executor: PostgreSqlQueryExecutor,
+  manifest: PostgreSqlRuntimePrivilegeManifest,
   options: { readonly expectedOwner: string; readonly signal?: AbortSignal },
 ): Promise<PostgreSqlRuntimeReadiness> {
   assertExpectedOwner(options.expectedOwner);
@@ -3836,16 +3916,18 @@ export async function verifyPostgreSqlRuntimeSchema(
       throw readinessError("migration-ledger", "readMigrations");
     }
     const ownership = await inspectOwnership(executor, options.expectedOwner, snapshot, signal);
-    const definitionObjectCount = await inspectDefinitions(executor, runtimeRole, snapshot, signal);
-    await inspectSchemaAcl(executor, runtimeRole, signal);
+    const definitionObjectCount = await inspectDefinitions(executor, manifest, runtimeRole, snapshot, signal);
+    await inspectSchemaAcl(executor, manifest, runtimeRole, signal);
     const relationOptionalPrivileges = await inspectRelationAcl(
       executor,
+      manifest,
       runtimeRole,
       snapshot,
       signal,
     );
     const columnOptionalPrivileges = await inspectColumnAcl(
       executor,
+      manifest,
       runtimeRole,
       snapshot,
       signal,
@@ -3855,7 +3937,7 @@ export async function verifyPostgreSqlRuntimeSchema(
       ...columnOptionalPrivileges,
     ]);
     const exactOptionalKeys = new Set(
-      POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional.map(privilegeKey),
+      manifest.optional.map(privilegeKey),
     );
     if (
       observed.size !== 0
@@ -3867,9 +3949,10 @@ export async function verifyPostgreSqlRuntimeSchema(
       throw readinessError("acl-shape", "inspectOptionalPrivileges");
     }
     const optionalPrivilegesPresent = observed.size > 0;
-    await inspectFunctionAcl(executor, runtimeRole, snapshot, signal);
+    await inspectFunctionAcl(executor, manifest, runtimeRole, snapshot, signal);
     await inspectEffectivePrivileges(
       executor,
+      manifest,
       runtimeRole,
       snapshot,
       optionalPrivilegesPresent,
@@ -3881,7 +3964,7 @@ export async function verifyPostgreSqlRuntimeSchema(
       runtimeRole,
       managedObjectCount: ownership.managedObjectCount,
       definitionObjectCount,
-      privilegeManifestVersion: POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.version,
+      privilegeManifestVersion: manifest.version,
     });
   } catch (error) {
     if (error instanceof PostgreSqlRuntimeReadinessError) throw error;
@@ -3893,4 +3976,20 @@ export async function verifyPostgreSqlRuntimeSchema(
     }
     throw readinessError("server-preflight", "verifyRuntimeReadiness");
   }
+}
+
+/** Catalog-only admission for the exact ordinary runtime privilege profile. */
+export async function verifyPostgreSqlRuntimeSchema(
+  executor: PostgreSqlQueryExecutor,
+  options: { readonly expectedOwner: string; readonly signal?: AbortSignal },
+): Promise<PostgreSqlRuntimeReadiness> {
+  return verifyPostgreSqlSchema(executor, POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST, options);
+}
+
+/** Catalog-only admission for a separately provisioned canonical transfer role. */
+export async function verifyPostgreSqlTransferSchema(
+  executor: PostgreSqlQueryExecutor,
+  options: { readonly expectedOwner: string; readonly signal?: AbortSignal },
+): Promise<PostgreSqlRuntimeReadiness> {
+  return verifyPostgreSqlSchema(executor, POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST, options);
 }

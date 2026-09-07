@@ -19,6 +19,7 @@ import {
 import { resolveCodexSessions } from "./codex-project-resolution.js";
 import { findAllCodexTranscripts } from "./codex-transcript.js";
 import { sanitizeTerminalText } from "./terminal-sanitize.js";
+import { listCliProjects } from "./cli-storage.js";
 import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
@@ -59,9 +60,11 @@ export function cwdToProjectHash(cwd: string): string {
   return cwd.replace(/\//g, '-');
 }
 
-function buildProjectMap(lcmDir?: string): Map<string, string> {
-  const lcmProjectsDir = join(lcmDir ?? lcmHomeDir(), 'projects');
-  const map = new Map<string, string>();
+// Preserve the explicit legacy fixture-directory seam without reading ambient
+// metadata in production. Normal imports enumerate authenticated CLI bindings.
+function fixtureProjects(lcmDir: string): Array<{ id: string; canonical: string; aliases: string[] }> {
+  const lcmProjectsDir = join(lcmDir, 'projects');
+  const map: Array<{ id: string; canonical: string; aliases: string[] }> = [];
   if (!existsSync(lcmProjectsDir)) return map;
   for (const entry of readdirSync(lcmProjectsDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
@@ -70,8 +73,7 @@ function buildProjectMap(lcmDir?: string): Map<string, string> {
     try {
       const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
       if (meta.cwd) {
-        const hash = cwdToProjectHash(meta.cwd);
-        map.set(hash, meta.cwd);
+        map.push({ id: entry.name, canonical: meta.cwd, aliases: [] });
       }
     } catch {}
   }
@@ -191,7 +193,7 @@ async function ingestSessionList(
     if (options.dryRun) {
       if (options.verbose) {
         const replayNote = options.replay ? " (would compact)" : "";
-        console.log(`  [dry-run] ${sessionId}${replayNote}`);
+        console.error(`  [dry-run] ${sessionId}${replayNote}`);
       }
       result.imported++;
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
@@ -208,7 +210,7 @@ async function ingestSessionList(
       });
       if (res.ingested === 0 && res.totalTokens === 0) {
         result.skippedEmpty++;
-        if (options.verbose) console.log(`  \u23ed\ufe0f ${sessionId}: empty or already ingested`);
+        if (options.verbose) console.error(`  \u23ed\ufe0f ${sessionId}: empty or already ingested`);
       } else {
         result.imported++;
         result.totalMessages += res.ingested;
@@ -217,7 +219,7 @@ async function ingestSessionList(
         if (!options.replay) {
           result.totalTokens += res.totalTokens;
         }
-        if (options.verbose) console.log(`  \u2705 ${sessionId}: ${res.ingested} messages (${formatNumber(res.totalTokens)} tokens)`);
+        if (options.verbose) console.error(`  \u2705 ${sessionId}: ${res.ingested} messages (${formatNumber(res.totalTokens)} tokens)`);
       }
 
       // Replay: compact immediately after every session (even already-ingested ones)
@@ -253,31 +255,29 @@ async function ingestSessionList(
             const ctx = hadPrevious ? ' (with prior context)' : '';
             if (typeof compactRes.tokensBefore === 'number' && typeof compactRes.tokensAfter === 'number' && compactRes.tokensAfter < compactRes.tokensBefore) {
               const ratio = formatRatio(compactRes.tokensBefore, compactRes.tokensAfter);
-              console.log(`  \ud83e\udde0 ${sessionId}: ${formatNumber(compactRes.tokensBefore)} \u2192 ${formatNumber(compactRes.tokensAfter)}  (${ratio}\u00d7)${ctx}`);
+              console.error(`  \ud83e\udde0 ${sessionId}: ${formatNumber(compactRes.tokensBefore)} \u2192 ${formatNumber(compactRes.tokensAfter)}  (${ratio}\u00d7)${ctx}`);
             } else {
-              console.log(`  \ud83e\udde0 ${sessionId}: compacted${ctx}`);
+              console.error(`  \ud83e\udde0 ${sessionId}: compacted${ctx}`);
             }
           }
-        } catch (err) {
+        } catch {
           // Non-fatal: import succeeded; compact failure breaks the chain at this link.
           previousSummaries.delete(replayKey);
           // Always warn on chain breakage so users know the DAG is incomplete,
           // regardless of whether --verbose was passed.
-          const message = err instanceof Error ? err.message : "unknown error";
           console.error(
-            `  \u26a0\ufe0f [replay] compact failed for session ${sanitizeTerminalText(sessionId)}: ${sanitizeTerminalText(message)}`,
+            `  \u26a0\ufe0f [replay] compact failed for session ${sanitizeTerminalText(sessionId)}: compaction failed`,
           );
           // Fall back to ingest's totalTokens so they aren't silently lost.
           result.totalTokens += res.totalTokens;
         }
       }
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
-    } catch (err) {
+    } catch {
       result.failed++;
       if (options.replay) previousSummaries.delete(replayKey); // chain broken for this project/client
       if (options.verbose) {
-        const message = err instanceof Error ? err.message : "failed";
-        console.log(`  \u274c ${sanitizeTerminalText(sessionId)}: ${sanitizeTerminalText(message)}`);
+        console.error(`  \u274c ${sanitizeTerminalText(sessionId)}: ingest failed`);
       }
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
     }
@@ -317,12 +317,34 @@ export async function importSessions(
 
     if (options.all) {
       if (existsSync(claudeProjectsDir)) {
-        const projectMap = buildProjectMap(options._lcmDir);
+        const projects = options._lcmDir !== undefined && options._lcmDir !== lcmHomeDir()
+          ? fixtureProjects(options._lcmDir)
+          : await listCliProjects();
+        const projectMap = new Map<string, Map<string, string>>();
+        for (const project of projects) {
+          for (const path of [project.canonical, ...project.aliases]) {
+            const hash = cwdToProjectHash(path);
+            const candidates = projectMap.get(hash) ?? new Map<string, string>();
+            candidates.set(project.id, project.canonical);
+            projectMap.set(hash, candidates);
+          }
+        }
         for (const entry of readdirSync(claudeProjectsDir, { withFileTypes: true })) {
           if (!entry.isDirectory()) continue;
-          const cwd = projectMap.get(entry.name);
-          if (!cwd) continue;
-          projectDirs.push({ dir: join(claudeProjectsDir, entry.name), cwd });
+          const dir = join(claudeProjectsDir, entry.name);
+          const candidates = projectMap.get(entry.name);
+          if (candidates?.size !== 1) {
+            const count = findSessionFiles(dir).length;
+            const ambiguous = candidates !== undefined;
+            if (ambiguous) result.ambiguous! += count;
+            else result.unresolved! += count;
+            result.failed += count;
+            if (options.verbose && count > 0) {
+              console.error(`  ${count} Claude sessions ${ambiguous ? "ambiguous" : "unresolved"} (refused): ${sanitizeTerminalText(entry.name)}`);
+            }
+            continue;
+          }
+          projectDirs.push({ dir, cwd: [...candidates.values()][0] });
         }
       }
     } else {
@@ -393,7 +415,7 @@ export async function importSessions(
         if (resolution.status === "ambiguous") result.ambiguous! += 1;
         else result.unresolved! += 1;
         if (options.verbose) {
-          console.log(`  \u23ed\ufe0f ${session.sessionId}: ${resolution.reason}`);
+          console.error(`  \u23ed\ufe0f ${session.sessionId}: ${resolution.reason}`);
         }
         continue;
       }

@@ -136,6 +136,20 @@ same session, the flat transcript is preferred; other similarly named files and
 subagent transcripts remain independent. Files with equal modification times
 are imported deterministically by session ID and then path.
 
+`lcm import --all` discovers Claude projects through authenticated local project
+bindings, including their aliases. This also works with a newly linked
+PostgreSQL project that has no local `meta.json` or SQLite database. It does not
+enumerate other projects hosted by the PostgreSQL server. `--provider all --all`
+uses the same Claude discovery alongside Codex discovery. A Claude folder that
+matches no known project or matches multiple projects is refused: each discovered
+session is counted as unresolved or ambiguous and as failed, so the command exits
+with status 1. `--verbose` reports the refused folders on stderr; `--dry-run`
+reports the same mapping refusals without ingesting sessions. Register or link the
+intended project before retrying an unresolved folder. Resolve conflicting local
+project paths before retrying an ambiguous folder; Claude folder encoding can
+collide when different paths contain slashes and dashes. Replay and chronological
+session ordering apply after project resolution as usual.
+
 The default Codex connector is the CLI bundle. It writes native hooks to
 `~/.codex/hooks.json`, enables Codex's current `hooks` feature in
 `~/.codex/config.toml`, and installs the LCM skill at
@@ -382,8 +396,8 @@ and production project-storage factory are also used by the daemon and MCP
 storage routes when `storage.backend` is explicitly `postgresql`. The factory
 composes all nine shared repository contracts only after eager runtime-readiness
 checks and per-project publication and identity admission. The native-transcript
-adapter remains a separate explicit backfill seam and does not add a daemon
-route or CLI command. SQLite remains the default; an explicit PostgreSQL
+capability runs through the existing transcript-path ingest route and
+`lcm import`; it also remains available to explicit embedded callers. SQLite remains the default; an explicit PostgreSQL
 selection never falls back to a project SQLite database. The factory's
 readiness contract also requires the parity extensions at their current default
 versions in the `public` schema; see the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md#required-extensions-and-postgresql-version).
@@ -507,7 +521,8 @@ and
 [`postgresql-runtime-coordination-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql).
 Apply the separate
 [`postgresql-runtime-transcript-grants.sql`](../src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql)
-only when the explicit native-transcript repository is used. Run every script
+for `lcm import`, transcript-path daemon ingestion, or explicit native-transcript
+repository use. Structured-message ingestion does not require this grant. Run every script
 as the migration owner or an administrator with equivalent grant authority,
 substituting the deployment's restricted runtime role. Applying a function
 grant through the runtime role itself creates foreign-grantor ACL evidence and
@@ -542,7 +557,7 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file src/storage/postgresql/reference/postgresql-runtime-coordination-grants.sql
 
-# Optional: explicit native-transcript import only.
+# Required for native transcript imports (including lcm import).
 psql "$LCM_POSTGRES_ADMIN_URL" \
   --set=lcm_runtime_role=lcm_runtime \
   --file src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql
@@ -551,8 +566,9 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
 The transcript grant permits immutable inserts, provenance reads, and bounded
 checkpoint updates only; it grants no payload update, deletion, truncation, or
 unrelated table access. Applying it makes the explicit native-transcript
-repository usable; native-transcript daemon and CLI routing remains outside
-this issue. See
+repository usable through the selected daemon and CLI import routes. Missing
+grants fail native imports without falling back to SQLite; parsed messages
+committed before the native failure remain available for retry. See
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md) before
 running an explicit backfill.
 The memory grant permits direct use of the selected promoted-memory, recall,

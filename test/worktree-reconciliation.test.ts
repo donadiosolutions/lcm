@@ -1321,6 +1321,87 @@ describe("worktree reconciliation", () => {
     else process.env.USERPROFILE = originalUserProfile;
   });
 
+  it.each([
+    "runtime_native_transcripts",
+    "runtime_native_transcript_messages",
+    "runtime_native_ingest_checkpoints",
+  ])("refuses populated %s before modifying either project store", (nativeTable) => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    })}\n`);
+    clearProjectMapCache();
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const sourceDir = join(home, ".lcm", "projects", sourceHash);
+    const targetPath = join(targetDir, "db.sqlite");
+    const sourcePath = join(sourceDir, "db.sqlite");
+    makeDatabase(targetPath, "native-main", "target content", targetHash);
+    makeDatabase(sourcePath, "native-legacy", "source content", sourceHash);
+    const source = new DatabaseSync(sourcePath);
+    // Any populated native table must block, even a partially recovered schema.
+    source.exec(`DROP TABLE ${nativeTable}; CREATE TABLE ${nativeTable}(evidence TEXT); INSERT INTO ${nativeTable} VALUES('PRIVATE_NATIVE_CONTENT')`);
+    removeLegacyMainMetadataColumns(source);
+    source.close();
+    writePrivateFixtureFile(join(sourceDir, "sensitive-patterns.txt"), "SOURCE_PATTERN\n");
+    writePrivateFixtureFile(join(targetDir, "sensitive-patterns.txt"), "TARGET_PATTERN\n");
+    const files = [sourcePath, targetPath, projectMapPath(), join(sourceDir, "sensitive-patterns.txt"), join(targetDir, "sensitive-patterns.txt")];
+    const before = files.map(path => readFileSync(path));
+    const sourceEntries = readdirSync(sourceDir);
+    const targetEntries = readdirSync(targetDir);
+    for (const dryRun of [true, false]) {
+      expect(() => reconcileWorktrees(main, { dryRun }))
+        .toThrow("legacy SQLite native transcript state cannot be reconciled safely");
+      files.forEach((path, index) => expect(readFileSync(path)).toEqual(before[index]));
+      expect(readdirSync(sourceDir)).toEqual(sourceEntries);
+      expect(readdirSync(targetDir)).toEqual(targetEntries);
+      expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+      expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
+    }
+    const [journal] = listWorktreeReconciliationJournals();
+    expect(journal).toMatchObject({ phase: "blocked", backupPaths: [] });
+    expect(journal!.reason).not.toContain("PRIVATE_NATIVE_CONTENT");
+  }, FULL_SUITE_SNAPSHOT_VALIDATION_TEST_TIMEOUT_MS);
+
+  it("refuses native rows added after preflight before committing a source fence", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    })}\n`);
+    clearProjectMapCache();
+    const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    const targetPath = join(home, ".lcm", "projects", targetHash, "db.sqlite");
+    makeDatabase(sourcePath, "native-race-source", "source content", sourceHash);
+    makeDatabase(targetPath, "native-race-target", "target content", targetHash);
+    const targetBefore = readFileSync(targetPath);
+    const mapBefore = readFileSync(projectMapPath());
+    expect(() => reconcileWorktrees(main, {
+      _observer(event) {
+        if (event !== "before-source-main-merge") return;
+        const source = new DatabaseSync(sourcePath);
+        // Unknown future native tables also fail closed rather than being omitted.
+        source.exec("CREATE TABLE Runtime_Native_Race(evidence TEXT); INSERT INTO runtime_native_race VALUES('retained')");
+        source.close();
+      },
+    })).toThrow("legacy SQLite native transcript state cannot be reconciled safely");
+    expect(readFileSync(targetPath)).toEqual(targetBefore);
+    expect(readFileSync(projectMapPath())).toEqual(mapBefore);
+    const source = new DatabaseSync(sourcePath, { readOnly: true });
+    try {
+      expect(source.prepare("SELECT evidence FROM runtime_native_race").get()).toMatchObject({ evidence: "retained" });
+      expect(source.prepare("SELECT count(*) AS count FROM conversations").get()).toMatchObject({ count: 1 });
+      expect(source.prepare("SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'").get()).toBeUndefined();
+    } finally { source.close(); }
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+  }, FULL_SUITE_SNAPSHOT_VALIDATION_TEST_TIMEOUT_MS);
+
   it("transactionally merges complete state, archives sources, and folds aliases", () => {
     const { linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(linked)!.canonical;

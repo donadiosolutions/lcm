@@ -77,3 +77,34 @@ export type {
   PortableVerification,
 } from "./portable-record-stream.js";
 export * from "./sqlite/factory.js";
+export {
+  PortableTransferError,
+  normalizePortableTransferError,
+  runPortableTransfer,
+} from "./portable-transfer.js";
+export type {
+  PortableDestinationProgress,
+  PortableDestinationVerification,
+  PortablePreflight,
+  PortableRecordWriter,
+  PortableTransferErrorCode,
+  PortableTransferProgress,
+  PortableTransferResult,
+  RunPortableTransferInput,
+} from "./portable-transfer.js";
+export { openSqlitePortableSource } from "./sqlite/portable-source.js";
+export type {
+  OpenSqlitePortableSourceInput,
+  SqlitePortableIdentityFacts,
+  SqlitePortableCapturedFile,
+  SqlitePortableAbsentSidecar,
+  SqlitePortableCapturedSidecars,
+  SqlitePortableRecordSource,
+} from "./sqlite/portable-source.js";
+export { openSqlitePortableDestination } from "./sqlite/portable-destination.js";
+export type { OpenSqlitePortableDestinationInput } from "./sqlite/portable-destination.js";
+export type { SqlitePortableArchiveReader } from "./sqlite/portable-archive.js";
+export { createPostgreSqlPortableSource } from "./postgresql/portable-source.js";
+export type { PostgreSqlPortableSourceOptions } from "./postgresql/portable-source.js";
+export { createPostgreSqlPortableDestination } from "./postgresql/portable-destination.js";
+export type { PostgreSqlPortableDestinationInput } from "./postgresql/portable-destination.js";

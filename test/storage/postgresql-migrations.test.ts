@@ -427,6 +427,18 @@ describe("PostgreSQL migration runner", () => {
     ])).toBeNull();
   });
 
+  it("registers the durable transfer ledger in the latest schema", () => {
+    const latest = loadPostgreSqlSchemaSnapshots().at(-1)!;
+    expect(loadPostgreSqlMigrations().at(-1)?.id).toBe("0006_transfer_ledger");
+    expect(latest.migrationId).toBe("0006_transfer_ledger");
+    expect(latest.tableIdentities).toEqual(expect.arrayContaining([
+      "transfer_runs", "transfer_batches", "transfer_identities",
+    ]));
+    expect(latest.ordinaryColumnIdentities).toContain("transfer_runs|source_witness_sha256");
+    expect(latest.ordinaryColumnIdentities).toContain("transfer_batches|next_ordinal");
+    expect(latest.ordinaryColumnIdentities).not.toContain("transfer_identities|payload");
+  });
+
   it("loads the pinned artifact and rejects missing or drifted files", () => {
     const migrations = loadPostgreSqlMigrations();
     expect(migrations).toEqual([
@@ -435,6 +447,7 @@ describe("PostgreSQL migration runner", () => {
       expect.objectContaining({ id: "0003_machine_identity_key", sha256: "bdc38d19bde5825eb1d59e9044769cbf9cac52be5c9fe34237f93ec347c3807b" }),
       expect.objectContaining({ id: "0004_machine_display_name", sha256: "f12b4e5493da187e4c8cd4083766010b896961225cadd6fe568e4e99264e3421" }),
       expect.objectContaining({ id: "0005_summary_context_integrity", sha256: "e16cb52a34bd06c0226e2dcff0273982eea975c394b1d7fa2cf6c8bcab1c2b3f" }),
+      expect.objectContaining({ id: "0006_transfer_ledger", sha256: "81fed3ac0a6059b6e2a536647a5ab5d8673322b7ba5804a60b068b927367983a" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
@@ -505,22 +518,22 @@ describe("PostgreSQL migration runner", () => {
     const snapshot = snapshots.at(-1)!;
 
     expect(getPostgreSqlSchemaSnapshotExpectations(snapshot)).toMatchObject({
-      definitionGroupCounts: [94, 4, 174, 15, 225, 6, 24, 30, 210, 0],
+      definitionGroupCounts: [100, 4, 204, 15, 253, 6, 27, 33, 238, 0],
       definitionGroupHashes: [
-        "58160b3542785f534c03d428d67cc5b1855280946458337b599a544588ced733",
+        "368fe168efeefb5d5f0d4aeff12bc82d7c821dbc96be3e4669bb9cc133ef7534",
         "ab34552f4ae69dbd972264066f812027f0bdb0d4494f39a909d5c3c1e141484e",
-        "eb9fdb72171517ac5b9d6162ae3495b8cb94d1d6300a0296aeb1f42c906d12b3",
+        "02cc3b15aae2f0cc9b9de547b6dd0c5d9a1ceff97c2b9387b6d85ef6d4477b23",
         "8d9c9ede1e990727ce8612ea7212fe7fe91f53d8dc3fa24f2de378cbbf4f4921",
-        "e2581c7c70cbec57d64bb02ac1520fe27336efb326618b36add668cb1431e98c",
+        "9ac43f5234bbe3ceca8f6a75b9f62ace547ccbd72ba63da16cd0bb580f235899",
         "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
-        "58f87970bd0ab0759dd5bbed4be01e086d563cc5f3c3b7f1a2452de673ee9b40",
-        "f9ace407bb5e2cae0310c03df6e156644ea9716fc45d3d55ce2b0c2d7a77d31b",
-        "f0abf51e9ee2b2ddcbd00ef21b672b8bc0361054c591564d76ad5d0f2928b190",
+        "78d9632759ec8ca03727808dee165201a47ee4ee8e85cff082c8a3f8f182d628",
+        "57f9a963c63a46cbd310f8cc683524b2e710797924c3cb3bf935f5d9bb13afe4",
+        "89dfba418076ede4ffbf90fe7402393dd3958a29f010bb9c947992839812a6b1",
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       ],
-      definitionObjectCount: 782,
+      definitionObjectCount: 880,
     });
-    expect(snapshot.indexNames).toHaveLength(94);
+    expect(snapshot.indexNames).toHaveLength(100);
     expect(snapshot.indexNames).toContain("session_ingest_log_pkey");
     expect(snapshot.identityFunctions).toContainEqual({
       name: "enforce_summary_parent_dag_integrity",
@@ -564,6 +577,11 @@ describe("PostgreSQL migration runner", () => {
           "eb9fdb72171517ac5b9d6162ae3495b8cb94d1d6300a0296aeb1f42c906d12b3",
         tableSha256:
           "58f87970bd0ab0759dd5bbed4be01e086d563cc5f3c3b7f1a2452de673ee9b40",
+      },
+      {
+        migrationId: "0006_transfer_ledger",
+        constraintSha256: "02cc3b15aae2f0cc9b9de547b6dd0c5d9a1ceff97c2b9387b6d85ef6d4477b23",
+        tableSha256: "78d9632759ec8ca03727808dee165201a47ee4ee8e85cff082c8a3f8f182d628",
       },
     ]);
   });
@@ -639,6 +657,7 @@ describe("PostgreSQL migration runner", () => {
           "0003_machine_identity_key",
           "0004_machine_display_name",
           "0005_summary_context_integrity",
+          "0006_transfer_ledger",
         ],
         current: [
           "0001_migration_ledger",
@@ -646,6 +665,7 @@ describe("PostgreSQL migration runner", () => {
           "0003_machine_identity_key",
           "0004_machine_display_name",
           "0005_summary_context_integrity",
+          "0006_transfer_ledger",
         ],
       });
     expect(fake.operations).toEqual(expect.arrayContaining([
@@ -1192,7 +1212,7 @@ describe("PostgreSQL migration runner", () => {
     {
       label: "an unowned managed object",
       managedOwnership: "unowned" as const,
-      existingObjectCount: 37,
+      existingObjectCount: 40,
       unownedObjectCount: 1,
       requiredOwner: "lcm_test_migrator",
     },
@@ -1220,7 +1240,7 @@ describe("PostgreSQL migration runner", () => {
     {
       label: "a changed current role",
       managedOwnership: "different-user" as const,
-      existingObjectCount: 37,
+      existingObjectCount: 40,
       unownedObjectCount: 0,
       requiredOwner: "different_migrator",
     },

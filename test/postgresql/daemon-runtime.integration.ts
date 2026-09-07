@@ -36,6 +36,9 @@ import {
   type RemoteProject,
 } from "../../src/storage/postgresql/identity-repository.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import { PostgreSqlSummaryRepository } from "../../src/storage/postgresql/summary-context-repositories.js";
+import type { DescribeResult } from "../../src/retrieval.js";
+import type { ExpansionResult } from "../../src/expansion.js";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import { SQLiteLocalHookOutboxFactory } from "../../src/storage/local-hook-outbox.js";
 import {
@@ -55,6 +58,7 @@ const RUNTIME_GRANT_SCRIPTS = [
   "postgresql-runtime-memory-grants.sql",
   "postgresql-runtime-search-grants.sql",
   "postgresql-runtime-coordination-grants.sql",
+  "postgresql-runtime-transcript-grants.sql",
 ] as const;
 
 function quotePostgreSqlRole(role: string): string {
@@ -203,7 +207,7 @@ describe("PostgreSQL 18 daemon runtime", { timeout: 120_000 }, () => {
       mkdirSync(projectPath);
       const transcriptPath = join(projectPath, "session.jsonl");
       writeFileSync(transcriptPath, [
-        JSON.stringify({ message: { role: "user", content: "PostgreSQL daemon ingestion needle" } }),
+        JSON.stringify({ message: { role: "user", content: "PostgreSQL daemon ingestion needle NATIVE_PG_SECRET" } }),
         JSON.stringify({ message: { role: "assistant", content: "The selected backend accepted this transcript." } }),
       ].join("\n") + "\n");
 
@@ -280,6 +284,7 @@ describe("PostgreSQL 18 daemon runtime", { timeout: 120_000 }, () => {
           {
             daemon: { port: 0, idleTimeoutMs: 0 },
             summarizer: { mock: true },
+            security: { sensitivePatterns: ["NATIVE_PG_SECRET"] },
           },
           {
             ...process.env,
@@ -317,6 +322,127 @@ describe("PostgreSQL 18 daemon runtime", { timeout: 120_000 }, () => {
         });
         expect(ingested.ingested).toBe(2);
         expect(ingested.totalTokens).toBeGreaterThan(0);
+        const raw = await database.migrator.query({
+          text: "SELECT native_payload FROM lcm.native_transcripts WHERE project_id=$1 ORDER BY source_ordinal",
+          values: [project.projectId],
+        }, { domain: "native-transcripts", operation: "verifyNativeImport" });
+        expect(raw.rows).toHaveLength(2);
+        expect(JSON.stringify(raw.rows)).toContain("[REDACTED]");
+        expect(JSON.stringify(raw.rows)).not.toContain("NATIVE_PG_SECRET");
+        const links = await database.migrator.query({
+          text: "SELECT t.source_ordinal, m.content FROM lcm.transcript_messages AS l JOIN lcm.native_transcripts AS t ON t.project_id=l.project_id AND t.transcript_id=l.transcript_id JOIN lcm.messages AS m ON m.project_id=l.project_id AND m.conversation_id=l.conversation_id AND m.message_id=l.message_id WHERE l.project_id=$1 ORDER BY t.source_ordinal",
+          values: [project.projectId],
+        }, { domain: "native-transcripts", operation: "verifyNativeLinks" });
+        expect(links.rows).toEqual([
+          { source_ordinal: "0", content: "PostgreSQL daemon ingestion needle [REDACTED]" },
+          { source_ordinal: "1", content: "The selected backend accepted this transcript." },
+        ]);
+        const retry = await client.post("/ingest", {
+          session_id: "daemon-runtime-ingest", cwd: projectPath, client: "claude", transcript_path: transcriptPath,
+        });
+        expect(retry).toEqual({ ingested: 0, totalTokens: 0 });
+        const checkpoint = await database.migrator.query({
+          text: "SELECT last_source_ordinal, imported_count FROM lcm.ingest_checkpoints WHERE project_id=$1 AND machine_id=$2",
+          values: [project.projectId, machine.machineId],
+        }, { domain: "native-transcripts", operation: "verifyNativeCheckpoint" });
+        expect(checkpoint.rows).toEqual([{ last_source_ordinal: "1", imported_count: "2" }]);
+
+        const sourceMessages = await database.runtime.query<{
+          conversation_id: number; message_id: number; role: string; content: string; token_count: number;
+        }>({
+          text: `SELECT m.conversation_id::integer, m.message_id::integer, m.role, m.content, m.token_count::integer
+                 FROM lcm.messages AS m
+                 JOIN lcm.conversations AS c
+                   ON c.project_id=m.project_id AND c.conversation_id=m.conversation_id
+                 WHERE c.project_id=$1 AND c.session_id=$2 ORDER BY m.seq`,
+          values: [project.projectId, "daemon-runtime-ingest"],
+        }, { domain: "conversations", operation: "readSummarySources" });
+        expect(sourceMessages.rows).toHaveLength(2);
+        const summaryId = "sum_daemon_runtime_retrieval";
+        const summaryContent = "The selected PostgreSQL backend preserves native import and retrieval provenance.";
+        const sourceMessageIds = sourceMessages.rows.map(message => message.message_id);
+        const sourceTokenCount = sourceMessages.rows.reduce((total, message) => total + message.token_count, 0);
+        const summaries = new PostgreSqlSummaryRepository(database.runtime, project.projectId);
+        await summaries.insertSummary({
+          summaryId,
+          conversationId: sourceMessages.rows[0]!.conversation_id,
+          kind: "leaf",
+          depth: 0,
+          content: summaryContent,
+          tokenCount: 12,
+          sourceMessageTokenCount: sourceTokenCount,
+        });
+        await summaries.linkSummaryToMessages(summaryId, sourceMessageIds);
+        const described = await client.post<{ node: DescribeResult }>("/describe", {
+          cwd: projectPath, nodeId: summaryId,
+        });
+        expect(described.node).toMatchObject({
+          id: summaryId,
+          type: "summary",
+          summary: {
+            conversationId: sourceMessages.rows[0]!.conversation_id,
+            kind: "leaf",
+            content: summaryContent,
+            depth: 0,
+            tokenCount: 12,
+            sourceMessageTokenCount: sourceTokenCount,
+            parentIds: [],
+            childIds: [],
+            messageIds: sourceMessageIds,
+          },
+        });
+        const parentSummaryId = "sum_daemon_runtime_retrieval_parent";
+        await summaries.insertSummary({
+          summaryId: parentSummaryId,
+          conversationId: sourceMessages.rows[0]!.conversation_id,
+          kind: "condensed",
+          depth: 1,
+          content: "PostgreSQL daemon retrieval overview.",
+          tokenCount: 6,
+        });
+        await summaries.linkSummaryToParents(summaryId, [parentSummaryId]);
+        const expanded = await client.post<ExpansionResult>("/expand", {
+          cwd: projectPath, nodeId: parentSummaryId, depth: 1,
+        });
+        expect(expanded).toEqual({
+          expansions: [{
+            summaryId: parentSummaryId,
+            children: [{ summaryId, kind: "leaf", snippet: summaryContent, tokenCount: 12 }],
+            messages: [],
+          }],
+          citedIds: [parentSummaryId, summaryId],
+          totalTokens: 12,
+          truncated: false,
+        });
+        const nativeAdministrator = new PostgreSqlRuntime(administratorSettings);
+        try {
+          await nativeAdministrator.query({ text: "REVOKE SELECT ON lcm.native_transcripts FROM lcm_test_runtime" },
+            { domain: "native-transcripts", operation: "injectNativeFailure" });
+          const nativeFailurePath = join(projectPath, "native-failure.jsonl");
+          writeFileSync(nativeFailurePath, JSON.stringify({ message: { role: "user", content: "retry native failure" } }) + "\n");
+          const failedNative = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ cwd: projectPath, session_id: "native-failure", transcript_path: nativeFailurePath }),
+          });
+          expect(failedNative.status).toBe(503);
+          expect(await failedNative.text()).not.toContain("permission denied");
+          const partial = await database.migrator.query({
+            text: "SELECT count(*) AS n FROM lcm.messages AS m JOIN lcm.conversations AS c ON c.project_id=m.project_id AND c.conversation_id=m.conversation_id WHERE c.project_id=$1 AND c.session_id=$2",
+            values: [project.projectId, "native-failure"],
+          }, { domain: "native-transcripts", operation: "verifyParsedBeforeNativeFailure" });
+          expect(partial.rows).toEqual([{ n: "1" }]);
+          await applyRuntimeGrantScript(nativeAdministrator, "postgresql-runtime-transcript-grants.sql", "restoreNativeGrants");
+          expect(await client.post("/ingest", {
+            cwd: projectPath, session_id: "native-failure", transcript_path: nativeFailurePath,
+          })).toEqual({ ingested: 0, totalTokens: 0 });
+          const recovered = await database.migrator.query({
+            text: "SELECT count(*) AS n FROM lcm.native_transcripts WHERE project_id=$1 AND native_session_id=$2",
+            values: [project.projectId, "native-failure"],
+          }, { domain: "native-transcripts", operation: "verifyNativeRetry" });
+          expect(recovered.rows).toEqual([{ n: "1" }]);
+        } finally { await nativeAdministrator.close(); }
+
+
 
         const search = await client.post<{ promoted: unknown[] }>("/search", {
           cwd: projectPath,

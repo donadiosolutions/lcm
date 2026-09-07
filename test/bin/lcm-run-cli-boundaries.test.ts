@@ -86,7 +86,9 @@ const state = vi.hoisted(() => ({
   providerWitnessReads: [] as Array<{ available: boolean; providers: unknown[] } | Error>,
   providerWitnessReconciles: [] as Array<{ available: boolean; providers: unknown[] } | Error>,
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
-  importResult: { imported: 1, skipped: 0 },
+  importResult: { imported: 1, skipped: 0, failed: 0 },
+  cliProjects: [] as Array<{ id: string; canonical: string; aliases: string[] }>,
+  listCliProjects: vi.fn(async () => state.cliProjects),
   importPatch: { lastResult: { ok: true } } as Record<string, unknown>,
   renderer: { start: vi.fn(), stop: vi.fn(), sessionDone: vi.fn(), printSummary: vi.fn() },
   rendererOptions: undefined as unknown,
@@ -230,6 +232,10 @@ vi.mock("../../src/import-summary.js", () => ({
   printImportSummary: vi.fn(),
   printCodexResolutionSummary: vi.fn(),
 }));
+vi.mock("../../src/cli-storage.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/cli-storage.js")>()),
+  listCliProjects: state.listCliProjects,
+}));
 vi.mock("../../src/portable-knowledge.js", () => ({
   exportKnowledge: vi.fn(async () => state.portableResult), importKnowledge: vi.fn(async () => state.portableResult),
 }));
@@ -253,7 +259,7 @@ const {
 
 type ActionHandler = (...args: any[]) => unknown;
 
-const stdoutIsTTYDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+const stderrIsTTYDescriptor = Object.getOwnPropertyDescriptor(process.stderr, "isTTY");
 
 function captureActions(register: (program: Command) => void): Map<string, ActionHandler> {
   const captured = new Map<string, ActionHandler>();
@@ -318,6 +324,7 @@ beforeEach(() => {
   state.authToken = "test-token";
   state.migrateLegacyHome.mockReset();
   state.portableResult = { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false };
+  state.cliProjects = [];
   state.projectList.mockResolvedValue({
     local: [{ hash: "hash", canonical: "/canonical", aliases: ["/alias"], remoteProjectId: "remote-id" }],
     remote: [{ projectId: "remote-id", displayName: "Remote", aliases: [{ machineId: "machine-id", path: "/canonical" }] }],
@@ -353,8 +360,8 @@ beforeEach(() => {
 
 afterEach(() => {
   process.exitCode = undefined;
-  if (stdoutIsTTYDescriptor) Object.defineProperty(process.stdout, "isTTY", stdoutIsTTYDescriptor);
-  else Reflect.deleteProperty(process.stdout, "isTTY");
+  if (stderrIsTTYDescriptor) Object.defineProperty(process.stderr, "isTTY", stderrIsTTYDescriptor);
+  else Reflect.deleteProperty(process.stderr, "isTTY");
   vi.restoreAllMocks();
 });
 
@@ -1053,7 +1060,7 @@ describe("runCli lifecycle and connector boundaries", () => {
     state.post.mockResolvedValueOnce({ promoted: 1, processedProjects: 1, skipped: 0, errors: 0, orphanedProjects: 0 });
     await expect(actions.get("events/promote")!({ all: true })).resolves.toBeUndefined();
     state.post.mockRejectedValueOnce("request failed");
-    await expect(actions.get("lcm/promote")!({ verbose: false })).resolves.toBeUndefined();
+    await expect(actions.get("lcm/promote")!({ verbose: false })).rejects.toThrow("exit:1");
   });
 
   it("covers connector help, installed display, and installer errors", async () => {
@@ -1111,7 +1118,7 @@ describe("runCli scanning and portable knowledge boundaries", () => {
   });
 
   it("covers compact TTY summary and fatal targeted promotion failure", async () => {
-    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+    Object.defineProperty(process.stderr, "isTTY", { configurable: true, value: true });
     state.entries = [
       { name: "file", isDirectory: () => false },
       { name: "missing", isDirectory: () => true },
@@ -1126,6 +1133,7 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     state.post.mockRejectedValueOnce(new Error("best effort"));
     expect(await invoke(["compact", "--all"])).toBeUndefined();
     expect(state.renderer.printSummary).toHaveBeenCalled();
+    expect(state.rendererOptions).toEqual(expect.objectContaining({ output: process.stderr, renderOpts: expect.objectContaining({ isTTY: true }) }));
     expect(state.post).toHaveBeenCalledWith("/promote", { cwd: "/good", dry_run: false });
     expect(process.exitCode).toBe(1);
     expect(state.progressState?.errors).toEqual([]);
@@ -1471,14 +1479,16 @@ describe("runCli scanning and portable knowledge boundaries", () => {
   });
 
   it("covers TTY all-provider import directory filtering", async () => {
-    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+    Object.defineProperty(process.stderr, "isTTY", { configurable: true, value: true });
     state.entries = [{ name: "file", isDirectory: () => false }, { name: "project", isDirectory: () => true }];
     state.exists.add(`${process.env.HOME}/.claude/projects`);
     expect(await invoke(["import", "--provider", "all", "--all"])).toBeUndefined();
     expect(state.renderer.printSummary).toHaveBeenCalled();
+    expect(state.rendererOptions).toEqual(expect.objectContaining({ output: process.stderr, renderOpts: expect.objectContaining({ isTTY: true }) }));
   });
 
   it("covers verbose promotion successes, primitive failures, and plural summaries", async () => {
+    state.cliProjects = [{ id: "one", canonical: "/one", aliases: [] }, { id: "two", canonical: "/two", aliases: [] }];
     state.entries = [
       { name: "file", isDirectory: () => false },
       { name: "missing", isDirectory: () => true },
@@ -1492,25 +1502,36 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     state.files.set("/lcm/projects/one/meta.json", JSON.stringify({ cwd: "/one" }));
     state.files.set("/lcm/projects/two/meta.json", JSON.stringify({ cwd: "/two" }));
     state.post.mockResolvedValueOnce({ processed: 2, promoted: 1, conversations: 2 }).mockRejectedValueOnce("failed");
-    expect(await invoke(["promote", "--all", "--verbose", "--dry-run"])).toBeUndefined();
+    expect((await invoke(["promote", "--all", "--verbose", "--dry-run"]))?.message).toBe("exit:1");
   });
 
-  it("covers all-project exports, generated slugs, metadata skips, and warnings", async () => {
-    state.entries = [
-      { name: "file", isDirectory: () => false },
-      { name: "missing", isDirectory: () => true },
-      { name: "bad", isDirectory: () => true },
-      { name: "one", isDirectory: () => true },
-      { name: "two", isDirectory: () => true },
+  it("exports authenticated bindings to generated files and fails partial exports", async () => {
+    state.cliProjects = [
+      { id: "one", canonical: "/a path/one", aliases: ["/one-alias"] },
+      { id: "two", canonical: "/two", aliases: [] },
     ];
-    state.exists.add("/lcm/projects");
-    for (const name of ["bad", "one", "two"]) state.exists.add(`/lcm/projects/${name}/meta.json`);
-    state.files.set("/lcm/projects/bad/meta.json", "bad json");
-    state.files.set("/lcm/projects/one/meta.json", JSON.stringify({ cwd: "/a path/one" }));
-    state.files.set("/lcm/projects/two/meta.json", JSON.stringify({ cwd: "/two" }));
     const portable = await import("../../src/portable-knowledge.js");
-    vi.mocked(portable.exportKnowledge).mockResolvedValueOnce({ exported: 2, entries: [] }).mockRejectedValueOnce(new Error("export failed"));
-    expect(await invoke(["export", "--all"])).toBeUndefined();
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    vi.mocked(portable.exportKnowledge)
+      .mockResolvedValueOnce({ exported: 2, entries: [] })
+      .mockRejectedValueOnce(new Error("SECRET_CANARY export failed"));
+    expect((await invoke(["export", "--all"]))?.message).toBe("exit:1");
+    expect(state.listCliProjects).toHaveBeenCalledOnce();
+    expect(state.reconcileWorktrees).not.toHaveBeenCalled();
+    expect(portable.exportKnowledge).toHaveBeenNthCalledWith(1,
+      "/a path/one", expect.objectContaining({ output: expect.stringMatching(/lcm-export--a-path-one-[a-f0-9]{12}\.json$/) }),
+    );
+    expect(portable.exportKnowledge).toHaveBeenNthCalledWith(2,
+      "/two", expect.objectContaining({ output: expect.stringMatching(/lcm-export--two-[a-f0-9]{12}\.json$/) }),
+    );
+    expect(diagnostic).toHaveBeenCalledWith(expect.stringContaining("Total: 2 entries exported"));
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("Export failed"));
+    expect([...diagnostic.mock.calls, ...stderr.mock.calls].flat().join(" ")).not.toContain("SECRET_CANARY");
+    expect(stdout).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
   });
 
   it("covers import result dry-run and rejection branches", async () => {

@@ -39,6 +39,9 @@ import type {
 } from "../../src/storage/postgresql/contracts.js";
 import {
   POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST,
+  POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+  verifyPostgreSqlTransferSchema,
+  type PostgreSqlRuntimePrivilegeManifest,
   PostgreSqlRuntimeReadinessError,
   verifyPostgreSqlRuntimeSchema,
   type PostgreSqlRuntimePrivilegeEntry,
@@ -71,6 +74,7 @@ function executor(): {
 }
 
 interface ReadyExecutorOptions {
+  readonly manifest?: PostgreSqlRuntimePrivilegeManifest;
   readonly includeSequenceRuntimeGrant?: boolean;
   readonly omitLcmPublicDefault?: boolean;
   readonly omitPublicSchemaUsage?: boolean;
@@ -620,15 +624,16 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
   readonly seam: PostgreSqlQueryExecutor;
   readonly queries: readonly { config: unknown; options: PostgreSqlQueryOptions }[];
 } {
+  const manifest = fixtureOptions.manifest ?? POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST;
   const queries: { config: unknown; options: PostgreSqlQueryOptions }[] = [];
   const migrations = loadPostgreSqlMigrations();
   const snapshot = loadPostgreSqlSchemaSnapshots().at(-1)!;
   const expectations = getPostgreSqlSchemaSnapshotExpectations(snapshot);
   const runtimeRole = "lcm_test_runtime";
   const includeSequenceRuntimeGrant = fixtureOptions.includeSequenceRuntimeGrant ?? true;
-  const optionalRelationEntries = POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional
+  const optionalRelationEntries = manifest.optional
     .filter(({ kind }) => kind === "relation");
-  const optionalColumnEntries = POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional
+  const optionalColumnEntries = manifest.optional
     .filter(({ kind }) => kind === "column");
   const selectedOptionalRelationEntries = fixtureOptions.omitOptionalDirectGrants
     ? []
@@ -805,7 +810,7 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
           ? ["DELETE", "INSERT", "MAINTAIN", "REFERENCES", "SELECT", "TRIGGER", "TRUNCATE", "UPDATE"]
           : ["SELECT", "UPDATE", "USAGE"]
       );
-      const required = POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required;
+      const required = manifest.required;
       const objects = (config as { values?: unknown[] }).values?.[0] as string[];
       const rows = [
         ...objects.flatMap((object) => [
@@ -830,7 +835,7 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
     }
     if (operation === "inspectColumnAcl") {
       const columns = [
-        ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required,
+        ...manifest.required,
         ...selectedOptionalColumnEntries,
       ].filter(({ kind }) => kind === "column") as readonly PostgreSqlRuntimePrivilegeEntry[];
       return applyOverride(result(columns.map((entry) => ({
@@ -847,11 +852,11 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
             const [, name, args] = identity.split("|");
             return `lcm.${name}(${args ?? ""})`;
           }),
-        ...POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required
+        ...manifest.required
           .filter(({ kind }) => kind === "function")
           .map(({ object }) => object),
       ])];
-      const functions = POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.required
+      const functions = manifest.required
         .filter(({ kind }) => kind === "function");
       return applyOverride(result([
         ...identities.flatMap((function_identity) => {
@@ -891,7 +896,7 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
           const column_name = columns === null ? null : columns[index];
           const privilege_type = privileges[index];
           const expectedValue = expected[index];
-          const optional = POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional.some((entry) => (
+          const optional = manifest.optional.some((entry) => (
             entry.kind === privilege_kind
               && entry.object === object_identity
               && (entry.column ?? null) === column_name
@@ -2241,4 +2246,156 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       .rejects.toMatchObject({ code: "STORAGE_INITIALIZATION_FAILED" });
     expect(fake.queries).toHaveLength(0);
   });
+});
+
+
+describe("PostgreSQL transfer readiness", () => {
+  it("admits preserved native timestamps and identities only as column inserts", async () => {
+    const transfer = readyExecutor({ manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST });
+    await verifyPostgreSqlTransferSchema(transfer.seam, { expectedOwner: EXPECTED_OWNER });
+    const effective = transfer.queries.find(({ options }) => options.operation === "inspectEffectivePrivileges")!;
+    const values = (effective.config as { values: unknown[] }).values;
+    const objects = values[10] as string[];
+    const columns = values[11] as string[];
+    const privileges = values[12] as string[];
+    const expected = values[13] as boolean[];
+    for (const [table, column] of [
+      ["conversations", "created_at"], ["message_parts", "part_id"],
+      ["promoted_memories", "memory_id"], ["ingest_checkpoints", "revision"],
+      ["passive_event_inbox", "status"],
+    ]) {
+      const index = objects.findIndex((object, i) => (
+        object === `lcm.${table}` && columns[i] === column && privileges[i] === "INSERT"
+      ));
+      expect(expected[index]).toBe(true);
+    }
+    const relations = values[4] as string[];
+    const relationPrivileges = values[5] as string[];
+    const relationExpected = values[6] as boolean[];
+    expect(relations.flatMap((object, index) => (
+      relationExpected[index] && relationPrivileges[index] === "INSERT"
+        ? [object] : []
+    )).sort()).toEqual(["lcm.transfer_batches", "lcm.transfer_identities", "lcm.transfer_runs"]);
+  });
+
+  it("probes exact ledger write boundaries and propagates cancellation", async () => {
+    const signal = new AbortController().signal;
+    const transfer = readyExecutor({ manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST });
+    await verifyPostgreSqlTransferSchema(transfer.seam, { expectedOwner: EXPECTED_OWNER, signal });
+    const effective = transfer.queries.find(({ options }) => options.operation === "inspectEffectivePrivileges")!;
+    const values = (effective.config as { values: unknown[] }).values;
+    const relations = values[4] as string[];
+    const relationPrivileges = values[5] as string[];
+    const relationExpected = values[6] as boolean[];
+    expect(relations.flatMap((object, index) => (
+      object.startsWith("lcm.transfer_") && relationExpected[index]
+        ? [`${object}|${relationPrivileges[index]}`]
+        : []
+    )).sort()).toEqual([
+      "lcm.transfer_batches|INSERT", "lcm.transfer_batches|SELECT",
+      "lcm.transfer_identities|INSERT", "lcm.transfer_identities|SELECT",
+      "lcm.transfer_runs|INSERT", "lcm.transfer_runs|SELECT",
+    ]);
+    const objects = values[10] as string[];
+    const columns = values[11] as string[];
+    const privileges = values[12] as string[];
+    const expected = values[13] as boolean[];
+    expect(objects.flatMap((object, index) => (
+      object.startsWith("lcm.transfer_") && privileges[index] === "UPDATE" && expected[index]
+        ? [`${object}|${columns[index]}`]
+        : []
+    )).sort()).toEqual([
+      "lcm.transfer_runs|checkpoint_bytes", "lcm.transfer_runs|checkpoint_sha256",
+      "lcm.transfer_runs|current_domain", "lcm.transfer_runs|state",
+    ]);
+    expect(transfer.queries.every(({ options }) => options.signal === signal)).toBe(true);
+  });
+
+  it("rejects effective transfer receipt UPDATE hidden from direct ACLs", async () => {
+    const transfer = readyExecutor({
+      manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      operationOverrides: {
+        inspectEffectivePrivileges: mutateRows((rows) => {
+          const receiptUpdate = rows.find((row) => (
+            row.privilege_kind === "relation"
+            && row.object_identity === "lcm.transfer_batches"
+            && row.privilege_type === "UPDATE"
+          ))!;
+          receiptUpdate.effective = true;
+        }),
+      },
+    });
+    await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).rejects.toMatchObject({ reason: "effective-privilege" });
+  });
+
+  it.each(["transfer_runs", "transfer_batches", "transfer_identities"])(
+    "ordinary runtime rejects ledger SELECT on %s", async (table) => {
+      const runtime = readyExecutor({ operationOverrides: {
+        inspectRelationAcl: mutateRows((rows) => {
+          rows.push({ object_identity: `table|${table}`, privilege_type: "SELECT",
+            grantee_is_owner: false, grantee_name: "lcm_test_runtime",
+            grantor_is_owner: true, is_grantable: false });
+        }),
+      } });
+      await expect(verifyPostgreSqlRuntimeSchema(runtime.seam, { expectedOwner: EXPECTED_OWNER }))
+        .rejects.toMatchObject({ reason: "acl-shape" });
+    },
+  );
+
+  it("requires transfer grants and keeps ordinary readiness strict", async () => {
+    await expect(verifyPostgreSqlTransferSchema(readyExecutor().seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).rejects.toMatchObject({ reason: "acl-shape" });
+    const transfer = readyExecutor({ manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST });
+    await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+    await expect(verifyPostgreSqlRuntimeSchema(transfer.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).rejects.toMatchObject({ reason: "acl-shape" });
+  });
+
+  it("rejects a missing transfer run checkpoint grant", async () => {
+    const transfer = readyExecutor({
+      manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      operationOverrides: {
+        inspectColumnAcl: mutateRows((rows) => {
+          const index = rows.findIndex((row) => (
+            row.object_identity === "lcm.transfer_runs|checkpoint_sha256"
+            && row.privilege_type === "UPDATE"
+          ));
+          rows.splice(index, 1);
+        }),
+      },
+    });
+    await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).rejects.toMatchObject({ reason: "acl-shape" });
+  });
+
+  it.each(["UPDATE", "DELETE", "TRUNCATE"])(
+    "rejects overbroad ledger %s even for a transfer role",
+    async (privilege) => {
+      const transfer = readyExecutor({
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+        operationOverrides: {
+          inspectRelationAcl: mutateRows((rows) => {
+            rows.push({
+              object_identity: "table|transfer_batches",
+              grantee_is_owner: false,
+              grantee_name: "lcm_test_runtime",
+              grantor_is_owner: true,
+              is_grantable: false,
+              privilege_type: privilege,
+            });
+          }),
+        },
+      });
+      await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+        expectedOwner: EXPECTED_OWNER,
+      })).rejects.toMatchObject({ reason: "acl-shape" });
+    },
+  );
 });

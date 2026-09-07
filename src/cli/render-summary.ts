@@ -21,8 +21,8 @@ function renderBar(barWidth: number): string {
   return '[' + '█'.repeat(barWidth) + ']';
 }
 
-/** Print the compact (non-verbose) summary table to stdout. */
-export function printSummary(state: ProgressState, opts: RenderOpts): void {
+/** Print the compact (non-verbose) summary table to the supplied output stream. */
+export function printSummary(state: ProgressState, opts: RenderOpts, output: Pick<NodeJS.WriteStream, "write"> = process.stdout): void {
   const elapsed = (Date.now() - state.startedAt) / 1_000;
   const processed = state.completed + state.errors.length;
   const width = Math.max(opts.width, 40);
@@ -37,7 +37,7 @@ export function printSummary(state: ProgressState, opts: RenderOpts): void {
       : state.errors.length > 0 || state.phaseErrors.length > 0
         ? 'Failed ✗'
         : 'Done ✓';
-    process.stdout.write(`\n  ${phaseBar}          ${doneLabel}\n`);
+    output.write(`\n  ${phaseBar}          ${doneLabel}\n`);
   }
 
   // Progress bar
@@ -53,11 +53,11 @@ export function printSummary(state: ProgressState, opts: RenderOpts): void {
     }
   }
   const msgs = state.messagesIn > 0 ? `  ${state.messagesIn.toLocaleString()} msgs` : '';
-  process.stdout.write(`\n  ${renderBar(barWidth)} ${pct}%${msgs}${tokenFlowStr}\n`);
+  output.write(`\n  ${renderBar(barWidth)} ${pct}%${msgs}${tokenFlowStr}\n`);
 
   // Metrics table
   const border = '─'.repeat(49);
-  process.stdout.write(`\n  ${border}\n`);
+  output.write(`\n  ${border}\n`);
 
   const rows: [string, string][] = [];
 
@@ -86,26 +86,26 @@ export function printSummary(state: ProgressState, opts: RenderOpts): void {
 
   const labelWidth = Math.max(...rows.map(([l]) => l.length));
   for (const [label, value] of rows) {
-    process.stdout.write(`  ${label.padEnd(labelWidth)}  ${value}\n`);
+    output.write(`  ${label.padEnd(labelWidth)}  ${value}\n`);
   }
 
-  process.stdout.write(`  ${border}\n`);
+  output.write(`  ${border}\n`);
 
   // Error list
   if (state.errors.length > 0) {
-    process.stdout.write('\n  Failed:\n');
+    output.write('\n  Failed:\n');
     for (const { sessionId, message } of state.errors) {
-      process.stdout.write(`    ${sanitizeTerminalText(sessionId)}: ${sanitizeTerminalText(message)}\n`);
+      output.write(`    ${sanitizeTerminalText(sessionId)}: ${sanitizeTerminalText(message)}\n`);
     }
   }
   if (state.phaseErrors.length > 0) {
-    process.stdout.write('\n  Phase failures:\n');
+    output.write('\n  Phase failures:\n');
     for (const { phase, target, message } of state.phaseErrors) {
       const safePhase = sanitizeTerminalText(phase);
       const safeTarget = target ? ` (${sanitizeTerminalText(target)})` : '';
-      process.stdout.write(`    ${safePhase}${safeTarget}: ${sanitizeTerminalText(message)}\n`);
+      output.write(`    ${safePhase}${safeTarget}: ${sanitizeTerminalText(message)}\n`);
     }
   }
 
-  process.stdout.write('\n');
+  output.write('\n');
 }

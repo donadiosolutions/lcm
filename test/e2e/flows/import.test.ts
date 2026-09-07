@@ -45,8 +45,8 @@ describe("Flows 2-4: Import", { timeout: 60_000 }, () => {
     expect(result.ingested).toBeGreaterThan(0);
   });
 
-  it("Flow 5: skips sessions marked in session_ingest_log", async () => {
-    // Pre-mark a session as already ingested in the database
+  it("Flow 5: refuses native completion when the ingest log claims missing messages", async () => {
+    // An inconsistent completion marker must not bypass exact native linkage.
     const { db, close } = openProjectDb(handle.tmpDir);
     try {
       db.prepare(
@@ -56,15 +56,10 @@ describe("Flows 2-4: Import", { timeout: 60_000 }, () => {
       close();
     }
 
-    // Try to import a transcript with that session_id
-    // The import should skip it (return ingested:0, totalTokens:0)
-    const result = await handle.client.post<{ ingested: number; totalTokens: number }>("/ingest", {
+    await expect(handle.client.post("/ingest", {
       session_id: "e2e-test-skip-me",
       cwd: handle.tmpDir,
-      transcript_path: handle.fixturePath, // reuse the existing fixture
-    });
-
-    expect(result.ingested).toBe(0);
-    expect(result.totalTokens).toBe(0);
+      transcript_path: handle.fixturePath,
+    })).rejects.toMatchObject({ statusCode: 500, message: "ingest failed" });
   });
 });

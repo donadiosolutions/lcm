@@ -52,6 +52,27 @@ function dedupDeps(db: ReturnType<typeof makeDb>, store: PromotedStore) {
 }
 
 describe("deduplicateAndInsert", () => {
+  it.each(["repositories", "legacy"] as const)("merges exact ranked content through %s without lowering the fuzzy threshold", async mode => {
+    const db = makeDb();
+    const store = new PromotedStore(db);
+    const content = "Orchard pruning architecture decision for perennial fruit trees";
+    const id = store.insert({ content, tags: ["original"], projectId: "p1", confidence: 0.8 });
+    const candidate = store.search(content, 10, undefined, "p1")[0];
+    expect(candidate.content).toBe(content);
+    expect(candidate.rank).toBeLessThan(0);
+    expect(candidate.rank).toBeGreaterThan(-15);
+    const backend = mode === "legacy" ? { store, projectId: "p1" } : dedupDeps(db, store);
+    const shared = { ...backend, tags: ["imported"], depth: 0, confidence: 0.9,
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 } };
+    expect(await deduplicateAndInsert({ ...shared, content })).toBe(id);
+    expect(store.getAll()).toHaveLength(1);
+    expect(JSON.parse(store.getById(id)!.tags)).toEqual(["original", "imported"]);
+    expect(store.getById(id)!.confidence).toBe(0.9);
+    // A partial ranked match still needs the configured threshold.
+    expect(await deduplicateAndInsert({ ...shared, content: "Orchard pruning architecture" })).not.toBe(id);
+    expect(store.getAll()).toHaveLength(2);
+  });
+
   it("converges exact unranked fallback matches without merging partial lexical matches", async () => {
     const db = makeDb();
     const store = new PromotedStore(db, false);

@@ -1,3 +1,4 @@
+import { PostgreSqlNativeTranscriptRepository } from "./native-transcript-repository.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import type {
@@ -308,6 +309,7 @@ function createRepositories(
 export class PostgreSqlProjectStorage implements ProjectStorage {
   readonly backend = "postgresql" as const;
   readonly capabilities = POSTGRESQL_STORAGE_CAPABILITIES;
+  readonly nativeTranscripts: NonNullable<ProjectStorage["nativeTranscripts"]>;
   readonly conversations: ProjectRepositories["conversations"];
   readonly summaries: ProjectRepositories["summaries"];
   readonly context: ProjectRepositories["context"];
@@ -337,6 +339,10 @@ export class PostgreSqlProjectStorage implements ProjectStorage {
       this,
       this.abortController.signal,
     );
+    this.nativeTranscripts = Object.freeze({
+      machineId,
+      repository: new PostgreSqlNativeTranscriptRepository(this.rootExecutor, projectId),
+    });
     const repositories = createRepositories(
       this.rootExecutor,
       projectId,

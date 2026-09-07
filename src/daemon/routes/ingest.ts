@@ -1,4 +1,14 @@
 import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { basename, dirname, join } from "node:path";
+import {
+  CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+  CODEX_NATIVE_TRANSCRIPT_FORMAT,
+  createExactNativeTranscriptMessageResolver,
+  createFileNativeTranscriptSource,
+  runNativeTranscriptBackfill,
+} from "../../storage/native-transcript-ingest.js";
+import { openLocalTranscriptQuarantine } from "../../storage/local-transcript-quarantine.js";
 import type { DaemonConfig } from "../config.js";
 import {
   MAX_PROJECT_METADATA_BYTES,
@@ -16,7 +26,7 @@ import {
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { ParsedMessage } from "../../transcript.js";
-import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
+import { normalizeTranscriptClient, parseTranscriptForClient, type TranscriptClient } from "../../transcript-provider.js";
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
@@ -43,19 +53,20 @@ function errorCode(error: unknown): string | undefined {
     : undefined;
 }
 
-function resolveMessages(input: { client?: unknown; messages?: unknown; provider?: unknown; transcript_path?: string }, cwd: string): ParsedMessage[] {
+function resolveMessages(input: { client?: unknown; messages?: unknown; provider?: unknown; transcript_path?: string }, cwd: string): { messages: ParsedMessage[]; nativePath?: string; client?: TranscriptClient } {
   if (Array.isArray(input.messages)) {
-    return input.messages.filter(isParsedMessage);
+    return { messages: input.messages.filter(isParsedMessage) };
   }
 
   if (input.transcript_path) {
     const safePath = isSafeTranscriptPath(input.transcript_path, cwd);
     if (safePath && existsSync(safePath)) {
-      return parseTranscriptForClient(safePath, normalizeTranscriptClient(input.client ?? input.provider));
+      const client = normalizeTranscriptClient(input.client ?? input.provider);
+      return { messages: parseTranscriptForClient(safePath, client), nativePath: safePath, client };
     }
   }
 
-  return [];
+  return { messages: [] };
 }
 
 export function createIngestHandler(config: DaemonConfig, storageFactory?: StorageBackendFactory): RouteHandler {
@@ -96,8 +107,10 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
           : { remoteProjectId: storageIdentity.remoteProjectId }),
       };
       const paths = projectPathsForIdentity(localIdentity);
-      const resolvedMessages = resolveMessages(input, cwd);
-      if (config.storage.backend === "sqlite" && resolvedMessages.length === 0) {
+      const resolved = resolveMessages(input, cwd);
+      const resolvedMessages = resolved.messages;
+      const importNative = resolved.nativePath;
+      if (config.storage.backend === "sqlite" && resolvedMessages.length === 0 && importNative === undefined) {
         sendJson(res, 200, { ingested: 0, totalTokens: 0 });
         return;
       }
@@ -121,9 +134,13 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
           expectedIdentity: storageIdentity,
         },
         async (project) => {
-          if (resolvedMessages.length === 0) return null;
+          if (resolvedMessages.length === 0 && importNative === undefined) return null;
+          if (importNative !== undefined && project.nativeTranscripts === undefined) {
+            throw new Error("native transcript storage unavailable");
+          }
 
           const persisted = await project.transaction(async (repositories) => {
+            if (resolvedMessages.length === 0) return null;
             const row = await repositories.coordination.getSessionIngest(session_id);
             if (row && resolvedMessages.length <= row.messageCount) return null;
 
@@ -156,6 +173,39 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
             return { conversationId: conversation.conversationId, records, totalCounts };
           });
 
+          // A parsed-message retry must still complete native storage before
+          // acknowledging success. Backfill owns atomic raw-record/link/checkpoint
+          // batches and resumes them independently of the parsed-message commit.
+          if (importNative !== undefined) {
+            const native = project.nativeTranscripts!;
+            const format = resolved.client === "codex"
+              ? CODEX_NATIVE_TRANSCRIPT_FORMAT
+              : CLAUDE_NATIVE_TRANSCRIPT_FORMAT;
+            const projectPatterns = await ScrubEngine.loadProjectPatterns(join(paths.dir, "sensitive-patterns.txt"));
+            const quarantine = openLocalTranscriptQuarantine(project.projectId, format.clientName);
+            let failed = false;
+            try {
+              await runNativeTranscriptBackfill({
+                repository: native.repository,
+                messageResolver: createExactNativeTranscriptMessageResolver(native.repository),
+                machineId: native.machineId,
+                format,
+                nativeSessionId: session_id,
+                sourceLocator: createHash("sha256").update(importNative).digest("hex"),
+                source: createFileNativeTranscriptSource(dirname(importNative), basename(importNative)),
+                globalPatterns: config.security?.sensitivePatterns ?? [],
+                projectPatterns,
+                quarantine,
+              });
+            } catch (error) {
+              failed = true;
+              throw error;
+            } finally {
+              try { await quarantine.close(); } catch (error) {
+                if (!failed) throw error;
+              }
+            }
+          }
           if (!persisted) return null;
           return {
             ...persisted,

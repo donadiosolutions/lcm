@@ -115,6 +115,16 @@ Exact duplicates are retained once. Per-source merge markers make retries and
 later-discovered generations idempotent, so each source generation is applied
 exactly once.
 
+Legacy split SQLite stores containing active native transcript records, message
+links, or ingest checkpoints currently block reconciliation. LCM checks every
+source before changing either project database, and rechecks while holding the
+source write lock. Empty native transcript tables remain compatible. The blocked
+journal explains the refusal; the source data stays in place and the project map
+is not folded. Preserve the legacy store until a supported native transcript
+merge is available; deleting its native rows to bypass the check would lose data.
+The canonical recovery archive is a separate transfer surface and does not enable
+this legacy merge.
+
 Exact same-UUID passive events with the same immutable envelope, compatible
 delivery state and checkpoints, and the same predecessor identity—the same
 numeric ID or null—also reconcile idempotently. For such a compatible pair, if

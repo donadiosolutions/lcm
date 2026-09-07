@@ -804,8 +804,10 @@ message cascade, so the runtime receives no direct `DELETE` on
 `message_parts`. Message inserts evaluate the stored generated
 `search_document`, so the script also grants exact `EXECUTE` on
 `lcm.normalize_search_text(text)`; `PUBLIC` execution remains revoked.
-Applying these grants permits direct repository use and conformance testing
-only; daemon and CLI routing remain staged behind #224 and #92.
+Applying these grants permits repository access for the authenticated selected
+PostgreSQL runtime. The daemon and operational CLI commands use those
+repositories after project and backend-publication admission. Migration
+cutover and rollback remain separate workflows.
 
 The transcript script grants column-limited `SELECT` on the exact conversation
 and message fields needed for native-session linkage, plus `SELECT` and
@@ -907,3 +909,30 @@ For the isolated local/CI workflow and checksum recovery procedure, see
 [PostgreSQL development](postgresql-development.md). For repository ownership
 and the staged activation boundary, see
 [Architecture](../../../../docs/architecture.md#storage-repository-architecture).
+
+## Portable transfer ledger
+
+Migration `0006_transfer_ledger.sql` adds three managed tables in the same
+`lcm` schema as the destination records. `transfer_runs` binds one run to a
+project and target generation, its exact manifest bytes, protocol checksums,
+source identity and witness, and durable progress. `transfer_batches` records
+immutable batch receipts keyed by run, domain and prior checkpoint checksum;
+the resulting checkpoint checksum is also unique within that run and domain.
+Its ordinal interval is `[first_ordinal, next_ordinal)`, so an empty terminal
+batch has equal bounds. `transfer_identities` maps each canonical identity and
+ordinal to its native locator and record checksum. It stores no record payload.
+
+The checksum fields contain the portable protocol checksums, calculated over
+the protocol preimages. They are not hashes of the serialized bytes, which also
+contain the checksum field. The adapter validates both canonical bytes and
+protocol checksums before acknowledging a receipt.
+
+The latest snapshot covers 27 tables, 100 indexes, 204 constraints, 253 column
+ACLs, and 880 definition objects. Previous migration snapshots remain pinned
+for safe incremental upgrades. These ledger tables do not grant the ordinary
+runtime role any additional privileges. The separate transfer grant script and
+`verifyPostgreSqlTransferSchema` admit an explicit transfer role; ordinary
+`verifyPostgreSqlRuntimeSchema` continues to reject transfer privileges.
+Batch and identity rows permit only SELECT and INSERT for that role. Run
+updates are limited to state, domain, and checkpoint columns. The migration
+owner can administer these tables and is not an appropriate transfer role.
