@@ -126,10 +126,6 @@ export function firePromoteEventsNotifyRequest(port: number, body: Record<string
   withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/promote-events/notify", body, lockToken));
 }
 
-export function fireSessionCompleteRequest(port: number, body: Record<string, unknown>): void {
-  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/session-complete", body, lockToken));
-}
-
 export async function handleSessionEnd(
   stdin: string,
   client: DaemonClient,
@@ -187,6 +183,10 @@ export async function handleSessionEnd(
     try {
       const input = JSON.parse(stdin || "{}") as Record<string, unknown>;
       const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
+      // Snapshot settings before ingest can trigger concurrent daemon writes.
+      // The authenticated config load releases its lock before network work.
+      const config = loadDaemonConfig(defaultConfigPath());
+      const disableCompact = config.hooks?.disableAutoCompact ?? false;
       // The daemon client owns its own admission at the lifecycle boundary;
       // perform a fresh read-only check without holding it across the request.
       assertHookPublicationFence();
@@ -196,9 +196,6 @@ export async function handleSessionEnd(
         redacted?: number;
         redactedCategories?: string[];
       }>("/ingest", { ...input, client: clientName });
-
-      const config = loadDaemonConfig(defaultConfigPath());
-      const disableCompact = config.hooks?.disableAutoCompact ?? false;
 
       // Notify user when sensitive data was filtered (default: on)
       const notifyOnFilter = config.security?.notify_on_filter !== false;
@@ -233,11 +230,19 @@ export async function handleSessionEnd(
   firePromoteRequest(daemonPort, { cwd: input.cwd });
   firePromoteEventsRequest(daemonPort, { cwd: input.cwd });
   if (clientName === "claude") {
-    fireSessionCompleteRequest(daemonPort, {
-      session_id: input.session_id,
-      cwd: input.cwd,
-      message_count: ingestResult.ingested ?? 0,
-    });
+    try {
+      // The CLI explicitly exits after dispatch. Wait for the completion
+      // response, with an absolute bound, without retaining publication locks.
+      assertHookPublicationFence();
+      await client.post("/session-complete", {
+        session_id: input.session_id,
+        cwd: input.cwd,
+        message_count: ingestResult.ingested ?? 0,
+      }, { signal: AbortSignal.timeout(1000) });
+    } catch (error) {
+      if (isBackendPublicationJournalError(error)) throw error;
+      // Completion remains best-effort on contention or transport failure.
+    }
   }
   return { exitCode: 0, stdout: "" };
 }

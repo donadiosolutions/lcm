@@ -13,6 +13,7 @@ component_management:
         # #1088 keeps unsupported connector-list-format admission CLI-owned.
         # #978 keeps compact replacement runtime-digest admission CLI-owned.
         # #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
+        # #1201 keeps diagnostic-only identity admission CLI-owned.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
@@ -47,6 +48,8 @@ component_management:
         # existing filesystem-topology owner.
         # #1086/#1095/#1119 keep cleanup-error precedence in this existing
         # configuration-security owner without changing component topology.
+        # #1134/#1135/#1136 preserve private-write failures while retaining
+        # ordered descriptor, temporary-file, and parent cleanup evidence here.
         # PR #791 keeps generated Gitleaks hostname-literal normalization in
         # this existing configuration-security owner.
         - "^src/config-manager\\.ts$"
@@ -56,10 +59,14 @@ component_management:
         - "^src/legacy-names\\.ts$"
         - "^src/private-mutation-lock\\.ts$"
         - "^src/runtime-paths\\.ts$"
+        # #1195 keeps strict moduleAssetUrl resource resolution in this
+        # existing configuration-security owner.
         - "^src/runtime-root\\.ts$"
         - "^src/scrub\\.ts$"
         - "^src/secret-key\\.ts$"
         - "^src/security-files\\.ts$"
+        # #1133 keeps project-pattern owner/single-link admission and authenticated
+        # single-snapshot scrubbing in this existing configuration-security owner.
         - "^src/sensitive\\.ts$"
         - "^src/shell-quote\\.ts$"
         - "^src/terminal-sanitize\\.ts$"
@@ -76,7 +83,9 @@ component_management:
       name: "Unit - Hooks"
       paths:
         # Includes native adapters and the #726/#737 publication-diagnostic flow.
+        # Claude's bounded session-completion acknowledgment remains hook-owned.
         - "src/hooks/"
+    # #1201 keeps process-only observation, its parser/client, and route allowlist here.
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
@@ -121,6 +130,8 @@ component_management:
         # episodic search candidate recall, and #890 bounded best-effort status
         # metadata reads,
         # and #833 passive-event identity admission remain route-owned.
+        # #1148 keeps promoted created_at UTC parsing in this existing
+        # daemon-routes owner without changing the component taxonomy.
         # #828 promotes topology failures through the route boundary while
         # preserving ordinary best-effort metadata persistence.
         # #947 keeps direct metadata-parent resource exhaustion best-effort
@@ -130,6 +141,8 @@ component_management:
         # #964 extends that retained metadata lifetime to the path-bound LCM
         # root, projects directory, and project leaf without changing ownership.
         # #1062 keeps missing promote metadata no-clobber handling route-owned.
+        # #1158 keeps PostgreSQL passive promotion route behavior route-owned;
+        # deduplication implementation remains in unit-promotion below.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -153,6 +166,8 @@ component_management:
         # caller-cancellation handling during resolver teardown here.
         # #1154/#1157 keep Spark protocol normalization, bounded upstream
         # classification, and terminal sentinel handling in this owner.
+        # #1168 keeps accepted HTTP body and SSE failure classification in
+        # this LLM-owned component.
         - "src/llm/"
         - "src/prompts/"
     - component_id: "unit-local-persistence"
@@ -260,7 +275,8 @@ component_management:
     - component_id: "unit-promotion"
       name: "Unit - Promotion"
       paths:
-        # #1153 rank-independent exact deduplication remains promotion-owned.
+        # #1153 exact-content identity and #1158 owner-scope selection remain
+        # owned by the deduplication helper; no component boundary changed.
         - "src/promotion/"
     - component_id: "unit-project-worktrees"
       name: "Unit - Projects and Worktrees"
@@ -293,6 +309,7 @@ component_management:
         # #1173 keeps promoted-content reconciliation guards in this existing
         # project/worktree ownership component; no topology change.
         - "^src/worktree-reconciliation\\.ts$"
+    # #1201 keeps doctor identity observation and unverified queue readiness here.
     - component_id: "unit-diagnostics"
       name: "Unit - Diagnostics"
       paths:
@@ -346,6 +363,8 @@ component_management:
       name: "Integration - PostgreSQL Schema"
       paths:
         - "^src/storage/postgresql/extensions\\.ts$"
+        # #1195 keeps packaged SQL loading and checksum verification in
+        # the existing PostgreSQL schema owner.
         - "^src/storage/postgresql/migrations\\.ts$"
         - "^src/storage/postgresql/provisioning\\.ts$"
         - "^src/storage/postgresql/runtime-readiness\\.ts$"

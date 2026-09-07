@@ -74,6 +74,7 @@ export type PrivateFilePublicationOutcome = "published" | "unknown";
 export class PrivateFilePublicationTopologyError extends PrivateDirectoryTopologyError {
   readonly outcome: PrivateFilePublicationOutcome;
   readonly topologyError: PrivateDirectoryTopologyError;
+  readonly operation: "rename" | "link";
 
   constructor(
     outcome: PrivateFilePublicationOutcome,
@@ -91,6 +92,7 @@ export class PrivateFilePublicationTopologyError extends PrivateDirectoryTopolog
     );
     this.outcome = outcome;
     this.topologyError = topologyError;
+    this.operation = operation;
   }
 }
 
@@ -514,10 +516,10 @@ function unlinkPrivateFileIfIdentityMatches(
 
 function privateFilePublicationCleanupFailure(
   primaryError: unknown,
-  cleanupError: unknown,
+  ...cleanupErrors: readonly unknown[]
 ): unknown {
   const aggregate = new AggregateError(
-    [primaryError, cleanupError],
+    [primaryError, ...cleanupErrors],
     "private file publication and temporary cleanup failed",
     { cause: primaryError },
   );
@@ -526,6 +528,7 @@ function privateFilePublicationCleanupFailure(
       primaryError.outcome,
       primaryError.topologyError,
       aggregate,
+      primaryError.operation,
     );
   }
   if (primaryError instanceof PrivateDirectoryTopologyError) {
@@ -956,6 +959,7 @@ export function atomicWritePrivateFile(
     let ownsTempPath = false;
     let published = false;
     let tempIdentity: PrivateFileIdentity | undefined;
+    let primaryErrorPresent = false;
     let primaryError: unknown;
     try {
       let fd: number;
@@ -973,6 +977,8 @@ export function atomicWritePrivateFile(
         throw error;
       }
       ownsTempPath = true;
+      let descriptorErrorPresent = false;
+      let descriptorError: unknown;
       try {
         tempIdentity = privateFileIdentity(
           fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
@@ -982,11 +988,22 @@ export function atomicWritePrivateFile(
         (operations.write ?? writeFileSync)(fd, content, "utf-8");
         (operations.fchmod ?? fchmodSync)(fd, PRIVATE_FILE_MODE);
         (operations.sync ?? fsyncSync)(fd);
-      } finally {
-        (operations.close ?? closeSync)(fd);
+      } catch (error) {
+        descriptorErrorPresent = true;
+        descriptorError = error;
       }
+      try {
+        (operations.close ?? closeSync)(fd);
+      } catch (closeError) {
+        if (descriptorErrorPresent) {
+          throw privateFilePublicationCleanupFailure(descriptorError, closeError);
+        }
+        throw closeError;
+      }
+      if (descriptorErrorPresent) throw descriptorError;
+      const preparedIdentity = tempIdentity!;
       assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
-      assertPrivateTemporaryFileIdentity(tempPath, tempIdentity);
+      assertPrivateTemporaryFileIdentity(tempPath, preparedIdentity);
       try {
         (operations.link ?? linkSync)(tempPath, path);
       } catch (error) {
@@ -1011,7 +1028,7 @@ export function atomicWritePrivateFile(
       published = true;
       const removed = unlinkPrivateFileIfIdentityMatches(
         tempPath,
-        tempIdentity,
+        preparedIdentity,
         (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
         undefined,
         2n,
@@ -1020,9 +1037,10 @@ export function atomicWritePrivateFile(
         throw new Error("private exclusive publication temp cleanup was not completed");
       }
       ownsTempPath = false;
-      assertPrivateFileSingleLink(path, tempIdentity);
+      assertPrivateFileSingleLink(path, preparedIdentity);
       assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
     } catch (error) {
+      primaryErrorPresent = true;
       primaryError = error;
       if (
         published
@@ -1064,7 +1082,7 @@ export function atomicWritePrivateFile(
         } catch { /* preserve the exclusive publication failure */ }
       }
     }
-    if (primaryError !== undefined) throw primaryError;
+    if (primaryErrorPresent) throw primaryError;
     return;
   }
   if (parent === undefined) {
@@ -1099,6 +1117,8 @@ export function atomicWritePrivateFile(
       throw error;
     }
     ownsTempPath = true;
+    let descriptorErrorPresent = false;
+    let descriptorError: unknown;
     try {
       tempIdentity = privateFileIdentity(
         fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
@@ -1110,12 +1130,23 @@ export function atomicWritePrivateFile(
       (operations.write ?? writeFileSync)(fd, content, "utf-8");
       (operations.fchmod ?? fchmodSync)(fd, PRIVATE_FILE_MODE);
       (operations.sync ?? fsyncSync)(fd);
-    } finally {
-      (operations.close ?? closeSync)(fd);
+    } catch (error) {
+      descriptorErrorPresent = true;
+      descriptorError = error;
     }
+    try {
+      (operations.close ?? closeSync)(fd);
+    } catch (closeError) {
+      if (descriptorErrorPresent) {
+        throw privateFilePublicationCleanupFailure(descriptorError, closeError);
+      }
+      throw closeError;
+    }
+    if (descriptorErrorPresent) throw descriptorError;
+    const preparedIdentity = tempIdentity!;
     if (parent !== undefined) {
       assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
-      assertPrivateTemporaryFileIdentity(tempPath, tempIdentity);
+      assertPrivateTemporaryFileIdentity(tempPath, preparedIdentity);
     }
     try {
       (operations.rename ?? renameSync)(tempPath, path);
@@ -1361,6 +1392,9 @@ export function atomicWritePrivateFileExclusive(
   let ownsTempPath = false;
   let tempIdentity: PrivateFileIdentity | undefined;
   let published = false;
+  let primaryErrorPresent = false;
+  let primaryError: unknown;
+  let result = true;
   try {
     const fd = openSync(tempPath, "wx", PRIVATE_FILE_MODE);
     ownsTempPath = true;
@@ -1368,12 +1402,24 @@ export function atomicWritePrivateFileExclusive(
       fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
       privatePathIdentity(directory),
     );
+    let descriptorErrorPresent = false;
+    let descriptorError: unknown;
     try {
       writeFileSync(fd, content, "utf-8");
       fsyncSync(fd);
-    } finally {
-      closeSync(fd);
+    } catch (error) {
+      descriptorErrorPresent = true;
+      descriptorError = error;
     }
+    try {
+      closeSync(fd);
+    } catch (closeError) {
+      if (descriptorErrorPresent) {
+        throw privateFilePublicationCleanupFailure(descriptorError, closeError);
+      }
+      throw closeError;
+    }
+    if (descriptorErrorPresent) throw descriptorError;
     // A hard link shares the completed temporary inode, including its mode.
     // Finish every fallible setup step before publishing the destination so a
     // thrown setup error can never strand a lock that the caller did not
@@ -1382,27 +1428,38 @@ export function atomicWritePrivateFileExclusive(
     try {
       (operations.link ?? linkSync)(tempPath, path);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-      throw error;
+      if (errorCode(error) === "EEXIST") result = false;
+      else throw error;
     }
-    published = true;
-    return true;
-  } finally {
-    if (ownsTempPath && tempIdentity !== undefined) {
-      try {
-        unlinkPrivateFileIfIdentityMatches(
-          tempPath,
-          tempIdentity,
-          (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
-        );
-      } catch (error) {
-        // Once the destination is published it is complete and private. A
-        // best-effort temporary-link cleanup failure must not report lock
-        // acquisition failure while leaving that valid destination behind.
-        if (!published) throw error;
-      }
+    if (result) published = true;
+  } catch (error) {
+    primaryErrorPresent = true;
+    primaryError = error;
+  }
+  let cleanupErrorPresent = false;
+  let cleanupError: unknown;
+  if (ownsTempPath && tempIdentity !== undefined) {
+    try {
+      unlinkPrivateFileIfIdentityMatches(
+        tempPath,
+        tempIdentity,
+        (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+      );
+    } catch (error) {
+      cleanupErrorPresent = true;
+      cleanupError = error;
     }
   }
+  // Once the destination is published it is complete and private. A
+  // best-effort temporary-link cleanup failure must not report lock
+  // acquisition failure while leaving that valid destination behind.
+  if (published) return true;
+  if (primaryErrorPresent && cleanupErrorPresent) {
+    throw privateFilePublicationCleanupFailure(primaryError, cleanupError);
+  }
+  if (primaryErrorPresent) throw primaryError;
+  if (cleanupErrorPresent) throw cleanupError;
+  return result;
 }
 
 export type DurablePrivateWriteOptions = Readonly<{
@@ -1447,38 +1504,40 @@ export function atomicWritePrivateFileDurable(
   const directory = dirname(path);
   const expectedUid = options.expectedUid ?? currentUid();
   const parent = openPrivateDirectory(directory, { expectedUid });
-  const parentIdentity: PrivatePathIdentity = {
-    dev: BigInt(parent.witness.dev),
-    ino: BigInt(parent.witness.ino),
-  };
-  const current = (() => {
-    try {
-      readBoundedRegularFileWithStat(path, {
-        allowedRoot: directory,
-        maxBytes: options.maxExistingBytes ?? Math.max(Buffer.byteLength(content), 1) + 1,
-        expectedUid,
-        allowedModes: OWNER_ONLY_FILE_MODES,
-        requireSingleLink: true,
-      });
-      return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-      throw error;
-    }
-  })();
-  if (options.requireAbsent && current) {
-    parent.close();
-    throw new Error("private file already exists");
-  }
-
-  const temporaryPath = join(
-    directory,
-    `.${basename(path)}.${(options.random ?? randomBytes)(12).toString("hex")}.tmp`,
-  );
+  let temporaryPath: string | undefined;
   let temporaryFd: number | undefined;
   let temporaryIdentity: PrivateFileIdentity | undefined;
+  let primaryErrorPresent = false;
   let primaryError: unknown;
+  const cleanupErrors: unknown[] = [];
   try {
+    const parentIdentity: PrivatePathIdentity = {
+      dev: BigInt(parent.witness.dev),
+      ino: BigInt(parent.witness.ino),
+    };
+    const current = (() => {
+      try {
+        readBoundedRegularFileWithStat(path, {
+          allowedRoot: directory,
+          maxBytes: options.maxExistingBytes ?? Math.max(Buffer.byteLength(content), 1) + 1,
+          expectedUid,
+          allowedModes: OWNER_ONLY_FILE_MODES,
+          requireSingleLink: true,
+        });
+        return true;
+      } catch (error) {
+        if (errorCode(error) === "ENOENT") return false;
+        throw error;
+      }
+    })();
+    if (options.requireAbsent && current) {
+      throw new Error("private file already exists");
+    }
+
+    temporaryPath = join(
+      directory,
+      `.${basename(path)}.${(options.random ?? randomBytes)(12).toString("hex")}.tmp`,
+    );
     temporaryFd = openSync(
       temporaryPath,
       constants.O_WRONLY
@@ -1501,48 +1560,64 @@ export function atomicWritePrivateFileDurable(
     }
     fchmodSync(temporaryFd, finalMode);
     fsyncSync(temporaryFd);
-    closeSync(temporaryFd);
+    const descriptorToClose = temporaryFd;
     temporaryFd = undefined;
+    closeSync(descriptorToClose);
     if (options.requireAbsent) {
       try {
         linkSync(temporaryPath, path);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        if (errorCode(error) === "EEXIST") {
           throw new Error("private file was created concurrently");
         }
         throw error;
       }
     } else {
       renameSync(temporaryPath, path);
+      temporaryIdentity = undefined;
     }
     if (options.requireAbsent && temporaryIdentity !== undefined) {
-      unlinkPrivateFileIfIdentityMatches(temporaryPath, temporaryIdentity);
-      assertPrivateFileSingleLink(path, temporaryIdentity);
+      const publishedIdentity = temporaryIdentity;
       temporaryIdentity = undefined;
+      unlinkPrivateFileIfIdentityMatches(temporaryPath, publishedIdentity);
+      assertPrivateFileSingleLink(path, publishedIdentity);
     }
     assertPrivateDirectory(parent, directory, parent.witness, expectedUid);
     fsyncSync(parent.fd);
   } catch (error) {
+    primaryErrorPresent = true;
     primaryError = error;
-    throw error;
-  } finally {
-    if (temporaryFd !== undefined) {
-      try { closeSync(temporaryFd); } catch { /* preserve the original error */ }
+  }
+  if (temporaryFd !== undefined) {
+    const descriptorToClose = temporaryFd;
+    temporaryFd = undefined;
+    try {
+      closeSync(descriptorToClose);
+    } catch (error) {
+      cleanupErrors.push(error);
     }
-    if (temporaryIdentity !== undefined) {
-      try {
-        unlinkPrivateFileIfIdentityMatches(temporaryPath, temporaryIdentity);
-      } catch (error) {
-        if (
-          primaryError === undefined
-          || (error as NodeJS.ErrnoException).code !== "ENOENT"
-        ) {
-          throw error;
-        }
+  }
+  if (temporaryIdentity !== undefined && temporaryPath !== undefined) {
+    try {
+      unlinkPrivateFileIfIdentityMatches(temporaryPath, temporaryIdentity);
+    } catch (error) {
+      if (!primaryErrorPresent || errorCode(error) !== "ENOENT") {
+        cleanupErrors.push(error);
       }
     }
-    parent.close();
   }
+  try {
+    parent.close();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (primaryErrorPresent) {
+    if (cleanupErrors.length > 0) {
+      throw privateFilePublicationCleanupFailure(primaryError, ...cleanupErrors);
+    }
+    throw primaryError;
+  }
+  if (cleanupErrors.length > 0) throw cleanupErrors[0];
 }
 
 /** Delete a regular file without following a symlink. */

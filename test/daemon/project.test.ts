@@ -196,6 +196,8 @@ describe("secure project-root handoff", () => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });
     const outside = join(home, "outside");
     mkdirSync(outside, { mode: 0o755 });
+    chmodSync(outside, 0o755);
+    expect(statSync(outside).mode & 0o777).toBe(0o755);
     const projects = join(home, ".lcm", "projects");
     mkdirSync(projects, { mode: 0o700 });
     symlinkSync(outside, join(projects, "e".repeat(64)));
@@ -209,6 +211,8 @@ describe("secure project-root handoff", () => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });
     const outside = join(home, "outside-projects");
     mkdirSync(outside, { mode: 0o755 });
+    chmodSync(outside, 0o755);
+    expect(statSync(outside).mode & 0o777).toBe(0o755);
     symlinkSync(outside, join(home, ".lcm", "projects"));
 
     expect(() => ensureProjectDirForIdentity({ id: "d".repeat(64), canonical: "/project" }, { writeMetadata: false }))
@@ -1242,6 +1246,8 @@ describe("secure project-root handoff", () => {
     const projects = join(rootPath, "projects");
     const leaf = join(projects, "8".repeat(64));
     mkdirSync(leaf, { recursive: true, mode: 0o755 });
+    chmodSync(leaf, 0o755);
+    expect(statSync(leaf).mode & 0o777).toBe(0o755);
     const closeError = new Error("root close failed");
     const capturedHandles: securityFiles.PrivateDirectoryHandle[] = [];
     const originalOpen = securityFiles.openPrivateDirectory;

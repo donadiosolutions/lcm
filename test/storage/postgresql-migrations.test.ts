@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type { QueryResult, QueryResultRow } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import type {
@@ -1854,5 +1855,33 @@ describe("PostgreSQL migration runner", () => {
         : "";
       return !text.includes("pg_get_loaded_modules");
     })).toBe(true);
+  });
+});
+
+
+describe("migration asset read contract", () => {
+  it("passes adjacent resource URLs through the injected native read seam", () => {
+    const read = vi.fn(readFileSync);
+    const migrations = loadPostgreSqlMigrations(read);
+    expect(migrations).toHaveLength(6);
+    for (const [index, migration] of migrations.entries()) {
+      const [resource, encoding] = read.mock.calls[index];
+      expect(resource).toBeInstanceOf(URL);
+      expect((resource as URL).href).toBe(new URL(
+        `../../src/storage/postgresql/migrations/${migration.filename}`, import.meta.url,
+      ).href);
+      expect(encoding).toBe("utf8");
+      expect(createHash("sha256").update(migration.sql).digest("hex")).toBe(migration.sha256);
+    }
+  });
+
+  it("classifies native missing resources separately from checksum drift", () => {
+    const missing = new URL("./absent-migrations/0001.sql", import.meta.url);
+    expect(() => readFileSync(missing, "utf8"))
+      .toThrowError(expect.objectContaining({ code: "ENOENT" }));
+    expect(() => loadPostgreSqlMigrations(() => readFileSync(missing, "utf8")))
+      .toThrowError(expect.objectContaining({ operation: "loadMigrations" }));
+    expect(() => loadPostgreSqlMigrations(() => "-- tampered bytes"))
+      .toThrowError(expect.objectContaining({ operation: "verifyMigrationArtifact" }));
   });
 });

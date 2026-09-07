@@ -56,6 +56,8 @@ const expectedComponents = [
       "^src/config-projection\\.ts$",
       // #1086/#1095/#1119 keep cleanup-error precedence in this existing
       // configuration-security owner without changing component topology.
+      // #1134/#1135/#1136 preserve private-write failures while retaining
+      // ordered descriptor, temporary-file, and parent cleanup evidence here.
       // PR #791 keeps generated Gitleaks hostname-literal normalization in
       // this existing configuration-security owner.
       "^src/generated-patterns\\.ts$",
@@ -63,11 +65,15 @@ const expectedComponents = [
       "^src/legacy-names\\.ts$",
       "^src/private-mutation-lock\\.ts$",
       "^src/runtime-paths\\.ts$",
+      // #1195 keeps strict moduleAssetUrl resource resolution in this
+      // existing configuration-security owner.
       "^src/runtime-root\\.ts$",
       "^src/scrub\\.ts$",
       "^src/secret-key\\.ts$",
       // #1032 keeps retained-parent atomic-write outcome hardening in this owner.
       "^src/security-files\\.ts$",
+      // #1133 keeps project-pattern owner/single-link admission and authenticated
+      // single-snapshot scrubbing in this existing configuration-security owner.
       "^src/sensitive\\.ts$",
       "^src/shell-quote\\.ts$",
       "^src/terminal-sanitize\\.ts$",
@@ -312,6 +318,8 @@ const expectedComponents = [
     name: "Integration - PostgreSQL Schema",
     paths: [
       "^src/storage/postgresql/extensions\\.ts$",
+      // #1195 keeps packaged SQL loading and checksum verification in
+      // the existing PostgreSQL schema owner.
       "^src/storage/postgresql/migrations\\.ts$",
       "^src/storage/postgresql/provisioning\\.ts$",
       "^src/storage/postgresql/runtime-readiness\\.ts$",
@@ -583,6 +591,7 @@ describe("Codecov configuration", () => {
       // #1088 keeps unsupported connector-list-format admission CLI-owned.
       // #978 keeps compact replacement runtime-digest admission CLI-owned.
       // #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
+      // #1201 keeps diagnostic identity admission CLI-owned.
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
       ["src/private-mutation-lock.ts", "unit-configuration-security"],
@@ -590,6 +599,8 @@ describe("Codecov configuration", () => {
       // #1041 preserves bootstrap directory authentication errors when
       // descriptor cleanup also fails in this existing owner.
       ["src/runtime-paths.ts", "unit-configuration-security"],
+      // #1195 strict module-relative asset resolution retains this owner.
+      ["src/runtime-root.ts", "unit-configuration-security"],
       ["src/security-files.ts", "unit-configuration-security"],
       ["src/sensitive.ts", "unit-configuration-security"],
       // #1049 keeps project metadata owner and single-link admission here.
@@ -604,7 +615,9 @@ describe("Codecov configuration", () => {
       // #881 absent-config journal admission and #882 post-health identity
       // fencing remain installer-owned.
       ["installer/install.ts", "unit-installation"],
+      // #1201 observation parser/client, allowlist and server retain daemon-core ownership.
       ["src/daemon/client.ts", "unit-daemon-core"],
+      ["src/daemon/http-url.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
       ["src/daemon/project.ts", "unit-daemon-core"],
       ["src/daemon/routes/compact.ts", "unit-daemon-routes"],
@@ -615,9 +628,13 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/status.ts", "unit-daemon-routes"],
       ["src/daemon/routes/session-complete.ts", "unit-daemon-routes"],
       ["src/daemon/routes/review-stale.ts", "unit-daemon-routes"],
+      // #1148 keeps promoted created_at UTC parsing in the existing daemon
+      // routes owner; prompt-search and restore retain their route ownership.
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
       // #833 passive-event identity admission remains route-owned.
+      // #1158 keeps passive PostgreSQL promotion route behavior here; its
+      // deduplication helper remains owned by unit-promotion.
       ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"],
       // #793 search-limit validation, #863 expand depth validation, and #864
       // search candidate recall remain owned by daemon routes.
@@ -626,6 +643,9 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
       ["src/daemon/routes/recent.ts", "unit-daemon-routes"],
       ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
+      // #1153 exact identity and #1158 backend-guarded owner scope remain
+      // within the existing promotion component.
+      ["src/promotion/dedup.ts", "unit-promotion"],
       // #1106/#618 keep discovery-related files in their established owners.
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/import.ts", "unit-transcripts-import"],
@@ -636,12 +656,15 @@ describe("Codecov configuration", () => {
       // caller-cancellation handling during resolver teardown in this owner.
       // #1154/#1157 retain Spark protocol normalization, bounded upstream
       // classification, and terminal sentinel handling in this owner.
+      // #1168 retains accepted HTTP body and SSE failure classification in
+      // this LLM-owned component.
       ["src/llm/codex-process.ts", "unit-llm-prompts"],
       ["src/llm/codex-config.ts", "unit-llm-prompts"],
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
       ["src/llm/process-utils.ts", "unit-llm-prompts"],
       // #997 keeps doctor publication retry deadlines monotonic in this owner.
       // #619 keeps observational doctor refusal guidance in this owner.
+      // #1201 identity observation and unverified queue readiness retain this owner.
       ["src/doctor/doctor.ts", "unit-diagnostics"],
       // #944/#950/#966 keep typed daemon-tmp diagnostics, authenticated restart
       // convergence, and bounded birth samples in the service-manager component.
@@ -655,6 +678,8 @@ describe("Codecov configuration", () => {
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
       ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
+      // #1195 checksummed packaged migration loading remains schema-owned.
+      ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"],
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.
@@ -679,6 +704,8 @@ describe("Codecov configuration", () => {
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],
+      // Bounded Claude completion delivery remains within the hook component.
+      ["src/hooks/session-end.ts", "unit-hooks"],
       // #793 search-limit schema remains owned by MCP tools.
       ["src/mcp/tools/lcm-search.ts", "unit-mcp"],
       ["src/mcp/tools/lcm-grep.ts", "unit-mcp"],

@@ -12,6 +12,14 @@ export function packageRootFor(moduleUrl: string, compiledParentLevels: number):
   return root;
 }
 
+/** Resolve required assets without probing or falling back to another layout. */
+export function moduleAssetUrl(moduleUrl: string, adjacentPath: string, bundledPath: string): URL {
+  return new URL(
+    basename(fileURLToPath(moduleUrl)) === "lcm.mjs" ? bundledPath : adjacentPath,
+    moduleUrl,
+  );
+}
+
 export function packageAsset(moduleUrl: string, root: string, builtPath: string, sourcePath: string): string {
   const modulePath = fileURLToPath(moduleUrl);
   const built = join(root, builtPath);

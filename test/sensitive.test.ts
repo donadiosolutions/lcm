@@ -1,5 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { chmodSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
@@ -154,6 +163,98 @@ describe("lcm sensitive", () => {
     await expect(handleSensitive(["list"], cwd, configPath)).rejects.toThrow();
   });
 
+  it.each([
+    ["list", ["list"]],
+    ["add", ["add", "PAT_B"]],
+    ["duplicate add", ["add", "PAT_A"]],
+    ["remove", ["remove", "PAT_A"]],
+    ["test", ["test", "PAT_A"]],
+  ] as const)("%s: refuses a multiply linked project pattern leaf without changing either name", async (
+    _label,
+    command,
+  ) => {
+    const patternsFile = join(pDir, "sensitive-patterns.txt");
+    const externalLink = join(tempBase, "external-sensitive-patterns.txt");
+    const original = "PAT_A\n";
+    writeFileSync(patternsFile, original, { mode: 0o600 });
+    chmodSync(patternsFile, 0o600);
+    linkSync(patternsFile, externalLink);
+
+    await expect(handleSensitive([...command], cwd, configPath))
+      .rejects.toThrow("file has multiple hard links");
+    expect(readFileSync(patternsFile, "utf8")).toBe(original);
+    expect(readFileSync(externalLink, "utf8")).toBe(original);
+    expect(statSync(patternsFile).nlink).toBe(2);
+  });
+
+  it.runIf(typeof process.getuid === "function")(
+    "list: supplies current-owner authentication and refuses a mismatched leaf owner",
+    async () => {
+      const patternsFile = join(pDir, "sensitive-patterns.txt");
+      writeFileSync(patternsFile, "OWNER_SECRET\n", { mode: 0o600 });
+      const securityFiles = await import("../src/security-files.js");
+      const originalRead = securityFiles.readBoundedRegularFile;
+      const readSpy = vi.spyOn(securityFiles, "readBoundedRegularFile");
+      readSpy.mockImplementation((path, options) => {
+        if (path !== patternsFile) return originalRead(path, options);
+        expect(options.expectedUid).toBe(process.getuid?.());
+        expect(options.requireSingleLink).toBe(true);
+        return originalRead(path, {
+          ...options,
+          expectedUid: process.getuid!() + 1,
+        });
+      });
+      try {
+        await expect(handleSensitive(["list"], cwd, configPath))
+          .rejects.toThrow("file owner is not trusted");
+      } finally {
+        readSpy.mockRestore();
+      }
+    },
+  );
+
+  it("list: still refuses hard links when the platform exposes no effective UID", async () => {
+    const patternsFile = join(pDir, "sensitive-patterns.txt");
+    const externalLink = join(tempBase, "uidless-sensitive-patterns.txt");
+    writeFileSync(patternsFile, "PAT_A\n", { mode: 0o600 });
+    linkSync(patternsFile, externalLink);
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    try {
+      Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+      await expect(handleSensitive(["list"], cwd, configPath))
+        .rejects.toThrow("file has multiple hard links");
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
+  });
+
+  it.each([
+    ["add", ["add", "PAT_B"]],
+    ["remove", ["remove", "PAT_A"]],
+  ] as const)("%s: accepts an owner-held single-link leaf without effective UID support", async (
+    _label,
+    command,
+  ) => {
+    const patternsFile = join(pDir, "sensitive-patterns.txt");
+    writeFileSync(patternsFile, "PAT_A\n", { mode: 0o600 });
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    try {
+      Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+      await expect(handleSensitive([...command], cwd, configPath))
+        .resolves.toMatchObject({ exitCode: 0 });
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
+  });
+
+  it("list: preserves the existing project pattern size limit", async () => {
+    writeFileSync(join(pDir, "sensitive-patterns.txt"), "x".repeat(1024 * 1024 + 1), { mode: 0o600 });
+    await expect(handleSensitive(["list"], cwd, configPath))
+      .rejects.toThrow("file exceeds the configured size limit");
+  });
+
   it("list: shows global user patterns from config.json", async () => {
     writeConfigFile(configPath, JSON.stringify({ security: { sensitivePatterns: ["CORP_TOKEN_.*"] } }, null, 2));
     const r = await handleSensitive(["list"], cwd, configPath);
@@ -273,6 +374,62 @@ describe("lcm sensitive", () => {
     expect(readFileSync(join(pDir, "sensitive-patterns.txt"), "utf-8")).toBe("PAT_A\nPAT_B\n");
   });
 
+  it.each([0o600, 0o644])(
+    "project commands accept an owner-held single-link %o leaf and preserve comments and blanks",
+    async (mode) => {
+      const patternsFile = join(pDir, "sensitive-patterns.txt");
+      writeFileSync(patternsFile, "# keep this comment\n\nPAT_A\n", { mode });
+      chmodSync(patternsFile, mode);
+
+      await expect(handleSensitive(["list"], cwd, configPath)).resolves.toMatchObject({
+        exitCode: 0,
+        stdout: expect.stringContaining("[user]      PAT_A"),
+      });
+      await expect(handleSensitive(["test", "PAT_A"], cwd, configPath)).resolves.toMatchObject({
+        exitCode: 0,
+        stdout: expect.stringContaining("[project]  PAT_A"),
+      });
+      await expect(handleSensitive(["add", "PAT_B"], cwd, configPath)).resolves.toMatchObject({ exitCode: 0 });
+      expect(readFileSync(patternsFile, "utf8")).toBe("# keep this comment\n\nPAT_A\nPAT_B\n");
+      await expect(handleSensitive(["remove", "PAT_A"], cwd, configPath)).resolves.toMatchObject({ exitCode: 0 });
+      expect(readFileSync(patternsFile, "utf8")).toBe("# keep this comment\n\nPAT_B\n");
+    },
+  );
+
+  it.each([
+    ["add", ["add", "PAT_B"], "PAT_A\n"],
+    ["remove", ["remove", "PAT_A"], "# keep\n\nPAT_A\nPAT_B\n"],
+  ] as const)("%s: authenticates the raw second read before mutation", async (
+    _label,
+    command,
+    original,
+  ) => {
+    const patternsFile = join(pDir, "sensitive-patterns.txt");
+    const externalLink = join(tempBase, "second-read-sensitive-patterns.txt");
+    writeFileSync(patternsFile, original, { mode: 0o600 });
+    const securityFiles = await import("../src/security-files.js");
+    const originalRead = securityFiles.readBoundedRegularFile;
+    const readSpy = vi.spyOn(securityFiles, "readBoundedRegularFile");
+    readSpy.mockImplementation((path, options) => {
+      const matchingCalls = readSpy.mock.calls.filter(([candidate]) => candidate === patternsFile).length;
+      if (path === patternsFile && matchingCalls === 2) {
+        expect(options.expectedUid).toBe(process.getuid?.());
+        expect(options.requireSingleLink).toBe(true);
+        linkSync(patternsFile, externalLink);
+      }
+      return originalRead(path, options);
+    });
+    try {
+      await expect(handleSensitive([...command], cwd, configPath))
+        .rejects.toThrow("file has multiple hard links");
+    } finally {
+      readSpy.mockRestore();
+    }
+    expect(readFileSync(patternsFile, "utf8")).toBe(original);
+    expect(readFileSync(externalLink, "utf8")).toBe(original);
+    expect(statSync(patternsFile).nlink).toBe(2);
+  });
+
   it("add --global: rethrows non-missing filesystem failures", async (): Promise<void> => {
     await expect(handleSensitive(["add", "--global", "PATTERN"], cwd, tempBase)).rejects.toThrow();
   });
@@ -334,6 +491,21 @@ describe("lcm sensitive", () => {
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("No patterns matched");
     expect(r.stdout).toContain("hello world");
+  });
+
+  it("test: uses one authenticated project snapshot for scrubbing and match reporting", async () => {
+    const patternsFile = join(pDir, "sensitive-patterns.txt");
+    writeFileSync(patternsFile, "PROJECT_[A-Z]+\n", { mode: 0o600 });
+    const securityFiles = await import("../src/security-files.js");
+    const readSpy = vi.spyOn(securityFiles, "readBoundedRegularFile");
+    try {
+      const result = await handleSensitive(["test", "PROJECT_ALPHA"], cwd, configPath);
+      expect(result.stdout).toContain("[project]  PROJECT_[A-Z]+");
+      expect(result.stdout).toContain("Redacted: [REDACTED]");
+      expect(readSpy.mock.calls.filter(([candidate]) => candidate === patternsFile)).toHaveLength(1);
+    } finally {
+      readSpy.mockRestore();
+    }
   });
 
   it("test: skips invalid global and project patterns", async (): Promise<void> => {
