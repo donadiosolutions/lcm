@@ -1641,6 +1641,11 @@ describe("worktree reconciliation", () => {
     expect(reconcileWorktrees(fixture.main, { _fts5Available: false })).toMatchObject({
       status: "completed",
     });
+    const mergedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(mergedTarget.prepare(
+      "SELECT content FROM promoted WHERE id = 'memory-source-unsupported-source'",
+    ).get()).toEqual({ content: "repaired source" });
+    mergedTarget.close();
   });
 
   it.each([true, false])(
@@ -1653,7 +1658,7 @@ describe("worktree reconciliation", () => {
       target.exec(
         `UPDATE promoted
          SET id = 'memory-target-unsupported-source',
-             content = CAST(X'6D656D6F727900736F75726365' AS TEXT),
+             content = CAST(X'6D656D6F727920736F7572636500737566666978' AS TEXT),
              source_summary_id = 'summary-target-unsupported-source',
              project_id = '${fixture.targetHash}',
              session_id = 'target-unsupported-source'`,
@@ -1665,7 +1670,7 @@ describe("worktree reconciliation", () => {
       );
       const blockedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
       expect(blockedTarget.prepare("SELECT hex(content) AS content FROM promoted").get())
-        .toEqual({ content: "6D656D6F727900736F75726365" });
+        .toEqual({ content: "6D656D6F727920736F7572636500737566666978" });
       blockedTarget.close();
       const fencedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
       expect(fencedSource.prepare(
@@ -8804,7 +8809,7 @@ describe("worktree reconciliation", () => {
     expect(ensureWorktreeProjectReconciled(main, identity).status).toBe("not-needed");
   }, 15_000);
 
-  it("re-fences source stores when target merge markers already exist", () => {
+  it("re-fences source stores without auditing a completed target merge", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
@@ -8828,6 +8833,9 @@ describe("worktree reconciliation", () => {
     target.prepare(
       "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
     ).run(sourceHash);
+    target.exec(
+      "UPDATE promoted SET content = CAST(X'6D656D6F727900746172676574' AS TEXT)",
+    );
     target.close();
     const targetEvents = join(home, ".lcm", "events", `${targetHash}.db`);
     const sourceEvents = join(home, ".lcm", "events", `${sourceHash}.db`);
@@ -8849,6 +8857,8 @@ describe("worktree reconciliation", () => {
     const merged = new DatabaseSync(targetPath, { readOnly: true });
     expect(merged.prepare("SELECT COUNT(*) AS count FROM conversations").get())
       .toEqual({ count: 1 });
+    expect(merged.prepare("SELECT hex(content) AS content FROM promoted").get())
+      .toEqual({ content: "6D656D6F727900746172676574" });
     merged.close();
   }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
 
