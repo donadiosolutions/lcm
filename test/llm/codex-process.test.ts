@@ -8,6 +8,8 @@ import { createCodexProcessSummarizer } from "../../src/llm/codex-process.js";
 import { createAbortError, isAbortError } from "../../src/daemon/cancellation.js";
 import { sanitizeError } from "../../src/daemon/safe-error.js";
 
+const SPARK_MODEL = "gpt-5.3-codex-spark";
+
 const processStartTime = vi.hoisted(() => vi.fn((pid: number) => pid === 9517 ? "controlled-birth-9517" : null));
 
 vi.mock("../../src/private-mutation-lock.js", async importOriginal => ({
@@ -1535,6 +1537,23 @@ describe("createCodexProcessSummarizer", () => {
     } as never)("text", false).catch((caught: unknown) => caught as Error);
     expect(error.message).not.toContain("Upgrade the Codex CLI");
     expect(error.message).toMatch(category === "usage" ? /usage limit/i : /authentication|sign in/i);
+  });
+
+  it.each([
+    ["model-protocol", "Codex compaction model protocol was rejected."],
+    ["upstream-request", "Codex compaction upstream request failed."],
+  ] as const)("renders a fixed public %s gateway failure through the summarizer", async (category, message) => {
+    const child = makeChild(1, "unexpected argument: UPSTREAM-CANARY");
+    const gateway = makeGateway({ upstreamFailureCategory: category });
+    const error = await createCodexProcessSummarizer({
+      ...baseDeps(child),
+      model: SPARK_MODEL,
+      _createGateway: vi.fn().mockResolvedValue(gateway),
+    } as never)("text", false).catch((caught: unknown) => caught as Error);
+    expect(error.message).toContain(message);
+    expect(error.message).not.toContain("Upgrade the Codex CLI");
+    expect(error.message).not.toContain("UPSTREAM-CANARY");
+    expect(error.message).toContain(`model ${JSON.stringify(SPARK_MODEL)}`);
   });
 
   it("preserves gateway category precedence across abort, timeout, and success", async () => {
