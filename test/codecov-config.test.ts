@@ -62,6 +62,7 @@ const expectedComponents = [
       "^src/runtime-root\\.ts$",
       "^src/scrub\\.ts$",
       "^src/secret-key\\.ts$",
+      // #1032 keeps retained-parent atomic-write outcome hardening in this owner.
       "^src/security-files\\.ts$",
       "^src/sensitive\\.ts$",
       "^src/shell-quote\\.ts$",
@@ -98,8 +99,8 @@ const expectedComponents = [
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
       // Error sanitization, including #893 adjacent-path, #903 prefixed
-      // nested-file, and #924 embedded-quote file-authority redaction, remains
-      // daemon-core-owned.
+      // nested-file, #924 embedded-quote file-authority, and #1060 adjacent
+      // nested-file scheme preservation, remains daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -218,15 +219,20 @@ const expectedComponents = [
     component_id: "unit-project-worktrees",
     name: "Unit - Projects and Worktrees",
     paths: [
+      // #1070 preserves post-commit topology diagnostics in this existing
+      // reconciliation owner.
       // #974 keeps target-parent reconciliation hardening in this
       // existing component.
       "^src/codex-project-resolution\\.ts$",
       "^src/git-project\\.ts$",
       "^src/machine-identity\\.ts$",
       "^src/portable-knowledge\\.ts$",
+      // #1049 keeps project metadata owner and single-link admission in this
+      // existing component; no taxonomy, status, or policy change.
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
       // #1044 keeps the existing owner; no taxonomy, status, or policy change.
+      // #1048 keeps target metadata leaf authentication in this owner.
       // #1069 preserves completed reconciliation evidence after retained
       // directory cleanup failures in this existing component.
       // #1059 keeps retained journal-parent publication in this existing owner.
@@ -236,7 +242,7 @@ const expectedComponents = [
   {
     component_id: "unit-diagnostics",
     name: "Unit - Diagnostics",
-    paths: ["^src/diagnose\\.ts$", "src/doctor/"],
+    paths: ["^src/diagnose\\.ts$", "^src/storage/diagnostics\\.ts$", "^src/storage/diagnostic-renderer\\.ts$", "^src/storage/diagnostic-project\\.ts$", "^src/storage/postgresql/diagnostics\\.ts$", "src/doctor/"],
   },
   {
     component_id: "integration-service-managers",
@@ -472,7 +478,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(209);
+    expect(productionFiles).toHaveLength(215);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -502,10 +508,10 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(209);
+    expect(ownershipCounts.size).toBe(215);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#964 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -523,6 +529,8 @@ describe("Codecov configuration", () => {
     // #890 keeps bounded best-effort status metadata reads route-owned.
     // #1003 keeps preliminary metadata admission daemon-core-owned.
     // #1050 keeps bounded preliminary metadata serialization there too.
+    // #1032 keeps the shared private-file writer's retained-parent checks and
+    // publication outcomes configuration-security-owned.
     // #947 keeps promote metadata-parent resource handling and fail-closed
     // topology behavior in the existing daemon-routes component.
     // #948 keeps promote metadata parent-first admission, sampled read binding,
@@ -545,6 +553,7 @@ describe("Codecov configuration", () => {
       ["src/runtime-paths.ts", "unit-configuration-security"],
       ["src/security-files.ts", "unit-configuration-security"],
       ["src/sensitive.ts", "unit-configuration-security"],
+      // #1049 keeps project metadata owner and single-link admission here.
       ["src/project-map.ts", "unit-project-worktrees"],
       // #889 keeps private import metadata publication in this owner.
       ["src/portable-knowledge.ts", "unit-project-worktrees"],
@@ -588,6 +597,7 @@ describe("Codecov configuration", () => {
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
       ["src/llm/process-utils.ts", "unit-llm-prompts"],
       // #997 keeps doctor publication retry deadlines monotonic in this owner.
+      // #619 keeps observational doctor refusal guidance in this owner.
       ["src/doctor/doctor.ts", "unit-diagnostics"],
       // #944/#950/#966 keep typed daemon-tmp diagnostics, authenticated restart
       // convergence, and bounded birth samples in the service-manager component.
@@ -605,6 +615,13 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.
       ["src/db/event-sidecars.ts", "unit-local-persistence"],
+      ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"],
+      ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"],
+      // #619 retained daemon pool observations stay diagnostics-owned.
+      ["src/storage/diagnostics.ts", "unit-diagnostics"],
+      ["src/storage/diagnostic-renderer.ts", "unit-diagnostics"],
+      ["src/storage/diagnostic-project.ts", "unit-diagnostics"],
+      ["src/storage/postgresql/diagnostics.ts", "unit-diagnostics"],
       // #992 keeps pre-initialization SQLite leaf admission and final
       // opened-identity fencing local-persistence-owned.
       ["src/db/connection.ts", "unit-local-persistence"],

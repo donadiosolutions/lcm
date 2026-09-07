@@ -37,6 +37,8 @@ component_management:
         # pre-handoff content within this configuration-security boundary.
         # #828 authenticates project-directory topology with retained
         # no-follow descriptors and borrowed publication parents.
+        # #1032 adds early retained-parent refusal, temp-leaf binding, and
+        # truthful post-rename outcomes to the shared private-file writer.
         # #1041 preserves bootstrap directory authentication errors when
         # descriptor cleanup also fails.
         - "^src/config-manager\\.ts$"
@@ -87,8 +89,8 @@ component_management:
         - "^src/daemon/proxy-manager\\.ts$"
         - "^src/daemon/remediation\\.ts$"
         # Error sanitization, including #893 adjacent-path, #903 prefixed
-        # nested-file, and #924 embedded-quote file-authority redaction, remains
-        # daemon-core-owned.
+        # nested-file, #924 embedded-quote file-authority, and #1060 adjacent
+        # nested-file scheme preservation, remains daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -234,6 +236,8 @@ component_management:
     - component_id: "unit-project-worktrees"
       name: "Unit - Projects and Worktrees"
       paths:
+        # #1070 preserves post-commit topology diagnostics in this existing
+        # reconciliation owner.
         # #974 keeps target-parent reconciliation hardening in this
         # existing component.
         # #866 export gather and project read preparation remain in this
@@ -243,9 +247,12 @@ component_management:
         - "^src/machine-identity\\.ts$"
         # #889 keeps private import metadata publication in this owner.
         - "^src/portable-knowledge\\.ts$"
+        # #1049 keeps project metadata owner and single-link admission in this
+        # existing component; no taxonomy, status, or policy change.
         - "^src/project-map\\.ts$"
         - "^src/worktree-reconciliation-fence\\.ts$"
         # #1044 keeps the existing owner; no taxonomy, status, or policy change.
+        # #1048 keeps target metadata leaf authentication in this owner.
         # #1069 preserves completed reconciliation evidence after retained
         # directory cleanup failures in this existing component.
         # #1059 keeps retained journal-parent publication in this existing owner.
@@ -254,7 +261,13 @@ component_management:
       name: "Unit - Diagnostics"
       paths:
         - "^src/diagnose\\.ts$"
+        # #619 retains authenticated daemon pool observations across probe failures.
+        - "^src/storage/diagnostics\\.ts$"
+        - "^src/storage/diagnostic-renderer\\.ts$"
+        - "^src/storage/diagnostic-project\\.ts$"
+        - "^src/storage/postgresql/diagnostics\\.ts$"
         # #997 keeps doctor publication retry deadlines monotonic in this owner.
+        # #619 keeps observational doctor refusal guidance in this owner.
         - "src/doctor/"
     - component_id: "integration-service-managers"
       name: "Integration - Service Managers and Legacy Migration"

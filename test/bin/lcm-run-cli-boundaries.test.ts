@@ -234,7 +234,8 @@ vi.mock("../../src/portable-knowledge.js", () => ({
   exportKnowledge: vi.fn(async () => state.portableResult), importKnowledge: vi.fn(async () => state.portableResult),
 }));
 vi.mock("../../src/mcp/server.js", () => ({ startMcpServer: vi.fn(async () => undefined) }));
-vi.mock("../../src/stats.js", () => ({ collectStats: vi.fn(() => ({})), printStats: vi.fn() }));
+vi.mock("../../src/stats.js", () => ({ collectStats: vi.fn(() => ({ messages: 0, summaries: 0, promotedCount: 0 })), printStats: vi.fn(), StatsUnavailableError: class extends Error {} }));
+vi.mock("../../src/storage/diagnostics.js", () => ({ backendDiagnosticFailure: () => ({ backend: "sqlite", classification: "unavailable" }) }));
 vi.mock("../../src/doctor/doctor.js", () => ({ runDoctor: vi.fn(async () => []), printResults: vi.fn() }));
 vi.mock("../../src/diagnose.js", () => ({ diagnose: vi.fn(async () => ({})), formatDiagnoseResult: vi.fn(() => "ok") }));
 vi.mock("../../src/sensitive.js", () => ({ handleSensitive: vi.fn(async () => ({ stdout: "", exitCode: 0 })) }));

@@ -580,6 +580,134 @@ describe("sanitizeError", () => {
 
   it.each([
     [
+      "https://outer.test/x?q=file://h.invalid/Users/a-file://h2.invalid/Users/b",
+      "https://outer.test/x?q=file://h.invalid<path>file://h2.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=file://one.invalid/Users/a-file://two.invalid/Users/b-file://three.invalid/Users/c",
+      "https://outer.test/x?q=file://one.invalid<path>file://two.invalid<path>file://three.invalid<path>",
+    ],
+    [
+      "https://outer.test/x#q=FiLe://one.invalid/Users/a-FILE://two.invalid/Users/b",
+      "https://outer.test/x#q=FiLe://one.invalid<path>FILE://two.invalid<path>",
+    ],
+    [
+      "https://outer.test?q=file://one.invalid/C:\\Users\\a-file://two.invalid/C:\\Users\\b",
+      "https://outer.test?q=file://one.invalid<path>file://two.invalid<path>",
+    ],
+    [
+      "https://outer.test?q=file://one.invalid\\\\server\\share\\a-file://two.invalid\\\\server\\share\\b",
+      "https://outer.test?q=file://one.invalid<path>file://two.invalid<path>",
+    ],
+    [
+      "file://outer.invalid?q=file://one.invalid/Users/a-file://two.invalid/Users/b",
+      "file://outer.invalid?q=file://one.invalid<path>file://two.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=file://[fe80::1%25eth0]/Users/a-file://[::1]/Users/b",
+      "https://outer.test/x?q=file://[fe80::1%25eth0]<path>file://[::1]<path>",
+    ],
+  ] as const)("preserves adjacent recognized file URL schemes across sanitizer passes: %#", (input, expected) => {
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+    expect(sanitizeError(sanitizeError(firstPass))).toBe(expected);
+  });
+
+  it.each([
+    [
+      "https://outer.test/x?q=file://one.invalid//file://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid//file://two.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=file://one.invalid/file://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid/file://two.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=file://one.invalid/-file://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>file://two.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=file:///file://two.invalid/Users/b",
+      "https://outer.test/x?q=file:///file://two.invalid<path>",
+    ],
+  ] as const)("preserves root-only spans before adjacent recognized file URL schemes: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each(["-", "1", "(", "[", ".", "_", "@", "+", "~", "%", "$", "*"] as const)(
+    "absorbs recognized file URL glue into the preceding redacted path: %s",
+    (glue) => {
+      const input = `https://outer.test/x?q=file://one.invalid/Users/a${glue}file://two.invalid/Users/b`;
+      const expected = "https://outer.test/x?q=file://one.invalid<path>file://two.invalid<path>";
+      const result = sanitizeError(input);
+
+      expect(result).toBe(expected);
+      expect(sanitizeError(result)).toBe(result);
+    },
+  );
+
+  it.each([
+    [
+      "https://outer.test/x?q='file://one.invalid/Users/a-file://two.invalid/Users/b'",
+      "https://outer.test/x?q='file://one.invalid<path>'",
+    ],
+    [
+      'https://outer.test/x?q="file://one.invalid/Users/a-file://two.invalid/Users/b"',
+      'https://outer.test/x?q="file://one.invalid<path>"',
+    ],
+    [
+      "https://outer.test/x?q='file://one.invalid/Users/a-file://two.invalid/Users/b",
+      "https://outer.test/x?q='file://one.invalid<path>",
+    ],
+  ] as const)("retains quoted scanning across adjacent file URL markers: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  // Bug #1117 owns top-level and unrecognized-prefix convergence. These rows
+  // pin their baseline first-pass output without widening Bug #1060.
+  it.each([
+    [
+      "file://one.invalid/Users/a-file://two.invalid/Users/b",
+      "file://one.invalid<path>://two.invalid/Users/b",
+    ],
+    [
+      "https://outer.test/x?q=file://one.invalid/Users/afile://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
+    ],
+    [
+      "https://outer.test/x?q=file://one.invalid/Users/aprofile://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
+    ],
+    [
+      "https://outer.test/x?q=file://one.invalid/Users/ahttps://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
+    ],
+    [
+      "https://outer.test/x?q=file://one.invalid/Users/a-profile://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
+    ],
+    [
+      "https://outer.test/x?q=file://one.invalid/Users/a-https://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
+    ],
+    [
+      "https://outer.test/x?q=file://one.invalid/Users/afile://two.invalid\\Users\\b",
+      "https://outer.test/x?q=file://one.invalid<path>://two.invalid\\Users\\b",
+    ],
+  ] as const)("preserves adjacent unrecognized scheme residuals: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
+  });
+
+  it.each([
+    [
       "file://host.invalid?x=https://example.test/p",
       "file://host.invalid?x=https://example.test/p",
     ],
@@ -1017,6 +1145,37 @@ describe("sanitizeError", () => {
 
     expect(result).toBe(`request failed for file://${authority}<path>`);
     expect(result).not.toContain("segment-0");
+    expect(whitespaceChecks).toBeLessThanOrEqual(Array.from(input).length);
+  });
+
+  it("bounds adjacent recognized file URL classification work by input length", () => {
+    const prefix = "request failed for https://outer.test/x?q=";
+    const tokens = Array.from(
+      { length: 256 },
+      (_, index) => `file://host-${index}.invalid/Users/canary/private-${index}.db`,
+    );
+    const input = `${prefix}${tokens.join("-")}`;
+    const expected = `${prefix}${tokens
+      .map((_, index) => `file://host-${index}.invalid<path>`)
+      .join("")}`;
+    const originalTest = RegExp.prototype.test;
+    let whitespaceChecks = 0;
+    const testSpy = vi.spyOn(RegExp.prototype, "test").mockImplementation(function (value: string): boolean {
+      if (this.source === "\\s" && this.flags === "u") whitespaceChecks += 1;
+      return Reflect.apply(originalTest, this, [value]);
+    });
+
+    let result: string;
+    try {
+      result = sanitizeError(input);
+    } finally {
+      testSpy.mockRestore();
+    }
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+    expect(result.match(/file:\/\//gu)).toHaveLength(tokens.length);
+    expect(result.match(/<path>/gu)).toHaveLength(tokens.length);
     expect(whitespaceChecks).toBeLessThanOrEqual(Array.from(input).length);
   });
 

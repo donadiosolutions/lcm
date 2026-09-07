@@ -49,11 +49,20 @@ With the default SQLite backend, all storage is on your machine:
   closed. Promotion database work and a metadata update completed before a
   post-publication failure are not rolled back. The guarantee begins when the
   metadata phase acquires this chain, so an independently valid private
-  hierarchy substituted before that phase can be admitted. Pathname operations
-  inside the atomic writer also leave a bounded race where a replacement can
-  receive a write before the postcondition reports failure. These checks do not
-  claim detection of every transient replacement. A missing-file race has no
-  sampled parent identity and remains outside this guarantee.
+  hierarchy substituted before that phase can be admitted. When promotion
+  retains the metadata parent, the atomic writer reasserts that parent after
+  creating its temporary file, before writing content, and again immediately
+  before rename. It also requires the temporary pathname to still identify the
+  regular file it created. Observed drift at either point refuses publication.
+  These checks are bounded observations rather than an atomic pin on the parent
+  pathname: they do not detect every transient replacement or prevent a change
+  during rename. If rename returns and the following parent check fails, the
+  error outcome is `published`; this means rename completed, not that it reached
+  the retained directory. If rename throws and the parent check also fails, the
+  outcome is `unknown`. Either outcome means bytes may have been published and
+  must not authorize automatic rollback or retry. Calls without a retained
+  parent, including a missing-file race with no sampled parent identity, remain
+  outside this guarantee.
 - **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
 - **`~/.lcm/daemon.pid`** — Daemon process ID (transient).
@@ -291,15 +300,18 @@ The `Security` section of the doctor output shows:
   character other than an ASCII letter, including query value wrappers,
   punctuation, and digits. ASCII-letter-glued names such as `profile://` and
   `xfile://` remain ordinary URL text. LCM preserves the outer URL and replaces
-  only the nested file path. This bounded rule does not decode percent-encoded
-  schemes or recognize `file://` text in an ordinary URL path. Outer-quoted
-  pathless file URLs retain their conservative file-path classification through
-  `?` and `#`, so a nested non-file URL in that quoted span may still be
-  redacted as a path. There are no configuration options for this
-  defense-in-depth behavior.
+  only the nested file path. When recognized nested `file://` literals are
+  adjacent within an outer URL query or fragment, each unquoted literal ends
+  the preceding redacted path and keeps its complete scheme for independent
+  redaction. A quoted path still consumes a nested scheme through its matching
+  closing quote. This bounded rule does not decode percent-encoded schemes or
+  recognize `file://` text in an ordinary URL path. Outer-quoted pathless file
+  URLs retain their conservative file-path classification through `?` and `#`,
+  so a nested non-file URL in that quoted span may still be redacted as a path.
+  There are no configuration options for this defense-in-depth behavior.
 - Hook project paths retain leading and trailing whitespace. Directories whose names differ only by that whitespace remain separate LCM projects.
 - Hook errors are attached to a project sidecar only when the reported working directory is an existing directory. Invalid paths are recorded in the bounded fallback log without creating project metadata.
-- `lcm stats` and verbose `lcm doctor` remove terminal control sequences and line breaks from persisted text before displaying it. SQLite content is not modified by display sanitization.
+- Stats, status, pool diagnostics, and doctor use an allowlisted backend snapshot. They omit recalled-text previews (`topRecalled`), memory and transcript payloads, raw errors, SQL values, URLs, role names, CA paths, and arbitrary local paths. Verbose diagnostics retain the same boundary. Only observed numeric aggregates, safe identifiers, classified states, and fixed guidance are exposed. SQLite content is not modified; necessary WAL/SHM read coordination may occur. See [observational diagnostics](cli.md#observational-diagnostics).
 - Sidecar scans return a single aggregate truncation record when their time or database limit is reached, so diagnostic responses remain bounded even if the events directory contains many files.
 
 ## Summary

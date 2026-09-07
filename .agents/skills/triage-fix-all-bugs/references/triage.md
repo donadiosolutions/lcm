@@ -173,7 +173,7 @@ The root Epic should also track aggregate counters for this run.
 
 For every Bug in S0 that is not already in the terminal state `delegated-existing-parent`, spawn one independent:
 
-**Luna, high reasoning, priority service tier**
+**`TRIAGE_MODEL` with `TRIAGE_REASONING` and best-effort `TRIAGE_TIER`**
 
 triage worker.
 
@@ -272,7 +272,7 @@ After all individual triage workers have completed, but before releasing the tri
 
 If any exist, spawn one dedicated:
 
-**Luna, high reasoning, priority service tier**
+**`TRIAGE_MODEL` with `TRIAGE_REASONING` and best-effort `TRIAGE_TIER`**
 
 duplicate-adjudication worker.
 
