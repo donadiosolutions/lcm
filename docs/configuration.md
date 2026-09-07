@@ -629,6 +629,15 @@ same publication workflow, then restart the daemon. Never leave identity
 commands configured with migration-owner credentials. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for
 the exact extension, role, ownership, ACL, backup, and recovery contracts.
 
+Daemon startup and `lcm postgres migrate` verify the SQL migration files shipped
+with the installed package. For the npm CLI, these files are under
+`dist/src/storage/postgresql/migrations/*.sql` inside the installed LCM package.
+If a file is missing or its SHA-256 checksum differs from the release manifest,
+startup or migration fails. Reinstall the complete package from a trusted release
+artifact; do not edit the SQL files or copy files from a source checkout into the
+installation. Source files cannot replace missing packaged migrations. A selected
+PostgreSQL backend never falls back to SQLite after an asset verification failure.
+
 The URL must use the `postgresql:` scheme. Do not add `ssl`, `sslmode`,
 `sslcert`, `sslkey`, `sslrootcert`, or other `ssl*` query parameters; LCM owns
 TLS configuration and uses the required CA file for certificate verification.
@@ -747,15 +756,32 @@ PID. It does not inspect project databases or expose installation paths.
 Supplying a valid daemon bearer token returns the full storage-backed health
 diagnostic; supplying an invalid credential returns `401`. Embedded and test
 callers that intentionally create a daemon without a token retain the full
-health response. `lcm doctor` treats public health as liveness only and uses the
-authenticated health result from an already-running managed daemon to decide
-whether passive-learning queues can drain. Doctor never starts one.
-Authenticated healthy storage is ready, authenticated unhealthy storage is
-unavailable, and a missing or unreadable managed-daemon token leaves
-readiness unverified. In that unverified state, doctor warns that access to the
-daemon token and authenticated diagnostics must be restored before it can
-promise that queued events will drain. Embedded and test-only tokenless servers
-do not relax this production doctor authentication requirement.
+health response.
+
+Diagnostic commands `lcm doctor`, `lcm status`, and `lcm stats --pool` instead use
+internal `GET /health/observe`. It requires the daemon bearer token, including
+refusing tokenless embedded servers with `401`, and remains subject to the
+normal configuration, publication, and shutdown admission checks. Its HTTP 200
+JSON has `status: "ok"`, `observation: "identity-only"`, and
+`storage: { "status": "unverified" }`, with version, selected backend, uptime,
+PID, entrypoint, daemon generation, and the actual runtime digest when available.
+An owner identifier is included when configured. No storage readiness or backend
+error result is included: observation never calls storage health or opens project
+storage. This endpoint is an internal diagnostic mechanism with no third-party
+compatibility promise.
+
+Doctor requires this explicit response and exact installed runtime identity;
+missing credentials, incompatible responses, or identity mismatches fail the
+daemon check without starting or repairing a daemon. A verified daemon check
+means identity was verified and active storage readiness was not probed. Doctor's
+separate backend diagnostic snapshot retains its healthy/degraded/unavailable
+classification for observed inventory, schema, and read availability. A staged
+or unavailable PostgreSQL backend can still expose process identity; unavailable
+backend reads fail the independent backend check. If reads succeed but write
+readiness would fail, doctor may report a healthy read snapshot while active
+storage readiness stays explicitly unverified. Pending queues therefore warn
+that queue draining is unverified. Authenticated active `GET /health` continues
+to probe storage readiness for lifecycle callers.
 
 Before sending the bearer token or admitting a daemon for ordinary use,
 lifecycle checks require the public `/health` PID and installed version, a
@@ -789,7 +815,7 @@ ports and performs no network I/O.
 Use `lcm daemon restart` after configuration changes. It validates the complete
 effective configuration before asking the host service manager to replace the
 managed process, then waits for authenticated health. `lcm doctor` is the
-canonical diagnostic command; it checks daemon health, service-manager
+canonical diagnostic command; it checks daemon identity, backend read diagnostics, service-manager
 availability, hooks, connector registration, MCP setup, and summarizer
 readiness. Do not start a second daemon to work around a health failure.
 
@@ -1040,6 +1066,11 @@ prompts, credentials, and provider response details are omitted. Codex usage
 and authentication failures observed as upstream 429 and 401 responses from
 LCM's loopback Responses gateway use the same safe categories without exposing
 provider detail.
+After an accepted upstream HTTP 200 response, missing bodies, invalid media
+types, malformed or incomplete SSE, reader failures, and premature EOF use a
+separate upstream stream category. Retry later or choose another available
+model when this category is reported; client disconnects and gateway shutdown
+remain cancellation outcomes.
 
 The intersection applies only to `llm.reasoningEffort` stored with
 `llm.provider: "auto"`, because that value must work for either process provider.
@@ -1187,8 +1218,11 @@ This behavior has no configuration option.
 Upstream authentication and usage failures retain their safe categories. The
 gateway also distinguishes a confirmed Spark protocol rejection from a generic
 upstream request failure, so neither is mislabeled as advice to upgrade Codex.
-Error bodies and provider diagnostics are never shown. Retry later or select a
-different available model when either safe upstream failure is reported.
+Failures after an accepted HTTP 200 response are reported as an upstream stream
+failure, including a missing body, wrong media type, malformed or incomplete
+SSE, reader failure, or clean EOF before completion. Error bodies and provider
+diagnostics are never shown. Retry later or select a different available model
+when any safe upstream failure is reported.
 
 ```json
 {
@@ -1375,6 +1409,11 @@ LCM identifies stale candidates by combining age with recall feedback signals:
 - **Restore age limit** (`restoration.restoreMaxPromotedAgeDays`, default 180): the restore route suppresses promoted memories older than this.
 - **Stale penalty** (`restoration.stalePenalty`, default 0.5): score penalty applied to stale candidates during prompt-time ranking.
 - **Strong match override** (`restoration.allowStaleOnStrongMatch`, default true): when enabled, stale memories can still surface if their relevance score is high enough despite the penalty.
+
+For these promoted-memory `created_at` comparisons, SQLite timestamps written as
+`YYYY-MM-DD HH:MM:SS` are interpreted as UTC. This keeps prompt ranking,
+staleness, restore filtering, and passive-insight filtering stable across host
+timezones; timestamps with an explicit offset keep that offset.
 
 ### Inspecting stale candidates
 

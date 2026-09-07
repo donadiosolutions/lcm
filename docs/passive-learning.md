@@ -8,6 +8,12 @@ explicit durable rationale: agents should still call `lcm_store` immediately
 when they recognize a durable decision, preference, root cause, pattern,
 gotcha, solution, or reusable workflow.
 
+Promoted-memory `created_at` values in SQLite's space-separated form are
+interpreted as UTC for prompt-search ranking, stale-memory evaluation, restored
+project knowledge, and passive insights. This keeps those decisions consistent
+when the host is configured for a non-UTC timezone; timestamps with explicit
+offsets retain their stated offset.
+
 ## How It Works
 
 ### Event Capture
@@ -162,6 +168,14 @@ When the daemon processes queued events, it applies three promotion tiers:
 **Tier 2 — Batch promotion** (priority 2): Git and environment events are promoted with moderate confidence (0.3).
 
 **Tier 3 — Pattern reinforcement** (priority 3): File access and tool usage events start as low-confidence signals. A one-off event is skipped unless it matches an existing entry in the promoted store. To bootstrap a new promotion without a seed, the same pattern must appear at least three times across at least two distinct sessions in recent sidecar history. Within one batch, successful reinforcement lookups are reused. A transient lookup failure leaves only that event unprocessed and retryable; a later sibling with the same pattern performs an independent retry. The reinforcement boost only applies on the insert path for a new memory, not when re-confirming an already-promoted entry.
+
+With PostgreSQL selected, passive promotion searches the current owner's promoted
+knowledge across its provenance values. This lets an event converge with a
+memory recorded through a local path hash, a remote project UUID, or the manual
+`/store` route while keeping the new row's remote UUID provenance unchanged.
+The PostgreSQL project predicate still excludes memories belonging to another
+owner. SQLite keeps its existing source-project filter, so its promotion scope
+is unchanged.
 
 ### Error→Fix Correlation
 
@@ -336,13 +350,19 @@ file. The doctor headline reports that total. Verbose output still emits one
 representative skipped row without repeating the count, so diagnostics remain
 bounded.
 
-Low nonzero backlog is reported as passing when both the daemon and its storage
-backend are healthy, because the daemon processes queued events automatically.
-If the daemon process is reachable while PostgreSQL storage is unavailable,
-`lcm doctor` warns that the queue cannot drain until storage recovers. When the
-daemon and storage are healthy but 200 or more queued events remain across
-project sidecars, `lcm doctor` warns and suggests `lcm events promote --all`
-instead of asking you to restart the daemon.
+A nonzero backlog, including fewer than 200 queued events, produces a warning:
+active storage readiness was not probed, so queue draining is unverified.
+Doctor verifies daemon identity separately from its backend read diagnostic
+snapshot. A healthy read snapshot does not prove active storage readiness or
+that queued events will drain.
+
+With verified daemon identity and 200 or more queued events across project
+sidecars, doctor preserves the backlog counts and suggests `lcm events promote
+--all` for metadata-backed sidecars. If some sidecars lack project metadata,
+it identifies those orphans and explains that they need metadata repair or
+pruning. If all pending sidecars are orphaned, the command can only report
+them; doctor suggests removing stale orphan sidecars or triggering new activity
+after `lcm install`. Queue draining remains unverified in each case.
 
 Doctor and stats scan sidecars observationally with orphan pruning disabled.
 Existing orphan sidecars, including their unprocessed events, delivery

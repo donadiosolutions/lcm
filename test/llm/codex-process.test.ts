@@ -755,6 +755,7 @@ describe("createCodexProcessSummarizer", () => {
   it("rejects an exit-0 child when the gateway stream is incomplete", async () => {
     const child = makeChild(0);
     const gateway = makeGateway({
+      upstreamFailureCategory: "upstream-stream",
       requestCompleted: false,
       waitForCompletion: vi.fn().mockRejectedValue(new Error("codex responses gateway did not complete")),
     });
@@ -1542,6 +1543,7 @@ describe("createCodexProcessSummarizer", () => {
   it.each([
     ["model-protocol", "Codex compaction model protocol was rejected."],
     ["upstream-request", "Codex compaction upstream request failed."],
+    ["upstream-stream", "Codex compaction upstream stream failed."],
   ] as const)("renders a fixed public %s gateway failure through the summarizer", async (category, message) => {
     const child = makeChild(1, "unexpected argument: UPSTREAM-CANARY");
     const gateway = makeGateway({ upstreamFailureCategory: category });

@@ -908,11 +908,14 @@ async function promoteEventsBatch(
             // enough repeated passive evidence to bootstrap a new memory.
             confidence = eventConf.pattern ?? 0.2;
             if (!reinforced) {
+              const candidateSourceProjectId = project.backend === "postgresql"
+                ? undefined
+                : project.projectId;
               const existing = await project.lexicalSearch.searchPromoted(
                 scrubbedData,
                 1,
                 undefined,
-                project.projectId,
+                candidateSourceProjectId,
               );
               if (existing.length === 0) {
                 processedIds.push(event.event_id);
@@ -944,6 +947,8 @@ async function promoteEventsBatch(
               ...(reinforced ? ["signal:reinforced"] : []),
             ],
             sourceProjectId: project.projectId,
+            candidateScope: "owner",
+            backend: project.backend,
             sessionId: event.session_id,
             depth: 0,
             confidence,

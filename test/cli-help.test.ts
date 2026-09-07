@@ -125,6 +125,9 @@ describe("printHelp — per-command detail", () => {
     const text = out.mock.calls.map(c => c[0]).join("");
     expect(text).toContain("IRREVERSIBLY");
     expect(text).toContain("--global");
+    expect(text).toContain("regular, current-user-owned, single-link file");
+    expect(text).toContain("preserves any external hard link");
+    expect(text).toContain("without an effective user ID, only the owner check is skipped");
   });
 
   it("routes unknown command to stderr + full help, not silent fallthrough", () => {

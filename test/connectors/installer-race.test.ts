@@ -344,6 +344,8 @@ describe("Claude connector removal races", () => {
     const configPath = join(tempHome, "config.json");
     const initial = installConnector("cursor", "mcp", tempHome, { configPath, persistTransport: false });
     const skillPath = initial.paths!.find((path) => path.endsWith("SKILL.md"))!;
+    chmodSync(skillPath, 0o644);
+    expect(statSync(skillPath).mode & 0o777).toBe(0o644);
     expect(() => installConnector("cursor", "cli", tempHome, {
       configPath, persistTransport: false,
       onPhase: (phase) => { if (phase === "snapshot") chmodSync(skillPath, 0o600); },

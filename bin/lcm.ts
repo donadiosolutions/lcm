@@ -2084,7 +2084,9 @@ async function createDaemonReadClientOrExit(
     if (typeof token === "string" && token.length > 0) {
       const port = first.config.daemon.port;
       const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
-      const health = await client.health(options.diagnosticOnly ? { timeoutMs: 2000 } : undefined);
+      const health = options.diagnosticOnly
+        ? await client.observe({ timeoutMs: 2000 })
+        : await client.health();
       if (
         (health?.status === "ok" || health?.status === "healthy")
         && typeof PKG_VERSION === "string"
@@ -2113,8 +2115,8 @@ async function createDaemonReadClientOrExit(
       }
     }
   } catch {
-    // Any snapshot, token, health, or witness failure falls back to the
-    // existing authenticated migration and lifecycle path below.
+    // Diagnostics refuse any snapshot, token, observation, or witness failure.
+    // Other callers retain the authenticated migration and lifecycle fallback.
   }
 
   if (options.diagnosticOnly) throw new Error("Daemon identity could not be verified; run lcm daemon status.");
@@ -2966,7 +2968,7 @@ export async function runCli(
       };
       try {
         const { client, health, config } = await createDaemonReadClientOrExit(preflightSeams, { diagnosticOnly: true });
-        // Diagnostic-only admission returns only after authenticated health and
+        // Diagnostic-only admission returns only after authenticated observation and
         // runtime identity match. A later backend refusal cannot erase that fact.
         observedDaemon = { status: "up", version: health!.version, uptime: health!.uptime, port: config.daemon.port };
         statusData = await client.post("/status", { cwd: process.cwd() }, { timeoutMs: 2000 });

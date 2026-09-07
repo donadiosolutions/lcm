@@ -14,6 +14,7 @@ const state = vi.hoisted(() => ({
   post: vi.fn(async () => ({ processed: 1, promoted: 1 })),
   get: vi.fn(async () => ({ totalConnections: 1, activeConnections: 0, idleConnections: 1, connections: [] })),
   health: vi.fn(async () => true),
+  observe: vi.fn(async () => null),
   startInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null })),
   heartbeatInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null })),
   cancelInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "cancelled", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null })),
@@ -218,6 +219,7 @@ vi.mock("../../src/daemon/client.js", () => ({ DaemonClient: class {
   post = state.post;
   get = state.get;
   health = state.health;
+  observe = state.observe;
   startInvocation = state.startInvocation;
   heartbeatInvocation = state.heartbeatInvocation;
   cancelInvocation = state.cancelInvocation;
@@ -390,6 +392,7 @@ beforeEach(() => {
   state.importPatch = { lastResult: { ok: true } };
   state.rendererOptions = undefined;
   state.health.mockResolvedValue(true);
+  state.observe.mockReset().mockResolvedValue(null);
   state.startInvocation.mockClear();
   state.heartbeatInvocation.mockClear();
   state.cancelInvocation.mockClear();
@@ -1141,7 +1144,7 @@ describe("runCli lifecycle and connector boundaries", () => {
     state.post.mockResolvedValueOnce({ processed: 1, promoted: 1 });
     await expect(actions.get("lcm/compact")!({ promote: true })).resolves.toBeUndefined();
 
-    state.health.mockResolvedValueOnce(false);
+    state.observe.mockResolvedValueOnce(null);
     await expect(actions.get("lcm/status")!({ json: true })).resolves.toBeUndefined();
     await expect(actions.get("lcm/doctor")!({ eventsMaxDbs: undefined })).rejects.toThrow("exit:0");
     await expect(actions.get("connectors/list")!({ format: undefined })).resolves.toBeUndefined();
