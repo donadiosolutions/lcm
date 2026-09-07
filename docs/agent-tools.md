@@ -111,7 +111,10 @@ Message timestamps stored by the local SQLite backend without a timezone
 designator (for example, `YYYY-MM-DD HH:mm:ss`) are UTC instants and are
 converted to the same UTC representation on reads. Fractional seconds are
 preserved to JavaScript `Date` millisecond precision; already-qualified `Z` or
-numeric-offset timestamps retain their represented instant.
+numeric-offset timestamps retain their represented instant. The same rule
+applies to conversation `createdAt`, `updatedAt`, and `bootstrappedAt` values,
+to promoted-memory `daysSinceCreated` calculations, and to summary metadata
+written during migration (`earliest_at` and `latest_at`).
 
 A successful search with no matches, including an unknown `sessionId`, returns
 `{ "messages": [], "summaries": [], "totalMatches": 0 }`. If `cwd` is

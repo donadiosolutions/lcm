@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
 import { validateRegex } from "./regex-safety.js";
+import { parseStoredTimestamp } from "../db/stored-timestamp.js";
 
 export type ConversationId = number;
 export type MessageId = number;
@@ -274,24 +275,14 @@ export function getConversationStoreAtomicCore(
 
 // ── Row mappers ───────────────────────────────────────────────────────────────
 
-function parseStoredTimestamp(value: string): Date {
-  // SQLite's CURRENT_TIMESTAMP is UTC but omits a timezone designator. Parse
-  // that storage form explicitly as UTC so local DST gaps cannot normalize it
-  // to a different wall-clock value. Preserve already-qualified ISO inputs.
-  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(value)
-    ? `${value.replace(" ", "T")}Z`
-    : value;
-  return new Date(normalized);
-}
-
 function toConversationRecord(row: ConversationRow): ConversationRecord {
   return {
     conversationId: row.conversation_id,
     sessionId: row.session_id,
     title: row.title,
-    bootstrappedAt: row.bootstrapped_at ? new Date(row.bootstrapped_at) : null,
-    createdAt: new Date(row.created_at),
-    updatedAt: new Date(row.updated_at),
+    bootstrappedAt: row.bootstrapped_at ? parseStoredTimestamp(row.bootstrapped_at) : null,
+    createdAt: parseStoredTimestamp(row.created_at),
+    updatedAt: parseStoredTimestamp(row.updated_at),
   };
 }
 
