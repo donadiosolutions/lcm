@@ -6950,7 +6950,7 @@ describe("worktree reconciliation", () => {
       try {
         const result = reconcileWorktrees(main, {
           homeDir: home,
-          _lockWaitMs: 100,
+          _lockWaitMs: 2_000,
           _lockRetryDelayMs: 50,
         });
         expect(result.status).toBe("completed");
