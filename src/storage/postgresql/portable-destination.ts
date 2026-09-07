@@ -6,7 +6,7 @@ import type { StorageIdentityContext } from '../contracts.js';
 import {
   PORTABLE_LIMITS, PORTABLE_RECORD_DOMAIN_ORDER, canonicalJson, sha256,
   serializePortableManifest, serializePortableCheckpoint,
-  parsePortableCheckpoint, negotiatePortableManifest, createPortableRecordStream,
+  parsePortableCheckpoint, negotiatePortableManifest, createPortableRecordStream, createPortableRecord,
   type PortableBatch, type PortableCheckpoint, type PortableDomain,
   type PortableManifest, type PortableRecordStream,
 } from '../portable-record-stream.js';
@@ -124,16 +124,37 @@ async function readIdentityFingerprint(state:DestinationState,signal?:AbortSigna
   }
   let machineAfter='';
   for(;;){
-    const result=await executor.query({text:`SELECT machine_id::text,CASE WHEN octet_length(identity_key)<=$2 THEN identity_key END AS identity_key FROM lcm.machines WHERE machine_id::text COLLATE \"C\">$1 COLLATE \"C\" ORDER BY machine_id::text COLLATE \"C\" LIMIT 1`,values:[machineAfter,PORTABLE_LIMITS.maxControlBytes]},options(state,signal));
+    const result=await executor.query({text:`SELECT machine_id::text,CASE WHEN octet_length(identity_key)<=$2 THEN identity_key END AS identity_key FROM lcm.machines WHERE (machine_id=$3::uuid OR EXISTS (SELECT 1 FROM lcm.project_aliases a WHERE a.project_id=$4::uuid AND a.machine_id=lcm.machines.machine_id)) AND machine_id::text COLLATE \"C\">$1 COLLATE \"C\" ORDER BY machine_id::text COLLATE \"C\" LIMIT 1`,values:[machineAfter,PORTABLE_LIMITS.maxControlBytes,state.input.expectedIdentity.machineId,state.input.expectedIdentity.id]},options(state,signal));
     if(!result.rows.length)break;
     const row=result.rows[0]!;if(typeof row.identity_key!=='string')fail('unsupported-capability');digest.update(canonicalJson(['machines',row]));machineAfter=String(row.machine_id);
   }
   return digest.digest('hex');
 }
+/** Source machine membership is fixed by the admitted manifest, not target rows. */
+async function assertSourceMachines(state:DestinationState,index:PortableIndex,signal?:AbortSignal,executor:PostgreSqlQueryExecutor=state.executor):Promise<void> {
+  let afterOrdinal=-1;
+  for(;;){
+    abort(signal);
+    const entry=index.entries('machines',{afterOrdinal,limit:1,maxBytes:PORTABLE_LIMITS.maxControlBytes,signal})[0];
+    if(!entry)return;
+    const identityKey=entry.order[0];
+    if(typeof identityKey!=='string')fail('destination-conflict');
+    const found=await executor.query<{machine_id:string;identity_key:string}>({
+      text:'SELECT machine_id::text,identity_key FROM lcm.machines WHERE identity_key=$1 LIMIT 2',
+      values:[identityKey],
+    },options(state,signal));
+    const machine=found.rows[0];
+    if(found.rows.length!==1 || !machine || typeof machine.machine_id!=='string' || machine.identity_key!==identityKey)fail('destination-conflict');
+    const actual=createPortableRecord({domain:'machines',ordinal:entry.ordinal,context:null,value:{identityKey:machine.identity_key,machineId:machine.machine_id}});
+    if(actual.recordSha256!==entry.recordSha256)fail('destination-conflict');
+    afterOrdinal=entry.ordinal;
+  }
+}
 async function assertIdentity(state:DestinationState,signal?:AbortSignal,executor:PostgreSqlQueryExecutor=state.executor):Promise<void> {
   abort(signal);
   if(state.closed || state.expectedIdentityBytes!==canonicalJson(state.expectedInput)) fail('destination-conflict');
   if(await readIdentityFingerprint(state,signal,executor)!==state.identityFingerprint) fail('destination-conflict');
+  if(state.index)await assertSourceMachines(state,state.index,signal,executor);
 }
 async function assertEmpty(state:DestinationState,signal?:AbortSignal):Promise<void> {
   for(const domain of PORTABLE_RECORD_DOMAIN_ORDER.slice(3)){
@@ -232,6 +253,7 @@ async function preflight(state:DestinationState,manifestInput:PortableManifest,s
     index.verifyDependencies();
     index.verifyScopesAndAcyclic();
     await assertIdentity(state,signal);
+    await assertSourceMachines(state,index,signal);
     const token=Object.freeze({manifestSha256:manifest.manifestSha256,destinationWitnessSha256:state.witness});
     preflights.set(token,{state,index,manifestBytes:Buffer.from(serializePortableManifest(manifest)).toString('base64')});
     state.index?.close();state.index=index;
@@ -343,7 +365,7 @@ async function apply(state:DestinationState,authority:PortableRecordWriter,batch
 async function verify(state:DestinationState,manifest:PortableManifest,signal?:AbortSignal):Promise<PortableDestinationVerification>{
   const saved=await progress(state,manifest.manifestSha256,signal);
   if(saved.checkpoints.length!==PORTABLE_RECORD_DOMAIN_ORDER.length||saved.checkpoints.some(checkpoint=>!checkpoint.complete))fail('verification-failed');
-  const source=await createPostgreSqlPortableSource({settings:state.input.settings,expectedOwner:state.input.expectedOwner,expectedIdentity:state.input.expectedIdentity,admission:'transfer',signal});
+  const source=await createPostgreSqlPortableSource({settings:state.input.settings,expectedOwner:state.input.expectedOwner,expectedIdentity:state.input.expectedIdentity,admission:'transfer',scratchParent:state.input.scratchParent,signal});
   let stream:PortableRecordStream|undefined;
   let primary:unknown;
   try{

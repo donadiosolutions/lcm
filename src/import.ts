@@ -19,6 +19,7 @@ import {
 import { resolveCodexSessions } from "./codex-project-resolution.js";
 import { findAllCodexTranscripts } from "./codex-transcript.js";
 import { sanitizeTerminalText } from "./terminal-sanitize.js";
+import { listCliProjects } from "./cli-storage.js";
 import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
@@ -59,9 +60,11 @@ export function cwdToProjectHash(cwd: string): string {
   return cwd.replace(/\//g, '-');
 }
 
-function buildProjectMap(lcmDir?: string): Map<string, string> {
-  const lcmProjectsDir = join(lcmDir ?? lcmHomeDir(), 'projects');
-  const map = new Map<string, string>();
+// Preserve the explicit legacy fixture-directory seam without reading ambient
+// metadata in production. Normal imports enumerate authenticated CLI bindings.
+function fixtureProjects(lcmDir: string): Array<{ id: string; canonical: string; aliases: string[] }> {
+  const lcmProjectsDir = join(lcmDir, 'projects');
+  const map: Array<{ id: string; canonical: string; aliases: string[] }> = [];
   if (!existsSync(lcmProjectsDir)) return map;
   for (const entry of readdirSync(lcmProjectsDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
@@ -70,8 +73,7 @@ function buildProjectMap(lcmDir?: string): Map<string, string> {
     try {
       const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
       if (meta.cwd) {
-        const hash = cwdToProjectHash(meta.cwd);
-        map.set(hash, meta.cwd);
+        map.push({ id: entry.name, canonical: meta.cwd, aliases: [] });
       }
     } catch {}
   }
@@ -315,12 +317,34 @@ export async function importSessions(
 
     if (options.all) {
       if (existsSync(claudeProjectsDir)) {
-        const projectMap = buildProjectMap(options._lcmDir);
+        const projects = options._lcmDir !== undefined && options._lcmDir !== lcmHomeDir()
+          ? fixtureProjects(options._lcmDir)
+          : await listCliProjects();
+        const projectMap = new Map<string, Map<string, string>>();
+        for (const project of projects) {
+          for (const path of [project.canonical, ...project.aliases]) {
+            const hash = cwdToProjectHash(path);
+            const candidates = projectMap.get(hash) ?? new Map<string, string>();
+            candidates.set(project.id, project.canonical);
+            projectMap.set(hash, candidates);
+          }
+        }
         for (const entry of readdirSync(claudeProjectsDir, { withFileTypes: true })) {
           if (!entry.isDirectory()) continue;
-          const cwd = projectMap.get(entry.name);
-          if (!cwd) continue;
-          projectDirs.push({ dir: join(claudeProjectsDir, entry.name), cwd });
+          const dir = join(claudeProjectsDir, entry.name);
+          const candidates = projectMap.get(entry.name);
+          if (candidates?.size !== 1) {
+            const count = findSessionFiles(dir).length;
+            const ambiguous = candidates !== undefined;
+            if (ambiguous) result.ambiguous! += count;
+            else result.unresolved! += count;
+            result.failed += count;
+            if (options.verbose && count > 0) {
+              console.error(`  ${count} Claude sessions ${ambiguous ? "ambiguous" : "unresolved"} (refused): ${sanitizeTerminalText(entry.name)}`);
+            }
+            continue;
+          }
+          projectDirs.push({ dir, cwd: [...candidates.values()][0] });
         }
       }
     } else {

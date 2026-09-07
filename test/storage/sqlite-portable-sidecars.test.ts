@@ -318,3 +318,53 @@ describe("sidecar TEXT NUL capability boundary", () => {
     expect([...iterateSqliteSidecarDomainRows(db, "passive-events", options)]).toEqual([row]);
   });
 });
+
+describe("sidecar fatal UTF-8 decoding and local project scope", () => {
+  it.each([
+    ["passive-events", "data"], ["passive-events", "session_id"],
+    ["session-instructions", "content"], ["session-instructions", "cwd_path"],
+    ["session-instructions", "scope_hash"],
+  ] as const)("refuses malformed bytes in %s.%s before returning a row", (domain, column) => {
+    const db = database(db => {
+      db.exec(domain === "passive-events" ? eventsSql : instructionsSql);
+      if (domain === "passive-events") event(db); else instruction(db);
+      db.exec(`PRAGMA ignore_check_constraints=ON; UPDATE ${domain === "passive-events" ? "events" : "session_instruction_cache"} SET ${column}=CAST(X'80' AS TEXT)`);
+    });
+    expect(() => [...iterateSqliteSidecarDomainRows(db, domain, options)]).toThrow(new PortableTransferError("unsupported-capability"));
+    if (column !== "scope_hash") {
+      expect(() => readSqliteSidecarDomainRow(db, domain, domain === "passive-events" ? "1" : "1".padStart(64, "0"), options))
+        .toThrow(new PortableTransferError("unsupported-capability"));
+    }
+  });
+
+  it("preserves genuine replacement characters in payload and keyset locators", () => {
+    const text = "\uFEFFvalid-�-雪";
+    const db = database(db => {
+      db.exec(eventsSql); event(db);
+      db.prepare("UPDATE events SET data=?").run(text);
+      db.exec(instructionsSql); instruction(db);
+      db.exec("PRAGMA ignore_check_constraints=ON");
+      db.prepare("UPDATE session_instruction_cache SET scope_hash=?, content=?").run(text, text);
+    });
+    expect([...iterateSqliteSidecarDomainRows(db, "passive-events", options)][0].value.data).toBe(text);
+    expect([...iterateSqliteSidecarDomainRows(db, "session-instructions", options)][0]).toMatchObject({ locator: text, value: { scopeHash: text, content: text } });
+    expect(readSqliteSidecarDomainRow(db, "session-instructions", text, options)?.value.content).toBe(text);
+  });
+
+  it("scopes shared project exports by the admitted local project ID", () => {
+    const localId = "a".repeat(64);
+    const sharedId = "11111111-1111-4111-8111-111111111111";
+    const identity = { ...options, projectIdentity: { scope: "shared" as const, projectId: sharedId }, sourceLocalProjectId: localId };
+    const db = database(db => {
+      db.exec(instructionsSql);
+      instruction(db, 1, localId);
+      instruction(db, 2, sharedId);
+      instruction(db, 3, `${localId}-suffix`);
+    });
+    const rows = [...iterateSqliteSidecarDomainRows(db, "session-instructions", identity)];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].locator).toBe("1".padStart(64, "0"));
+    expect(readSqliteSidecarDomainRow(db, "session-instructions", rows[0].locator, identity)).toEqual(rows[0]);
+    expect(readSqliteSidecarDomainRow(db, "session-instructions", "2".padStart(64, "0"), identity)).toBeUndefined();
+  });
+});

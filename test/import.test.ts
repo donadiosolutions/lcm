@@ -303,6 +303,85 @@ describe("importSessions", () => {
     expect(log).toHaveBeenCalledWith("  [dry-run] session");
   });
 
+  it("imports mapped Claude canonical and alias folders without local metadata", async () => {
+    const home = makeTmpDir();
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home);
+    const lcmDir = join(home, ".lcm");
+    mkdirSync(lcmDir, { mode: 0o700 });
+    const canonical = join(home, "canonical");
+    const alias = join(home, "alias");
+    writeFileSync(join(lcmDir, "map.json"), JSON.stringify({
+      [hashProjectPath(canonical)]: { canonical, aliases: [alias] },
+    }), { mode: 0o600 });
+    const claudeProjectsDir = makeTmpDir();
+    for (const [cwd, session] of [[canonical, "canonical-session"], [alias, "alias-session"]]) {
+      const dir = join(claudeProjectsDir, cwdToProjectHash(cwd));
+      mkdirSync(dir);
+      writeFileSync(join(dir, `${session}.jsonl`), "");
+    }
+    const ingested: unknown[] = [];
+    const client = makeMockClient(async (_path, body) => {
+      ingested.push(body);
+      return { ingested: 1, totalTokens: 2 };
+    });
+    const result = await importSessions(client, { all: true, _claudeProjectsDir: claudeProjectsDir });
+    expect(result).toMatchObject({ imported: 2, failed: 0, unresolved: 0, ambiguous: 0 });
+    expect(ingested).toEqual(expect.arrayContaining([
+      expect.objectContaining({ cwd: canonical, session_id: "canonical-session", client: "claude" }),
+      expect.objectContaining({ cwd: canonical, session_id: "alias-session", client: "claude" }),
+    ]));
+    expect(existsSync(join(lcmDir, "projects"))).toBe(false);
+  });
+
+  it("refuses an invalid authenticated map before ingesting Claude sessions", async () => {
+    const home = makeTmpDir();
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home);
+    const lcmDir = join(home, ".lcm");
+    mkdirSync(lcmDir, { mode: 0o700 });
+    writeFileSync(join(lcmDir, "map.json"), "{", { mode: 0o600 });
+    const projectsDir = makeTmpDir();
+    const dir = join(projectsDir, "unknown");
+    mkdirSync(dir);
+    writeFileSync(join(dir, "session.jsonl"), "");
+    const client = makeMockClient(async () => ({ ingested: 1, totalTokens: 1 }));
+    await expect(importSessions(client, {
+      all: true, _claudeProjectsDir: projectsDir, _lcmDir: lcmDir,
+    })).rejects.toThrow();
+    expect(client.post).not.toHaveBeenCalled();
+    expect(readFileSync(join(lcmDir, "map.json"), "utf8")).toBe("{");
+  });
+
+  it.each([false, true])("counts unmapped and colliding Claude sessions as refusals (dryRun=%s)", async dryRun => {
+    const home = makeTmpDir();
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home);
+    const lcmDir = join(home, ".lcm");
+    mkdirSync(lcmDir, { mode: 0o700 });
+    const first = join(home, "a-b");
+    const second = join(home, "a", "b");
+    writeFileSync(join(lcmDir, "map.json"), JSON.stringify({
+      [hashProjectPath(first)]: { canonical: first, aliases: [] },
+      [hashProjectPath(second)]: { canonical: second, aliases: [] },
+    }), { mode: 0o600 });
+    const claudeProjectsDir = makeTmpDir();
+    for (const folder of [cwdToProjectHash(first), "unmapped"]) {
+      const dir = join(claudeProjectsDir, folder);
+      mkdirSync(dir);
+      writeFileSync(join(dir, "session.jsonl"), "");
+    }
+    const client = makeMockClient(async () => { throw new Error("must not ingest refused inputs"); });
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const result = await importSessions(client, { all: true, dryRun, verbose: dryRun, _claudeProjectsDir: claudeProjectsDir });
+    expect(result).toMatchObject({ imported: 0, failed: 2, unresolved: 1, ambiguous: 1 });
+    expect(client.post).not.toHaveBeenCalled();
+    if (dryRun) {
+      expect(log).toHaveBeenCalledWith(expect.stringContaining("ambiguous"));
+      expect(log).toHaveBeenCalledWith(expect.stringContaining("unresolved"));
+    }
+  });
+
   it("discovers all Claude projects through valid project metadata", async () => {
     const claudeProjectsDir = makeTmpDir();
     const lcmDir = makeTmpDir();

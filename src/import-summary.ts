@@ -1,21 +1,27 @@
-import type { ImportResult } from "./import.js";
+import type { ImportProvider, ImportResult } from "./import.js";
 import { formatNumber, formatRatio } from "./stats.js";
 
-export function printCodexResolutionSummary(result: ImportResult, log: (value?: string) => void = console.log): void {
+export function printCodexResolutionSummary(
+  result: ImportResult,
+  log: (value?: string) => void = console.log,
+  provider: ImportProvider = "codex",
+): void {
+  const label = provider === "claude" ? "Claude" : provider === "all" ? "Claude and Codex" : "Codex";
+  const disposition = provider === "claude" ? "refused" : provider === "all" ? "not imported" : "skipped";
   if ((result.reconciled ?? 0) > 0) {
     log(`  ${result.reconciled} historical Codex sessions reconciled`);
   }
   if ((result.unresolved ?? 0) > 0) {
-    log(`  ${result.unresolved} Codex sessions unresolved (skipped)`);
+    log(`  ${result.unresolved} ${label} sessions unresolved (${disposition})`);
   }
   if ((result.ambiguous ?? 0) > 0) {
-    log(`  ${result.ambiguous} Codex sessions ambiguous (skipped)`);
+    log(`  ${result.ambiguous} ${label} sessions ambiguous (${disposition})`);
   }
 }
 
 export function printImportSummary(
   result: ImportResult,
-  opts: { replay?: boolean; log?: (value?: string) => void } = {},
+  opts: { replay?: boolean; log?: (value?: string) => void; provider?: ImportProvider } = {},
 ): void {
   const log = opts.log ?? console.log;
   const sessionsProcessed = result.imported + result.skippedEmpty + result.failed;
@@ -23,7 +29,7 @@ export function printImportSummary(
   log(`  ${result.imported} sessions imported (${result.totalMessages} messages${tokenSuffix})`);
   if (result.skippedEmpty > 0) log(`  ${result.skippedEmpty} skipped (empty transcript)`);
   if (result.failed > 0) log(`  ${result.failed} failed`);
-  printCodexResolutionSummary(result, log);
+  printCodexResolutionSummary(result, log, opts.provider);
 
   if (opts.replay) {
     log("  [replay] Sessions compacted sequentially with threaded context.");

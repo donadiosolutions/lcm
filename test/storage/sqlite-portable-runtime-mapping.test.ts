@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { runLcmMigrations } from "../../src/db/migration.js";
 import {
   iteratePortableRuntimeRows,
@@ -16,7 +16,7 @@ const domains: PortableDomain[] = [
   "promoted-memories", "promoted-memory-tags", "recall-surfacings", "redaction-counters", "session-ingest",
 ];
 const databases: DatabaseSync[] = [];
-afterEach(() => { for (const db of databases.splice(0)) db.close(); });
+afterEach(() => { vi.restoreAllMocks(); for (const db of databases.splice(0)) db.close(); });
 
 function database(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
@@ -169,4 +169,76 @@ it("refuses a NUL hidden in an expanded JSON tag before the driver can truncate 
   expect(evidence.value).toBe("prefix");
   expect(() => [...iteratePortableRuntimeRows(db,"promoted-memory-tags")]).toThrowError(expect.objectContaining({code:"record-unrepresentable"}));
   expect(() => readPortableRuntimeRow(db,"promoted-memory-tags",JSON.stringify(["nul-memory","0"]))).toThrowError(expect.objectContaining({code:"record-unrepresentable"}));
+});
+
+it.each([
+  ["content", "80", "promoted-memories"],
+  ["metadata", "7b2278223a2280227d", "promoted-memories"],
+  ["tags", "5b2280225d", "promoted-memory-tags"],
+  ["id", "80", "promoted-memories"],
+  ["id", "80", "promoted-memory-tags"],
+] as const)("refuses malformed UTF-8 in native %s bytes %s", (column, hex, domain) => {
+  const db = database();
+  db.prepare("INSERT INTO promoted(id,content,project_id,tags) VALUES('m','safe',?,'[\"safe\"]')").run(options.projectIdentity.projectId);
+  db.exec(`UPDATE promoted SET ${column}=CAST(X'${hex}' AS TEXT)`);
+  expect(db.prepare(`SELECT hex(CAST(${column} AS BLOB)) AS raw FROM promoted`).get()?.raw).toBe(hex.toUpperCase());
+  expect(() => [...iteratePortableRuntimeRows(db, domain, options)]).toThrowError(expect.objectContaining({code: "unsupported-capability"}));
+  if (column !== "id") {
+    expect(() => readPortableRuntimeRow(db, domain, domain === "promoted-memory-tags" ? '["m","0"]' : "m", options))
+      .toThrowError(expect.objectContaining({code: "unsupported-capability"}));
+  }
+});
+
+it("preserves genuine replacement characters and Unicode in native scalars, JSON, arrays and locators", () => {
+  const db = database();
+  const text = "\uFEFF�é水😀";
+  db.prepare("INSERT INTO promoted(id,content,metadata,tags,project_id) VALUES(?,?,?,?,?)")
+    .run(text, text, JSON.stringify({[text]: text}), JSON.stringify([text]), options.projectIdentity.projectId);
+  const memory = [...iteratePortableRuntimeRows(db, "promoted-memories", options)][0];
+  expect(memory.locator).toBe(text);
+  expect(memory.value).toMatchObject({ memoryId: text, content: text, metadata: {[text]: text} });
+  expect(readPortableRuntimeRow(db, "promoted-memories", text, options)).toEqual(memory);
+  const tag = [...iteratePortableRuntimeRows(db, "promoted-memory-tags", options)][0];
+  expect(tag).toEqual({locator: JSON.stringify([text, "0"]), value: {memoryId: text, ordinal: 0n, tag: text}});
+  expect(readPortableRuntimeRow(db, "promoted-memory-tags", tag.locator, options)).toEqual(tag);
+});
+
+it("uses the authenticated local source ID for shared project predicates and self provenance", () => {
+  const db = database();
+  const sourceLocalProjectId = "b".repeat(64);
+  const bound = {...options, sourceLocalProjectId};
+  db.prepare("INSERT INTO promoted(id,content,project_id) VALUES('self','memory',?)").run(sourceLocalProjectId);
+  db.prepare("INSERT INTO redaction_stats VALUES(?,?,?)").run(sourceLocalProjectId, "gitleaks", 7);
+  db.prepare("INSERT INTO redaction_stats VALUES(?,?,?)").run(options.projectIdentity.projectId, "global", 99);
+  expect([...iteratePortableRuntimeRows(db, "redaction-counters", bound)].map(row => row.value)).toEqual([{ category: "gitleaks", count: 7n }]);
+  expect(readPortableRuntimeRow(db, "redaction-counters", "gitleaks", bound)?.value.count).toBe(7n);
+  expect(readPortableRuntimeRow(db, "promoted-memories", "self", bound)?.value.sourceProjectId).toBeNull();
+});
+
+it("refuses malformed bytes in a JSON BLOB before returning substituted array strings", () => {
+  const db = database();
+  db.exec("INSERT INTO promoted(id,content,project_id,tags) VALUES('m','safe','project',X'5b2280225d')");
+  expect(() => [...iteratePortableRuntimeRows(db, "promoted-memory-tags")]).toThrowError(expect.objectContaining({code: "unsupported-capability"}));
+});
+
+
+it("validates each immutable parent once while point rereading actual bounded array elements", () => {
+  const db = database();
+  db.exec("INSERT INTO promoted(id,content,project_id,tags) VALUES('m','safe','project','[\"one\",\"two\",\"three\"]'),('other','safe','project','[\"other\"]')");
+  const validated = new Set<string>();
+  const arrayValidation = {
+    has: (domain: PortableDomain, parent: string) => validated.has(`${domain}:${parent}`),
+    add: (domain: PortableDomain, parent: string) => { validated.add(`${domain}:${parent}`); },
+  };
+  const readOptions = { arrayValidation };
+  const prepare = vi.spyOn(db, "prepare");
+  for (const [ordinal, tag] of ["one", "two", "three"].entries()) {
+    expect(readPortableRuntimeRow(db, "promoted-memory-tags", JSON.stringify(["m", String(ordinal)]), readOptions)?.value.tag).toBe(tag);
+  }
+  expect([...iteratePortableRuntimeRows(db, "promoted-memory-tags", readOptions)].map(row => row.value.tag)).toEqual(["one", "two", "three", "other"]);
+  // Only the two parent payloads cross the driver for validation; every point
+  // reread still fetches its actual SQL element rather than a cached record.
+  expect(prepare.mock.calls.filter(([sql]) => sql.includes('_portable_utf8_type_tags'))).toHaveLength(2);
+  expect(validated).toEqual(new Set(["promoted-memory-tags:m", "promoted-memory-tags:other"]));
+  expect(prepare.mock.calls.filter(([sql]) => sql.includes("json_each"))).toHaveLength(5);
 });

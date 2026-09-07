@@ -1,6 +1,6 @@
 import { closeSync, fstatSync, lstatSync, openSync, realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { runLcmMigrations } from "../../db/migration.js";
 import {
   PORTABLE_LIMITS, PORTABLE_RECORD_DOMAIN_ORDER, canonicalJson, canonicalSha256,
@@ -11,10 +11,11 @@ import type { PortableBatch, PortableCheckpoint, PortableDomain, PortableManifes
 import {
   PortableTransferError, normalizePortableTransferError, validatePortableTransferBatch,
 } from "../portable-transfer.js";
-import type { PortableDestinationProgress, PortablePreflight, PortableRecordWriter } from "../portable-transfer.js";
+import type { PortableDestinationProgress, PortablePreflight, PortableRecordWriter, PortableTransferErrorCode } from "../portable-transfer.js";
 import { createPortableIndex } from "../portable-index.js";
 import { initializePortableArchive, PORTABLE_ARCHIVE_DOMAINS, writePortableArchiveRecord } from "./portable-archive.js";
 import { writePortableRuntimeRecord } from "./portable-runtime-mapping.js";
+import { sqliteUtf8Projection, decodeSqliteUtf8Row } from "./portable-utf8.js";
 import { openSqlitePortableSource, sqlitePortableFileSha256, validateSqlitePortableSchema } from "./portable-source.js";
 
 export interface OpenSqlitePortableDestinationInput {
@@ -59,7 +60,7 @@ function guard(token:object,signal?:AbortSignal,database?:DatabaseSync|null):voi
     const hasLedger=checked&&state.run?ledgerExists(checked):false;
     if(checked&&state.run&&!hasLedger&&(state.manifestSha!==undefined||state.schemaVersion!==undefined))throw new PortableTransferError("destination-conflict");
     if(checked&&state.run&&hasLedger){
-      const row=checked.prepare("SELECT project_json,manifest_sha,schema_ready FROM transfer_runs WHERE generation_sha=?").get(state.run);
+      const row=controlRow(checked,"transfer_runs",["project_json","manifest_sha"],"generation_sha=?",[state.run],["schema_ready"],"destination-conflict");
       if(!row||row.project_json!==state.projectJson||(state.manifestSha!==undefined&&row.manifest_sha!==state.manifestSha)){
         state.active=false;throw new PortableTransferError("destination-conflict");
       }
@@ -73,10 +74,21 @@ function guard(token:object,signal?:AbortSignal,database?:DatabaseSync|null):voi
     }
   }catch(error){state.active=false;throw normalizePortableTransferError(error,"destination-conflict");}
 }
+/** Bound each stored control before driver materialization, parsing or comparison. */
+function controlRow(db:DatabaseSync,table:"transfer_runs"|"transfer_batches",columns:readonly string[],where:string,values:readonly SQLInputValue[],fixed:readonly string[]=[],code:PortableTransferErrorCode="checkpoint-mismatch"):Record<string,unknown>|undefined {
+  const size=(column:string)=>`_portable_control_bytes_${column}`;
+  const lengths=columns.map(column=>`length(CAST(${column} AS BLOB)) AS ${size(column)}`);
+  const bounded=columns.map(column=>`CASE WHEN length(CAST(${column} AS BLOB))<=${PORTABLE_LIMITS.maxControlBytes} THEN ${column} END AS ${column}`);
+  const row=db.prepare(`SELECT ${sqliteUtf8Projection([...columns,...fixed])},${columns.map(size).join(",")} FROM (
+    SELECT ${[...bounded,...fixed,...lengths].join(",")} FROM ${table} WHERE ${where})`).get(...values);
+  if(row===undefined)return undefined;
+  for(const column of columns)if(Number(row[size(column)])>PORTABLE_LIMITS.maxControlBytes)throw new PortableTransferError(code);
+  return decodeSqliteUtf8Row(row,[...columns,...fixed]);
+}
 function ledgerExists(db:DatabaseSync):boolean {return db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transfer_runs'").get()!==undefined;}
 function checkpoint(text:string):PortableCheckpoint {return parsePortableCheckpoint(Buffer.from(text));}
 function receipt(db:DatabaseSync,run:string,batch:PortableBatch):Record<string,unknown>|undefined {
-  return db.prepare("SELECT checkpoint_json,batch_sha FROM transfer_batches WHERE run_sha=? AND domain=? AND prior_sha=?").get(run,batch.domain,batch.priorCheckpointSha256??"");
+  return controlRow(db,"transfer_batches",["checkpoint_json","batch_sha"],"run_sha=? AND domain=? AND prior_sha=?",[run,batch.domain,batch.priorCheckpointSha256??""]);
 }
 function committedReceipt(authority:object,run:string,batch:PortableBatch):Record<string,unknown>|undefined {
   guard(authority,undefined,null);
@@ -90,14 +102,14 @@ function committedReceipt(authority:object,run:string,batch:PortableBatch):Recor
   } finally {reader.close();}
 }
 function progress(db:DatabaseSync,run:string,manifestSha:string):PortableDestinationProgress {
-  const row=db.prepare("SELECT manifest_sha,checkpoints_json,complete FROM transfer_runs WHERE generation_sha=?").get(run);
+  const row=controlRow(db,"transfer_runs",["manifest_sha","checkpoints_json"],"generation_sha=?",[run],["complete"]);
   if(!row||row.manifest_sha!==manifestSha)throw new PortableTransferError("destination-conflict");
   const entries=JSON.parse(String(row.checkpoints_json)) as string[];
   if(!Array.isArray(entries)||entries.length>22)throw new PortableTransferError("checkpoint-mismatch");
   const checkpoints=entries.map(checkpoint);
   for(const [index,value] of checkpoints.entries()){
     if(value.domain!==PORTABLE_RECORD_DOMAIN_ORDER[index]||value.manifestSha256!==manifestSha||(!value.complete&&index!==checkpoints.length-1))throw new PortableTransferError("checkpoint-mismatch");
-    const durable=db.prepare("SELECT checkpoint_json FROM transfer_batches WHERE run_sha=? AND result_sha=?").get(run,value.checkpointSha256);
+    const durable=controlRow(db,"transfer_batches",["checkpoint_json"],"run_sha=? AND result_sha=?",[run,value.checkpointSha256]);
     if(!durable||durable.checkpoint_json!==entries[index])throw new PortableTransferError("checkpoint-mismatch");
   }
   return {generationIdentitySha256:run,manifestSha256:manifestSha,checkpoints,complete:row.complete===1};
@@ -133,7 +145,7 @@ export function applyPortableBatchInTransaction(db:DatabaseSync,authority:object
   }
   const run=context.generationIdentitySha256;
   const batchSha=canonicalSha256(batch);
-  const prior=batch.priorCheckpointSha256===null?undefined:db.prepare("SELECT checkpoint_json FROM transfer_batches WHERE run_sha=? AND result_sha=?").get(run,batch.priorCheckpointSha256);
+  const prior=batch.priorCheckpointSha256===null?undefined:controlRow(db,"transfer_batches",["checkpoint_json"],"run_sha=? AND result_sha=?",[run,batch.priorCheckpointSha256]);
   if(batch.priorCheckpointSha256!==null&&!prior)throw new PortableTransferError("checkpoint-mismatch");
   const validated=validatePortableTransferBatch(batch,context.manifest,prior?checkpoint(String(prior.checkpoint_json)):undefined);
   const existing=receipt(db,run,validated);
@@ -186,7 +198,7 @@ export async function openSqlitePortableDestination(input:OpenSqlitePortableDest
     guard(token,input.signal);
     if(input.mode==="resume"){
       if(!ledgerExists(db))throw new PortableTransferError("destination-conflict");
-      const row=db.prepare("SELECT project_json FROM transfer_runs WHERE generation_sha=?").get(input.generationIdentitySha256);
+      const row=controlRow(db,"transfer_runs",["project_json"],"generation_sha=?",[input.generationIdentitySha256],[],"destination-conflict");
       if(!row||row.project_json!==canonicalJson(projectIdentity)||db.prepare("SELECT count(*) AS count FROM transfer_runs").get()!.count!==1)throw new PortableTransferError("destination-conflict");
     }
     const witness=canonicalSha256(["sqlite-exclusive-target-v1",input.generationIdentitySha256,projectIdentity,stat.dev,stat.ino]);
@@ -232,7 +244,7 @@ export async function openSqlitePortableDestination(input:OpenSqlitePortableDest
         try{
           connection.exec("BEGIN IMMEDIATE");
           if(ledgerExists(connection)){
-            const row=connection.prepare("SELECT manifest_json,project_json FROM transfer_runs WHERE generation_sha=?").get(input.generationIdentitySha256);
+            const row=controlRow(connection,"transfer_runs",["manifest_json","project_json"],"generation_sha=?",[input.generationIdentitySha256],[],"destination-conflict");
             if(!row||row.manifest_json!==Buffer.from(serializePortableManifest(normalized)).toString()||row.project_json!==canonicalJson(projectIdentity))throw new PortableTransferError("destination-conflict");
           }else{
             if(connection.prepare("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").get()!==undefined)throw new PortableTransferError("destination-conflict");

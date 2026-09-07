@@ -11,7 +11,7 @@ import * as migration from "../../src/db/migration.js";
 import { openSqlitePortableSource, sqlitePortableFileSha256 } from "../../src/storage/sqlite/portable-source.js";
 import { applyPortableBatchInTransaction, openSqlitePortableDestination } from "../../src/storage/sqlite/portable-destination.js";
 import type { OpenSqlitePortableDestinationInput } from "../../src/storage/sqlite/portable-destination.js";
-import { canonicalSha256, createPortableBatch, createPortableManifest, createPortableRecord, sha256, createPortableRecordStream, serializePortableCheckpoint, PORTABLE_RECORD_DOMAIN_ORDER } from "../../src/storage/portable-record-stream.js";
+import { canonicalSha256, createPortableBatch, createPortableManifest, createPortableRecord, sha256, createPortableRecordStream, serializePortableCheckpoint, PORTABLE_LIMITS, PORTABLE_RECORD_DOMAIN_ORDER } from "../../src/storage/portable-record-stream.js";
 import type { PortableBatch, PortableCheckpoint, PortableRecordStream } from "../../src/storage/portable-record-stream.js";
 import { runPortableTransfer } from "../../src/storage/portable-transfer.js";
 import type { PortableRecordWriter } from "../../src/storage/portable-transfer.js";
@@ -71,6 +71,81 @@ afterEach(async () => {
 });
 
 describe("SQLite canonical destination", () => {
+  it("rejects oversized valid durable control JSON before the driver materializes it", async () => {
+    const f = await fixture(); const writer = await destination(f); const manifest = await admit(f, writer);
+    const oversized=" ".repeat(PORTABLE_LIMITS.maxControlBytes+1)+"[]";
+    sql(f,db=>db.prepare("UPDATE transfer_runs SET checkpoints_json=?").run(oversized));
+    let largestReturnedControl=0;
+    const get=StatementSync.prototype.get;
+    const spy=vi.spyOn(StatementSync.prototype,"get").mockImplementation(function(this:StatementSync,...args){
+      const result=get.apply(this,args);
+      if(result&&"checkpoints_json" in result){
+        const value=result.checkpoints_json;
+        if(typeof value==="string")largestReturnedControl=Math.max(largestReturnedControl,Buffer.byteLength(value));
+        else if(value instanceof Uint8Array)largestReturnedControl=Math.max(largestReturnedControl,value.byteLength);
+      }
+      return result;
+    });
+    const outcome=await writer.readProgress(manifest.manifestSha256).then(value=>({value,error:undefined}),error=>({value:undefined,error}));
+    spy.mockRestore();
+    expect(largestReturnedControl).toBeLessThanOrEqual(PORTABLE_LIMITS.maxControlBytes);
+    expect(outcome.error).toMatchObject({code:"checkpoint-mismatch"});
+    sql(f,db=>expect(db.prepare("SELECT length(CAST(checkpoints_json AS BLOB)) AS bytes,complete FROM transfer_runs").get()).toEqual({bytes:Buffer.byteLength(oversized),complete:0}));
+  });
+  it("refuses an imported source ledger with oversized individually valid checkpoints JSON before fetching it", async () => {
+    const f=await fixture();
+    await runPortableTransfer({source:f.source,destination:await destination(f)});
+    sql(f,db=>db.prepare("UPDATE transfer_runs SET checkpoints_json=?||checkpoints_json").run(" ".repeat(PORTABLE_LIMITS.maxControlBytes+1)));
+    let largestReturnedControl=0;
+    const get=StatementSync.prototype.get;
+    const spy=vi.spyOn(StatementSync.prototype,"get").mockImplementation(function(this:StatementSync,...args){
+      const result=get.apply(this,args);
+      if(result&&"checkpoints_json" in result){
+        const value=result.checkpoints_json;
+        if(typeof value==="string")largestReturnedControl=Math.max(largestReturnedControl,Buffer.byteLength(value));
+        else if(value instanceof Uint8Array)largestReturnedControl=Math.max(largestReturnedControl,value.byteLength);
+      }
+      return result;
+    });
+    const outcome=await openSqlitePortableSource({databasePath:f.target,projectIdentity,expectedFileSha256:sqlitePortableFileSha256(f.target),capturedAt,scratchParent:f.dir}).then(value=>({value,error:undefined}),error=>({value:undefined,error}));
+    spy.mockRestore();
+    if(outcome.value)handles.push(outcome.value);
+    expect(largestReturnedControl).toBeLessThanOrEqual(PORTABLE_LIMITS.maxControlBytes);
+    expect(outcome.error).toMatchObject({code:"verification-failed"});
+  });
+
+  it.each(["manifest_json","project_json","checkpoint_json"])("bounds malformed resumed ledger control %s before comparison or parse", async field => {
+    const f=await fixture();const first=await destination(f);const manifest=await admit(f,first);
+    const batch=(await batches(f.source))[0];await first.applyBatch(batch);await first.close();
+    sql(f,db=>{
+      const table=field==="checkpoint_json"?"transfer_batches":"transfer_runs";
+      let trigger:string|undefined;
+      if(field==="checkpoint_json"){
+        trigger=String(db.prepare("SELECT sql FROM sqlite_schema WHERE name='transfer_batches_no_update'").get()!.sql);
+        db.exec("DROP TRIGGER transfer_batches_no_update");
+      }
+      db.prepare(`UPDATE ${table} SET ${field}=?||${field}`).run(" ".repeat(PORTABLE_LIMITS.maxControlBytes+1));
+      if(trigger!==undefined)db.exec(trigger);
+    });
+    let largest=0;const get=StatementSync.prototype.get;
+    const spy=vi.spyOn(StatementSync.prototype,"get").mockImplementation(function(this:StatementSync,...args){
+      const row=get.apply(this,args);const value=row?.[field];
+      if(typeof value==="string")largest=Math.max(largest,Buffer.byteLength(value));
+      else if(value instanceof Uint8Array)largest=Math.max(largest,value.byteLength);
+      return row;
+    });
+    const operation=async()=>{
+      const resumed=await destination(f,{mode:"resume"});
+      await admit(f,resumed);
+      await resumed.readProgress(manifest.manifestSha256);
+    };
+    const failure=await operation().then(()=>undefined,error=>error);
+    spy.mockRestore();
+    expect(largest).toBeLessThanOrEqual(PORTABLE_LIMITS.maxControlBytes);
+    expect(failure).toMatchObject({code:field==="checkpoint_json"?"checkpoint-mismatch":"destination-conflict"});
+    sql(f,db=>expect(db.prepare("SELECT count(*) AS count FROM transfer_batches").get()).toEqual({count:1}));
+  });
+
   it("writes runtime data and verifies all real SQL domains", async () => {
     const f = await fixture();
     const result = await runPortableTransfer({ source: f.source, destination: await destination(f) });
@@ -301,7 +376,7 @@ describe("SQLite canonical destination", () => {
     const get = StatementSync.prototype.get;
     vi.spyOn(StatementSync.prototype, "get").mockImplementation(function(this: StatementSync, ...args) {
       const row = Reflect.apply(get, this, args);
-      return row && "batch_sha" in row && "checkpoint_json" in row ? { ...row, batch_sha: "corrupt read" } : row;
+      return row && "batch_sha" in row && "checkpoint_json" in row ? { ...row, batch_sha: Buffer.from("corrupt read") } : row;
     });
     await expect(writer.applyBatch(batch)).rejects.toMatchObject({ code: "checkpoint-mismatch" });
     await expect(writer.applyBatch(batch)).rejects.toMatchObject({ code: "checkpoint-mismatch" });

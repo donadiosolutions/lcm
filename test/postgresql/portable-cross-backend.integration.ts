@@ -79,14 +79,29 @@ function expectEquivalent(actual: PortableManifest, expected: PortableManifest):
     .toEqual(expected.domains.map(({ domain, recordCount, prefixSha256 }) => ({ domain, recordCount, prefixSha256 })));
 }
 
-async function assertRuntimeMemory(repository: PromotedMemoryRepository, corpus: Corpus): Promise<void> {
+async function assertRuntimeMemory(repository: PromotedMemoryRepository, corpus: Corpus, ownProjectId: string): Promise<void> {
   for (const memory of domainValues(corpus, "promoted-memories")) {
     const tags = domainValues(corpus, "promoted-memory-tags").filter(tag => tag.memoryId === memory.memoryId).map(tag => tag.tag);
     expect(await repository.getById(memory.memoryId)).toMatchObject({
       id: memory.memoryId, content: memory.content, metadata: memory.metadata, tags,
+      projectId: memory.sourceProjectId ?? ownProjectId,
       sourceSummaryId: memory.sourceSummaryId, sessionId: memory.sessionId,
       depth: Number(memory.depth.$integer), confidence: memory.confidence,
     });
+  }
+  const memories = domainValues(corpus, "promoted-memories");
+  const activeOwn = memories.filter(memory => memory.sourceProjectId === null && memory.archivedAt === null);
+  expect(activeOwn.length).toBeGreaterThan(0);
+  expect((await repository.getAll({ sourceProjectId: ownProjectId })).map(memory => memory.id).sort())
+    .toEqual(activeOwn.map(memory => memory.memoryId).sort());
+  for (const memory of memories.filter(memory => memory.sourceProjectId !== null && memory.archivedAt === null)) {
+    const filtered = await repository.getAll({ sourceProjectId: memory.sourceProjectId! });
+    expect(filtered.map(row => row.id).sort()).toEqual(memories
+      .filter(row => row.sourceProjectId === memory.sourceProjectId && row.archivedAt === null)
+      .map(row => row.memoryId).sort());
+    expect(filtered).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: memory.memoryId, projectId: memory.sourceProjectId }),
+    ]));
   }
 }
 
@@ -99,7 +114,7 @@ async function assertSqliteReadback(path: string, identity: StorageIdentityConte
   try {
     const repositories = createSqliteRepositories(createSqliteRepositoryStores(db, { fts5Available: false }), identity.id,
       async (_domain, _operation, callback) => callback());
-    await assertRuntimeMemory(repositories.promotedMemory, corpus);
+    await assertRuntimeMemory(repositories.promotedMemory, corpus, identity.id);
     expect(await archive.getProject()).toEqual(domainValues(corpus, "project")[0]);
     expect(await archive.listMachines({ limit: 500 })).toEqual(domainValues(corpus, "machines"));
     for (const machine of domainValues(corpus, "machines")) {
@@ -132,6 +147,47 @@ async function assertSqliteReadback(path: string, identity: StorageIdentityConte
   } finally { db.close(); await source.close(); }
 }
 
+function nativeCapturePaths(path: string, capture: ReturnType<typeof seedPortableSqlite>): string[] {
+  const sidecars = capture.capturedSidecars!;
+  if ("absent" in sidecars.events || !Array.isArray(sidecars.instructions)) throw new Error("native fixture sidecars required");
+  return [path, sidecars.events.databasePath, ...sidecars.instructions.map(file => file.databasePath)];
+}
+function nativeCaptureHashes(path: string, capture: ReturnType<typeof seedPortableSqlite>): string[] {
+  return nativeCapturePaths(path, capture).map(sqlitePortableFileSha256);
+}
+function assertNativeSqliteScope(path: string, capture: ReturnType<typeof seedPortableSqlite>): void {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    expect(db.prepare("SELECT name FROM sqlite_schema WHERE name LIKE 'portable_archive_%'").all()).toEqual([]);
+    for (const table of ["redaction_stats", "session_instruction_cache", "runtime_native_transcripts", "runtime_native_transcript_messages", "runtime_native_ingest_checkpoints"]) {
+      expect(db.prepare(`SELECT project_id FROM ${table}`).all()).toEqual([{ project_id: capture.sourceLocalProjectId }]);
+    }
+    expect(db.prepare("SELECT project_id FROM promoted WHERE id=?").get(SQLITE_PORTABLE_FIXTURE.ownProjectMemoryId))
+      .toEqual({ project_id: capture.sourceLocalProjectId });
+    expect(db.prepare("SELECT project_id FROM promoted WHERE id=?").get(SQLITE_PORTABLE_FIXTURE.externalMemoryId))
+      .toEqual({ project_id: SQLITE_PORTABLE_FIXTURE.externalProjectId });
+  } finally { db.close(); }
+  const instructions = capture.capturedSidecars!.instructions;
+  if (!Array.isArray(instructions)) throw new Error("native fixture instruction sidecars required");
+  for (const file of instructions) {
+    const sidecar = new DatabaseSync(file.databasePath, { readOnly: true });
+    try {
+      expect(sidecar.prepare("SELECT project_id FROM session_instruction_cache").all()).toEqual([{ project_id: capture.sourceLocalProjectId }]);
+    } finally { sidecar.close(); }
+  }
+}
+async function assertPostgreSqlNativeCounts(database: PostgreSqlTestDatabase, projectId: string, corpus: Corpus): Promise<void> {
+  const tables = {
+    "redaction-counters": "redaction_counters", "session-instructions": "session_instructions",
+    "native-transcripts": "native_transcripts", "native-transcript-message-links": "transcript_messages",
+    "native-transcript-checkpoints": "ingest_checkpoints",
+  } as const;
+  for (const [domain, table] of Object.entries(tables)) {
+    expect((await database.migrator.query({ text: `SELECT count(*)::int AS n FROM lcm.${table} WHERE project_id=$1`, values: [projectId] }, context)).rows[0].n)
+      .toBe(corpus.get(domain as PortableDomain)!.length);
+  }
+}
+
 async function withOwnedHandles<T>(callback: (root: string, own: <H extends { close(): Promise<void> }>(handle: H) => H) => Promise<T>): Promise<T> {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "lcm-portable-cross-")));
   const handles: { close(): Promise<void> }[] = [];
@@ -151,8 +207,8 @@ async function pgDestination(database: PostgreSqlTestDatabase, expectedIdentity:
   return createPostgreSqlPortableDestination({ settings: settings(database.runtimeUrl), expectedOwner: "lcm_test_migrator", expectedIdentity,
     generationId: randomUUID(), runId: randomUUID(), scratchParent });
 }
-async function sqliteSource(path: string, expectedIdentity: StorageIdentityContext, scratchParent: string): Promise<PortableRecordStream> {
-  return createPortableRecordStream(await openSqlitePortableSource({ databasePath: path,
+async function sqliteSource(path: string, expectedIdentity: StorageIdentityContext, scratchParent: string, nativeCapture?: ReturnType<typeof seedPortableSqlite>): Promise<PortableRecordStream> {
+  return createPortableRecordStream(await openSqlitePortableSource({ ...nativeCapture, databasePath: path,
     projectIdentity: { scope: "shared", projectId: expectedIdentity.id }, expectedFileSha256: sqlitePortableFileSha256(path), capturedAt, scratchParent }));
 }
 
@@ -180,7 +236,7 @@ describe("PostgreSQL 18 and SQLite complete canonical transfer", { timeout: 120_
           expect((await runPortableTransfer({ source: intermediate, destination: remote, maxRecords: 2 })).contentSha256).toBe(expected.contentSha256);
           const readback = own(await pgSource(target, registered.expectedIdentity));
           expectEquivalent(readback.describe(), expected);
-          await assertRuntimeMemory(new PostgreSqlPromotedMemoryRepository(target.runtime, registered.expectedIdentity.id), corpus);
+          await assertRuntimeMemory(new PostgreSqlPromotedMemoryRepository(target.runtime, registered.expectedIdentity.id), corpus, registered.expectedIdentity.id);
           expect((await target.migrator.query({ text: "SELECT count(*)::int AS n FROM lcm.native_transcripts WHERE project_id=$1", values: [registered.expectedIdentity.id] }, context)).rows[0].n)
             .toBe(corpus.get("native-transcripts")!.length);
         });
@@ -194,16 +250,30 @@ describe("PostgreSQL 18 and SQLite complete canonical transfer", { timeout: 120_
       await transferGrants(target);
       await withOwnedHandles(async (root, own) => {
         const path = join(root, "independent.sqlite");
-        seedPortableSqlite(path, { projectIdentity: { scope: "shared", projectId: fixture.expectedIdentity.id }, identityFacts: await identityFacts(target, fixture.expectedIdentity) });
-        const source = own(await sqliteSource(path, fixture.expectedIdentity, root));
+        const nativeCapture = seedPortableSqlite(path, { projectIdentity: { scope: "shared", projectId: fixture.expectedIdentity.id }, identityFacts: await identityFacts(target, fixture.expectedIdentity) });
+        expect(nativeCapture.sourceLocalProjectId).toBe(SQLITE_PORTABLE_FIXTURE.sourceLocalProjectId);
+        expect(nativeCapture.sourceLocalProjectId).not.toBe(fixture.expectedIdentity.id);
+        const captureHashes = nativeCaptureHashes(path, nativeCapture);
+        assertNativeSqliteScope(path, nativeCapture);
+        const source = own(await sqliteSource(path, fixture.expectedIdentity, root, nativeCapture));
         const expected = source.describe();
         const corpus = await capture(source);
         expect(domainValues(corpus, "messages")[0].tokenCount.$integer).toBe("9007199254740995");
         expect(domainValues(corpus, "message-parts")[0]).toMatchObject({ subtaskDescription: "exact subtask description", isIgnored: false, isSynthetic: true, compactionAuto: true });
         expect(domainValues(corpus, "promoted-memories")[0].createdAt).toBe(SQLITE_PORTABLE_FIXTURE.timestamp);
+        expect(domainValues(corpus, "redaction-counters")).toHaveLength(1);
+        expect(domainValues(corpus, "session-instructions")).toHaveLength(1 + nativeCapture.identityFacts!.machines.length);
+        for (const domain of ["native-transcripts", "native-transcript-message-links", "native-transcript-checkpoints"] as const) {
+          expect(domainValues(corpus, domain)).toHaveLength(1);
+        }
+        expect(domainValues(corpus, "promoted-memories")).toEqual(expect.arrayContaining([
+          expect.objectContaining({ memoryId: SQLITE_PORTABLE_FIXTURE.ownProjectMemoryId, sourceProjectId: null }),
+          expect.objectContaining({ memoryId: SQLITE_PORTABLE_FIXTURE.externalMemoryId, sourceProjectId: SQLITE_PORTABLE_FIXTURE.externalProjectId }),
+        ]));
         const remote = own(await pgDestination(target, fixture.expectedIdentity, root));
         expect((await runPortableTransfer({ source, destination: remote, maxRecords: 2 })).contentSha256).toBe(expected.contentSha256);
-        await assertRuntimeMemory(new PostgreSqlPromotedMemoryRepository(target.runtime, fixture.expectedIdentity.id), corpus);
+        await assertRuntimeMemory(new PostgreSqlPromotedMemoryRepository(target.runtime, fixture.expectedIdentity.id), corpus, fixture.expectedIdentity.id);
+        await assertPostgreSqlNativeCounts(target, fixture.expectedIdentity.id, corpus);
         const intermediate = own(await pgSource(target, fixture.expectedIdentity));
         expectEquivalent(intermediate.describe(), expected);
         const finalPath = join(root, "returned.sqlite");
@@ -214,6 +284,8 @@ describe("PostgreSQL 18 and SQLite complete canonical transfer", { timeout: 120_
         const readback = own(await sqliteSource(finalPath, fixture.expectedIdentity, root));
         expectEquivalent(readback.describe(), expected);
         expect(await capture(readback)).toEqual(corpus);
+        assertNativeSqliteScope(path, nativeCapture);
+        expect(nativeCaptureHashes(path, nativeCapture)).toEqual(captureHashes);
       });
     });
   });

@@ -136,6 +136,20 @@ same session, the flat transcript is preferred; other similarly named files and
 subagent transcripts remain independent. Files with equal modification times
 are imported deterministically by session ID and then path.
 
+`lcm import --all` discovers Claude projects through authenticated local project
+bindings, including their aliases. This also works with a newly linked
+PostgreSQL project that has no local `meta.json` or SQLite database. It does not
+enumerate other projects hosted by the PostgreSQL server. `--provider all --all`
+uses the same Claude discovery alongside Codex discovery. A Claude folder that
+matches no known project or matches multiple projects is refused: each discovered
+session is counted as unresolved or ambiguous and as failed, so the command exits
+with status 1. `--verbose` reports the refused folders on stderr; `--dry-run`
+reports the same mapping refusals without ingesting sessions. Register or link the
+intended project before retrying an unresolved folder. Resolve conflicting local
+project paths before retrying an ambiguous folder; Claude folder encoding can
+collide when different paths contain slashes and dashes. Replay and chronological
+session ordering apply after project resolution as usual.
+
 The default Codex connector is the CLI bundle. It writes native hooks to
 `~/.codex/hooks.json`, enables Codex's current `hooks` feature in
 `~/.codex/config.toml`, and installs the LCM skill at

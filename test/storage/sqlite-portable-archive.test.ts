@@ -252,3 +252,40 @@ describe("archive TEXT NUL capability boundary", () => {
     await expect(reader.getNativeCheckpoint(fixture("native-transcript-checkpoints").value)).rejects.toMatchObject({ code: "invalid-input" });
   });
 });
+
+describe("archive fatal UTF-8 decoding", () => {
+  it.each([
+    ["machines", "identityKey", "80"],
+    ["native-transcripts", "nativePayload", "7b2274657874223a2280227d"],
+    ["machines", "_identity_sha256", "80"],
+    ["native-transcript-message-links", "_transcript_identity_sha256", "80"],
+  ] as const)("refuses malformed bytes in %s.%s", (domain, column, hex) => {
+    const db = database();
+    db.exec(`UPDATE portable_archive_${domain.replaceAll("-", "_")} SET "${column}"=CAST(X'${hex}' AS TEXT) WHERE _ordinal=0`);
+    expect(() => [...readArchiveDomain(db, domain)]).toThrow(expect.objectContaining({ code: "unsupported-capability" }));
+    if (column !== "_identity_sha256") {
+      expect(() => readArchiveDomainRow(db, domain, fixture(domain).identitySha256)).toThrow(expect.objectContaining({ code: "unsupported-capability" }));
+    }
+  });
+
+  it("refuses malformed bytes through scoped readers and preserves genuine replacement characters", async () => {
+    const db = database();
+    const transcript = fixture("native-transcripts").value;
+    const reader = createSqlitePortableArchiveReader(db, () => {});
+    db.exec("UPDATE portable_archive_native_transcripts SET sourceLocator=CAST(X'80' AS TEXT)");
+    await expect(reader.getNativeTranscript(transcript)).rejects.toMatchObject({ code: "unsupported-capability" });
+    db.prepare("UPDATE portable_archive_native_transcripts SET sourceLocator=?, nativePayload=?").run("\uFEFFvalid-�-雪", JSON.stringify({ text: "�-雪" }));
+    const value = (await reader.getNativeTranscript(transcript))!;
+    expect(value.sourceLocator).toBe("\uFEFFvalid-�-雪");
+    expect(value.nativePayload).toEqual({ text: "�-雪" });
+    expect([...readArchiveDomain(db, "native-transcripts")][0].value.nativePayload).toEqual({ text: "�-雪" });
+  });
+
+  it("bounds the internal identity before fetching raw archive bytes", () => {
+    const db = database();
+    db.prepare("UPDATE portable_archive_machines SET _identity_sha256=CAST(zeroblob(?) AS TEXT) WHERE _ordinal=0").run(128 * 1024 * 1024 + 1);
+    const prepare = vi.spyOn(db, "prepare");
+    expect(() => [...readArchiveDomain(db, "machines")]).toThrow(expect.objectContaining({ code: "record-unrepresentable" }));
+    expect(prepare.mock.calls).toHaveLength(1);
+  });
+});

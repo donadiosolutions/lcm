@@ -304,6 +304,7 @@ primitive.
   and recovery archive materialization. It consumes the production adapters
   and does not add another wire format.
 
-These boundaries are staged work. Publishing this compatibility contract does
-not claim that migration, cutover, PostgreSQL routing, CLI import/export, or
-any runtime activation is available.
+The record-stream contract does not perform snapshot capture, migration
+cutover, global writer fencing, or recovery archive activation. The production
+readers, writers and operational CLI surfaces are described in the
+[canonical transfer guide](portable-transfer.md).

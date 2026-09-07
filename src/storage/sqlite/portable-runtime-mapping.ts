@@ -7,6 +7,8 @@ import {
   type PortableRecord,
 } from "../portable-record.js";
 
+import { decodeSqliteUtf8Row, sqliteUtf8Projection } from "./portable-utf8.js";
+
 export interface SqliteRawDomainRow {
   readonly locator: string;
   readonly value: Record<string, unknown>;
@@ -19,7 +21,13 @@ export interface SqliteRawDomainRow {
 
 export interface SqliteRuntimeReadOptions {
   readonly projectIdentity?: PortableProjectIdentity;
+  readonly sourceLocalProjectId?: string;
   readonly conversationLocator?: string;
+  /** Caller-owned evidence, bound to one verified immutable database lifetime. */
+  readonly arrayValidation?: {
+    readonly has: (domain: PortableDomain, parent: string) => boolean;
+    readonly add: (domain: PortableDomain, parent: string) => void;
+  };
 }
 
 type Field = readonly [field: string, column: string, kind?: "boolean" | "timestamp" | "json" | "conversations" | "messages"];
@@ -123,7 +131,7 @@ function timestamp(value: SQLOutputValue): string {
 
 function projectId(options: SqliteRuntimeReadOptions): string {
   if (options.projectIdentity === undefined) throw new PortableStreamError("source-invalid");
-  return options.projectIdentity.projectId;
+  return options.sourceLocalProjectId ?? options.projectIdentity.projectId;
 }
 
 interface ArrayMapping { readonly table: string; readonly key: string; readonly column: string; readonly parentField: string; readonly valueField: string }
@@ -229,24 +237,35 @@ function readNative(db: DatabaseSync, domain: PortableDomain, mapping: Mapping, 
   const header = db.prepare(`SELECT ${length} AS bytes FROM ${mapping.table}${where}`).get(...values);
   if (header === undefined) return undefined;
   byteCheck(header.bytes);
-  const statement = db.prepare(`SELECT ${columns.join(",")} FROM ${mapping.table}${where}`);
+  const statement = db.prepare(`SELECT ${sqliteUtf8Projection(columns)} FROM ${mapping.table}${where}`);
   statement.setReadBigInts(true);
-  return decodeRow(domain, mapping, statement.get(...values)!, options);
+  return decodeRow(domain, mapping, decodeSqliteUtf8Row(statement.get(...values)!, columns), options);
 }
 
-function* readArray(db: DatabaseSync, domain: PortableDomain, mapping: ArrayMapping, locator?: string): Generator<SqliteRawDomainRow> {
+function* readArray(db: DatabaseSync, domain: PortableDomain, mapping: ArrayMapping, options: SqliteRuntimeReadOptions, locator?: string): Generator<SqliteRawDomainRow> {
   const keys = locator === undefined ? undefined : locatorValues(locator, 2);
   const length = `length(CAST(${mapping.column} AS BLOB))+length(CAST(${mapping.key} AS BLOB))`;
-  const parents = db.prepare(`SELECT CASE WHEN ${length}<=${PORTABLE_LIMITS.maxRecordBytes} THEN ${mapping.key} END AS parent, ${length} AS bytes FROM ${mapping.table}${keys === undefined ? "" : ` WHERE ${mapping.key}=?`}`);
-  for (const parent of parents.iterate(...(keys === undefined ? [] : [keys[0]]))) {
-    byteCheck(parent.bytes);
-    const shape = db.prepare(`SELECT json_valid(${mapping.column}) AS valid, CASE WHEN json_valid(${mapping.column}) THEN json_type(${mapping.column}) END AS kind FROM ${mapping.table} WHERE ${mapping.key}=?`).get(parent.parent)!;
-    if (shape.valid !== 1 || shape.kind !== "array") throw new PortableStreamError("source-invalid", { domain });
-    const statement = db.prepare(`SELECT j.key AS ordinal, CASE WHEN instr(j.value,char(0))=0 THEN j.value END AS value, instr(j.value,char(0)) AS nul_at, j.type AS type FROM ${mapping.table} AS p, json_each(p.${mapping.column}) AS j WHERE p.${mapping.key}=?${keys === undefined ? "" : " AND j.key=CAST(? AS INTEGER)"} ORDER BY j.key`);
+  const parents = db.prepare(`SELECT ${sqliteUtf8Projection(["parent"])}, bytes FROM (SELECT CASE WHEN ${length}<=${PORTABLE_LIMITS.maxRecordBytes} THEN ${mapping.key} END AS parent, ${length} AS bytes FROM ${mapping.table}${keys === undefined ? "" : ` WHERE ${mapping.key}=?`})`);
+  for (const rawParent of parents.iterate(...(keys === undefined ? [] : [keys[0]]))) {
+    byteCheck(rawParent.bytes);
+    const parent = decodeSqliteUtf8Row(rawParent, ["parent"]);
+    // Validate original JSON before JSON1 expansion, once per immutable parent
+    // when the source supplies its bounded validation index. Direct readers
+    // have no retained authority and validate the complete parent every time.
+    const parentLocator = String(parent.parent);
+    if (!options.arrayValidation?.has(domain, parentLocator)) {
+      const rawJson = db.prepare(`SELECT ${sqliteUtf8Projection([mapping.column])} FROM ${mapping.table} WHERE ${mapping.key}=?`).get(parent.parent)!;
+      decodeSqliteUtf8Row(rawJson, [mapping.column]);
+      const shape = db.prepare(`SELECT json_valid(${mapping.column}) AS valid, CASE WHEN json_valid(${mapping.column}) THEN json_type(${mapping.column}) END AS kind FROM ${mapping.table} WHERE ${mapping.key}=?`).get(parent.parent)!;
+      if (shape.valid !== 1 || shape.kind !== "array") throw new PortableStreamError("source-invalid", { domain });
+      options.arrayValidation?.add(domain, parentLocator);
+    }
+    const statement = db.prepare(`SELECT ${sqliteUtf8Projection(["value"])}, ordinal, nul_at, type FROM (SELECT j.key AS ordinal, CASE WHEN instr(j.value,char(0))=0 THEN j.value END AS value, instr(j.value,char(0)) AS nul_at, j.type AS type FROM ${mapping.table} AS p, json_each(p.${mapping.column}) AS j WHERE p.${mapping.key}=?${keys === undefined ? "" : " AND j.key=CAST(? AS INTEGER)"} ORDER BY j.key)`);
     statement.setReadBigInts(true);
-    for (const item of statement.iterate(...(keys === undefined ? [parent.parent] : [parent.parent, keys[1]]))) {
-      if (item.type !== "text") throw new PortableStreamError("source-invalid", { domain });
-      if (item.nul_at !== 0n) throw new PortableStreamError("record-unrepresentable", { domain });
+    for (const rawItem of statement.iterate(...(keys === undefined ? [parent.parent] : [parent.parent, keys[1]]))) {
+      if (rawItem.type !== "text") throw new PortableStreamError("source-invalid", { domain });
+      if (rawItem.nul_at !== 0n) throw new PortableStreamError("record-unrepresentable", { domain });
+      const item = decodeSqliteUtf8Row(rawItem, ["value"]);
       yield {
         locator: JSON.stringify([String(parent.parent), String(item.ordinal)]),
         value: { [mapping.parentField]: parent.parent, ordinal: item.ordinal, [mapping.valueField]: item.value },
@@ -258,17 +277,17 @@ function* readArray(db: DatabaseSync, domain: PortableDomain, mapping: ArrayMapp
 /** Native physical order only. Canonical ordering/occurrences belong to the source index. */
 export function* iteratePortableRuntimeRows(db: DatabaseSync, domain: PortableDomain, options: SqliteRuntimeReadOptions = {}): Generator<SqliteRawDomainRow> {
   const array = arrayMapping(domain);
-  if (array !== undefined) { yield* readArray(db, domain, array); return; }
+  if (array !== undefined) { yield* readArray(db, domain, array, options); return; }
   const mapping = mappingFor(domain);
   const { where, values } = queryParts(mapping, domain, options);
   const order = domain === "messages" ? "conversation_id,seq" : mapping.key.join(",");
   const bytes = nativeBytes(mapping);
   const keys = mapping.key.map(key => `CASE WHEN ${bytes}<=${PORTABLE_LIMITS.maxRecordBytes} THEN ${key} END AS ${key}`);
-  const statement = db.prepare(`SELECT ${keys.join(",")},${bytes} AS bytes FROM ${mapping.table}${where} ORDER BY ${order}`);
+  const statement = db.prepare(`SELECT ${sqliteUtf8Projection(mapping.key)}, bytes FROM (SELECT ${keys.join(",")},${bytes} AS bytes FROM ${mapping.table}${where} ORDER BY ${order})`);
   statement.setReadBigInts(true);
   for (const header of statement.iterate(...values)) {
     byteCheck(header.bytes);
-    yield readNative(db, domain, mapping, locatorFor(mapping.key, header), options)!;
+    yield readNative(db, domain, mapping, locatorFor(mapping.key, decodeSqliteUtf8Row(header, mapping.key)), options)!;
   }
 }
 
@@ -277,7 +296,7 @@ export function readPortableRuntimeRow(db: DatabaseSync, domain: PortableDomain,
   const array = arrayMapping(domain);
   if (array !== undefined) {
     // for-of closes both SQLite iterators on the early point-read return.
-    for (const row of readArray(db, domain, array, locator)) return row;
+    for (const row of readArray(db, domain, array, options, locator)) return row;
     return undefined;
   }
   return readNative(db, domain, mappingFor(domain), locator, options);

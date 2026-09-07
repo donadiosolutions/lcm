@@ -68,6 +68,7 @@ it("roundtrips every field of all 22 decoded SQL domain families through the can
     const conversationOrder = originalContext?.conversationOrder as import("../../src/storage/portable-record.js").PortableRawConversationOrder | undefined;
     const messageOrder = originalContext?.messageOrder as import("../../src/storage/portable-record.js").PortableRawMessageOrder | undefined;
     row.status = value.disposition;
+    row.payload_envelope_supported = true;
     if (draft.domain === "passive-events") for (const key of ["sessionId","sessionSequence","category","data","priority","sourceHook","createdAt"]) row[key] = String(value[key]);
     const context = {projectIdentity:{scope:"shared" as const,projectId},occurrenceOrdinal:String(value.occurrenceOrdinal ?? 0),
       conversation:{identitySha256:String(value.conversationIdentitySha256 ?? conversationId),order:conversationOrder ?? ["session",null,null,timestamp,timestamp,"0"] as const},
@@ -191,7 +192,7 @@ it("refuses missing decode evidence instead of inventing parent identities or du
   const part=buildDomainDrafts(postgresGeneration()).find(draft=>draft.domain==="message-parts")!.values[0];
   const partRow=Object.fromEntries(Object.entries(part).map(([key,value])=>[key==="subtaskDescription" ? "subtask_desc" : key.replace(/[A-Z]/g,letter=>`_${letter.toLowerCase()}`),value]));
   expect(()=>mapping.decodeCanonicalRow("message-parts",partRow,context)).toThrow();
-  expect(()=>mapping.decodeCanonicalRow("passive-events",{event_id:"a",event_version:"1",machine_sequence:"0",event_type:"x",machine_identity_key:42},context)).toThrow();
+  expect(()=>mapping.decodeCanonicalRow("passive-events",{event_id:"a",event_version:"1",machine_sequence:"0",event_type:"x",machine_identity_key:42,payload_envelope_supported:true},context)).toThrow();
   const memory=buildDomainDrafts(postgresGeneration()).find(draft=>draft.domain==="promoted-memories")!.values[0];
   const memoryRow=Object.fromEntries(Object.entries(memory).map(([key,value])=>[key.replace(/[A-Z]/g,letter=>`_${letter.toLowerCase()}`),typeof value === "object" && value !== null ? JSON.stringify(value) : value]));
   memoryRow.source_project_id=projectId;
@@ -324,4 +325,32 @@ it("sanitizes generated search rejection and preserves cancellation",async()=>{
   query.mockImplementation(async()=>{after.abort();return {rows:[{bytes:8}],rowCount:1,fields:[],command:"SELECT",oid:0};});
   await expect(mapping.assertPostgreSqlExistingConstraints(db,projectId,record,after.signal)).rejects.toMatchObject({code:"aborted"});
   for(const rows of [[],[{bytes:-1}],[{bytes:"8"}]]) await expect(mapping.assertPostgreSqlExistingConstraints(executor(rows).db,projectId,record)).rejects.toMatchObject({code:"record-unrepresentable"});
+});
+
+it("stores canonical self memory provenance as the destination project UUID and preserves external provenance",async()=>{
+  for(const [sourceProjectId,stored] of [[null,projectId],["external-project","external-project"]] as const) {
+    const record=createPortableRecord({domain:"promoted-memories",ordinal:0,context:{projectIdentity:{scope:"shared",projectId}},value:{memoryId:"550e8400-e29b-41d4-a716-446655440000",content:"own memory",metadata:{},sourceProjectId,sourceSummaryId:null,sessionId:null,depth:0,confidence:1,createdAt:timestamp,archivedAt:null}});
+    const {db,query}=executor([{locator:'["550e8400-e29b-41d4-a716-446655440000"]'}]);
+    await mapping.insertCanonicalRecord(db,projectId,record,async()=>"unused");
+    expect(query.mock.calls[0][0].text).toContain("source_project_id");
+    expect(query.mock.calls[0][0].values?.[4]).toBe(stored);
+  }
+});
+
+it("refuses unsupported passive envelope metadata without fetching unknown payload values",async()=>{
+  const context={projectIdentity:{scope:"shared" as const,projectId}};
+  const row={event_id:"01990000-0000-7000-8000-000000000010",event_version:"1",machine_sequence:"0",event_type:"context",machine_identity_key:"machine:"+"a".repeat(64),status:"applied",sessionId:"session",sessionSequence:"1",category:"context",data:'{"unknownOpaqueDataKey":"preserved"}',priority:"0",sourceHook:"fixture",createdAt:timestamp};
+  for(const unsupported of [false,undefined]) expect(()=>mapping.decodeCanonicalRow("passive-events",{...row,payload_envelope_supported:unsupported},context)).toThrow();
+  expect(mapping.decodeCanonicalRow("passive-events",{...row,payload_envelope_supported:true},context).value).toMatchObject({data:row.data,disposition:"applied"});
+  const {db,query}=executor([]);
+  await mapping.readCanonicalRow(db,projectId,"passive-events",'["1"]');
+  expect(query.mock.calls[0][0].text).toContain("jsonb_object_keys(r.payload)");
+  expect(query.mock.calls[0][0].text).toContain("AS payload_envelope_supported");
+  expect(query.mock.calls[0][0].text).not.toContain("r.payload::text");
+});
+
+it("requires native JSON types before extracting passive-event envelope text",()=>{
+  const sql=mapping.mappingForDomain("passive-events").selectColumns;
+  for(const key of ["sessionId","category","data","sourceHook","createdAt"]) expect(sql).toContain(`pg_catalog.jsonb_typeof(r.payload->'${key}') = 'string'`);
+  for(const key of ["sessionSequence","priority"]) expect(sql).toContain(`pg_catalog.jsonb_typeof(r.payload->'${key}') = 'number'`);
 });

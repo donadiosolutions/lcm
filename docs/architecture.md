@@ -71,8 +71,9 @@ update or deletion operation. Embedded backfill code receives
 `NativeTranscriptRepository` explicitly; both production project factories
 expose the repository and an exact session-message snapshot through
 `ProjectStorage.nativeTranscripts`. SQLite stores active native records in its
-project database, separately from immutable canonical recovery archives. The production PostgreSQL factory, runtime, migration
-runner, identity repository, and isolated test-database lease support the
+project database, separately from immutable canonical recovery archives. The
+production PostgreSQL factory, runtime, migration runner, identity repository,
+and isolated test-database lease support the
 daemon's selected project-storage routes. CLI/import-export and portable
 transfer remain #618-owned, while aggregate stats, status, pool diagnostics,
 and doctor parity remain #619-owned. Selecting `postgresql` never falls back to

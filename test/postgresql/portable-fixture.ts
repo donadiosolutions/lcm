@@ -56,6 +56,7 @@ export const PORTABLE_POSTGRESQL_FIXTURE = Object.freeze({
   secondaryMachineIdentityKey: `machine:${"b".repeat(64)}`,
   memoryId: "11111111-1111-4111-8111-111111111111",
   archivedMemoryId: "11111111-1111-4111-8111-111111111112",
+  ownProjectMemoryId: "11111111-1111-4111-8111-111111111113",
   partId: "22222222-2222-4222-8222-222222222222",
   nullPartId: "22222222-2222-4222-8222-222222222223",
   sessionId: "portable-session",
@@ -187,8 +188,9 @@ export async function seedPortablePostgreSql(
      depth, confidence, metadata, created_at, archived_at)
     VALUES ($1, $2, 'Portable memory', 'deleted-summary', 'deleted-project', $3,
       2, 0.75, '{"nested":[true,null,"value"]}', $4, NULL),
-      ($5, $2, 'Archived portable memory', NULL, NULL, NULL, 0, 1, '{}', $4, $6)`,
-  [fixture.memoryId, projectId, fixture.sessionId, at, fixture.archivedMemoryId, later]);
+      ($5, $2, 'Archived portable memory', NULL, NULL, NULL, 0, 1, '{}', $4, $6),
+      ($7, $2, 'Own project portable memory', NULL, $2, $3, 0, 1, '{}', $4, NULL)`,
+  [fixture.memoryId, projectId, fixture.sessionId, at, fixture.archivedMemoryId, later, fixture.ownProjectMemoryId]);
   await query(`INSERT INTO lcm.promoted_memory_tags (project_id, memory_id, ordinal, tag)
     VALUES ($1, $2, 0, 'Repeat'), ($1, $2, 1, 'Repeat'), ($1, $2, 2, 'repeat')`,
   [projectId, fixture.memoryId]);

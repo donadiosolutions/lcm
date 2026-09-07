@@ -40,6 +40,8 @@ export interface PostgreSqlPortableSourceOptions {
   readonly expectedOwner: string;
   readonly expectedIdentity: StorageIdentityContext;
   readonly admission?: "runtime" | "transfer";
+  /** Parent directory for the source-owned bounded disk index. */
+  readonly scratchParent?: string;
   readonly signal?: AbortSignal;
 }
 
@@ -162,7 +164,7 @@ export async function createPostgreSqlPortableSource(options: PostgreSqlPortable
     const capturedAt=await snapshotState(session,options.signal);
     const sourceWitnessSha256=await readPostgreSqlPortableWitness(session,expectedIdentity.id,options.signal);
     const sourceIdentitySha256=sha256(canonicalJson(["lcm-postgresql-snapshot-v1",sourceWitnessSha256,session.identity]));
-    index=createPortableIndex({signal:options.signal});
+    index=createPortableIndex({scratchParent:options.scratchParent,signal:options.signal});
     return await buildSource({options, runtime, session,index,expectedHash,expectedIdentity,normalizedPath,
       capturedAt,sourceIdentitySha256,sourceWitnessSha256});
   } catch (error) {
@@ -191,7 +193,7 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
   const projectIdentity={scope:"shared",projectId:expectedIdentity.id} as const;
   const sessionHash=sha256(canonicalJson(session.identity));
   const counts=new Map<PortableDomain,number>();
-  const terminals=new Map<PortableDomain,{prefix:string;last:{recordSha256:string;identitySha256:string} | null}>();
+
   const queryRow=async (domain: PortableDomain, locator: string, signal?: AbortSignal) => {
     abort(signal); abort(options.signal);
     const row=await readCanonicalRow(session,expectedIdentity.id,domain,locator,signal);
@@ -299,26 +301,49 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     index.finalizeDomain(domain); counts.set(domain,count);
   }
   index.verifyDependencies();
-  const boundaryAt=async(domain:PortableDomain,nextOrdinal:number,signal?:AbortSignal) => {
+  type BoundaryEvidence={prefix:string;last:{recordSha256:string;identitySha256:string}|null};
+  // This private bounded disk index is created once per admitted session. Store
+  // digests at final canonical ordinals, never caller checkpoints or payloads.
+  const prefixScope=(domain:PortableDomain) => `${input.sourceIdentitySha256}/${domain}`;
+  const cachedBoundary=(domain:PortableDomain,nextOrdinal:number):BoundaryEvidence => {
+    if (nextOrdinal === 0) return {prefix:initialPrefix(domain),last:null};
+    const encoded=index.getScope(prefixScope(domain),String(nextOrdinal));
+    if (encoded === null) invalid();
+    return JSON.parse(encoded) as BoundaryEvidence;
+  };
+  const checkedRecordAt=async(domain:PortableDomain,locator:string,ordinal:number,signal?:AbortSignal) => {
+    const record=await recordAt(domain,locator,ordinal,signal);
+    const expected=cachedBoundary(domain,ordinal+1).last;
+    if (expected?.recordSha256 !== record.recordSha256 || expected.identitySha256 !== record.identitySha256) {
+      throw new PortableStreamError("source-changed");
+    }
+    return record;
+  };
+  const readOrdinal=async(domain:PortableDomain,ordinal:number,signal?:AbortSignal) => {
+    const entry=index.entries(domain,{afterOrdinal:ordinal-1,limit:1,maxBytes:PORTABLE_LIMITS.maxBatchBytes,signal})[0];
+    if (entry === undefined) invalid();
+    return checkedRecordAt(domain,entry.locator,entry.ordinal,signal);
+  };
+  const boundaryAt=async(domain:PortableDomain,nextOrdinal:number,capture:boolean,signal?:AbortSignal) => {
     let prefix=initialPrefix(domain);
-    let last:{recordSha256:string;identitySha256:string}|null=null;
+    let last:BoundaryEvidence["last"]=null;
     let ordinal=0;
     while (ordinal < nextOrdinal) {
       const entries=index.entries(domain,{afterOrdinal:ordinal-1,limit:Math.min(500,nextOrdinal-ordinal),
         maxBytes:PORTABLE_LIMITS.maxBatchBytes,signal});
       if (entries.length === 0) invalid();
       for (const entry of entries) {
-        const record=await recordAt(domain,entry.locator,entry.ordinal,signal);
+        const record=await (capture ? recordAt : checkedRecordAt)(domain,entry.locator,entry.ordinal,signal);
         prefix=appendDigest(prefix,serializePortableRecord(record));
         last={recordSha256:record.recordSha256,identitySha256:record.identitySha256};ordinal++;
+        if (capture) index.bindScope(prefixScope(domain),String(ordinal),JSON.stringify({prefix,last}));
       }
     }
     return {prefix,last};
   };
   let contentSha256=sha256(canonicalJson(["lcm-portable-content-v1",PORTABLE_RECORD_SCHEMA_SHA256]));
   for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
-    const terminal=await boundaryAt(domain,counts.get(domain)!,options.signal);
-    terminals.set(domain,terminal);
+    const terminal=await boundaryAt(domain,counts.get(domain)!,true,options.signal);
     contentSha256=appendDigest(contentSha256,Buffer.from(terminal.prefix,"hex"));
   }
   const coverage=Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => [domain,Object.freeze({
@@ -358,18 +383,13 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
           || request.maxBytes !== PORTABLE_LIMITS.maxBatchBytes || typeof request.includePredecessor !== "boolean") {
           throw new PortableStreamError("invalid-limit");
         }
-        const loadOrdinal=async(ordinal:number) => {
-          const entry=index.entries(request.domain,{afterOrdinal:ordinal-1,limit:1,maxBytes:request.maxBytes,signal:request.signal})[0];
-          if (entry === undefined) invalid();
-          return recordAt(request.domain,entry.locator,entry.ordinal,request.signal);
-        };
         const predecessor=request.includePredecessor && request.afterOrdinal > 0
-          ? await loadOrdinal(request.afterOrdinal-1) : null;
+          ? await readOrdinal(request.domain,request.afterOrdinal-1,request.signal) : null;
         const records:PortableRecord[]=[];let bytes=0;
         const entries=index.entries(request.domain,{afterOrdinal:request.afterOrdinal-1,limit:request.maxRecords,
           maxBytes:request.maxBytes,signal:request.signal});
         for (const entry of entries) {
-          const record=await recordAt(request.domain,entry.locator,entry.ordinal,request.signal);
+          const record=await checkedRecordAt(request.domain,entry.locator,entry.ordinal,request.signal);
           const length=serializePortableRecord(record).byteLength+8;
           if (bytes+length > request.maxBytes) break;
           records.push(record);bytes+=length;
@@ -391,9 +411,18 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
           const count=counts.get(b.domain);
           if (count === undefined || !Number.isSafeInteger(b.nextOrdinal) || b.nextOrdinal < 0
             || b.recordCount !== b.nextOrdinal || b.nextOrdinal > count) return "invalid";
-          const actual=b.nextOrdinal === count ? terminals.get(b.domain)! : await boundaryAt(b.domain,b.nextOrdinal,request.signal);
+          const actual=cachedBoundary(b.domain,b.nextOrdinal);
           if (actual.prefix !== b.prefixSha256 || (actual.last?.recordSha256 ?? null) !== b.lastRecordSha256
             || (actual.last?.identitySha256 ?? null) !== b.lastRecordIdentitySha256) return "changed";
+          if (b.nextOrdinal === count) {
+            // Completion proves the whole actual SQL domain again. Intermediate
+            // checkpoints use exact indexed evidence plus an actual boundary
+            // read; the owned repeatable-read session protects its interior.
+            const current=await boundaryAt(b.domain,count,false,request.signal);
+            if (current.prefix !== actual.prefix) return "changed";
+          } else if (b.nextOrdinal > 0) {
+            await readOrdinal(b.domain,b.nextOrdinal-1,request.signal);
+          }
         }
         await authenticate(request.signal);
         return "unchanged";

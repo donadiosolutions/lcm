@@ -232,7 +232,10 @@ vi.mock("../../src/import-summary.js", () => ({
   printImportSummary: vi.fn(),
   printCodexResolutionSummary: vi.fn(),
 }));
-vi.mock("../../src/cli-storage.js", () => ({ listCliProjects: state.listCliProjects }));
+vi.mock("../../src/cli-storage.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/cli-storage.js")>()),
+  listCliProjects: state.listCliProjects,
+}));
 vi.mock("../../src/portable-knowledge.js", () => ({
   exportKnowledge: vi.fn(async () => state.portableResult), importKnowledge: vi.fn(async () => state.portableResult),
 }));
@@ -1039,7 +1042,7 @@ describe("runCli lifecycle and connector boundaries", () => {
     state.post.mockResolvedValueOnce({ promoted: 1, processedProjects: 1, skipped: 0, errors: 0, orphanedProjects: 0 });
     await expect(actions.get("events/promote")!({ all: true })).resolves.toBeUndefined();
     state.post.mockRejectedValueOnce("request failed");
-    await expect(actions.get("lcm/promote")!({ verbose: false })).resolves.toBeUndefined();
+    await expect(actions.get("lcm/promote")!({ verbose: false })).rejects.toThrow("exit:1");
   });
 
   it("covers connector help, installed display, and installer errors", async () => {
@@ -1452,6 +1455,7 @@ describe("runCli scanning and portable knowledge boundaries", () => {
   });
 
   it("covers verbose promotion successes, primitive failures, and plural summaries", async () => {
+    state.cliProjects = [{ id: "one", canonical: "/one", aliases: [] }, { id: "two", canonical: "/two", aliases: [] }];
     state.entries = [
       { name: "file", isDirectory: () => false },
       { name: "missing", isDirectory: () => true },
@@ -1465,7 +1469,7 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     state.files.set("/lcm/projects/one/meta.json", JSON.stringify({ cwd: "/one" }));
     state.files.set("/lcm/projects/two/meta.json", JSON.stringify({ cwd: "/two" }));
     state.post.mockResolvedValueOnce({ processed: 2, promoted: 1, conversations: 2 }).mockRejectedValueOnce("failed");
-    expect(await invoke(["promote", "--all", "--verbose", "--dry-run"])).toBeUndefined();
+    expect((await invoke(["promote", "--all", "--verbose", "--dry-run"]))?.message).toBe("exit:1");
   });
 
   it("exports authenticated bindings to generated files and fails partial exports", async () => {

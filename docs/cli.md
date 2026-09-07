@@ -25,12 +25,27 @@ be registered. Missing bindings or database failures stop the operation;
 commands never fall back to a local SQLite database. Backend selection applies
 to the configured home and daemon, rather than individual projects.
 
-`lcm export --all` and `lcm compact --all` enumerate authenticated locally known
+`lcm export --all`, `lcm promote --all`, and `lcm compact --all` enumerate authenticated locally known
 project paths and bindings, including bindings that have no SQLite database or
 `meta.json`. Aliases of the same selected project are processed once. This does
 not enumerate every project hosted by the PostgreSQL server. An unbound local
 project requires `lcm project create` or `lcm project link <project-id>` before
 it can be selected with PostgreSQL.
+
+`lcm promote --all` processes the canonical paths from those bindings even when
+no local `meta.json` exists. `--verbose` reports each project's counts and
+`--dry-run` previews the same selected projects. Progress and summaries go to
+stderr. A failed project request is reported and makes the command exit with
+status 1; other admitted projects may still complete. Identity or publication
+refusals stop the command, and no successful empty-result message hides a failed
+scan.
+
+Unbound-project errors explain how to run `lcm project create` or
+`lcm project link <project-id>`. Missing local storage errors direct you to
+`lcm import` or `lcm import-knowledge <file>` in the intended project. CLI
+remedies for these known failures are fixed messages; database diagnostics,
+connection strings, and mutable exception text are not printed. Unknown
+failures retain a generic diagnostic and exit with status 1.
 
 `lcm export` without `--output` writes only the version-1 promoted-knowledge
 JSON document to stdout. Progress and status messages go to stderr. With

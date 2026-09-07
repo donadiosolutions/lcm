@@ -3,6 +3,9 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { ConfigValidationError } from "../../src/daemon/config.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
+import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
+import { CliProjectStorageMissingError } from "../../src/cli-storage.js";
+import { MachineIdentityFileError } from "../../src/machine-identity.js";
 import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 import { createPublicationConvergence } from "../../src/storage/publication-convergence.js";
@@ -292,7 +295,10 @@ vi.mock("../../src/portable-knowledge.js", () => ({
   exportKnowledge: vi.fn(async () => { if (state.exportError) throw state.exportError; return state.portableResult; }),
   importKnowledge: vi.fn(async () => { if (state.importKnowledgeError) throw state.importKnowledgeError; return state.portableResult; }),
 }));
-vi.mock("../../src/cli-storage.js", () => ({ listCliProjects: state.listCliProjects }));
+vi.mock("../../src/cli-storage.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/cli-storage.js")>()),
+  listCliProjects: state.listCliProjects,
+}));
 vi.mock("../../src/worktree-reconciliation.js", () => ({
   reconcileWorktrees: state.reconcileWorktrees,
 }));
@@ -718,7 +724,7 @@ describe("runCli registration and help dispatch", () => {
       expect(() => handleCliError(result)).toThrow("exit:1");
       expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
         failure instanceof BackendPublicationJournalError
-          ? FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC : failure.message,
+          ? FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC : "LCM storage publication is busy. Wait for the active operation to finish, then retry; run `lcm doctor` if it remains blocked.",
       );
       expect(portable.exportKnowledge).toHaveBeenCalledOnce();
       expect(log).not.toHaveBeenCalled();
@@ -744,7 +750,7 @@ describe("runCli registration and help dispatch", () => {
         expect(() => handleCliError(result)).toThrow("exit:1");
         expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
           failure instanceof BackendPublicationJournalError
-            ? FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC : failure.message,
+            ? FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC : "LCM storage publication is busy. Wait for the active operation to finish, then retry; run `lcm doctor` if it remains blocked.",
         );
         expect(state.listCliProjects.mock.calls.length).toBe(
           failure instanceof PrivateMutationLockContentionError ? 40 : 1,
@@ -891,12 +897,12 @@ describe("runCli registration and help dispatch", () => {
     expect(() => writeCliError("err")).not.toThrow();
     expect(consoleError).toHaveBeenCalledTimes(4);
     expect(consoleError).toHaveBeenNthCalledWith(1, "LCM command failed. Check the command inputs and selected storage configuration.");
-    expect(consoleError).toHaveBeenNthCalledWith(2, configError.message);
-    expect(consoleError).toHaveBeenNthCalledWith(3, backendError.message);
-    expect(consoleError).toHaveBeenNthCalledWith(4, contentionError.message);
+    expect(consoleError).toHaveBeenNthCalledWith(2, "LCM configuration is invalid. Check config.json and the required environment variables, then retry.");
+    expect(consoleError).toHaveBeenNthCalledWith(3, "This operation is not available for the postgresql storage backend.");
+    expect(consoleError).toHaveBeenNthCalledWith(4, "LCM home migration is busy. Wait for the active operation to finish, then retry.");
     const publicationContention = new PrivateMutationLockContentionError("publication contention");
     expect(() => handleCliError(publicationContention)).toThrow("exit:1");
-    expect(consoleError).toHaveBeenNthCalledWith(5, publicationContention.message);
+    expect(consoleError).toHaveBeenNthCalledWith(5, "LCM storage publication is busy. Wait for the active operation to finish, then retry; run `lcm doctor` if it remains blocked.");
     expect(consoleError).toHaveBeenCalledTimes(5);
     expect(stdout).toHaveBeenCalledWith("out");
     expect(stderr).toHaveBeenCalledWith("err");
@@ -921,6 +927,103 @@ describe("runCli registration and help dispatch", () => {
       "LCM command failed. Check the command inputs and selected storage configuration.",
     );
     expect(stdout).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [new StorageIdentityConfigurationError("mutable"), "lcm project link <project-id>"],
+    [new CliProjectStorageMissingError(), "lcm import"],
+    [new ConfigValidationError("secret", "secret"), "configuration"],
+    [new StorageBackendUnavailableError("postgresql"), "not available"],
+    [new PrivateMutationLockContentionError("mutable"), "retry"],
+    [new MachineIdentityFileError("mutable", "mutable"), "lcm machine"],
+  ])("renders static actionable diagnostics for known error %#", (failure, remedy) => {
+    const error = failure as Error;
+    error.message="SECRET_CANARY postgresql://private SQL";
+    const diagnostic=vi.spyOn(console,"error").mockImplementation(() => undefined);
+    expect(() => handleCliError(error)).toThrow("exit:1");
+    expect(diagnostic.mock.calls.flat().join(" ")).toContain(remedy);
+    expect(diagnostic.mock.calls.flat().join(" ")).not.toContain("SECRET_CANARY");
+  });
+
+  it("promotes map-only PostgreSQL bindings with stderr progress and partial-failure exit", async () => {
+    state.storageBackend="postgresql";
+    state.publicationAllowed=true;
+    state.entries=[];
+    state.cliProjects=[{id:"one",canonical:"/bound-no-meta",aliases:[]},{id:"two",canonical:"/second",aliases:[]}];
+    state.post.mockResolvedValueOnce({processed:2,promoted:1,conversations:1})
+      .mockRejectedValueOnce(new Error("SECRET_CANARY postgresql://private SQL"));
+    const stdout=vi.spyOn(process.stdout,"write").mockReturnValue(true);
+    const diagnostic=vi.spyOn(console,"error").mockImplementation(() => undefined);
+    const log=vi.spyOn(console,"log").mockImplementation(() => undefined);
+    const stderr=vi.spyOn(process.stderr,"write").mockReturnValue(true);
+    expect((await invoke(["promote","--all","--verbose","--dry-run"]))?.message).toBe("exit:1");
+    expect(state.listCliProjects).toHaveBeenCalledOnce();
+    expect(state.post).toHaveBeenNthCalledWith(1,"/promote",{cwd:"/bound-no-meta",dry_run:true});
+    expect(state.post).toHaveBeenNthCalledWith(2,"/promote",{cwd:"/second",dry_run:true});
+    expect(stdout).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
+    expect(diagnostic.mock.calls.flat().join(" ")).toContain("1 project failed");
+    expect([...diagnostic.mock.calls,...stderr.mock.calls].flat().join(" ")).not.toContain("SECRET_CANARY");
+  });
+
+  it.each([
+    new StorageIdentityConfigurationError("SECRET_CANARY identity"),
+    new BackendPublicationJournalError("unsafe-storage", "SECRET_CANARY publication"),
+    new PrivateMutationLockContentionError("SECRET_CANARY contention"),
+  ])("propagates typed promotion admission refusal %# without further project requests", async failure => {
+    state.cliProjects = [
+      { id: "one", canonical: "/one", aliases: [] },
+      { id: "two", canonical: "/two", aliases: [] },
+    ];
+    state.post.mockRejectedValueOnce(failure);
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect(await invoke(["promote", "--all"])).toBe(failure);
+    expect(state.post).toHaveBeenCalledExactlyOnceWith("/promote", { cwd: "/one", dry_run: false });
+    expect(() => handleCliError(failure)).toThrow("exit:1");
+    const text = diagnostic.mock.calls.flat().join(" ");
+    expect(text).not.toContain("SECRET_CANARY");
+    expect(text).not.toContain("Nothing to promote");
+    expect(text).not.toContain("insights promoted");
+  });
+
+  it("counts all failed promotion projects without claiming there were no insights", async () => {
+    state.cliProjects = [
+      { id: "one", canonical: "/one", aliases: [] },
+      { id: "two", canonical: "/two", aliases: [] },
+    ];
+    state.post.mockRejectedValueOnce(new Error("SECRET_CANARY first")).mockRejectedValueOnce("SECRET_CANARY second");
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    expect((await invoke(["promote", "--all"]))?.message).toBe("exit:1");
+    expect(state.post).toHaveBeenCalledTimes(2);
+    expect(diagnostic).toHaveBeenCalledWith("  2 projects failed; 0 insights promoted before completion.");
+    const text = diagnostic.mock.calls.flat().join(" ");
+    expect(text).not.toContain("SECRET_CANARY");
+    expect(text).not.toContain("Nothing to promote");
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it("refuses promotion enumeration before daemon work and preserves identity refusal", async () => {
+    const failure=new StorageIdentityConfigurationError("SECRET_CANARY");
+    state.listCliProjects.mockRejectedValueOnce(failure);
+    expect(await invoke(["promote","--all"])).toBe(failure);
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+  });
+
+  it("shows the static missing-storage remedy for export and import failures", async () => {
+    const missing=new CliProjectStorageMissingError();
+    missing.message="SECRET_CANARY";
+    state.exportError=missing;
+    const error=vi.spyOn(console,"error").mockImplementation(() => undefined);
+    const stderr=vi.spyOn(process.stderr,"write").mockReturnValue(true);
+    expect((await invoke(["export"]))?.message).toBe("exit:1");
+    expect(stderr.mock.calls.flat().join(" ")).toContain("lcm import");
+    state.fileText=JSON.stringify({version:1,entries:[]});
+    state.importKnowledgeError=new StorageIdentityConfigurationError("SECRET_CANARY");
+    expect((await invoke(["import-knowledge","x"]))?.message).toBe("exit:1");
+    expect(error.mock.calls.flat().join(" ")).toContain(UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
+    expect([...error.mock.calls,...stderr.mock.calls].flat().join(" ")).not.toContain("SECRET_CANARY");
   });
 
   it("routes executable failures to the supplied top-level handler", async () => {
@@ -2707,7 +2810,7 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(await invoke(["promote", "--all", "--verbose", "--dry-run"])).toBeUndefined();
     expect(state.reconcileWorktrees).not.toHaveBeenCalled();
     expect(await invoke(["export", "--all"])).toBeUndefined();
-    expect(state.listCliProjects).toHaveBeenCalledOnce();
+    expect(state.listCliProjects).toHaveBeenCalledTimes(2);
     expect(state.reconcileWorktrees).not.toHaveBeenCalled();
   });
 
@@ -2747,7 +2850,7 @@ describe("runCli failure and alternate presentation branches", () => {
       expect(await invoke(["compact", "--no-promote"])).toBeUndefined();
       expect(await invoke(["import"])).toBeUndefined();
       const summary = await import("../../src/import-summary.js");
-      expect(summary.printCodexResolutionSummary).toHaveBeenCalledWith(state.importResult, console.error);
+      expect(summary.printCodexResolutionSummary).toHaveBeenCalledWith(state.importResult, console.error, "claude");
       expect(summary.printImportSummary).not.toHaveBeenCalled();
     } finally {
       if (descriptor) Object.defineProperty(process.stderr, "isTTY", descriptor);
@@ -2755,7 +2858,7 @@ describe("runCli failure and alternate presentation branches", () => {
     }
   });
 
-  it("fails compact when automatic promotion fails while keeping explicit promote best-effort", async () => {
+  it("fails compact and explicit promotion when promotion requests fail", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     state.post.mockRejectedValueOnce(new Error("promote\u001b[31m\nfailed"));
     expect(await invoke(["compact"])).toBeUndefined();
@@ -2769,7 +2872,7 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(process.exitCode).toBe(1);
     process.exitCode = undefined;
     state.post.mockRejectedValueOnce("promote failed");
-    expect(await invoke(["promote", "--verbose"])).toBeUndefined();
+    expect((await invoke(["promote", "--verbose"]))?.message).toBe("exit:1");
     state.exportError = new Error("export failed");
     expect((await invoke(["export"]))?.message).toBe("exit:1");
   });
@@ -2860,6 +2963,18 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(isDaemonTransportFailure(cycle)).toBe(false);
   });
 
+  it("reports valid and skipped knowledge entries separately in dry-run", async () => {
+    state.fileText = JSON.stringify({ version: 1, entries: [{ id: "valid" }, { id: "invalid" }] });
+    state.portableResult = { exported: 0, imported: 0, skipped: 1, total: 2, dryRun: true };
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    expect(await invoke(["import-knowledge", "input.json", "--dry-run"])).toBeUndefined();
+    expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
+      "\n  [dry-run] 1 valid, 1 skipped. No changes written.\n",
+    );
+    expect(stdout).not.toHaveBeenCalled();
+  });
+
   it("reports portable import dry-run results and import failures", async () => {
     state.fileText = JSON.stringify({ version: 1, entries: [{ id: "one" }] });
     state.portableResult = { exported: 0, imported: 0, skipped: 0, total: 1, dryRun: true };
@@ -2936,9 +3051,9 @@ describe("runCli failure and alternate presentation branches", () => {
     state.post.mockResolvedValueOnce({ processed: 1, promoted: 0 });
     expect(await invoke(["promote", "--verbose"])).toBeUndefined();
     state.post.mockRejectedValueOnce(new Error("failed"));
-    expect(await invoke(["promote", "--verbose"])).toBeUndefined();
+    expect((await invoke(["promote", "--verbose"]))?.message).toBe("exit:1");
     state.post.mockRejectedValueOnce(new Error("failed"));
-    expect(await invoke(["promote"])).toBeUndefined();
+    expect((await invoke(["promote"]))?.message).toBe("exit:1");
   });
 });
 

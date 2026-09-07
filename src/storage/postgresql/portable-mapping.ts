@@ -80,6 +80,7 @@ function projection(domain: PortableDomain, mapping: Mapping): string {
   if (domain === "native-transcript-message-links") columns.set("ingest_key","t.ingest_key AS ingest_key");
   if (domain === "passive-events") {
     columns.set("status","r.status AS status");
+    columns.set("payload_envelope_supported", `(r.payload ?& ARRAY['sessionId','sessionSequence','category','data','priority','sourceHook','createdAt'] AND NOT EXISTS (SELECT 1 FROM pg_catalog.jsonb_object_keys(r.payload) AS envelope(key) WHERE envelope.key NOT IN ('sessionId','sessionSequence','category','data','priority','sourceHook','createdAt')) AND pg_catalog.jsonb_typeof(r.payload->'sessionId') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'category') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'data') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'sourceHook') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'createdAt') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'sessionSequence') = 'number' AND pg_catalog.jsonb_typeof(r.payload->'priority') = 'number') AS payload_envelope_supported`);
     for (const key of ["sessionId","sessionSequence","category","data","priority","sourceHook","createdAt"]) columns.set(key,`r.payload->>'${key}' AS "${key}"`);
   }
   return [...columns.values()].join(", ");
@@ -123,6 +124,7 @@ export interface CanonicalDecodeContext {
   readonly conversationFingerprint?:string;
 }
 export function decodeCanonicalRow(domain:PortableDomain,row:Row,parent:CanonicalDecodeContext):Omit<PortableRawRecordInput,"ordinal"> {
+  if (domain === "passive-events" && row.payload_envelope_supported !== true) fail();
   const value:Row = {};
   for (const [property,column,kind] of mappings[domain].fields) {
     const raw = row[column];
@@ -229,7 +231,11 @@ export async function insertCanonicalRecord(executor:PostgreSqlQueryExecutor,pro
     const transcript = await query("SELECT t.transcript_id::text AS id FROM lcm.native_transcripts t JOIN lcm.machines m ON m.machine_id=t.machine_id WHERE t.project_id=$1::uuid AND m.identity_key=$2 AND t.ingest_key=$3 LIMIT 2",[projectId,value.machineIdentityKey,value.ingestKey]);
     add("transcript_id",transcript.id);
   }
-  for (const [property,column,kind] of mapping.fields) add(column,kind === "json" ? canonicalJson(value[property]) : scalar(value[property]),kind === "json" ? "?::jsonb" : undefined);
+  for (const [property,column,kind] of mapping.fields) {
+    const input = domain === "promoted-memories" && property === "sourceProjectId" && value[property] === null
+      ? projectId : value[property];
+    add(column,kind === "json" ? canonicalJson(input) : scalar(input),kind === "json" ? "?::jsonb" : undefined);
+  }
   if (domain === "passive-events") {
     const payload:Row = {};
     for (const key of ["sessionId","category","data","sourceHook","createdAt"]) payload[key] = value[key];

@@ -39,6 +39,7 @@ class Database {
   records = new Map<PortableDomain, PortableRecord[]>();
   transaction?: Saved;
   foreignRows: Row[] = [];
+  sourceMachineRows?: Row[];
   clients: FakeClient[] = [];
   queryLog: string[] = [];
   beforeQuery?: (config: QueryConfig) => void | Promise<void>;
@@ -90,7 +91,12 @@ class Database {
     if (text.includes("current_setting('server_version_num')")) return result(this.safety);
     if (text.includes('pg_try_advisory_lock')) return result([{ held: this.lock }]);
     if (text.includes('JOIN lcm.project_aliases')) return result(this.binding);
-    if (text.includes('FROM lcm.machines WHERE')) return result(this.machines.filter(row => String(row.machine_id) > values[0]).slice(0, 1));
+    if (text.includes('FROM lcm.machines WHERE identity_key=$1')) return result(this.sourceMachineRows ?? this.machines.filter(row => row.identity_key === values[0]));
+    if (text.includes('FROM lcm.machines WHERE')) {
+      const aliases = this.records.get('project-aliases') ?? [];
+      const relevant = this.machines.filter(row => row.machine_id === values[2] || aliases.some(alias => (alias.value as unknown as Row).machineIdentityKey === row.identity_key));
+      return result(relevant.filter(row => String(row.machine_id) > values[0]).sort((left, right) => String(left.machine_id).localeCompare(String(right.machine_id))).slice(0, 1));
+    }
     if (text.includes("current_setting('transaction_isolation')")) return result(this.isolation);
     if (text.includes('pg_current_xact_id_if_assigned')) return result([{ transaction_id: this.transaction ? '1001' : null }]);
     if (text.includes('FROM lcm.transfer_runs')) return result(this.run ? (this.extraRuns ? [this.run, this.run] : [this.run]) : []);
@@ -138,15 +144,33 @@ let input: PostgreSqlPortableDestinationInput;
 let writers: PortableRecordWriter[];
 let streams: PortableRecordStream[];
 const identityDomains = new Set(['machines', 'project', 'project-aliases']);
+const MACHINE_B_UUID = '018f7765-7b5c-7d92-8a2e-c6f6a15fca35';
+const UNRELATED_MACHINE_UUID = '018f7765-7b5c-7d92-8a2e-c6f6a15fca36';
+function registeredGeneration(historicalWithoutAlias = false) {
+  return createGeneration({ ...postgresGeneration(), mutate: (domain, values) => {
+    if (domain === 'machines') return values.map(value => value.machineId === null ? { ...value, machineId: MACHINE_B_UUID } : value);
+    if (historicalWithoutAlias && domain === 'project-aliases') return values.filter(value => value.machineIdentityKey !== 'installation:9f2c4a');
+    return values;
+  } });
+}
+function seedGeneration(next = registeredGeneration()) {
+  generation = next;
+  db.records.clear();
+  for (const [domain, records] of generation.records) db.records.set(domain, identityDomains.has(domain) ? [...records] : []);
+  db.machines = generation.records.get('machines')!.map(record => {
+    const value = record.value as unknown as Row;
+    return { machine_id: value.machineId, identity_key: value.identityKey };
+  });
+}
+
 
 beforeEach(() => {
   vi.resetAllMocks();
   db = new Database();
-  generation = createGeneration(postgresGeneration());
+  seedGeneration();
   scratch = mkdtempSync(join(tmpdir(), 'lcm-pg-destination-'));
   writers = []; streams = [];
   input = { settings: {} as never, expectedOwner: 'fixture_owner', expectedIdentity: { id: SHARED_PROJECT_UUID, remoteProjectId: SHARED_PROJECT_UUID, machineId: MACHINE_A_UUID, localProjectId: 'a'.repeat(64), selectedPath: '/fixture/project' }, generationId: 'generation_1', runId: 'run_1', scratchParent: scratch };
-  for (const [domain, records] of generation.records) db.records.set(domain, identityDomains.has(domain) ? [...records] : []);
   boundaries.client.mockImplementation(() => { const client = new FakeClient(db); db.clients.push(client); return client; });
   boundaries.config.mockReturnValue({});
   boundaries.schema.mockResolvedValue(undefined);
@@ -652,5 +676,108 @@ describe('generated PostgreSQL search expressions', () => {
     expect(`${String(failure)}${JSON.stringify(failure)}`).not.toContain(canary);
     expect(failure).not.toHaveProperty('cause');
     expectNoRun(); expect(db.snapshot()).toEqual(saved); expect(readdirSync(scratch)).toEqual([]);
+  });
+});
+
+
+describe('machine authority scope', () => {
+  it('ignores unrelated machine registration, changes and removal during a run and resume', async () => {
+    const { writer, stream, manifest } = await admitted(); const first = await batch(stream, 'machines', undefined, 1);
+    db.machines.push({ machine_id: UNRELATED_MACHINE_UUID, identity_key: 'installation:unrelated' });
+    await expect(writer.readProgress(manifest.manifestSha256)).resolves.toMatchObject({ checkpoints: [] });
+    await expect(writer.applyBatch(first)).resolves.toEqual(first.checkpoint);
+    db.machines.find(row => row.machine_id === UNRELATED_MACHINE_UUID)!.identity_key = 'installation:unrelated-changed';
+    expect((await writer.readProgress(manifest.manifestSha256)).checkpoints).toEqual([first.checkpoint]);
+    await writer.close();
+    const resumed = await open(); const token = await resumed.preflight(manifest, stream); await resumed.admit(manifest, token);
+    db.machines = db.machines.filter(row => row.machine_id !== UNRELATED_MACHINE_UUID);
+    const second = await batch(stream, 'machines', first.checkpoint);
+    await expect(resumed.applyBatch(second)).resolves.toEqual(second.checkpoint);
+    expect((await resumed.readProgress(manifest.manifestSha256)).checkpoints).toEqual([second.checkpoint]);
+    expect(db.receipts).toHaveLength(2);
+  });
+  it('keeps historical source machines without aliases stable as their native references are inserted', async () => {
+    seedGeneration(registeredGeneration(true));
+    const { writer, stream, manifest } = await admitted(); await transferAll(writer, stream);
+    expect((await writer.readProgress(manifest.manifestSha256)).checkpoints).toHaveLength(22);
+    await writer.verifyComplete(manifest); expect(db.run!.state).toBe('completed');
+    for (const [domain, records] of generation.records) expect(db.records.get(domain)).toEqual(records);
+  });
+  it.each(['identity-key', 'machine-id', 'removed'] as const)('refuses %s drift of a historical source machine before read or apply', async fault => {
+    seedGeneration(registeredGeneration(true));
+    const { writer, stream, manifest } = await admitted(); const first = await batch(stream); const saved = db.snapshot();
+    const historical = db.machines.find(row => row.machine_id === MACHINE_B_UUID)!;
+    if (fault === 'identity-key') historical.identity_key = 'installation:historical-changed';
+    if (fault === 'machine-id') historical.machine_id = UNRELATED_MACHINE_UUID;
+    if (fault === 'removed') db.machines = db.machines.filter(row => row !== historical);
+    await expect(writer.readProgress(manifest.manifestSha256)).rejects.toMatchObject({ code: 'destination-conflict' });
+    await expect(writer.applyBatch(first)).rejects.toMatchObject({ code: 'destination-conflict' });
+    expect(db.snapshot()).toEqual(saved);
+  });
+  it('requires full source preflight before a resumed run can use a changed historical machine', async () => {
+    seedGeneration(registeredGeneration(true));
+    const { writer, stream, manifest } = await admitted(); const first = await batch(stream); await writer.applyBatch(first); await writer.close();
+    db.machines.find(row => row.machine_id === MACHINE_B_UUID)!.machine_id = UNRELATED_MACHINE_UUID;
+    const saved = db.snapshot(); const resumed = await open();
+    await expect(resumed.applyBatch(first)).rejects.toMatchObject({ code: 'destination-conflict' });
+    await expect(resumed.preflight(manifest, stream)).rejects.toMatchObject({ code: 'destination-conflict' });
+    expect(db.snapshot()).toEqual(saved);
+  });
+});
+
+describe('readback scratch ownership', () => {
+  it.each(['success', 'readback-failure'] as const)('uses and cleans the caller scratch directory on %s', async outcome => {
+    const { writer, stream, manifest } = await admitted(); await transferAll(writer, stream);
+    const destinationIndexes = readdirSync(scratch); expect(destinationIndexes).toHaveLength(1);
+    let sourceIndexDirectory: string | undefined;
+    boundaries.source.mockImplementation(async (options: { scratchParent?: string }) => {
+      const index = new PortableIndex({ scratchParent: options.scratchParent });
+      sourceIndexDirectory = readdirSync(scratch).find(entry => !destinationIndexes.includes(entry));
+      return createFixtureSource({ description: generation.description, records: db.records,
+        ...(outcome === 'readback-failure' ? { describeOverride: () => { throw new Error('private scratch readback'); } } : {}),
+        onClose: () => index.close(),
+      });
+    });
+    if (outcome === 'success') await expect(writer.verifyComplete(manifest)).resolves.toMatchObject({ complete: true });
+    else await expect(writer.verifyComplete(manifest)).rejects.toMatchObject({ code: 'source-failed' });
+    expect(sourceIndexDirectory).toBeDefined(); expect(readdirSync(scratch)).toEqual(destinationIndexes);
+    await writer.close(); expect(readdirSync(scratch)).toEqual([]);
+  });
+});
+
+
+describe('historical source machine admission', () => {
+  it.each(['missing', 'duplicate', 'invalid-machine-id', 'invalid-identity-key'] as const)('rejects %s machine evidence before admitting a run', async fault => {
+    seedGeneration(registeredGeneration(true));
+    const writer = await open(); const stream = await source(); const saved = db.snapshot();
+    const machine = db.machines[0]!;
+    db.sourceMachineRows = fault === 'missing' ? [] : fault === 'duplicate' ? [machine, machine]
+      : [{ ...machine, ...(fault === 'invalid-machine-id' ? { machine_id: null } : { identity_key: null }) }];
+    await expect(writer.preflight(stream.describe(), stream)).rejects.toMatchObject({ code: 'destination-conflict' });
+    expectNoRun(); expect(db.snapshot()).toEqual(saved); expect(readdirSync(scratch)).toEqual([]);
+  });
+  it('rejects source-machine drift during the full preflight scan', async () => {
+    seedGeneration(registeredGeneration(true)); const writer = await open(); const stream = await source(); const saved = db.snapshot();
+    boundaries.capability.mockImplementation((record: PortableRecord) => {
+      if (record.domain === 'passive-events') db.machines.find(row => row.machine_id === MACHINE_B_UUID)!.identity_key = 'installation:changed-during-scan';
+    });
+    await expect(writer.preflight(stream.describe(), stream)).rejects.toMatchObject({ code: 'destination-conflict' });
+    expectNoRun(); expect(db.snapshot()).toEqual(saved); expect(readdirSync(scratch)).toEqual([]);
+  });
+});
+
+describe('source-machine evidence integrity', () => {
+  it('refuses corrupt source-machine index ordering before applying a batch', async () => {
+    const { writer, stream } = await admitted(); const first = await batch(stream); const saved = db.snapshot();
+    const original = PortableIndex.prototype.entries;
+    vi.spyOn(PortableIndex.prototype, 'entries').mockImplementationOnce(function (domain, options) {
+      const entries = original.call(this, domain, options);
+      return [{ ...entries[0]!, order: [null] }];
+    });
+    await expect(writer.applyBatch(first)).rejects.toMatchObject({ code: 'destination-conflict' }); expect(db.snapshot()).toEqual(saved);
+  });
+  it('refuses a missing row payload despite a claimed one-row source-machine result', async () => {
+    const { writer, stream } = await admitted(); const saved = db.snapshot(); db.sourceMachineRows = [undefined] as never;
+    await expect(writer.applyBatch(await batch(stream))).rejects.toMatchObject({ code: 'destination-conflict' }); expect(db.snapshot()).toEqual(saved);
   });
 });

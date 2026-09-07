@@ -1,22 +1,60 @@
 import { createHash } from "node:crypto";
-import { chmodSync } from "node:fs";
-import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { chmodSync, readFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { runLcmMigrations } from "../../src/db/migration.js";
-import { initializePortableArchive } from "../../src/storage/sqlite/portable-archive.js";
-import type { SqlitePortableIdentityFacts } from "../../src/storage/sqlite/portable-source.js";
+import type { OpenSqlitePortableSourceInput, SqlitePortableIdentityFacts } from "../../src/storage/sqlite/portable-source.js";
 import type { PortableProjectIdentity } from "../../src/storage/portable-record.js";
 
-// The fixture preimages below contain arrays and one-key integer objects only,
-// so JSON.stringify is independently canonical without production hash helpers.
-function independentSha256(preimage: unknown): string {
-  return createHash("sha256").update(JSON.stringify(preimage)).digest("hex");
-}
-function independentIdentity(domain: string, key: readonly unknown[]): string {
-  return independentSha256(["lcm-portable-identity-v1", domain, key]);
-}
-function integer(value: number | bigint): { $integer: string } { return { $integer: String(value) }; }
+const eventsSql = `CREATE TABLE events (
+  event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_uuid TEXT NOT NULL UNIQUE,
+  event_version INTEGER NOT NULL CHECK(event_version > 0),
+  machine_id TEXT,
+  machine_sequence TEXT NOT NULL UNIQUE CHECK(length(machine_sequence)=19 AND machine_sequence NOT GLOB '*[^0-9]*'),
+  session_id TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0,
+  type TEXT NOT NULL, category TEXT NOT NULL, data TEXT NOT NULL,
+  priority INTEGER DEFAULT 3, source_hook TEXT NOT NULL, prev_event_id INTEGER,
+  processed_at TEXT, created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  delivery_state TEXT NOT NULL DEFAULT 'pending' CHECK(delivery_state IN ('pending','claimed','retry','replicated','acknowledged','quarantined')),
+  delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK(delivery_generation>=0),
+  delivery_attempts INTEGER NOT NULL DEFAULT 0 CHECK(delivery_attempts>=0),
+  delivery_owner TEXT, delivery_claimed_at TEXT,
+  delivery_next_attempt_at TEXT NOT NULL DEFAULT(datetime('now')),
+  delivery_last_error TEXT, remote_inbox_id TEXT, quarantine_reason TEXT,
+  acknowledged_at TEXT, remote_pruned_at TEXT,
+  delivery_updated_at TEXT NOT NULL DEFAULT(datetime('now')),
+  CHECK((delivery_state='claimed')=(delivery_claimed_at IS NOT NULL)),
+  CHECK((delivery_claimed_at IS NULL)=(delivery_owner IS NULL)),
+  CHECK((delivery_state='acknowledged')=(acknowledged_at IS NOT NULL)),
+  CHECK((delivery_state='quarantined')=(quarantine_reason IS NOT NULL)),
+  CHECK(delivery_state<>'replicated' OR remote_inbox_id IS NOT NULL),
+  CHECK(delivery_state<>'acknowledged' OR remote_inbox_id IS NOT NULL),
+  CHECK(remote_pruned_at IS NULL OR(delivery_state='acknowledged' AND remote_inbox_id IS NOT NULL))
+)`;
+const eventMetadataSql = `CREATE TABLE error_log (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, hook TEXT NOT NULL,error TEXT NOT NULL,
+ session_id TEXT, created_at TEXT DEFAULT(datetime('now')));
+ CREATE TABLE missing_cwd_state(id INTEGER PRIMARY KEY CHECK(id=1),observations INTEGER NOT NULL CHECK(observations>0),last_observed_at INTEGER NOT NULL CHECK(last_observed_at>=0),parked_at TEXT CHECK(parked_at IS NULL OR observations>=3));
+ CREATE TABLE schema_version(version INTEGER NOT NULL);
+ INSERT INTO schema_version VALUES(5);`;
+
+const instructionsSql = `CREATE TABLE session_instruction_cache (
+  project_id TEXT NOT NULL,
+  scope_hash TEXT NOT NULL CHECK(length(scope_hash)=64 AND scope_hash NOT GLOB '*[^a-f0-9]*'),
+  client_name TEXT NOT NULL CHECK(client_name IN ('claude','codex')),
+  session_id TEXT NOT NULL CHECK(session_id<>''),
+  worktree_path TEXT NOT NULL CHECK(worktree_path<>''),
+  cwd_path TEXT NOT NULL CHECK(cwd_path<>''),
+  content TEXT NOT NULL, content_hash TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT(datetime('now')),
+  PRIMARY KEY(project_id,scope_hash)
+)`;
 
 export const SQLITE_PORTABLE_FIXTURE = {
+  sourceLocalProjectId: createHash("sha256").update("/fixture/linked-project").digest("hex"),
+  ownProjectMemoryId: "33333333-3333-4333-8333-333333333334",
+  externalMemoryId: "33333333-3333-4333-8333-333333333335",
+  externalProjectId: "external-sqlite-project",
   timestamp: "2026-09-06T12:00:00.123456Z",
   sessionId: "independent-sqlite-session",
   memoryId: "33333333-3333-4333-8333-333333333333",
@@ -31,32 +69,19 @@ export const SQLITE_PORTABLE_FIXTURE = {
 export function seedPortableSqlite(databasePath: string, input: {
   readonly projectIdentity: PortableProjectIdentity;
   readonly identityFacts: SqlitePortableIdentityFacts;
-}): void {
+  readonly sourceLocalProjectId?: string;
+}): Pick<OpenSqlitePortableSourceInput, "sourceLocalProjectId" | "identityFacts" | "expectedFactsSha256" | "machineIdentityKey" | "capturedSidecars"> {
+  const sourceLocalProjectId = input.sourceLocalProjectId ?? SQLITE_PORTABLE_FIXTURE.sourceLocalProjectId;
+  const identityFacts = { ...input.identityFacts, sourceLocalProjectId };
+  const machineIdentityKey = identityFacts.machines[0].identityKey;
   const db = new DatabaseSync(databasePath);
   chmodSync(databasePath, 0o600);
   try {
     db.exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE");
     runLcmMigrations(db, { fts5Available: false });
-    initializePortableArchive(db);
     const f = SQLITE_PORTABLE_FIXTURE;
     const t = f.timestamp.replace("T", " ").replace("Z", "");
-    const machine = input.identityFacts.machines[0].identityKey;
-    const fingerprint = independentSha256(["lcm-portable-conversation-value-v1", f.sessionId, "SQLite source", null, f.timestamp, f.timestamp]);
-    const conversationIdentity = independentIdentity("conversations", [fingerprint, integer(0)]);
-    const messageIdentity = independentIdentity("messages", [conversationIdentity, integer(9007199254740993n)]);
-    const transcriptIdentity = independentIdentity("native-transcripts", [machine, f.ingestKey]);
-    const archive = (domain: string, ordinal: number, fields: Record<string, SQLInputValue>) => {
-      const columns = Object.keys(fields);
-      db.prepare(`INSERT INTO portable_archive_${domain.replaceAll("-", "_")}
-        (_ordinal,_identity_sha256,${columns.map(column => `"${column}"`).join(",")})
-        VALUES(?,?,${columns.map(() => "?").join(",")})`).run(
-        ordinal, independentSha256(["independent-native-sqlite-fixture", domain, ordinal]), ...Object.values(fields),
-      );
-    };
     db.exec("BEGIN");
-    for (const [ordinal, value] of input.identityFacts.machines.entries()) archive("machines", ordinal, { ...value });
-    archive("project", 0, { ...input.projectIdentity });
-    for (const [ordinal, value] of input.identityFacts.aliases.entries()) archive("project-aliases", ordinal, { ...value });
     db.prepare("INSERT INTO conversations(conversation_id,session_id,title,created_at,updated_at) VALUES(71,?,'SQLite source',?,?)").run(f.sessionId, t, t);
     db.prepare("INSERT INTO messages(message_id,conversation_id,seq,role,content,token_count,created_at) VALUES(83,71,?,'assistant','SQLite source message',?,?)").run(9007199254740993n, 9007199254740995n, t);
     db.prepare(`INSERT INTO message_parts(part_id,message_id,session_id,part_type,ordinal,text_content,
@@ -74,37 +99,60 @@ export function seedPortableSqlite(databasePath: string, input: {
     db.exec("INSERT INTO summary_messages VALUES('sqlite-leaf',83,0); INSERT INTO summary_parents VALUES('sqlite-parent','sqlite-leaf',0)");
     db.prepare("INSERT INTO context_items VALUES(71,0,'message',83,NULL,?),(71,1,'summary',NULL,'sqlite-parent',?)").run(t, t);
     db.prepare(`INSERT INTO promoted(id,content,tags,metadata,source_summary_id,project_id,session_id,depth,confidence,created_at,archived_at)
-      VALUES(?,?,'["same","","same"]','{"nested":{"ok":true},"ordinal":2}','orphan-summary',?,?,1,0.75,?,?)`).run(f.memoryId, f.content, input.projectIdentity.projectId, f.sessionId, t, t);
+      VALUES(?,?,'["same","","same"]','{"nested":{"ok":true},"ordinal":2}','orphan-summary',?,?,1,0.75,?,?)`).run(f.memoryId, f.content, sourceLocalProjectId, f.sessionId, t, t);
     db.prepare("INSERT INTO recall_surfacing(memory_id,session_id,surfaced_at) VALUES('orphan-memory',NULL,?),('orphan-memory',NULL,?)").run(t, t);
-    db.prepare("INSERT INTO redaction_stats VALUES(?,'gitleaks',?)").run(input.projectIdentity.projectId, 9223372036854775807n);
+    db.prepare("INSERT INTO redaction_stats VALUES(?,'gitleaks',?)").run(sourceLocalProjectId, 9223372036854775807n);
     db.prepare("INSERT INTO session_ingest_log(session_id,completed_at,message_count) VALUES(?,?,?)").run(f.sessionId, t, 9007199254740993n);
-    for (const [ordinal, value] of input.identityFacts.machines.entries()) archive("session-instructions", ordinal, {
-      machineIdentityKey: value.identityKey, scopeHash: f.scopeHash, clientName: "codex", sessionId: f.sessionId,
-      worktreePath: "/portable/sqlite", cwdPath: "/portable/sqlite/src", content: `instructions ${ordinal}`,
-      contentHash: "c".repeat(64), updatedAt: f.timestamp,
-    });
-    archive("native-transcripts", 0, {
-      machineIdentityKey: machine, clientName: "codex", formatName: "jsonl", formatVersion: "1",
-      nativeSessionId: f.sessionId, sourceLocator: f.sourceLocator, sourceOrdinal: 1n,
-      observedAt: f.timestamp, ingestedAt: f.timestamp, scrubberVersion: "1", contentSha256: "b".repeat(64),
-      ingestKey: f.ingestKey, nativePayload: '{"role":"assistant","content":["scrubbed","native"]}',
-    });
-    archive("native-transcript-message-links", 0, {
-      machineIdentityKey: machine, ingestKey: f.ingestKey, sourceOrdinal: 0n,
-      conversationIdentitySha256: conversationIdentity, messageIdentitySha256: messageIdentity,
-      _transcript_identity_sha256: transcriptIdentity,
-    });
-    archive("native-transcript-checkpoints", 0, {
-      machineIdentityKey: machine, clientName: "codex", sourceLocator: f.sourceLocator, revision: 9007199254740991n,
-      lastSourceOrdinal: 9007199254740993n, importedCount: 9007199254740993n, skippedCount: 2n,
-      quarantinedCount: 1n, checkpoint: '{"cursor":"exact","nested":{"offset":"9007199254740993"}}', updatedAt: f.timestamp,
-    });
-    for (const [ordinal, disposition] of ["pending", "applied", "quarantined"].entries()) archive("passive-events", ordinal, {
-      machineIdentityKey: machine, eventId: `55555555-5555-4555-8555-55555555555${ordinal}`,
-      eventVersion: 1n, machineSequence: 9007199254740993n + BigInt(ordinal), eventType: "user_prompt",
-      sessionId: f.sessionId, sessionSequence: BigInt(ordinal), category: "prompt", data: '{"safe":true}',
-      priority: 0n, sourceHook: "UserPromptSubmit", createdAt: f.timestamp, disposition,
-    });
+    db.prepare(`INSERT INTO promoted(id,content,tags,metadata,project_id,session_id,depth,confidence,created_at)
+      VALUES(?,'Active own SQLite memory','["own"]','{}',?,?,0,1,?),
+      (?,'External SQLite provenance','["external"]','{}',?,?,0,1,?)`).run(
+      f.ownProjectMemoryId, sourceLocalProjectId, f.sessionId, t,
+      f.externalMemoryId, f.externalProjectId, f.sessionId, t);
+    db.prepare("INSERT INTO session_instruction_cache VALUES(?,?,?,?,?,?,?,?,?)").run(
+      sourceLocalProjectId, f.scopeHash, "codex", f.sessionId, "/portable/sqlite", "/portable/sqlite/src",
+      "main instructions", "c".repeat(64), t);
+    db.prepare("INSERT INTO runtime_native_transcripts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      "sqlite-transcript", sourceLocalProjectId, "local", "codex", "jsonl", "1", f.sessionId, f.sourceLocator,
+      1n, t, t, "1", "b".repeat(64), f.ingestKey, '{"role":"assistant","content":["scrubbed","native"]}');
+    db.prepare("INSERT INTO runtime_native_transcript_messages VALUES(?,?,71,83,0)").run(sourceLocalProjectId, "sqlite-transcript");
+    db.prepare("INSERT INTO runtime_native_ingest_checkpoints VALUES(?,?,?,?,?,?,?,?,?,?,?)").run(
+      sourceLocalProjectId, "local", "codex", f.sourceLocator, 9007199254740991n, 9007199254740993n,
+      9007199254740993n, 2n, 1n, '{"cursor":"exact","nested":{"offset":"9007199254740993"}}', t);
     db.exec("COMMIT");
   } finally { db.close(); }
+  const capturedFile = (path: string, machineKey: string, seed: (connection: DatabaseSync) => void) => {
+    const connection = new DatabaseSync(path);
+    try { connection.exec("PRAGMA journal_mode=DELETE"); seed(connection); } finally { connection.close(); }
+    chmodSync(path, 0o600);
+    return { databasePath: path, machineIdentityKey: machineKey,
+      expectedFileSha256: createHash("sha256").update(readFileSync(path)).digest("hex") };
+  };
+  const f = SQLITE_PORTABLE_FIXTURE;
+  const t = f.timestamp.replace("T", " ").replace("Z", "");
+  const instructions = input.identityFacts.machines.map((machine, ordinal) => capturedFile(
+    `${databasePath}.instructions-${ordinal}.sqlite`, machine.identityKey, connection => {
+      connection.exec(instructionsSql);
+      connection.prepare("INSERT INTO session_instruction_cache VALUES(?,?,?,?,?,?,?,?,?)").run(
+        sourceLocalProjectId, createHash("sha256").update(`sidecar-scope-${ordinal}`).digest("hex"), "codex",
+        f.sessionId, "/portable/sqlite", "/portable/sqlite/src", `sidecar instructions ${ordinal}`, "c".repeat(64), t);
+    }));
+  const events = capturedFile(`${databasePath}.events.sqlite`, machineIdentityKey, connection => {
+    connection.exec(eventsSql); connection.exec(eventMetadataSql);
+    for (const [ordinal, state] of ["pending", "acknowledged", "quarantined"].entries()) {
+      connection.prepare(`INSERT INTO events(event_uuid,event_version,machine_id,machine_sequence,session_id,seq,
+        type,category,data,priority,source_hook,created_at,delivery_state,remote_inbox_id,acknowledged_at,quarantine_reason)
+        VALUES(?,1,?,?,?,?, 'user_prompt','prompt','{"safe":true}',0,'UserPromptSubmit',?,?,?,?,?)`).run(
+        `55555555-5555-4555-8555-55555555555${ordinal}`, identityFacts.machines[0].machineId,
+        String(9007199254740993n + BigInt(ordinal)).padStart(19, "0"), f.sessionId, ordinal, t, state,
+        state === "acknowledged" ? "remote-inbox" : null, state === "acknowledged" ? t : null,
+        state === "quarantined" ? "fixture quarantine" : null);
+    }
+  });
+  // The facts hash uses the same frozen canonical JSON representation as source
+  // admission, independently encoded here by sorting object keys recursively.
+  const sorted = (value: unknown): unknown => Array.isArray(value) ? value.map(sorted)
+    : value !== null && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, item]) => [key, sorted(item)])) : value;
+  return { sourceLocalProjectId, identityFacts, machineIdentityKey,
+    expectedFactsSha256: createHash("sha256").update(JSON.stringify(sorted(identityFacts))).digest("hex"),
+    capturedSidecars: { instructions, events } };
 }

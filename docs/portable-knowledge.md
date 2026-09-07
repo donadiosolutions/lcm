@@ -97,3 +97,7 @@ are absent from knowledge version 1. It is a reusable internal/library transfer
 surface, not a replacement for `lcm export` or a CLI cutover command. Knowledge
 export/import does not perform database migration, publication, fencing, cutover,
 or rollback orchestration.
+
+`lcm import-knowledge --dry-run` reports valid entries separately from entries
+skipped during document validation. It performs no storage writes and does not
+claim that invalid entries would be imported.

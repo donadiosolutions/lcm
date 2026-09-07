@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as filesystem from "node:fs";
+import * as filePromises from "node:fs/promises";
 import { PortableIndex } from "../../src/storage/portable-index.js";
 import { chmodSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,6 +17,7 @@ import { openSqlitePortableDestination } from "../../src/storage/sqlite/portable
 import { runPortableTransfer, PortableTransferError } from "../../src/storage/portable-transfer.js";
 import { buildRecords, independentSha256, integer, postgresGeneration } from "../fixtures/portable-records.js";
 
+vi.mock("node:fs/promises", async importOriginal => ({...await importOriginal<typeof import("node:fs/promises")>()}));
 vi.mock("node:fs", async importOriginal => ({...await importOriginal<typeof import("node:fs")>()}));
 
 const eventsSql = `CREATE TABLE events (
@@ -115,6 +117,126 @@ afterEach(async () => {
 },60000);
 
 describe("SQLite supplied canonical generation", () => {
+  it.each(["main", "sidecar"])("refuses UTF16 %s capture before decoding text as UTF8",async kind=>{
+    const legacy=capturedSidecar(db=>{db.exec("PRAGMA encoding='UTF-16le'");if(kind==="main")runLcmMigrations(db,{fts5Available:false});else db.exec(instructionsSql);});
+    if(kind==="main")await expect(open(legacy)).rejects.toMatchObject({code:"unsupported-capability"});
+    else await expect(open(fixture(),{capturedSidecars:{events:{absent:true,evidenceSha256:"f".repeat(64)},instructions:[{databasePath:legacy.path,expectedFileSha256:sqlitePortableFileSha256(legacy.path),machineIdentityKey:"local-machine"}]}})).rejects.toMatchObject({code:"unsupported-capability"});
+  });
+
+  it("requires an explicit native scope for shared sources even with legacy facts",async()=>{
+    await expect(open(fixture(),{projectIdentity:postgresGeneration().projectIdentity})).rejects.toMatchObject({code:"unsupported-capability"});
+  });
+
+  it("refuses a source-local remap for an already canonical archive",async()=>{
+    const evidence={...facts,sourceLocalProjectId:identity.projectId};
+    await expect(open(fixture(db=>initializePortableArchive(db)),{projectIdentity:postgresGeneration().projectIdentity,sourceLocalProjectId:identity.projectId,identityFacts:evidence,expectedFactsSha256:canonicalSha256(evidence)})).rejects.toMatchObject({code:"unsupported-capability"});
+  });
+
+  it("refuses runtime native records in a recovery archive with matching scope",async()=>{
+    await expect(open(fixture(db=>{initializePortableArchive(db);native(db);}))).rejects.toMatchObject({code:"unsupported-capability"});
+  });
+
+  it.each(["content", "checkpoint", "native payload", "native key"])("rejects malformed UTF8 in captured %s without changing its bytes",async kind=>{
+    const file=fixture(db=>{instructions(db);native(db);
+      if(kind==="content")db.exec("UPDATE session_instruction_cache SET content=CAST(X'80' AS TEXT)");
+      if(kind==="checkpoint")db.exec("UPDATE runtime_native_ingest_checkpoints SET checkpoint=CAST(X'7b2278223a2280227d' AS TEXT)");
+      if(kind==="native payload")db.exec("UPDATE runtime_native_transcripts SET native_payload=CAST(X'7b2278223a2280227d' AS TEXT)");
+      if(kind==="native key")db.exec("UPDATE runtime_native_ingest_checkpoints SET source_locator=CAST(X'80' AS TEXT)");
+    });
+    const before=readFileSync(file.path);
+    await expect(open(file)).rejects.toMatchObject({code:"unsupported-capability"});
+    expect(readFileSync(file.path)).toEqual(before);
+  });
+
+  it("preserves literal replacement characters and BOMs in captured scalar and JSON values",async()=>{
+    const file=fixture(db=>{instructions(db);native(db);db.prepare("UPDATE session_instruction_cache SET content=?").run("\uFEFF\uFFFD");db.prepare("UPDATE runtime_native_ingest_checkpoints SET checkpoint=?").run(JSON.stringify({value:"\uFFFD"}));});
+    const source=await open(file);
+    expect((await source.readDomainPage(page("session-instructions"))).records[0].value.content).toBe("\uFEFF\uFFFD");
+    expect((await source.readDomainPage(page("native-transcript-checkpoints"))).records[0].value.checkpoint).toEqual({value:"\uFFFD"});
+  });
+
+  it("opens checkpointed WAL-mode main and supplied sidecars without creating files",async()=>{
+    const main=fixture(db=>{instructions(db);db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)");});
+    const cache=capturedSidecar(db=>{db.exec(instructionsSql);instructions(db);db.exec("UPDATE session_instruction_cache SET scope_hash='"+"c".repeat(64)+"'");db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)");});
+    const events=capturedSidecar(db=>{db.exec(eventsSql+";"+eventMetadataSql);db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)");});
+    const scratch=mkdtempSync(join(tmpdir(),"lcm-immutable-source-scratch-"));dirs.push(scratch);
+    const files=[main,cache,events];const bytes=files.map(file=>readFileSync(file.path));const entries=files.map(file=>readdirSync(file.dir));
+    const source=await open(main,{scratchParent:scratch,capturedSidecars:{events:{databasePath:events.path,expectedFileSha256:sqlitePortableFileSha256(events.path),machineIdentityKey:"local-machine"},instructions:[{databasePath:cache.path,expectedFileSha256:sqlitePortableFileSha256(cache.path),machineIdentityKey:"local-machine"}]}});
+    await source.readDomainPage(page("session-instructions"));await source.close();
+    for(const [n,file] of files.entries()){expect(readFileSync(file.path)).toEqual(bytes[n]);expect(readdirSync(file.dir)).toEqual(entries[n]);}
+  });
+
+  it("binds a real local source scope separately from the shared canonical identity", async () => {
+    const projectIdentity=postgresGeneration().projectIdentity;
+    const boundFacts={...facts,sourceLocalProjectId:identity.projectId};
+    const file=fixture(db=>{native(db);instructions(db);db.prepare("INSERT INTO redaction_stats VALUES(?,?,?)").run(identity.projectId,"gitleaks",7);
+      db.prepare("INSERT INTO promoted(id,content,tags,metadata,project_id,depth,confidence,created_at) VALUES(?,?,'[]','{}',?,0,1,'2026-09-06 00:00:00')").run("33333333-3333-4333-8333-333333333333","own memory",identity.projectId);
+    });
+    const source=await open(file,{projectIdentity,sourceLocalProjectId:identity.projectId,identityFacts:boundFacts,expectedFactsSha256:canonicalSha256(boundFacts)});
+    for(const domain of ["native-transcripts","native-transcript-checkpoints","session-instructions","redaction-counters"] as const) expect((await source.readDomainPage(page(domain))).records).toHaveLength(1);
+    expect((await source.readDomainPage(page("project"))).records[0].value).toEqual({identity:projectIdentity});
+    expect((await source.readDomainPage(page("promoted-memories"))).records[0].value.sourceProjectId).toBeNull();
+  });
+
+  it.each(["missing", "unbound", "mismatched", "malformed"])("refuses an unauthenticated shared source-local scope: %s",async kind=>{
+    const sourceLocalProjectId=kind==="malformed" ? "wrong" : identity.projectId;
+    const boundFacts={...facts,sourceLocalProjectId:kind==="mismatched" ? "b".repeat(64) : sourceLocalProjectId};
+    await expect(open(fixture(),{projectIdentity:postgresGeneration().projectIdentity,
+      ...(kind==="missing"?{}:{sourceLocalProjectId}),identityFacts:kind==="unbound"?facts:boundFacts,
+      expectedFactsSha256:canonicalSha256(kind==="unbound"?facts:boundFacts)})).rejects.toBeInstanceOf(PortableTransferError);
+  });
+
+  it("refuses mismatched native project scope instead of emitting an empty domain",async()=>{
+    const file=fixture(db=>{native(db);db.prepare("UPDATE runtime_native_transcripts SET project_id=?").run("b".repeat(64));});
+    await expect(open(file)).rejects.toMatchObject({code:"unsupported-capability"});
+  });
+
+  it.each(["main", "sidecar"])("refuses a nonempty %s instruction capture with no admitted scope",async kind=>{
+    const main=fixture(db=>{if(kind==="main")instructions(db,"b".repeat(64));});
+    const cache=capturedSidecar(db=>{db.exec(instructionsSql);instructions(db,"b".repeat(64));});
+    await expect(open(main,kind==="main"?{}:{capturedSidecars:{events:{absent:true,evidenceSha256:"f".repeat(64)},instructions:[{databasePath:cache.path,expectedFileSha256:sqlitePortableFileSha256(cache.path),machineIdentityKey:"local-machine"}]}})).rejects.toMatchObject({code:"unsupported-capability"});
+  });
+
+  it("refuses a cached checkpoint whose private prefix evidence is absent",async()=>{
+    const source=await open(fixture(db=>conversations(db,2)));const stream=await createPortableRecordStream(source);
+    const checkpoint=(await stream.readBatch({domain:"conversations",maxRecords:1,maxBytes:4096})).checkpoint;
+    const original=PortableIndex.prototype.getScope;
+    vi.spyOn(PortableIndex.prototype,"getScope").mockImplementation(function(namespace,key){return namespace==="source-boundary"?null:original.call(this,namespace,key);});
+    expect(await source.verifySource({...source.describeSource(),boundary:checkpoint})).toBe("changed");
+  });
+
+  it("refuses cached record digest drift during actual point reads",async()=>{
+    const source=await open(fixture(db=>conversations(db,1)));
+    const original=PortableIndex.prototype.getScope;
+    vi.spyOn(PortableIndex.prototype,"getScope").mockImplementation(function(namespace,key){return namespace==="source-record-digest"?"0".repeat(64):original.call(this,namespace,key);});
+    await expect(source.readDomainPage(page("conversations"))).rejects.toMatchObject({code:"source-changed"});
+  });
+
+  it("performs full final source authentication before releasing a changed capture",async()=>{
+    const file=fixture();const source=await open(file);const bytes=readFileSync(file.path);bytes[60]^=1;writeFileSync(file.path,bytes);
+    await expect(source.close()).rejects.toMatchObject({code:"source-changed"});
+    expect(readdirSync(file.dir)).toEqual(["source.db"]);
+  });
+
+  it("authenticates many successive checkpoint prefixes without rescanning earlier source records",async()=>{
+    const source=await open(fixture(db=>conversations(db,60)));
+    const stream=await createPortableRecordStream(source);
+    const description=source.describeSource();
+    const checkpoints=[];
+    let checkpoint;
+    for(let n=0;n<60;n++){
+      const batch=await stream.readBatch({domain:"conversations",maxRecords:1,maxBytes:PORTABLE_LIMITS.maxBatchBytes,...(checkpoint?{checkpoint}:{})});
+      checkpoint=batch.checkpoint;
+      checkpoints.push(checkpoint);
+    }
+    const spy=vi.spyOn(DatabaseSync.prototype,"prepare");
+    const fileReads=vi.spyOn(filePromises,"open");
+    for(const boundary of checkpoints)expect(await source.verifySource({...description,boundary})).toBe("unchanged");
+    expect(spy.mock.calls.length).toBeLessThan(120);
+    expect(fileReads).not.toHaveBeenCalled();
+    expect(await source.verifySource({...description,boundary:{...checkpoints[29],prefixSha256:"0".repeat(64)}})).toBe("changed");
+  },30000);
+
   it("roundtrips all 22 real runtime and archive domains with exact values, relationships and hashes", async () => {
     // The fixture's default digest belongs to its declared backend dialect. Supply
     // the production closure vocabulary using the independent fixture encoder.
@@ -371,7 +493,7 @@ describe("SQLite supplied canonical generation", () => {
 
   it("rejects a native/cache row disappearing between bounded metadata and point reads",async()=>{
     const file=fixture(db=>instructions(db));const original=DatabaseSync.prototype.prepare;
-    vi.spyOn(DatabaseSync.prototype,"prepare").mockImplementation(function(sql){const statement=original.call(this,sql);if(sql.startsWith("SELECT s.scope_hash AS scope_hash"))vi.spyOn(statement,"get").mockReturnValue(undefined);return statement;});
+    vi.spyOn(DatabaseSync.prototype,"prepare").mockImplementation(function(sql){const statement=original.call(this,sql);if(sql.includes("FROM (SELECT s.scope_hash AS scope_hash"))vi.spyOn(statement,"get").mockReturnValue(undefined);return statement;});
     await expect(open(file)).rejects.toMatchObject({code:"source-changed"});
   });
 
@@ -381,7 +503,7 @@ describe("SQLite supplied canonical generation", () => {
     expect((await (await open(file)).readDomainPage(page("conversations"))).records).toHaveLength(2);
   });
 
-  it.each(["missing trigger","extra run","oversized manifest","checkpoint shape","checkpoint element","checkpoint order","missing receipt","unready"])("rejects altered imported generation evidence: %s",async kind=>{
+  it.each(["missing trigger","extra run","oversized manifest","oversized checkpoints","oversized identity","checkpoint shape","checkpoint element","checkpoint order","missing receipt","unready"])("rejects altered imported generation evidence: %s",async kind=>{
     const main=fixture(db=>conversations(db,1));const source=await createPortableRecordStream(await open(main));const target=join(main.dir,"target.db");
     const writer=await openSqlitePortableDestination({databasePath:target,projectIdentity:identity,generationIdentitySha256:"b".repeat(64),mode:"create",scratchParent:main.dir});
     await runPortableTransfer({source,destination:writer});
@@ -389,7 +511,9 @@ describe("SQLite supplied canonical generation", () => {
     try{
       if(kind === "missing trigger")db.exec("DROP TRIGGER transfer_batches_no_delete");
       if(kind === "extra run")db.prepare("INSERT INTO transfer_runs SELECT ?,project_json,?,manifest_json,source_identity,source_witness,checkpoints_json,schema_ready,complete FROM transfer_runs").run("c".repeat(64),"d".repeat(64));
-      if(kind === "oversized manifest")db.prepare("UPDATE transfer_runs SET manifest_json=?").run("x".repeat(4*PORTABLE_LIMITS.maxControlBytes));
+      if(kind === "oversized manifest")db.prepare("UPDATE transfer_runs SET manifest_json=manifest_json||?").run(" ".repeat(PORTABLE_LIMITS.maxControlBytes));
+      if(kind === "oversized checkpoints")db.prepare("UPDATE transfer_runs SET checkpoints_json=checkpoints_json||?").run(" ".repeat(PORTABLE_LIMITS.maxControlBytes));
+      if(kind === "oversized identity")db.prepare("UPDATE transfer_runs SET project_json=?").run("x".repeat(4*PORTABLE_LIMITS.maxControlBytes));
       if(kind === "unready")db.exec("UPDATE transfer_runs SET schema_ready=0");
       if(kind.startsWith("checkpoint")){
         const checkpoints=JSON.parse(String(db.prepare("SELECT checkpoints_json FROM transfer_runs").get()!.checkpoints_json));

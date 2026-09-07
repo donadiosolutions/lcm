@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
-import { open as openFile } from "node:fs/promises";
+import { closeSync, openSync, readSync } from "node:fs";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import type { SQLInputValue, SQLOutputValue } from "node:sqlite";
-import { dirname, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { resolve } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+import { createCapturedSqliteAuthority, openCapturedSqliteDatabase, type CapturedSqliteAuthority } from "./portable-capture.js";
+import { decodeSqliteUtf8Row, sqliteUtf8Projection } from "./portable-utf8.js";
 import {
   PORTABLE_LIMITS, PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_RECORD_SCHEMA_SHA256, canonicalJson, canonicalSha256,
   createPortableRecord, serializePortableRecord,
@@ -23,6 +24,7 @@ import { iterateSqliteSidecarDomainRows, readSqliteSidecarDomainRow, validateSql
 import type { SqliteRawDomainRow } from "./portable-runtime-mapping.js";
 
 export interface SqlitePortableIdentityFacts {
+  readonly sourceLocalProjectId?: string;
   readonly machines: readonly Readonly<{identityKey:string;machineId:string|null}>[];
   readonly aliases: readonly Readonly<{machineIdentityKey:string;path:string;normalizedPath:string}>[];
 }
@@ -45,6 +47,8 @@ export interface SqlitePortableRecordSource extends PortableRecordSource {
 export interface OpenSqlitePortableSourceInput {
   readonly databasePath: string;
   readonly projectIdentity: PortableProjectIdentity;
+  /** Native SQLite scope authenticated by identityFacts; distinct from a shared canonical UUID. */
+  readonly sourceLocalProjectId?: string;
   readonly expectedFileSha256: string;
   /** Explicit captured identity facts, never discovered from the live installation. */
   readonly identityFacts?: SqlitePortableIdentityFacts;
@@ -137,6 +141,7 @@ const sourceTriggers: Readonly<Record<string,string>> = {
   "transfer_batches_no_update": "CREATE TRIGGER transfer_batches_no_update BEFORE UPDATE ON transfer_batches BEGIN SELECT RAISE(ABORT,'immutable receipt');END"
 };
 export function validateSqlitePortableSchema(db: DatabaseSync): void {
+  if(db.prepare("PRAGMA encoding").get()?.encoding!=="UTF-8")throw new PortableTransferError("unsupported-capability");
   if (db.prepare("PRAGMA user_version").get()?.user_version !== 0) throw new PortableTransferError("unsupported-capability");
   const seen = new Set<string>();
   const seenTriggers = new Set<string>();
@@ -174,10 +179,7 @@ export function validateSqlitePortableSchema(db: DatabaseSync): void {
 }
 
 interface SourceAuthority {
-  readonly path: string;
-  readonly dev: number;
-  readonly ino: number;
-  readonly expected: string;
+  readonly capture: CapturedSqliteAuthority;
   active: boolean;
 }
 const authorities = new WeakMap<object, SourceAuthority>();
@@ -195,17 +197,6 @@ function authority(token: object, signal?: AbortSignal): SourceAuthority {
   if (!state?.active) throw new PortableTransferError("source-failed");
   return state;
 }
-function checkFile(state: SourceAuthority): void {
-  const stat = lstatSync(state.path);
-  const parent = lstatSync(dirname(state.path));
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.dev !== state.dev || stat.ino !== state.ino
-    || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0
-    || parent.uid !== stat.uid || (parent.mode & 0o077) !== 0
-    || realpathSync(state.path) !== state.path
-    || (existsSync(`${state.path}-wal`) && lstatSync(`${state.path}-wal`).size > 0)) {
-    throw new PortableTransferError("source-changed");
-  }
-}
 function changed(state: SourceAuthority, error: unknown): never {
   if (error instanceof PortableTransferError && error.code === "aborted") throw error;
   state.active = false;
@@ -214,33 +205,15 @@ function changed(state: SourceAuthority, error: unknown): never {
 function assertAuthority(token: object): void {
   const state = authority(token);
   try {
-    checkFile(state);
-    if (sqlitePortableFileSha256(state.path) !== state.expected) throw new PortableTransferError("source-changed");
+    state.capture.checkSync();
   } catch (error) { changed(state, error); }
 }
 /** Async operations hash in bounded I/O chunks so cancellation can arrive during verification. */
-async function assertAuthorityAsync(token: object, signal?: AbortSignal): Promise<void> {
+async function assertAuthorityAsync(token: object, signal?: AbortSignal, forceHash = false): Promise<void> {
   const state = authority(token, signal);
   try {
-    checkFile(state);
-    const file = await openFile(state.path, "r");
-    let digest: string;
-    try {
-      const stat = await file.stat();
-      if (stat.dev !== state.dev || stat.ino !== state.ino) throw new PortableTransferError("source-changed");
-      const hash = createHash("sha256");
-      const buffer = Buffer.alloc(64 * 1024);
-      for (;;) {
-        abort(signal);
-        const { bytesRead } = await file.read(buffer, 0, buffer.length, null);
-        if (bytesRead === 0) break;
-        hash.update(buffer.subarray(0, bytesRead));
-      }
-      digest = hash.digest("hex");
-    } finally { await file.close(); }
+    await state.capture.check(signal,forceHash);
     authority(token, signal);
-    checkFile(state);
-    if (digest !== state.expected) throw new PortableTransferError("source-changed");
   } catch (error) { changed(state, error); }
 }
 
@@ -253,7 +226,8 @@ function snapshotFacts(input: SqlitePortableIdentityFacts, expectedHash: string 
   let bytes = 0;
   const shapes = [[input.machines, ["identityKey", "machineId"]],
     [input.aliases, ["machineIdentityKey", "path", "normalizedPath"]]] as const;
-  if (Object.keys(input).length !== 2) throw new PortableTransferError("invalid-input");
+  if (Object.keys(input).length !== (input.sourceLocalProjectId === undefined ? 2 : 3)
+    || (input.sourceLocalProjectId !== undefined && !/^[a-f0-9]{64}$/.test(input.sourceLocalProjectId))) throw new PortableTransferError("invalid-input");
   for (const [values, keys] of shapes) {
     for (const value of values) {
       if (Object.keys(value).length !== keys.length) throw new PortableTransferError("invalid-input");
@@ -323,22 +297,23 @@ function* capturedRows(db: DatabaseSync, domain: CapturedDomain, projectId: stri
     const predicate = point !== undefined ? ` AND ${pointWhere}`
       : after === undefined ? "" : ` AND (${keySql.join(",")}) > (${keys.map(() => "?").join(",")})`;
     const metaColumns = keys.map((key, index) => `CASE WHEN ${byteLength}<=${PORTABLE_LIMITS.maxRecordBytes} THEN ${keySql[index]} END AS ${key}`);
-    const statement = db.prepare(`SELECT ${metaColumns.join(",")},${byteLength} AS _bytes${extraMeta} FROM ${from}
-      WHERE s.project_id=?${predicate} ORDER BY ${keySql.join(",")} LIMIT ${point === undefined ? 500 : 1}`);
+    const statement = db.prepare(`SELECT ${sqliteUtf8Projection(keys)},_bytes${domain === "native-transcripts" ? ",_metadata_bytes,_payload_bytes" : ""} FROM (SELECT ${metaColumns.join(",")},${byteLength} AS _bytes${extraMeta} FROM ${from}
+      WHERE s.project_id=?${predicate} ORDER BY ${keySql.join(",")} LIMIT ${point === undefined ? 500 : 1})`);
     statement.setReadBigInts(true);
     let count = 0;
-    for (const meta of statement.iterate(projectId, ...(point ?? after ?? []))) {
+    for (const rawMeta of statement.iterate(projectId, ...(point ?? after ?? []))) {
+      const meta=decodeSqliteUtf8Row(rawMeta,keys);
       if (BigInt(meta._bytes as bigint) > BigInt(PORTABLE_LIMITS.maxRecordBytes)) throw new PortableTransferError("unsupported-capability");
       if (domain === "native-transcripts" && (BigInt(meta._metadata_bytes as bigint) > BigInt(PORTABLE_LIMITS.maxControlBytes)
         || BigInt(meta._payload_bytes as bigint) > 100n * 1024n * 1024n)) throw new PortableTransferError("unsupported-capability");
       const values = keys.map(key => meta[key]);
       if (!content) {
-        content = db.prepare(`SELECT ${projection} FROM ${from} WHERE s.project_id=? AND ${pointWhere}`);
+        content = db.prepare(`SELECT ${sqliteUtf8Projection(fields.map(([name])=>name))} FROM (SELECT ${projection} FROM ${from} WHERE s.project_id=? AND ${pointWhere})`);
         content.setReadBigInts(true);
       }
       const row = content.get(projectId, ...values);
       if (row === undefined) throw new PortableTransferError("source-changed");
-      yield row;
+      yield decodeSqliteUtf8Row(row,fields.map(([name])=>name));
       after = values;
       count++;
     }
@@ -356,24 +331,24 @@ export async function openSqlitePortableSource(input:OpenSqlitePortableSourceInp
   let index:ReturnType<typeof createPortableIndex>|undefined;
   const token=Object.freeze({});
   const tokens: object[] = [token];
-  const sidecars: { connection: DatabaseSync; domain: "passive-events" | "session-instructions"; identity: { projectIdentity: PortableProjectIdentity; machineIdentityKey: string; machineId: string | null } }[] = [];
+  const sidecars: { connection: DatabaseSync; domain: "passive-events" | "session-instructions"; identity: { projectIdentity: PortableProjectIdentity; machineIdentityKey: string; machineId: string | null; sourceLocalProjectId: string } }[] = [];
   function revoke(): void { for (const item of tokens) { const state=authorities.get(item); if(state) state.active=false; } }
   function guardSync(): void {
     try { for (const item of tokens) assertAuthority(item); }
     catch (error) { revoke(); throw error; }
   }
-  async function guard(signal?: AbortSignal): Promise<void> {
-    try { for (const item of tokens) await assertAuthorityAsync(item,signal); }
+  async function guard(signal?: AbortSignal,forceHash=false): Promise<void> {
+    try { for (const item of tokens) await assertAuthorityAsync(item,signal,forceHash); }
     catch (error) { if (!(error instanceof PortableTransferError && error.code === "aborted")) revoke(); throw error; }
   }
   const { databasePath, expectedFileSha256, expectedFactsSha256, capturedAt, scratchParent, signal, machineIdentityKey } = input;
   try {
     if(databasePath.includes("\0") || machineIdentityKey?.includes("\0"))throw new PortableTransferError("unsupported-capability");
     if(!/^[0-9a-f]{64}$/.test(expectedFileSha256)||!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/.test(capturedAt))throw new PortableTransferError("invalid-input");
-    const path=resolve(databasePath);const stat=lstatSync(path);
-    authorities.set(token,{path,dev:stat.dev,ino:stat.ino,expected:expectedFileSha256,active:true});
+    const path=resolve(databasePath);
+    authorities.set(token,{capture:createCapturedSqliteAuthority(path,expectedFileSha256),active:true});
     await assertAuthorityAsync(token,signal);
-    db=new DatabaseSync(path,{readOnly:true});
+    db=openCapturedSqliteDatabase(path);
     db.exec("PRAGMA query_only=ON; BEGIN");
     db.prepare("SELECT count(*) FROM sqlite_master").get();
     await assertAuthorityAsync(token,signal);
@@ -383,6 +358,20 @@ export async function openSqlitePortableSource(input:OpenSqlitePortableSourceInp
     if(input.identityFacts!==undefined) facts=snapshotFacts(input.identityFacts,expectedFactsSha256);
     validateSqlitePortableSchema(connection);
     const archive=tableExists(connection,"portable_archive_project");
+    const sourceLocalProjectId=input.sourceLocalProjectId ?? identity.projectId;
+    if(input.sourceLocalProjectId!==undefined && (!/^[a-f0-9]{64}$/.test(input.sourceLocalProjectId)
+      || facts?.sourceLocalProjectId!==input.sourceLocalProjectId))throw new PortableTransferError("unsupported-capability");
+    if(facts?.sourceLocalProjectId!==undefined && facts.sourceLocalProjectId!==sourceLocalProjectId)throw new PortableTransferError("unsupported-capability");
+    if(!archive && identity.scope==="shared" && input.sourceLocalProjectId===undefined)throw new PortableTransferError("unsupported-capability");
+    if(archive && sourceLocalProjectId!==identity.projectId)throw new PortableTransferError("unsupported-capability");
+    for(const table of ["redaction_stats","runtime_native_transcripts","runtime_native_transcript_messages","runtime_native_ingest_checkpoints"]){
+      if(tableExists(connection,table) && connection.prepare(`SELECT 1 FROM ${table} WHERE project_id<>? LIMIT 1`).get(sourceLocalProjectId)!==undefined)throw new PortableTransferError("unsupported-capability");
+    }
+    function validateCacheScope(handle:DatabaseSync):void {
+      if(handle.prepare("SELECT 1 FROM session_instruction_cache LIMIT 1").get()!==undefined
+        && handle.prepare("SELECT 1 FROM session_instruction_cache WHERE project_id=? LIMIT 1").get(sourceLocalProjectId)===undefined)throw new PortableTransferError("unsupported-capability");
+    }
+    validateCacheScope(connection);
     if(!archive&&!facts)throw new PortableTransferError("unsupported-capability");
     if(archive){
       for(const table of ["session_instruction_cache","runtime_native_transcripts","runtime_native_transcript_messages","runtime_native_ingest_checkpoints"]){
@@ -431,22 +420,26 @@ export async function openSqlitePortableSource(input:OpenSqlitePortableSourceInp
       for (const descriptor of descriptors) {
         if (seen.has(descriptor.path)) throw new PortableTransferError("invalid-input");
         seen.add(descriptor.path);
-        const stat = lstatSync(descriptor.path);
         const sideToken=Object.freeze({});tokens.push(sideToken);
-        authorities.set(sideToken,{path:descriptor.path,dev:stat.dev,ino:stat.ino,expected:descriptor.expected,active:true});
+        authorities.set(sideToken,{capture:createCapturedSqliteAuthority(descriptor.path,descriptor.expected),active:true});
         await assertAuthorityAsync(sideToken,signal);
-        const sideConnection = new DatabaseSync(descriptor.path,{readOnly:true});
-        sidecars.push({connection:sideConnection,domain:descriptor.domain,identity:{projectIdentity:identity,machineIdentityKey:descriptor.machineIdentityKey,machineId:descriptor.machineId}});
+        const sideConnection = openCapturedSqliteDatabase(descriptor.path);
+        sidecars.push({connection:sideConnection,domain:descriptor.domain,identity:{projectIdentity:identity,machineIdentityKey:descriptor.machineIdentityKey,machineId:descriptor.machineId,sourceLocalProjectId}});
         sideConnection.exec("PRAGMA query_only=ON; BEGIN");
         sideConnection.prepare("SELECT count(*) FROM sqlite_master").get();
+        if(sideConnection.prepare("PRAGMA encoding").get()?.encoding!=="UTF-8")throw new PortableTransferError("unsupported-capability");
         if (descriptor.domain === "session-instructions" && tableExists(sideConnection,"conversations")) validateSqlitePortableSchema(sideConnection);
         else validateSqliteSidecarSchema(sideConnection,descriptor.domain);
+        if(descriptor.domain === "session-instructions")validateCacheScope(sideConnection);
         await assertAuthorityAsync(sideToken,signal);
       }
     }
     index=createPortableIndex({scratchParent:scratchParent,signal:signal});
     const ordinalIndex=index;
-    const options={projectIdentity:identity};
+    const options={projectIdentity:identity,sourceLocalProjectId,arrayValidation:{
+      has(domain:PortableDomain,parent:string){return ordinalIndex.getScope(`source-array:${domain}`,parent)!==null;},
+      add(domain:PortableDomain,parent:string){ordinalIndex.bindScope(`source-array:${domain}`,parent,"validated");},
+    }};
     const machineKey=():string=>{
       if(mainMachineIdentityKey === null)throw new PortableTransferError("unsupported-capability");
       return mainMachineIdentityKey;
@@ -464,7 +457,7 @@ export async function openSqlitePortableSource(input:OpenSqlitePortableSourceInp
         }
       }
       if(domain==="session-instructions" || domain==="native-transcripts" || domain==="native-transcript-message-links" || domain==="native-transcript-checkpoints") {
-        for (const value of capturedRows(connection,domain,identity.projectId)) yield decodeCaptured(domain,value);
+        for (const value of capturedRows(connection,domain,sourceLocalProjectId)) yield decodeCaptured(domain,value);
         return;
       }
       if(domain==="passive-events")return;
@@ -506,7 +499,7 @@ export async function openSqlitePortableSource(input:OpenSqlitePortableSourceInp
         const value=facts!.aliases.find(alias=>canonicalJson([alias.machineIdentityKey,alias.normalizedPath])===locator);
         if(value)return {locator,value:{...value}};
       } else if(domain!=="passive-events") {
-        for(const row of capturedRows(connection,domain as CapturedDomain,identity.projectId,locator))return decodeCaptured(domain as CapturedDomain,row);
+        for(const row of capturedRows(connection,domain as CapturedDomain,sourceLocalProjectId,locator))return decodeCaptured(domain as CapturedDomain,row);
       }
       throw new PortableTransferError("source-changed");
     }
@@ -564,24 +557,29 @@ export async function openSqlitePortableSource(input:OpenSqlitePortableSourceInp
     }
     ordinalIndex.verifyDependencies();
     await guard(signal);
-    const sourceIdentitySha256=canonicalSha256(["sqlite-supplied-generation-v1",expectedFileSha256,identity,expectedFactsSha256??null,mainMachineIdentityKey,sidecarEvidence]);
+    const sourceIdentitySha256=canonicalSha256(["sqlite-supplied-generation-v1",expectedFileSha256,identity,sourceLocalProjectId,expectedFactsSha256??null,mainMachineIdentityKey,sidecarEvidence]);
     const sourceWitnessSha256=canonicalSha256([sourceIdentitySha256,capturedAt]);
     const description:PortableSourceDescription=Object.freeze({capturedAt:capturedAt,sourceIdentitySha256,sourceWitnessSha256,coverage:Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map(domain=>[domain,{state:"available",evidenceSha256:canonicalSha256([sourceWitnessSha256,domain])}])) as PortableSourceDescription["coverage"]});
     function recordAt(domain:PortableDomain,metadata:NonNullable<ReturnType<typeof ordinalIndex.lookup>>):PortableRecord{
       const row=readRow(domain,metadata.locator);
       if(domain==="recall-surfacings")row.value.occurrenceOrdinal=rawOrder(metadata.order.at(-1)!);
       // Occurrences are assigned once during index construction, then taken from persisted order.
-      if(domain==="recall-surfacings")return createPortableRecord({domain,ordinal:metadata.ordinal,context:{projectIdentity:identity},value:row.value} as PortableRecordInput);
-      return build(domain,row,metadata.ordinal);
+      const record=domain==="recall-surfacings" ? createPortableRecord({domain,ordinal:metadata.ordinal,context:{projectIdentity:identity},value:row.value} as PortableRecordInput) : build(domain,row,metadata.ordinal);
+      const expected=ordinalIndex.getScope("source-record-digest",`${domain}:${metadata.ordinal}`);
+      if(record.identitySha256!==metadata.identitySha256 || (expected!==null && record.recordSha256!==expected))throw new PortableTransferError("source-changed");
+      return record;
     }
     function appendDigest(previous: string, bytes: Uint8Array): string {
       const length=Buffer.alloc(8);length.writeBigUInt64BE(BigInt(bytes.byteLength));
       return createHash("sha256").update(Buffer.from(previous,"hex")).update(length).update(bytes).digest("hex");
     }
+    // Authenticate each prefix once from actual records, keeping fixed-size evidence
+    // on bounded scratch disk. Arbitrary resume checkpoints use this exact index.
     async function boundaryAt(domain: PortableDomain,nextOrdinal: number,signal?: AbortSignal) {
       let prefix=canonicalSha256(["lcm-portable-domain-v1",PORTABLE_RECORD_SCHEMA_SHA256,domain,1]);
       let last: {recordSha256:string;identitySha256:string}|null=null;
       let ordinal=0;
+      ordinalIndex.bindScope("source-boundary",`${domain}:0`,canonicalJson({prefix,last}));
       while(ordinal<nextOrdinal){
         const entries=ordinalIndex.entries(domain,{afterOrdinal:ordinal-1,limit:Math.min(500,nextOrdinal-ordinal),maxBytes:PORTABLE_LIMITS.maxBatchBytes,signal});
         if(entries.length===0)throw new PortableTransferError("source-changed");
@@ -589,6 +587,8 @@ export async function openSqlitePortableSource(input:OpenSqlitePortableSourceInp
           await cooperate(signal);
           const record=recordAt(domain,entry);prefix=appendDigest(prefix,serializePortableRecord(record));
           last={recordSha256:record.recordSha256,identitySha256:record.identitySha256};ordinal++;
+          ordinalIndex.bindScope("source-record-digest",`${domain}:${entry.ordinal}`,record.recordSha256);
+          ordinalIndex.bindScope("source-boundary",`${domain}:${ordinal}`,canonicalJson({prefix,last}));
         }
       }
       return {prefix,last};
@@ -600,9 +600,12 @@ export async function openSqlitePortableSource(input:OpenSqlitePortableSourceInp
       contentSha256=appendDigest(contentSha256,Buffer.from(terminal.prefix,"hex"));
     }
     if(archive && tableExists(connection,"transfer_runs")){
-      const runMeta=connection.prepare("SELECT rowid,length(CAST(manifest_json AS BLOB))+length(CAST(checkpoints_json AS BLOB))+length(CAST(project_json AS BLOB))+length(CAST(generation_sha AS BLOB)) AS bytes FROM transfer_runs LIMIT 2").all();
-      if(runMeta.length!==1 || BigInt(runMeta[0].bytes as number)>BigInt(3*PORTABLE_LIMITS.maxControlBytes))throw new PortableTransferError("verification-failed");
-      const run=connection.prepare("SELECT generation_sha,manifest_sha,manifest_json,checkpoints_json,project_json,schema_ready FROM transfer_runs WHERE rowid=?").get(runMeta[0].rowid)!;
+      const runMeta=connection.prepare("SELECT rowid,length(CAST(manifest_json AS BLOB)) AS manifest_bytes,length(CAST(checkpoints_json AS BLOB)) AS checkpoint_bytes,length(CAST(manifest_json AS BLOB))+length(CAST(checkpoints_json AS BLOB))+length(CAST(project_json AS BLOB))+length(CAST(generation_sha AS BLOB))+length(CAST(manifest_sha AS BLOB)) AS bytes FROM transfer_runs LIMIT 2").all();
+      if(runMeta.length!==1 || BigInt(runMeta[0].manifest_bytes as number)>BigInt(PORTABLE_LIMITS.maxControlBytes)
+        || BigInt(runMeta[0].checkpoint_bytes as number)>BigInt(PORTABLE_LIMITS.maxControlBytes)
+        || BigInt(runMeta[0].bytes as number)>BigInt(3*PORTABLE_LIMITS.maxControlBytes))throw new PortableTransferError("verification-failed");
+      const controlColumns=["generation_sha","manifest_sha","manifest_json","checkpoints_json","project_json","schema_ready"];
+      const run=decodeSqliteUtf8Row(connection.prepare(`SELECT ${sqliteUtf8Projection(controlColumns)} FROM transfer_runs WHERE rowid=?`).get(runMeta[0].rowid)!,controlColumns);
       const expected=parsePortableManifest(Buffer.from(String(run.manifest_json)));
       const encodedCheckpoints:unknown=JSON.parse(String(run.checkpoints_json));
       if(run.schema_ready!==1 || run.manifest_sha!==expected.manifestSha256 || run.project_json!==canonicalJson(identity)
@@ -616,7 +619,7 @@ export async function openSqlitePortableSource(input:OpenSqlitePortableSourceInp
       }
       if(expected.contentSha256!==contentSha256 || expected.domains.some(domain=>domain.recordCount!==counts.get(domain.domain) || domain.prefixSha256!==terminals.get(domain.domain)!.prefix))throw new PortableTransferError("verification-failed");
     }
-    await guard(signal);
+    await guard(signal,true);
     let queue: Promise<unknown> = Promise.resolve();
     let closing = false;
     let closePromise: Promise<void> | undefined;
@@ -648,14 +651,19 @@ export async function openSqlitePortableSource(input:OpenSqlitePortableSourceInp
       });},
       async verifySource(verification){
         try{return await enqueue(async () => {
-          await guard(verification.signal);
+          // The stream supplies contentSha256 on every batch, so only the final
+          // domain boundary forces another complete file hash. Close also hashes.
+          await guard(verification.signal,verification.boundary?.domain === "passive-events"
+            && verification.boundary.nextOrdinal === counts.get("passive-events"));
           if(verification.sourceIdentitySha256!==sourceIdentitySha256 || verification.sourceWitnessSha256!==sourceWitnessSha256
             || (verification.contentSha256!==undefined && verification.contentSha256!==contentSha256))return "changed" as const;
           if(verification.boundary!==undefined){
             const boundary=verification.boundary;const count=counts.get(boundary.domain);
             if(count===undefined || !Number.isSafeInteger(boundary.nextOrdinal) || boundary.nextOrdinal<0 || Object.is(boundary.nextOrdinal,-0)
               || Object.is(boundary.recordCount,-0) || boundary.recordCount!==boundary.nextOrdinal || boundary.nextOrdinal>count)return "invalid" as const;
-            const actual=boundary.nextOrdinal===count?terminals.get(boundary.domain)!:await boundaryAt(boundary.domain,boundary.nextOrdinal,verification.signal);
+            const cached=ordinalIndex.getScope("source-boundary",`${boundary.domain}:${boundary.nextOrdinal}`);
+            if(cached===null)throw new PortableTransferError("source-changed");
+            const actual=JSON.parse(cached) as Awaited<ReturnType<typeof boundaryAt>>;
             if(actual.prefix!==boundary.prefixSha256 || (actual.last?.recordSha256??null)!==boundary.lastRecordSha256
               || (actual.last?.identitySha256??null)!==boundary.lastRecordIdentitySha256)return "changed" as const;
           }
@@ -665,7 +673,9 @@ export async function openSqlitePortableSource(input:OpenSqlitePortableSourceInp
       close(){
         if(closePromise)return closePromise.catch(() => {});
         closing=true;
-        closePromise=queue.then(() => {
+        closePromise=queue.then(async () => {
+          let verificationError:unknown;
+          try{if(authorities.get(token)!.active)await guard(undefined,true);}catch(error){verificationError=error;}
           revoke();let failed=false;
           try{ordinalIndex.close();}catch{failed=true;}
           for(const handle of [connection,...sidecars.map(item=>item.connection)]){
@@ -673,6 +683,7 @@ export async function openSqlitePortableSource(input:OpenSqlitePortableSourceInp
             try{handle.close();}catch{failed=true;}
           }
           db=undefined;
+          if(verificationError!==undefined)throw verificationError;
           if(failed)throw new PortableTransferError("close-failed");
         });
         // Cleanup is attempted exactly once, including after a reported close failure.

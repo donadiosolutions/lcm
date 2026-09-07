@@ -1,3 +1,7 @@
+import { createHash } from 'node:crypto';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as adapter from '../../src/storage/postgresql/portable-source.js';
 import * as codec from '../../src/storage/portable-record.js';
@@ -80,8 +84,9 @@ function dataHarness(extra:Partial<Record<PortableDomain,Record<string,unknown>[
   const ordered=new Map(PORTABLE_RECORD_DOMAIN_ORDER.map(domain=>[domain,[...(data[domain]??[])].sort((a,b)=>Buffer.from(locator(domain,a)).compare(Buffer.from(locator(domain,b))))]));
   const rows=(domain:PortableDomain)=>ordered.get(domain)!;
   const byLocator=new Map(PORTABLE_RECORD_DOMAIN_ORDER.map(domain=>[domain,new Map(rows(domain).map(row=>[locator(domain,row),row]))]));
+  const positions=new Map(PORTABLE_RECORD_DOMAIN_ORDER.map(domain=>[domain,new Map(rows(domain).map((row,i)=>[locator(domain,row),i]))]));
   const list=vi.spyOn(mapping,'listCanonicalHeaders').mockImplementation(async(_db,_project,domain,after,limit)=>{
-    const values=rows(domain); const start=after===null?0:values.findIndex(row=>locator(domain,row)===after)+1;
+    const values=rows(domain); const start=after===null?0:positions.get(domain)!.get(after)!+1;
     return values.slice(start,start+limit).map(row=>({locator:locator(domain,row),byteLength:'1000'}));
   });
   const read=vi.spyOn(mapping,'readCanonicalRow').mockImplementation(async(_db,_project,domain,key)=>
@@ -289,5 +294,95 @@ describe('PostgreSQL source failure boundaries',()=>{
     h.runtime.close.mockRejectedValue(new Error('runtime-secret'));
     await expect(source.close()).rejects.toMatchObject({code:'source-unavailable'});
     expect(h.session.close).toHaveBeenCalledTimes(1);expect(h.runtime.close).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('PostgreSQL source private scratch and authenticated prefix evidence',()=>{
+  const sha=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex');
+  function nextPrefix(previous:string,record:codec.PortableRecord):string {
+    const bytes=serializePortableRecord(record),length=Buffer.alloc(8);
+    length.writeBigUInt64BE(BigInt(bytes.byteLength));
+    return sha(Buffer.concat([Buffer.from(previous,'hex'),length,bytes]));
+  }
+  const rows=(count:number)=>Array.from({length:count},(_,i)=>({ingest_key:String(i),session_id:`s-${String(i).padStart(5,'0')}`,message_count:'1',completed_at:timestamp}));
+  it('places and removes its private index in the supplied scratch directory',async()=>{
+    const scratchParent=mkdtempSync(join(tmpdir(),'pg-source-scratch-'));
+    const ambient=process.env.TMPDIR,h=dataHarness();
+    let source:Awaited<ReturnType<typeof adapter.createPostgreSqlPortableSource>>|undefined;
+    try {
+      source=await adapter.createPostgreSqlPortableSource({settings,expectedOwner:'owner',expectedIdentity:identity(),scratchParent},h.dependencies as never);
+      expect(readdirSync(scratchParent)).toEqual([expect.stringMatching(/^lcm-portable-index-/)]);
+      await source.close();source=undefined;
+      expect(readdirSync(scratchParent)).toEqual([]);
+      expect(process.env.TMPDIR).toBe(ambient);
+    } finally {await source?.close();rmSync(scratchParent,{recursive:true,force:true});}
+  });
+  it('keeps SQL reads and prefix hashing linear while verifying every sequential batch',async()=>{
+    const measure=async(count:number)=>{
+      const h=dataHarness({'session-ingest':rows(count)}),hashes=vi.spyOn(codec,'sha256');
+      const source=await open(h),description=source.describeSource();
+      let prefix=sha(codec.canonicalJson(['lcm-portable-domain-v1',codec.PORTABLE_RECORD_SCHEMA_SHA256,'session-ingest',1]));
+      try {
+        for(let after=0;after<count;) {
+          const batch=await source.readDomainPage(page('session-ingest',after));
+          for(const record of batch.records) prefix=nextPrefix(prefix,record);
+          after+=batch.records.length;
+          const last=batch.records.at(-1)!;
+          const boundary={domain:'session-ingest' as const,nextOrdinal:after,recordCount:after,prefixSha256:prefix,lastRecordSha256:last.recordSha256,lastRecordIdentitySha256:last.identitySha256};
+          expect(await source.verifySource({...description,boundary})).toBe('unchanged');
+        }
+        const reads=h.read.mock.calls.filter(call=>call[2]==='session-ingest').length;
+        expect(reads).toBeLessThanOrEqual(4*count+Math.ceil(count/500));
+        expect(hashes.mock.calls.length).toBeLessThanOrEqual(2*count+500);
+        return reads;
+      } finally {await source.close();vi.restoreAllMocks();}
+    };
+    const first=await measure(1200),second=await measure(2400);
+    expect(second-first).toBeLessThanOrEqual(4*1200+5);
+  },30000);
+  it('validates zero and arbitrary resumed prefixes without accepting forged evidence',async()=>{
+    const h=dataHarness({'session-ingest':rows(2)}),source=await open(h),description=source.describeSource();
+    const first=(await source.readDomainPage(page('session-ingest'))).records[0];
+    const initial=sha(codec.canonicalJson(['lcm-portable-domain-v1',codec.PORTABLE_RECORD_SCHEMA_SHA256,'session-ingest',1]));
+    const zero={domain:'session-ingest' as const,nextOrdinal:0,recordCount:0,prefixSha256:initial,lastRecordSha256:null,lastRecordIdentitySha256:null};
+    expect(await source.verifySource({...description,boundary:zero})).toBe('unchanged');
+    const resumed={...zero,nextOrdinal:1,recordCount:1,prefixSha256:nextPrefix(initial,first),lastRecordSha256:first.recordSha256,lastRecordIdentitySha256:first.identitySha256};
+    expect(await source.verifySource({...description,boundary:resumed})).toBe('unchanged');
+    expect(await source.verifySource({...description,boundary:{...resumed,prefixSha256:'a'.repeat(64)}})).toBe('changed');
+    await source.close();
+  });
+  it('fails closed when private prefix evidence is unavailable',async()=>{
+    const h=dataHarness(),source=await open(h);
+    vi.spyOn(PortableIndex.prototype,'getScope').mockReturnValue(null);
+    await expect(source.readDomainPage(page('project'))).rejects.toMatchObject({code:'source-invalid'});
+    await source.close();
+  });
+  it('recomputes completion rather than trusting a corrupted cached terminal prefix',async()=>{
+    const h=dataHarness({'session-ingest':rows(2)}),source=await open(h),description=source.describeSource();
+    const last=(await source.readDomainPage(page('session-ingest'))).records.at(-1)!;
+    const original=PortableIndex.prototype.getScope,forged='a'.repeat(64);
+    vi.spyOn(PortableIndex.prototype,'getScope').mockImplementation(function(namespace,key){
+      const actual=JSON.parse(original.call(this,namespace,key)!);
+      return JSON.stringify({...actual,prefix:forged});
+    });
+    expect(await source.verifySource({...description,boundary:{domain:'session-ingest',nextOrdinal:2,recordCount:2,prefixSha256:forged,lastRecordSha256:last.recordSha256,lastRecordIdentitySha256:last.identitySha256}})).toBe('changed');
+    await source.close();
+  });
+  it('refuses same-length record mutations returned by the held snapshot',async()=>{
+    const h=dataHarness({'session-ingest':rows(2)}),source=await open(h);
+    h.data['session-ingest']![0].message_count='2';
+    await expect(source.readDomainPage(page('session-ingest'))).rejects.toMatchObject({code:'source-changed'});
+    await source.close();
+  });
+  it('rescans actual interior records at completion after building cached prefix evidence',async()=>{
+    const h=dataHarness({'session-ingest':rows(2)}),source=await open(h),description=source.describeSource();
+    const batch=await source.readDomainPage(page('session-ingest'));
+    let prefix=sha(codec.canonicalJson(['lcm-portable-domain-v1',codec.PORTABLE_RECORD_SCHEMA_SHA256,'session-ingest',1]));
+    for(const record of batch.records) prefix=nextPrefix(prefix,record);
+    const last=batch.records.at(-1)!;
+    h.data['session-ingest']![0].message_count='2';
+    await expect(source.verifySource({...description,boundary:{domain:'session-ingest',nextOrdinal:2,recordCount:2,prefixSha256:prefix,lastRecordSha256:last.recordSha256,lastRecordIdentitySha256:last.identitySha256}})).rejects.toMatchObject({code:'source-changed'});
+    await source.close();
   });
 });

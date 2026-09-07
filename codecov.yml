@@ -149,6 +149,7 @@ component_management:
         # #992 keeps pre-initialization SQLite leaf admission and final
         # opened-identity fencing local-persistence-owned.
         - "src/db/"
+        # Captured UTF-8 decoding and immutable-file authority remain local-persistence-owned.
         - "src/storage/sqlite/"
         - "src/store/"
     - component_id: "unit-storage-abstractions"

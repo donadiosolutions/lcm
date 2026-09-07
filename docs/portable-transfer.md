@@ -24,14 +24,23 @@ database when admission fails.
 The SQLite source opener takes an existing captured database, its expected
 SHA-256, its project identity and capture timestamp. It checks the regular file,
 owner, restrictive permissions, canonical path, open identity and expected hash.
-The database must have no populated WAL. The opener uses read-only handles and
-does not migrate the source. For a source without a recovery archive, supply the
+The database must have no WAL or SHM sidecars. An immutable, existing-only
+connection can read a checkpointed WAL-mode main file without creating sidecars
+or changing captured bytes. The opener does not migrate the source. For a source without a recovery archive, supply the
 captured machine and alias facts with their expected digest, plus explicit
 captured event and instruction sidecars or their authenticated absence evidence.
 There is no discovery of files in the live LCM home. Each supplied sidecar is
 checked and held with the main generation. Set `machineIdentityKey` explicitly
 when the main database contains machine-local facts and the captured identity
 descriptor contains more than one machine.
+
+A bound SQLite capture still stores its native project ID as a local path hash.
+Set `sourceLocalProjectId` to that native ID and include the same value in
+`identityFacts`, covered by `expectedFactsSha256`. Keep `projectIdentity` as the
+registered shared identity emitted to the canonical stream. Native project
+predicates and self-provenance normalization use the local ID; the canonical
+identity and PostgreSQL destination use the shared UUID. No source rows or
+capture IDs are rewritten to bridge the two identities.
 
 These checks establish that the supplied files match the chosen evidence. A
 file digest cannot establish that separately captured files describe the same
@@ -153,7 +162,10 @@ constraints before writing domain data, including:
 An unsupported corpus fails as a whole. The adapters do not silently replace
 identities, coerce incompatible values, discard unsupported domains or export
 a partial manifest as complete. Correct the source or choose a compatible
-new generation before retrying a non-retryable refusal.
+new generation before retrying a non-retryable refusal. PostgreSQL passive-event
+envelopes must have the supported seven keys and their native field types;
+unknown envelope fields are refused rather than silently discarded. The `data`
+string stays opaque, and event disposition normalization remains unchanged.
 
 Readers use an owned disk index for ordering, logical identities, dependency
 checks and duplicate conversation occurrence assignment. The index stores
@@ -164,16 +176,19 @@ than the caller's byte budget is refused without advancing its checkpoint.
 Disk scratch also has a finite budget and is removed when its owner closes.
 
 Literal U+0000 and malformed UTF-16 are outside the version 1 format. SQLite
-readers check text in SQL before decoding it, so a driver cannot erase a NUL
-and turn an invalid value into a silently truncated export. Literal backslash
+readers admit UTF-8 database encoding and validate bounded raw text bytes with
+fatal decoding before canonical parsing. Malformed UTF-8 is refused; genuine
+U+FFFD and valid Unicode remain unchanged. The driver cannot erase a NUL or
+replace invalid bytes and turn changed content into a verified export. Literal backslash
 text such as `\u0000` remains distinct from a NUL character.
 
 ## Receipts, retries and interruption
 
 Data mutations, identity mappings and immutable batch receipts share one
 destination transaction: SQLite uses `BEGIN IMMEDIATE`; PostgreSQL uses
-`READ COMMITTED` and locks the run row. A batch is keyed by its domain and prior
-checkpoint. Exact replay returns its saved receipt. Changed replay, a stale
+`READ COMMITTED` and locks the run row. A different run or generation requires a fresh isolated destination; do not
+delete a ledger or reuse a populated project in place. A batch is keyed by its
+domain and prior checkpoint. Exact replay returns its saved receipt. Changed replay, a stale
 checkpoint or a different manifest fails without accepting a new checkpoint.
 
 If the commit response is lost, the writer reconciles against the same

@@ -1,4 +1,5 @@
 import type { DatabaseSync, SQLInputValue, SQLOutputValue } from "node:sqlite";
+import { sqliteUtf8Projection, decodeSqliteUtf8Row } from "./portable-utf8.js";
 import { PORTABLE_LIMITS, type PortableProjectIdentity } from "../portable-record.js";
 import { PortableTransferError } from "../portable-transfer.js";
 import type { SqliteRawDomainRow } from "./portable-runtime-mapping.js";
@@ -8,6 +9,7 @@ export type SqliteSidecarDomain = "passive-events" | "session-instructions";
 /** Identity facts from the admitted captured generation, never live registration. */
 export interface SqliteSidecarIdentity {
   readonly projectIdentity: PortableProjectIdentity;
+  readonly sourceLocalProjectId?: string;
   readonly machineIdentityKey: string;
   readonly machineId: string | null;
 }
@@ -87,7 +89,7 @@ function decode(mapping: Mapping, domain: SqliteSidecarDomain, row: Row, identit
 
 function scope(domain: SqliteSidecarDomain, identity: SqliteSidecarIdentity): { predicates: string[]; values: SQLInputValue[] } {
   return domain === "session-instructions"
-    ? { predicates: ["project_id COLLATE BINARY=?"], values: [identity.projectIdentity.projectId] }
+    ? { predicates: ["project_id COLLATE BINARY=?"], values: [identity.sourceLocalProjectId ?? identity.projectIdentity.projectId] }
     : { predicates: [], values: [] };
 }
 
@@ -118,17 +120,18 @@ export function readSqliteSidecarDomainRow(
     if (header === undefined) return undefined;
     assertSize(header);
     const columns = new Set([mapping.key, ...mapping.fields.map(([, column]) => column)]);
+    let disposition = "";
     if (domain === "passive-events") {
       columns.add("machine_id");
       // Evaluate disposition in SQL so operational payload/lease/reason values
       // never cross the driver boundary or become imported execution authority.
-      columns.add("CASE WHEN processed_at IS NOT NULL OR delivery_state='acknowledged' THEN 'applied' WHEN delivery_state='quarantined' THEN 'quarantined' ELSE 'pending' END AS disposition");
+      disposition = ", CASE WHEN processed_at IS NOT NULL OR delivery_state='acknowledged' THEN 'applied' WHEN delivery_state='quarantined' THEN 'quarantined' ELSE 'pending' END AS disposition";
     }
-    const statement = db.prepare(`SELECT ${[...columns].join(",")}${from}`);
+    const statement = db.prepare(`SELECT ${sqliteUtf8Projection([...columns])}${disposition}${from}`);
     statement.setReadBigInts(true);
     const row = statement.get(...values);
     if (row === undefined) throw new PortableTransferError("source-failed");
-    return decode(mapping, domain, row, identity);
+    return decode(mapping, domain, decodeSqliteUtf8Row(row, [...columns]), identity);
   } catch (error) { fail(error); }
 }
 
@@ -148,12 +151,13 @@ export function* iterateSqliteSidecarDomainRows(
       if (after !== undefined) { predicates.push(`${mapping.key}${domain === "session-instructions" ? " COLLATE BINARY" : ""}>?`); values.push(after); }
       const where = predicates.length === 0 ? "" : ` WHERE ${predicates.join(" AND ")}`;
       // CASE also bounds the physical key itself before it enters JavaScript.
-      const metadata = db.prepare(`SELECT CASE WHEN ${bytes}<=${PORTABLE_LIMITS.maxRecordBytes} AND NOT (${nul}) THEN ${mapping.key} END AS locator, (${nul}) AS nul, ${bytes} AS bytes FROM ${mapping.table}${where} ORDER BY ${mapping.key}${domain === "session-instructions" ? " COLLATE BINARY" : ""} LIMIT 500`);
+      const metadata = db.prepare(`SELECT ${sqliteUtf8Projection(["locator"])}, nul, bytes FROM (SELECT CASE WHEN ${bytes}<=${PORTABLE_LIMITS.maxRecordBytes} AND NOT (${nul}) THEN ${mapping.key} END AS locator, (${nul}) AS nul, ${bytes} AS bytes FROM ${mapping.table}${where} ORDER BY ${mapping.key}${domain === "session-instructions" ? " COLLATE BINARY" : ""} LIMIT 500)`);
       metadata.setReadBigInts(true);
       const page = metadata.all(...values);
       if (page.length === 0) return;
-      for (const header of page) {
-        assertSize(header);
+      for (const rawHeader of page) {
+        assertSize(rawHeader);
+        const header = decodeSqliteUtf8Row(rawHeader, ["locator"]);
         const row = readSqliteSidecarDomainRow(db, domain, String(header.locator), identity);
         if (row === undefined) throw new PortableTransferError("source-failed");
         yield row;

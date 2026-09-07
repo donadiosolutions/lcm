@@ -41,6 +41,9 @@ import {
   projectsDir as lcmProjectsDir,
 } from "../src/runtime-paths.js";
 import type { ProgressState } from "../src/cli/progress-state.js";
+import { CliProjectStorageMissingError } from "../src/cli-storage.js";
+import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../src/storage/identity-context.js";
+import { MachineIdentityFileError } from "../src/machine-identity.js";
 import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 import { PrivateMutationLockContentionError } from "../src/private-mutation-lock.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
@@ -3814,11 +3817,11 @@ export async function runCli(
         state.phases[0].status = "done";
         renderer.printSummary();
         const { printCodexResolutionSummary } = await import("../src/import-summary.js");
-        printCodexResolutionSummary(result, console.error);
+        printCodexResolutionSummary(result, console.error, provider);
       } else {
         const { printImportSummary } = await import("../src/import-summary.js");
         if (dryRun) console.error("  [dry-run] No changes written.\n");
-        printImportSummary(result, { replay, log: console.error });
+        printImportSummary(result, { replay, log: console.error, provider });
         console.error();
       }
       if (result.failed > 0) exit(1);
@@ -3845,12 +3848,14 @@ export async function runCli(
       const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
       const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
-      const { join } = await import("node:path");
-      const { homedir } = await import("node:os");
 
       const configFile = defaultConfigPath();
       const config = loadDaemonConfig(configFile);
       selectStorageBackendForConfig(configFile, config.storage);
+      const { listCliProjects } = await import("../src/cli-storage.js");
+      const cwds = all
+        ? (await listCliProjects()).map(project => project.canonical)
+        : [process.cwd()];
       const port = config.daemon?.port ?? 3737;
       const pidFilePath = daemonPidPath();
       const daemonResult = await ensureDaemon({
@@ -3867,39 +3872,19 @@ export async function runCli(
       clearDaemonRemediationMarker();
 
       const client = new DaemonClient(`http://127.0.0.1:${port}`);
-      const { readdirSync, existsSync, readFileSync } = await import("node:fs");
-
-      if (dryRun) console.log("  [dry-run] No changes will be written.\n");
-
-      // Collect project cwds to promote
-      const cwds: string[] = [];
-      if (all) {
-        const projectsDir = lcmProjectsDir();
-        if (existsSync(projectsDir)) {
-          for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
-            if (!entry.isDirectory()) continue;
-            const metaPath = join(projectsDir, entry.name, "meta.json");
-            if (!existsSync(metaPath)) continue;
-            try {
-              const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-              if (meta.cwd) cwds.push(meta.cwd);
-            } catch { /* skip unreadable */ }
-          }
-        }
-      } else {
-        cwds.push(process.cwd());
-      }
+      if (dryRun) console.error("  [dry-run] No changes will be written.\n");
 
       let totalProcessed = 0;
       let totalPromoted = 0;
+      let failures = 0;
       const total = cwds.length;
 
       for (let i = 0; i < cwds.length; i++) {
         const cwd = cwds[i];
         if (total > 1) {
-          process.stdout.write(`\r  scanning project ${i + 1}/${total}...`);
+          process.stderr.write(`\r  scanning project ${i + 1}/${total}...`);
         } else {
-          process.stdout.write(`\r  scanning...`);
+          process.stderr.write(`\r  scanning...`);
         }
 
         try {
@@ -3912,31 +3897,34 @@ export async function runCli(
           totalPromoted += result.promoted;
 
           if (verbose) {
-            process.stdout.write("\r");
+            process.stderr.write("\r");
             const convLabel = result.conversations !== undefined ? `, ${result.conversations} conversation${result.conversations !== 1 ? "s" : ""}` : "";
-            console.log(
+            console.error(
               `  ${sanitizeTerminalText(cwd)}: ${result.processed} scanned${convLabel}, ${result.promoted} promoted`,
             );
           }
         } catch (err) {
-          if (verbose) {
-            const message = err instanceof Error ? err.message : "request failed";
-            console.error(`  promote failed for ${sanitizeTerminalText(cwd)}: ${sanitizeTerminalText(message)}`);
-          }
-          continue;
+          if (err instanceof StorageIdentityConfigurationError
+            || err instanceof BackendPublicationJournalError
+            || err instanceof PrivateMutationLockContentionError) throw err;
+          failures++;
+          console.error(`  promote failed for ${sanitizeTerminalText(cwd)}: ${knownCliErrorDiagnostic(err) ?? "promotion request failed; check the selected project and retry"}`);
         }
       }
       // Clear the progress line
-      process.stdout.write("\r  \r");
+      process.stderr.write("\r  \r");
 
-      if (totalPromoted === 0) {
-        console.log("  Nothing to promote — no new insights found.");
+      if (failures > 0) {
+        console.error(`  ${failures} project${failures === 1 ? "" : "s"} failed; ${totalPromoted} insights promoted before completion.`);
+      } else if (totalPromoted === 0) {
+        console.error("  Nothing to promote — no new insights found.");
       } else {
-        console.log(`  ${totalPromoted} insight${totalPromoted !== 1 ? "s" : ""} promoted to long-term memory`);
+        console.error(`  ${totalPromoted} insight${totalPromoted !== 1 ? "s" : ""} promoted to long-term memory`);
       }
-      if (verbose) console.log(`  (${totalProcessed} summaries scanned across ${cwds.length} project${cwds.length !== 1 ? "s" : ""})`);
-      if (dryRun) console.log("  [dry-run] No changes written.");
-      console.log();
+      if (verbose) console.error(`  (${totalProcessed} summaries scanned across ${cwds.length} project${cwds.length !== 1 ? "s" : ""})`);
+      if (dryRun) console.error("  [dry-run] No changes written.");
+      console.error();
+      if (failures > 0) exit(1);
     });
 
   // ─── export ────────────────────────────────────────────────────────────────
@@ -4012,7 +4000,7 @@ export async function runCli(
         } catch (err: any) {
           if (err instanceof PrivateMutationLockContentionError || err instanceof BackendPublicationJournalError) throw err;
           failures++;
-          process.stderr.write("  Export failed for a selected project. Check its storage binding and retry.\n");
+          process.stderr.write(`  ${knownCliErrorDiagnostic(err) ?? "Export failed for a selected project. Check its storage binding and retry."}\n`);
         }
       }
 
@@ -4078,12 +4066,12 @@ export async function runCli(
       try {
         const result = await importKnowledge(cwd, doc, { merge: true, dryRun, confidence });
         if (result.dryRun) {
-          console.error(`\n  [dry-run] Would import ${result.total} entries. No changes written.\n`);
+          console.error(`\n  [dry-run] ${result.total - result.skipped} valid, ${result.skipped} skipped. No changes written.\n`);
         } else {
           console.error(`\n  Imported ${result.imported} entries (${result.skipped} skipped) into ${cwd}\n`);
         }
       } catch (err: any) {
-        console.error("  Knowledge import failed. Check the document and selected storage, then retry.");
+        console.error(`  ${knownCliErrorDiagnostic(err) ?? "Knowledge import failed. Check the document and selected storage, then retry."}`);
         exit(1);
       }
     });
@@ -4131,18 +4119,23 @@ export async function runCli(
   await unknownCommandCompletion;
 }
 
+/** Static remedies never include a mutable error message, driver text, or cause. */
+function knownCliErrorDiagnostic(error: unknown): string | undefined {
+  if (error instanceof BackendPublicationJournalError) return BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC;
+  if (error instanceof StorageIdentityConfigurationError) return UNBOUND_POSTGRESQL_PROJECT_MESSAGE;
+  if (error instanceof CliProjectStorageMissingError) return "No LCM storage found for this project. Run `lcm import` or `lcm import-knowledge <file>` in the intended project, then retry.";
+  if (error instanceof MachineIdentityFileError) return "LCM machine identity is unavailable. Run `lcm machine show` and register or recover the machine before retrying.";
+  if (error instanceof ConfigValidationError) return "LCM configuration is invalid. Check config.json and the required environment variables, then retry.";
+  if (error instanceof StorageBackendUnavailableError) return "This operation is not available for the postgresql storage backend.";
+  if (error instanceof BootstrapLockContentionError) return "LCM home migration is busy. Wait for the active operation to finish, then retry.";
+  if (error instanceof PrivateMutationLockContentionError) return "LCM storage publication is busy. Wait for the active operation to finish, then retry; run `lcm doctor` if it remains blocked.";
+  return undefined;
+}
+
 /** @internal Top-level rejection handler kept separate for deterministic tests. */
 export function handleCliError(err: unknown): never {
-  console.error(
-    err instanceof BackendPublicationJournalError
-      ? BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC
-      : err instanceof ConfigValidationError
-      || err instanceof StorageBackendUnavailableError
-      || err instanceof BootstrapLockContentionError
-      || err instanceof PrivateMutationLockContentionError
-      ? err.message
-      : "LCM command failed. Check the command inputs and selected storage configuration.",
-  );
+  console.error(knownCliErrorDiagnostic(err)
+    ?? "LCM command failed. Check the command inputs and selected storage configuration.");
   return exit(1);
 }
 

@@ -1,4 +1,5 @@
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import { sqliteUtf8Projection, decodeSqliteUtf8Row } from "./portable-utf8.js";
 import { PortableTransferError, normalizePortableTransferError } from "../portable-transfer.js";
 import type { DatabaseSync, SQLInputValue, SQLOutputValue } from "node:sqlite";
 import {
@@ -112,7 +113,8 @@ function decode<D extends PortableArchiveDomain>(domain: D, row: Row, tagged: bo
 
 /** Measure actual SQL content, including UTF-8 bytes, before fetching any large field. */
 function byteExpression(domain: PortableArchiveDomain): string {
-  return definition(domain).columns.map(([name]) => `coalesce(length(CAST("${name}" AS BLOB)), 0)`).join(" + ");
+  return ["_identity_sha256", ...definition(domain).columns.map(([name]) => name)]
+    .map(name => `coalesce(length(CAST("${name}" AS BLOB)), 0)`).join(" + ");
 }
 // Check stored TEXT before node:sqlite can silently truncate it at U+0000.
 // JSON escapes contain no actual NUL and remain available to the canonical codec.
@@ -128,11 +130,12 @@ function checkRowBytes(meta: Row): void {
   if (meta._nul === 1n) throw new PortableTransferError("unsupported-capability");
 }
 function fetchRow(db: DatabaseSync, domain: PortableArchiveDomain, ordinal: SQLInputValue): Row {
-  const statement = db.prepare(`SELECT _identity_sha256, ${names(definition(domain).columns)} FROM ${table(domain)} WHERE _ordinal = ?`);
+  const columns = ["_identity_sha256", ...definition(domain).columns.map(([name]) => name)];
+  const statement = db.prepare(`SELECT ${sqliteUtf8Projection(columns)} FROM ${table(domain)} WHERE _ordinal = ?`);
   statement.setReadBigInts(true);
   const row = statement.get(ordinal);
   if (!row) throw new PortableStreamError("source-changed");
-  return row;
+  return decodeSqliteUtf8Row(row, columns);
 }
 
 /** Internal source read. SQL itself is bounded; no archive domain is collected in memory. */
@@ -216,15 +219,16 @@ export function createSqlitePortableArchiveReader(
       || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > PORTABLE_LIMITS.maxBatchBytes) {
       throw new PortableStreamError("invalid-limit");
     }
-    const statement = db.prepare(`SELECT _ordinal, ${byteExpression(domain)} AS _bytes, (${nulExpression(domain)}) AS _nul FROM ${table(domain)} WHERE ${where} ORDER BY ${order} LIMIT ?`);
+    const statement = db.prepare(`SELECT _ordinal, ${byteExpression(domain)} AS _bytes, length(CAST(_identity_sha256 AS BLOB)) AS _identity_bytes, (${nulExpression(domain)}) AS _nul FROM ${table(domain)} WHERE ${where} ORDER BY ${order} LIMIT ?`);
     statement.setReadBigInts(true);
     const result: PortableRecordValueByDomain[D][] = [];
     let bytes = 0;
     for (const meta of statement.iterate(...parameters, options.limit)) {
       await check(options.signal);
       checkRowBytes(meta);
-      // A lower bound prevents materializing a huge singleton under a tiny request.
-      if (BigInt(meta._bytes as bigint) > BigInt(maxBytes - bytes)) {
+      // The physical identity is bounded above but is absent from canonical output.
+      // Compare only the payload lower bound with the requested page budget.
+      if (BigInt(meta._bytes as bigint) - BigInt(meta._identity_bytes as bigint) > BigInt(maxBytes - bytes)) {
         if (result.length === 0) throw new PortableStreamError("record-unrepresentable");
         break;
       }

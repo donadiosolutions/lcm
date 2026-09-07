@@ -50,6 +50,16 @@ describe("printImportSummary", () => {
     expect(logs).toContain("  4 Codex sessions ambiguous (skipped)");
   });
 
+  it.each([
+    ["claude", "Claude", "refused"],
+    ["all", "Claude and Codex", "not imported"],
+  ] as const)("labels %s resolution diagnostics accurately", (provider, label, disposition) => {
+    capture();
+    printImportSummary(baseResult({ unresolved: 2, ambiguous: 1, totalTokens: 0 }), { provider });
+    expect(logs).toContain(`  2 ${label} sessions unresolved (${disposition})`);
+    expect(logs).toContain(`  1 ${label} sessions ambiguous (${disposition})`);
+  });
+
   it("shows compression stats in replay mode", () => {
     capture();
     printImportSummary(baseResult({ tokensAfter: 2000 }), { replay: true });
