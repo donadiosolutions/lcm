@@ -1,6 +1,8 @@
 import { DatabaseSync } from "node:sqlite";
 import {
   chmodSync,
+  readFileSync,
+  statSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -24,23 +26,16 @@ vi.mock("../src/runtime-paths.js", async (importOriginal) => {
   };
 });
 
-vi.mock("../src/daemon/config.js", () => ({
-  loadDaemonConfig: () => ({
-    restoration: { staleAfterDays: 90, staleSurfacingWithoutUseLimit: 5 },
-    storage: { backend: "sqlite" },
-  }),
-}));
-
-vi.mock("../src/storage/backend.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/storage/backend.js")>();
-  return {
-    ...actual,
-    selectStorageBackendForConfig: () => ({ backend: "sqlite" }),
-  };
-});
-
-vi.mock("../src/db/events-stats.js", () => ({
-  collectEventStats: async () => ({ captured: 0, unprocessed: 0, errors: 0 }),
+vi.mock("../src/storage/diagnostics.js", () => ({
+  collectBackendDiagnostics: async (options: { homeDir?: string; projectId?: string; signal?: AbortSignal; collectSqlite: (options: object) => Promise<void> }) => {
+    const snapshot = {
+      backend: "sqlite", classification: "healthy",
+      outbox: { status: "ready", captured: 0, unprocessed: 0, errors: 0 },
+    };
+    try { await options.collectSqlite({ ...options, staleAfterDays: 90, staleSurfacingWithoutUseLimit: 5 }); }
+    catch { snapshot.classification = "unavailable"; }
+    return snapshot;
+  },
 }));
 
 import { collectStats } from "../src/stats.js";
@@ -133,7 +128,7 @@ async function expectAdmissionFailure(
     () => undefined,
     (failure: unknown) => failure,
   );
-  expect(error).toMatchObject({ name: "StatsDatabaseAdmissionError" });
+  expect(error).toMatchObject({ name: "StatsUnavailableError" });
   expect(String(error)).not.toContain(untrustedPath);
 }
 
@@ -150,7 +145,7 @@ describe("stats database admission", () => {
     fixture.projectsDir = join(scratch, ".lcm", "projects");
 
     await expect(collectStats()).rejects.toMatchObject({
-      name: "StatsDatabaseAdmissionError",
+      name: "StatsUnavailableError",
     });
   });
 
@@ -166,22 +161,24 @@ describe("stats database admission", () => {
     symlinkSync(redirectedProjects, fixture.projectsDir, "dir");
 
     await expect(collectStats()).rejects.toMatchObject({
-      name: "StatsDatabaseAdmissionError",
+      name: "StatsUnavailableError",
     });
   });
 
-  it("migrates an admitted legacy database and includes its messages", async () => {
+  it("leaves an admitted legacy database unchanged and reports unavailable", async () => {
     const { projectsDir } = makeFixture();
     const databasePath = seedLegacyProject(projectsDir, "legacy");
 
-    await expect(collectStats()).resolves.toMatchObject({ projects: 1, messages: 1 });
+    const before = readFileSync(databasePath);
+    await expect(collectStats()).rejects.toMatchObject({ name: "StatsUnavailableError" });
+    expect(readFileSync(databasePath)).toEqual(before);
 
     const inspection = new DatabaseSync(databasePath, { readOnly: true });
     try {
       const columns = inspection.prepare("PRAGMA table_info(conversations)").all() as Array<{
         name: string;
       }>;
-      expect(columns.map((column) => column.name)).toContain("bootstrapped_at");
+      expect(columns.map((column) => column.name)).not.toContain("bootstrapped_at");
     } finally {
       inspection.close();
     }
@@ -192,7 +189,7 @@ describe("stats database admission", () => {
     tempDirs.push(scratch);
     fixture.projectsDir = join(scratch, ".lcm", "projects");
 
-    await expect(collectStats()).resolves.toMatchObject({ projects: 0, messages: 0 });
+    await expect(collectStats()).rejects.toMatchObject({ name: "StatsUnavailableError" });
     expect(() => new DatabaseSync(join(fixture.projectsDir, "project", "db.sqlite"), {
       readOnly: true,
     })).toThrow();
@@ -205,11 +202,11 @@ describe("stats database admission", () => {
     const stateRoot = privateDirectory(scratch, ".lcm");
     fixture.projectsDir = join(stateRoot, "projects");
 
-    await expect(collectStats()).resolves.toMatchObject({ projects: 0, messages: 0 });
+    await expect(collectStats()).rejects.toMatchObject({ name: "StatsUnavailableError" });
 
     const projectsDir = privateDirectory(stateRoot, "projects");
     const projectDir = privateDirectory(projectsDir, "missing-db");
-    await expect(collectStats()).resolves.toMatchObject({ projects: 0, messages: 0 });
+    await expect(collectStats()).rejects.toMatchObject({ name: "StatsUnavailableError" });
     expect(() => new DatabaseSync(join(projectDir, "db.sqlite"), { readOnly: true })).toThrow();
   });
 
@@ -281,4 +278,83 @@ describe("stats database admission", () => {
       }
     },
   );
+});
+
+
+describe("read-only numeric statistics", () => {
+  it("reads committed live WAL rows while preserving main database bytes and schema", async () => {
+    const { projectsDir } = makeFixture();
+    seedProject(projectsDir, "live");
+    const path = join(projectsDir, "live", "db.sqlite");
+    const writer = new DatabaseSync(path);
+    try {
+      writer.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;");
+      writer.prepare("INSERT INTO messages (conversation_id,seq,role,content,token_count) VALUES (1,2,'user',?,12)")
+        .run("WAL content must not appear in diagnostics");
+      const before = readFileSync(path);
+      const witness = statSync(path, { bigint: true });
+      const schema = writer.prepare("SELECT name,sql FROM sqlite_schema ORDER BY name").all();
+      const result = await collectStats();
+      expect(result).toMatchObject({ projects: 1, messages: 2 });
+      expect(JSON.stringify(result)).not.toContain("WAL content");
+      expect(readFileSync(path)).toEqual(before);
+      const after = statSync(path, { bigint: true });
+      expect([after.ino, after.mtimeNs]).toEqual([witness.ino, witness.mtimeNs]);
+      expect(writer.prepare("SELECT name,sql FROM sqlite_schema ORDER BY name").all()).toEqual(schema);
+    } finally { writer.close(); }
+  });
+
+  it("scopes a project without creating a missing project or reading another project", async () => {
+    const { projectsDir } = makeFixture();
+    seedProject(projectsDir, "one");
+    seedProject(projectsDir, "two");
+    expect(await collectStats({ projectId: "one" })).toMatchObject({ projects: 1, messages: 1 });
+    await expect(collectStats({ projectId: "missing" })).rejects.toMatchObject({ name: "StatsUnavailableError" });
+    expect(() => statSync(join(projectsDir, "missing"))).toThrow();
+    await expect(collectStats({ projectId: "../one" })).rejects.toMatchObject({ name: "StatsUnavailableError" });
+  });
+
+  it("computes recall and stale counts without serializing content, tags or ids", async () => {
+    const { projectsDir } = makeFixture();
+    seedProject(projectsDir, "numeric");
+    const path = join(projectsDir, "numeric", "db.sqlite");
+    const writer = new DatabaseSync(path);
+    try {
+      writer.prepare(`INSERT INTO promoted (id,content,tags,project_id,session_id,confidence,created_at)
+        VALUES ('private-id','private-content','[]','numeric','session',1,'2000-01-01 00:00:00')`).run();
+      writer.prepare("INSERT INTO recall_surfacing(memory_id,session_id) VALUES ('private-id','session')").run();
+      writer.prepare(`INSERT INTO promoted (id,content,tags,project_id,session_id,confidence)
+        VALUES ('signal-id','private-signal','["signal:memory_used","memory_id:private-id"]','numeric','session',1)`).run();
+      const result = await collectStats();
+      expect(result.recallStats).toEqual({ memoriesSurfaced: 1, memoriesActedUpon: 1, recallPrecision: 100 });
+      expect(result.staleCount).toBe(0);
+      expect(JSON.stringify(result)).not.toMatch(/private-content|private-signal|private-id|signal:memory_used|topRecalled/);
+    } finally { writer.close(); }
+  });
+
+  it("aggregates compression and rejects nonnumeric database metrics without disclosure", async () => {
+    const { projectsDir } = makeFixture();
+    seedProject(projectsDir, "compression");
+    const path = join(projectsDir, "compression", "db.sqlite");
+    const writer = new DatabaseSync(path);
+    try {
+      writer.prepare("INSERT INTO summaries(summary_id,conversation_id,kind,content,token_count,depth) VALUES ('sum',1,'leaf','private-summary',1,2)").run();
+      writer.exec("INSERT INTO redaction_stats(project_id,category,count) VALUES ('compression','built_in',3),('compression','global',2),('compression','project',1)");
+      const result = await collectStats();
+      expect(result).toMatchObject({ compactedConversations: 1, rawTokens: 7, summaryTokens: 1, ratio: 7, maxDepth: 2 });
+      expect(result.conversationDetails?.[0].ratio).toBe(7);
+      expect(result.redactionCounts).toEqual({ builtIn: 3, global: 2, project: 1, total: 6 });
+      for (const depth of ["private-depth", -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+        writer.prepare("UPDATE summaries SET depth=?").run(depth);
+        await expect(collectStats()).rejects.toMatchObject({ name: "StatsUnavailableError" });
+      }
+    } finally { writer.close(); }
+  });
+
+  it("propagates cancellation without opening a database", async () => {
+    makeFixture();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(collectStats({ signal: controller.signal })).rejects.toMatchObject({ name: "StatsUnavailableError" });
+  });
 });

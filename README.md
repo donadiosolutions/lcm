@@ -580,10 +580,12 @@ The [PostgreSQL summary, context, and large-file guide](src/storage/postgresql/r
 defines graph, coverage, context-range, ordering, lock/fence, grant, query-plan,
 diagnostic, and recovery semantics.
 
-Issue #617 activates daemon and MCP project-storage routing. CLI/import-export
-and portable transfer remain #618-owned; aggregate stats, pool diagnostics,
-status, and doctor parity remain #619-owned. Those limitations do not weaken
-the daemon's publication, identity, cancellation, shutdown, or privacy gates.
+Daemon and MCP project-storage routing and observational diagnostics support
+the selected backend. Stats, pool diagnostics, status, and doctor share a
+[sanitized backend snapshot](docs/cli.md#observational-diagnostics); diagnostics
+do not repair state or expose stored content. CLI/import-export and portable
+transfer remain #618-owned. Publication, identity, cancellation, shutdown, and
+privacy gates continue to apply.
 
 ## Development
 

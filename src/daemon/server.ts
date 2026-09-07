@@ -17,7 +17,6 @@ import {
   type DaemonConfigSnapshotWitness,
 } from "./config.js";
 import { sanitizeError } from "./safe-error.js";
-import { stagedPostgreSqlUnavailablePayload } from "./staged-postgresql.js";
 import { readAuthToken } from "./auth.js";
 import type { ProxyManager } from "./proxy-manager.js";
 import { createCompactHandler } from "./routes/compact.js";
@@ -41,6 +40,7 @@ import {
   type BackgroundPublicationAdmission,
 } from "./passive-event-processor.js";
 import { createStatsHandler } from "./routes/stats.js";
+import { backendDiagnosticFailure } from "../storage/diagnostics.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
 import { createReviewStaleHandler } from "./routes/review-stale.js";
 import { createInvocationControlHandler } from "./routes/invocation-control.js";
@@ -386,12 +386,6 @@ export function requestCancellation(
   };
 }
 
-function stagedPostgreSqlUnavailableHandler(operation: string): RouteHandler {
-  return async (_req, res) => {
-    sendJson(res, 503, stagedPostgreSqlUnavailablePayload(operation));
-  };
-}
-
 /** Revalidate config/publication state before each route or scheduled scan. */
 function assertDaemonRequestStorageAdmission(
   startupConfig: DaemonConfig,
@@ -607,7 +601,6 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     await settleCleanup(() => invocationCoordinator.shutdown());
     throw error;
   }
-  const sqliteStorage = config.storage.backend === "sqlite";
   let constructedProcessor: PassiveEventProcessor | undefined;
   let constructedWatcher: ReturnType<typeof watchProjectMap> | undefined;
   let constructedIngestInterval: ReturnType<typeof setInterval> | undefined;
@@ -778,13 +771,13 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   registerBuiltInRoute(
     "GET",
     "/stats",
-    sqliteStorage ? createStatsHandler() : stagedPostgreSqlUnavailableHandler("stats"),
+    createStatsHandler(publicationHome, storageFactory),
     "read",
   );
   registerBuiltInRoute(
     "GET",
     "/stats/pool",
-    sqliteStorage ? createPoolStatsHandler() : stagedPostgreSqlUnavailableHandler("pool stats"),
+    createPoolStatsHandler(publicationHome, storageFactory),
     "read",
   );
   registerBuiltInRoute(
@@ -902,6 +895,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     );
     const requestSignal = cancellation.signal;
     let bufferedResponse: BufferedServerResponse | undefined;
+    const diagnosticRoute = ["GET /stats", "GET /stats/pool", "POST /status"].includes(`${req.method} ${req.url?.split("?")[0]}`);
     try {
       const key = `${req.method} ${req.url?.split("?")[0]}`;
       const route = routes.get(key);
@@ -987,6 +981,11 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         }
       }
     } catch (err: unknown) {
+      if (diagnosticRoute) {
+        bufferedResponse?.discard();
+        sendJsonIfWritable(res, 503, { backendDiagnostics: backendDiagnosticFailure(err, config.storage.backend) });
+        return;
+      }
       if (bufferedResponse !== undefined) {
         bufferedResponse.discard();
         if (err instanceof BackendPublicationJournalError) {
@@ -1061,9 +1060,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       registerBuiltInRoute(
         "POST",
         "/status",
-        sqliteStorage
-          ? createStatusHandler(config, startTime, actualPort)
-          : stagedPostgreSqlUnavailableHandler("status"),
+        createStatusHandler(config, startTime, actualPort, publicationHome, storageFactory),
         "read",
       );
       passiveEventProcessor.start();
