@@ -12,6 +12,8 @@ import * as publicationModule from "../src/storage/backend-publication.js";
 import * as projectModule from "../src/daemon/project.js";
 import { SqliteStorageBackendFactory } from "../src/storage/sqlite/factory.js";
 import { hashProjectPath } from "../src/project-map.js";
+import { PrivateMutationLockContentionError, withPrivateMutationLock, withPrivateMutationLockAsync } from "../src/private-mutation-lock.js";
+import { createPublicationConvergence } from "../src/storage/publication-convergence.js";
 import { isLcmConnectionOpen } from "../src/db/connection.js";
 
 describe("CLI selected project storage", () => {
@@ -71,11 +73,11 @@ describe("CLI selected project storage", () => {
   it("attempts both closes and preserves a callback error when cleanup fails", async () => {
     const primary = new Error("primary");
     const realCreate = factoryModule.createStorageBackendFactory;
-    let factoryClosed = false;
+    let factoryCloses = 0;
     vi.spyOn(factoryModule,"createStorageBackendFactory").mockImplementation(async (...args) => {
       const factory = await realCreate(...args);
       const close = factory.close.bind(factory);
-      vi.spyOn(factory,"close").mockImplementation(async () => { await close(); factoryClosed=true; throw new Error("CANARY cleanup"); });
+      vi.spyOn(factory,"close").mockImplementation(async () => { await close(); factoryCloses++; throw new Error("CANARY cleanup"); });
       return factory;
     });
     await expect(withCliProjectStorage(cwd,{create:true},async ({storage}) => {
@@ -83,10 +85,190 @@ describe("CLI selected project storage", () => {
       vi.spyOn(storage,"close").mockImplementation(async () => { await close(); throw new Error("CANARY close"); });
       throw primary;
     })).rejects.toBe(primary);
-    expect(factoryClosed).toBe(true);
+    expect(factoryCloses).toBe(1);
     await expect(withCliProjectStorage(cwd,{create:false},async () => true))
       .rejects.toThrow("LCM storage could not be closed.");
   });
+  it.each([false, true])("holds publication authority through work and both closes (failure=%s)", async (fail) => {
+    const lockPath = join(home, ".lcm.backend-publication.lock");
+    const primary = new Error("callback failure");
+    const phases: string[] = [];
+    const assertPublisherBlocked = async (phase: string) => {
+      await Promise.resolve();
+      expect(() => withPrivateMutationLock(lockPath, "backend publication", () => {
+        writeFileSync(join(home, "published"), phase);
+      })).toThrow(PrivateMutationLockContentionError);
+      expect(existsSync(join(home, "published"))).toBe(false);
+      phases.push(phase);
+    };
+    const realCreate = factoryModule.createStorageBackendFactory;
+    vi.spyOn(factoryModule, "createStorageBackendFactory").mockImplementation(async (...args) => {
+      const factory = await realCreate(...args);
+      const close = factory.close.bind(factory);
+      vi.spyOn(factory, "close").mockImplementation(async () => {
+        await assertPublisherBlocked("factory close");
+        await close();
+      });
+      return factory;
+    });
+    const operation = withCliProjectStorage(cwd, { create: true }, async ({ storage }) => {
+      const close = storage.close.bind(storage);
+      vi.spyOn(storage, "close").mockImplementation(async () => {
+        await assertPublisherBlocked("storage close");
+        await close();
+      });
+      await assertPublisherBlocked("callback");
+      await storage.conversations.getOrCreateConversation("committed");
+      if (fail) throw primary;
+      return "done";
+    });
+    if (fail) await expect(operation).rejects.toBe(primary);
+    else await expect(operation).resolves.toBe("done");
+    expect(phases).toEqual(["callback", "storage close", "factory close"]);
+    expect(withPrivateMutationLock(lockPath, "backend publication", () => "published")).toBe("published");
+    expect(await withCliProjectStorage(cwd, {}, async ({ storage }) =>
+      (await storage.conversations.listConversations()).map(row => row.sessionId))).toEqual(["committed"]);
+  });
+
+  it.each(["callback", "storage close", "factory close"])("checks publication evidence after %s and closes once", async (phase) => {
+    let storageCloses = 0;
+    let factoryCloses = 0;
+    const invalidatePublication = () => mkdirSync(join(home, ".lcm", "backend-publication"), { mode: 0o700 });
+    const realCreate = factoryModule.createStorageBackendFactory;
+    vi.spyOn(factoryModule, "createStorageBackendFactory").mockImplementation(async (...args) => {
+      const factory = await realCreate(...args);
+      const close = factory.close.bind(factory);
+      vi.spyOn(factory, "close").mockImplementation(async () => {
+        factoryCloses++;
+        await close();
+        if (phase === "factory close") invalidatePublication();
+      });
+      return factory;
+    });
+    let path = "";
+    await expect(withCliProjectStorage(cwd, { create: true }, async ({ storage, project }) => {
+      path = project.dbPath;
+      const close = storage.close.bind(storage);
+      vi.spyOn(storage, "close").mockImplementation(async () => {
+        storageCloses++;
+        await close();
+        if (phase === "storage close") invalidatePublication();
+      });
+      if (phase === "callback") invalidatePublication();
+      return "must not report success";
+    })).rejects.toBeInstanceOf(publicationModule.BackendPublicationJournalError);
+    expect(storageCloses).toBe(1);
+    expect(factoryCloses).toBe(1);
+    expect(isLcmConnectionOpen(path)).toBe(false);
+  });
+
+  function convergence(sleep: (ms: number) => Promise<void>, syntheticOwner = false) {
+    const identity = {
+      pid: process.pid, version: "1.0.0", storageBackend: "sqlite" as const,
+      entrypoint: "/opt/lcm.mjs", runtimeDigest: "a".repeat(64),
+    };
+    let now = 0;
+    return createPublicationConvergence({
+      port: 3737, identity,
+      deps: {
+        homeDir: home, now: () => now,
+        readToken: () => "fixture-token",
+        ...(syntheticOwner ? {
+          readOwner: () => ({ version: 1 as const, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
+          processBirth: () => "birth",
+        } : {}),
+        fetch: async () => new Response(JSON.stringify({ status: "ok", ...identity })),
+        sleep: async ms => { now += ms; await sleep(ms); },
+      },
+    });
+  }
+
+  it("retries contended admission before preparing or opening storage", async () => {
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const publisher = withPrivateMutationLockAsync(join(home, ".lcm.backend-publication.lock"), "backend publication", () => released);
+    let prepared = 0;
+    let invoked = 0;
+    let sleeps = 0;
+    const retry = convergence(async () => {
+      sleeps++;
+      expect(prepared).toBe(0);
+      expect(invoked).toBe(0);
+      expect(existsSync(join(home, ".lcm", "projects"))).toBe(false);
+      writeFileSync(join(home, ".lcm", "config.json"), JSON.stringify({ daemon: { port: 4321 } }), { mode: 0o600 });
+      release();
+      await publisher;
+    });
+    try {
+      await expect(withCliProjectStorage(cwd, {
+        create: true, _publicationConvergence: retry,
+        prepare: async ({ config }) => { prepared++; expect(config.daemon.port).toBe(4321); },
+      }, async ({ storage }) => {
+        invoked++;
+        await storage.conversations.getOrCreateConversation("once");
+        return "admitted";
+      })).resolves.toBe("admitted");
+    } finally {
+      release();
+      await publisher;
+    }
+    expect(sleeps).toBe(1);
+    expect(prepared).toBe(1);
+    expect(invoked).toBe(1);
+  });
+
+  it.each(["prepare", "open", "callback", "post-check"])("does not replay admitted work after %s contention", async (phase) => {
+    const contention = new PrivateMutationLockContentionError("post-admission contention");
+    let prepared = 0;
+    let opened = 0;
+    let invoked = 0;
+    let storageCloses = 0;
+    let factoryCloses = 0;
+    // Authenticate a potential retry even after the operation has released its lock.
+    const retry = convergence(async () => undefined, true);
+    const realLock = publicationModule.withBackendPublicationConsumerLockAsync;
+    vi.spyOn(publicationModule, "withBackendPublicationConsumerLockAsync").mockImplementation(async (...args) => {
+      const result = await realLock(...args);
+      if (phase === "post-check") throw contention;
+      return result;
+    });
+    const realCreate = factoryModule.createStorageBackendFactory;
+    vi.spyOn(factoryModule, "createStorageBackendFactory").mockImplementation(async (...args) => {
+      const factory = await realCreate(...args);
+      const open = factory.openProject.bind(factory);
+      vi.spyOn(factory, "openProject").mockImplementation(async (...openArgs) => {
+        opened++;
+        if (phase === "open") throw contention;
+        const storage = await open(...openArgs);
+        const close = storage.close.bind(storage);
+        vi.spyOn(storage, "close").mockImplementation(async () => { storageCloses++; await close(); });
+        return storage;
+      });
+      const close = factory.close.bind(factory);
+      vi.spyOn(factory, "close").mockImplementation(async () => { factoryCloses++; await close(); });
+      return factory;
+    });
+    await expect(withCliProjectStorage(cwd, {
+      create: true, _publicationConvergence: retry,
+      prepare: async () => { prepared++; if (phase === "prepare") throw contention; },
+    }, async ({ storage }) => {
+      invoked++;
+      await storage.conversations.getOrCreateConversation(`effect-${invoked}`);
+      if (phase === "callback") throw contention;
+      return "committed";
+    })).rejects.toBe(contention);
+    expect(prepared).toBe(1);
+    expect(opened).toBe(phase === "prepare" ? 0 : 1);
+    expect(invoked).toBe(phase === "prepare" || phase === "open" ? 0 : 1);
+    expect(storageCloses).toBe(invoked);
+    expect(factoryCloses).toBe(phase === "prepare" ? 0 : 1);
+    vi.restoreAllMocks();
+    if (invoked !== 0) {
+      expect(await withCliProjectStorage(cwd, {}, async ({ storage }) =>
+        (await storage.conversations.listConversations()).map(row => row.sessionId))).toEqual(["effect-1"]);
+    }
+  });
+
   it("refuses PG custom local paths and absent remote projects without creating SQLite", async () => {
     const config=configModule.loadDaemonConfig(join(home,".lcm","config.json"));
     vi.spyOn(configModule,"loadDaemonConfig").mockReturnValue({...config,storage:{...config.storage,backend:"postgresql"}});

@@ -128,6 +128,15 @@ read preparation retry only the lock-acquisition callback. Output, exit status,
 and export file writes happen once after the callback succeeds. Mutation and
 lifecycle commands keep their existing admission and migration behavior.
 
+When version 1 knowledge export/import or compaction discovery opens project
+storage, its selected backend stays protected until the storage work and
+connection cleanup finish.
+Backend publication must wait or report contention during that interval.
+Automatic publication retries stop once project preparation begins; an error
+from opening storage, performing the operation, cleanup, or final publication
+validation is reported without replaying the operation. A failed command may
+already have committed storage changes, so inspect its result before retrying.
+
 The first authenticated health probe used to identify a retryable daemon can
 take up to two seconds. After the first qualifying contention, retries share a
 single two-second monotonic elapsed deadline and poll at most every 50

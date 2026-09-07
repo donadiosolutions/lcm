@@ -40,6 +40,7 @@ import { clearWorktreeReconciliationCache } from "../src/worktree-reconciliation
 import { lcmHomeDir } from "../src/runtime-paths.js";
 import { isLcmConnectionOpen } from "../src/db/connection.js";
 import { ScrubEngine } from "../src/scrub.js";
+import * as publicationModule from "../src/storage/backend-publication.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
 import { createPublicationConvergence } from "../src/storage/publication-convergence.js";
 
@@ -247,10 +248,9 @@ describe("portable-knowledge — export", () => {
     const cwd = makeTempDir();
     const outFile = join(makeTempDir(), "retried.json");
     seedProject(baseDir, cwd, [{ content: "Retried entry", tags: ["note"] }]);
-    const { SqliteStorageBackendFactory } = await import("../src/storage/sqlite/factory.js");
     const contention = new (await import("../src/private-mutation-lock.js")).PrivateMutationLockContentionError("busy");
-    const runMigration = vi.spyOn(SqliteStorageBackendFactory.prototype, "openExistingProject");
-    runMigration.mockImplementationOnce(() => { throw contention; });
+    const admitStorage = vi.spyOn(publicationModule, "withBackendPublicationConsumerLockAsync");
+    admitStorage.mockImplementationOnce(() => { throw contention; });
     const convergence = createPublicationConvergence({
       port: 3737,
       identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
@@ -275,10 +275,10 @@ describe("portable-knowledge — export", () => {
         _publicationConvergence: convergence,
       });
       expect(result.exported).toBe(1);
-      expect(runMigration).toHaveBeenCalledTimes(2);
+      expect(admitStorage).toHaveBeenCalledTimes(2);
       expect(JSON.parse(readFileSync(outFile, "utf-8")).entries).toHaveLength(1);
     } finally {
-      runMigration.mockRestore();
+      admitStorage.mockRestore();
     }
   });
 
@@ -286,10 +286,9 @@ describe("portable-knowledge — export", () => {
     const baseDir = makeTempDir();
     const cwd = makeTempDir();
     seedProject(baseDir, cwd, [{ content: "stdout retry", tags: ["note"] }]);
-    const { SqliteStorageBackendFactory } = await import("../src/storage/sqlite/factory.js");
     const contention = new (await import("../src/private-mutation-lock.js")).PrivateMutationLockContentionError("busy");
-    const runMigration = vi.spyOn(SqliteStorageBackendFactory.prototype, "openExistingProject");
-    runMigration.mockImplementationOnce(() => { throw contention; });
+    const admitStorage = vi.spyOn(publicationModule, "withBackendPublicationConsumerLockAsync");
+    admitStorage.mockImplementationOnce(() => { throw contention; });
     let now = 0;
     const convergence = createPublicationConvergence({
       port: 3737,
@@ -311,9 +310,9 @@ describe("portable-knowledge — export", () => {
       const documents = output.mock.calls.map(([value]) => String(value)).filter(value => value.includes('"version"'));
       expect(documents).toHaveLength(1);
       expect(JSON.parse(documents[0]!).entries).toHaveLength(1);
-      expect(runMigration).toHaveBeenCalledTimes(2);
+      expect(admitStorage).toHaveBeenCalledTimes(2);
     } finally {
-      runMigration.mockRestore();
+      admitStorage.mockRestore();
     }
   });
 
@@ -328,10 +327,9 @@ describe("portable-knowledge — export", () => {
     const outFile = join(makeTempDir(), "existing.json");
     writeFileSync(outFile, "previous export");
     seedProject(baseDir, cwd, [{ content: "blocked entry", tags: ["note"] }]);
-    const { SqliteStorageBackendFactory } = await import("../src/storage/sqlite/factory.js");
     const { PrivateMutationLockContentionError } = await import("../src/private-mutation-lock.js");
     const contention = new PrivateMutationLockContentionError("publication busy");
-    const runMigration = vi.spyOn(SqliteStorageBackendFactory.prototype, "openExistingProject").mockImplementation(() => { throw contention; });
+    const admitStorage = vi.spyOn(publicationModule, "withBackendPublicationConsumerLockAsync").mockImplementation(() => { throw contention; });
     let now = 0;
     const convergence = createPublicationConvergence({
       port: 3737,
@@ -355,10 +353,10 @@ describe("portable-knowledge — export", () => {
       })).rejects.toBe(contention);
       expect(output).not.toHaveBeenCalled();
       expect(readFileSync(outFile, "utf-8")).toBe("previous export");
-      expect(runMigration).toHaveBeenCalledTimes(authenticated ? 40 : 1);
+      expect(admitStorage).toHaveBeenCalledTimes(authenticated ? 40 : 1);
       expect(now).toBe(authenticated ? 2000 : 0);
     } finally {
-      runMigration.mockRestore();
+      admitStorage.mockRestore();
       output.mockRestore();
     }
   });

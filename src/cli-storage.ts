@@ -39,71 +39,83 @@ export async function withCliProjectStorage<T>(
   options: CliProjectOptions,
   callback: (context: CliProjectContext & { storage: ProjectStorage }) => Promise<T>,
 ): Promise<T> {
-  const opened = await withPublicationAdmissionRetry(() => {
+  const outcome = await withPublicationAdmissionRetry(async () => {
     const configFile = configPath();
     const config = loadDaemonConfig(configFile);
     selectStorageBackendForConfig(configFile, config.storage);
-    return withBackendPublicationConsumerLockAsync(undefined, async token => {
-      assertStorageBackendPublication(config.storage, token);
-      const customBase = options._lcmBaseDir !== undefined && options._lcmBaseDir !== lcmHomeDir();
-      if (customBase && config.storage.backend !== "sqlite") {
-        throw new Error("Custom local storage paths are unavailable for PostgreSQL.");
-      }
-      let canonical = cwd;
-      if (customBase) {
-        try { canonical = realpathSync(cwd); } catch { /* Keep the established missing-path identity. */ }
-      }
-      const identity = customBase
-        ? { id: hashProjectPath(canonical), canonical }
-        : projectIdentity(cwd, config.storage, token);
-      const localId = "localProjectId" in identity ? identity.localProjectId : identity.id;
-      const local = { id: localId, canonical: identity.canonical };
-      const paths = customBase
-        ? { ...local, dir: join(options._lcmBaseDir!, "projects", localId), dbPath: join(options._lcmBaseDir!, "projects", localId, "db.sqlite") }
-        : projectPathsForIdentity(local);
-      const project = { ...paths, id: identity.id };
-      const context = { project, config };
-      await options.prepare?.(context);
-      if (options.create && config.storage.backend === "sqlite") {
+    let admitted = false;
+    try {
+      const value = await withBackendPublicationConsumerLockAsync(undefined, async token => {
+        // Admission may retry, but prepare/open/work/cleanup may already have effects.
+        admitted = true;
+        assertStorageBackendPublication(config.storage, token);
+        const customBase = options._lcmBaseDir !== undefined && options._lcmBaseDir !== lcmHomeDir();
+        if (customBase && config.storage.backend !== "sqlite") {
+          throw new Error("Custom local storage paths are unavailable for PostgreSQL.");
+        }
+        let canonical = cwd;
         if (customBase) {
-          ensurePrivateDirectory(options._lcmBaseDir!);
-          ensurePrivateDirectory(join(options._lcmBaseDir!, "projects"));
-          ensurePrivateDirectory(paths.dir);
-          atomicWritePrivateFileExclusive(join(paths.dir, "meta.json"), JSON.stringify({ cwd: canonical }, null, 2) + "\n");
-        } else {
-          ensureProjectDirForIdentity(local);
+          try { canonical = realpathSync(cwd); } catch { /* Keep the established missing-path identity. */ }
         }
-      }
-      const factory: StorageBackendFactory = customBase
-        ? new SqliteStorageBackendFactory({ resolveProject: () => ({ id: identity.id, dbPath: paths.dbPath }) })
-        : await createStorageBackendFactory(config.storage, undefined, undefined, token);
-      try {
-        const storage = options.create && config.storage.backend === "sqlite"
-          ? await factory.openProject(identity, token)
-          : await factory.openExistingProject(identity, token);
-        if (!storage) {
-          if (config.storage.backend === "sqlite") throw new CliProjectStorageMissingError();
-          throw new Error("The bound PostgreSQL project is unavailable.");
+        const identity = customBase
+          ? { id: hashProjectPath(canonical), canonical }
+          : projectIdentity(cwd, config.storage, token);
+        const localId = "localProjectId" in identity ? identity.localProjectId : identity.id;
+        const local = { id: localId, canonical: identity.canonical };
+        const paths = customBase
+          ? { ...local, dir: join(options._lcmBaseDir!, "projects", localId), dbPath: join(options._lcmBaseDir!, "projects", localId, "db.sqlite") }
+          : projectPathsForIdentity(local);
+        const project = { ...paths, id: identity.id };
+        const context = { project, config };
+        await options.prepare?.(context);
+        if (options.create && config.storage.backend === "sqlite") {
+          if (customBase) {
+            ensurePrivateDirectory(options._lcmBaseDir!);
+            ensurePrivateDirectory(join(options._lcmBaseDir!, "projects"));
+            ensurePrivateDirectory(paths.dir);
+            atomicWritePrivateFileExclusive(join(paths.dir, "meta.json"), JSON.stringify({ cwd: canonical }, null, 2) + "\n");
+          } else {
+            ensureProjectDirForIdentity(local);
+          }
         }
-        return { ...context, storage, factory };
-      } catch (error) {
-        try { await factory.close(); } catch { /* Preserve the primary admission error. */ }
-        throw error;
-      }
-    });
+        const factory: StorageBackendFactory = customBase
+          ? new SqliteStorageBackendFactory({ resolveProject: () => ({ id: identity.id, dbPath: paths.dbPath }) })
+          : await createStorageBackendFactory(config.storage, undefined, undefined, token);
+        let storage: ProjectStorage | null;
+        try {
+          storage = options.create && config.storage.backend === "sqlite"
+            ? await factory.openProject(identity, token)
+            : await factory.openExistingProject(identity, token);
+          if (!storage) {
+            if (config.storage.backend === "sqlite") throw new CliProjectStorageMissingError();
+            throw new Error("The bound PostgreSQL project is unavailable.");
+          }
+        } catch (error) {
+          try { await factory.close(); } catch { /* Preserve the primary admission error. */ }
+          throw error;
+        }
+        let failed = false;
+        try {
+          return await callback({ ...context, storage });
+        } catch (error) {
+          failed = true;
+          throw error;
+        } finally {
+          let closeFailed = false;
+          try { await storage.close(); } catch { closeFailed = true; }
+          try { await factory.close(); } catch { closeFailed = true; }
+          if (!failed && closeFailed) throw new Error("LCM storage could not be closed.");
+        }
+      });
+      return { succeeded: true as const, value };
+    } catch (error) {
+      if (!admitted) throw error;
+      // Return admitted failures past the retry boundary, including post-check errors.
+      return { succeeded: false as const, error };
+    }
   }, options._publicationConvergence);
-  let failed = false;
-  try {
-    return await callback(opened);
-  } catch (error) {
-    failed = true;
-    throw error;
-  } finally {
-    let closeFailed = false;
-    try { await opened.storage.close(); } catch { closeFailed = true; }
-    try { await opened.factory.close(); } catch { closeFailed = true; }
-    if (!failed && closeFailed) throw new Error("LCM storage could not be closed.");
-  }
+  if (!outcome.succeeded) throw outcome.error;
+  return outcome.value;
 }
 
 /** Enumerate authenticated local bindings, including entries without SQLite metadata. */
