@@ -1,6 +1,6 @@
 import type { EventRow, PatternReinforcementStats } from "../../hooks/events-db.js";
 import { eventsDbPath, existingEventsDbPath } from "../../db/events-path.js";
-import { deduplicateAndInsert } from "../../promotion/dedup.js";
+import { deduplicateAndInsert, deduplicateAndInsertInRepositories } from "../../promotion/dedup.js";
 import { sendJson, type RouteExecutionContext, type RouteHandler } from "../server.js";
 import { isMissingCwdError, validateCwd } from "../validate-cwd.js";
 import { projectIdentity, projectPathsForIdentity } from "../project.js";
@@ -1008,11 +1008,10 @@ async function promoteEventsBatch(
                 return { promoted: false as const };
               }
             }
-            const promotedMemoryId = await deduplicateAndInsert({
-              transaction: async (callback) => callback(repositories),
+            const promotedMemoryId = await deduplicateAndInsertInRepositories(
               repositories,
-              ...dedupInput,
-            });
+              dedupInput,
+            );
             await repositories.migrationReceipt!.record({
               epochId: epoch.epochId,
               envelope,

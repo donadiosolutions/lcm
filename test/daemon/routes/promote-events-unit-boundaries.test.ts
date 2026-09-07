@@ -171,6 +171,20 @@ describe("promote-events unit boundaries", () => {
     mocks.closeEvents.mockImplementation(() => undefined);
   });
 
+  it("uses ordinary promotion when a SQLite transaction has no receipt repository", async () => {
+    const transaction = vi.fn(async (callback: (repositories: unknown) => Promise<unknown>) =>
+      callback({}));
+    mocks.openProject.mockResolvedValueOnce({ ...projectStorage(), backend: "sqlite", transaction });
+    mocks.events.mockReturnValueOnce([event({ machine_id: "machine" })]);
+
+    const result = await promoteEventsForCwd(config, "/cwd", "/events.db");
+
+    expect(result).toMatchObject({ promoted: 1, skipped: 0, errors: 0 });
+    expect(transaction).toHaveBeenCalledOnce();
+    expect(mocks.dedup).toHaveBeenCalledOnce();
+    expect(mocks.mark).toHaveBeenCalledWith([1]);
+  });
+
   it("returns a generic global error when sidecar collection throws", async () => {
     mocks.collect.mockImplementationOnce(() => { throw new Error("scan failed"); });
     const response = {} as never;

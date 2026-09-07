@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -8,6 +8,10 @@ import {
   type LocalHookOutboxRepository,
   SQLiteLocalHookOutboxFactory,
 } from "../../src/storage/local-hook-outbox.js";
+import {
+  BackendPublicationCoordinator,
+  type BackendPublicationDriver,
+} from "../../src/storage/backend-publication.js";
 
 describe("SQLiteLocalHookOutboxFactory", () => {
   const machineId = "0195d250-0000-7000-8000-000000000091";
@@ -24,6 +28,14 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-local-outbox-"));
     directories.push(directory);
     return join(directory, `${name}.db`);
+  }
+
+  function localPathFor(name: string): { homeDir: string; dbPath: string } {
+    const homeDir = mkdtempSync(join(tmpdir(), "lcm-local-outbox-home-"));
+    directories.push(homeDir);
+    const eventsDirectory = join(homeDir, ".lcm", "events");
+    mkdirSync(eventsDirectory, { recursive: true, mode: 0o700 });
+    return { homeDir, dbPath: join(eventsDirectory, `${name}.db`) };
   }
 
   function retainedOperations(
@@ -235,6 +247,108 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     expect(isLcmConnectionOpen(path)).toBe(false);
     await factory.close();
     await factory.close();
+  });
+
+  it("forwards delivery quarantine lifecycle operations through the local repository", async () => {
+    const path = pathFor("delivery-lifecycle");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const repository = await factory.open(path);
+    const first = await repository.insertEvent(
+      "delivery-session",
+      { type: "choice", category: "decision", data: "first", priority: 1 },
+      "PostToolUse",
+    );
+    const second = await repository.insertEvent(
+      "delivery-session",
+      { type: "choice", category: "decision", data: "second", priority: 1 },
+      "PostToolUse",
+    );
+    const [firstClaim] = await repository.claimDeliveries({
+      machineId: (await repository.getUnprocessed())[0].machine_id ?? machineId,
+      claimOwner: "owner-a",
+      limit: 1,
+      staleClaimMs: 1_000,
+    });
+    expect(firstClaim.event_id).toBe(first);
+    expect(await repository.markDeliveryRetry(
+      firstClaim.event_uuid,
+      "owner-a",
+      "temporary failure",
+      "2000-01-01T00:00:00.000Z",
+    )).toBe(true);
+
+    const [reclaimed] = await repository.claimDeliveries({
+      machineId: firstClaim.machine_id ?? machineId,
+      claimOwner: "owner-b",
+      limit: 1,
+      staleClaimMs: 1_000,
+    });
+    expect(reclaimed.event_id).toBe(first);
+    expect(await repository.markDeliveryQuarantined(
+      reclaimed.event_uuid,
+      "owner-b",
+      "poisoned payload",
+    )).toBe(true);
+    expect((await repository.listQuarantined()).map((event) => event.event_id)).toEqual([first]);
+
+    const [secondClaim] = await repository.claimDeliveries({
+      machineId: firstClaim.machine_id ?? machineId,
+      claimOwner: "owner-c",
+      limit: 1,
+      staleClaimMs: 1_000,
+    });
+    expect(secondClaim.event_id).toBe(second);
+    expect(await repository.markReplicated(secondClaim.event_uuid, "owner-c", 41n)).toBe(true);
+    expect((await repository.listAwaitingRemote()).map((event) => event.event_id)).toEqual([second]);
+    expect(await repository.markQuarantined(secondClaim.event_uuid, 41n, "remote poison")).toBe(true);
+    expect(await repository.listAwaitingRemote()).toEqual([]);
+    expect((await repository.listAwaitingRemote(undefined, true)).map((event) => event.event_id)).toEqual([second]);
+    expect((await repository.listQuarantined()).map((event) => event.event_id)).toEqual([first, second]);
+    expect(await repository.replayQuarantined(reclaimed.event_uuid)).toBe(true);
+    expect(await repository.replayQuarantined(secondClaim.event_uuid)).toBe(true);
+    expect(await repository.markAcknowledged(secondClaim.event_uuid, 41n)).toBe(true);
+    expect((await repository.listAcknowledgedForRemotePrune()).map((event) => event.event_id)).toEqual([second]);
+
+    await repository.close();
+    await factory.close();
+  });
+
+  it("opens an existing local outbox while migration maintenance is held", async () => {
+    const { homeDir, dbPath } = localPathFor("maintenance-held");
+    const seedFactory = new SQLiteLocalHookOutboxFactory();
+    const seed = await seedFactory.open(dbPath);
+    await seed.insertEvent(
+      "maintenance-session",
+      { type: "choice", category: "decision", data: "held", priority: 1 },
+      "PostToolUse",
+    );
+    await seedFactory.close();
+
+    const unexpected: BackendPublicationDriver["observeLocalState"] = async () => {
+      throw new Error("publication driver must not run");
+    };
+    const driver: BackendPublicationDriver = {
+      observeLocalState: unexpected,
+      publishProjectMap: async () => { throw new Error("publication driver must not run"); },
+      publishConfig: async () => { throw new Error("publication driver must not run"); },
+      restoreConfig: async () => { throw new Error("publication driver must not run"); },
+      restoreProjectMap: async () => { throw new Error("publication driver must not run"); },
+    };
+    const coordinator = new BackendPublicationCoordinator({ homeDir, driver });
+    await coordinator.enterMaintenance({
+      publicationId: "local-outbox-publication",
+      generationId: "local-outbox-generation",
+      sourceSelectionSha256: "a".repeat(64),
+      queueEvidenceSha256: "b".repeat(64),
+      roster: [{ machineId, queueCutoff: null, evidenceSha256: "a".repeat(64) }],
+    });
+
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const repository = await factory.openExisting(dbPath);
+    expect(repository).not.toBeNull();
+    await repository?.close();
+    await factory.close();
+
   });
 
   it("opens only an existing local outbox without creating missing path state", async () => {

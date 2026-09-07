@@ -81,7 +81,8 @@ describe("local hook event sequence", () => {
   });
 
   it("reads the next cutoff sequence without allocating it", () => {
-    const allocator = new LocalHookEventSequenceAllocator(sequencePath());
+    const allocatorPath = sequencePath();
+    const allocator = new LocalHookEventSequenceAllocator(allocatorPath);
     try {
       expect(allocator.peekNextSequence()).toBe(0n);
       expect(allocator.allocateSequence()).toBe(0n);
@@ -89,6 +90,9 @@ describe("local hook event sequence", () => {
     } finally {
       allocator.close();
     }
+    expect(() => allocator.peekNextSequence()).toThrow("allocator is closed");
+    expect(isLcmConnectionOpen(allocatorPath)).toBe(false);
+    expect(allocateLocalHookEventSequence(allocatorPath)).toBe(1n);
   });
 
   it("releases its connection when checkpoint initialization fails", () => {

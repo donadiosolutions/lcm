@@ -49,13 +49,18 @@ vi.mock("../../../src/db/events-path.js", () => ({
 }));
 
 // Mock deduplicateAndInsert to track calls without needing real FTS5
-vi.mock("../../../src/promotion/dedup.js", () => ({
-  deduplicateAndInsert: vi.fn().mockResolvedValue("mock-id"),
-}));
+vi.mock("../../../src/promotion/dedup.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../src/promotion/dedup.js")>();
+  return {
+    ...actual,
+    deduplicateAndInsert: vi.fn().mockResolvedValue("mock-id"),
+    deduplicateAndInsertInRepositories: vi.fn(actual.deduplicateAndInsertInRepositories),
+  };
+});
 
 // Import the mocked modules
 import { eventsDbPath } from "../../../src/db/events-path.js";
-import { deduplicateAndInsert } from "../../../src/promotion/dedup.js";
+import { deduplicateAndInsert, deduplicateAndInsertInRepositories } from "../../../src/promotion/dedup.js";
 
 function makeConfig(): DaemonConfig {
   return {
@@ -151,6 +156,7 @@ describe("promote-events route", () => {
     eventPathMocks.existingEventsDbPath.mockReturnValue(sidecarPath);
     vi.mocked(eventsDbPath).mockReturnValue(sidecarPath);
     vi.mocked(deduplicateAndInsert).mockClear();
+    vi.mocked(deduplicateAndInsertInRepositories).mockClear();
     clearProjectMapCache();
   });
 
@@ -255,14 +261,17 @@ describe("promote-events route", () => {
 
     const verify = new DatabaseSync(projectDbPath(dir), { readOnly: true });
     const evidence = readMigrationReceiptEvidence(verify, projectId(dir), MACHINE_ID);
+    const effects = new PromotedStore(verify).getAll();
+    expect(effects).toHaveLength(1);
+    expect(effects[0].content).toBe("receipt covered");
     expect(evidence.receipts).toMatchObject([{
       outcome: "applied",
-      effectWitness: { promotedMemoryId: "mock-id" },
+      effectWitness: { promotedMemoryId: effects[0].id },
     }]);
     verify.close();
   });
 
-  it("commits a no-effect receipt with the unreinforced lexical decision", async () => {
+  it.each([false, true])("commits the unreinforced lexical decision with existing match=%s", async (hasMatch) => {
     recoverMachineIdentity({
       version: 1,
       identityKey: `machine:${"c".repeat(64)}`,
@@ -277,6 +286,9 @@ describe("promote-events route", () => {
       firstMachineSequence: "0000000000000000000",
       establishedAt: "2026-09-07T03:04:05.123456Z",
     });
+    const existingId = hasMatch ? new PromotedStore(projectDb).insert({
+      content: "only once", tags: [], projectId: projectId(dir), depth: 0, confidence: 0.5,
+    }) : undefined;
     projectDb.close();
     const edb = new EventsDb(sidecarPath);
     edb.insertEvent("s1", {
@@ -294,13 +306,19 @@ describe("promote-events route", () => {
       JSON.stringify({ cwd: dir }),
     );
 
-    expect(output.getBody()).toMatchObject({ promoted: 0, skipped: 1, errors: 0 });
+    expect(output.getBody()).toMatchObject({
+      promoted: hasMatch ? 1 : 0, skipped: hasMatch ? 0 : 1, errors: 0,
+    });
     const verify = new DatabaseSync(projectDbPath(dir), { readOnly: true });
     expect(readMigrationReceiptEvidence(verify, projectId(dir), MACHINE_ID).receipts)
-      .toMatchObject([{
+      .toMatchObject([hasMatch ? {
+        outcome: "applied",
+        effectWitness: { promotedMemoryId: existingId },
+      } : {
         outcome: "no-effect",
         effectWitness: { reason: "unreinforced-pattern" },
       }]);
+    expect(new PromotedStore(verify).getAll()).toHaveLength(hasMatch ? 1 : 0);
     verify.close();
   });
 
@@ -328,12 +346,7 @@ describe("promote-events route", () => {
       priority: outcome === "applied" ? 1 : 3,
     }, "PostToolUse");
     edb.close();
-    const actual = await vi.importActual<typeof import("../../../src/promotion/dedup.js")>(
-      "../../../src/promotion/dedup.js",
-    );
-    const dedup = vi.mocked(deduplicateAndInsert);
-    const previousDedup = dedup.getMockImplementation();
-    dedup.mockImplementation(actual.deduplicateAndInsert);
+    const dedup = vi.mocked(deduplicateAndInsertInRepositories);
     // Leave the real original SQLite envelope pending after the effect transaction
     // commits, as when the process dies before its separate outbox acknowledgement.
     const mark = vi.spyOn(EventsDb.prototype, "markProcessed").mockImplementationOnce(() => undefined);
@@ -374,8 +387,6 @@ describe("promote-events route", () => {
       remaining.close();
     } finally {
       mark.mockRestore();
-      if (previousDedup) dedup.mockImplementation(previousDedup);
-      else dedup.mockReset();
     }
   });
 
