@@ -90,18 +90,20 @@ link-count, type, containment, and size checks happen before LCM consumes the
 file contents. Symlinks, FIFOs, directories, oversized files, foreign-owner
 files, and multiply linked files are rejected.
 
-These checks also protect Claude all-project imports, SQLite batch-compaction
-discovery, and the daemon's periodic Claude transcript scan. An import silently
-skips rejected metadata for that run, the periodic daemon scan tries again at
-its next interval, and `lcm compact --all` reports the project metadata as
-unreadable or malformed while continuing with trusted siblings. Existing map
-entries remain unchanged. LCM does not repair rejected metadata automatically.
+These checks also protect the daemon's periodic Claude transcript scan, which
+skips rejected metadata and tries again at its next interval. Public
+`lcm import --all` and `lcm compact --all` use authenticated project bindings
+instead of enumerating metadata. They do not trust unbound metadata directories
+or report metadata-scan failures for this unused discovery path. Selected
+project storage failures remain visible. Existing map entries remain unchanged;
+LCM does not repair rejected metadata automatically.
 
 An atomic metadata publication can be rejected briefly while it has two links
 or while its descriptor metadata is changing. This is deliberate fail-closed
-behavior. Retry `lcm compact --all` after concurrent project activity settles;
-a persistently unsafe file must be restored as an owner-local, single-link
-`meta.json` from trusted project state before discovery can use it. Avoid
+behavior. Retry metadata-based recovery after concurrent project activity
+settles; a persistently unsafe file must be restored as an owner-local,
+single-link `meta.json` from trusted project state before recovery or the
+periodic scan can use it. Avoid
 sharing the file or its `cwd` value in diagnostics unless needed, because local
 paths can identify users, organizations, and repositories; see
 [Privacy and data handling](privacy.md).
@@ -124,6 +126,16 @@ and project-sensitive patterns into the primary checkout's local project.
 Exact duplicates are retained once. Per-source merge markers make retries and
 later-discovered generations idempotent, so each source generation is applied
 exactly once.
+
+Legacy split SQLite stores containing active native transcript records, message
+links, or ingest checkpoints currently block reconciliation. LCM checks every
+source before changing either project database, and rechecks while holding the
+source write lock. Empty native transcript tables remain compatible. The blocked
+journal explains the refusal; the source data stays in place and the project map
+is not folded. Preserve the legacy store until a supported native transcript
+merge is available; deleting its native rows to bypass the check would lose data.
+The canonical recovery archive is a separate transfer surface and does not enable
+this legacy merge.
 
 Exact same-UUID passive events with the same immutable envelope, compatible
 delivery state and checkpoints, and the same predecessor identity—the same

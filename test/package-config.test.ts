@@ -1,3 +1,4 @@
+import { stagePortableArtifact, verifyPortablePackage } from "../scripts/portable-package-smoke.mjs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,6 +34,7 @@ const POSTGRESQL_REFERENCE_FILES = [
   "postgresql-schema.md",
   "postgresql-search.md",
   "postgresql-summary-context.md",
+  "postgresql-transfer-grants.sql",
 ] as const;
 
 function npmPackInventory(): string[] {
@@ -44,7 +46,8 @@ function npmPackInventory(): string[] {
     repositoryRoot,
     "dist/src/storage/postgresql.js",
   );
-  if (!existsSync(transcriptRuntime) || !existsSync(postgresqlRuntime)) {
+  if (!existsSync(transcriptRuntime) || !existsSync(postgresqlRuntime)
+      || !existsSync(resolve(repositoryRoot, "dist/src/storage/portable.js"))) {
     execFileSync("pnpm", ["run", "build"], {
       cwd: repositoryRoot,
       encoding: "utf8",
@@ -100,7 +103,24 @@ describe("package.json", () => {
       "node scripts/verify-postgresql-package.mjs && tsc --project tsconfig.postgresql-package.json",
     );
     expect(pkg.scripts.postbuild).toContain("pnpm run verify:postgresql-package");
+    expect(pkg.exports).toHaveProperty("./storage/portable", {
+      types: "./dist/src/storage/portable.d.ts", import: "./dist/src/storage/portable.js",
+    });
+    expect(pkg.scripts.postbuild).toContain("pnpm run verify:portable-package");
   });
+  it("imports and typechecks portable APIs from an offline extracted tarball", { timeout: 120_000 }, () => {
+    npmPackInventory();
+    const scratch = mkdtempSync(join(tmpdir(), "lcm-portable-package-"));
+    try {
+      const packed = JSON.parse(execFileSync("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", scratch], {
+        cwd: repositoryRoot, encoding: "utf8", timeout: PACKAGE_COMMAND_TIMEOUT_MS,
+      })) as Array<{ filename: string }>;
+      writeFileSync(join(scratch, "package.json"), JSON.stringify({ name: "portable-consumer", version: "1.0.0", private: true }));
+      stagePortableArtifact(join(scratch, packed[0].filename), scratch);
+      verifyPortablePackage(scratch);
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
   it("has anthropic sdk as optional peer dep", () => expect(pkg.peerDependencies).toHaveProperty("@anthropic-ai/sdk"));
   it("keeps the bundled MCP build graph out of published consumer dependencies", () => {
     expect(pkg.dependencies).not.toHaveProperty("@modelcontextprotocol/sdk");
@@ -218,6 +238,8 @@ describe("package.json", () => {
           "dist/src/storage/native-transcripts.js",
           "dist/src/storage/postgresql.d.ts",
           "dist/src/storage/postgresql.js",
+          "dist/src/storage/portable.js",
+          "dist/src/storage/portable.d.ts",
           "docs/README.md",
           ...POSTGRESQL_REFERENCE_FILES.map(
             (fileName) => `src/storage/postgresql/reference/${fileName}`,

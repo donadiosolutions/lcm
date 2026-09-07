@@ -16,6 +16,10 @@
     "./storage/postgresql": {
       "types": "./dist/src/storage/postgresql.d.ts",
       "import": "./dist/src/storage/postgresql.js"
+    },
+    "./storage/portable": {
+      "types": "./dist/src/storage/portable.d.ts",
+      "import": "./dist/src/storage/portable.js"
     }
   },
   "bin": {
@@ -41,7 +45,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "postbuild": "mkdir -p dist/src/prompts && cp -r src/prompts/*.yaml dist/src/prompts/ && rm -rf dist/src/connectors/templates && rm -f dist/src/connectors/operation-catalog.js dist/src/connectors/operation-catalog.d.ts dist/src/connectors/operation-catalog.js.map && mkdir -p dist/src/connectors/templates && cp -r src/connectors/templates/. dist/src/connectors/templates/ && mkdir -p dist/src/storage/postgresql/migrations && cp src/storage/postgresql/migrations/*.sql dist/src/storage/postgresql/migrations/ && cp installer/setup.sh dist/installer/setup.sh && pnpm run build:runtime && pnpm run verify:native-transcript-package && pnpm run verify:postgresql-package",
+    "postbuild": "mkdir -p dist/src/prompts && cp -r src/prompts/*.yaml dist/src/prompts/ && rm -rf dist/src/connectors/templates && rm -f dist/src/connectors/operation-catalog.js dist/src/connectors/operation-catalog.d.ts dist/src/connectors/operation-catalog.js.map && mkdir -p dist/src/connectors/templates && cp -r src/connectors/templates/. dist/src/connectors/templates/ && mkdir -p dist/src/storage/postgresql/migrations && cp src/storage/postgresql/migrations/*.sql dist/src/storage/postgresql/migrations/ && cp installer/setup.sh dist/installer/setup.sh && pnpm run build:runtime && pnpm run verify:native-transcript-package && pnpm run verify:postgresql-package && pnpm run verify:portable-package",
     "build:runtime": "node scripts/build-runtime.mjs",
     "prepublishOnly": "pnpm run build",
     "changeset": "changeset",
@@ -55,7 +59,8 @@
     "verify:native-transcript-package": "node scripts/verify-native-transcript-package.mjs && tsc --project tsconfig.native-transcript-package.json",
     "verify:postgresql-package": "node scripts/verify-postgresql-package.mjs && tsc --project tsconfig.postgresql-package.json",
     "version-packages": "node scripts/version-packages.mjs",
-    "update:patterns": "node --experimental-strip-types scripts/update-gitleaks-patterns.ts"
+    "update:patterns": "node --experimental-strip-types scripts/update-gitleaks-patterns.ts",
+    "verify:portable-package": "node scripts/verify-portable-package.mjs && tsc --project tsconfig.portable-package.json"
   },
   "dependencies": {
     "@hono/node-server": "2.0.12",
