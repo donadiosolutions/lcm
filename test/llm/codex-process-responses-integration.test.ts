@@ -8,8 +8,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCodexProcessSummarizer } from "../../src/llm/codex-process.js";
 import { createCodexResponsesGateway, type CodexResponsesGateway } from "../../src/llm/codex-responses-gateway.js";
 
-const PROMPT = "SYSTEM: summarize only\n\nUSER: transcript text";
-
 type FakeChild = EventEmitter & {
   stdout: PassThrough;
   stderr: PassThrough;

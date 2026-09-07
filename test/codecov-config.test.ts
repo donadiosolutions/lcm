@@ -611,6 +611,8 @@ describe("Codecov configuration", () => {
       // caller-cancellation handling during resolver teardown in this owner.
       // #1154/#1157 retain Spark protocol normalization, bounded upstream
       // classification, and terminal sentinel handling in this owner.
+      // #1168 retains accepted HTTP body and SSE failure classification in
+      // this LLM-owned component.
       ["src/llm/codex-process.ts", "unit-llm-prompts"],
       ["src/llm/codex-config.ts", "unit-llm-prompts"],
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
