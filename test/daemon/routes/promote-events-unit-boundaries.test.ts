@@ -169,6 +169,7 @@ describe("promote-events unit boundaries", () => {
     mocks.closeProject.mockResolvedValue(undefined);
     mocks.closeFactory.mockResolvedValue(undefined);
     mocks.closeEvents.mockImplementation(() => undefined);
+    mocks.transaction.mockImplementation(async (callback: (repositories: unknown) => Promise<unknown>) => callback({}));
   });
 
   it("returns a generic global error when sidecar collection throws", async () => {
@@ -1107,5 +1108,100 @@ describe("promote-events unit boundaries", () => {
       sourceProjectId: "pid",
     }));
     expect(mocks.mark).toHaveBeenCalledWith([1, 2]);
+  });
+
+  it("runs the public PostgreSQL priority 3 path through real dedup and preserves local provenance", async () => {
+    const actual = await vi.importActual<typeof import("../../../src/promotion/dedup.js")>(
+      "../../../src/promotion/dedup.js",
+    );
+    const candidate = {
+      id: "local-canonical",
+      content: "existing local pattern",
+      tags: ["local"],
+      projectId: "pid",
+      sessionId: null,
+      confidence: 0.75,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      rank: -0.1,
+    };
+    const repositories = {
+      lexicalSearch: { searchPromoted: mocks.storeSearch },
+      promotedMemory: {
+        insert: vi.fn().mockResolvedValue("inserted"),
+        update: vi.fn().mockResolvedValue(undefined),
+        archive: vi.fn().mockResolvedValue(undefined),
+      },
+    };
+    mocks.events.mockReturnValueOnce([
+      event({ event_id: 31, category: "file", type: "file", data: candidate.content, priority: 3 }),
+    ]);
+    mocks.storeSearch.mockReturnValue([candidate]);
+    mocks.openProject.mockResolvedValue({
+      ...projectStorage(),
+      backend: "postgresql",
+      lexicalSearch: repositories.lexicalSearch,
+      promotedMemory: repositories.promotedMemory,
+    });
+    mocks.transaction.mockImplementation(async (callback: (value: typeof repositories) => Promise<unknown>) =>
+      callback(repositories));
+    mocks.dedup.mockImplementation(async input => actual.deduplicateAndInsert(input as never));
+
+    await expect(promoteEventsForCwd(postgresqlConfig, "/cwd", "/events.db"))
+      .resolves.toMatchObject({ promoted: 1, skipped: 0, errors: 0 });
+    expect(mocks.storeSearch).toHaveBeenNthCalledWith(1, candidate.content, 1, undefined, undefined);
+    expect(mocks.storeSearch).toHaveBeenNthCalledWith(2, candidate.content, 100, undefined, undefined);
+    expect(repositories.promotedMemory.insert).not.toHaveBeenCalled();
+    expect(repositories.promotedMemory.update).toHaveBeenCalledWith("local-canonical", {
+      confidence: 0.75,
+      tags: expect.arrayContaining(["local", "source:passive-capture"]),
+    });
+    expect(mocks.dedup).toHaveBeenCalledWith(expect.objectContaining({
+      sourceProjectId: "pid",
+      candidateScope: "owner",
+      backend: "postgresql",
+    }));
+    expect(mocks.mark).toHaveBeenCalledWith([31]);
+  });
+
+  it.each([
+    ["priority 1", 1, "public PostgreSQL decision"],
+    ["priority 2", 2, "public PostgreSQL batch"],
+  ] as const)("runs %s with owner-wide dedup and preserves insertion provenance", async (_label, priority, content) => {
+    const actual = await vi.importActual<typeof import("../../../src/promotion/dedup.js")>(
+      "../../../src/promotion/dedup.js",
+    );
+    const repositories = {
+      lexicalSearch: { searchPromoted: mocks.storeSearch },
+      promotedMemory: {
+        insert: vi.fn().mockResolvedValue("inserted-provenance"),
+        update: vi.fn().mockResolvedValue(undefined),
+        archive: vi.fn().mockResolvedValue(undefined),
+      },
+    };
+    mocks.events.mockReturnValueOnce([
+      event({ event_id: priority, category: priority === 1 ? "decision" : "git", type: priority === 1 ? "decision" : "git", data: content, priority }),
+    ]);
+    mocks.storeSearch.mockReturnValue([]);
+    mocks.openProject.mockResolvedValue({
+      ...projectStorage(),
+      backend: "postgresql",
+      lexicalSearch: repositories.lexicalSearch,
+      promotedMemory: repositories.promotedMemory,
+    });
+    mocks.transaction.mockImplementation(async (callback: (value: typeof repositories) => Promise<unknown>) =>
+      callback(repositories));
+    mocks.dedup.mockImplementation(async input => actual.deduplicateAndInsert(input as never));
+
+    await expect(promoteEventsForCwd(postgresqlConfig, "/cwd", "/events.db"))
+      .resolves.toMatchObject({ promoted: 1, skipped: 0, errors: 0 });
+    expect(mocks.storeSearch).toHaveBeenCalledWith(content, 100, undefined, undefined);
+    expect(repositories.promotedMemory.insert).toHaveBeenCalledWith(expect.objectContaining({
+      sourceProjectId: "pid",
+    }));
+    expect(mocks.dedup).toHaveBeenCalledWith(expect.objectContaining({
+      sourceProjectId: "pid",
+      candidateScope: "owner",
+      backend: "postgresql",
+    }));
   });
 });

@@ -113,7 +113,7 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
     params.projectId,
   );
 
-  // Ranked matches must clear the BM25 threshold; unranked fallbacks require exact content.
+  // Exact identity is authoritative; only nonidentical ranked matches need the BM25 threshold.
   const duplicates = candidates.filter(
     (candidate) => isDuplicateCandidate(candidate, content, thresholds.dedupBm25Threshold),
   );

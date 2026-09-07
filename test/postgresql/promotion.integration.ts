@@ -64,7 +64,10 @@ describe("PostgreSQL passive promotion provenance", { timeout: 120_000 }, () => 
           tags: ["manual"],
           confidence: 0.8,
         });
-        await otherStorage.promotedMemory.insert({ content, sourceProjectId: projectId });
+        const otherOwnerContentId = await otherStorage.promotedMemory.insert({
+          content,
+          sourceProjectId: projectId,
+        });
         await otherStorage.promotedMemory.insert({
           content: "Only exists in another owner",
           sourceProjectId: otherProjectId,
@@ -84,11 +87,30 @@ describe("PostgreSQL passive promotion provenance", { timeout: 120_000 }, () => 
         );
         expect(ownerCandidates).toHaveLength(2);
         expect(sourceCandidates).toHaveLength(1);
+        const otherOwnerCandidates = await otherStorage.lexicalSearch.searchPromoted(
+          content,
+          100,
+          undefined,
+          undefined,
+        );
+        expect(otherOwnerCandidates).toHaveLength(1);
+        expect(otherOwnerCandidates[0]?.id).toBe(otherOwnerContentId);
+        expect(otherOwnerCandidates[0]?.projectId).toBe(projectId);
 
         const id = await deduplicateAndInsert({
-          transaction: (callback) => storage.transaction(callback),
+          transaction: (callback) => storage.transaction(async repositories => {
+            const bounded = await repositories.lexicalSearch.searchPromoted(
+              content,
+              1,
+              undefined,
+              undefined,
+            );
+            expect(bounded).toHaveLength(1);
+            expect([localId, manualId]).toContain(bounded[0]?.id);
+            return callback(repositories);
+          }),
           content,
-          sourceProjectId: "remote-owner-uuid",
+          sourceProjectId: projectId,
           candidateScope: "owner",
           backend: "postgresql",
           tags: ["passive"],
@@ -100,12 +122,35 @@ describe("PostgreSQL passive promotion provenance", { timeout: 120_000 }, () => 
         const rows = await storage.promotedMemory.getAll();
         expect(rows).toHaveLength(1);
         expect(rows[0]).toMatchObject({ id, confidence: 0.9 });
-        expect(rows[0].tags).toEqual(["manual", "local", "passive"]);
+        const canonicalTags = ownerCandidates[0]?.id === localId
+          ? ["local", "manual", "passive"]
+          : ["manual", "local", "passive"];
+        expect(rows[0].tags).toEqual(canonicalTags);
+
+        const remoteOnlyContent = "Remote UUID provenance converges";
+        const remoteOnlyId = await storage.promotedMemory.insert({
+          content: remoteOnlyContent,
+          sourceProjectId: projectId,
+          tags: ["remote"],
+          confidence: 0.6,
+        });
+        const remoteConvergedId = await deduplicateAndInsert({
+          transaction: callback => storage.transaction(callback),
+          content: remoteOnlyContent,
+          sourceProjectId: projectId,
+          candidateScope: "owner",
+          backend: "postgresql",
+          tags: ["passive"],
+          depth: 0,
+          confidence: 0.7,
+          thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 100 },
+        });
+        expect(remoteConvergedId).toBe(remoteOnlyId);
 
         const isolated = await deduplicateAndInsert({
           transaction: (callback) => storage.transaction(callback),
           content: "Only exists in another owner",
-          sourceProjectId: "remote-owner-uuid",
+          sourceProjectId: projectId,
           candidateScope: "owner",
           backend: "postgresql",
           tags: [],
@@ -119,7 +164,7 @@ describe("PostgreSQL passive promotion provenance", { timeout: 120_000 }, () => 
                  WHERE project_id = $1 AND memory_id = $2`,
           values: [projectId, isolated],
         }, { domain: "promoted-memory", operation: "verifyPromotionProvenance" });
-        expect(provenance.rows[0].source_project_id).toBe("remote-owner-uuid");
+        expect(provenance.rows[0].source_project_id).toBe(projectId);
       } finally {
         await storage.close();
         await otherStorage.close();
