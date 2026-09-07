@@ -198,9 +198,17 @@ try {
    database file or discard its WAL/SHM sidecars to restore a backup; stop all
    writers again before any restoration.
 
-Legacy worktree reconciliation uses a separate import path. Inspect and
-deliberately repair affected source rows before reconciling worktrees; this
-store guard does not protect that import path. The reconciliation limitation
+Legacy worktree reconciliation uses a separate import path. During a real
+reconciliation, LCM checks the live source database while its existing
+exclusive write lock is held and checks the canonical target inside its target
+transaction. A promoted row whose `content` is not SQLite `TEXT` or contains an
+embedded NUL fails closed with `stored promoted content is unsupported` before
+the row can be copied or used to rebuild FTS. The source check rolls back the
+uncommitted fence, so the source bytes remain intact and can be repaired in
+place. A target check rolls back the target transaction; its source fence may
+already be committed, so repair the target database in place and rerun
+reconciliation. Use the offline diagnostic and replacement procedure above to
+inspect and deliberately repair affected rows before retrying. The limitation
 is tracked in [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
 
 No data is sent to any Long Context Manager (LCM) server. There is no telemetry.

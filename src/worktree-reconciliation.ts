@@ -719,6 +719,19 @@ function tableExists(db: DatabaseSync, table: string): boolean {
   ).get(table) !== undefined;
 }
 
+function assertSupportedPromotedContent(db: DatabaseSync): void {
+  if (!tableExists(db, "promoted")) return;
+  const unsupported = db.prepare(
+    `SELECT 1
+     FROM promoted
+     WHERE typeof(content) <> 'text' OR instr(content, char(0)) > 0
+     LIMIT 1`,
+  ).get();
+  if (unsupported !== undefined) {
+    throw new Error("stored promoted content is unsupported");
+  }
+}
+
 function assertNoRuntimeNativeTranscriptState(db: DatabaseSync): void {
   const nativeTables = db.prepare(
     "SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') AND lower(name) GLOB 'runtime_native_*'",
@@ -1387,6 +1400,7 @@ function mergeMainDatabase(
     source,
     commitFence,
   ) => {
+    assertSupportedPromotedContent(source);
     commitFence();
     assertTarget();
     return withNormalizedMainSnapshot(
@@ -1426,6 +1440,7 @@ function mergeMainDatabase(
               assertTarget();
               return;
             }
+            assertSupportedPromotedContent(target);
             for (const conversation of rows(
               normalizedSource,
               "SELECT * FROM conversations ORDER BY conversation_id",

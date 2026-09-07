@@ -258,6 +258,8 @@ const expectedComponents = [
       // #1059 keeps retained journal-parent publication in this existing owner.
       // #1087 bounds canonical metadata publication in this existing owner.
       // #1091 preserves completion evidence across publication failures here.
+      // #1173 keeps promoted-content reconciliation guards in this existing
+      // project/worktree ownership component; no topology change.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },

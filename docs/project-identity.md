@@ -206,6 +206,16 @@ operator-visible result, and LCM does not publish a partially reconciled map.
 After the conflict is corrected, rerun reconciliation; the durable journal and
 merge markers continue from the verified state.
 
+Promoted-memory content is checked at the SQLite boundary during project
+reconciliation. A source row with a non-`TEXT` value or an embedded NUL is
+refused before its source fence commits, preserving the source bytes for an
+in-place repair. The same check runs on the target inside its transaction
+before conversation or promoted rows are copied and before FTS is rebuilt. A
+target refusal can leave the source fence committed; repair the target in place
+and rerun reconciliation. The fixed error is `stored promoted content is
+unsupported` and does not include memory content, IDs, paths, or tags. See the
+[offline promoted-memory repair procedure](privacy.md#embedded-nul-in-promoted-memory).
+
 The canonical target's `meta.json` is a separate leaf-file trust boundary. LCM
 refuses to parse or reuse it when its owner differs from the admitted project
 directory owner (`file owner is not trusted`) or when it has more than one hard
