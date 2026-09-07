@@ -204,7 +204,9 @@ export type SqliteSnapshotBoundary =
   | "after-private-fsync"
   | "before-witness"
   | "before-commit-marker"
-  | "after-commit-marker";
+  | "after-commit-marker"
+  | "before-cutoff-read"
+  | "after-cutoff-read";
 
 type BigIntStats = FsBigIntStats;
 
@@ -1004,7 +1006,8 @@ function sourceByteWitness(
   } as unknown as RecordValue) as unknown as SqliteSnapshotSourceByteWitness;
 }
 
-function validateSourceByteWitness(
+/** @internal Authenticate a caller-provided binding before any refresh. */
+export function validateSourceByteWitness(
   value: unknown,
   authority: AuthenticatedSqliteSnapshotAuthority,
 ): SqliteSnapshotSourceByteWitness {
@@ -1457,10 +1460,11 @@ export async function captureSqliteSnapshotArtifact(
   }
 }
 
-export async function dryRunSqliteSnapshotArtifact(
+async function inspectSqliteSnapshotSource(
   authorityValue: AuthenticatedSqliteSnapshotAuthority,
   options: SqliteSnapshotDryRunOptions,
-): Promise<SqliteSnapshotDryRun> {
+  readCutoff: boolean,
+): Promise<Readonly<{ dryRun: SqliteSnapshotDryRun; expectedSourceBytes: SqliteSnapshotSourceByteWitness; queueCutoff: string | null }>> {
   const authority = validateAuthority(authorityValue);
   const context = contextFor({
     homeDir: options.homeDir,
@@ -1486,7 +1490,7 @@ export async function dryRunSqliteSnapshotArtifact(
         const inspectionsFd = context.ops.open(inspections, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
         descriptors.push(inspectionsFd);
         if (!sameInode(inspectionsIdentity, context.ops.fstat(inspectionsFd))) throw new InternalSnapshotError("changed");
-        let result: SqliteSnapshotDryRun | undefined;
+        let result: Awaited<ReturnType<typeof inspectSqliteSnapshotSource>> | undefined;
         let bodyError: unknown;
         try {
           const inspectRoles = async (): Promise<Readonly<{
@@ -1524,7 +1528,11 @@ export async function dryRunSqliteSnapshotArtifact(
             })),
             inspectedAt,
           };
-          result = withChecksum(body as unknown as RecordValue) as unknown as SqliteSnapshotDryRun;
+          result = {
+            dryRun: withChecksum(body as unknown as RecordValue) as unknown as SqliteSnapshotDryRun,
+            expectedSourceBytes: roles.expectedSourceBytes,
+            queueCutoff: readCutoff ? await readPrivateSequenceCutoff(context, scratch, roles.captured[roles.captured.length - 1]!.normalizedMain) : null,
+          };
         } catch (error) {
           bodyError = error;
           throw error;
@@ -1561,4 +1569,45 @@ export async function dryRunSqliteSnapshotArtifact(
   } catch (error) {
     mapCaptureError(error);
   }
+}
+
+/** Read only the normalized private checkpoint; never initialize a source DB. */
+async function readPrivateSequenceCutoff(context: Context, scratch: string, expected: SqliteSnapshotPrivateFileWitness): Promise<string | null> {
+  const path = join(scratch, `${roleBase("machine-sequence")}.sqlite`);
+  const parent = assertDirectory(context, scratch);
+  await observe(context, "before-cutoff-read", path, "machine-sequence");
+  if (canonicalJson(privateFileWitness(context, scratch, path)) !== canonicalJson(expected)) throw new InternalSnapshotError("changed");
+  const before = liveDescriptors(context);
+  const database = new DatabaseSync(`${pathToFileURL(path).href}?mode=ro&immutable=1`, { readOnly: true });
+  try {
+    const opened = liveDescriptors(context).filter((fd) => !before.includes(fd));
+    if (opened.length !== 1 || !sameInode(context.ops.fstat(opened[0]!), context.ownedFiles.get(path)!)
+      || !sameInode(parent, assertDirectory(context, scratch))) throw new InternalSnapshotError("changed");
+    const rows = database.prepare("SELECT singleton, next_sequence FROM local_hook_sequence LIMIT 2").all();
+    const next = rows[0]?.next_sequence;
+    if (rows.length !== 1 || rows[0]!.singleton !== 1 || typeof next !== "string"
+      || !/^(0|[1-9][0-9]{0,18})$/u.test(next) || BigInt(next) > 9223372036854775808n) {
+      throw new InternalSnapshotError("invalid");
+    }
+    await observe(context, "after-cutoff-read", path, "machine-sequence");
+    if (!sameInode(parent, assertDirectory(context, scratch))
+      || canonicalJson(privateFileWitness(context, scratch, path)) !== canonicalJson(expected)) throw new InternalSnapshotError("changed");
+    return next === "0" ? null : (BigInt(next) - 1n).toString().padStart(19, "0");
+  } finally { database.close(); }
+}
+
+export async function dryRunSqliteSnapshotArtifact(
+  authority: AuthenticatedSqliteSnapshotAuthority,
+  options: SqliteSnapshotDryRunOptions,
+): Promise<SqliteSnapshotDryRun> {
+  return (await inspectSqliteSnapshotSource(authority, options, false)).dryRun;
+}
+
+/** @internal Fresh capture binding sampled under the caller's append barrier. */
+export async function authenticateSqliteSnapshotCaptureBinding(
+  authority: AuthenticatedSqliteSnapshotAuthority,
+  options: SqliteSnapshotSourceByteOptions,
+): Promise<Readonly<{ expectedSourceBytes: SqliteSnapshotSourceByteWitness; queueCutoff: string | null }>> {
+  const { expectedSourceBytes, queueCutoff } = await inspectSqliteSnapshotSource(authority, options, true);
+  return { expectedSourceBytes, queueCutoff };
 }

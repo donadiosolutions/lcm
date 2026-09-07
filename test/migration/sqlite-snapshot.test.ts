@@ -33,6 +33,7 @@ import {
 } from "../../src/storage/backend-publication.js";
 import {
   captureSqliteSnapshotArtifact,
+  authenticateSqliteSnapshotCaptureBinding,
   classifySqliteSnapshotArtifact,
   authenticateSqliteSnapshotSourceBytes,
   dryRunSqliteSnapshotArtifact,
@@ -221,6 +222,39 @@ async function captureFixture(
 }
 
 describe("authenticated SQLite snapshot artifacts", () => {
+  it.each(["0", "9223372036854775808"])("samples private sequence cutoff %s without source writes", async (next) => {
+    const fixture = sourceFixture();
+    fixture.openDatabases[2]!.exec(`CREATE TABLE local_hook_sequence(singleton, next_sequence); INSERT INTO local_hook_sequence VALUES(1, '${next}')`);
+    const before = sha256(fixture.authority.machineSequenceDbPath + "-wal");
+    const binding = await withBackendPublicationAppendBarrierAsync(fixture.homeDir, (lockToken) =>
+      authenticateSqliteSnapshotCaptureBinding(fixture.authority, { homeDir: fixture.homeDir, lockToken }));
+    expect(binding.queueCutoff).toBe(next === "0" ? null : "9223372036854775807");
+    expect(sha256(fixture.authority.machineSequenceDbPath + "-wal")).toBe(before);
+  });
+  it.each(["", "01", "-1", "9223372036854775809", "empty", "number", "singleton", "duplicate"])("refuses malformed private cutoff %s", async (kind) => {
+    const fixture = sourceFixture();
+    const sequence = fixture.openDatabases[2]!;
+    sequence.exec("CREATE TABLE local_hook_sequence(singleton, next_sequence)");
+    if (kind !== "empty") sequence.prepare("INSERT INTO local_hook_sequence VALUES(?, ?)").run(kind === "singleton" ? 2 : 1, kind === "number" ? 1 : kind);
+    if (kind === "duplicate") sequence.exec("INSERT INTO local_hook_sequence VALUES(1, '2')");
+    await expect(withBackendPublicationAppendBarrierAsync(fixture.homeDir, (lockToken) =>
+      authenticateSqliteSnapshotCaptureBinding(fixture.authority, { homeDir: fixture.homeDir, lockToken }))).rejects.toThrow();
+  });
+  it.each(["before-cutoff-read", "after-cutoff-read", "descriptor"])("refuses private cutoff replacement at %s", async (point) => {
+    const fixture = sourceFixture();
+    fixture.openDatabases[2]!.exec("CREATE TABLE local_hook_sequence(singleton, next_sequence); INSERT INTO local_hook_sequence VALUES(1, '1')");
+    const before = sha256(fixture.authority.machineSequenceDbPath + "-wal");
+    let reading = false; let reads = 0;
+    await expect(withBackendPublicationAppendBarrierAsync(fixture.homeDir, (lockToken) =>
+      authenticateSqliteSnapshotCaptureBinding(fixture.authority, { homeDir: fixture.homeDir, lockToken, _operationsForTesting: {
+        observe: (boundary, path) => {
+          if (boundary === "before-cutoff-read") reading = true;
+          if (boundary === point) { chmodSync(path, 0o600); appendFileSync(path, "tampered"); chmodSync(path, 0o400); }
+        },
+        readdir: (path) => point === "descriptor" && reading && path === "/dev/fd" && ++reads === 2 ? [] : readdirSync(path),
+      } }))).rejects.toThrow();
+    expect(sha256(fixture.authority.machineSequenceDbPath + "-wal")).toBe(before);
+  });
   it("authenticates source bytes under a live token without writing an artifact", async () => {
     const fixture = sourceFixture();
     const before = sourceState(fixture.authority);

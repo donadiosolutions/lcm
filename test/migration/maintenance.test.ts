@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, openSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -139,6 +139,127 @@ async function heldSource(fixture: ReturnType<typeof enrollmentFixture>) {
 }
 
 describe("backend publication maintenance journal v3", () => {
+  it.each([false, true])("captures legal held appends with fresh cutoff after restart=%s", async (restart) => {
+    const fixture = await populatedFixture();
+    const source = await heldSource(fixture);
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const outbox = await factory.open(join(fixture.homeDir, ".lcm", "events", `${fixture.local.id}.db`));
+    await outbox.insertEvent("later", { type: "decision", category: "decision", data: "held append", priority: 1 }, "SessionStart");
+    await factory.close();
+    const authority = restart ? await withBackendPublicationAppendBarrierAsync(fixture.homeDir, async (token) =>
+      authenticateSqliteMigrationSource(fixture.cwd, fixture.homeDir, token)) : source.authority;
+    const snapshot = await captureAuthenticatedSqliteMigrationSource(authority, source.options);
+    expect(snapshot.receiptReference.queueCutoff).toBe("0000000000000000001");
+    expect(snapshot.artifact.maintenanceChecksumSha256).toBe(publicationApi.readBackendMaintenanceJournal(fixture.homeDir)!.checksumSha256);
+    const page = JSON.parse(readFileSync(join(fixture.homeDir, ".lcm", "migration-evidence", "generation-1", snapshot.pages[0].name), "utf8"));
+    expect(page.records).toHaveLength(2);
+    expect(page.records.every((row: { disposition: string }) => row.disposition === "retained")).toBe(true);
+  });
+  it("serializes a concurrent public append behind the complete cutoff-copy interval", async () => {
+    const fixture = await populatedFixture();
+    const source = await heldSource(fixture);
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const outbox = await factory.open(source.authority.passiveEventsDbPath!);
+    let reached!: () => void; let release!: () => void;
+    const paused = new Promise<void>((resolve) => { reached = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let once = false;
+    const capture = captureAuthenticatedSqliteMigrationSource(source.authority, { ...source.options, _operationsForTesting: {
+      observe: async (boundary) => {
+        if (!once && boundary === "before-private-inspection") { once = true; reached(); await gate; }
+      },
+    } });
+    await paused;
+    let appended = false;
+    const append = outbox.insertEvent("concurrent", { type: "decision", category: "decision", data: "after seal", priority: 1 }, "SessionStart")
+      .then(() => { appended = true; });
+    await Promise.resolve();
+    expect(appended).toBe(false);
+    release();
+    const snapshot = await capture;
+    await append;
+    expect(snapshot.receiptReference.queueCutoff).toBe("0000000000000000000");
+    expect(snapshot.pages[0].records).toBe(1);
+    expect((await outbox.getHealthStats()).unprocessed).toBe(2);
+    await factory.close();
+  });
+  it("recovers a refreshed held binding after failure before generation intent", async () => {
+    const fixture = await populatedFixture(); const source = await heldSource(fixture);
+    const factory = new SQLiteLocalHookOutboxFactory(); const outbox = await factory.open(source.authority.passiveEventsDbPath!);
+    await outbox.insertEvent("later", { type: "decision", category: "decision", data: "before failed capture", priority: 1 }, "SessionStart");
+    await factory.close();
+    await expect(captureAuthenticatedSqliteMigrationSource(source.authority, { ...source.options, _operationsForTesting: {
+      open: (path, flags, mode) => {
+        if (path.endsWith("generation-1.intent.json")) throw new Error("injected before intent");
+        return mode === undefined ? openSync(path, flags) : openSync(path, flags, mode);
+      },
+    } })).rejects.toThrow();
+    const durable = publicationApi.readBackendMaintenanceJournal(fixture.homeDir)!;
+    expect(durable.checksumSha256).not.toBe(source.options.maintenanceChecksumSha256);
+    expect(await classifyImmutableSqliteSnapshot("generation-1", fixture.homeDir)).toEqual({ state: "absent" });
+    await expect(captureAuthenticatedSqliteMigrationSource(source.authority, source.options)).rejects.toThrow("authority changed");
+    const lateFactory = new SQLiteLocalHookOutboxFactory(); const lateOutbox = await lateFactory.open(source.authority.passiveEventsDbPath!);
+    await lateOutbox.insertEvent("after-crash", { type: "decision", category: "decision", data: "another legal append", priority: 1 }, "SessionStart");
+    await lateFactory.close();
+    const restart = await withBackendPublicationAppendBarrierAsync(fixture.homeDir, async (token) => {
+      const authority = authenticateSqliteMigrationSource(fixture.cwd, fixture.homeDir, token);
+      const expectedSourceBytes = await authenticateSqliteMigrationSourceBytes(authority, { homeDir: fixture.homeDir, lockToken: token });
+      return { authority, expectedSourceBytes };
+    });
+    const snapshot = await captureAuthenticatedSqliteMigrationSource(restart.authority, { ...source.options,
+      expectedSourceBytes: restart.expectedSourceBytes, maintenanceChecksumSha256: durable.checksumSha256 });
+    expect(snapshot.receiptReference.queueCutoff).toBe("0000000000000000002");
+  });
+  it.each(["partial", "replaced", "tampered", "complete"])("never rebinds %s generation after legal append", async (kind) => {
+    const fixture = await populatedFixture(); const source = await heldSource(fixture);
+    const generation = join(fixture.homeDir, ".lcm", "migration-snapshots", "generations", "generation-1");
+    let complete: Awaited<ReturnType<typeof captureAuthenticatedSqliteMigrationSource>> | undefined;
+    if (kind === "partial") {
+      await expect(captureAuthenticatedSqliteMigrationSource(source.authority, { ...source.options, _operationsForTesting: {
+        observe: (boundary) => { if (boundary === "before-witness") throw new Error("crash before seal"); },
+      } })).rejects.toThrow();
+    } else {
+      complete = await captureAuthenticatedSqliteMigrationSource(source.authority, source.options);
+      if (kind === "replaced") { renameSync(generation, `${generation}.saved`); mkdirSync(generation, { mode: 0o700 }); }
+      if (kind === "tampered") writeFileSync(join(generation, "witness.committed"), "tampered");
+    }
+    const before = readFileSync(publicationApi.backendPublicationJournalPath(fixture.homeDir));
+    const factory = new SQLiteLocalHookOutboxFactory(); const outbox = await factory.open(source.authority.passiveEventsDbPath!);
+    await outbox.insertEvent("later", { type: "decision", category: "decision", data: "after attempt", priority: 1 }, "SessionStart");
+    await factory.close();
+    const retry = captureAuthenticatedSqliteMigrationSource(source.authority, source.options);
+    if (kind === "complete") await expect(retry).resolves.toEqual(complete);
+    else await expect(retry).rejects.toMatchObject({ reason: `snapshot-${kind}` });
+    expect(readFileSync(publicationApi.backendPublicationJournalPath(fixture.homeDir))).toEqual(before);
+  });
+  it("refuses a generation that appears during private cutoff sampling", async () => {
+    const fixture = await populatedFixture(); const source = await heldSource(fixture);
+    const before = readFileSync(publicationApi.backendPublicationJournalPath(fixture.homeDir));
+    let appeared = false;
+    await expect(captureAuthenticatedSqliteMigrationSource(source.authority, { ...source.options, _operationsForTesting: {
+      observe: (boundary, _path, role) => {
+        if (!appeared && boundary === "after-private-inspection" && role === "machine-sequence") {
+          appeared = true;
+          mkdirSync(join(fixture.homeDir, ".lcm", "migration-snapshots", "generations", "generation-1"), { mode: 0o700 });
+        }
+      },
+    } })).rejects.toThrow("generation appeared");
+    expect(readFileSync(publicationApi.backendPublicationJournalPath(fixture.homeDir))).toEqual(before);
+  });
+  it.each(["source", "roster", "generation"])("refuses changed capture %s authority without rebinding", async (kind) => {
+    const fixture = await populatedFixture(); const source = await heldSource(fixture);
+    const path = publicationApi.backendPublicationJournalPath(fixture.homeDir);
+    const { checksumSha256: _checksum, ...journal } = JSON.parse(readFileSync(path, "utf8"));
+    if (kind === "source") journal.sourceSelectionSha256 = HASH_A;
+    if (kind === "roster") journal.roster[0].machineId = MACHINE_ID;
+    const checksum = publicationApi.backendPublicationCanonicalSha256(journal);
+    writeFileSync(path, JSON.stringify({ ...journal, checksumSha256: checksum }));
+    const before = readFileSync(path);
+    await expect(captureAuthenticatedSqliteMigrationSource(source.authority, { ...source.options,
+      generationId: kind === "generation" ? "different" : source.options.generationId, maintenanceChecksumSha256: checksum,
+    })).rejects.toThrow();
+    expect(readFileSync(path)).toEqual(before);
+  });
   it("captures and inspects a populated source through authenticated public preparation", async () => {
     const fixture = await populatedFixture();
     const dryRun = await dryRunAuthenticatedSqliteMigrationSource(fixture.cwd, fixture.homeDir);

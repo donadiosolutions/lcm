@@ -29,9 +29,13 @@ SQLite recovery, `quick_check`, schema inspection, UTF-8 admission, and
 opens the source through SQLite, checkpoints it, changes its mode, runs a source
 migration, cleans a sidecar, or writes its directory.
 
-One short local append barrier covers the queue cutoff, exact source-byte
-commitment, durable maintenance entry, and private artifact seal. Hooks may
-append again only after that seal; their later events stay beyond the cutoff.
+Maintenance enters durably before capture. Hooks may keep appending to their
+local outboxes throughout the hold, including after restart. Capture takes a
+short local append barrier, authenticates fresh source bytes and a private copy
+of the sequence checkpoint, and durably refreshes the held journal's cutoff and
+byte commitment by exact-checksum compare-and-swap. The barrier remains held
+through private artifact and queue-evidence sealing. Later hook events stay
+beyond the sealed cutoff.
 Project writers, promotion, delivery claims, correlation repair, processing
 marks, replay, and destructive pruning remain fenced while maintenance is held.
 The maintenance record survives restart and can leave the fence only through an
@@ -103,13 +107,36 @@ publication lock. Finalization rechecks the original configuration and project
 identity, then adopts the forward receipt epoch under writer admission and the
 local append barrier. It never backfills ambiguous historical receipts.
 
-A caller authenticates the SQLite source and source bytes, enters held
-maintenance through the existing backend publication coordinator, and calls
-`captureAuthenticatedSqliteMigrationSource` under the same append barrier. The
-roster must contain the verified machine, its exact last allocated sequence
-(or null before any allocation), and the authenticated source-byte evidence.
-Configuration or identity drift refuses finalization and capture. The APIs are
-exported by the `src/migration` module for the later migration orchestrator.
+A caller authenticates the SQLite source and source bytes, then enters held
+maintenance through the existing backend publication coordinator. The initial
+roster contains the verified machine, its last allocated sequence (or null
+before allocation), and the authenticated source-byte evidence. A later call to
+`captureAuthenticatedSqliteMigrationSource` acquires its own append barrier;
+callers need not retain a process-local token across maintenance or restart.
+The supplied checksum must match the durable held journal; fresh evidence is
+bound at capture only while the physical generation remains absent.
+Configuration, source selection, machine identity, or participant drift refuses
+capture. The APIs are exported by the `src/migration` module for the later
+migration orchestrator.
+
+Capture returns the refreshed maintenance checksum in
+`artifact.maintenanceChecksumSha256` and the exact source-byte commitment in
+`artifact.sourceByteWitnessSha256`; its source role witnesses are
+`artifact.roles[].source`. Retain these with the generation for exact retries.
+An existing complete artifact is reused only with its original authority,
+maintenance checksum and source-byte witness. A retry never refreshes a partial,
+complete, replaced or tampered generation to fit later source bytes.
+
+If capture fails after refreshing the journal but before creating any generation
+intent, read the durable held journal again, reauthenticate source bytes under
+the append barrier, and retry with that journal's checksum and commitment. Fresh bytes may include later legal appends: an absent generation has not yet
+frozen its capture-time commitment. The exact generation and source-selection
+authority must still match the durable hold. Once any generation intent exists, preserve its files
+and use explicit abort followed by a new generation. An interrupted
+`maintenance-entering` can be resumed with the exact original request and the
+observed `expectedChecksumSha256`, or explicitly aborted with matching source
+selection and abort evidence. Completed selection and authenticated abort
+journals are archived byte-for-byte before a subsequent generation begins.
 
 Normal installations retain their existing storage selection. Do not manually
 create, edit, delete, or otherwise mutate the journal or its lock file. Preserve

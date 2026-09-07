@@ -132,6 +132,22 @@ compare-and-swap; completion is reserved for a caller that has authoritative
 terminal readback. A source-preserving abort verifies the original selection
 evidence and never invokes the version-2 target config/map restoration path.
 
+If maintenance entry is interrupted after its entering checkpoint, call
+`enterMaintenance` with the exact original publication, generation, selection,
+queue evidence and roster, plus the observed `expectedChecksumSha256` for
+explicit recovery. The coordinator compares and swaps that checkpoint to held;
+a changed request or journal refuses. Entering also permits explicit abort with
+matching source-selection and abort evidence: writers have been fenced since
+the entering checkpoint, and snapshot capture has not been admitted. Ordinary
+resume never releases this fence. Terminal v3 journals are retained byte-for-byte
+in publication history before entering a fresh generation.
+
+Held queue cutoffs are provisional until capture. The authenticated migration
+capture refreshes them under the append barrier only when its generation has no
+physical artifacts. Once any intent or artifact exists, it is immutable recovery
+evidence and cannot be rebound. The returned artifact carries the durable
+refreshed maintenance checksum for subsequent selection or exact retry.
+
 While maintenance is held, ordinary SQLite operations fail publication
 admission even through handles opened earlier. Local hook append has one narrow
 capability: its installation-global sequence allocation and matching outbox
@@ -139,6 +155,11 @@ insert share a short append barrier. Existing outboxes must already have the
 current schema; hook open cannot opportunistically migrate or create an outbox
 during maintenance. Claims, processing marks, retries, acknowledgements,
 correlation updates, replay, missing-cwd updates, and pruning remain blocked.
+A valid version-2 publication, including an unfinished publication or the safe
+pre-journal directory state, does not block durable local enqueue. Existing
+journals must still have an authenticated supported shape; malformed or unknown
+versions and unsafe paths refuse. Consumer operations remain fenced until their
+own authoritative terminal readback.
 After an authenticated abort, SQLite consumer admission resumes. After selected-
 generation completion, only the recorded target backend is admitted.
 

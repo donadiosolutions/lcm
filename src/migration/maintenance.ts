@@ -20,6 +20,7 @@ import {
   backendPublicationCanonicalSha256,
   BackendPublicationJournalError,
   readBackendMaintenanceJournal,
+  rebindBackendMaintenanceCutoff,
   withBackendPublicationAppendBarrierAsync,
   withBackendPublicationConsumerLockAsync,
   type BackendPublicationLockToken,
@@ -27,6 +28,8 @@ import {
 import type { StorageBackendName } from "../storage/contracts.js";
 import {
   captureSqliteSnapshotArtifact,
+  authenticateSqliteSnapshotCaptureBinding,
+  validateSourceByteWitness,
   authenticateSqliteSnapshotSourceBytes,
   classifySqliteSnapshotArtifact,
   dryRunSqliteSnapshotArtifact,
@@ -161,20 +164,48 @@ export async function captureAuthenticatedSqliteMigrationSource(
   options: SqliteSnapshotOptions,
 ): Promise<AuthenticatedSqliteMigrationSnapshot> {
   assertAuthenticatedAuthority(authority);
+  validateSourceByteWitness(options.expectedSourceBytes, authority);
   const expected = canonicalJson(authority);
   return withBackendPublicationAppendBarrierAsync(options.homeDir, async (token) => {
+    let captureOptions = options;
     const revalidate = (): void => {
       const current = authenticateSqliteMigrationSource(authority.canonicalPath, options.homeDir, token);
       const journal = readBackendMaintenanceJournal(options.homeDir);
       if (canonicalJson(current) !== expected
         || authenticatedAuthorities.get(current) !== authenticatedAuthorities.get(authority) || journal?.phase !== "maintenance-held"
-        || journal.checksumSha256 !== options.maintenanceChecksumSha256
+        || journal.checksumSha256 !== captureOptions.maintenanceChecksumSha256
         || journal.generationId !== options.generationId) {
         throw new Error("SQLite migration source authority changed before seal");
       }
     };
     revalidate();
-    const artifact = await captureSqliteSnapshotArtifact(authority, { ...options, lockToken: token });
+    const existing = await classifySqliteSnapshotArtifact(options.generationId, options);
+    if (existing.state === "absent") {
+      const maintenance = readBackendMaintenanceJournal(options.homeDir)!;
+      if (maintenance.sourceSelectionSha256 !== authority.sourceSelectionSha256) {
+        throw new Error("SQLite migration capture request does not match held binding");
+      }
+      if (authority.projectIdentity.scope !== "local" || maintenance.roster.length !== 1
+        || maintenance.roster[0]!.machineId !== authority.machineIdentity.machineId) {
+        throw new Error("migration participant authority is incomplete or disconnected");
+      }
+      const binding = await authenticateSqliteSnapshotCaptureBinding(authority, { ...options, lockToken: token });
+      revalidate();
+      // A failed/partial/replaced generation is immutable evidence. Check again
+      // after private sampling, before any durable journal change.
+      if ((await classifySqliteSnapshotArtifact(options.generationId, options)).state !== "absent") {
+        throw new Error("SQLite migration generation appeared before capture binding");
+      }
+      const bound = rebindBackendMaintenanceCutoff({
+        homeDir: options.homeDir, expectedChecksumSha256: captureOptions.maintenanceChecksumSha256,
+        generationId: options.generationId, sourceSelectionSha256: authority.sourceSelectionSha256,
+        queueEvidenceSha256: binding.expectedSourceBytes.checksumSha256,
+        roster: [{ machineId: authority.machineIdentity.machineId, queueCutoff: binding.queueCutoff,
+          evidenceSha256: binding.expectedSourceBytes.checksumSha256 }],
+      }, token);
+      captureOptions = { ...options, expectedSourceBytes: binding.expectedSourceBytes, maintenanceChecksumSha256: bound.checksumSha256 };
+    }
+    const artifact = await captureSqliteSnapshotArtifact(authority, { ...captureOptions, lockToken: token });
     revalidate();
     const maintenance = readBackendMaintenanceJournal(options.homeDir)!;
     const result = await withMigrationQueueEvidence(options.homeDir, artifact, maintenance, (reference, records) =>

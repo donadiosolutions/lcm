@@ -216,6 +216,8 @@ export type EnterBackendMaintenanceInput = Readonly<{
   queueEvidenceSha256: string;
   roster: readonly BackendMaintenanceRosterEntry[];
   now?: Date;
+  /** Exact entering journal observed during crash recovery. */
+  expectedChecksumSha256?: string;
 }>;
 
 export type PrepareBackendMaintenanceSelectionInput = Readonly<{
@@ -1172,7 +1174,13 @@ function readMaintenanceJournalFromDirectory(
     if (!isRecord(candidate)) {
       return fail("malformed-journal", "backend publication journal is not an object");
     }
-    if (candidate.version !== BACKEND_MAINTENANCE_VERSION) return null;
+    if (candidate.version !== BACKEND_MAINTENANCE_VERSION) {
+      // Local append does not require a ready backend, but an existing journal
+      // still has to be an authenticated, supported v2 record.
+      parseJournal(observed.content);
+      assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
+      return null;
+    }
     const parsed = parseMaintenanceJournal(candidate);
     assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
     return parsed;
@@ -1192,12 +1200,14 @@ function writeMaintenanceJournal(
 ): void {
   assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
   const current = replaceTerminalPublication
-    ? withBackendPublicationDirectoryRead(homeDir, (freshHandle) => readJournalFromDirectory(homeDir, freshHandle))
+    ? withBackendPublicationDirectoryRead(homeDir, (freshHandle) =>
+      readMaintenanceJournalFromDirectory(homeDir, freshHandle) ?? readJournalFromDirectory(homeDir, freshHandle))
     : readMaintenanceJournalFromDirectory(homeDir, directoryHandle);
   if (expectedChecksumSha256 === undefined) {
     if (current !== null) return fail("unresolved-publication", "backend publication journal already exists");
   } else if (current?.checksumSha256 !== expectedChecksumSha256
-    || (replaceTerminalPublication && current.phase !== "completed" && current.phase !== "aborted")) {
+    || (replaceTerminalPublication && current.phase !== "completed" && current.phase !== "aborted"
+      && current.phase !== "selection-completed" && current.phase !== "maintenance-aborted")) {
     return fail("unexpected-state", "backend maintenance journal changed before update");
   }
   atomicWritePrivateFileDurable(
@@ -1805,14 +1815,12 @@ export function withBackendPublicationAppendBarrier<T>(
       homeDir,
       (directoryHandle) => readMaintenanceJournalFromDirectory(homeDir, directoryHandle),
     );
-    if (maintenance === null) {
-      assertBackendPublicationConsumerAccessUnlocked({ homeDir, lockToken: token });
-    } else if (
+    if (maintenance !== null && (
       maintenance.phase !== "maintenance-held"
       && maintenance.phase !== "selection-prepared"
       && maintenance.phase !== "selection-completed"
       && maintenance.phase !== "maintenance-aborted"
-    ) {
+    )) {
       return fail("unresolved-publication", "backend maintenance is not ready for local append");
     }
     return withPrivateMutationLock(
@@ -1853,14 +1861,12 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
       homeDir,
       (directoryHandle) => readMaintenanceJournalFromDirectory(homeDir, directoryHandle),
     );
-    if (maintenance === null) {
-      assertBackendPublicationConsumerAccessUnlocked({ homeDir, lockToken: token });
-    } else if (
+    if (maintenance !== null && (
       maintenance.phase !== "maintenance-held"
       && maintenance.phase !== "selection-prepared"
       && maintenance.phase !== "selection-completed"
       && maintenance.phase !== "maintenance-aborted"
-    ) {
+    )) {
       return fail("unresolved-publication", "backend maintenance is not ready for local append");
     }
     return withPrivateMutationLockAsync(
@@ -1880,6 +1886,40 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
     release();
     if (appendBarrierTails.get(key) === tail) appendBarrierTails.delete(key);
   }
+}
+
+/**
+ * @internal Capture-only CAS. The migration caller authenticates absence of the
+ * physical generation before invoking this under its retained append barrier.
+ */
+export function rebindBackendMaintenanceCutoff(
+  input: Readonly<{
+    homeDir: string;
+    expectedChecksumSha256: string;
+    generationId: string;
+    sourceSelectionSha256: string;
+    queueEvidenceSha256: string;
+    roster: readonly BackendMaintenanceRosterEntry[];
+  }>,
+  token: BackendPublicationLockToken,
+): BackendMaintenanceJournal {
+  assertLockToken(token, input.homeDir);
+  if (!activeAppendBarrierTokens.has(token)) return fail("unexpected-state", "maintenance capture requires the append barrier");
+  return withBackendPublicationDirectoryRead(input.homeDir, (directoryHandle) => {
+    const journal = readMaintenanceJournalFromDirectory(input.homeDir, directoryHandle);
+    if (journal === null) return fail("publication-evidence-missing", "backend maintenance journal is missing");
+    const roster = parseMaintenanceRoster(input.roster);
+    if (journal.phase !== "maintenance-held" || journal.checksumSha256 !== input.expectedChecksumSha256
+      || journal.generationId !== input.generationId || journal.sourceSelectionSha256 !== input.sourceSelectionSha256
+      || !HASH_PATTERN.test(input.queueEvidenceSha256)
+      || canonicalJson(journal.roster.map((row) => row.machineId)) !== canonicalJson(roster.map((row) => row.machineId))) {
+      return fail("unexpected-state", "backend maintenance capture does not match held state");
+    }
+    if (journal.queueEvidenceSha256 === input.queueEvidenceSha256 && canonicalJson(journal.roster) === canonicalJson(roster)) return journal;
+    const bound = withMaintenanceChecksum({ ...journal, queueEvidenceSha256: input.queueEvidenceSha256, roster, updatedAt: new Date().toISOString() });
+    writeMaintenanceJournal(input.homeDir, directoryHandle!, bound, journal.checksumSha256);
+    return bound;
+  });
 }
 
 export function assertBackendPublicationConsumerAccess(options: {
@@ -2478,7 +2518,7 @@ function writeJournal(
 
 function archiveTerminalJournal(
   homeDir: string | undefined,
-  journal: BackendPublicationJournal,
+  journal: BackendPublicationJournal | BackendMaintenanceJournal,
 ): void {
   const directory = backendPublicationDirectory(homeDir);
   const history = backendPublicationHistoryDirectory(homeDir);
@@ -2489,6 +2529,11 @@ function archiveTerminalJournal(
     allowedModes: [0o600],
     requireSingleLink: true,
   }).content;
+  const archived = journal.version === BACKEND_MAINTENANCE_VERSION
+    ? parseMaintenanceJournal(JSON.parse(current)) : parseJournal(current);
+  if (archived.checksumSha256 !== journal.checksumSha256) {
+    return fail("unexpected-state", "backend publication journal changed before archive");
+  }
   let historyHandle;
   try {
     historyHandle = openPrivateDirectory(history);
@@ -2868,13 +2913,8 @@ export class BackendPublicationCoordinator {
     lockToken?: BackendPublicationLockToken,
   ): Promise<BackendMaintenanceJournal> {
     return this.#locked(async (directoryHandle) => {
-      const existing = readJournalFromDirectory(this.#homeDir, directoryHandle);
-      if (existing !== null) {
-        if (existing.phase !== "completed" && existing.phase !== "aborted") {
-          return fail("unresolved-publication", "backend publication journal already exists");
-        }
-        archiveTerminalJournal(this.#homeDir, existing);
-      }
+      const maintenance = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
+      const existing = maintenance ?? readJournalFromDirectory(this.#homeDir, directoryHandle);
       if (
         !PUBLICATION_ID_PATTERN.test(input.publicationId)
         || !PUBLICATION_ID_PATTERN.test(input.generationId)
@@ -2885,6 +2925,30 @@ export class BackendPublicationCoordinator {
         return fail("invalid-input", "backend maintenance input is malformed");
       }
       const roster = parseMaintenanceRoster(input.roster);
+      if (maintenance?.phase === "maintenance-entering") {
+        if (maintenance.publicationId !== input.publicationId
+          || maintenance.generationId !== input.generationId
+          || maintenance.sourceSelectionSha256 !== input.sourceSelectionSha256
+          || maintenance.queueEvidenceSha256 !== input.queueEvidenceSha256
+          || canonicalJson(maintenance.roster) !== canonicalJson(roster)
+          || (input.now !== undefined && input.now.toISOString() !== maintenance.createdAt)
+          || (input.expectedChecksumSha256 !== undefined && input.expectedChecksumSha256 !== maintenance.checksumSha256)) {
+          return fail("unexpected-state", "backend maintenance recovery request does not match entering state");
+        }
+        const held = withMaintenanceChecksum({ ...maintenance, phase: "maintenance-held", updatedAt: new Date().toISOString() });
+        writeMaintenanceJournal(this.#homeDir, directoryHandle, held, maintenance.checksumSha256);
+        return held;
+      }
+      if (input.expectedChecksumSha256 !== undefined) {
+        return fail("unexpected-state", "backend maintenance entering checkpoint is no longer current");
+      }
+      if (existing !== null) {
+        if (existing.phase !== "completed" && existing.phase !== "aborted"
+          && existing.phase !== "selection-completed" && existing.phase !== "maintenance-aborted") {
+          return fail("unresolved-publication", "backend publication journal already exists");
+        }
+        archiveTerminalJournal(this.#homeDir, existing);
+      }
       const now = (input.now ?? new Date()).toISOString();
       const entering = withMaintenanceChecksum({
         version: BACKEND_MAINTENANCE_VERSION,
@@ -2998,7 +3062,7 @@ export class BackendPublicationCoordinator {
         return fail("invalid-input", "backend maintenance abort input is malformed");
       }
       if (
-        journal.phase !== "maintenance-held"
+        (journal.phase !== "maintenance-held" && journal.phase !== "maintenance-entering")
         || journal.checksumSha256 !== input.expectedChecksumSha256
         || journal.sourceSelectionSha256 !== input.sourceSelectionSha256
       ) {
