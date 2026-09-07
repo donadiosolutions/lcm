@@ -1075,16 +1075,9 @@ function parseMaintenanceRoster(value: unknown): readonly BackendMaintenanceRost
   return roster;
 }
 
-function parseMaintenanceJournal(content: string): BackendMaintenanceJournal {
-  let value: unknown;
-  try {
-    value = JSON.parse(content);
-  } catch {
-    return fail("malformed-journal", "backend maintenance journal is not valid JSON");
-  }
+function parseMaintenanceJournal(value: Record<string, unknown>): BackendMaintenanceJournal {
   if (
-    !isRecord(value)
-    || !exactKeys(value, [
+    !exactKeys(value, [
       "abortEvidenceSha256", "checksumSha256", "createdAt", "generationId",
       "phase", "publicationId", "queueEvidenceSha256", "roster",
       "selectedGenerationId", "sourceBackend", "sourceSelectionSha256",
@@ -1159,7 +1152,7 @@ function readMaintenanceJournalFromDirectory(
   if (directoryHandle === undefined) return null;
   const directory = backendPublicationDirectory(homeDir);
   try {
-    assertPrivateDirectory(directoryHandle, directory, directoryHandle.witness);
+    assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
     const observed = readBoundedRegularFileWithStat(backendPublicationJournalPath(homeDir), {
       allowedRoot: directory,
       maxBytes: MAX_JOURNAL_BYTES,
@@ -1180,8 +1173,8 @@ function readMaintenanceJournalFromDirectory(
       return fail("malformed-journal", "backend publication journal is not an object");
     }
     if (candidate.version !== BACKEND_MAINTENANCE_VERSION) return null;
-    const parsed = parseMaintenanceJournal(observed.content);
-    assertPrivateDirectory(directoryHandle, directory, directoryHandle.witness);
+    const parsed = parseMaintenanceJournal(candidate);
+    assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
     return parsed;
   } catch (error) {
     if (isMissing(error)) return null;
@@ -1195,11 +1188,16 @@ function writeMaintenanceJournal(
   directoryHandle: BackendPublicationDirectoryHandle,
   journal: BackendMaintenanceJournal,
   expectedChecksumSha256?: string,
+  replaceTerminalPublication = false,
 ): void {
-  const current = readMaintenanceJournalFromDirectory(homeDir, directoryHandle);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
+  const current = replaceTerminalPublication
+    ? withBackendPublicationDirectoryRead(homeDir, (freshHandle) => readJournalFromDirectory(homeDir, freshHandle))
+    : readMaintenanceJournalFromDirectory(homeDir, directoryHandle);
   if (expectedChecksumSha256 === undefined) {
     if (current !== null) return fail("unresolved-publication", "backend publication journal already exists");
-  } else if (current?.checksumSha256 !== expectedChecksumSha256) {
+  } else if (current?.checksumSha256 !== expectedChecksumSha256
+    || (replaceTerminalPublication && current.phase !== "completed" && current.phase !== "aborted")) {
     return fail("unexpected-state", "backend maintenance journal changed before update");
   }
   atomicWritePrivateFileDurable(
@@ -1207,7 +1205,7 @@ function writeMaintenanceJournal(
     `${canonicalJson(journal)}\n`,
     { requireAbsent: expectedChecksumSha256 === undefined, maxExistingBytes: MAX_JOURNAL_BYTES },
   );
-  assertPrivateDirectory(directoryHandle, backendPublicationDirectory(homeDir), directoryHandle.witness);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
 }
 
 type BackendPublicationDirectoryHandle = ReturnType<typeof openPrivateDirectory>;
@@ -2315,12 +2313,16 @@ function assertBackendPublicationProjectMapAccessUnlocked(input: {
   readonly map: unknown;
   readonly present: boolean;
   readonly permit?: PrivateMutationPermit;
+  readonly lockToken?: BackendPublicationLockToken;
 }): void {
   if (input.present !== (input.content !== null)) {
     return fail("unexpected-state", "project-map presence and content disagree");
   }
+  const maintenance = input.lockToken === undefined || input.permit !== undefined ? null
+    : withBackendPublicationDirectoryRead(input.homeDir,
+      (directory) => readMaintenanceJournalFromDirectory(input.homeDir, directory));
   const journal = input.permit === undefined
-    ? readConsumerPublicationJournal(input.homeDir)
+    ? maintenance ?? readConsumerPublicationJournal(input.homeDir)
     : readPublicationJournalForAccess(input.homeDir, input.permit);
   if (journal === null) return;
   if (input.content === null) {
@@ -2900,7 +2902,7 @@ export class BackendPublicationCoordinator {
         terminalEvidenceSha256: null,
         abortEvidenceSha256: null,
       });
-      writeMaintenanceJournal(this.#homeDir, directoryHandle, entering);
+      writeMaintenanceJournal(this.#homeDir, directoryHandle, entering, existing?.checksumSha256, existing !== null);
       const held = withMaintenanceChecksum({
         ...entering,
         phase: "maintenance-held",

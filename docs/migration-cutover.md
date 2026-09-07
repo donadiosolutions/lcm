@@ -48,12 +48,38 @@ commit-before-`processed_at` crash boundary, so this refusal can be permanent.
 LCM preserves the source and private evidence rather than guessing whether to
 replay or suppress such an effect.
 
-Completed artifacts expose authenticated main and WAL paths, source identities,
-schema and content hashes, maintenance checksum, and bounded queue/receipt root
-digests. The canonical SQLite reader remains owned by the portable storage
-adapter. Migration copy orchestration consumes the artifact alongside that
-adapter; it must not create a second reader, maintenance lock, or admission
-authority.
+`captureAuthenticatedSqliteMigrationSource` returns an outer-ready snapshot with
+its physical artifact, exact receipt reference, bounded queue page references,
+and a checksum. It reauthenticates machine identity, project metadata, aliases,
+configuration, and the held maintenance journal before sealing and returning.
+The actual copied machine-sequence counter must equal the journal cutoff. The
+currently supported participant set is the authenticated local machine; a shared
+project or another participant without acknowledged fencing is refused.
+
+Queue evidence is stored separately under
+`~/.lcm/migration-evidence/<generationId>/`. Each immutable page contains at most
+128 records and 128 KiB. The bounded index is at most 1 MiB; a generation admits
+at most 100,000 queue or receipt rows. Receipt checksums and queue records are
+hashed incrementally in canonical order. Capture never loads the entire queue
+or receipt set to construct pages. Inputs beyond these limits are refused with
+the source and partial generation preserved.
+
+Use `inspectAuthenticatedSqliteMigrationSnapshot` to verify a previously sealed
+outer-ready snapshot. Readback authenticates page identities and content and
+recomputes the receipt and queue commitments from the immutable SQLite
+artifacts. A copied replacement, malformed record, forged disposition, partial
+page set, or changed request refuses reuse. A physical artifact reported as
+complete by the lower-level artifact inspector has not, by itself, passed this
+queue and receipt admission. Preserve both directories on failure and start a
+new generation after the cause is resolved; do not repair a partial generation
+by editing its files.
+
+The canonical SQLite reader remains owned by the portable storage adapter.
+Migration copy orchestration consumes the physical artifact alongside the
+outer-ready receipt/page evidence; it must not create a second reader,
+maintenance lock, or admission authority. Exact duplicate promotion attempts
+reuse the committed receipt before repeating any decision or effect, including
+recovery from a crash before the outbox processing mark.
 
 | Source condition | Snapshot disposition |
 | --- | --- |
@@ -68,13 +94,26 @@ authority.
 
 ## How to use this today
 
-Issue #621 is an internal foundation for the later migration work. It exposes
-only the programmatic `src/migration` module; there is no CLI or operator
-command for this protocol yet. Normal installations continue to use their
-existing storage selection. Do not manually create, edit, delete, or otherwise
-mutate the journal or its lock file. If the protocol refuses a journal state,
-preserve the generation directory for the later diagnostic and recovery
-tooling.
+These capabilities are programmatic preparation APIs; no migration CLI is
+available yet. `prepareSqliteMigrationEnrollment` accepts the current project
+and home directory plus a separately resolved PostgreSQL target configuration.
+It uses the existing verified PostgreSQL identity service to register and read
+back the machine, while SQLite remains selected. Remote work occurs outside the
+publication lock. Finalization rechecks the original configuration and project
+identity, then adopts the forward receipt epoch under writer admission and the
+local append barrier. It never backfills ambiguous historical receipts.
+
+A caller authenticates the SQLite source and source bytes, enters held
+maintenance through the existing backend publication coordinator, and calls
+`captureAuthenticatedSqliteMigrationSource` under the same append barrier. The
+roster must contain the verified machine, its exact last allocated sequence
+(or null before any allocation), and the authenticated source-byte evidence.
+Configuration or identity drift refuses finalization and capture. The APIs are
+exported by the `src/migration` module for the later migration orchestrator.
+
+Normal installations retain their existing storage selection. Do not manually
+create, edit, delete, or otherwise mutate the journal or its lock file. Preserve
+the physical and queue evidence directories when preparation refuses a state.
 
 ## Configuration
 

@@ -304,6 +304,81 @@ describe("promote-events route", () => {
     verify.close();
   });
 
+  it.each(["applied", "no-effect"] as const)("retries a committed %s receipt without repeating its decision or effect", async (outcome) => {
+    recoverMachineIdentity({
+      version: 1,
+      identityKey: `machine:${"d".repeat(64)}`,
+      machineId: MACHINE_ID,
+      displayName: "Machine A",
+    }, { homeDir });
+    const projectDb = setupProjectDb(dir);
+    adoptMigrationReceiptEpoch(projectDb, {
+      projectId: projectId(dir),
+      machineId: MACHINE_ID,
+      epochId: "418f22c4-6d2a-4f10-8a4c-6b8d3e5f9012",
+      firstMachineSequence: "0000000000000000000",
+      establishedAt: "2026-09-07T03:04:05.123456Z",
+    });
+    projectDb.close();
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", {
+      type: outcome === "applied" ? "decision" : "file_read",
+      category: outcome === "applied" ? "decision" : "file",
+      data: "exact durable receipt retry",
+      priority: outcome === "applied" ? 1 : 3,
+    }, "PostToolUse");
+    edb.close();
+    const actual = await vi.importActual<typeof import("../../../src/promotion/dedup.js")>(
+      "../../../src/promotion/dedup.js",
+    );
+    const dedup = vi.mocked(deduplicateAndInsert);
+    const previousDedup = dedup.getMockImplementation();
+    dedup.mockImplementation(actual.deduplicateAndInsert);
+    // Leave the real original SQLite envelope pending after the effect transaction
+    // commits, as when the process dies before its separate outbox acknowledgement.
+    const mark = vi.spyOn(EventsDb.prototype, "markProcessed").mockImplementationOnce(() => undefined);
+    try {
+      const handler = createPromoteEventsHandler(makeConfig());
+      const firstOutput = mockRes();
+      await handler(request, firstOutput.res, JSON.stringify({ cwd: dir }));
+      expect(firstOutput.getBody()).toMatchObject({ errors: 0 });
+      const source = new DatabaseSync(projectDbPath(dir));
+      const before = readMigrationReceiptEvidence(source, projectId(dir), MACHINE_ID);
+      expect(before.receipts).toHaveLength(1);
+      expect(before.receipts[0].outcome).toBe(outcome);
+      // An unrelated later promotion changes the lexical no-effect decision.
+      if (outcome === "no-effect") new PromotedStore(source).insert({
+        content: "exact durable receipt retry", tags: [], projectId: projectId(dir),
+        depth: 0, confidence: 0.9,
+      });
+      const effectsBefore = new PromotedStore(source).getAll();
+      source.close();
+      const pending = new EventsDb(sidecarPath);
+      expect(pending.getUnprocessed()).toHaveLength(1);
+      pending.close();
+      dedup.mockClear();
+      const retryOutput = mockRes();
+      await handler(request, retryOutput.res, JSON.stringify({ cwd: dir }));
+      expect(retryOutput.getBody()).toMatchObject({
+        promoted: outcome === "applied" ? 1 : 0,
+        skipped: outcome === "no-effect" ? 1 : 0,
+        errors: 0,
+      });
+      expect(dedup).not.toHaveBeenCalled();
+      const verify = new DatabaseSync(projectDbPath(dir), { readOnly: true });
+      expect(readMigrationReceiptEvidence(verify, projectId(dir), MACHINE_ID)).toEqual(before);
+      expect(new PromotedStore(verify).getAll()).toEqual(effectsBefore);
+      verify.close();
+      const remaining = new EventsDb(sidecarPath);
+      expect(remaining.getUnprocessed()).toHaveLength(0);
+      remaining.close();
+    } finally {
+      mark.mockRestore();
+      if (previousDedup) dedup.mockImplementation(previousDedup);
+      else dedup.mockReset();
+    }
+  });
+
   it("reuses the retained publication token through the single-project route", async () => {
     const edb = new EventsDb(sidecarPath);
     edb.insertEvent(

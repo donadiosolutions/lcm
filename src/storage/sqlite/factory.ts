@@ -28,7 +28,7 @@ import { throwIfAborted } from "../../daemon/cancellation.js";
 import { readMachineIdentity } from "../../machine-identity.js";
 import { LocalHookEventSequenceAllocator } from "../local-hook-event-sequence.js";
 import { adoptMigrationReceiptEpoch } from "../../migration/receipts.js";
-import { withBackendPublicationAppendBarrierAsync } from "../backend-publication.js";
+import { withBackendPublicationAppendBarrierAsync, withBackendPublicationConsumerLock, assertBackendPublicationConsumerAccess } from "../backend-publication.js";
 
 export class SqliteStorageBackendFactory implements StorageBackendFactory {
   readonly backend = "sqlite" as const;
@@ -103,9 +103,13 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       }
       dbPath = paths.dbPath;
       throwIfAborted(signal);
-      db = createIfMissing
-        ? getLcmConnection(paths.dbPath)
-        : getExistingLcmConnection(paths.dbPath) ?? undefined;
+      const sourceHome = sqliteProjectHomeDir(paths.dbPath);
+      db = sourceHome === undefined
+        ? (createIfMissing ? getLcmConnection(paths.dbPath) : getExistingLcmConnection(paths.dbPath) ?? undefined)
+        : withBackendPublicationConsumerLock(sourceHome, (token) => {
+          assertBackendPublicationConsumerAccess({ homeDir: sourceHome, backend: "sqlite", lockToken: token });
+          return createIfMissing ? getLcmConnection(paths.dbPath) : getExistingLcmConnection(paths.dbPath) ?? undefined;
+        }, { lockToken: publicationLockToken });
       if (!db) return null;
       throwIfAborted(signal);
       const executor = sqliteExecutorFor(
@@ -144,7 +148,8 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       if (homeDir !== undefined) {
         const machine = readMachineIdentity(homeDir);
         if (machine?.machineId !== null && machine?.machineId !== undefined) {
-          await withBackendPublicationAppendBarrierAsync(homeDir, async () => {
+          await withBackendPublicationAppendBarrierAsync(homeDir, async (token) => {
+            assertBackendPublicationConsumerAccess({ homeDir, backend: "sqlite", lockToken: token });
             const allocator = new LocalHookEventSequenceAllocator(
               join(homeDir, ".lcm", "events", ".machine-sequence.sqlite"),
             );
@@ -225,7 +230,13 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
   private async probeKnownProject(project: { id: string; dbPath: string }): Promise<StorageHealth> {
     let db: ReturnType<typeof getLcmConnection> | undefined;
     try {
-      db = getExistingLcmConnection(project.dbPath) ?? undefined;
+      const homeDir = sqliteProjectHomeDir(project.dbPath);
+      db = homeDir === undefined
+        ? getExistingLcmConnection(project.dbPath) ?? undefined
+        : withBackendPublicationConsumerLock(homeDir, (token) => {
+          assertBackendPublicationConsumerAccess({ homeDir, backend: "sqlite", lockToken: token });
+          return getExistingLcmConnection(project.dbPath) ?? undefined;
+        });
       if (!db) {
         throw new StorageOperationError(
           "STORAGE_OPERATION_FAILED",
@@ -249,7 +260,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
           }
           throw error;
         }
-      }, { homeDir: sqliteProjectHomeDir(project.dbPath) });
+      }, { homeDir });
       return { status: "healthy", backend: "sqlite", projectId: project.id };
     } catch (error) {
       return {

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -14,6 +14,9 @@ import { runLcmMigrations } from "../../src/db/migration.js";
 import { sqliteStorageCapabilities } from "../../src/storage/capabilities.js";
 import { SqliteProjectStorage } from "../../src/storage/sqlite/project-storage.js";
 import { sqliteExecutorFor } from "../../src/storage/sqlite/executor.js";
+import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
+import * as publication from "../../src/storage/backend-publication.js";
+import { recoverMachineIdentity } from "../../src/machine-identity.js";
 
 type Deferred<T = void> = {
   promise: Promise<T>;
@@ -78,6 +81,114 @@ async function expectPending(promise: Promise<unknown>): Promise<void> {
 
 afterEach(() => {
   closeLcmConnection();
+  vi.restoreAllMocks();
+});
+
+describe("SQLite factory maintenance admission", () => {
+  function fixture() {
+    const homeDir = mkdtempSync(join(tmpdir(), "lcm-factory-maintenance-"));
+    const projectId = "a".repeat(64);
+    const projectDirectory = join(homeDir, ".lcm", "projects", projectId);
+    mkdirSync(projectDirectory, { recursive: true, mode: 0o700 });
+    const dbPath = join(projectDirectory, "db.sqlite");
+    const db = new DatabaseSync(dbPath);
+    runLcmMigrations(db);
+    db.close();
+    chmodSync(dbPath, 0o644);
+    const factory = new SqliteStorageBackendFactory({ resolveProject: () => ({ id: projectId, dbPath }) });
+    const unexpected = async (): Promise<never> => { throw new Error("unexpected v2 driver"); };
+    const coordinator = new publication.BackendPublicationCoordinator({ homeDir, driver: {
+      observeLocalState: unexpected, publishProjectMap: unexpected, publishConfig: unexpected,
+      restoreConfig: unexpected, restoreProjectMap: unexpected,
+    } });
+    const hold = () => coordinator.enterMaintenance({
+      publicationId: "factory-maintenance", generationId: "factory-generation",
+      sourceSelectionSha256: "a".repeat(64), queueEvidenceSha256: "b".repeat(64),
+      roster: [{ machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
+        queueCutoff: null, evidenceSha256: "c".repeat(64) }],
+    });
+    return { homeDir, dbPath, factory, hold, identity: { id: projectId, canonical: homeDir } };
+  }
+
+  it.each(["openProject", "openExistingProject"] as const)("fences %s before SQLite initialization changes the source", async (operation) => {
+    const context = fixture();
+    try {
+      const bytes = readFileSync(context.dbPath);
+      const mode = statSync(context.dbPath).mode;
+      await context.hold();
+      await expect(context.factory[operation](context.identity)).rejects.toThrow();
+      expect(readFileSync(context.dbPath)).toEqual(bytes);
+      expect(statSync(context.dbPath).mode).toBe(mode);
+      expect(existsSync(`${context.dbPath}-wal`)).toBe(false);
+      expect(existsSync(`${context.dbPath}-shm`)).toBe(false);
+    } finally {
+      await context.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses epoch adoption when maintenance enters after factory migrations", async () => {
+    const context = fixture();
+    recoverMachineIdentity({ version: 1, identityKey: `machine:${"d".repeat(64)}`,
+      machineId: "018f0b5d-1234-7abc-8def-1234567890ab", displayName: "Factory test" },
+    { homeDir: context.homeDir });
+    const originalBarrier = publication.withBackendPublicationAppendBarrierAsync;
+    vi.spyOn(publication, "withBackendPublicationAppendBarrierAsync").mockImplementationOnce(async (...args) => {
+      await context.hold();
+      return originalBarrier(...args);
+    });
+    try {
+      const opened = await context.factory.openProject(context.identity).then(() => true, () => false);
+      expect(opened).toBe(false);
+      const source = new DatabaseSync(context.dbPath, { readOnly: true });
+      expect(source.prepare("SELECT name FROM sqlite_schema WHERE name LIKE 'migration_receipt_v1_%'").all()).toEqual([]);
+      source.close();
+      expect(existsSync(join(context.homeDir, ".lcm", "events", ".machine-sequence.sqlite"))).toBe(false);
+    } finally {
+      await context.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fences an idle factory health probe before opening SQLite", async () => {
+    const context = fixture();
+    try {
+      const project = await context.factory.openProject(context.identity);
+      await project.close();
+      expect(await context.factory.health()).toMatchObject({ status: "healthy" });
+      const reset = new DatabaseSync(context.dbPath);
+      reset.exec("PRAGMA journal_mode = DELETE");
+      reset.close();
+      chmodSync(context.dbPath, 0o644);
+      const bytes = readFileSync(context.dbPath);
+      const mode = statSync(context.dbPath).mode;
+      await context.hold();
+      expect(await context.factory.health()).toMatchObject({ status: "unavailable" });
+      expect(readFileSync(context.dbPath)).toEqual(bytes);
+      expect(statSync(context.dbPath).mode).toBe(mode);
+      expect(existsSync(`${context.dbPath}-wal`)).toBe(false);
+      expect(existsSync(`${context.dbPath}-shm`)).toBe(false);
+    } finally {
+      await context.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("opens an existing admitted source and never recreates a missing source on lookup or health", async () => {
+    const context = fixture();
+    try {
+      const existing = await context.factory.openExistingProject(context.identity);
+      expect(existing).not.toBeNull();
+      await existing!.close();
+      rmSync(context.dbPath);
+      expect(await context.factory.openExistingProject(context.identity)).toBeNull();
+      expect(await context.factory.health()).toMatchObject({ status: "unavailable" });
+      expect(existsSync(context.dbPath)).toBe(false);
+    } finally {
+      await context.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("SqliteProjectStorage project health lifecycle", () => {

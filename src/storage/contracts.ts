@@ -373,6 +373,10 @@ export interface CoordinationRepository {
 
 export interface MigrationReceiptRepository {
   getEpoch(machineId: string): Promise<import("../migration/receipts.js").MigrationReceiptEpoch | null>;
+  findMatching(input: Readonly<{
+    epochId: string;
+    envelope: import("../migration/receipts.js").MigrationReceiptEnvelope;
+  }>): Promise<import("../migration/receipts.js").MigrationReceipt | null>;
   record(input: Readonly<{
     epochId: string;
     envelope: import("../migration/receipts.js").MigrationReceiptEnvelope;

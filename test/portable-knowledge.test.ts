@@ -40,7 +40,7 @@ import { clearWorktreeReconciliationCache } from "../src/worktree-reconciliation
 import { lcmHomeDir } from "../src/runtime-paths.js";
 import { isLcmConnectionOpen } from "../src/db/connection.js";
 import { ScrubEngine } from "../src/scrub.js";
-import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
+import { BackendPublicationCoordinator, BackendPublicationJournalError, type BackendPublicationDriver } from "../src/storage/backend-publication.js";
 import { createPublicationConvergence } from "../src/storage/publication-convergence.js";
 
 const tempDirs: string[] = [];
@@ -525,6 +525,52 @@ describe("portable-knowledge — import", () => {
       entries,
     };
   }
+
+  it.each(["maintenance", "configuration"])("refuses %s drift while import scrubber preparation is paused", async (change) => {
+    const cwd = makeTempDir();
+    const { dbPath } = seedProject(lcmHomeDir(), cwd, [{ content: "preserve original source" }]);
+    const originalBytes = readFileSync(dbPath);
+    const originalMode = statSync(dbPath).mode;
+    let resume!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => { resume = resolve; });
+    const preparing = new Promise<void>((resolve) => { started = resolve; });
+    const originalScrubber = ScrubEngine.forProject;
+    vi.spyOn(ScrubEngine, "forProject").mockImplementationOnce(async (...args) => {
+      started();
+      await gate;
+      return originalScrubber.apply(ScrubEngine, args);
+    });
+    const importing = importKnowledge(cwd, makeDoc([{
+      content: "must never write through held admission", tags: [], confidence: 1,
+      createdAt: new Date().toISOString(), sessionId: null,
+    }]));
+    await preparing;
+    try {
+      if (change === "maintenance") {
+        const unexpected = async (): Promise<never> => { throw new Error("unexpected v2 driver"); };
+        const driver: BackendPublicationDriver = {
+          observeLocalState: unexpected, publishProjectMap: unexpected,
+          publishConfig: unexpected, restoreConfig: unexpected, restoreProjectMap: unexpected,
+        };
+        await new BackendPublicationCoordinator({ homeDir: tempHome, driver }).enterMaintenance({
+          publicationId: "import-maintenance", generationId: "import-generation",
+          sourceSelectionSha256: "a".repeat(64), queueEvidenceSha256: "b".repeat(64),
+          roster: [{ machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
+            queueCutoff: null, evidenceSha256: "c".repeat(64) }],
+        });
+      } else {
+        writeFileSync(join(lcmHomeDir(), "config.json"), '{"storage":{"backend":"sqlite"}}\n', { mode: 0o600 });
+      }
+    } finally {
+      resume();
+    }
+    await expect(importing).rejects.toThrow(change === "maintenance" ? "maintenance" : "selection changed");
+    expect(readFileSync(dbPath)).toEqual(originalBytes);
+    expect(statSync(dbPath).mode).toBe(originalMode);
+    expect(existsSync(`${dbPath}-wal`)).toBe(false);
+    expect(existsSync(`${dbPath}-shm`)).toBe(false);
+  });
 
   it("imports entries into an empty project", async () => {
     const baseDir = makeTempDir();

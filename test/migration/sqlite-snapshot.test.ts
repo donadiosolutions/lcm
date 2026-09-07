@@ -716,6 +716,293 @@ describe("authenticated SQLite snapshot artifacts", () => {
     }
   });
 
+  it("rejects a normalized leaf replaced by a hard link before writable SQLite inspection", async () => {
+    const fixture = await heldFixture();
+    let inspectionCalled = false;
+    let replaced = false;
+    await expect(captureFixture(fixture, {
+      observe: (boundary, path, role) => {
+        if (replaced || boundary !== "before-private-inspection" || role !== "project") return;
+        replaced = true;
+        rmSync(path);
+        linkSync(fixture.authority.projectDbPath, path);
+      },
+      inspectDatabase: () => {
+        inspectionCalled = true;
+        throw new Error("writable SQLite inspection must not be reached");
+      },
+    })).rejects.toMatchObject({ reason: "source-unsafe" });
+    expect(inspectionCalled).toBe(false);
+    expect(() => statSync(join(generationDirectory(fixture.homeDir), "witness.committed"))).toThrow();
+  });
+
+  it.each(["before-open", "opened-aba"])("preserves real source bytes and sidecars after private %s replacement", async (point) => {
+    const fixture = await heldFixture();
+    const source = fixture.authority.projectDbPath;
+    const original = [source, `${source}-wal`, `${source}-shm`].map((path) => ({
+      path, bytes: readFileSync(path), mode: statSync(path).mode,
+    }));
+    let replaced = false;
+    await expect(captureFixture(fixture, {
+      observe: (boundary, path, role) => {
+        if (point !== "before-open" || replaced || boundary !== "before-private-inspection" || role !== "project") return;
+        replaced = true;
+        renameSync(path, `${path}.owned`);
+        linkSync(source, path);
+      },
+      openDatabase: (path) => {
+        if (replaced) return new DatabaseSync(path);
+        replaced = true;
+        renameSync(path, `${path}.owned`);
+        linkSync(source, path);
+        const opened = new DatabaseSync(path);
+        rmSync(path);
+        renameSync(`${path}.owned`, path);
+        return opened;
+      },
+    })).rejects.toMatchObject({ reason: "source-unsafe" });
+    for (const item of original) {
+      expect(readFileSync(item.path)).toEqual(item.bytes);
+      expect(statSync(item.path).mode).toBe(item.mode);
+    }
+  });
+
+  it("preserves a late replaced scratch tree while cleanup follows its retained directory", async () => {
+    const fixture = sourceFixture();
+    let replacement: string | undefined;
+    await expect(dryRunSqliteSnapshotArtifact(fixture.authority, {
+      homeDir: fixture.homeDir,
+      _operationsForTesting: {
+        remove: (path, options) => {
+          if (replacement === undefined) {
+            const inspections = join(fixture.homeDir, ".lcm", "migration-snapshots", "inspections");
+            const scratch = join(inspections, readdirSync(inspections)[0]!);
+            renameSync(scratch, `${scratch}.owned`);
+            mkdirSync(scratch, { mode: 0o700 });
+            replacement = join(scratch, "sentinel");
+            writeFileSync(replacement, "unrelated", { mode: 0o600 });
+          }
+          rmSync(path, options);
+        },
+      },
+    })).rejects.toMatchObject({ reason: "source-changed" });
+    expect(readFileSync(replacement!, "utf8")).toBe("unrelated");
+  });
+
+  it.each(["ancestor", "leaf"])("preserves a late replacement %s during nonrecursive dry-run cleanup", async (target) => {
+    const fixture = sourceFixture();
+    let sentinel: string | undefined;
+    await expect(dryRunSqliteSnapshotArtifact(fixture.authority, {
+      homeDir: fixture.homeDir,
+      _operationsForTesting: {
+        remove: (path, options) => {
+          if (sentinel === undefined) {
+            const inspections = join(fixture.homeDir, ".lcm", "migration-snapshots", "inspections");
+            const scratchName = readdirSync(inspections)[0]!;
+            if (target === "ancestor") {
+              renameSync(inspections, `${inspections}.owned`);
+              mkdirSync(inspections, { mode: 0o700 });
+              const replacement = join(inspections, scratchName);
+              mkdirSync(replacement, { mode: 0o700 });
+              sentinel = join(replacement, "sentinel");
+            } else {
+              rmSync(path);
+              mkdirSync(path, { mode: 0o700 });
+              sentinel = join(inspections, scratchName, path.split("/").at(-1)!, "sentinel");
+            }
+            writeFileSync(sentinel, "replacement", { mode: 0o600 });
+          }
+          rmSync(path, options);
+        },
+      },
+    })).rejects.toMatchObject({ reason: target === "ancestor" ? "source-changed" : "snapshot-io" });
+    expect(readFileSync(sentinel!, "utf8")).toBe("replacement");
+  });
+
+  it("refuses cleanup of a replaced private leaf directory without traversing it", async () => {
+    const fixture = sourceFixture();
+    let sentinel: string | undefined;
+    await expect(dryRunSqliteSnapshotArtifact(fixture.authority, {
+      homeDir: fixture.homeDir,
+      _operationsForTesting: {
+        now: () => {
+          const inspections = join(fixture.homeDir, ".lcm", "migration-snapshots", "inspections");
+          const scratch = join(inspections, readdirSync(inspections)[0]!);
+          const path = join(scratch, "project.sqlite");
+          rmSync(path);
+          mkdirSync(path, { mode: 0o700 });
+          sentinel = join(path, "sentinel");
+          writeFileSync(sentinel, "unrelated", { mode: 0o600 });
+          return new Date("2026-09-07T12:00:00.000Z");
+        },
+      },
+    })).rejects.toMatchObject({ reason: "source-changed" });
+    expect(readFileSync(sentinel!, "utf8")).toBe("unrelated");
+  });
+
+  it.each([
+    { boundary: "before-private-inspection", target: "parent", reason: "source-changed" },
+    { boundary: "before-private-inspection", target: "main", reason: "source-changed" },
+    { boundary: "before-private-inspection", target: "-shm", reason: "source-unsafe" },
+    { boundary: "after-private-inspection", target: "parent", reason: "source-changed" },
+    { boundary: "after-private-inspection", target: "-wal", reason: "source-unsafe" },
+    { boundary: "before-private-fsync", target: "parent", reason: "source-changed" },
+    { boundary: "before-private-fsync", target: "main", reason: "source-changed" },
+  ] as const)("refuses $target replacement at $boundary without changing the source", async (scenario) => {
+    const fixture = await heldFixture();
+    const before = sourceState(fixture.authority);
+    let changed = false;
+    let replacement: string | undefined;
+    await expect(captureFixture(fixture, {
+      observe: (boundary, path, role) => {
+        if (changed || boundary !== scenario.boundary || role !== "project") return;
+        changed = true;
+        if (scenario.target === "parent") {
+          const parent = join(path, "..");
+          renameSync(parent, `${parent}.owned`);
+          mkdirSync(parent, { mode: 0o700 });
+          replacement = join(parent, "sentinel");
+          writeFileSync(replacement, "replacement", { mode: 0o600 });
+        } else if (scenario.target === "main") {
+          renameSync(path, `${path}.owned`);
+          replacement = path;
+          writeFileSync(path, "replacement", { mode: 0o600 });
+        } else {
+          replacement = `${path}${scenario.target}`;
+          writeFileSync(replacement, "replacement", { mode: 0o600 });
+        }
+      },
+    })).rejects.toMatchObject({ reason: scenario.reason });
+    expect(changed).toBe(true);
+    expect(readFileSync(replacement!, "utf8")).toBe("replacement");
+    expect(sourceState(fixture.authority)).toEqual(before);
+  });
+
+  it("refuses a sealed artifact inode replacement before constructing its witness", async () => {
+    const fixture = await heldFixture();
+    let replacement: string | undefined;
+    const ownedPath = join(fixture.homeDir, "sealed-original.sqlite");
+    await expect(captureFixture(fixture, {
+      observe: (boundary, path, role) => {
+        if (replacement !== undefined || boundary !== "after-private-fsync" || role !== "project" || !path.endsWith("project.sqlite")) return;
+        renameSync(path, ownedPath);
+        writeFileSync(path, readFileSync(ownedPath), { mode: 0o400 });
+        replacement = path;
+      },
+    })).rejects.toMatchObject({ reason: "source-changed" });
+    expect(replacement).toBeDefined();
+    expect(readFileSync(replacement!)).toEqual(readFileSync(ownedPath));
+    expect(() => statSync(join(generationDirectory(fixture.homeDir), "witness.committed"))).toThrow();
+  });
+
+  it.each(["migration-snapshots", "migration-snapshots/registrations"])("refuses an exact retry through unsafe %s permissions", async (relative) => {
+    const fixture = await heldFixture();
+    await captureFixture(fixture);
+    chmodSync(join(fixture.homeDir, ".lcm", relative), 0o755);
+    expect(await classifySqliteSnapshotArtifact("generation-1", { homeDir: fixture.homeDir }))
+      .toEqual({ state: "tampered", generationId: "generation-1" });
+    await expect(captureFixture(fixture)).rejects.toMatchObject({ reason: "snapshot-tampered" });
+  });
+
+  it("refuses ambiguous SQLite-open descriptor evidence before running SQL", async () => {
+    const fixture = await heldFixture();
+    const before = sourceState(fixture.authority);
+    let extra: number | undefined;
+    try {
+      await expect(captureFixture(fixture, {
+        openDatabase: (path) => {
+          const database = new DatabaseSync(path);
+          extra = openSync(path, "r");
+          return database;
+        },
+      })).rejects.toMatchObject({ reason: "source-unsafe" });
+      expect(sourceState(fixture.authority)).toEqual(before);
+    } finally { if (extra !== undefined) closeSync(extra); }
+  });
+
+  it("refuses non-EBADF descriptor inspection failures before opening SQLite", async () => {
+    const fixture = await heldFixture();
+    let inventory = false;
+    let opened = false;
+    await expect(captureFixture(fixture, {
+      readdir: (path) => {
+        if (path === "/dev/fd") inventory = true;
+        return readdirSync(path);
+      },
+      fstat: (fd) => {
+        if (inventory) throw Object.assign(new Error("descriptor stat failed"), { code: "EIO" });
+        return fstatSync(fd, { bigint: true });
+      },
+      openDatabase: () => { opened = true; throw new Error("unexpected SQLite open"); },
+    })).rejects.toMatchObject({ reason: "snapshot-io" });
+    expect(inventory).toBe(true);
+    expect(opened).toBe(false);
+  });
+
+  it.each(["scratch", "parent"])("refuses a replaced %s during dry-run descriptor initialization", async (target) => {
+    const fixture = sourceFixture();
+    let replaced = false;
+    let scratchOpened = false;
+    let sentinel: string | undefined;
+    await expect(dryRunSqliteSnapshotArtifact(fixture.authority, {
+      homeDir: fixture.homeDir,
+      _operationsForTesting: {
+        open: (path, flags, mode) => {
+          const shouldReplace = target === "scratch" ? /\/dry-run\.[0-9a-f]+$/u.test(path)
+            : path.endsWith("/inspections") && scratchOpened;
+          if (!replaced && shouldReplace) {
+            replaced = true;
+            renameSync(path, `${path}.owned`);
+            mkdirSync(path, { mode: 0o700 });
+            sentinel = join(path, "sentinel");
+            writeFileSync(sentinel, "replacement", { mode: 0o600 });
+          }
+          const fd = mode === undefined ? openSync(path, flags) : openSync(path, flags, mode);
+          if (/\/dry-run\.[0-9a-f]+$/u.test(path)) scratchOpened = true;
+          return fd;
+        },
+      },
+    })).rejects.toMatchObject({ reason: "source-changed" });
+    expect(replaced).toBe(true);
+    expect(readFileSync(sentinel!, "utf8")).toBe("replacement");
+  });
+
+  it.each(["raw-stat", "scratch-stat", "parent-open", "parent-stat"])("closes every owned descriptor after %s failure", async (failure) => {
+    const fixture = sourceFixture();
+    const descriptors = new Map<number, string>();
+    let rejected = false;
+    await expect(dryRunSqliteSnapshotArtifact(fixture.authority, {
+      homeDir: fixture.homeDir,
+      _operationsForTesting: {
+        open: (path, flags, mode) => {
+          if (!rejected && failure === "parent-open" && path.endsWith("/inspections")
+            && [...descriptors.values()].some((value) => value.includes("/dry-run."))) {
+            rejected = true;
+            throw new Error("parent open failed");
+          }
+          const fd = mode === undefined ? openSync(path, flags) : openSync(path, flags, mode);
+          descriptors.set(fd, path);
+          return fd;
+        },
+        fstat: (fd) => {
+          const path = descriptors.get(fd)!;
+          if (!rejected && ((failure === "raw-stat" && path.endsWith("project.raw.sqlite"))
+            || (failure === "scratch-stat" && /\/dry-run\.[0-9a-f]+$/u.test(path))
+            || (failure === "parent-stat" && path.endsWith("/inspections")))) {
+            rejected = true;
+            throw new Error("stat failed");
+          }
+          return fstatSync(fd, { bigint: true });
+        },
+        close: (fd) => { closeSync(fd); descriptors.delete(fd); },
+      },
+    })).rejects.toMatchObject({ reason: "snapshot-io" });
+    expect(rejected).toBe(true);
+    const leaked = [...descriptors.values()];
+    for (const fd of descriptors.keys()) closeSync(fd);
+    expect(leaked).toEqual([]);
+  });
+
   it("fails closed when a source open fails and its descriptor cannot close", async () => {
     const fixture = sourceFixture();
     let fstatCalls = 0;
@@ -852,6 +1139,50 @@ describe("authenticated SQLite snapshot artifacts", () => {
       homeDir: clock.homeDir,
       _operationsForTesting: { now: () => new Date(Number.NaN) },
     })).rejects.toMatchObject({ reason: "snapshot-io" });
+  });
+
+  it("preserves a replacement of dry-run scratch storage and fails closed", async () => {
+    const fixture = sourceFixture();
+    let replacement: string | undefined;
+    await expect(dryRunSqliteSnapshotArtifact(fixture.authority, {
+      homeDir: fixture.homeDir,
+      _operationsForTesting: {
+        now: () => {
+          const inspections = join(fixture.homeDir, ".lcm", "migration-snapshots", "inspections");
+          const scratchName = readdirSync(inspections)[0]!;
+          const scratch = join(inspections, scratchName);
+          renameSync(scratch, `${scratch}.owned`);
+          mkdirSync(scratch, { mode: 0o700 });
+          replacement = join(scratch, "sentinel");
+          writeFileSync(replacement, "unrelated", { mode: 0o600 });
+          return new Date("2026-09-07T12:00:00.000Z");
+        },
+      },
+    })).rejects.toMatchObject({ reason: "source-changed" });
+    expect(replacement).toBeDefined();
+    expect(readFileSync(replacement!, "utf8")).toBe("unrelated");
+  });
+
+  it("refuses a complete generation under a different held request", async () => {
+    const fixture = await heldFixture();
+    await captureFixture(fixture);
+    const journalPath = join(fixture.homeDir, ".lcm", "backend-publication", "journal.json");
+    const current = JSON.parse(readFileSync(journalPath, "utf8")) as Record<string, unknown>;
+    const { checksumSha256: _checksum, ...body } = current;
+    body.publicationId = "replacement-publication";
+    body.updatedAt = "2026-09-07T12:00:00.000Z";
+    const replacement = {
+      ...body,
+      checksumSha256: backendPublicationCanonicalSha256(body),
+    };
+    writeFileSync(journalPath, `${JSON.stringify(replacement)}\n`, { mode: 0o600 });
+
+    await expect(captureSqliteSnapshotArtifact(fixture.authority, {
+      homeDir: fixture.homeDir,
+      generationId: "generation-1",
+      maintenanceChecksumSha256: replacement.checksumSha256,
+      expectedSourceBytes: fixture.expectedSourceBytes,
+    })).rejects.toMatchObject({ reason: "snapshot-replaced" });
   });
 
   it("returns the immutable witness on an exact retry and through inspect", async () => {

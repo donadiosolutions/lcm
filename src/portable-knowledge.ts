@@ -26,14 +26,15 @@ import { ScrubEngine } from "./scrub.js";
 import { getLcmConnection, closeLcmConnection } from "./db/connection.js";
 import { lcmHomeDir } from "./runtime-paths.js";
 import { resolveProjectIdentity } from "./project-map.js";
-import { loadDaemonConfig } from "./daemon/config.js";
+import { daemonConfigSnapshotWitnessEqual, loadDaemonConfig, readDaemonConfigRawSnapshot } from "./daemon/config.js";
 import { configPath } from "./runtime-paths.js";
-import { selectStorageBackendForConfig } from "./storage/backend.js";
+import { assertStorageBackendPublication, selectStorageBackendForConfig } from "./storage/backend.js";
 import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
 import {
   withPublicationAdmissionRetry,
   type PublicationConvergence,
 } from "./storage/publication-convergence.js";
+import { backendPublicationHomeForConfigPath, withBackendPublicationConsumerLockAsync } from "./storage/backend-publication.js";
 import { atomicWritePrivateFileExclusive } from "./security-files.js";
 
 export const EXPORT_VERSION = 1;
@@ -231,6 +232,7 @@ export async function importKnowledge(
   opts: ImportOptions = {},
 ): Promise<ImportResult> {
   const configFile = configPath();
+  const configWitness = readDaemonConfigRawSnapshot(configFile).witness;
   const config = loadDaemonConfig(configFile);
   selectStorageBackendForConfig(configFile, config.storage);
   if (doc.version !== EXPORT_VERSION) {
@@ -257,6 +259,12 @@ export async function importKnowledge(
   const globalPatterns = opts._globalPatterns
     ?? config.security.sensitivePatterns;
   const scrubber = await ScrubEngine.forProject(globalPatterns, projDir);
+  const homeDir = backendPublicationHomeForConfigPath(configFile);
+  return withBackendPublicationConsumerLockAsync(homeDir, async (token) => {
+  if (!daemonConfigSnapshotWitnessEqual(configWitness, readDaemonConfigRawSnapshot(configFile).witness)) {
+    throw new Error("Storage selection changed during knowledge import preparation");
+  }
+  assertStorageBackendPublication({ backend: "sqlite", homeDir }, token);
   const db = getLcmConnection(dbPath);
 
   let imported = 0;
@@ -310,4 +318,5 @@ export async function importKnowledge(
     dryRun: false,
     ...(errors.length > 0 ? { errors } : {}),
   };
+  });
 }

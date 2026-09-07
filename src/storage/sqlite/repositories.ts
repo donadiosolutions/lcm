@@ -30,6 +30,7 @@ import { normalizeStorageError } from "../errors.js";
 import { sessionInstructionsScopeHash } from "../session-instructions.js";
 import {
   getMigrationReceiptEpoch,
+  findMatchingMigrationReceipt,
   recordMigrationReceipt,
 } from "../../migration/receipts.js";
 
@@ -125,6 +126,11 @@ export function createSqliteRepositories(
 
   const repositories: TransactionRepositories = {
     migrationReceipt: {
+      findMatching: (input) => invoke(
+        "coordination",
+        "findMatchingMigrationReceipt",
+        () => findMatchingMigrationReceipt(db, { projectId, ...input }),
+      ),
       getEpoch: (machineId) => invoke(
         "coordination",
         "getMigrationReceiptEpoch",

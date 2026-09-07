@@ -980,6 +980,13 @@ async function promoteEventsBatch(
               sourceHook: event.source_hook,
               createdAt: event.created_at,
             };
+            const priorReceipt = await repositories.migrationReceipt!.findMatching({
+              epochId: epoch.epochId,
+              envelope,
+            });
+            if (priorReceipt !== null) {
+              return { promoted: priorReceipt.outcome === "applied" };
+            }
             if (event.priority === 3 && !reinforced) {
               const existing = await repositories.lexicalSearch.searchPromoted(
                 scrubbedData,

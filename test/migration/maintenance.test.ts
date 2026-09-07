@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -15,10 +15,23 @@ import { SQLiteLocalHookOutboxFactory } from "../../src/storage/local-hook-outbo
 import {
   assertMigrationReplayAdmission,
   prepareSqliteMigrationEnrollment,
+  authenticateSqliteMigrationSource,
+  authenticateSqliteMigrationSourceBytes,
+  captureAuthenticatedSqliteMigrationSource,
+  classifyImmutableSqliteSnapshot,
+  inspectImmutableSqliteSnapshot,
+  dryRunAuthenticatedSqliteMigrationSource,
+  type SqliteMigrationEnrollmentInput,
 } from "../../src/migration/maintenance.js";
 import { localProjectIdentity } from "../../src/daemon/project.js";
 import { writeFileSync } from "node:fs";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
+import * as identityApi from "../../src/machine-identity.js";
+import * as publicationApi from "../../src/storage/backend-publication.js";
+import * as identityService from "../../src/identity-service.js";
+import { type IdentityRepository } from "../../src/identity-service.js";
+import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
+import { closeLcmConnection } from "../../src/db/connection.js";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -26,6 +39,10 @@ const MACHINE_ID = "018f0b5d-1234-4abc-8def-1234567890ab";
 const roots: string[] = [];
 
 afterEach(() => {
+  closeLcmConnection();
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  clearProjectMapCache();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -65,7 +82,308 @@ function input() {
   } as const;
 }
 
+const REGISTERED_MACHINE = "018f0b5d-1234-7abc-8def-1234567890ab";
+
+function enrollmentFixture() {
+  const homeDir = home();
+  const cwd = join(homeDir, "project");
+  mkdirSync(cwd, { mode: 0o700 });
+  const local = localProjectIdentity(cwd, homeDir);
+  const projectDir = join(homeDir, ".lcm", "projects", local.id);
+  mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+  mkdirSync(join(homeDir, ".lcm", "events"), { mode: 0o700 });
+  const metadata = join(projectDir, "meta.json");
+  writeFileSync(metadata, `${JSON.stringify({ cwd })}\n`, { mode: 0o600 });
+  const request: SqliteMigrationEnrollmentInput = {
+    cwd, homeDir, targetConfig: { backend: "postgresql", postgresql: {
+      url: "postgresql://unused.invalid/lcm", caFile: "/unused", migrationRole: "unused",
+      poolMax: 1, connectionTimeoutMs: 100, idleTimeoutMs: 100, statementTimeoutMs: 100,
+    } },
+  };
+  const registered = () => {
+    const pending = identityApi.readMachineIdentity(homeDir)!;
+    return { machineId: REGISTERED_MACHINE, identityKey: pending.identityKey, displayName: pending.displayName };
+  };
+  const repository = {
+    registerMachine: vi.fn(async () => registered()),
+    recoverMachine: vi.fn(async () => registered()),
+  };
+  const close = vi.fn(async () => undefined);
+  const openIdentitySession = vi.fn(async () => ({ repository: repository as unknown as IdentityRepository, close }));
+  return { homeDir, cwd, local, projectDir, metadata, request, registered, repository, close, openIdentitySession };
+}
+
+async function populatedFixture(legacy = false) {
+  const fixture = enrollmentFixture();
+  const factory = new SQLiteLocalHookOutboxFactory();
+  const outbox = await factory.open(join(fixture.homeDir, ".lcm", "events", `${fixture.local.id}.db`));
+  if (legacy) await outbox.insertEvent("legacy", { type: "decision", category: "decision", data: "unknown legacy effect", priority: 1 }, "SessionStart");
+  await prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession });
+  if (!legacy) await outbox.insertEvent("pending", { type: "decision", category: "decision", data: "proven receipt-era pending", priority: 1 }, "SessionStart");
+  await factory.close();
+  return fixture;
+}
+
+async function heldSource(fixture: ReturnType<typeof enrollmentFixture>) {
+  return withBackendPublicationAppendBarrierAsync(fixture.homeDir, async (token) => {
+    const authority = authenticateSqliteMigrationSource(fixture.cwd, fixture.homeDir, token);
+    const expectedSourceBytes = await authenticateSqliteMigrationSourceBytes(authority, { homeDir: fixture.homeDir, lockToken: token });
+    const held = await coordinator(fixture.homeDir).enterMaintenance({
+      ...input(), sourceSelectionSha256: authority.sourceSelectionSha256,
+      queueEvidenceSha256: expectedSourceBytes.checksumSha256,
+      roster: [{ machineId: REGISTERED_MACHINE, queueCutoff: "0000000000000000000", evidenceSha256: expectedSourceBytes.checksumSha256 }],
+    }, token);
+    return { authority, options: { homeDir: fixture.homeDir, generationId: held.generationId,
+      maintenanceChecksumSha256: held.checksumSha256, expectedSourceBytes } };
+  });
+}
+
 describe("backend publication maintenance journal v3", () => {
+  it("captures and inspects a populated source through authenticated public preparation", async () => {
+    const fixture = await populatedFixture();
+    const dryRun = await dryRunAuthenticatedSqliteMigrationSource(fixture.cwd, fixture.homeDir);
+    expect(dryRun).toBeDefined();
+    const source = await heldSource(fixture);
+    const snapshot = await captureAuthenticatedSqliteMigrationSource(source.authority, source.options);
+    expect(snapshot.receiptReference.machineId).toBe(REGISTERED_MACHINE);
+    expect(snapshot.pages).toHaveLength(1);
+    const page = JSON.parse(readFileSync(join(fixture.homeDir, ".lcm", "migration-evidence", "generation-1", snapshot.pages[0].name), "utf8"));
+    expect(page.records).toMatchObject([{ disposition: "retained" }]);
+    expect(await inspectImmutableSqliteSnapshot("generation-1", fixture.homeDir)).toEqual(snapshot.artifact);
+    expect(await classifyImmutableSqliteSnapshot("generation-1", fixture.homeDir)).toMatchObject({ state: "complete" });
+  });
+
+  it("refuses copied authority objects even when every field matches", async () => {
+    const fixture = await populatedFixture();
+    const source = await heldSource(fixture);
+    const copy = { ...source.authority };
+    await expect(captureAuthenticatedSqliteMigrationSource(copy, source.options)).rejects.toThrow("not authenticated");
+    await withBackendPublicationAppendBarrierAsync(fixture.homeDir, async (lockToken) => {
+      await expect(authenticateSqliteMigrationSourceBytes(copy, { homeDir: fixture.homeDir, lockToken })).rejects.toThrow("not authenticated");
+    });
+  });
+
+  it("refuses authentication and enrollment when PostgreSQL is already configured", async () => {
+    const fixture = enrollmentFixture();
+    const caFile = join(fixture.homeDir, ".lcm", "ca.crt");
+    writeFileSync(caFile, "test authority", { mode: 0o600 });
+    writeFileSync(join(fixture.homeDir, ".lcm", "config.json"), JSON.stringify({ storage: { backend: "postgresql" } }), { mode: 0o600 });
+    vi.stubEnv("LCM_POSTGRES_URL", "postgresql://user:password@db.example.invalid/lcm");
+    vi.stubEnv("LCM_POSTGRES_CA_FILE", caFile);
+    vi.stubEnv("LCM_POSTGRES_MIGRATION_ROLE", "lcm_test_migrator");
+    expect(() => authenticateSqliteMigrationSource(fixture.cwd, fixture.homeDir)).toThrow("SQLite to remain selected");
+    await expect(prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession })).rejects.toThrow("SQLite to remain selected");
+    expect(fixture.openIdentitySession).not.toHaveBeenCalled();
+    expect(identityApi.readMachineIdentity(fixture.homeDir)).toBeNull();
+  });
+
+  it("refuses configuration changes at physical seal without publishing queue evidence", async () => {
+    const fixture = await populatedFixture();
+    const source = await heldSource(fixture);
+    await expect(captureAuthenticatedSqliteMigrationSource(source.authority, {
+      ...source.options, _operationsForTesting: { observe: (boundary) => {
+        if (boundary === "after-commit-marker") writeFileSync(join(fixture.homeDir, ".lcm", "config.json"), '{"storage":{"backend":"sqlite"}}\n', { mode: 0o600 });
+      } },
+    })).rejects.toThrow("authority changed");
+    expect(existsSync(join(fixture.homeDir, ".lcm", "migration-evidence", "generation-1", "index.json"))).toBe(false);
+  });
+
+  it("refuses configuration drift during remote enrollment before identity finalization", async () => {
+    const fixture = enrollmentFixture();
+    fixture.repository.recoverMachine.mockImplementation(async () => {
+      writeFileSync(join(fixture.homeDir, ".lcm", "config.json"), '{"storage":{"backend":"sqlite"}}\n', { mode: 0o600 });
+      return fixture.registered();
+    });
+    await expect(prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession })).rejects.toThrow("selection changed during");
+    expect(identityApi.readMachineIdentity(fixture.homeDir)?.machineId).toBeNull();
+    expect(existsSync(join(fixture.projectDir, "db.sqlite"))).toBe(false);
+  });
+
+  it.each(["before-capture", "before-seal"])("refuses authority drift %s", async (when) => {
+    const fixture = await populatedFixture();
+    const source = await heldSource(fixture);
+    const mutate = () => writeFileSync(fixture.metadata, `${JSON.stringify({ cwd: fixture.cwd, changed: true })}\n`);
+    if (when === "before-capture") mutate();
+    await expect(captureAuthenticatedSqliteMigrationSource(source.authority, {
+      ...source.options, _operationsForTesting: { observe: (boundary) => {
+        if (when === "before-seal" && boundary === "after-commit-marker") mutate();
+      } },
+    })).rejects.toThrow("authority changed");
+    expect(existsSync(join(fixture.homeDir, ".lcm", "migration-evidence", "generation-1", "index.json"))).toBe(false);
+  });
+
+  it.each(["generation", "checksum", "terminal"])("refuses mismatched %s maintenance authority", async (change) => {
+    const fixture = await populatedFixture();
+    const source = await heldSource(fixture);
+    if (change === "terminal") await coordinator(fixture.homeDir).abortMaintenance({
+      expectedChecksumSha256: source.options.maintenanceChecksumSha256,
+      sourceSelectionSha256: source.authority.sourceSelectionSha256, abortEvidenceSha256: HASH_B,
+    });
+    await expect(captureAuthenticatedSqliteMigrationSource(source.authority, {
+      ...source.options,
+      ...(change === "generation" ? { generationId: "other-generation" } : {}),
+      ...(change === "checksum" ? { maintenanceChecksumSha256: HASH_A } : {}),
+    })).rejects.toThrow("authority changed");
+  });
+
+  it("refuses unknown null-machine legacy input without deleting its evidence", async () => {
+    const fixture = await populatedFixture(true);
+    const source = await heldSource(fixture);
+    await expect(captureAuthenticatedSqliteMigrationSource(source.authority, source.options)).rejects.toThrow();
+    const db = new DatabaseSync(source.authority.passiveEventsDbPath!, { readOnly: true });
+    expect(db.prepare("SELECT machine_id, processed_at, data FROM events").all()).toEqual([
+      { machine_id: null, processed_at: null, data: "unknown legacy effect" },
+    ]);
+    db.close();
+  });
+
+  it("authenticates mapped project identities, aliases and absent outboxes", async () => {
+    const fixture = enrollmentFixture();
+    await prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession });
+    writeFileSync(projectMapPath(fixture.homeDir), JSON.stringify({ [fixture.local.id]: {
+      canonical: fixture.cwd, aliases: [fixture.cwd, join(fixture.homeDir, "alias")], remoteProjectId: REGISTERED_MACHINE,
+    } }), { mode: 0o600 });
+    const authority = authenticateSqliteMigrationSource(fixture.cwd, fixture.homeDir);
+    expect(authority.projectIdentity).toEqual({ scope: "shared", projectId: REGISTERED_MACHINE });
+    expect(authority.aliases).toEqual([join(fixture.homeDir, "alias")]);
+    expect(authority.passiveEventsDbPath).toBeNull();
+  });
+
+  it("refuses replay with missing, wrong, held or tampered terminal evidence", async () => {
+    const homeDir = home();
+    const replay = { homeDir, generationId: "generation-1", evidenceSha256: HASH_B };
+    expect(() => assertMigrationReplayAdmission(replay)).toThrow("terminal maintenance generation");
+    const held = await coordinator(homeDir).enterMaintenance(input());
+    expect(() => assertMigrationReplayAdmission({ ...replay, generationId: "wrong" })).toThrow("terminal maintenance generation");
+    expect(() => assertMigrationReplayAdmission(replay)).toThrow("no authoritative terminal");
+    await coordinator(homeDir).abortMaintenance({ expectedChecksumSha256: held.checksumSha256,
+      sourceSelectionSha256: HASH_A, abortEvidenceSha256: HASH_B });
+    expect(() => assertMigrationReplayAdmission({ ...replay, evidenceSha256: HASH_A })).toThrow("no authoritative terminal");
+    expect(assertMigrationReplayAdmission(replay)).toEqual({ backend: "sqlite", disposition: "source-abort" });
+  });
+
+  it.each(["machine", "identity-key"])("preserves pending identity when remote readback changes %s", async (change) => {
+    const fixture = enrollmentFixture();
+    fixture.repository.recoverMachine.mockImplementation(async () => ({ ...fixture.registered(),
+      ...(change === "machine" ? { machineId: "118f0b5d-1234-7abc-8def-1234567890ab" } : { identityKey: `machine:${"e".repeat(64)}` }),
+    }));
+    await expect(prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession })).rejects.toThrow("readback");
+    expect(identityApi.readMachineIdentity(fixture.homeDir)?.machineId).toBeNull();
+    expect(fixture.close).toHaveBeenCalledOnce();
+    expect(existsSync(join(fixture.projectDir, "db.sqlite"))).toBe(false);
+  });
+
+  it("preserves remote registration failure over session close failure", async () => {
+    const fixture = enrollmentFixture();
+    fixture.repository.registerMachine.mockRejectedValueOnce(new Error("registration unavailable"));
+    fixture.close.mockRejectedValueOnce(new Error("close failed"));
+    await expect(prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession })).rejects.toThrow("registration unavailable");
+    expect(identityApi.readMachineIdentity(fixture.homeDir)?.machineId).toBeNull();
+  });
+
+  it("rejects source selection drift before finalizing remote registration", async () => {
+    const fixture = enrollmentFixture();
+    fixture.repository.recoverMachine.mockImplementation(async () => {
+      writeFileSync(fixture.metadata, `${JSON.stringify({ cwd: fixture.cwd, changed: true })}\n`);
+      return fixture.registered();
+    });
+    await expect(prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession })).rejects.toThrow("selection changed during");
+    expect(identityApi.readMachineIdentity(fixture.homeDir)?.machineId).toBeNull();
+  });
+
+  it("uses the native session entry point and supports platforms without getuid", async () => {
+    const fixture = enrollmentFixture();
+    vi.spyOn(identityService, "openPostgreSqlIdentitySession").mockImplementation(fixture.openIdentitySession);
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+    try {
+      const result = await prepareSqliteMigrationEnrollment({ ...fixture.request, displayName: "explicit name" });
+      expect(result.identity.machineId).toBe(REGISTERED_MACHINE);
+      // Metadata without a cwd is not an authoritative project-map participant.
+      writeFileSync(fixture.metadata, "{}\n");
+      const authority = authenticateSqliteMigrationSource(fixture.cwd, fixture.homeDir);
+      expect(authority.canonicalPath).toBe(fixture.cwd);
+      expect(authority.aliases).toEqual([]);
+    } finally {
+      if (descriptor) Object.defineProperty(process, "getuid", descriptor);
+    }
+  });
+
+  it("rechecks source selection after waiting for finalization admission", async () => {
+    const fixture = enrollmentFixture();
+    const original = publicationApi.withBackendPublicationAppendBarrierAsync;
+    vi.spyOn(publicationApi, "withBackendPublicationAppendBarrierAsync").mockImplementationOnce(async (...args) => {
+      writeFileSync(fixture.metadata, `${JSON.stringify({ cwd: fixture.cwd, changed: true })}\n`);
+      return original(...args);
+    });
+    await expect(prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession })).rejects.toThrow("before finalization");
+    expect(identityApi.readMachineIdentity(fixture.homeDir)?.machineId).toBeNull();
+  });
+
+  it.each(["selection", "identity"])("refuses %s drift between finalization and epoch adoption", async (change) => {
+    const fixture = enrollmentFixture();
+    const original = identityApi.finalizeMachineIdentity;
+    vi.spyOn(identityApi, "finalizeMachineIdentity").mockImplementationOnce((...args) => {
+      const finalized = original(...args);
+      if (change === "selection") writeFileSync(fixture.metadata, `${JSON.stringify({ cwd: fixture.cwd, changed: true })}\n`);
+      else writeFileSync(join(fixture.homeDir, ".lcm", "machine.json"), JSON.stringify({ ...finalized, machineId: "118f0b5d-1234-7abc-8def-1234567890ab" }));
+      return finalized;
+    });
+    await expect(prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession })).rejects.toThrow("before receipt adoption");
+    expect(existsSync(join(fixture.projectDir, "db.sqlite"))).toBe(false);
+  });
+
+  it("recovers an uncertain local finalization from authoritative readback without changing provenance", async () => {
+    const fixture = enrollmentFixture();
+    const originalFinalize = identityApi.finalizeMachineIdentity;
+    vi.spyOn(identityApi, "finalizeMachineIdentity").mockImplementationOnce((...args) => {
+      originalFinalize(...args);
+      throw new identityApi.MachineIdentityRegistrationChangedError();
+    });
+    fixture.close.mockRejectedValue(new Error("close unavailable"));
+    const result = await prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession });
+    expect(result.identity).toMatchObject({ machineId: REGISTERED_MACHINE, identityKey: fixture.registered().identityKey });
+    expect(fixture.repository.recoverMachine).toHaveBeenCalledTimes(2);
+    expect(fixture.close).toHaveBeenCalledTimes(2);
+    const db = new DatabaseSync(join(fixture.projectDir, "db.sqlite"), { readOnly: true });
+    expect(db.prepare("SELECT machine_id FROM migration_receipt_v1_epochs").get()).toEqual({ machine_id: REGISTERED_MACHINE });
+    db.close();
+  });
+
+  it("recovers a pending same-key identity after an uncertain finalization", async () => {
+    const fixture = enrollmentFixture();
+    vi.spyOn(identityApi, "finalizeMachineIdentity").mockImplementationOnce(() => { throw new identityApi.MachineIdentityRegistrationChangedError(); });
+    const result = await prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession });
+    expect(result.identity.machineId).toBe(REGISTERED_MACHINE);
+  });
+
+  it.each(["remote-machine", "remote-key", "local-machine", "local-key", "missing-local", "selection"])("preserves conflicting %s evidence during uncertain-finalization recovery", async (change) => {
+    const fixture = enrollmentFixture();
+    vi.spyOn(identityApi, "finalizeMachineIdentity").mockImplementationOnce(() => { throw new identityApi.MachineIdentityRegistrationChangedError(); });
+    fixture.repository.recoverMachine.mockImplementationOnce(async () => fixture.registered())
+      .mockImplementationOnce(async () => {
+        const registered = fixture.registered();
+        if (change === "remote-machine") return { ...registered, machineId: "118f0b5d-1234-7abc-8def-1234567890ab" };
+        if (change === "remote-key") return { ...registered, identityKey: `machine:${"e".repeat(64)}` };
+        if (change === "selection") writeFileSync(fixture.metadata, `${JSON.stringify({ cwd: fixture.cwd, changed: true })}\n`);
+        if (change === "missing-local") rmSync(join(fixture.homeDir, ".lcm", "machine.json"));
+        if (change === "local-machine" || change === "local-key") writeFileSync(join(fixture.homeDir, ".lcm", "machine.json"), JSON.stringify({
+          version: 1, ...registered,
+          ...(change === "local-machine" ? { machineId: "118f0b5d-1234-7abc-8def-1234567890ab" } : { identityKey: `machine:${"e".repeat(64)}` }),
+        }));
+        return registered;
+      });
+    await expect(prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession })).rejects.toThrow(change === "selection" ? "before recovery" : "identity changed");
+    expect(existsSync(join(fixture.projectDir, "db.sqlite"))).toBe(false);
+    expect(fixture.close).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not report enrollment completion when finalization never runs", async () => {
+    const fixture = enrollmentFixture();
+    vi.spyOn(publicationApi, "withBackendPublicationAppendBarrierAsync").mockResolvedValueOnce(undefined);
+    await expect(prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession })).rejects.toThrow("did not complete");
+    expect(identityApi.readMachineIdentity(fixture.homeDir)?.machineId).toBeNull();
+  });
   it("durably holds maintenance across coordinator restart", async () => {
     const homeDir = home();
     const entered = await coordinator(homeDir).enterMaintenance(input());
@@ -272,7 +590,11 @@ describe("backend publication maintenance journal v3", () => {
         identityKey,
         displayName,
       }),
-      recoverMachine: async () => { throw new Error("unexpected recovery"); },
+      recoverMachine: async () => {
+        const { readMachineIdentity } = await import("../../src/machine-identity.js");
+        const pending = readMachineIdentity(homeDir)!;
+        return { machineId: "018f0b5d-1234-7abc-8def-1234567890ab", identityKey: pending.identityKey, displayName: pending.displayName };
+      },
     };
     const originalOpen = SqliteStorageBackendFactory.prototype.openProject;
     let releaseAdoption!: () => void;

@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
-  chmodSync,
+  fchmodSync,
   closeSync,
   constants,
   fstatSync,
@@ -13,12 +13,14 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  rmdirSync,
   unlinkSync,
   writeSync,
   type BigIntStats as FsBigIntStats,
 } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { withPrivateMutationLockAsync } from "../private-mutation-lock.js";
 import { canonicalJson } from "../storage/portable-record.js";
 import {
@@ -223,14 +225,16 @@ export interface SqliteSnapshotOperations {
   read(fd: number, buffer: Buffer, offset: number, length: number, position: number): number;
   write(fd: number, buffer: Buffer, offset: number, length: number, position: number | null): number;
   fsync(fd: number): void;
-  chmod(path: string, mode: number): void;
+  fchmod(fd: number, mode: number): void;
+  rmdir(path: string): void;
+  openDatabase(path: string): DatabaseSync;
   mkdir(path: string, mode: number): void;
   link(source: string, destination: string): void;
   readdir(path: string): readonly string[];
   realpath(path: string): string;
   remove(path: string, options: Readonly<{ recursive?: boolean; force?: boolean }>): void;
   unlink(path: string): void;
-  inspectDatabase(path: string, normalize: boolean): DatabaseInspection;
+  inspectDatabase(path: string, normalize: boolean, authenticateOpened?: () => void, openDatabase?: (path: string) => DatabaseSync): DatabaseInspection;
   observe(boundary: SqliteSnapshotBoundary, path: string, role: SqliteSnapshotRole | null): void | Promise<void>;
 }
 
@@ -373,10 +377,11 @@ function sqliteRows(database: DatabaseSync, sql: string): readonly RecordValue[]
   return database.prepare(sql).all() as RecordValue[];
 }
 
-function inspectDatabase(path: string, normalize: boolean): DatabaseInspection {
+function inspectDatabase(path: string, normalize: boolean, authenticateOpened?: () => void, openDatabase?: (path: string) => DatabaseSync): DatabaseInspection {
   let database: DatabaseSync | undefined;
   try {
-    database = new DatabaseSync(path, normalize ? {} : { readOnly: true });
+    database = normalize ? openDatabase!(path) : new DatabaseSync(path, { readOnly: true });
+    authenticateOpened?.();
     if (normalize) {
       database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
       database.exec("PRAGMA journal_mode = DELETE");
@@ -421,7 +426,11 @@ const DEFAULT_OPERATIONS: SqliteSnapshotOperations = {
   read: (fd, buffer, offset, length, position) => readSync(fd, buffer, offset, length, position),
   write: (fd, buffer, offset, length, position) => writeSync(fd, buffer, offset, length, position),
   fsync: (fd) => fsyncSync(fd),
-  chmod: (path, fileMode) => chmodSync(path, fileMode),
+  fchmod: (fd, fileMode) => fchmodSync(fd, fileMode),
+  rmdir: (path) => rmdirSync(path),
+  // mode=rw forbids SQLite from creating a replacement main file. Opening and
+  // db_config do not run recovery; authenticate its descriptor before any SQL.
+  openDatabase: (path) => new DatabaseSync(`${pathToFileURL(path).href}?mode=rw`),
   mkdir: (path, fileMode) => mkdirSync(path, { mode: fileMode }),
   link: (source, destination) => linkSync(source, destination),
   readdir: (path) => readdirSync(path),
@@ -438,6 +447,7 @@ type Context = Readonly<{
   maintenanceChecksumSha256?: string;
   lockToken?: BackendPublicationLockToken;
   ops: SqliteSnapshotOperations;
+  ownedFiles: Map<string, BigIntStats>;
 }>;
 
 function contextFor(options: ClassificationOptions & Partial<Pick<SqliteSnapshotOptions, "generationId" | "maintenanceChecksumSha256" | "lockToken">>): Context {
@@ -445,6 +455,7 @@ function contextFor(options: ClassificationOptions & Partial<Pick<SqliteSnapshot
   const ops = Object.freeze({ ...DEFAULT_OPERATIONS, ...options._operationsForTesting });
   return {
     homeDir: options.homeDir,
+    ownedFiles: new Map(),
     generationId: options.generationId === undefined ? "" : validateGeneration(options.generationId),
     ...(options.maintenanceChecksumSha256 === undefined ? {} : { maintenanceChecksumSha256: options.maintenanceChecksumSha256 }),
     ...(options.lockToken === undefined ? {} : { lockToken: options.lockToken }),
@@ -669,6 +680,7 @@ function copySourceToExclusive(
   const buffer = Buffer.allocUnsafe(COPY_CHUNK);
   let position = 0n;
   try {
+    context.ownedFiles.set(destination, context.ops.fstat(destinationFd));
     while (position < source.stat.size) {
       const wanted = Number(source.stat.size - position > BigInt(buffer.byteLength) ? BigInt(buffer.byteLength) : source.stat.size - position);
       const read = context.ops.read(source.fd, buffer, 0, wanted, Number(position));
@@ -699,6 +711,7 @@ function copyPrivateFile(context: Context, source: string, destination: string):
     const sourceStat = context.ops.fstat(sourceFd);
     if (!sourceStat.isFile() || sourceStat.size > SOURCE_LIMIT) throw new InternalSnapshotError("unsafe");
     destinationFd = context.ops.open(destination, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, CONTROL_MODE);
+    context.ownedFiles.set(destination, context.ops.fstat(destinationFd));
     const buffer = Buffer.allocUnsafe(COPY_CHUNK);
     let position = 0n;
     while (position < sourceStat.size) {
@@ -732,6 +745,8 @@ function privateFileWitness(context: Context, generationRoot: string, path: stri
   try {
     const retained = context.ops.fstat(fd);
     if (!sameInode(stat, retained)) throw new InternalSnapshotError("changed");
+    const owned = context.ownedFiles.get(path);
+    if (owned !== undefined && !sameInode(owned, retained)) throw new InternalSnapshotError("changed");
     const digest = streamHash(context, fd, retained.size, SOURCE_LIMIT);
     const relativePath = path.slice(generationRoot.length + 1);
     return {
@@ -857,6 +872,15 @@ async function authenticateSourceRoleBytes<T>(
   }
 }
 
+function liveDescriptors(context: Context): number[] {
+  return context.ops.readdir("/dev/fd").map(Number).filter((fd) => {
+    try { context.ops.fstat(fd); return true; } catch (error) {
+      if (errorCode(error) === "EBADF") return false;
+      throw error;
+    }
+  });
+}
+
 async function captureRole(
   context: Context,
   role: SqliteSnapshotRole,
@@ -873,22 +897,58 @@ async function captureRole(
   const normalizedMainPath = join(destinationRoot, `${roleBase(role)}.sqlite`);
   copyPrivateFile(context, rawMainPath, normalizedMainPath);
   if (authenticated.value.walPresent) copyPrivateFile(context, rawWalPath, `${normalizedMainPath}-wal`);
-  await observe(context, "before-private-inspection", normalizedMainPath, role);
-  const inspection = context.ops.inspectDatabase(normalizedMainPath, true);
-  await observe(context, "after-private-inspection", normalizedMainPath, role);
-  for (const suffix of ["-wal", "-shm"]) {
-    try { context.ops.unlink(`${normalizedMainPath}${suffix}`); } catch (error) {
-      if (errorCode(error) !== "ENOENT") throw error;
+  const parentFd = context.ops.open(destinationRoot, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  let inspection: DatabaseInspection;
+  try {
+    const parent = context.ops.fstat(parentFd);
+    const privatePaths = [rawMainPath, ...(authenticated.value.walPresent ? [rawWalPath] : []), normalizedMainPath,
+      ...(authenticated.value.walPresent ? [`${normalizedMainPath}-wal`] : [])];
+    const authenticatePrivate = (): void => {
+      if (!sameInode(parent, assertDirectory(context, destinationRoot))) throw new InternalSnapshotError("changed");
+      for (const path of privatePaths) {
+        const stat = context.ops.lstat(path);
+        validateSourceStat(stat, SOURCE_LIMIT);
+        if (!sameInode(stat, context.ownedFiles.get(path)!)) throw new InternalSnapshotError("changed");
+      }
+      for (const suffix of ["-shm", "-journal"]) {
+        if (exists(context, `${normalizedMainPath}${suffix}`)) throw new InternalSnapshotError("unsafe");
+      }
+    };
+    await observe(context, "before-private-inspection", normalizedMainPath, role);
+    authenticatePrivate();
+    // /dev/fd enumerates actual process handles on supported Unix systems. Keep
+    // only live descriptors: the enumeration itself temporarily opens a handle.
+    const before = liveDescriptors(context);
+    inspection = context.ops.inspectDatabase(normalizedMainPath, true, () => {
+      const opened = liveDescriptors(context).filter((fd) => !before.includes(fd));
+      if (opened.length !== 1) throw new InternalSnapshotError("unsafe");
+      const actual = context.ops.fstat(opened[0]!);
+      validateSourceStat(actual, SOURCE_LIMIT);
+      if (!sameInode(actual, context.ownedFiles.get(normalizedMainPath)!)) throw new InternalSnapshotError("unsafe");
+      authenticatePrivate();
+    }, context.ops.openDatabase);
+    await observe(context, "after-private-inspection", normalizedMainPath, role);
+    if (!sameInode(parent, assertDirectory(context, destinationRoot))) throw new InternalSnapshotError("changed");
+    // A successful DELETE-mode close removes its own WAL/SHM. Never unlink an
+    // unowned sidecar that appeared after inspection.
+    for (const suffix of ["-wal", "-shm", "-journal"]) {
+      if (exists(context, `${normalizedMainPath}${suffix}`)) throw new InternalSnapshotError("unsafe");
     }
-  }
-  const durablePaths = [rawMainPath, ...(authenticated.value.walPresent ? [rawWalPath] : []), normalizedMainPath];
-  for (const path of durablePaths) {
-    await observe(context, "before-private-fsync", path, role);
-    const fd = context.ops.open(path, constants.O_RDWR | constants.O_NOFOLLOW);
-    try { context.ops.fsync(fd); } finally { context.ops.close(fd); }
-    context.ops.chmod(path, ARTIFACT_MODE);
-    await observe(context, "after-private-fsync", path, role);
-  }
+    const durablePaths = [rawMainPath, ...(authenticated.value.walPresent ? [rawWalPath] : []), normalizedMainPath];
+    for (const path of durablePaths) {
+      await observe(context, "before-private-fsync", path, role);
+      if (!sameInode(parent, assertDirectory(context, destinationRoot))) throw new InternalSnapshotError("changed");
+      const fd = context.ops.open(path, constants.O_RDWR | constants.O_NOFOLLOW);
+      try {
+        const stat = context.ops.fstat(fd);
+        validateSourceStat(stat, SOURCE_LIMIT);
+        if (!sameInode(stat, context.ownedFiles.get(path)!)) throw new InternalSnapshotError("changed");
+        context.ops.fsync(fd);
+        context.ops.fchmod(fd, ARTIFACT_MODE);
+      } finally { context.ops.close(fd); }
+      await observe(context, "after-private-fsync", path, role);
+    }
+  } finally { context.ops.close(parentFd); }
   syncDirectory(context, destinationRoot);
     const rawMain = privateFileWitness(context, destinationRoot, rawMainPath);
     const rawWal = authenticated.value.walPresent ? privateFileWitness(context, destinationRoot, rawWalPath) : null;
@@ -1209,6 +1269,9 @@ function classifyInternal(context: Context, generationId: string): SqliteSnapsho
   const directoryExists = exists(context, directoryPath);
   if (!intentExists && !identityExists && !directoryExists) return { state: "absent" };
   if (!intentExists) throw new InternalSnapshotError("invalid");
+  assertDirectory(context, join(context.homeDir, ".lcm"));
+  assertDirectory(context, rootPath(context));
+  assertDirectory(context, registrationsPath(context));
   const registrationIntent = readControl(context, intentPath);
   if (!exactKeys(registrationIntent, ["checksumSha256", "generationId", "requestSha256", "version"])
     || registrationIntent.version !== 1 || registrationIntent.generationId !== generationId || !HASH.test(String(registrationIntent.requestSha256))) {
@@ -1341,7 +1404,17 @@ export async function captureSqliteSnapshotArtifact(
         }
         if (existing.state === "complete") {
           assertMaintenance(context, authority);
-          return existing.witness;
+          const witness = existing.witness;
+          if (witness.requestSha256 !== requestSha256(authority, context.generationId, context.maintenanceChecksumSha256!)
+            || canonicalJson(witness.authority) !== canonicalJson(authority)
+            || witness.sourceSelectionSha256 !== authority.sourceSelectionSha256
+            || witness.maintenanceChecksumSha256 !== maintenance.checksumSha256
+            || witness.queueEvidenceSha256 !== maintenance.queueEvidenceSha256
+            || witness.sourceByteWitnessSha256 !== expectedSourceBytes.checksumSha256
+            || canonicalJson(witness.roles.map((role) => role.source)) !== canonicalJson(expectedSourceBytes.roles)) {
+            throw new SqliteSnapshotError("snapshot-replaced");
+          }
+          return witness;
         }
         if (existing.state !== "absent") return classificationFailure(existing);
         const generation = await createGenerationPrefix(context, authority);
@@ -1401,60 +1474,89 @@ export async function dryRunSqliteSnapshotArtifact(
       const nonce = context.ops.nonce();
       if (!/^[0-9a-f]{48}$/u.test(nonce)) throw new InternalSnapshotError("invalid");
       const scratch = join(inspections, `dry-run.${nonce}`);
+      const inspectionsIdentity = assertDirectory(context, inspections);
       context.ops.mkdir(scratch, DIRECTORY_MODE);
+      const scratchIdentity = assertDirectory(context, scratch);
       syncDirectory(context, inspections);
-      let result: SqliteSnapshotDryRun | undefined;
-      let bodyError: unknown;
+      const descriptors: number[] = [];
       try {
-        const inspectRoles = async (): Promise<Readonly<{
-          captured: SqliteSnapshotArtifactRoleWitness[];
-          expectedSourceBytes: SqliteSnapshotSourceByteWitness;
-        }>> => {
-          const expectedSourceBytes = await authenticateSqliteSnapshotSourceBytes(authority, {
-            homeDir: context.homeDir,
-            lockToken: token,
-            _operationsForTesting: options._operationsForTesting,
-          });
-          const captured: SqliteSnapshotArtifactRoleWitness[] = [];
-          for (const input of roleInputs(authority)) captured.push(await captureRole(context, input.role, input.path, scratch));
-          if (canonicalJson(captured.map((role) => role.source)) !== canonicalJson(expectedSourceBytes.roles)) {
-            throw new InternalSnapshotError("changed");
-          }
-          return { captured, expectedSourceBytes };
-        };
-        const roles = context.lockToken === undefined
-          ? await withBackendPublicationAppendBarrierAsync(context.homeDir, inspectRoles, token)
-          : await inspectRoles();
-        const inspectedAt = context.ops.now().toISOString();
-        const body = {
-          version: 1 as const,
-          sourceSelectionSha256: authority.sourceSelectionSha256,
-          sourceByteWitnessSha256: roles.expectedSourceBytes.checksumSha256,
-          roles: roles.captured.map((role) => ({
-            role: role.role,
-            source: role.source,
-            encoding: role.encoding,
-            userVersion: role.userVersion,
-            quickCheck: role.quickCheck,
-            schemaSha256: role.schemaSha256,
-            contentSha256: role.contentSha256,
-          })),
-          inspectedAt,
-        };
-        result = withChecksum(body as unknown as RecordValue) as unknown as SqliteSnapshotDryRun;
-      } catch (error) {
-        bodyError = error;
-        throw error;
-      } finally {
+        const scratchFd = context.ops.open(scratch, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+        descriptors.push(scratchFd);
+        if (!sameInode(scratchIdentity, context.ops.fstat(scratchFd))) throw new InternalSnapshotError("changed");
+        const inspectionsFd = context.ops.open(inspections, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+        descriptors.push(inspectionsFd);
+        if (!sameInode(inspectionsIdentity, context.ops.fstat(inspectionsFd))) throw new InternalSnapshotError("changed");
+        let result: SqliteSnapshotDryRun | undefined;
+        let bodyError: unknown;
         try {
-          context.ops.remove(scratch, { recursive: true, force: false });
-          syncDirectory(context, inspections);
-        } catch (cleanupError) {
-          if (bodyError === undefined) throw cleanupError;
-          throw new AggregateError([bodyError, cleanupError], "snapshot dry-run and cleanup failed", { cause: bodyError });
+          const inspectRoles = async (): Promise<Readonly<{
+            captured: SqliteSnapshotArtifactRoleWitness[];
+            expectedSourceBytes: SqliteSnapshotSourceByteWitness;
+          }>> => {
+            const expectedSourceBytes = await authenticateSqliteSnapshotSourceBytes(authority, {
+              homeDir: context.homeDir,
+              lockToken: token,
+              _operationsForTesting: options._operationsForTesting,
+            });
+            const captured: SqliteSnapshotArtifactRoleWitness[] = [];
+            for (const input of roleInputs(authority)) captured.push(await captureRole(context, input.role, input.path, scratch));
+            if (canonicalJson(captured.map((role) => role.source)) !== canonicalJson(expectedSourceBytes.roles)) {
+              throw new InternalSnapshotError("changed");
+            }
+            return { captured, expectedSourceBytes };
+          };
+          const roles = context.lockToken === undefined
+            ? await withBackendPublicationAppendBarrierAsync(context.homeDir, inspectRoles, token)
+            : await inspectRoles();
+          const inspectedAt = context.ops.now().toISOString();
+          const body = {
+            version: 1 as const,
+            sourceSelectionSha256: authority.sourceSelectionSha256,
+            sourceByteWitnessSha256: roles.expectedSourceBytes.checksumSha256,
+            roles: roles.captured.map((role) => ({
+              role: role.role,
+              source: role.source,
+              encoding: role.encoding,
+              userVersion: role.userVersion,
+              quickCheck: role.quickCheck,
+              schemaSha256: role.schemaSha256,
+              contentSha256: role.contentSha256,
+            })),
+            inspectedAt,
+          };
+          result = withChecksum(body as unknown as RecordValue) as unknown as SqliteSnapshotDryRun;
+        } catch (error) {
+          bodyError = error;
+          throw error;
+        } finally {
+          try {
+            if (!sameInode(scratchIdentity, assertDirectory(context, scratch))
+              || !sameInode(inspectionsIdentity, assertDirectory(context, inspections))) throw new InternalSnapshotError("changed");
+            const retainedRoot = `/dev/fd/${scratchFd}`;
+            for (const leaf of context.ops.readdir(retainedRoot)) {
+              const path = join(retainedRoot, leaf);
+              const owned = context.ownedFiles.get(join(scratch, leaf));
+              const stat = context.ops.lstat(path);
+              if (owned === undefined || !sameInode(owned, stat) || !stat.isFile() || stat.nlink !== 1n) {
+                throw new InternalSnapshotError("changed");
+              }
+              // Nonrecursive removal anchored to the retained directory cannot
+              // traverse a replacement directory or a replaced ancestor.
+              context.ops.remove(path, { recursive: false, force: false });
+            }
+            if (!sameInode(scratchIdentity, assertDirectory(context, scratch))
+              || !sameInode(inspectionsIdentity, assertDirectory(context, inspections))) throw new InternalSnapshotError("changed");
+            context.ops.rmdir(`/dev/fd/${inspectionsFd}/${basename(scratch)}`);
+            context.ops.fsync(inspectionsFd);
+          } catch (cleanupError) {
+            if (bodyError === undefined) throw cleanupError;
+            throw new AggregateError([bodyError, cleanupError], "snapshot dry-run and cleanup failed", { cause: bodyError });
+          }
         }
+        return result!;
+      } finally {
+        closeDescriptors(context, descriptors, "snapshot cleanup descriptor close failed");
       }
-      return result!;
     }, { allowUnresolved: true, ...(context.lockToken === undefined ? {} : { lockToken: context.lockToken }) });
   } catch (error) {
     mapCaptureError(error);

@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
-import type { ResolvedStorageConfig } from "../daemon/config.js";
+import { readDaemonConfigSnapshot, type ResolvedStorageConfig } from "../daemon/config.js";
 import { localProjectIdentity } from "../daemon/project.js";
 import {
   ensurePendingMachineIdentity,
@@ -9,6 +9,7 @@ import {
   MachineIdentityRegistrationChangedError,
   recoverMachineIdentity,
   requireMachineIdentity,
+  readMachineIdentity,
   type MachineIdentity,
 } from "../machine-identity.js";
 import { projectMapPath, readProjectMapSnapshot } from "../project-map.js";
@@ -20,6 +21,7 @@ import {
   BackendPublicationJournalError,
   readBackendMaintenanceJournal,
   withBackendPublicationAppendBarrierAsync,
+  withBackendPublicationConsumerLockAsync,
   type BackendPublicationLockToken,
 } from "../storage/backend-publication.js";
 import type { StorageBackendName } from "../storage/contracts.js";
@@ -43,6 +45,12 @@ import {
   openPostgreSqlIdentitySession,
   type IdentityRepository,
 } from "../identity-service.js";
+
+import {
+  withMigrationQueueEvidence, sealMigrationQueueEvidence,
+  type AuthenticatedSqliteMigrationSnapshot,
+} from "./queue-evidence.js";
+import { canonicalJson } from "../storage/portable-record.js";
 
 type PostgreSqlConfig = Extract<ResolvedStorageConfig, { backend: "postgresql" }>;
 
@@ -69,7 +77,7 @@ export type SqliteMigrationEnrollmentDependencies = Readonly<{
   openIdentitySession?: (config: PostgreSqlConfig) => Promise<IdentitySession>;
 }>;
 
-const authenticatedAuthorities = new WeakSet<object>();
+const authenticatedAuthorities = new WeakMap<object, string>();
 
 function digestFile(path: string, allowedRoot: string): string {
   const value = readBoundedRegularFileWithStat(path, {
@@ -93,6 +101,8 @@ export function authenticateSqliteMigrationSource(
   homeDir: string,
   publicationLockToken?: BackendPublicationLockToken,
 ): AuthenticatedSqliteSnapshotAuthority {
+  const configuration = readDaemonConfigSnapshot(join(homeDir, ".lcm", "config.json"));
+  if (configuration.config.storage.backend !== "sqlite") throw new Error("SQLite migration requires SQLite to remain selected");
   const local = localProjectIdentity(cwd, homeDir);
   const map = readProjectMapSnapshot(homeDir, publicationLockToken);
   const entry = map[local.id];
@@ -134,7 +144,7 @@ export function authenticateSqliteMigrationSource(
     ...body,
     sourceSelectionSha256: backendPublicationCanonicalSha256(body),
   });
-  authenticatedAuthorities.add(authority);
+  authenticatedAuthorities.set(authority, backendPublicationCanonicalSha256(configuration.witness));
   return authority;
 }
 
@@ -149,9 +159,29 @@ function assertAuthenticatedAuthority(
 export async function captureAuthenticatedSqliteMigrationSource(
   authority: AuthenticatedSqliteSnapshotAuthority,
   options: SqliteSnapshotOptions,
-): Promise<SqliteSnapshotArtifactWitness> {
+): Promise<AuthenticatedSqliteMigrationSnapshot> {
   assertAuthenticatedAuthority(authority);
-  return captureSqliteSnapshotArtifact(authority, options);
+  const expected = canonicalJson(authority);
+  return withBackendPublicationAppendBarrierAsync(options.homeDir, async (token) => {
+    const revalidate = (): void => {
+      const current = authenticateSqliteMigrationSource(authority.canonicalPath, options.homeDir, token);
+      const journal = readBackendMaintenanceJournal(options.homeDir);
+      if (canonicalJson(current) !== expected
+        || authenticatedAuthorities.get(current) !== authenticatedAuthorities.get(authority) || journal?.phase !== "maintenance-held"
+        || journal.checksumSha256 !== options.maintenanceChecksumSha256
+        || journal.generationId !== options.generationId) {
+        throw new Error("SQLite migration source authority changed before seal");
+      }
+    };
+    revalidate();
+    const artifact = await captureSqliteSnapshotArtifact(authority, { ...options, lockToken: token });
+    revalidate();
+    const maintenance = readBackendMaintenanceJournal(options.homeDir)!;
+    const result = await withMigrationQueueEvidence(options.homeDir, artifact, maintenance, (reference, records) =>
+      sealMigrationQueueEvidence(options.homeDir, artifact, reference, records, revalidate));
+    revalidate();
+    return result;
+  }, options.lockToken);
 }
 
 export async function authenticateSqliteMigrationSourceBytes(
@@ -226,6 +256,7 @@ type StaticSourceSelection = Readonly<{
   projectDbPath: string;
   projectMapSha256: string;
   projectMetadataSha256: string;
+  configSha256: string;
 }>;
 
 function staticSourceSelection(
@@ -233,6 +264,8 @@ function staticSourceSelection(
   homeDir: string,
   publicationLockToken?: BackendPublicationLockToken,
 ): StaticSourceSelection {
+  const configuration = readDaemonConfigSnapshot(join(homeDir, ".lcm", "config.json"));
+  if (configuration.config.storage.backend !== "sqlite") throw new Error("SQLite migration requires SQLite to remain selected");
   const local = localProjectIdentity(cwd, homeDir);
   const projectDir = join(lcmHomeDir(homeDir), "projects", local.id);
   const metadata = readBoundedRegularFileWithStat(join(projectDir, "meta.json"), {
@@ -246,6 +279,7 @@ function staticSourceSelection(
   return {
     version: 1,
     backend: "sqlite",
+    configSha256: backendPublicationCanonicalSha256(configuration.witness),
     physicalProjectId: local.id,
     canonicalPath: local.canonical,
     projectDbPath: join(projectDir, "db.sqlite"),
@@ -281,6 +315,11 @@ export async function prepareSqliteMigrationEnrollment(
       pending.identity.identityKey,
       input.displayName ?? pending.identity.displayName,
     );
+    const readback = await session.repository.recoverMachine(registered.machineId);
+    if (readback.machineId !== registered.machineId || readback.identityKey !== pending.identity.identityKey) {
+      throw new Error("SQLite migration remote machine readback did not match enrollment");
+    }
+    registered = readback;
   } finally {
     try { await session.close(); } catch { /* preserve remote outcome */ }
   }
@@ -317,6 +356,11 @@ export async function prepareSqliteMigrationEnrollment(
   let identity: MachineIdentity | undefined;
   try {
     await withBackendPublicationAppendBarrierAsync(input.homeDir, async (token) => {
+      assertStorageBackendPublication({ backend: "sqlite", homeDir: input.homeDir }, token);
+      const selection = staticSourceSelection(input.cwd, input.homeDir, token);
+      if (backendPublicationCanonicalSha256(before) !== backendPublicationCanonicalSha256(selection)) {
+        throw new Error("SQLite migration source selection changed before finalization");
+      }
       identity = finalizeMachineIdentity(
         pending.identity,
         registered.machineId,
@@ -341,6 +385,14 @@ export async function prepareSqliteMigrationEnrollment(
         displayName: authoritative.displayName,
       } as const;
       await withBackendPublicationAppendBarrierAsync(input.homeDir, async (token) => {
+        assertStorageBackendPublication({ backend: "sqlite", homeDir: input.homeDir }, token);
+        const selection = staticSourceSelection(input.cwd, input.homeDir, token);
+        if (backendPublicationCanonicalSha256(before) !== backendPublicationCanonicalSha256(selection)) {
+          throw new Error("SQLite migration source selection changed before recovery");
+        }
+        const localIdentity = readMachineIdentity(input.homeDir);
+        if (localIdentity?.identityKey !== pending.identity.identityKey
+          || (localIdentity.machineId !== null && localIdentity.machineId !== registered.machineId)) throw error;
         identity = recoverMachineIdentity(recovered, {
           homeDir: input.homeDir,
           force: true,

@@ -30,3 +30,6 @@ export type {
   SqliteSnapshotSourceByteWitness,
   SqliteSnapshotSourceRoleWitness,
 } from "./sqlite-snapshot.js";
+
+export { inspectAuthenticatedSqliteMigrationSnapshot } from "./queue-evidence.js";
+export type { AuthenticatedSqliteMigrationSnapshot, MigrationReceiptReference } from "./queue-evidence.js";

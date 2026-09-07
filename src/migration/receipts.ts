@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { canonicalJson } from "../storage/portable-record.js";
 
 const HASH = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -52,22 +53,6 @@ export const MIGRATION_RECEIPT_EVENTS_DDL = `CREATE TABLE migration_receipt_v1_e
   UNIQUE (project_id, machine_id, machine_sequence),
   FOREIGN KEY (epoch_id) REFERENCES migration_receipt_v1_epochs(epoch_id)
 )`;
-
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value === "boolean" || typeof value === "string") {
-    return JSON.stringify(value);
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new TypeError("receipt value is not finite");
-    return JSON.stringify(Object.is(value, -0) ? 0 : value);
-  }
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
-  }
-  throw new TypeError("receipt value is not canonical JSON");
-}
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -194,15 +179,31 @@ function assertExactReceiptSchema(db: DatabaseSync): void {
     )
   `).all();
   if (triggers.length !== 0) throw new Error("migration receipt schema has unexpected triggers");
-  const shapes = [
-    ["migration_receipt_v1_epochs", "project_id:TEXT|machine_id:TEXT|epoch_id:TEXT|first_machine_sequence:TEXT|established_at:TEXT|checksum_sha256:TEXT"],
-    ["migration_receipt_v1_events", "project_id:TEXT|machine_id:TEXT|epoch_id:TEXT|event_uuid:TEXT|machine_sequence:TEXT|envelope_sha256:TEXT|outcome:TEXT|effect_witness_json:TEXT|committed_at:TEXT|checksum_sha256:TEXT"],
+  const definitions = [
+    ["migration_receipt_v1_epochs", MIGRATION_RECEIPT_EPOCHS_DDL],
+    ["migration_receipt_v1_events", MIGRATION_RECEIPT_EVENTS_DDL],
   ] as const;
-  for (const [table, expected] of shapes) {
-    const actual = (db.prepare(`PRAGMA table_xinfo(${table})`).all() as Array<{ name: string; type: string }>)
-      .map(({ name, type }) => `${name}:${type}`).join("|");
-    if (actual !== expected) throw new Error(`migration receipt ${table} shape is malformed`);
+  for (const [table, expected] of definitions) {
+    const row = db.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?")
+      .get(table) as { sql: string } | undefined;
+    const actual = row?.sql.trim().replace(/;$/u, "").trim();
+    if (actual !== expected) throw new Error(`migration receipt ${table} schema is malformed`);
   }
+}
+
+function hasActiveTransaction(db: DatabaseSync): boolean {
+  if (typeof db.isTransaction === "boolean") return db.isTransaction;
+  // Node 22.12-22.15 lacks isTransaction. BEGIN DEFERRED changes no data and
+  // only the exact nested-transaction error proves a transaction already owns
+  // this connection. A successful probe is rolled back and is not admission.
+  try { db.exec("BEGIN DEFERRED"); } catch (error) {
+    const sqlite = error as { code?: string; errcode?: number; message?: string };
+    if (sqlite.code === "ERR_SQLITE_ERROR" && sqlite.errcode === 1
+      && sqlite.message === "cannot start a transaction within a transaction") return true;
+    throw error;
+  }
+  db.exec("ROLLBACK");
+  return false;
 }
 
 export function adoptMigrationReceiptEpoch(
@@ -210,7 +211,7 @@ export function adoptMigrationReceiptEpoch(
   input: Omit<MigrationReceiptEpoch, "checksumSha256">,
 ): MigrationReceiptEpoch {
   validateEpochInput(input);
-  if (db.isTransaction) throw new Error("migration receipt epoch adoption owns its transaction");
+  if (hasActiveTransaction(db)) throw new Error("migration receipt epoch adoption owns its transaction");
   db.exec("BEGIN IMMEDIATE");
   try {
     const tables = exactReceiptTables(db);
@@ -321,6 +322,8 @@ export function migrationReceiptEnvelopeSha256(envelope: MigrationReceiptEnvelop
 
 function validateEffectWitness(value: MigrationReceiptEffectWitness): void {
   if (value.version !== 1) throw new Error("migration receipt effect witness version is invalid");
+  const keys = value.outcome === "applied" ? ["outcome", "promotedMemoryId", "version"] : ["outcome", "reason", "version"];
+  if (canonicalJson(Object.keys(value).sort()) !== canonicalJson(keys)) throw new Error("migration receipt effect witness shape is invalid");
   if (value.outcome === "applied") {
     nulFree(value.promotedMemoryId, "promotedMemoryId");
     if (value.promotedMemoryId.length === 0) throw new Error("promotedMemoryId is blank");
@@ -341,7 +344,7 @@ export function recordMigrationReceipt(
     committedAt: string;
   }>,
 ): MigrationReceipt {
-  if (!db.isTransaction) throw new Error("migration receipt requires an active project transaction");
+  if (!hasActiveTransaction(db)) throw new Error("migration receipt requires an active project transaction");
   nulFree(input.projectId, "projectId");
   canonicalUuid(input.epochId, "epochId");
   validateEnvelope(input.envelope);
@@ -406,6 +409,43 @@ function readReceiptRow(
     WHERE project_id = ? AND machine_id = ? AND event_uuid = ?
   `).get(projectId, machineId, eventUuid) as Record<string, string> | undefined;
   return row === undefined ? null : parseReceiptRow(row);
+}
+
+/** Authenticate an already committed outcome before repeating any project effect. */
+export function findMatchingMigrationReceipt(
+  db: DatabaseSync,
+  input: Readonly<{
+    projectId: string;
+    epochId: string;
+    envelope: MigrationReceiptEnvelope;
+  }>,
+): MigrationReceipt | null {
+  if (!hasActiveTransaction(db)) throw new Error("migration receipt lookup requires an active project transaction");
+  canonicalUuid(input.epochId, "epochId");
+  const envelopeDigest = migrationReceiptEnvelopeSha256(input.envelope);
+  const epoch = getMigrationReceiptEpoch(db, input.projectId, input.envelope.machineId);
+  if (epoch === null || epoch.epochId !== input.epochId
+    || input.envelope.machineSequence < epoch.firstMachineSequence) {
+    throw new Error("migration receipt epoch conflict");
+  }
+  const rows = db.prepare(`
+    SELECT project_id, machine_id, epoch_id, event_uuid, machine_sequence,
+           envelope_sha256, outcome, effect_witness_json, committed_at, checksum_sha256
+    FROM migration_receipt_v1_events
+    WHERE project_id = ? AND machine_id = ?
+      AND (event_uuid = ? OR machine_sequence = ?) LIMIT 2
+  `).all(input.projectId, input.envelope.machineId,
+    input.envelope.eventUuid, input.envelope.machineSequence) as Array<Record<string, string>>;
+  if (rows.length === 0) return null;
+  if (rows.length !== 1) throw new Error("migration receipt identity conflict");
+  const receipt = parseReceiptRow(rows[0]);
+  if (receipt.epochId !== epoch.epochId
+    || receipt.eventUuid !== input.envelope.eventUuid
+    || receipt.machineSequence !== input.envelope.machineSequence
+    || receipt.envelopeSha256 !== envelopeDigest) {
+    throw new Error("migration receipt envelope conflict");
+  }
+  return receipt;
 }
 
 function parseReceiptRow(row: Record<string, string>): MigrationReceipt {
@@ -485,6 +525,27 @@ export function readMigrationReceiptEvidence(
     receiptSchemaSha256: MIGRATION_RECEIPT_SCHEMA_SHA256,
     receiptSetSha256: sha256(canonicalJson(receipts.map(({ checksumSha256 }) => checksumSha256))),
   };
+}
+
+/** Stream canonical receipt checksums without materializing the receipt set. */
+export function* iterateMigrationReceiptChecksums(
+  db: DatabaseSync,
+  epoch: MigrationReceiptEpoch,
+): Generator<string> {
+  assertExactReceiptSchema(db);
+  const oversized = db.prepare(`SELECT 1 FROM migration_receipt_v1_events
+    WHERE length(CAST(effect_witness_json AS BLOB)) > ? LIMIT 1`).get(MAX_EFFECT_WITNESS_BYTES);
+  if (oversized !== undefined) throw new Error("migration receipt effect witness is too large");
+  for (const value of db.prepare(`SELECT project_id, machine_id, epoch_id, event_uuid, machine_sequence,
+    envelope_sha256, outcome, effect_witness_json, committed_at, checksum_sha256
+    FROM migration_receipt_v1_events ORDER BY machine_sequence COLLATE BINARY, event_uuid COLLATE BINARY`).iterate()) {
+    const receipt = parseReceiptRow(value as Record<string, string>);
+    if (receipt.projectId !== epoch.projectId || receipt.machineId !== epoch.machineId
+      || receipt.epochId !== epoch.epochId || receipt.machineSequence < epoch.firstMachineSequence) {
+      throw new Error("migration receipt epoch identity is inconsistent");
+    }
+    yield receipt.checksumSha256;
+  }
 }
 
 export type MigrationQueueRecord = Readonly<{
