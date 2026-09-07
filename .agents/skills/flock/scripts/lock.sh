@@ -6,9 +6,9 @@ lock() {
         return 2
     fi
     resource=$1
-    thread=${CODEX_THREAD_ID:-}
+    thread=${AGENT_THREAD_ID:-${CODEX_THREAD_ID:-}}
     if ! [[ $thread =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
-        printf 'Current Codex thread UUID is unavailable in CODEX_THREAD_ID.\n' >&2
+        printf 'Current thread UUID is unavailable; export AGENT_THREAD_ID from the runtime.\n' >&2
         return 2
     fi
     if [ -L /proc/self/fd/9 ]; then

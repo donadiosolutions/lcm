@@ -6,6 +6,7 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
+import { waitForAbortable } from "../daemon/cancellation.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const CAPABILITY_BYTES = 32;
@@ -17,10 +18,14 @@ const MAX_ACCOUNT_BYTES = 256;
 const MAX_SSE_CHUNK_BYTES = 1024 * 1024;
 const MAX_SSE_LINE_CHARS = 1024 * 1024;
 const MAX_SSE_EVENT_DATA_CHARS = 1024 * 1024;
+const MAX_UPSTREAM_ERROR_BODY_BYTES = 64 * 1024;
 const GENERIC_ERROR = "codex responses gateway request failed\n";
 const OUTCOME_ERROR = "codex responses gateway did not complete";
 const CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const SPARK_MODEL = "gpt-5.3-codex-spark";
+const SPARK_LITE_REJECTION =
+  "This model is not supported when using X-OpenAI-Internal-Codex-Responses-Lite.";
 
 const REASONING_EFFORTS = new Set([
   "none",
@@ -84,7 +89,11 @@ export type CodexResponsesGatewayOptions = {
   _randomBytes?: RandomBytesFn;
 };
 
-export type CodexResponsesGatewayFailureCategory = "usage" | "authentication";
+export type CodexResponsesGatewayFailureCategory =
+  | "usage"
+  | "authentication"
+  | "model-protocol"
+  | "upstream-request";
 
 export type CodexResponsesGateway = {
   /** Base URL ending at the private capability path; append `/responses`. */
@@ -313,10 +322,15 @@ function validatedServiceTier(value: unknown): string | undefined {
 function buildPayload(prompt: string, input: PlainRecord, responsesLite = false): PlainRecord {
   const model = boundedModel(input.model);
   const reasoning = validatedReasoning(input.reasoning);
+  const normalizeSpark = model === SPARK_MODEL;
+  const upstreamResponsesLite = responsesLite && !normalizeSpark;
+  const forwardedReasoning = normalizeSpark
+    ? reasoning?.effort === undefined ? undefined : { effort: reasoning.effort }
+    : reasoning;
   const serviceTier = validatedServiceTier(input.service_tier);
   const payload: PlainRecord = {
     model,
-    input: responsesLite
+    input: upstreamResponsesLite
       ? [
           { type: "additional_tools", role: "developer", tools: [] },
           { type: "message", role: "user", content: [{ type: "input_text", text: prompt }] },
@@ -331,8 +345,8 @@ function buildPayload(prompt: string, input: PlainRecord, responsesLite = false)
     store: false,
     stream: true,
   };
-  if (!responsesLite) payload.tools = [];
-  if (reasoning !== undefined) payload.reasoning = reasoning;
+  if (!upstreamResponsesLite) payload.tools = [];
+  if (forwardedReasoning !== undefined) payload.reasoning = forwardedReasoning;
   if (serviceTier !== undefined) payload.service_tier = serviceTier;
   return payload;
 }
@@ -345,6 +359,7 @@ function buildUpstreamHeaders(
   headers: IncomingHttpHeaders,
   authorization: ManagedAuthorization,
   accountId: string | undefined,
+  omitResponsesLite = false,
 ): Record<string, string> {
   const outbound: Record<string, string> = {
     Authorization: authorization.header,
@@ -355,6 +370,7 @@ function buildUpstreamHeaders(
   if (accountId !== undefined) outbound["ChatGPT-Account-Id"] = accountId;
 
   for (const name of CODEX_METADATA_HEADERS) {
+    if (omitResponsesLite && name === "x-openai-internal-codex-responses-lite") continue;
     const raw = typeof headers[name] === "string" ? headers[name] : undefined;
     if (raw === undefined) continue;
     const value = boundedHeader(raw, MAX_HEADER_VALUE_BYTES);
@@ -458,6 +474,31 @@ function classifyResponsesSseEvent(eventType: string, data: string): ResponsesTe
     : "failed";
 }
 
+function isOptionalDoneRemainder(text: string, start: number): boolean {
+  let offset = start;
+  while (offset < text.length && text.charCodeAt(offset) === 10) offset += 1;
+  if (offset === text.length) return true;
+
+  for (const sentinel of ["data:[DONE]\n", "data: [DONE]\n"] as const) {
+    const remaining = text.length - offset;
+    const compared = Math.min(remaining, sentinel.length);
+    let matches = true;
+    for (let index = 0; index < compared; index += 1) {
+      if (text.charCodeAt(offset + index) !== sentinel.charCodeAt(index)) {
+        matches = false;
+        break;
+      }
+    }
+    if (!matches) continue;
+    if (remaining < sentinel.length) return true;
+
+    let suffix = offset + sentinel.length;
+    while (suffix < text.length && text.charCodeAt(suffix) === 10) suffix += 1;
+    if (suffix === text.length) return true;
+  }
+  return false;
+}
+
 function createResponsesSseObserver(): ResponsesSseObserver {
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let pendingLine = "";
@@ -514,7 +555,9 @@ function createResponsesSseObserver(): ResponsesSseObserver {
       dispatchLine();
       const nextOffset = newline + 1;
       if (terminalState !== "pending") {
-        if (nextOffset < text.length) terminalState = "failed";
+        if (terminalState !== "completed" || !isOptionalDoneRemainder(text, nextOffset)) {
+          terminalState = "failed";
+        }
         return;
       }
       offset = nextOffset;
@@ -578,6 +621,53 @@ async function cancelUpstreamBody(body: ReadableStream<Uint8Array> | null | unde
     // The abort signal is the primary cancellation mechanism. A body that is
     // already errored or locked is safely discarded when its request closes.
   }
+}
+
+async function readBoundedUpstreamError(
+  body: ReadableStream<Uint8Array> | null,
+  signal: AbortSignal,
+): Promise<PlainRecord | undefined> {
+  if (body === null) return undefined;
+  const reader = body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const result = await waitForAbortable(reader.read(), signal);
+      if (result.done) break;
+      total += result.value.byteLength;
+      if (total > MAX_UPSTREAM_ERROR_BODY_BYTES) return undefined;
+      chunks.push(Buffer.from(result.value));
+    }
+  } finally {
+    try {
+      void reader.cancel().catch(() => undefined);
+    } catch {
+      // The request abort remains authoritative when the body is already errored.
+    }
+    reader.releaseLock();
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+  } catch {
+    return undefined;
+  }
+  return isPlainObject(parsed) ? parsed : undefined;
+}
+
+function isSparkLiteRejection(
+  payload: PlainRecord | undefined,
+  model: unknown,
+  responsesLite: boolean,
+): boolean {
+  if (model !== SPARK_MODEL || !responsesLite || payload === undefined) return false;
+  const error = isPlainObject(payload.error) ? payload.error : undefined;
+  return error?.message === SPARK_LITE_REJECTION
+    && error.type === "invalid_request_error"
+    && error.code === "invalid_request_error"
+    && error.param === "model";
 }
 
 function listen(server: Server): Promise<void> {
@@ -715,7 +805,8 @@ export async function createCodexResponsesGateway(
       bodyReadAttempted = true;
       const body = parseRequestBody(await readRequestBody(request, declaredLength));
       const payload = buildPayload(options.prompt, body, responsesLite);
-      const headers = buildUpstreamHeaders(request.headers, authorization, accountId);
+      const normalizeSpark = payload.model === SPARK_MODEL;
+      const headers = buildUpstreamHeaders(request.headers, authorization, accountId, normalizeSpark);
       requestAccepted = true;
 
       let upstream: Response;
@@ -728,12 +819,22 @@ export async function createCodexResponsesGateway(
           signal: controller.signal,
         });
       } catch {
+        upstreamFailureCategory = "upstream-request";
         throw new GatewayInputError(502);
       }
       upstreamBody = upstream.body;
       if (!upstream.ok) {
         if (upstream.status === 429) upstreamFailureCategory = "usage";
         else if (upstream.status === 401) upstreamFailureCategory = "authentication";
+        else {
+          upstreamFailureCategory = "upstream-request";
+          if (upstream.status === 400) {
+            const upstreamError = await readBoundedUpstreamError(upstream.body, controller.signal);
+            if (isSparkLiteRejection(upstreamError, payload.model, responsesLite)) {
+              upstreamFailureCategory = "model-protocol";
+            }
+          }
+        }
         throw new GatewayInputError(502);
       }
       if (upstream.body === null) {
@@ -876,7 +977,10 @@ export const __codexResponsesGatewayTestUtils = {
   relaySse,
   createResponsesSseObserver,
   classifyResponsesSseEvent,
+  isOptionalDoneRemainder,
   flushResponsesSseDecoder,
+  readBoundedUpstreamError,
+  isSparkLiteRejection,
   listen,
   closeServer,
 };

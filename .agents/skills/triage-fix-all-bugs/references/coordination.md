@@ -1,93 +1,78 @@
 # Campaign accounting and completion
 
-Read [the entrypoint](../SKILL.md), the
-[shared coordination procedure](../../procedural-development/references/coordination.md)
-and [LCM integration](../../shared/lcm-development.md). This reference owns only
-triage-specific state, hierarchy and completion rules.
+Apply [the entrypoint](../SKILL.md), [shared coordination](../../procedural-development/references/coordination.md)
+and [LCM integration](../../shared/lcm-development.md). This reference adds only
+triage-specific accounting and hierarchy rules.
 
-## Inventory and checkpoints
+## Directives
 
-Keep full S0 and its denominator separate from the remediation subset. Persist
-T0, TF, freeze SHA, native types/parents, hierarchy, triage evidence and dispositions
-alongside shared candidate/review/round/PR and installed-artifact evidence. Give
-the root Epic a stable run identifier, coordinator task/host, relative scratch
-location and compact checkpoint. Update at meaningful transitions; keep private
-absolute paths and secrets out of public tracking. Preserve successor recovery.
+Keep full S0/denominator separate from its remediation subset. Persist T0, TF,
+freeze SHA, native types/parents/hierarchy and triage dispositions/evidence alongside
+shared candidate/review/round/PR and installed-artifact records. The root Epic records
+stable run identity, coordinator task/host and relative scratch/checkpoint location;
+keep private absolute paths and secrets out. Preserve successor recovery.
 
-Inspect existing run Epics before creating one. Resume the same run when requested;
-an unrelated open Epic alone does not block a new authorized run or authorize
-takeover. Recheck parents immediately before attachment/dispatch; preserve external
-claims and record delegation. Use shared recovery for uncertain writes/workers.
+Resume requested runs; an unrelated open Epic neither blocks authorized new work
+nor authorizes takeover. Recheck parents before attachment/dispatch and preserve
+external claims. Partial, failed or changing enumeration stays unfrozen; a fixed
+CLI result limit is not an empty set. Never mutate issues to stabilize enumeration.
+Explicit scope changes retain original S0 and record timestamped revised accounting;
+new Bugs or idle workers never expand scope.
 
-Incomplete, failed or changing enumeration leaves S0 unfrozen. A partial response
-or fixed CLI limit is not an empty set. Do not mutate issues to stabilize it.
-For validated empty S0, create the requested empty tracking Epic, launch no workers
-and perform the normal audit. Explicit user scope changes are timestamped contract
-revisions with their own denominator; preserve original S0. New Bugs or idle workers
-never imply expansion.
+## Reconcile closures and follow-ups
 
-## External closures and follow-ups
+External closure does not remove an S0 member. Record who/when and have the assigned
+worker validate the evidence: established duplicate is `closed-duplicate`;
+obsolete/fixed report verified on default branch is `closed-nonreproducible`;
+verified merged remediation with resolved source is `merged-resolved`. Do not close
+again. Unsupported closures require investigation, justified correction or a genuine
+external blocker, not a generic terminal state. Delegated members remain untouched.
 
-External closure never removes an item from S0. Read reason/evidence and have the
-assigned worker validate disposition: established duplicate is `closed-duplicate`;
-obsolete/fixed report verified on the default branch is `closed-nonreproducible`;
-verified merged remediation with source resolved is `merged-resolved`. Record who
-closed it and when; no second close is needed.
+Deferred accepted P2 findings are native `Bug` issues outside S0 and its native
+campaign hierarchy. At final audit read back type, source/PR links and current
+resolution. Preserve valid fixes, duplicates and successors; do not repeatedly
+reopen resolved work to satisfy counters.
 
-Unsupported automatic closures are not terminal evidence. Investigate, correct
-state where justified or report a genuine external blocker. Delegated members
-retain their no-mutation rule/disposition even as duplicate targets. Do not invent
-a generic terminal state for unverified closures.
+## Counters and events
 
-Deferred accepted P2 issues are native `Bug`, outside S0 and the campaign's native
-hierarchy. Read back type, source/PR links and resolution at final audit. Preserve
-valid fixes/duplicates/canonical successors; correct unsupported changes without
-repeatedly reopening resolved work for counters.
+Add these to shared checkpoints/watchdog reports: S0 total; delegated; completed
+triage; nonreproducible/duplicate closures; eligible after triage; waiting/active
+remediation; open/merged PRs; blocked/parked; escalated/security-routed items;
+deferred P2 issues created; S0 remaining to valid terminal state. Follow-ups never
+enter that remaining count.
 
-## Counters and reporting
-
-Add these caller counters to shared progress reports:
-
-- Total S0; delegated to existing parent; completed triage dispositions.
-- Closed nonreproducible; closed duplicate; eligible after triage.
-- Waiting remediation; active owners; PRs open/merged; blocked/parked S0.
-- Escalated S0 (`ESCALATED_IMPLEMENTER_MODEL` role); security-routed S0
-  (`SECURITY_IMPLEMENTER_MODEL` role); deferred P2 follow-ups created.
-- S0 remaining to a valid terminal state, excluding every follow-up.
-
-The shared watchdog runs every `WATCHDOG_MINUTES` with this concise report.
-Triage completion, duplicate-adjudication completion and a satisfiable barrier
-are immediate events; do not delay remediation until a periodic check. Routine
-worker chatter is not user-facing reporting.
+Triage completion, duplicate adjudication and a satisfiable barrier are immediate
+root events, not deferred to the `WATCHDOG_MINUTES` pass. Routine leaf chatter is
+not user-facing reporting. Meaningful transitions update the existing checkpoint.
 
 ## Terminal states
 
-Every S0 member must end in exactly one validated state:
+Each member has exactly one validated state:
 
-1. `delegated-existing-parent`
-2. `closed-nonreproducible`
-3. `closed-duplicate`
-4. `merged-resolved`
-5. `blocked-genuine-external-condition`
+| State | Meaning |
+| --- | --- |
+| `delegated-existing-parent` | Protected external ownership, not a fix by this run |
+| `closed-nonreproducible` | Verified obsolete/fixed report |
+| `closed-duplicate` | Established canonical duplicate |
+| `merged-resolved` | Complete default-branch fix and verified source closure |
+| `blocked-genuine-external-condition` | Condition the workflow cannot resolve autonomously, explicitly reported to the user; not fixed |
 
-The last requires a condition the workflow cannot resolve autonomously and explicit
-reporting to the user. Temporary parking is not terminal. Terminal accounting of
-a genuine blocker does not claim its Bug was fixed.
+Temporary parking is not terminal. Blocked accounting does not establish successful
+triage-barrier completion or delivery.
 
 ## Final audit
 
-Satisfy both shared final audit and all these caller gates:
+For empty and nonempty S0, satisfy shared audit and verify:
 
-- Every S0 member has one supported terminal state; no owner still productively
-  works on an item declared terminal.
-- Every merged fix is on current default branch and source closure is verified;
-  unresolved/open source Bugs are not `merged-resolved`.
-- Every deferred P2 has required native type, links and verified current resolution,
-  and remains outside S0 and the campaign hierarchy.
-- Root Epic, native hierarchy, dispositions and all counters reconcile.
-- Main installed LCM matches current observed default-branch revision and the
-  daemon/connector pass the shared integration's final checks.
+- One supported terminal state per member; no worker productively owns an item
+  declared terminal.
+- Merged fixes exist on current default branch with source closure read back;
+  open/unresolved sources are not `merged-resolved`.
+- P2 follow-up types, source/PR links and resolutions are valid, outside S0/hierarchy.
+- Root Epic, native hierarchy, dispositions and counters reconcile.
+- Installed LCM matches current observed default-branch revision; daemon/connector
+  and required artifact/tests satisfy integration gates.
 
-Report total, delegated, closed nonreproducible/duplicate, merged-resolved,
+Report total, delegated, nonreproducible/duplicate closures, merged-resolved,
 genuinely blocked, escalated, security-routed, deferred follow-ups, target SHA and
-LCM health. An empty worker queue does not satisfy these gates.
+LCM health. An empty worker queue alone satisfies none of these gates.
