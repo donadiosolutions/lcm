@@ -7,6 +7,8 @@ import {
   createExactNativeTranscriptMessageResolver,
   createFileNativeTranscriptSource,
   runNativeTranscriptBackfill,
+  NativeTranscriptSourceChangedError,
+  type NativeTranscriptSourceSnapshot,
 } from "../../storage/native-transcript-ingest.js";
 import { openLocalTranscriptQuarantine } from "../../storage/local-transcript-quarantine.js";
 import type { DaemonConfig } from "../config.js";
@@ -26,12 +28,13 @@ import {
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { ParsedMessage } from "../../transcript.js";
-import { normalizeTranscriptClient, parseTranscriptForClient, type TranscriptClient } from "../../transcript-provider.js";
+import { normalizeTranscriptClient, parseTranscriptTextForClient, type TranscriptClient } from "../../transcript-provider.js";
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
-import type { StorageBackendFactory } from "../../storage/index.js";
-import { storageRouteFailureResponse, withProjectStorage } from "./storage-lifecycle.js";
+import type { ProjectStorage, StorageBackendFactory } from "../../storage/index.js";
+import { createCommitCloseBarrier, storageRouteFailureResponse, withProjectStorage } from "./storage-lifecycle.js";
+import { isAbortError, throwIfAborted } from "../cancellation.js";
 import { BackendPublicationJournalError } from "../../storage/backend-publication.js";
 
 function isParsedMessage(value: unknown): value is ParsedMessage {
@@ -62,7 +65,7 @@ function resolveMessages(input: { client?: unknown; messages?: unknown; provider
     const safePath = isSafeTranscriptPath(input.transcript_path, cwd);
     if (safePath && existsSync(safePath)) {
       const client = normalizeTranscriptClient(input.client ?? input.provider);
-      return { messages: parseTranscriptForClient(safePath, client), nativePath: safePath, client };
+      return { messages: [], nativePath: safePath, client };
     }
   }
 
@@ -92,6 +95,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
     }
 
     try {
+      throwIfAborted(context?.signal);
       // Preserve the route's early identity/configuration rejection while the
       // lifecycle helper re-resolves the identity with its live admission token.
       const storageIdentity = projectIdentity(
@@ -114,8 +118,8 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         sendJson(res, 200, { ingested: 0, totalTokens: 0 });
         return;
       }
-      const scrubber = resolvedMessages.length > 0
-        ? await (async () => {
+      const createScrubber = (messages: ParsedMessage[]) => messages.length > 0
+        ? (async () => {
             ensureProjectDirForIdentity(localIdentity);
             return ScrubEngine.forProject(
               config.security?.sensitivePatterns ?? [],
@@ -124,96 +128,191 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
           })()
         : undefined;
 
-      const ingest = await withProjectStorage(
-        {
-          config,
-          cwd,
-          factory: storageFactory,
-          context,
-          mode: "create",
-          expectedIdentity: storageIdentity,
-        },
-        async (project) => {
-          if (resolvedMessages.length === 0 && importNative === undefined) return null;
-          if (importNative !== undefined && project.nativeTranscripts === undefined) {
-            throw new Error("native transcript storage unavailable");
-          }
+      const signal = context?.signal ?? new AbortController().signal;
+      async function persist(project: ProjectStorage, messages: ParsedMessage[], scrubber: ScrubEngine | undefined) {
+        const resolvedMessages = messages;
+        return await project.transaction(async (repositories) => {
+          if (resolvedMessages.length === 0) return null;
+          const row = await repositories.coordination.getSessionIngest(session_id);
+          if (row && resolvedMessages.length <= row.messageCount) return null;
 
-          const persisted = await project.transaction(async (repositories) => {
-            if (resolvedMessages.length === 0) return null;
-            const row = await repositories.coordination.getSessionIngest(session_id);
-            if (row && resolvedMessages.length <= row.messageCount) return null;
+          const conversation = await repositories.conversations.getOrCreateConversation(session_id);
+          const storedCount = await repositories.conversations.getMessageCount(conversation.conversationId);
+          const newMessages = resolvedMessages.slice(storedCount);
+          if (newMessages.length === 0) return null;
 
-            const conversation = await repositories.conversations.getOrCreateConversation(session_id);
-            const storedCount = await repositories.conversations.getMessageCount(conversation.conversationId);
-            const newMessages = resolvedMessages.slice(storedCount);
-            if (newMessages.length === 0) return null;
-
-            const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
-            const inputs = newMessages.map((m, i) => {
-              const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project: projectCount } = scrubber!.scrubWithCounts(m.content);
-              totalCounts.gitleaks += gitleaks;
-              totalCounts.builtIn += builtIn;
-              totalCounts.global += globalCount;
-              totalCounts.project += projectCount;
-              return {
-                conversationId: conversation.conversationId,
-                seq: storedCount + i,
-                role: m.role as "user" | "assistant" | "system" | "tool",
-                content: scrubbedContent,
-                tokenCount: m.tokenCount,
-              };
-            });
-            const records = await repositories.conversations.createMessagesBulk(inputs);
-            await repositories.redactionAdmin.upsertCounts(totalCounts);
-            await repositories.context.appendContextMessages(
-              conversation.conversationId,
-              records.map((record) => record.messageId),
-            );
-            return { conversationId: conversation.conversationId, records, totalCounts };
+          const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
+          const inputs = newMessages.map((m, i) => {
+            const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project: projectCount } = scrubber!.scrubWithCounts(m.content);
+            totalCounts.gitleaks += gitleaks;
+            totalCounts.builtIn += builtIn;
+            totalCounts.global += globalCount;
+            totalCounts.project += projectCount;
+            return {
+              conversationId: conversation.conversationId,
+              seq: storedCount + i,
+              role: m.role as "user" | "assistant" | "system" | "tool",
+              content: scrubbedContent,
+              tokenCount: m.tokenCount,
+            };
           });
-
-          // A parsed-message retry must still complete native storage before
-          // acknowledging success. Backfill owns atomic raw-record/link/checkpoint
-          // batches and resumes them independently of the parsed-message commit.
-          if (importNative !== undefined) {
-            const native = project.nativeTranscripts!;
-            const format = resolved.client === "codex"
-              ? CODEX_NATIVE_TRANSCRIPT_FORMAT
-              : CLAUDE_NATIVE_TRANSCRIPT_FORMAT;
-            const projectPatterns = await ScrubEngine.loadProjectPatterns(join(paths.dir, "sensitive-patterns.txt"));
-            const quarantine = openLocalTranscriptQuarantine(project.projectId, format.clientName);
-            let failed = false;
-            try {
-              await runNativeTranscriptBackfill({
-                repository: native.repository,
-                messageResolver: createExactNativeTranscriptMessageResolver(native.repository),
-                machineId: native.machineId,
-                format,
-                nativeSessionId: session_id,
-                sourceLocator: createHash("sha256").update(importNative).digest("hex"),
-                source: createFileNativeTranscriptSource(dirname(importNative), basename(importNative)),
-                globalPatterns: config.security?.sensitivePatterns ?? [],
-                projectPatterns,
-                quarantine,
-              });
-            } catch (error) {
-              failed = true;
-              throw error;
-            } finally {
-              try { await quarantine.close(); } catch (error) {
-                if (!failed) throw error;
-              }
+          const records = await repositories.conversations.createMessagesBulk(inputs);
+          await repositories.redactionAdmin.upsertCounts(totalCounts);
+          await repositories.context.appendContextMessages(
+            conversation.conversationId,
+            records.map((record) => record.messageId),
+          );
+          return { conversationId: conversation.conversationId, records, totalCounts };
+        });
+      }
+      let accumulated: Awaited<ReturnType<typeof persist>> = null;
+      let ingest: (NonNullable<Awaited<ReturnType<typeof persist>>> & { totalTokens: number }) | null = null;
+      let sourceWitness: { byteLength: number; sha256: string } | undefined;
+      let retryFailure: NativeTranscriptSourceChangedError | undefined;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        throwIfAborted(signal);
+        let snapshot: NativeTranscriptSourceSnapshot | undefined;
+        let closeSnapshot: (() => Promise<void>) | undefined;
+        let sourceClosed = false;
+        let attemptFailed = false;
+        let retryableFailure: NativeTranscriptSourceChangedError | undefined;
+        const closeSource = async () => {
+          if (sourceClosed) return;
+          sourceClosed = true;
+          try { await closeSnapshot?.(); } catch (error) {
+            if (retryableFailure !== undefined) {
+              throw new AggregateError([retryableFailure, error], "Native ingest source cleanup failed", { cause: retryableFailure });
             }
+            if (!attemptFailed) throw error;
           }
-          if (!persisted) return null;
-          return {
-            ...persisted,
-            totalTokens: await project.context.getContextTokenCount(persisted.conversationId),
-          };
-        },
-      );
+        };
+        try {
+          let messages = resolvedMessages;
+          if (importNative !== undefined) {
+            snapshot = await createFileNativeTranscriptSource(dirname(importNative), basename(importNative)).openSnapshot();
+            closeSnapshot = snapshot.close.bind(snapshot);
+            // The route owns cleanup, including failures before backfill.
+            const bound = snapshot;
+            snapshot = {
+              metadata: bound.metadata,
+              stream: bound.stream.bind(bound),
+              digestPrefix: bound.digestPrefix.bind(bound),
+              assertUnchanged: bound.assertUnchanged.bind(bound),
+              assertByteRangesUnchanged: bound.assertByteRangesUnchanged.bind(bound),
+              close: async () => undefined,
+            };
+            if (sourceWitness !== undefined && (
+              snapshot.metadata.sizeBytes < sourceWitness.byteLength
+              || await snapshot.digestPrefix(sourceWitness.byteLength) !== sourceWitness.sha256
+            )) throw retryFailure;
+            const chunks: Buffer[] = [];
+            for await (const chunk of snapshot.stream()) chunks.push(Buffer.from(chunk));
+            await snapshot.assertUnchanged();
+            const bytes = Buffer.concat(chunks);
+            sourceWitness = { byteLength: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex") };
+            messages = parseTranscriptTextForClient(bytes.toString("utf8"), resolved.client!);
+          }
+          throwIfAborted(signal);
+          const scrubber = await createScrubber(messages);
+          throwIfAborted(signal);
+          const lifetime = createCommitCloseBarrier();
+          ingest = await withProjectStorage(
+            {
+              config, cwd, factory: storageFactory, context, mode: "create",
+              expectedIdentity: storageIdentity, beforeClose: lifetime.waitForZero,
+            },
+            async (project, signal) => {
+              const permit = lifetime.acquire(() => ({ release: () => undefined }));
+              try {
+                throwIfAborted(signal);
+                if (resolvedMessages.length === 0 && importNative === undefined) return null;
+                if (importNative !== undefined && project.nativeTranscripts === undefined) {
+                  throw new Error("native transcript storage unavailable");
+                }
+                await snapshot?.assertUnchanged();
+                throwIfAborted(signal);
+                const persisted = await persist(project, messages, scrubber);
+                if (persisted) {
+                  accumulated = accumulated === null ? persisted : {
+                    conversationId: persisted.conversationId,
+                    records: [...accumulated.records, ...persisted.records],
+                    totalCounts: {
+                      gitleaks: accumulated.totalCounts.gitleaks + persisted.totalCounts.gitleaks,
+                      builtIn: accumulated.totalCounts.builtIn + persisted.totalCounts.builtIn,
+                      global: accumulated.totalCounts.global + persisted.totalCounts.global,
+                      project: accumulated.totalCounts.project + persisted.totalCounts.project,
+                    },
+                  };
+                }
+                throwIfAborted(signal);
+                if (importNative !== undefined) {
+                  const native = project.nativeTranscripts!;
+                  const format = resolved.client === "codex"
+                    ? CODEX_NATIVE_TRANSCRIPT_FORMAT
+                    : CLAUDE_NATIVE_TRANSCRIPT_FORMAT;
+                  const projectPatterns = await ScrubEngine.loadProjectPatterns(join(paths.dir, "sensitive-patterns.txt"));
+                  const quarantine = openLocalTranscriptQuarantine(project.projectId, format.clientName);
+                  let backfillFailed = false;
+                  let backfillRetryFailure: NativeTranscriptSourceChangedError | undefined;
+                  try {
+                    await runNativeTranscriptBackfill({
+                      repository: native.repository,
+                      messageResolver: createExactNativeTranscriptMessageResolver(native.repository),
+                      machineId: native.machineId,
+                      format,
+                      nativeSessionId: session_id,
+                      sourceLocator: createHash("sha256").update(importNative).digest("hex"),
+                      source: { openSnapshot: async () => snapshot! },
+                      globalPatterns: config.security?.sensitivePatterns ?? [],
+                      projectPatterns,
+                      quarantine,
+                    });
+                  } catch (error) {
+                    backfillFailed = true;
+                    if (error instanceof NativeTranscriptSourceChangedError && attempt === 0 && !signal.aborted) {
+                      backfillRetryFailure = error;
+                    }
+                    throw error;
+                  } finally {
+                    try { await quarantine.close(); } catch (error) {
+                      if (backfillRetryFailure !== undefined) {
+                        throw new AggregateError([backfillRetryFailure, error], "Native ingest quarantine cleanup failed", { cause: backfillRetryFailure });
+                      }
+                      if (!backfillFailed) throw error;
+                    }
+                  }
+                }
 
+                throwIfAborted(signal);
+                if (!accumulated) return null;
+                const totalTokens = await project.context.getContextTokenCount(accumulated.conversationId);
+                throwIfAborted(signal);
+                return { ...accumulated, totalTokens };
+              } catch (error) {
+                attemptFailed = true;
+                if (error instanceof NativeTranscriptSourceChangedError && attempt === 0 && !signal.aborted) {
+                  retryableFailure = error;
+                }
+                throw error;
+              } finally {
+                try { await closeSource(); } finally { permit.release(); }
+              }
+            },
+          );
+          break;
+        } catch (error) {
+          attemptFailed = true;
+          if (!(error instanceof NativeTranscriptSourceChangedError) || attempt === 1) throw error;
+          throwIfAborted(signal);
+          if (sourceWitness === undefined) throw error;
+          retryFailure = error;
+          retryableFailure = error;
+        } finally {
+          await closeSource();
+        }
+      }
+
+      throwIfAborted(context?.signal);
       if (!ingest) {
         sendJson(res, 200, { ingested: 0, totalTokens: 0 });
         return;
@@ -284,6 +383,12 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         ...(totalRedacted > 0 ? { redacted: totalRedacted, redactedCategories: redactionCategories } : {}),
       });
     } catch (err) {
+      if (isAbortError(err)) {
+        if (!res.headersSent && !res.writableEnded && !res.destroyed && res.writable !== false) {
+          sendJson(res, 499, { status: "cancelled", error: "ingest cancelled" });
+        }
+        return;
+      }
       if (err instanceof BackendPublicationJournalError) {
         sendJson(res, 503, {
           status: "blocked",

@@ -571,6 +571,7 @@ describe("Codecov configuration", () => {
     // #930 keeps expand body-shape validation in that component as well.
     // #969 keeps the route-family and passive notification body-shape
     // validation in their existing route and daemon-events components.
+    // #1217 keeps native snapshot retries, preparation/admission and attempt lifetime route-owned.
     // #888 keeps private final ingest and compact metadata writes route-owned.
     // #890 keeps bounded best-effort status metadata reads route-owned.
     // #1003 keeps preliminary metadata admission daemon-core-owned.
