@@ -164,7 +164,7 @@ describe("update-patterns workflow", () => {
     expect(runStep("Bootstrap verified pnpm")).toContain('"$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"');
     expect(runStep("Locate pnpm store")).toContain('store_path="$(pnpm store path)"');
     expect(step("Cache pnpm store")).toMatchObject({
-      uses: "actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306",
+      uses: "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
       with: {
         path: "${{ steps.pnpm-store.outputs.path }}",
         key: "pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-22.20.0-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}",
