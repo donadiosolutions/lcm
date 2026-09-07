@@ -320,6 +320,17 @@ function isWindowsDrivePathStart(chars: readonly string[], index: number): boole
   return !isPathWord(chars[index - 1]);
 }
 
+function isDoubledDriveColonInPath(chars: readonly string[], index: number, windows: boolean): boolean {
+  const boundary = chars[index - 2];
+  return (
+    chars[index] === ":" &&
+    chars[index + 1] === ":" &&
+    chars[index + 2] === "\\" &&
+    /^[A-Za-z]$/u.test(chars[index - 1] ?? "") &&
+    (boundary === "\\" || (windows && boundary === "/"))
+  );
+}
+
 function isUncPathStart(chars: readonly string[], index: number): boolean {
   if (chars[index] !== "\\" || chars[index + 1] !== "\\") return false;
   return !isPathWord(chars[index - 1]);
@@ -379,6 +390,10 @@ function scanAbsolutePath(
     }
     if (char === ":" && chars[index + 1] === "\\" && isWindowsDrivePathStart(chars, index - 1)) {
       index += 1;
+      continue;
+    }
+    if (isDoubledDriveColonInPath(chars, index, windows)) {
+      index += 2;
       continue;
     }
     if (
