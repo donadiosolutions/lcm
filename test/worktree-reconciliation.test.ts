@@ -108,7 +108,10 @@ function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T)
 
 type IsolatedDirectoryFaults = Readonly<{
   targetDir: string;
+  journalDir?: string;
   mkdirErrorCode?: "EACCES" | "EEXIST";
+  failJournalClose?: boolean;
+  failJournalWriteOpen?: boolean;
   failTargetFchmod?: boolean;
   failTargetClose?: boolean;
   failSnapshotDirectoryClose?: boolean;
@@ -129,6 +132,8 @@ async function importReconciliationWithDirectoryFaults(
   const openDirectoryPaths = new Set<string>();
   const openedDirectoryPaths: string[] = [];
   const closedDirectoryPaths: string[] = [];
+  let journalCloseFailed = false;
+  let journalWriteOpenFailed = false;
   let targetCloseFailed = false;
   let snapshotDirectoryCloseFailed = false;
   let targetMkdirFailed = false;
@@ -143,6 +148,18 @@ async function importReconciliationWithDirectoryFaults(
         flags: Parameters<typeof actual.openSync>[1],
         mode?: Parameters<typeof actual.openSync>[2],
       ) => {
+        if (
+          faults.failJournalWriteOpen
+          && !journalWriteOpenFailed
+          && String(path).startsWith(`${faults.journalDir}/.`)
+          && String(path).includes(".json.")
+          && String(path).endsWith(".tmp")
+        ) {
+          journalWriteOpenFailed = true;
+          throw Object.assign(new Error("injected blocked journal open failure"), {
+            code: "EACCES",
+          });
+        }
         const fd = actual.openSync(path, flags, mode);
         descriptorPaths.set(fd, String(path));
         if (typeof flags === "number" && (flags & actual.constants.O_DIRECTORY) !== 0) {
@@ -197,6 +214,14 @@ async function importReconciliationWithDirectoryFaults(
         actual.closeSync(fd);
         if (descriptorPath !== undefined && openDirectoryPaths.has(descriptorPath)) {
           closedDirectoryPaths.push(descriptorPath);
+        }
+        if (
+          faults.failJournalClose
+          && !journalCloseFailed
+          && descriptorPath === faults.journalDir
+        ) {
+          journalCloseFailed = true;
+          throw new Error("injected reconciliation journal directory close failure");
         }
         if (
           faults.failTargetClose
@@ -1522,6 +1547,24 @@ describe("worktree reconciliation", () => {
     expect(existsSync(join(home, ".lcm", "oldmaps"))).toBe(true);
   }, FULL_SUITE_SNAPSHOT_MIGRATION_TEST_TIMEOUT_MS);
 
+  it("creates first-run reconciliation state when the LCM root is absent", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    rmSync(join(home, ".lcm"), { recursive: true, force: true });
+    clearProjectMapCache();
+    clearWorktreeReconciliationCache();
+
+    expect(existsSync(join(home, ".lcm"))).toBe(false);
+    expect(reconcileWorktrees(main).status).toBe("not-needed");
+    expect(existsSync(join(
+      home,
+      ".lcm",
+      "reconciliations",
+      `${targetHash}.json`,
+    ))).toBe(true);
+  });
+
   it("normalizes a legacy main snapshot with WAL state without migrating source evidence", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
@@ -2382,6 +2425,171 @@ describe("worktree reconciliation", () => {
     expect(readFileSync(metaPath, "utf8")).toBe(metadata);
   }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
+  it("refuses an early rebound reconciliation journal parent", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "early-journal-parent-replacement",
+      "content",
+      sourceHash,
+    );
+    const journalDir = join(home, ".lcm", "reconciliations");
+    const displacedJournalDir = `${journalDir}.early-displaced`;
+    const replacementSentinel = join(journalDir, "must-remain");
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event !== "after-map-preflight") return;
+        renameSync(journalDir, displacedJournalDir);
+        makePrivateFixtureDirectory(journalDir);
+        writePrivateFixtureFile(replacementSentinel, "replacement must remain unchanged\n");
+      },
+    })).toThrow("private directory topology is not trusted");
+
+    expect(readFileSync(replacementSentinel, "utf8"))
+      .toBe("replacement must remain unchanged\n");
+    expect(readdirSync(journalDir).filter((entry) => /\.json$|\.tmp$/u.test(entry)))
+      .toEqual([]);
+    expect(readdirSync(displacedJournalDir).filter((entry) => /\.json$|\.tmp$/u.test(entry)))
+      .toEqual([]);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("refuses an early rebound parent before no-source completion", () => {
+    const { main } = makeRepository(home);
+    const journalDir = join(home, ".lcm", "reconciliations");
+    const displacedJournalDir = `${journalDir}.completion-displaced`;
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event !== "after-map-preflight") return;
+        renameSync(journalDir, displacedJournalDir);
+        makePrivateFixtureDirectory(journalDir);
+      },
+    })).toThrow("private directory topology is not trusted");
+
+    expect(readdirSync(journalDir).filter((entry) => /\.json$|\.tmp$/u.test(entry)))
+      .toEqual([]);
+    expect(readdirSync(displacedJournalDir).filter((entry) => /\.json$|\.tmp$/u.test(entry)))
+      .toEqual([]);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("preserves a primary failure when blocked journal recording loses its parent", () => {
+    const { main } = makeRepository(home);
+    const journalDir = join(home, ".lcm", "reconciliations");
+    const displacedJournalDir = `${journalDir}.blocked-displaced`;
+    const primaryError = new Error("injected reconciliation failure");
+    let caught: unknown;
+
+    try {
+      reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event !== "after-map-preflight") return;
+          renameSync(journalDir, displacedJournalDir);
+          makePrivateFixtureDirectory(journalDir);
+          throw primaryError;
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).cause).toBe(primaryError);
+    expect((caught as AggregateError).errors).toHaveLength(2);
+    expect((caught as AggregateError).errors[0]).toBe(primaryError);
+    expect(String((caught as AggregateError).errors[1]))
+      .toContain("private directory topology is not trusted");
+    expect(readdirSync(journalDir).filter((entry) => /\.json$|\.tmp$/u.test(entry)))
+      .toEqual([]);
+    expect(readdirSync(displacedJournalDir).filter((entry) => /\.json$|\.tmp$/u.test(entry)))
+      .toEqual([]);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("preserves a primary failure when blocked journal publication fails", async () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetDir = join(home, ".lcm", "projects", hashProjectPath(canonical));
+    const journalDir = join(home, ".lcm", "reconciliations");
+    const primaryError = new Error("primary failure before blocked publication");
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir,
+      journalDir,
+      failJournalWriteOpen: true,
+    });
+    try {
+      let caught: unknown;
+      try {
+        isolated.module.reconcileWorktrees(main, {
+          _observer: (event) => {
+            if (event === "after-map-preflight") throw primaryError;
+          },
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(AggregateError);
+      expect((caught as AggregateError).cause).toBe(primaryError);
+      expect((caught as AggregateError).errors[0]).toBe(primaryError);
+      expect(String((caught as AggregateError).errors[1]))
+        .toContain("injected blocked journal open failure");
+      expect(readdirSync(journalDir).filter((entry) => /\.json$|\.tmp$/u.test(entry)))
+        .toEqual([]);
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("refuses a rebound journal parent after a durable merge transition", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makeDatabase(
+      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
+      "late-journal-parent-replacement",
+      "content",
+      sourceHash,
+    );
+    const journalDir = join(home, ".lcm", "reconciliations");
+    const displacedJournalDir = `${journalDir}.late-displaced`;
+    const journalFile = join(journalDir, `${targetHash}.json`);
+    const replacementJournal = "replacement journal must remain unchanged\n";
+    let displacedJournal = "";
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event !== "after-merge-before-archive") return;
+        renameSync(journalDir, displacedJournalDir);
+        displacedJournal = readFileSync(
+          join(displacedJournalDir, `${targetHash}.json`),
+          "utf8",
+        );
+        makePrivateFixtureDirectory(journalDir);
+        writePrivateFixtureFile(journalFile, replacementJournal);
+      },
+    })).toThrow("private directory topology is not trusted");
+
+    expect(readFileSync(join(displacedJournalDir, `${targetHash}.json`), "utf8"))
+      .toBe(displacedJournal);
+    expect(readFileSync(journalFile, "utf8")).toBe(replacementJournal);
+    expect(readdirSync(journalDir).filter((entry) => /\.tmp$/u.test(entry))).toEqual([]);
+    expect(readdirSync(displacedJournalDir).filter((entry) => /\.tmp$/u.test(entry)))
+      .toEqual([]);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
   it.each([
     {
       fault: "hard-linked",
@@ -2984,6 +3192,7 @@ describe("worktree reconciliation", () => {
       expect(isolated.module.reconcileWorktrees(main).status).toBe("completed");
       expect([...isolated.openDirectoryPaths]).toEqual(expect.arrayContaining([
         join(home, ".lcm"),
+        join(home, ".lcm", "reconciliations"),
         join(home, ".lcm", "projects"),
         targetDir,
         join(home, ".lcm", "events"),
@@ -2995,6 +3204,100 @@ describe("worktree reconciliation", () => {
       resetReconciliationModuleMocks();
     }
   }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("reports journal-parent cleanup failure after an otherwise completed attempt", async () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetDir = join(home, ".lcm", "projects", hashProjectPath(canonical));
+    const journalDir = join(home, ".lcm", "reconciliations");
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir,
+      journalDir,
+      failJournalClose: true,
+    });
+    try {
+      expect(() => isolated.module.reconcileWorktrees(main)).toThrow(
+        "reconciliation journal directory cleanup failed",
+      );
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("preserves a primary failure when journal-parent cleanup also fails", async () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetDir = join(home, ".lcm", "projects", hashProjectPath(canonical));
+    const journalDir = join(home, ".lcm", "reconciliations");
+    const primaryError = new Error("primary journal attempt failure");
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir,
+      journalDir,
+      failJournalClose: true,
+    });
+    try {
+      let caught: unknown;
+      try {
+        isolated.module.reconcileWorktrees(main, {
+          _observer: (event) => {
+            if (event === "after-map-preflight") throw primaryError;
+          },
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(AggregateError);
+      expect((caught as AggregateError).cause).toBe(primaryError);
+      expect((caught as AggregateError).errors[0]).toBe(primaryError);
+      expect(String((caught as AggregateError).errors[1]))
+        .toContain("injected reconciliation journal directory close failure");
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it.each(["backend publication", "mutation contention"])(
+    "preserves a %s error when journal-parent cleanup fails",
+    async (name) => {
+      const { main } = makeRepository(home);
+      const canonical = resolveGitProjectAnchor(main)!.canonical;
+      const targetDir = join(home, ".lcm", "projects", hashProjectPath(canonical));
+      const journalDir = join(home, ".lcm", "reconciliations");
+      const isolated = await importReconciliationWithDirectoryFaults({
+        targetDir,
+        journalDir,
+        failJournalClose: true,
+      });
+      try {
+        const error = name === "backend publication"
+          ? new (await import("../src/storage/backend-publication.js"))
+            .BackendPublicationJournalError(
+              "unresolved-publication",
+              "classified backend publication failure",
+            )
+          : new (await import("../src/private-mutation-lock.js"))
+            .PrivateMutationLockContentionError("classified mutation contention");
+        let caught: unknown;
+        try {
+          isolated.module.reconcileWorktrees(main, {
+            _lockWaitMs: 0,
+            _observer: (event) => {
+              if (event === "after-map-preflight") throw error;
+            },
+          });
+        } catch (candidate) {
+          caught = candidate;
+        }
+        expect(caught).toBe(error);
+        expect(isolated.remainingDescriptorPaths()).toEqual([]);
+      } finally {
+        resetReconciliationModuleMocks();
+      }
+    },
+    FULL_SUITE_PROCESS_TEST_TIMEOUT_MS,
+  );
 
   it("preserves a primary observer failure while closing every retained handle", async () => {
     const { main, linked } = makeRepository(home);
@@ -6762,6 +7065,131 @@ describe("worktree reconciliation", () => {
     }
   });
 
+  it("acquires a fresh journal parent after lock contention", () => {
+    const { main } = makeReconciliationLockFixture(home);
+    const journalDir = join(home, ".lcm", "reconciliations");
+    const displacedJournalDir = `${journalDir}.between-attempts`;
+    let monotonicNow = 0;
+    let waits = 0;
+    const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+    const atomicsWait = vi.spyOn(Atomics, "wait").mockImplementation(
+      (_array, _index, _value, timeout) => {
+        waits += 1;
+        renameSync(journalDir, displacedJournalDir);
+        makePrivateFixtureDirectory(journalDir);
+        monotonicNow += timeout ?? 0;
+        return "timed-out";
+      },
+    );
+    try {
+      expect(reconcileWorktrees(main, {
+        _lockWaitMs: 100,
+        _lockRetryDelayMs: 50,
+      }).status).toBe("completed");
+      expect(waits).toBe(1);
+      expect(readdirSync(journalDir)).toEqual(expect.arrayContaining([
+        expect.stringMatching(/\.json$/u),
+      ]));
+      expect(readdirSync(displacedJournalDir).filter((entry) => /\.json$|\.tmp$/u.test(entry)))
+        .toEqual([]);
+    } finally {
+      atomicsWait.mockRestore();
+      performanceNow.mockRestore();
+    }
+  });
+
+  it("refuses to retry contention after journal-parent drift", async () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
+    makeDatabase(sourcePath, "contention-with-journal-drift", "content", sourceHash);
+    const targetDir = join(home, ".lcm", "projects", targetHash);
+    const journalDir = join(home, ".lcm", "reconciliations");
+    const displacedJournalDir = `${journalDir}.contention-displaced`;
+    const isolated = await importReconciliationWithDirectoryFaults({ targetDir });
+    try {
+      const { PrivateMutationLockContentionError: IsolatedContentionError } = await import(
+        "../src/private-mutation-lock.js"
+      );
+      const { BackendPublicationJournalError: IsolatedPublicationError } = await import(
+        "../src/storage/backend-publication.js"
+      );
+      const { PrivateDirectoryTopologyError: IsolatedTopologyError } = await import(
+        "../src/security-files.js"
+      );
+      const contentionError = new IsolatedContentionError(
+        "injected contention after journal-parent replacement",
+      );
+      let attempts = 0;
+      let caught: unknown;
+      try {
+        isolated.module.reconcileWorktrees(main, {
+          _lockWaitMs: 1_000,
+          _lockRetryDelayMs: 1,
+          _observer: (event) => {
+            if (event !== "after-map-preflight") return;
+            attempts += 1;
+            if (attempts !== 1) return;
+            renameSync(journalDir, displacedJournalDir);
+            makePrivateFixtureDirectory(journalDir);
+            throw contentionError;
+          },
+        });
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(IsolatedPublicationError);
+      expect(caught).toMatchObject({
+        reason: "unsafe-storage",
+        message: "worktree reconciliation journal parent changed during retryable contention",
+      });
+      const cause = (caught as Error).cause;
+      expect(cause).toBeInstanceOf(AggregateError);
+      expect((cause as AggregateError).cause).toBe(contentionError);
+      expect((cause as AggregateError).errors).toHaveLength(2);
+      expect((cause as AggregateError).errors[0]).toBe(contentionError);
+      expect((cause as AggregateError).errors[1]).toBeInstanceOf(IsolatedTopologyError);
+      expect(attempts).toBe(1);
+      expect(existsSync(sourcePath)).toBe(true);
+      expect(readdirSync(journalDir).filter((entry) => /\.json$|\.tmp$/u.test(entry)))
+        .toEqual([]);
+      expect(readdirSync(displacedJournalDir).filter((entry) => /\.json$|\.tmp$/u.test(entry)))
+        .toEqual([]);
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it("retries in-attempt contention while the journal parent remains stable", () => {
+    const { main } = makeRepository(home);
+    const contentionError = new PrivateMutationLockContentionError(
+      "injected contention with stable journal topology",
+    );
+    let attempts = 0;
+
+    const result = reconcileWorktrees(main, {
+      _lockWaitMs: 1_000,
+      _lockRetryDelayMs: 1,
+      _observer: (event) => {
+        if (event !== "after-map-preflight") return;
+        attempts += 1;
+        if (attempts === 1) throw contentionError;
+      },
+    });
+
+    expect(result.status).toBe("not-needed");
+    expect(attempts).toBe(2);
+  });
+
   it("holds the project-map mutation fence from preflight through publication", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
@@ -6805,13 +7233,41 @@ describe("worktree reconciliation", () => {
       "unresolved-publication",
       "reconciliation publication state is unresolved",
     );
+    let caught: unknown;
 
-    expect(() => reconcileWorktrees(main, {
-      _observer: (event) => {
-        if (event === "before-source-main-merge") throw publicationError;
-      },
-    })).toThrow("reconciliation publication state is unresolved");
+    try {
+      reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event === "before-source-main-merge") throw publicationError;
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBe(publicationError);
     expect(listWorktreeReconciliationJournals()).toEqual(expect.any(Array));
+  });
+
+  it("preserves a classified contention error from a locked attempt", () => {
+    const { main } = makeRepository(home);
+    const contentionError = new PrivateMutationLockContentionError(
+      "injected nested mutation contention",
+    );
+    let caught: unknown;
+
+    try {
+      reconcileWorktrees(main, {
+        _lockWaitMs: 0,
+        _observer: (event) => {
+          if (event === "after-map-preflight") throw contentionError;
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBe(contentionError);
+    expect(listWorktreeReconciliationJournals()).toEqual([]);
   });
 
   it("handles bounded catalogue entries, non-Git paths, and catalogue failures", () => {

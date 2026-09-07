@@ -235,6 +235,7 @@ const expectedComponents = [
       // #1048 keeps target metadata leaf authentication in this owner.
       // #1069 preserves completed reconciliation evidence after retained
       // directory cleanup failures in this existing component.
+      // #1059 keeps retained journal-parent publication in this existing owner.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
