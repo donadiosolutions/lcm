@@ -190,8 +190,11 @@ try {
 
 4. Repeat the diagnostic until no affected IDs remain (use a new backup name
    for each repair). Restart the service and agent sessions, then verify the
-   repaired memory with `lcm search` and `lcm describe ID` before resuming normal
-   use. Retain the backup until verification is complete. Do not replace a live
+   active memory with `lcm search "distinctive replacement words"` from the
+   original project directory before resuming normal use. Archived memories
+   remain excluded from search; the offline diagnostic verifies that their
+   content is now supported. Retain the backup until verification is complete.
+   Do not replace a live
    database file or discard its WAL/SHM sidecars to restore a backup; stop all
    writers again before any restoration.
 
