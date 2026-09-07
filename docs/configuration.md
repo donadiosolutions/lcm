@@ -910,6 +910,13 @@ reassigned only from exact thread ownership or a unique repository URL under an
 existing `~/.codex/worktrees/<token>` tombstone; unresolved and ambiguous
 sessions are reported and skipped.
 
+Claude `lcm import --all` maps projects through each local `meta.json`. It uses
+only owner-local, single-link regular files up to 1 MiB and silently skips a
+symlink, FIFO, directory, oversized file, foreign-owner file, or multiply
+linked file for that import run. Trusted sibling projects continue importing.
+See [Metadata-backed map discovery](project-identity.md#metadata-backed-map-discovery)
+for recovery and concurrent-publication behavior.
+
 See [Machine registration and project identity](project-identity.md) for
 permissions, recovery, pairing, stored-data guards, backup behavior, migration,
 ambiguity rules, and the command reference.

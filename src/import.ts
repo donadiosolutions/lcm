@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, existsSync, lstatSync } from "node:fs";
+import { readdirSync, existsSync, lstatSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import type { DaemonClient } from "./daemon/client.js";
@@ -8,7 +8,8 @@ import type { TranscriptClient } from "./transcript-provider.js";
 import { configPath, lcmHomeDir } from "./runtime-paths.js";
 import { loadDaemonConfig } from "./daemon/config.js";
 import { selectStorageBackendForConfig } from "./storage/backend.js";
-import { projectId } from "./daemon/project.js";
+import { MAX_PROJECT_METADATA_BYTES, projectId } from "./daemon/project.js";
+import { readBoundedRegularFile } from "./security-files.js";
 import {
   hashProjectPath,
   normalizeProjectIdentityPath,
@@ -68,7 +69,12 @@ function buildProjectMap(lcmDir?: string): Map<string, string> {
     const metaPath = join(lcmProjectsDir, entry.name, 'meta.json');
     if (!existsSync(metaPath)) continue;
     try {
-      const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+      const meta = JSON.parse(readBoundedRegularFile(metaPath, {
+        allowedRoot: join(lcmProjectsDir, entry.name),
+        maxBytes: MAX_PROJECT_METADATA_BYTES,
+        expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+        requireSingleLink: true,
+      }));
       if (meta.cwd) {
         const hash = cwdToProjectHash(meta.cwd);
         map.set(hash, meta.cwd);
