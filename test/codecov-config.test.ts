@@ -104,8 +104,8 @@ const expectedComponents = [
       "^src/daemon/remediation\\.ts$",
       // Error sanitization, including #893 adjacent-path, #903 prefixed
       // nested-file, #924 embedded-quote authority, #1010 pathless-tail
-      // bracket redaction, and #1060 adjacent nested-file scheme
-      // preservation, remains daemon-core-owned.
+      // bracket redaction, #1060 adjacent nested-file scheme preservation,
+      // and #1117 glued file-authority handling, remains daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -623,6 +623,7 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.
+      // #1101 numeric skipped-sidecar counts stay local-persistence-owned.
       ["src/db/event-sidecars.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"],

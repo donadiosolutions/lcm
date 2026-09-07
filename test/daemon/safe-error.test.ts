@@ -671,38 +671,248 @@ describe("sanitizeError", () => {
     expect(sanitizeError(result)).toBe(result);
   });
 
-  // Bug #1117 owns top-level and unrecognized-prefix convergence. These rows
-  // pin their baseline first-pass output without widening Bug #1060.
+  // Bug #1117 absorbs an adjacent literal file suffix only after an unquoted
+  // confidential path scan has started. Non-file suffixes remain independent.
   it.each([
     [
       "file://one.invalid/Users/a-file://two.invalid/Users/b",
-      "file://one.invalid<path>://two.invalid/Users/b",
+      "file://one.invalid<path>",
     ],
     [
       "https://outer.test/x?q=file://one.invalid/Users/afile://two.invalid/Users/b",
-      "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>",
     ],
     [
       "https://outer.test/x?q=file://one.invalid/Users/aprofile://two.invalid/Users/b",
-      "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
-    ],
-    [
-      "https://outer.test/x?q=file://one.invalid/Users/ahttps://two.invalid/Users/b",
-      "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>",
     ],
     [
       "https://outer.test/x?q=file://one.invalid/Users/a-profile://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=file://one.invalid/Users/afile://two.invalid\\Users\\b",
+      "https://outer.test/x?q=file://one.invalid<path>",
+    ],
+  ] as const)("absorbs adjacent literal file suffixes into active paths: %#", (input, expected) => {
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+    expect(sanitizeError(sanitizeError(firstPass))).toBe(expected);
+  });
+
+  it.each([
+    [
+      "https://outer.test/x?q=file://one.invalid/Users/ahttps://two.invalid/Users/b",
       "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
     ],
     [
       "https://outer.test/x?q=file://one.invalid/Users/a-https://two.invalid/Users/b",
       "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
     ],
+  ] as const)("preserves adjacent non-file scheme residuals: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
+  });
+
+  it.each([
     [
-      "https://outer.test/x?q=file://one.invalid/Users/afile://two.invalid\\Users\\b",
-      "https://outer.test/x?q=file://one.invalid<path>://two.invalid\\Users\\b",
+      "https://outer.test/x?q=file://h.invalid/Users/afile://h2.invalid/Users/b",
+      "https://outer.test/x?q=file://h.invalid<path>",
     ],
-  ] as const)("preserves adjacent unrecognized scheme residuals: %#", (input, expected) => {
+    [
+      "file://host.invalid?x=a\\Users\\a-file://h2.invalid/Users/b",
+      "file://host.invalid?x=a<path>",
+    ],
+    [
+      "https://outer.test/x?q=file://one.invalid/Users/aFILE://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=file://one.invalid/Users/aFiLe://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>",
+    ],
+    [
+      "https://outer.test/x?q=file://one.invalid/Users/afile://two.invalid/Users/cfile://three.invalid/Users/d",
+      "https://outer.test/x?q=file://one.invalid<path>",
+    ],
+    ["failed C:\\Users\\a\\afile://two.invalid/Users/b", "failed <path>"],
+    ["failed \\\\server\\share\\afile://two.invalid/Users/b", "failed <path>"],
+    ["failed /Users/aliceprofile://two.invalid/Users/b", "failed <path>"],
+  ] as const)("converges adjacent file suffix path canaries: %#", (input, expected) => {
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(firstPass).not.toContain("/Users");
+    expect(firstPass.match(/<path>/g)).toHaveLength(1);
+    expect(sanitizeError(firstPass)).toBe(expected);
+    expect(sanitizeError(sanitizeError(firstPass))).toBe(expected);
+  });
+
+  it.each([
+    "two.invalid:8080/Users/b",
+    "[fe80::1]/Users/b",
+    "[fe80::1]:8080/Users/b",
+    "[fe80::1%25eth0]/Users/b",
+    "u:p@two.invalid:99/Users/b",
+  ] as const)("absorbs adjacent file authority shape %s", (tail) => {
+    const input = `https://outer.test/x?q=file://one.invalid/Users/afile://${tail}`;
+    const expected = "https://outer.test/x?q=file://one.invalid<path>";
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(firstPass).not.toContain("/Users");
+    expect(firstPass.match(/<path>/g)).toHaveLength(1);
+    expect(sanitizeError(firstPass)).toBe(expected);
+    expect(sanitizeError(sanitizeError(firstPass))).toBe(expected);
+  });
+
+  it("absorbs a parenthesized adjacent file authority", () => {
+    const input = "(file://one.invalid/Users/afile://two.invalid:80/Users/b)";
+    const expected = "(file://one.invalid<path>)";
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(firstPass).not.toContain("/Users");
+    expect(firstPass.match(/<path>/g)).toHaveLength(1);
+    expect(sanitizeError(firstPass)).toBe(expected);
+    expect(sanitizeError(sanitizeError(firstPass))).toBe(expected);
+  });
+
+  it.each([
+    ["two.invalid trailing text", " trailing text"],
+    ["two.invalid\ttrailing text", "\ttrailing text"],
+    ["two.invalid\ntrailing text", "\ntrailing text"],
+    ["two.invalid\rtrailing text", "\rtrailing text"],
+    ["two.invalid,tail", ",tail"],
+    ["two.invalid]tail", "]tail"],
+    ['two.invalid"tail', '"tail'],
+    ["two.invalid", ""],
+    ["", ""],
+    ["/", ""],
+  ] as const)("stops adjacent file authority at its bounded terminator: %#", (tail, preserved) => {
+    const input = `https://outer.test/x?q=file://one.invalid/Users/afile://${tail}`;
+    const expected = `https://outer.test/x?q=file://one.invalid<path>${preserved}`;
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  it("hands a recognized nested file marker off after an authority delimiter", () => {
+    const input =
+      "https://outer.test/x?q=file://one.invalid/Users/afile://h1.invalid?x=file://h2.invalid/Users/c";
+    const expected =
+      "https://outer.test/x?q=file://one.invalid<path>?x=file://h2.invalid<path>";
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(firstPass).not.toContain("/Users");
+    expect(firstPass.match(/<path>/g)).toHaveLength(2);
+    expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  it.each(["-", "1", "[", ".", "_", "@", "+", "~", "%", "$", "*", ":"] as const)(
+    "preserves an authority-internal nested file marker after %s glue",
+    (glue) => {
+      const input =
+        `https://outer.test/x?q=file://one.invalid/Users/afile://h1.invalid${glue}` +
+        "file://h2.invalid/Users/b";
+      const expected =
+        "https://outer.test/x?q=file://one.invalid<path>file://h2.invalid<path>";
+      const firstPass = sanitizeError(input);
+
+      expect(firstPass).toBe(expected);
+      expect(firstPass).not.toContain("/Users");
+      expect(firstPass.match(/<path>/g)).toHaveLength(2);
+      expect(sanitizeError(firstPass)).toBe(expected);
+      expect(sanitizeError(sanitizeError(firstPass))).toBe(expected);
+    },
+  );
+
+  it("keeps a word-glued private-looking tail beyond an ordinary authority delimiter", () => {
+    const input =
+      "https://outer.test/x?q=file://one.invalid/Users/afile://h]tail/Users/b";
+    const expected =
+      "https://outer.test/x?q=file://one.invalid<path>]tail/Users/b";
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+    expect(sanitizeError(sanitizeError(firstPass))).toBe(expected);
+  });
+
+  it("resumes active path scanning at an opening parenthesis after an authority", () => {
+    const input =
+      "https://outer.test/x?q=file://one.invalid/Users/afile://h(tail/Users/b";
+    const expected = "https://outer.test/x?q=file://one.invalid<path>";
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(firstPass).not.toContain("/Users");
+    expect(sanitizeError(firstPass)).toBe(expected);
+    expect(sanitizeError(sanitizeError(firstPass))).toBe(expected);
+  });
+
+  it("preserves recognized nested file handoff with a port", () => {
+    const input =
+      "https://outer.test/x?q=file://one.invalid/Users/a-file://two.invalid:8080/Users/b";
+    const expected =
+      "https://outer.test/x?q=file://one.invalid<path>file://two.invalid:8080<path>";
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  it("retains quoted scanning across a glued file authority with a port", () => {
+    const input =
+      "https://outer.test/x?q='file://one.invalid/Users/afile://two.invalid:8080/Users/b'";
+    const expected = "https://outer.test/x?q='file://one.invalid<path>'";
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  it.each([
+    [
+      "profile://remote.invalid/Users/canary/private.db",
+      "profile://remote.invalid/Users/canary/private.db",
+    ],
+    ["afile://remote.invalid/Users/canary/private.db", "afile://remote.invalid/Users/canary/private.db"],
+    ["xfile://remote.invalid/Users/canary/private.db", "xfile://remote.invalid/Users/canary/private.db"],
+    [
+      "file://host.invalid?next=afile://remote.invalid/Users/canary/private.db",
+      "file://host.invalid?next=afile://remote.invalid/Users/canary/private.db",
+    ],
+    [
+      "profile://localhost/Users/canary/private.db",
+      "profile://localhost<path>",
+    ],
+    [
+      "https://outer.test/x?q=https://one.invalid/Users/afile://two.invalid/Users/b",
+      "https://outer.test/x?q=https://one.invalid/Users/afile://two.invalid/Users/b",
+    ],
+  ] as const)("preserves ordinary URL classification around file suffixes: %#", (input, expected) => {
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  // Bug #1141 separately owns single-slash file-shaped tails and their drive
+  // interaction. Pin the existing first-pass output without widening #1117.
+  it.each([
+    [
+      "file://one.invalid/Users/afile:/two.invalid/Users/b",
+      "file://one.invalid<path>:/two.invalid/Users/b",
+    ],
+    [
+      "file://one.invalid/Users/afile:/C:/Users/b",
+      "file://one.invalid<path>:/C:/Users/b",
+    ],
+  ] as const)("preserves known single-slash residual for Bug #1141: %#", (input, expected) => {
     expect(sanitizeError(input)).toBe(expected);
   });
 
