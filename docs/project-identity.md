@@ -147,9 +147,11 @@ archived phase and preserves the pending source hashes and backup evidence. A
 failure after durable completed publication leaves that completed journal in
 place, so a retry can return the published result without repeating merge or
 archival work. If an atomic completed-journal replacement reports an ambiguous
-published topology outcome before confirming success, LCM records the attempt
-as blocked from archived; a retry converges from the folded map and retained
-source evidence.
+topology outcome, LCM attempts to record a blocked result using the retained
+archived evidence. That recording can also fail if the retained parent is no
+longer trusted. The completed replacement may already exist, so preserve the
+journal and backups, run `lcm doctor`, and inspect the reported errors before
+retrying.
 
 LCM permanently fences legacy project and event databases against writes before
 committing their data to the canonical stores. After the merged databases pass
