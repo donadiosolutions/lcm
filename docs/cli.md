@@ -50,6 +50,13 @@ In `lcm store`, `--tag` and `--tags` are repeatable single-tag aliases. This is
 different from `lcm export --tags`, which remains a comma-separated filter,
 for example `lcm export --tags decision,architecture`.
 
+When SQLite is selected, the stored text must not contain an embedded NUL
+character (`U+0000`). The store operation rejects that input before writing;
+JSON-escaped NUL characters in tags remain supported. A selected legacy
+promoted row containing an embedded NUL fails closed instead of returning a
+truncated value. See [Privacy & Data Handling](privacy.md#embedded-nul-in-promoted-memory)
+for the read-only diagnostic and deliberate replacement procedure.
+
 `lcm export` writes JSON by default. The optional `--format` value accepts
 only `json`; unsupported values are rejected before export work or output
 writes begin.

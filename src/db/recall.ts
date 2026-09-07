@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import { parsePromotedTags } from "./promoted.js";
+import { parsePromotedTags, readPromotedContent } from "./promoted.js";
 
 function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, "\\$&");
@@ -100,11 +100,17 @@ export class RecallStore {
     const topRecalled: Array<{ id: string; content: string; actCount: number }> = [];
     for (const [memId, count] of sorted) {
       const memRow = this.db.prepare(
-        `SELECT content FROM promoted WHERE id = ?`
-      ).get(memId) as { content: string } | undefined;
+        `SELECT content, typeof(content) AS content_type,
+                instr(content, char(0)) AS content_nul_marker
+         FROM promoted WHERE id = ?`
+      ).get(memId) as {
+        content: unknown;
+        content_type: unknown;
+        content_nul_marker: unknown;
+      } | undefined;
       topRecalled.push({
         id: memId,
-        content: memRow?.content ?? "(memory not found)",
+        content: memRow ? readPromotedContent(memRow) : "(memory not found)",
         actCount: count,
       });
     }

@@ -206,9 +206,9 @@ describe("PromotedStore", () => {
     let iterateReads = 0;
     let allCalls = 0;
     const rows = [
-      { id: "ineligible", content: "needle", tags: '["other"]', project_id: "p", session_id: null, confidence: 1, created_at: "2020", rank: -3 },
-      { id: "eligible", content: "needle", tags: '["required"]', project_id: "p", session_id: null, confidence: 1, created_at: "2020", rank: -2 },
-      { id: "late", content: "needle", get tags(): string { throw new Error("late row decoded"); }, project_id: "p", session_id: null, confidence: 1, created_at: "2020", rank: -1 },
+      { id: "ineligible", content: "needle", content_type: "text", content_nul_marker: 0, tags: '["other"]', project_id: "p", session_id: null, confidence: 1, created_at: "2020", rank: -3 },
+      { id: "eligible", content: "needle", content_type: "text", content_nul_marker: 0, tags: '["required"]', project_id: "p", session_id: null, confidence: 1, created_at: "2020", rank: -2 },
+      { id: "late", content: "needle", content_type: "text", content_nul_marker: 0, get tags(): string { throw new Error("late row decoded"); }, project_id: "p", session_id: null, confidence: 1, created_at: "2020", rank: -1 },
     ];
     const db = {
       prepare: () => ({
@@ -236,8 +236,8 @@ describe("PromotedStore", () => {
   it("falls back to all() when the statement has no iterator", () => {
     let allCalls = 0;
     const rows = [
-      { id: "ineligible", content: "needle", tags: '["other"]', project_id: "p", session_id: null, confidence: 1, created_at: "2020", rank: -2 },
-      { id: "eligible", content: "needle", tags: '["required"]', project_id: "p", session_id: null, confidence: 1, created_at: "2020", rank: -1 },
+      { id: "ineligible", content: "needle", content_type: "text", content_nul_marker: 0, tags: '["other"]', project_id: "p", session_id: null, confidence: 1, created_at: "2020", rank: -2 },
+      { id: "eligible", content: "needle", content_type: "text", content_nul_marker: 0, tags: '["required"]', project_id: "p", session_id: null, confidence: 1, created_at: "2020", rank: -1 },
     ];
     const db = {
       prepare: () => ({
@@ -260,6 +260,8 @@ describe("PromotedStore", () => {
       const row = {
         id: "eligible",
         content: "needle",
+        content_type: "text",
+        content_nul_marker: 0,
         tags: '["required"]',
         project_id: "p",
         session_id: null,

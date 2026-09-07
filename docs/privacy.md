@@ -88,6 +88,41 @@ With the default SQLite backend, all storage is on your machine:
 
 On first startup after upgrading from older releases, lcm automatically migrates an existing legacy runtime directory to `~/.lcm/` when `~/.lcm/` is absent or does not already contain LCM data.
 
+### Embedded NUL in promoted memory
+
+SQLite promoted-memory content must be ordinary SQLite `TEXT` without an
+embedded NUL character (`U+0000`). The Node SQLite binding can return only the
+prefix of a scalar value when a legacy row contains that byte, so LCM refuses
+to publish, search, list, export, recall, or replay it into the promoted FTS
+index.
+The refusal uses a fixed error and does not include the memory text, ID, path,
+or query. NUL characters in JSON-escaped tags remain supported.
+
+New promoted content containing `U+0000` is rejected before the database write.
+An explicit replacement through the repository API can repair a known legacy
+row without first decoding its old content:
+
+```ts
+promotedStore.update(memoryId, { content: "the intended replacement" });
+```
+
+This replacement must be deliberate; LCM does not strip bytes, truncate rows,
+or run an automatic migration. Stop writers and take a verified backup before
+offline maintenance. To identify affected rows without printing their content,
+run this diagnostic query against a stopped copy of the project database:
+
+```sql
+SELECT id
+FROM promoted
+WHERE typeof(content) <> 'text'
+   OR instr(content, char(0)) > 0;
+```
+
+The query is an operator diagnostic only. Correct each selected row with an
+intended replacement through the repository API, then verify reads and search
+results before returning the database to service. If no replacement is known,
+preserve the backup and leave the row refused.
+
 No data is sent to any Long Context Manager (LCM) server. There is no telemetry.
 An explicitly configured PostgreSQL backend is a user-operated remote-primary
 store; daemon project writes and reads use it only after the publication and

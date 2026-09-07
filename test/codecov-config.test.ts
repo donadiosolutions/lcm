@@ -134,6 +134,8 @@ const expectedComponents = [
     // #898 applies required promoted tags before the caller result maximum while retaining local-persistence ownership.
     // #898's guarded dual-JSON eligibility keeps this search in the same owner.
     // #989 retains event-sidecar parent authentication in this owner.
+    // #1082 keeps SQLite promoted-content NUL admission and replay guards in
+    // local persistence; this change does not alter component ownership.
     paths: ["src/db/", "src/storage/sqlite/", "src/store/"],
   },
   {
