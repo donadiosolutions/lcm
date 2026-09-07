@@ -181,6 +181,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       // claiming later slashes as this URL authority.
       quotedPathEnded = true;
       schemeQuote = 0;
+      // An adjacent backslash starts a fresh path even before the wrapper closes.
+      if (chars[index + 1] === "\\") foundFilePath = false;
       continue;
     }
     if (

@@ -104,7 +104,7 @@ const expectedComponents = [
       "^src/daemon/remediation\\.ts$",
       // Error sanitization, including #893 adjacent-path, #903 prefixed
       // nested-file, #924 embedded-quote, #925/#1076 quoted-authority,
-      // bracketed path quote closure, #1060 adjacent nested-file scheme
+      // bracketed path quote/backslash handoff, #1060 adjacent nested-file scheme
       // preservation, #1117 glued file-authority handling, and #1128 active
       // file-URL own-query backslash paths remain daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",

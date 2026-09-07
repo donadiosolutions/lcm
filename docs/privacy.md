@@ -316,7 +316,10 @@ The `Security` section of the doctor output shows:
   existing path and prose delimiter behavior, and a matching quote closes the
   redacted path, even inside unmatched or path-wrapping brackets. The matching
   quote also stops that file URL from hiding a later standalone local path,
-  which is redacted in the same pass. While an exact file URL's context remains
+  which is redacted in the same pass. A backslash path immediately after that
+  quote is also redacted when the surrounding bracket remains unmatched:
+  `'file://host'['/private'\Users\SECRET` becomes
+  `'file://host'['<path>'<path>`. While an exact file URL's context remains
   active, a backslash path in that URL's own query or fragment is redacted on
   the first pass. This includes a query or fragment following a closed quoted
   path, with or without a closing wrapper. Whitespace and URL-ending delimiters

@@ -515,6 +515,15 @@ describe("sanitizeError", () => {
     expect(sanitizeError(input)).toBe(expected);
   });
 
+  it.each([
+    ["'file://host'['/private'\\Users\\SECRET", "'file://host'['<path>'<path>"],
+    ['"file://host["/private"\\Users\\SECRET', '"file://host["<path>"<path>'],
+    ["'file://host'[['/private'\\Users\\SECRET", "'file://host'[['<path>'<path>"],
+  ] as const)("redacts immediate backslash tails inside unmatched quoted wrappers: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
+    expect(sanitizeError(sanitizeError(input))).toBe(expected);
+  });
+
   it("preserves the deferred word-bearing query tail boundary", () => {
     const result = sanitizeError("'file://host'['/private']?next/Users/SECRET");
 
