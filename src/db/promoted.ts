@@ -399,6 +399,14 @@ export class PromotedStore {
     }
 
     const rows = statement.all(...queryParams) as Array<PromotedRow & PromotedContentRow & { rank: number }>;
+    if (needsTagFilter && !useNativeTagFilter) {
+      const eligibleRows = rows.filter((row) => {
+        const tags = parsePromotedTags(row.tags);
+        return filterTags!.every((tag) => tags.includes(tag));
+      });
+      const selectedRows = limit < 0 ? eligibleRows : eligibleRows.slice(0, limit);
+      return selectedRows.map((row) => toSearchResult(row)!);
+    }
     const results = rows.flatMap((row) => {
       const result = toSearchResult(row);
       return result ? [result] : [];
@@ -566,8 +574,7 @@ export class PromotedStore {
     }
     sql += " ORDER BY created_at ASC";
 
-    const rows = (this.db.prepare(sql).all(...params) as Array<PromotedRow & PromotedContentRow>)
-      .map(publicPromotedRow);
+    const rows = this.db.prepare(sql).all(...params) as Array<PromotedRow & PromotedContentRow>;
     if (rows.length === 0) return [];
 
     // Batch: get surfacing counts for all candidate IDs in one query
@@ -608,7 +615,7 @@ export class PromotedStore {
       const purelyOld = surfacingCount === 0 && usageCount === 0;
 
       if (surfacedWithoutUse || purelyOld) {
-        result.push({ ...row, surfacingCount, usageCount, daysSinceCreated });
+        result.push({ ...publicPromotedRow(row), surfacingCount, usageCount, daysSinceCreated });
       }
     }
 

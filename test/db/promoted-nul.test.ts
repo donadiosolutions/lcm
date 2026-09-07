@@ -174,4 +174,64 @@ describe("SQLite promoted content NUL contract", () => {
     expect(store.search("needle", 10, ["required"]).map(({ id }) => id)).toEqual([eligible]);
     expect(store.getAll({ tags: ["required"] }).map(({ id }) => id)).toEqual([eligible]);
   });
+
+  it("does not decode a tag-eligible poison row beyond the no-iterator native FTS limit", () => {
+    const db = makeDb(true);
+    const baseStore = new PromotedStore(db, true);
+    const clean = baseStore.insert({ content: "needle clean", tags: ["required"], projectId: "project", confidence: 0.9 });
+    const poison = baseStore.insert({ content: "needle poison", tags: ["required"], projectId: "project", confidence: 0.1 });
+    const other = baseStore.insert({ content: "needle other", tags: ["other"], projectId: "project", confidence: 0.8 });
+    db.prepare("UPDATE promoted SET content = CAST(X'6E6565646C6500706F69736F6E' AS TEXT) WHERE id = ?").run(poison);
+
+    const noIteratorDb = {
+      exec: (sql: string) => db.exec(sql),
+      prepare: (sql: string) => {
+        const statement = db.prepare(sql);
+        if (sql.includes("json_valid")) {
+          return { get: () => ({ bad_valid: 1, json_kind: "array", each_type: "text" }) };
+        }
+        if (sql.includes("promoted_fts MATCH")) {
+          return {
+            all: () => [
+              { id: clean, content: "needle clean", content_type: "text", content_nul_marker: 0, tags: '["required"]', project_id: "project", session_id: null, confidence: 0.9, created_at: "2020", rank: -1 },
+              { id: poison, content: "needle", content_type: "text", content_nul_marker: 7, tags: '["required"]', project_id: "project", session_id: null, confidence: 0.1, created_at: "2020", rank: -1 },
+              { id: other, content: "needle other", content_type: "text", content_nul_marker: 0, tags: '["other"]', project_id: "project", session_id: null, confidence: 0.8, created_at: "2020", rank: -2 },
+            ],
+          };
+        }
+        return statement;
+      },
+    } as unknown as DatabaseSync;
+
+    const results = new PromotedStore(noIteratorDb, true).search("needle", 1, ["required"]);
+    expect(results.map(({ id }) => id)).toEqual([clean]);
+
+    const nativeTagDb = {
+      exec: (sql: string) => db.exec(sql),
+      prepare: (sql: string) => {
+        if (sql.includes("promoted_fts MATCH")) {
+          return {
+            all: () => [
+              { id: clean, content: "needle clean", content_type: "text", content_nul_marker: 0, tags: '["required"]', project_id: "project", session_id: null, confidence: 0.9, created_at: "2020", rank: -1 },
+              { id: other, content: "needle other", content_type: "text", content_nul_marker: 0, tags: '["other"]', project_id: "project", session_id: null, confidence: 0.8, created_at: "2020", rank: -2 },
+            ],
+          };
+        }
+        if (sql.includes("json_valid")) {
+          return { get: () => ({ bad_valid: 0, json_kind: "array", each_type: "text" }) };
+        }
+        return db.prepare(sql);
+      },
+    } as unknown as DatabaseSync;
+    expect(new PromotedStore(nativeTagDb, true).search("needle", 1, ["required"]).map(({ id }) => id)).toEqual([clean]);
+  });
+
+  it("does not decode an acted-upon legacy row excluded by findStale", () => {
+    const db = makeDb();
+    const store = new PromotedStore(db);
+    const id = seedLegacyNul(db, "poison-used");
+    store.insert({ content: "usage signal", tags: ["signal:memory_used", `memory_id:${id}`], projectId: "project" });
+
+    expect(store.findStale({ staleAfterDays: 1, staleSurfacingWithoutUseLimit: 2 })).toEqual([]);
+  });
 });
