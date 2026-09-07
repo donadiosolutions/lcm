@@ -90,18 +90,20 @@ link-count, type, containment, and size checks happen before LCM consumes the
 file contents. Symlinks, FIFOs, directories, oversized files, foreign-owner
 files, and multiply linked files are rejected.
 
-These checks also protect Claude all-project imports, SQLite batch-compaction
-discovery, and the daemon's periodic Claude transcript scan. An import silently
-skips rejected metadata for that run, the periodic daemon scan tries again at
-its next interval, and `lcm compact --all` reports the project metadata as
-unreadable or malformed while continuing with trusted siblings. Existing map
-entries remain unchanged. LCM does not repair rejected metadata automatically.
+These checks also protect the daemon's periodic Claude transcript scan, which
+skips rejected metadata and tries again at its next interval. Public
+`lcm import --all` and `lcm compact --all` use authenticated project bindings
+instead of enumerating metadata. They do not trust unbound metadata directories
+or report metadata-scan failures for this unused discovery path. Selected
+project storage failures remain visible. Existing map entries remain unchanged;
+LCM does not repair rejected metadata automatically.
 
 An atomic metadata publication can be rejected briefly while it has two links
 or while its descriptor metadata is changing. This is deliberate fail-closed
-behavior. Retry `lcm compact --all` after concurrent project activity settles;
-a persistently unsafe file must be restored as an owner-local, single-link
-`meta.json` from trusted project state before discovery can use it. Avoid
+behavior. Retry metadata-based recovery after concurrent project activity
+settles; a persistently unsafe file must be restored as an owner-local,
+single-link `meta.json` from trusted project state before recovery or the
+periodic scan can use it. Avoid
 sharing the file or its `cwd` value in diagnostics unless needed, because local
 paths can identify users, organizations, and repositories; see
 [Privacy and data handling](privacy.md).
@@ -124,6 +126,16 @@ and project-sensitive patterns into the primary checkout's local project.
 Exact duplicates are retained once. Per-source merge markers make retries and
 later-discovered generations idempotent, so each source generation is applied
 exactly once.
+
+Legacy split SQLite stores containing active native transcript records, message
+links, or ingest checkpoints currently block reconciliation. LCM checks every
+source before changing either project database, and rechecks while holding the
+source write lock. Empty native transcript tables remain compatible. The blocked
+journal explains the refusal; the source data stays in place and the project map
+is not folded. Preserve the legacy store until a supported native transcript
+merge is available; deleting its native rows to bypass the check would lose data.
+The canonical recovery archive is a separate transfer surface and does not enable
+this legacy merge.
 
 Exact same-UUID passive events with the same immutable envelope, compatible
 delivery state and checkpoints, and the same predecessor identity—the same
@@ -211,6 +223,33 @@ repair the refusal. Rerun `lcm project reconcile-worktrees` after replacement;
 or pattern merges may already have completed before this late metadata check,
 so a journal blocked from the planned phase does not promise rollback; the
 durable merge markers make the explicit retry resumable.
+
+Reconciliation journals and project-sensitive pattern files are also
+authenticated before LCM reads their contents. A journal must be a regular
+file, have exactly one hard link, and use an
+owner-only mode (`0400`, `0500`, `0600`, or `0700`). Listing reconciliation
+state checks only regular files with journal-shaped names and stops if one
+fails authentication. Non-regular entries, including symlinks, directories,
+and FIFOs, are currently skipped by listing. Pattern files that LCM reads must
+be regular files with exactly one hard link; an existing non-regular source
+pattern entry can currently be treated as absent before reaching that reader.
+On platforms where Node.js exposes `process.getuid()`, both
+readers also require the file to be owned by the current user; the ownership
+check is skipped when that API is unavailable. Historical pattern permissions,
+including `0644`, are accepted for reads. When reconciliation creates or
+rewrites a pattern file, the new file uses owner-only mode `0600`; a no-op
+merge leaves an existing pattern file and its permissions unchanged.
+
+When a pattern read fails authentication, it blocks that use and publication of
+the folded project map. A later archive check can fail after the same verified
+content was merged, and the journal keeps that operation resumable. An
+unauthenticated journal is not overwritten with blocked state, so its original
+inode and bytes remain available for inspection. After verifying the content,
+recover either file by creating a separate user-owned file, copying the
+verified bytes into it, and atomically replacing the refused path. Do not
+repair a hard-linked file with `chmod`: that changes the shared inode and every
+external link while leaving the unsafe link count unchanged. Rerun
+`lcm project reconcile-worktrees` after replacing the file.
 
 Atomic metadata replacement also keeps a publication or directory-topology
 failure primary when cleanup of its authenticated temporary file fails. The

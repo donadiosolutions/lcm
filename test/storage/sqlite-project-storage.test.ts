@@ -110,6 +110,21 @@ describe("SQLite factory maintenance admission", () => {
     return { homeDir, dbPath, factory, hold, identity: { id: projectId, canonical: homeDir } };
   }
 
+  it("fences a retained native transcript writer after maintenance entry", async () => {
+    const context = fixture();
+    try {
+      const project = await context.factory.openProject(context.identity);
+      const repository = project.nativeTranscripts!.repository;
+      const key = { machineId: "local", clientName: "codex", sourceLocator: "sessions/test.jsonl" };
+      expect(await repository.getCheckpoint(key)).toBeNull();
+      await context.hold();
+      const bytes = readFileSync(context.dbPath);
+      await expect(repository.ingestBatch({ ...key, expectedCheckpoint: null, records: [], quarantinedCount: 0,
+        checkpoint: { lastSourceOrdinal: 0, checkpoint: {} } })).rejects.toThrow();
+      expect(readFileSync(context.dbPath)).toEqual(bytes);
+      await project.close();
+    } finally { await context.factory.close(); rmSync(context.homeDir, { recursive: true, force: true }); }
+  });
   it.each(["openProject", "openExistingProject"] as const)("fences %s before SQLite initialization changes the source", async (operation) => {
     const context = fixture();
     try {

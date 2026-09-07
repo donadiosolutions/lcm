@@ -45,6 +45,7 @@ import {
   openPrivateDirectory,
   openPrivateDirectoryForCreation,
   openPrivateDirectoryIfExists,
+  OWNER_ONLY_FILE_MODES,
   readBoundedRegularFile,
   type PrivateDirectoryHandle,
 } from "./security-files.js";
@@ -480,6 +481,9 @@ function readJournal(path: string): ReconciliationJournal | null {
   const value = JSON.parse(readBoundedRegularFile(path, {
     allowedRoot: dirname(path),
     maxBytes: MAX_JOURNAL_BYTES,
+    expectedUid: process.getuid?.(),
+    allowedModes: OWNER_ONLY_FILE_MODES,
+    requireSingleLink: true,
   })) as Partial<ReconciliationJournal>;
   if (
     value.version !== RECONCILIATION_VERSION
@@ -713,6 +717,30 @@ function tableExists(db: DatabaseSync, table: string): boolean {
   return db.prepare(
     "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?",
   ).get(table) !== undefined;
+}
+
+function assertNoRuntimeNativeTranscriptState(db: DatabaseSync): void {
+  const nativeTables = db.prepare(
+    "SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') AND lower(name) GLOB 'runtime_native_*'",
+  ).iterate();
+  for (const table of nativeTables) {
+    if (db.prepare(`SELECT 1 FROM ${quoteIdentifier(String(table.name))} LIMIT 1`).get()) {
+      throw new Error("legacy SQLite native transcript state cannot be reconciled safely");
+    }
+  }
+}
+
+function preflightNativeTranscriptSources(sources: readonly WorktreeReconciliationSource[]): void {
+  for (const source of sources) {
+    const sourcePath = join(source.projectDir, "db.sqlite");
+    if (!isRegularFile(sourcePath)) continue;
+    const database = new DatabaseSync(sourcePath, { readOnly: true });
+    try {
+      assertNoRuntimeNativeTranscriptState(database);
+    } finally {
+      database.close();
+    }
+  }
 }
 
 function rows(db: DatabaseSync, sql: string, ...params: SQLInputValue[]): SqlRow[] {
@@ -1308,6 +1336,8 @@ function withSourceWriteFence<T>(
     source.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
     source.exec("BEGIN EXCLUSIVE");
     try {
+      // Recheck under the write lock: ingestion may race the read-only preflight.
+      if (kind === "project") assertNoRuntimeNativeTranscriptState(source);
       installSourceWriteFence(source, sourceHash, kind);
       const result = operation(source, () => {
         source.exec("COMMIT");
@@ -1886,6 +1916,8 @@ function mergePatterns(
   const sourceContent = readBoundedRegularFile(sourcePath, {
     allowedRoot: source.projectDir,
     maxBytes: MAX_PATTERN_BYTES,
+    expectedUid: process.getuid?.(),
+    requireSingleLink: true,
   });
   if (
     expected.patternsDigest === undefined
@@ -1899,7 +1931,12 @@ function mergePatterns(
   assertTarget();
   const targetExists = isRegularFile(targetPath);
   const target = targetExists
-    ? readBoundedRegularFile(targetPath, { allowedRoot: targetDir, maxBytes: MAX_PATTERN_BYTES })
+    ? readBoundedRegularFile(targetPath, {
+        allowedRoot: targetDir,
+        maxBytes: MAX_PATTERN_BYTES,
+        expectedUid: process.getuid?.(),
+        requireSingleLink: true,
+      })
     : "";
   assertTarget();
   const targetEffective = new Set(effectivePatterns(target));
@@ -1972,6 +2009,8 @@ function sourceComponentSnapshot(
             readBoundedRegularFile(patternsPath, {
               allowedRoot: source.projectDir,
               maxBytes: MAX_PATTERN_BYTES,
+              expectedUid: process.getuid?.(),
+              requireSingleLink: true,
             }),
           ),
         }
@@ -2177,6 +2216,8 @@ function assertArchivedPatternsMatch(
   const archivedContent = readBoundedRegularFile(archivedPatternsPath, {
     allowedRoot: archivedProjectDir,
     maxBytes: MAX_PATTERN_BYTES,
+    expectedUid: process.getuid?.(),
+    requireSingleLink: true,
   });
   if (
     expected.patternsDigest === undefined
@@ -2486,6 +2527,8 @@ export function reconcileWorktrees(
         eventsPath: projectEventsPath(hash, opts.homeDir),
       };
     });
+    // Admit every source before any source fencing, snapshot migration or target write.
+    preflightNativeTranscriptSources(sources);
     const journal: ReconciliationJournal = existingJournal ?? {
       version: RECONCILIATION_VERSION,
       targetHash,

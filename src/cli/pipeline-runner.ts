@@ -9,6 +9,8 @@ import { printSummary } from './render-summary.js';
 
 export interface PipelineRunnerOpts {
   state: ProgressState;
+  /** Destination for progress; callers emitting data on stdout use stderr. */
+  output?: Pick<NodeJS.WriteStream, "write" | "columns">;
   renderOpts: RenderOpts;
   /** Called once the runner has started (before session iteration begins) */
   onReady?: () => void;
@@ -30,6 +32,7 @@ export interface PipelineRunnerOpts {
  *   renderer.printSummary();
  */
 export class NinjaRenderer {
+  private readonly output: Pick<NodeJS.WriteStream, "write" | "columns">;
   private state: ProgressState;
   private opts: RenderOpts;
   private intervalId?: ReturnType<typeof setInterval>;
@@ -42,6 +45,7 @@ export class NinjaRenderer {
   private readonly onSignal?: (signal: 'SIGINT' | 'SIGTERM') => void;
 
   constructor(opts: PipelineRunnerOpts) {
+    this.output = opts.output ?? process.stdout;
     this.state = opts.state;
     this.opts = opts.renderOpts;
     this.onReady = opts.onReady;
@@ -55,7 +59,7 @@ export class NinjaRenderer {
 
     // Register SIGWINCH to update terminal width
     this.sigwinchHandler = () => {
-      this.opts.width = process.stdout.columns ?? 80;
+      this.opts.width = this.output.columns ?? 80;
     };
     process.on('SIGWINCH', this.sigwinchHandler);
 
@@ -78,7 +82,7 @@ export class NinjaRenderer {
 
     if (isTTY && !verbose) {
       // Emit blank lines to reserve space for the 3-line frame
-      process.stdout.write('\n\n\n');
+      this.output.write('\n\n\n');
       this.firstFrame = false;
 
       // 16 fps render loop
@@ -125,7 +129,7 @@ export class NinjaRenderer {
     const { isTTY, verbose } = this.opts;
     if (!isTTY || verbose) {
       const line = renderFrame(this.state, this.opts, 0);
-      if (line) process.stdout.write(line);
+      if (line) this.output.write(line);
     }
   }
 
@@ -133,9 +137,9 @@ export class NinjaRenderer {
   printSummary(): void {
     // In TTY non-verbose mode we need to move past the live frame
     if (this.opts.isTTY && !this.opts.verbose) {
-      process.stdout.write('\n');
+      this.output.write('\n');
     }
-    printSummary(this.state, this.opts);
+    printSummary(this.state, this.opts, this.output);
   }
 
   /** Update the render opts (e.g. after SIGWINCH) */
@@ -146,6 +150,6 @@ export class NinjaRenderer {
   private _writeFrame(): void {
     const frame = renderFrame(this.state, this.opts, this.firstFrame ? 0 : FRAME_LINES);
     this.firstFrame = false;
-    if (frame) process.stdout.write(frame);
+    if (frame) this.output.write(frame);
   }
 }

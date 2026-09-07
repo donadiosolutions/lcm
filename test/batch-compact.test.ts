@@ -1,19 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  chmodSync,
-  linkSync,
-  mkdirSync,
-  mkdtempSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { batchCompact, findUncompacted, formatLlmDiagnostic, runBatchWorkerPool } from "../src/batch-compact.js";
+import * as cliStorage from "../src/cli-storage.js";
+import * as daemonConfig from "../src/daemon/config.js";
 import { DaemonClient } from "../src/daemon/client.js";
 import { closeLcmConnection, getLcmConnection, getPoolStats } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
@@ -107,7 +101,142 @@ describe("batch compaction discovery", () => {
     else process.env.USERPROFILE = originalUserProfile;
   });
 
-  it("matches current-project filters through project-map aliases", () => {
+  it("discovers a persisted project binding without requiring redundant metadata", async () => {
+    const cwd = makeDir("compact-bound-without-metadata");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    rmSync(paths.metaPath);
+
+    expect(await findUncompacted(100, true, cwd)).toEqual([
+      expect.objectContaining({ cwd: paths.canonical, sessionId: "session-1" }),
+    ]);
+  });
+
+  it("skips a bound project whose SQLite database does not exist without creating it", async () => {
+    const cwd = makeDir("compact-bound-empty");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    for (const dryRun of [true, false]) {
+      expect(await batchCompact({ minTokens: 100, dryRun, port: 3737, cwd })).toEqual({
+        compacted: 0, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [],
+      });
+      expect(existsSync(paths.dbPath)).toBe(false);
+    }
+  });
+
+  it("leaves unmigrated SQLite schema and user version unchanged during preview", async () => {
+    const cwd = makeDir("compact-unmigrated-preview");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const db = new DatabaseSync(paths.dbPath);
+    db.exec("DROP TABLE session_ingest_log; PRAGMA user_version = 17");
+    const schema = db.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").all();
+    db.close();
+    expect(await findUncompacted(100, true, cwd)).toEqual([
+      expect.objectContaining({ sessionId: "session-1", messages: 9, tokens: 250 }),
+    ]);
+    const reopened = new DatabaseSync(paths.dbPath);
+    try {
+      expect(reopened.prepare("PRAGMA user_version").get()).toMatchObject({ user_version: 17 });
+      expect(reopened.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").all()).toEqual(schema);
+    } finally { reopened.close(); }
+    expect(getPoolStats().totalConnections).toBe(0);
+  });
+
+  it("counts paginated messages and keeps descending token priority", async () => {
+    const cwd = makeDir("compact-message-pages");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const db = new DatabaseSync(paths.dbPath);
+    db.prepare("INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)").run(2, "large");
+    insertMessages(db, 2, 501, 5010);
+    db.close();
+    expect(await findUncompacted(100, true, cwd)).toEqual([
+      expect.objectContaining({ sessionId: "large", messages: 501, tokens: 5010 }),
+      expect.objectContaining({ sessionId: "session-1", messages: 9, tokens: 250 }),
+    ]);
+  });
+
+  it("rejects symlinked databases during preview without reading the target", async () => {
+    const cwd = makeDir("compact-symlink-db");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    const target = join(homedir(), "external.sqlite");
+    seedConversation(target);
+    symlinkSync(target, paths.dbPath);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737, cwd })).toMatchObject({ failures: 1 });
+    expect(getPoolStats().totalConnections).toBe(0);
+  });
+
+  it("keeps progress on stderr and hides raw transport errors", async () => {
+    const cwd = makeDir("compact-private-output");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const canary = "postgresql://private-user:private-password@private-host/private-db SELECT secret";
+    vi.spyOn(DaemonClient.prototype, "post").mockRejectedValue(new Error(canary));
+    const stdout = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const progress: Array<Partial<ProgressState>> = [];
+    expect(await batchCompact({ minTokens: 100, dryRun: false, port: 3737, cwd,
+      onProgress: patch => progress.push(patch),
+    })).toMatchObject({ failures: 1 });
+    expect(stdout).not.toHaveBeenCalled();
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("compaction request failed"));
+    expect(JSON.stringify([stderr.mock.calls, progress])).not.toContain(canary);
+  });
+
+  it("excludes empty conversations and conversations below the token threshold", async () => {
+    const cwd = makeDir("compact-threshold");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const db = new DatabaseSync(paths.dbPath);
+    db.prepare("INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)").run(2, "empty");
+    db.close();
+    expect(await findUncompacted(251, true, cwd)).toEqual([]);
+  });
+
+  it("rejects identities changed or removed after enumeration before opening SQLite", async () => {
+    const cwd = makeDir("compact-rebound");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    vi.spyOn(cliStorage, "listCliProjects").mockResolvedValue([
+      { id: "0".repeat(64), canonical: cwd, aliases: [] },
+      { id: "1".repeat(64), canonical: makeDir("compact-removed"), aliases: [] },
+    ]);
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737 })).toMatchObject({ failures: 2 });
+    expect(output).toHaveBeenCalledWith(expect.stringContaining("project storage discovery failed"));
+    expect(getPoolStats().totalConnections).toBe(0);
+  });
+
+  it("rejects a changed backend selection before composing SQLite preview repositories", async () => {
+    const cwd = makeDir("compact-selection-change");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    vi.spyOn(cliStorage, "listCliProjects").mockResolvedValue([
+      { id: paths.id, canonical: cwd, aliases: [] },
+    ]);
+    const config = daemonConfig.loadDaemonConfig(join(homedir(), ".lcm", "config.json"));
+    vi.spyOn(daemonConfig, "loadDaemonConfig")
+      .mockReturnValueOnce(config)
+      .mockReturnValueOnce(config)
+      .mockReturnValue({ ...config, storage: { ...config.storage, backend: "postgresql" } });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737 })).toMatchObject({ failures: 1 });
+    expect(getPoolStats().totalConnections).toBe(0);
+  });
+
+  it("matches current-project filters through project-map aliases", async () => {
     const canonical = makeDir("compact-canonical");
     const alias = makeDir("compact-alias");
     const paths = projectPaths(canonical);
@@ -117,7 +246,7 @@ describe("batch compaction discovery", () => {
     addProjectAlias(alias, { canonical });
     const execSpy = vi.spyOn(DatabaseSync.prototype, "exec");
 
-    const conversations = findUncompacted(100, true, alias);
+    const conversations = await findUncompacted(100, true, alias);
 
     expect(conversations).toHaveLength(1);
     expect(conversations[0].cwd).toBe(paths.canonical);
@@ -128,11 +257,11 @@ describe("batch compaction discovery", () => {
     const victim = makeDir("compact-alias-victim");
     rmSync(alias, { recursive: true });
     symlinkSync(victim, alias, "dir");
-    expect(findUncompacted(100, true, alias)).toHaveLength(1);
-    expect(findUncompacted(100, true, victim)).toEqual([]);
+    expect(await findUncompacted(100, true, alias)).toHaveLength(1);
+    expect(await findUncompacted(100, true, victim)).toEqual([]);
   });
 
-  it("does not match a current-project filter that is unrelated to the map entry", () => {
+  it("does not match a current-project filter that is unrelated to the map entry", async () => {
     const canonical = makeDir("compact-unmatched");
     const unrelated = makeDir("compact-unrelated");
     const paths = projectPaths(canonical);
@@ -140,10 +269,27 @@ describe("batch compaction discovery", () => {
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }, null, 2) + "\n");
     seedConversation(paths.dbPath);
 
-    expect(findUncompacted(100, true, unrelated)).toEqual([]);
+    expect(await findUncompacted(100, true, unrelated)).toEqual([]);
   });
 
-  it("requires at least one raw message outside the manual fresh tail", () => {
+  it("discovers a linked Git worktree once using the shared canonical project", async () => {
+    const canonical = makeDir("compact-git-main");
+    const linked = join(homedir(), "compact-git-linked");
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: canonical });
+    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false",
+      "commit", "--allow-empty", "--signoff", "-qm", "fixture"], { cwd: canonical });
+    execFileSync("git", ["worktree", "add", "-q", "-b", "linked", linked], { cwd: canonical });
+    const paths = projectPaths(canonical);
+    ensureProjectDir(canonical);
+    seedConversation(paths.dbPath);
+    expect(projectPaths(linked).id).toBe(paths.id);
+    expect(await findUncompacted(100, true, linked)).toEqual([
+      expect.objectContaining({ cwd: canonical, projectDir: paths.dir, sessionId: "session-1" }),
+    ]);
+    expect(await findUncompacted(100, true)).toHaveLength(1);
+  });
+
+  it("requires at least one raw message outside the manual fresh tail", async () => {
     const protectedCwd = makeDir("compact-protected-tail");
     const protectedPaths = projectPaths(protectedCwd);
     ensureProjectDir(protectedCwd);
@@ -156,22 +302,22 @@ describe("batch compaction discovery", () => {
     writeFileSync(eligiblePaths.metaPath, JSON.stringify({ cwd: eligiblePaths.canonical }));
     seedConversation(eligiblePaths.dbPath, 9);
 
-    expect(findUncompacted(100, true, protectedCwd)).toEqual([]);
-    expect(findUncompacted(100, true, eligibleCwd)).toEqual([
+    expect(await findUncompacted(100, true, protectedCwd)).toEqual([]);
+    expect(await findUncompacted(100, true, eligibleCwd)).toEqual([
       expect.objectContaining({ cwd: eligiblePaths.canonical, messages: 9 }),
     ]);
   });
 
-  it("falls back to canonical comparison for legacy symlink metadata", () => {
+  it("discovers authenticated legacy hash metadata through canonical symlinks", async () => {
     const canonical = makeDir("compact-legacy-canonical");
     const legacyLink = join(homedir(), "compact-legacy-link");
     symlinkSync(canonical, legacyLink, "dir");
-    const projectDir = join(homedir(), ".lcm", "projects", "legacy-project");
+    const projectDir = join(homedir(), ".lcm", "projects", "a".repeat(64));
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(projectDir, "meta.json"), JSON.stringify({ cwd: legacyLink }));
     seedConversation(join(projectDir, "db.sqlite"));
 
-    expect(findUncompacted(100, true, canonical)).toHaveLength(1);
+    expect(await findUncompacted(100, true, canonical)).toHaveLength(1);
   });
 
   it("returns failures while continuing to compact later sessions", async () => {
@@ -183,7 +329,7 @@ describe("batch compaction discovery", () => {
     const post = vi.spyOn(DaemonClient.prototype, "post")
       .mockRejectedValueOnce(new Error("provider unavailable"))
       .mockResolvedValueOnce({ tokensBefore: 250, tokensAfter: 50 });
-    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const progress: Array<Partial<ProgressState>> = [];
 
@@ -209,14 +355,14 @@ describe("batch compaction discovery", () => {
     seedConversation(healthyPaths.dbPath);
 
     const corruptCwd = makeDir("compact-unreadable-project");
-    const corruptProjectDir = join(homedir(), ".lcm", "projects", "corrupt-project");
-    mkdirSync(corruptProjectDir, { recursive: true });
+    const corruptProjectDir = projectPaths(corruptCwd).dir;
+    ensureProjectDir(corruptCwd);
     writeFileSync(join(corruptProjectDir, "meta.json"), JSON.stringify({ cwd: corruptCwd }));
     writeFileSync(join(corruptProjectDir, "db.sqlite"), "not sqlite");
 
     const post = vi.spyOn(DaemonClient.prototype, "post")
       .mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const progress: Array<Partial<ProgressState>> = [];
@@ -241,7 +387,7 @@ describe("batch compaction discovery", () => {
       phaseErrors: [{
         phase: "Compact",
         target: corruptCwd,
-        message: expect.stringContaining("not a database"),
+        message: "project storage discovery failed",
       }],
     });
     expect(progress.at(-1)).toMatchObject({ completed: 1 });
@@ -251,13 +397,13 @@ describe("batch compaction discovery", () => {
 
   it("fails an all-unreadable scan without claiming there is nothing to compact", async () => {
     const corruptCwd = makeDir("compact-only-unreadable-project");
-    const corruptProjectDir = join(homedir(), ".lcm", "projects", "only-corrupt-project");
-    mkdirSync(corruptProjectDir, { recursive: true });
+    const corruptProjectDir = projectPaths(corruptCwd).dir;
+    ensureProjectDir(corruptCwd);
     writeFileSync(join(corruptProjectDir, "meta.json"), JSON.stringify({ cwd: corruptCwd }));
     writeFileSync(join(corruptProjectDir, "db.sqlite"), "not sqlite");
 
     const post = vi.spyOn(DaemonClient.prototype, "post");
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const progress: Array<Partial<ProgressState>> = [];
 
@@ -279,59 +425,30 @@ describe("batch compaction discovery", () => {
       phaseErrors: [{
         phase: "Compact",
         target: corruptCwd,
-        message: expect.stringContaining("not a database"),
+        message: "project storage discovery failed",
       }],
     }]);
     expect(log).not.toHaveBeenCalledWith("Nothing to compact — no sessions are currently eligible.");
     expect(error).toHaveBeenCalledWith("No sessions were compacted because project discovery failed.");
   });
 
-  it("reports missing, malformed, and empty project metadata as scan failures", async () => {
+  it("ignores directories without authenticated project bindings", async () => {
     const projectsDir = join(homedir(), ".lcm", "projects");
-    const fixtures: Array<{ name: string; metadata?: string }> = [
-      { name: "missing-metadata" },
-      { name: "malformed-metadata", metadata: "{" },
-      { name: "empty-metadata", metadata: "{}" },
-    ];
-    for (const fixture of fixtures) {
-      const projectDir = join(projectsDir, fixture.name);
-      mkdirSync(projectDir, { recursive: true });
+    for (const [index, metadata] of [undefined, "{", "{}"].entries()) {
+      const projectDir = join(projectsDir, String(index).repeat(64));
+      mkdirSync(projectDir, { recursive: true, mode: 0o700 });
       seedConversation(join(projectDir, "db.sqlite"));
-      if (fixture.metadata !== undefined) {
-        writeFileSync(join(projectDir, "meta.json"), fixture.metadata);
-      }
+      if (metadata !== undefined) writeFileSync(join(projectDir, "meta.json"), metadata);
     }
-
     const post = vi.spyOn(DaemonClient.prototype, "post");
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const progress: Array<Partial<ProgressState>> = [];
-
-    expect(findUncompacted(100, false)).toEqual([]);
-    expect(await batchCompact({
-      minTokens: 100,
-      dryRun: false,
-      port: 3737,
-      onProgress: patch => progress.push(patch),
-    })).toEqual({
-      compacted: 0,
-      unchanged: 0,
-      skipped: 0,
-      failures: 3,
-      compactedProjects: [],
+    expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737 })).toEqual({
+      compacted: 0, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [],
     });
     expect(post).not.toHaveBeenCalled();
-    expect(progress).toHaveLength(1);
-    expect(progress[0]?.total).toBe(0);
-    expect(progress[0]?.phaseErrors).toEqual(expect.arrayContaining([
-      { phase: "Compact", target: "missing-metadata", message: "project metadata is missing" },
-      { phase: "Compact", target: "malformed-metadata", message: "project metadata is unreadable or malformed" },
-      { phase: "Compact", target: "empty-metadata", message: "project metadata cwd must be a non-empty string" },
-    ]));
-    expect(log).not.toHaveBeenCalledWith("Nothing to compact — no sessions are currently eligible.");
   });
 
-  it("admits bounded metadata and rejects unsafe leaves before opening their databases", async () => {
+  it("uses authenticated bindings and ignores unsafe metadata leaves during discovery", async () => {
     const projectsDir = join(homedir(), ".lcm", "projects");
     const addProject = (name: string, cwd: string, metadata: string, validDb = false): string => {
       const projectDir = join(projectsDir, name);
@@ -344,11 +461,16 @@ describe("batch compaction discovery", () => {
     };
 
     const trustedCwd = makeDir("compact-trusted-metadata");
-    addProject("trusted-metadata", trustedCwd, JSON.stringify({ cwd: trustedCwd }), true);
+    ensureProjectDir(trustedCwd);
+    const trustedPaths = projectPaths(trustedCwd);
+    seedConversation(trustedPaths.dbPath);
     const exactCwd = makeDir("compact-exact-metadata");
     const exactMetadata = sizedProjectMetadata(exactCwd, MAX_PROJECT_METADATA_BYTES);
     expect(Buffer.byteLength(exactMetadata, "utf8")).toBe(MAX_PROJECT_METADATA_BYTES);
-    addProject("exact-metadata", exactCwd, exactMetadata, true);
+    ensureProjectDir(exactCwd);
+    const exactPaths = projectPaths(exactCwd);
+    writeFileSync(exactPaths.metaPath, exactMetadata);
+    seedConversation(exactPaths.dbPath);
 
     const hardlinkCwd = "/hardlink-compact-canary";
     const hardlinkMeta = addProject("hardlink-metadata", hardlinkCwd, JSON.stringify({ cwd: hardlinkCwd }));
@@ -371,7 +493,7 @@ describe("batch compaction discovery", () => {
     mkdirSync(join(directoryProject, "meta.json"), { recursive: true });
     writeFileSync(join(directoryProject, "db.sqlite"), "must not be opened");
 
-    expect(findUncompacted(100, true).map(conversation => conversation.cwd).sort())
+    expect((await findUncompacted(100, true)).map(conversation => conversation.cwd).sort())
       .toEqual([exactCwd, trustedCwd].sort());
 
     vi.spyOn(console, "log").mockImplementation(() => undefined);
@@ -384,17 +506,14 @@ describe("batch compaction discovery", () => {
       onProgress: patch => progress.push(patch),
     });
 
-    expect(result).toMatchObject({ failures: 4 });
-    expect(progress[0]?.phaseErrors).toEqual(expect.arrayContaining([
-      { phase: "Compact", target: "hardlink-metadata", message: "project metadata is unreadable or malformed" },
-      { phase: "Compact", target: "symlink-metadata", message: "project metadata is unreadable or malformed" },
-      { phase: "Compact", target: "oversized-metadata", message: "project metadata is unreadable or malformed" },
-      { phase: "Compact", target: "directory-metadata", message: "project metadata is unreadable or malformed" },
-    ]));
+    // The selected-storage path never reads metadata for discovery. Unbound
+    // unsafe leaves neither become targets nor generate metadata diagnostics.
+    expect(result).toMatchObject({ failures: 0 });
+    expect(progress.some(patch => (patch.phaseErrors?.length ?? 0) > 0)).toBe(false);
     expect(JSON.stringify(progress)).not.toMatch(/compact-canary/u);
   });
 
-  it("reports unsafe metadata through the existing cwd-filter failure path", async () => {
+  it("uses the cwd binding without reading unsafe discovery metadata", async () => {
     const cwd = makeDir("compact-filtered-unsafe-metadata");
     const paths = projectPaths(cwd);
     ensureProjectDir(cwd);
@@ -411,13 +530,12 @@ describe("batch compaction discovery", () => {
       port: 3737,
       cwd,
       onProgress: patch => progress.push(patch),
-    })).toMatchObject({ failures: 1 });
-    expect(progress[0]?.phaseErrors).toEqual([
-      { phase: "Compact", target: paths.id, message: "project metadata is unreadable or malformed" },
-    ]);
+    })).toMatchObject({ failures: 0 });
+    expect(progress.some(patch => (patch.phaseErrors?.length ?? 0) > 0)).toBe(false);
+    expect(await findUncompacted(100, true, cwd)).toEqual([expect.objectContaining({ cwd: paths.canonical })]);
   });
 
-  it("rejects FIFO metadata without blocking compaction discovery", async () => {
+  it("ignores unbound FIFO metadata without blocking compaction discovery", async () => {
     const projectDir = join(homedir(), ".lcm", "projects", "fifo-metadata");
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(projectDir, "db.sqlite"), "must not be opened");
@@ -447,19 +565,15 @@ describe("batch compaction discovery", () => {
         onProgress: patch => progress.push(patch),
       });
       expect(performance.now() - started).toBeLessThan(1000);
-      expect(result).toMatchObject({ failures: 1 });
-      expect(progress[0]?.phaseErrors).toEqual([{
-        phase: "Compact",
-        target: "fifo-metadata",
-        message: "project metadata is unreadable or malformed",
-      }]);
+      expect(result).toMatchObject({ failures: 0 });
+      expect(progress.some(patch => (patch.phaseErrors?.length ?? 0) > 0)).toBe(false);
     } finally {
       writer.kill("SIGKILL");
       await exited;
     }
   });
 
-  it("enforces metadata ownership and supports platforms without getuid", async () => {
+  it("does not consult metadata ownership during authenticated discovery", async () => {
     const cwd = makeDir("compact-uid-metadata");
     const paths = projectPaths(cwd);
     ensureProjectDir(cwd);
@@ -497,14 +611,14 @@ describe("batch compaction discovery", () => {
         };
       });
       const isolated = await import("../src/batch-compact.js");
-      expect(isolated.findUncompacted(100, true)).toEqual([]);
+      expect(await isolated.findUncompacted(100, true)).toEqual([expect.objectContaining({ cwd: paths.canonical })]);
 
       vi.doUnmock("node:fs");
       vi.resetModules();
       const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
       Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
       try {
-        expect(findUncompacted(100, true)).toEqual([
+        expect(await findUncompacted(100, true)).toEqual([
           expect.objectContaining({ cwd: paths.canonical }),
         ]);
       } finally {
@@ -517,67 +631,42 @@ describe("batch compaction discovery", () => {
     }
   });
 
-  it("reports mapped metadata failures for a cwd-filtered scan", async () => {
-    const cwd = makeDir("compact-filtered-missing-metadata");
+  it("deduplicates canonical and alias bindings during all-project discovery", async () => {
+    const cwd = makeDir("compact-dedup-canonical");
+    const alias = makeDir("compact-dedup-alias");
     const paths = projectPaths(cwd);
     ensureProjectDir(cwd);
     seedConversation(paths.dbPath);
-    rmSync(paths.metaPath);
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const progress: Array<Partial<ProgressState>> = [];
-
-    expect(await batchCompact({
-      minTokens: 100,
-      dryRun: false,
-      port: 3737,
-      cwd,
-      onProgress: patch => progress.push(patch),
-    })).toEqual({
-      compacted: 0,
-      unchanged: 0,
-      skipped: 0,
-      failures: 1,
-      compactedProjects: [],
-    });
-    expect(progress[0]?.phaseErrors).toEqual([
-      { phase: "Compact", target: paths.id, message: "project metadata is missing" },
+    addProjectAlias(alias, { canonical: cwd });
+    const aliasHash = "a".repeat(64);
+    const legacyDir = join(homedir(), ".lcm", "projects", aliasHash);
+    mkdirSync(legacyDir, { mode: 0o700 });
+    writeFileSync(join(legacyDir, "meta.json"), JSON.stringify({ cwd }));
+    seedConversation(join(legacyDir, "db.sqlite"));
+    expect(await findUncompacted(100, true)).toEqual([
+      expect.objectContaining({ cwd, projectDir: paths.dir, sessionId: "session-1" }),
     ]);
-    expect(log).not.toHaveBeenCalledWith("Nothing to compact — no sessions are currently eligible.");
   });
 
-  it("does not attribute unrelated metadata failures to a cwd-filtered scan", async () => {
-    const cwd = makeDir("compact-filtered-readable");
+  it("fails closed when the project map is malformed instead of trusting metadata", async () => {
+    const cwd = makeDir("compact-malformed-map");
     const paths = projectPaths(cwd);
     ensureProjectDir(cwd);
-    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
     seedConversation(paths.dbPath);
-
-    const unrelatedProject = join(homedir(), ".lcm", "projects", "unrelated-metadata");
-    mkdirSync(unrelatedProject, { recursive: true });
-    seedConversation(join(unrelatedProject, "db.sqlite"));
-    writeFileSync(join(unrelatedProject, "meta.json"), "{");
     writeFileSync(projectMapPath(), "{");
     clearProjectMapCache();
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const post = vi.spyOn(DaemonClient.prototype, "post");
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     const progress: Array<Partial<ProgressState>> = [];
-
-    expect(await batchCompact({
-      minTokens: 100,
-      dryRun: true,
-      port: 3737,
-      cwd,
+    expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737, cwd,
       onProgress: patch => progress.push(patch),
-    })).toEqual({
-      compacted: 0,
-      unchanged: 0,
-      skipped: 0,
-      failures: 0,
-      compactedProjects: [],
-    });
-    expect(progress).toEqual([{ total: 1 }, { completed: 1 }]);
-    expect(log).toHaveBeenCalledWith(expect.stringContaining("Found 1 uncompacted conversation"));
+    })).toEqual({ compacted: 0, unchanged: 0, skipped: 0, failures: 1, compactedProjects: [] });
+    expect(progress).toEqual([{ total: 0, phaseErrors: [
+      { phase: "Compact", target: cwd, message: "project discovery failed" },
+    ] }]);
+    expect(post).not.toHaveBeenCalled();
+    expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737 })).toMatchObject({ failures: 1 });
   });
 
   it("counts each successful session once and falls back to discovered input tokens", async () => {
@@ -591,7 +680,7 @@ describe("batch compaction discovery", () => {
     const post = vi.spyOn(DaemonClient.prototype, "post")
       .mockResolvedValueOnce({ tokensBefore: 250, tokensAfter: 250 })
       .mockResolvedValueOnce({ tokensBefore: 300, tokensAfter: 30 });
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const progress: Array<Record<string, unknown>> = [];
 
@@ -647,7 +736,7 @@ describe("batch compaction discovery", () => {
     const signal = new AbortController().signal;
     const post = vi.spyOn(DaemonClient.prototype, "post")
       .mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
-    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
     await batchCompact({
@@ -692,7 +781,7 @@ describe("batch compaction discovery", () => {
     const transportError = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
     vi.spyOn(DaemonClient.prototype, "post").mockRejectedValue(transportError);
     const onTransportFailure = vi.fn();
-    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
     await batchCompact({
@@ -707,7 +796,7 @@ describe("batch compaction discovery", () => {
     expect(onTransportFailure).toHaveBeenCalledWith(transportError);
   });
 
-  it("preserves a safe upstream failure message in batch output and progress", async () => {
+  it("bounds even safe-looking upstream Error messages to stderr and progress", async () => {
     const cwd = makeDir("compact-upstream-failure");
     const paths = projectPaths(cwd);
     ensureProjectDir(cwd);
@@ -715,7 +804,8 @@ describe("batch compaction discovery", () => {
     seedConversation(paths.dbPath);
     const safeMessage = "Codex compaction upstream request failed. Retry later or choose another available model.";
     vi.spyOn(DaemonClient.prototype, "post").mockRejectedValue(new Error(safeMessage));
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const progress: Array<Partial<ProgressState>> = [];
 
@@ -728,9 +818,11 @@ describe("batch compaction discovery", () => {
     });
 
     expect(result.failures).toBe(1);
-    expect(log).toHaveBeenCalledWith(expect.stringContaining(`FAILED (${safeMessage})`));
+    expect(stdout).not.toHaveBeenCalled();
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("FAILED (compaction request failed)"));
+    expect(JSON.stringify([stderr.mock.calls, progress])).not.toContain(safeMessage);
     expect(progress.find(patch => patch.errors)?.errors).toEqual([
-      { sessionId: "session-1", message: safeMessage },
+      { sessionId: "session-1", message: "compaction request failed" },
     ]);
   });
 
@@ -748,7 +840,7 @@ describe("batch compaction discovery", () => {
         tokensAfter: 120,
       })
       .mockResolvedValueOnce({ actionTaken: true, tokensBefore: 250, tokensAfter: 50 });
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const progress: Array<Partial<ProgressState>> = [];
 
@@ -775,7 +867,7 @@ describe("batch compaction discovery", () => {
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
     seedConversation(paths.dbPath);
     vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ actionTaken: false });
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const progress: Array<Partial<ProgressState>> = [];
 
@@ -803,7 +895,7 @@ describe("batch compaction discovery", () => {
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
     seedConversation(paths.dbPath);
     const post = vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue(response as never);
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const progress: Array<Partial<ProgressState>> = [];
 
@@ -835,7 +927,7 @@ describe("batch compaction discovery", () => {
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
     seedConversation(paths.dbPath);
     vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensAfter: 50 });
-    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
     await expect(batchCompact({ minTokens: 100, dryRun: false, port: 3737, cwd }))
@@ -850,7 +942,7 @@ describe("batch compaction discovery", () => {
     seedConversations(paths.dbPath);
     const post = vi.spyOn(DaemonClient.prototype, "post")
       .mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
-    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
     await batchCompact({
@@ -868,8 +960,8 @@ describe("batch compaction discovery", () => {
     }
   });
 
-  it("handles absent, malformed, summarized, and replay discovery entries", () => {
-    expect(findUncompacted(100, true)).toEqual([]);
+  it("handles absent, malformed, summarized, and replay discovery entries", async () => {
+    expect(await findUncompacted(100, true)).toEqual([]);
 
     const projectsDir = join(homedir(), ".lcm", "projects");
     mkdirSync(projectsDir, { recursive: true, mode: 0o700 });
@@ -908,10 +1000,10 @@ describe("batch compaction discovery", () => {
     ).run("summary-1", 1, "leaf", "summary", 10);
     db.close();
 
-    expect(findUncompacted(100, true, cwd)).toEqual([]);
-    expect(findUncompacted(100, true, cwd, true)).toHaveLength(1);
-    expect(findUncompacted(100, false, cwd, true)).toHaveLength(1);
-    expect(findUncompacted(100, true)).toHaveLength(0);
+    expect(await findUncompacted(100, true, cwd)).toEqual([]);
+    expect(await findUncompacted(100, true, cwd, true)).toHaveLength(1);
+    expect(await findUncompacted(100, false, cwd, true)).toHaveLength(1);
+    expect(await findUncompacted(100, true)).toHaveLength(0);
 
     const replayDb = new DatabaseSync(paths.dbPath);
     try {
@@ -923,7 +1015,7 @@ describe("batch compaction discovery", () => {
     } finally {
       replayDb.close();
     }
-    expect(findUncompacted(100, true, cwd, true)).toEqual([]);
+    expect(await findUncompacted(100, true, cwd, true)).toEqual([]);
 
     const condensationDb = new DatabaseSync(paths.dbPath);
     try {
@@ -944,7 +1036,7 @@ describe("batch compaction discovery", () => {
     } finally {
       condensationDb.close();
     }
-    expect(findUncompacted(100, true, cwd, true)).toHaveLength(1);
+    expect(await findUncompacted(100, true, cwd, true)).toHaveLength(1);
 
     const interruptedRunDb = new DatabaseSync(paths.dbPath);
     try {
@@ -954,7 +1046,7 @@ describe("batch compaction discovery", () => {
     } finally {
       interruptedRunDb.close();
     }
-    expect(findUncompacted(100, true, cwd, true)).toEqual([]);
+    expect(await findUncompacted(100, true, cwd, true)).toEqual([]);
 
     const chunkLimitDb = new DatabaseSync(paths.dbPath);
     try {
@@ -964,7 +1056,7 @@ describe("batch compaction discovery", () => {
     } finally {
       chunkLimitDb.close();
     }
-    expect(findUncompacted(100, true, cwd, true)).toEqual([]);
+    expect(await findUncompacted(100, true, cwd, true)).toEqual([]);
 
     const fullChunkDb = new DatabaseSync(paths.dbPath);
     try {
@@ -974,7 +1066,7 @@ describe("batch compaction discovery", () => {
     } finally {
       fullChunkDb.close();
     }
-    expect(findUncompacted(100, true, cwd, true)).toEqual([]);
+    expect(await findUncompacted(100, true, cwd, true)).toEqual([]);
 
     const condensedDb = new DatabaseSync(paths.dbPath);
     try {
@@ -984,7 +1076,7 @@ describe("batch compaction discovery", () => {
     } finally {
       condensedDb.close();
     }
-    expect(findUncompacted(100, true, cwd, true)).toHaveLength(1);
+    expect(await findUncompacted(100, true, cwd, true)).toHaveLength(1);
 
     const summaryOnlyDb = new DatabaseSync(paths.dbPath);
     try {
@@ -994,15 +1086,15 @@ describe("batch compaction discovery", () => {
     } finally {
       summaryOnlyDb.close();
     }
-    expect(findUncompacted(100, true, cwd, true)).toHaveLength(1);
+    expect(await findUncompacted(100, true, cwd, true)).toHaveLength(1);
 
     writeFileSync(projectMapPath(), "{");
     clearProjectMapCache();
-    expect(findUncompacted(100, true, "/unmapped", true)).toEqual([]);
+    expect(await findUncompacted(100, true, "/unmapped", true)).toEqual([]);
   }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
 
   it("reports empty, dry-run, skipped, and unknown-error batch outcomes", async () => {
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737 })).toEqual({
       compacted: 0,
       unchanged: 0,
@@ -1055,7 +1147,7 @@ describe("batch compaction discovery", () => {
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
     seedConversation(paths.dbPath);
     vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensBefore: 250 });
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
     expect(await batchCompact({ minTokens: 100, dryRun: false, port: 3737, cwd })).toEqual({
@@ -1076,7 +1168,7 @@ describe("batch compaction discovery", () => {
     ensureProjectDir(cwd);
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
     seedConversations(paths.dbPath, [1, 2, 3, 4, 5]);
-    const conversations = findUncompacted(100, true, cwd);
+    const conversations = await findUncompacted(100, true, cwd);
     const labels = new Map(conversations.map(conv => [
       conv.sessionId,
       `${conv.cwd} conv #${conv.conversationId} (${conv.messages} msgs, ${(conv.tokens / 1000).toFixed(1)}k tokens)`,
@@ -1101,7 +1193,7 @@ describe("batch compaction discovery", () => {
       return outcome;
     });
     const lines: string[] = [];
-    vi.spyOn(console, "log").mockImplementation((line?: unknown) => { lines.push(String(line)); });
+    vi.spyOn(console, "error").mockImplementation((line?: unknown) => { lines.push(String(line)); });
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
     const pending = batchCompact({
@@ -1133,13 +1225,13 @@ describe("batch compaction discovery", () => {
       `${labels.get("session-2")} done`,
       `${labels.get("session-3")} unchanged (No action)`,
       `${labels.get("session-4")} skipped (already in progress)`,
-      `${labels.get("session-5")} FAILED (provider unavailable)`,
+      `${labels.get("session-5")} FAILED (compaction request failed)`,
     ]));
     expect(lines).not.toEqual(expect.arrayContaining([
       " done",
       " skipped (already in progress)",
       " unchanged (No action)",
-      " FAILED (provider unavailable)",
+      " FAILED (compaction request failed)",
     ]));
   });
 
@@ -1152,7 +1244,7 @@ describe("batch compaction discovery", () => {
     const label = `${paths.canonical} conv #1 (9 msgs, 0.3k tokens)`;
     vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
     const lines: string[] = [];
-    vi.spyOn(console, "log").mockImplementation((line?: unknown) => { lines.push(String(line)); });
+    vi.spyOn(console, "error").mockImplementation((line?: unknown) => { lines.push(String(line)); });
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
     await batchCompact({ minTokens: 100, dryRun: false, port: 3737, cwd, verbose: true });
@@ -1173,7 +1265,7 @@ describe("batch compaction discovery", () => {
     writeFileSync(secondPaths.metaPath, JSON.stringify({ cwd: secondPaths.canonical }));
     seedConversation(secondPaths.dbPath);
 
-    const expectedProjectOrder = [...new Set(findUncompacted(100, true).map(conv => conv.cwd))];
+    const expectedProjectOrder = [...new Set((await findUncompacted(100, true)).map(conv => conv.cwd))];
     expect(expectedProjectOrder).toEqual(expect.arrayContaining([
       firstPaths.canonical,
       secondPaths.canonical,
@@ -1189,7 +1281,7 @@ describe("batch compaction discovery", () => {
       await releases[index]!.pending;
       return { tokensBefore: 250, tokensAfter: 50 };
     });
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const progress: Array<Partial<ProgressState>> = [];
 
@@ -1238,7 +1330,7 @@ describe("batch compaction discovery", () => {
       await releases[index]!.pending;
       return { tokensBefore: 250, tokensAfter: 50 };
     });
-    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
     const pending = batchCompact({

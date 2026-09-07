@@ -27,6 +27,8 @@ import { BackendPublicationCoordinator, withBackendPublicationAppendBarrierAsync
 import { inspectAuthenticatedSqliteMigrationSnapshot } from "../../src/migration/queue-evidence.js";
 import { assertStorageBackendPublication } from "../../src/storage/backend.js";
 import { readMigrationReceiptEvidence } from "../../src/migration/receipts.js";
+import { PORTABLE_LIMITS, PORTABLE_RECORD_DOMAIN_ORDER, canonicalSha256, createPortableRecordStream,
+  openSqlitePortableSource, type PortableRecordValueByDomain } from "@donadiosolutions/lcm/storage/portable";
 import { closeLcmConnection } from "../../src/db/connection.js";
 
 beforeAll(assertHarnessReady);
@@ -80,36 +82,95 @@ describe("SQLite migration enrollment against PostgreSQL 18", () => {
         const config = loadDaemonConfig(join(lcm, "config.json"));
         expect(config.storage.backend).toBe("sqlite");
         expect(await promoteEventsForCwd(config, cwd)).toMatchObject({ promoted: 1, skipped: 1, errors: 0 });
-        await appendLocalHookEvents({ cwd, sessionId: "pending", sourceHook: "SessionStart", events: [
-          { type: "decision", category: "decision", data: "Retain this exact pending input", priority: 1 },
-        ] });
-        const sourceBytes = readFileSync(join(projectDir, "db.sqlite"));
         const outboxPath = join(lcm, "events", `${local.id}.db`);
-        const queueBytes = readFileSync(outboxPath);
         const unused = async (): Promise<never> => { throw new Error("v2 driver must not run"); };
         const driver: BackendPublicationDriver = {
           observeLocalState: unused, publishProjectMap: unused, publishConfig: unused,
           restoreConfig: unused, restoreProjectMap: unused,
         };
-        const snapshot = await withBackendPublicationAppendBarrierAsync(root, async (token) => {
+        const entered = await withBackendPublicationAppendBarrierAsync(root, async (token) => {
           const authority = authenticateSqliteMigrationSource(cwd, root, token);
           const expectedSourceBytes = await authenticateSqliteMigrationSourceBytes(authority, { homeDir: root, lockToken: token });
           const held = await new BackendPublicationCoordinator({ homeDir: root, driver }).enterMaintenance({
             publicationId: "pg-enrollment-generation", generationId: "pg-enrollment-generation",
             sourceSelectionSha256: authority.sourceSelectionSha256,
             queueEvidenceSha256: expectedSourceBytes.checksumSha256,
-            roster: [{ machineId: result.identity.machineId, queueCutoff: "0000000000000000002", evidenceSha256: expectedSourceBytes.checksumSha256 }],
+            roster: [{ machineId: result.identity.machineId, queueCutoff: "0000000000000000001", evidenceSha256: expectedSourceBytes.checksumSha256 }],
           }, token);
-          return captureAuthenticatedSqliteMigrationSource(authority, {
-            homeDir: root, generationId: held.generationId, maintenanceChecksumSha256: held.checksumSha256,
-            expectedSourceBytes, lockToken: token,
-          });
+          return { held, expectedSourceBytes };
         });
+        // The hold survives returning from its original barrier. A real hook
+        // appends before a fresh coordinator and authority resume capture.
+        await appendLocalHookEvents({ cwd, sessionId: "pending", sourceHook: "SessionStart", events: [
+          { type: "decision", category: "decision", data: "Retain this exact pending input", priority: 1 },
+        ] });
+        const restarted = new BackendPublicationCoordinator({ homeDir: root, driver });
+        expect(restarted.inspectMaintenance()).toEqual(entered.held);
+        const authority = await withBackendPublicationAppendBarrierAsync(root, async (token) => authenticateSqliteMigrationSource(cwd, root, token));
+        const sourceBytes = readFileSync(join(projectDir, "db.sqlite"));
+        const queueBytes = readFileSync(outboxPath);
+        const snapshot = await captureAuthenticatedSqliteMigrationSource(authority, {
+          homeDir: root, generationId: entered.held.generationId, maintenanceChecksumSha256: entered.held.checksumSha256,
+          expectedSourceBytes: entered.expectedSourceBytes,
+        });
+        expect(snapshot.artifact.maintenanceChecksumSha256).not.toBe(entered.held.checksumSha256);
         expect(snapshot.receiptReference).toMatchObject({ machineId: result.identity.machineId, queueCutoff: "0000000000000000002" });
         expect(snapshot.pages).toHaveLength(1);
         const page = JSON.parse(readFileSync(join(lcm, "migration-evidence", "pg-enrollment-generation", snapshot.pages[0]!.name), "utf8"));
         expect(page.records.map((record: { disposition: string }) => record.disposition)).toEqual(["represented", "represented", "retained"]);
         expect(await inspectAuthenticatedSqliteMigrationSnapshot("pg-enrollment-generation", root)).toEqual(snapshot);
+        const artifact = snapshot.artifact;
+        const artifactDirectory = join(lcm, "migration-snapshots", "generations", artifact.generationId);
+        const projectFile = artifact.roles.find((role) => role.role === "project")!.normalizedMain;
+        const eventsFile = artifact.roles.find((role) => role.role === "passive-events")!.normalizedMain;
+        const projectCapturePath = join(artifactDirectory, projectFile.relativePath);
+        const capturedProject = new DatabaseSync(projectCapturePath, { readOnly: true });
+        try {
+          expect(readMigrationReceiptEvidence(capturedProject, authority.physicalProjectId,
+            authority.machineIdentity.machineId).receipts.map((receipt) => receipt.outcome)).toEqual(["applied", "no-effect"]);
+        } finally { capturedProject.close(); }
+        const identityFacts = {
+          sourceLocalProjectId: authority.physicalProjectId,
+          machines: [authority.machineIdentity],
+          aliases: [authority.canonicalPath, ...authority.aliases].map((path) => ({
+            machineIdentityKey: authority.machineIdentity.identityKey, path, normalizedPath: path,
+          })),
+        };
+        // Consume the accepted package export, using the authenticated artifact
+        // hashes and actual receipt-bearing captures, never live source paths.
+        const portableSource = await openSqlitePortableSource({
+          databasePath: projectCapturePath, expectedFileSha256: projectFile.sha256,
+          projectIdentity: authority.projectIdentity, sourceLocalProjectId: authority.physicalProjectId,
+          identityFacts, expectedFactsSha256: canonicalSha256(identityFacts), machineIdentityKey: authority.machineIdentity.identityKey,
+          capturedSidecars: {
+            events: { databasePath: join(artifactDirectory, eventsFile.relativePath), expectedFileSha256: eventsFile.sha256,
+              machineIdentityKey: authority.machineIdentity.identityKey },
+            // This isolated fixture creates no separate instruction-cache DB.
+            instructions: { absent: true, evidenceSha256: snapshot.checksumSha256 },
+          },
+          capturedAt: artifact.capturedAt.replace(/\.(\d{3})Z$/, (_match, milliseconds: string) => `.${milliseconds}000Z`),
+          scratchParent: root,
+        });
+        const stream = await createPortableRecordStream(portableSource);
+        try {
+          const manifest = stream.describe();
+          expect(manifest.domains.map(({ domain }) => domain)).toEqual(PORTABLE_RECORD_DOMAIN_ORDER);
+          expect(manifest.domains.find(({ domain }) => domain === "promoted-memories")?.recordCount).toBe(1);
+          expect(manifest.domains.find(({ domain }) => domain === "passive-events")?.recordCount).toBe(3);
+          for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
+            const batch = await stream.readBatch({ domain, maxRecords: PORTABLE_LIMITS.maxBatchRecords, maxBytes: PORTABLE_LIMITS.maxBatchBytes });
+            expect(batch.complete).toBe(true);
+            expect(batch.records).toHaveLength(manifest.domains.find((entry) => entry.domain === domain)!.recordCount);
+            expect(await stream.verify(batch.checkpoint)).toMatchObject({ authoritative: true, complete: true, matchesManifestBoundary: true });
+            if (domain === "passive-events") {
+              const events = batch.records.map((record) => record.value as PortableRecordValueByDomain["passive-events"]);
+              expect(events.map((event) => ({ sequence: event.machineSequence.$integer, disposition: event.disposition }))
+                .sort((left, right) => Number(left.sequence) - Number(right.sequence))).toEqual([
+                { sequence: "0", disposition: "applied" }, { sequence: "1", disposition: "applied" }, { sequence: "2", disposition: "pending" },
+              ]);
+            }
+          }
+        } finally { await stream.close(); }
         expect(readFileSync(join(projectDir, "db.sqlite"))).toEqual(sourceBytes);
         expect(readFileSync(outboxPath)).toEqual(queueBytes);
         // Postcutoff hooks stay durable while ordinary source consumers are fenced.

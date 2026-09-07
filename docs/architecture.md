@@ -32,8 +32,10 @@ Explicit embedded callers use the curated
 production factory and its minimum configuration/result contracts while
 keeping runtime internals, migrators, and deterministic testing hooks private.
 
-The native-transcript adapter remains separate because transcript import is an
-explicit backfill seam rather than a `ProjectStorage` repository. Normal daemon
+The native-transcript adapter is exposed as an explicit `ProjectStorage`
+capability. Its backfill owns raw-record, message-link, and checkpoint batch
+transactions after the parsed-message transaction commits. Native retries
+therefore run even when all parsed messages already exist. Normal daemon
 and MCP composition now select the verified PostgreSQL factory when the
 published backend is explicitly `postgresql`. A valid terminal publication
 witness, registered machine, and exact project binding are required before a
@@ -68,10 +70,12 @@ The native-transcript repository adds immutable sanitized client-native
 records, exact message provenance, atomic checkpoint accounting, and
 idempotent ingest-key conflict handling. It intentionally exposes no payload
 update or deletion operation. Embedded backfill code receives
-`NativeTranscriptRepository` explicitly; PostgreSQL callers construct
-`PostgreSqlNativeTranscriptRepository`. The repository is not exposed through
-`ProjectStorage`. The production PostgreSQL factory, runtime, migration
-runner, identity repository, and isolated test-database lease support the
+`NativeTranscriptRepository` explicitly; both production project factories
+expose the repository and an exact session-message snapshot through
+`ProjectStorage.nativeTranscripts`. SQLite stores active native records in its
+project database, separately from immutable canonical recovery archives. The
+production PostgreSQL factory, runtime, migration runner, identity repository,
+and isolated test-database lease support the
 daemon's selected project-storage routes. CLI/import-export and portable
 transfer remain #618-owned. Aggregate stats, status, pool diagnostics, and
 doctor use a separate read-only diagnostic path with classified outcomes and

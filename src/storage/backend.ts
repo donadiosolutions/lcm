@@ -12,11 +12,11 @@ export type StorageBackendSelection = {
   homeDir?: string;
 };
 
-export type SelectedStorageBackend = { backend: "sqlite" };
+export type SelectedStorageBackend = { backend: StorageBackend };
 
 export class StorageBackendUnavailableError extends Error {
   constructor(backend: "postgresql") {
-    super(`The ${backend} storage backend is not available in this release; use storage.backend \"sqlite\" until PostgreSQL repository support lands.`);
+    super(`This operation is not available for the ${backend} storage backend.`);
     this.name = "StorageBackendUnavailableError";
   }
 }
@@ -59,8 +59,7 @@ export function assertStorageBackendPublication(
 /** Select the configured implementation after the caller's required preflight. */
 export function selectStorageBackend(config: StorageBackendSelection): SelectedStorageBackend {
   assertStorageBackendPublication(config);
-  if (config.backend === "postgresql") throw new StorageBackendUnavailableError(config.backend);
-  return { backend: "sqlite" };
+  return { backend: config.backend };
 }
 
 /** Select storage using the publication scope authenticated by a canonical config path. */

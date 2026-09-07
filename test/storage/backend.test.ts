@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   selectStorageBackend,
   selectStorageBackendForConfig,
@@ -9,6 +9,13 @@ import {
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 describe("storage backend selection", () => {
+  it("selects admitted PostgreSQL without a staging refusal", async () => {
+    const publication = await import("../../src/storage/backend-publication.js");
+    const admission = vi.spyOn(publication, "assertBackendPublicationConsumerAccess").mockReturnValue(undefined);
+    try {
+      expect(selectStorageBackend({backend:"postgresql"})).toEqual({backend:"postgresql"});
+    } finally { admission.mockRestore(); }
+  });
   it("selects SQLite", () => {
     expect(selectStorageBackend({ backend: "sqlite" })).toEqual({ backend: "sqlite" });
   });

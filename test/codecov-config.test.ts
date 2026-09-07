@@ -41,7 +41,7 @@ const expectedComponents = [
   {
     component_id: "unit-cli",
     name: "Unit - CLI",
-    paths: ["bin/", "src/cli/", "^src/cli-help\\.ts$"],
+    paths: ["bin/", "src/cli/", "^src/cli-help\\.ts$", "^src/cli-storage\\.ts$"],
   },
   {
     component_id: "unit-installation",
@@ -104,9 +104,10 @@ const expectedComponents = [
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
       // Error sanitization, including #893 adjacent-path, #903 prefixed
-      // nested-file, #924 embedded-quote authority, #1010 pathless-tail
-      // bracket redaction, #1060 adjacent nested-file scheme preservation,
-      // and #1117 glued file-authority handling, remains daemon-core-owned.
+      // nested-file, #924 embedded-quote, #925/#1076 quoted-authority,
+      // quoted/root-only backslash handoff, #1010 pathless-tail brackets,
+      // #1060 adjacent nested-file schemes, #1117 glued authorities, and
+      // #1128 active file-URL own-query backslash paths remain daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -140,6 +141,9 @@ const expectedComponents = [
     // #898 applies required promoted tags before the caller result maximum while retaining local-persistence ownership.
     // #898's guarded dual-JSON eligibility keeps this search in the same owner.
     // #989 retains event-sidecar parent authentication in this owner.
+    // #1082 keeps SQLite promoted-content NUL admission and replay guards in
+    // local persistence; this change does not alter component ownership.
+    // #618 optional receipt schema admission stays local-persistence-owned.
     paths: ["src/db/", "src/storage/sqlite/", "src/store/"],
   },
   {
@@ -161,8 +165,12 @@ const expectedComponents = [
       "^src/storage/home-lock-topology\\.ts$",
       "^src/storage/identity-context\\.ts$",
       "^src/storage/index\\.ts$",
+      // Curated portable package API remains storage-abstractions-owned.
+      "^src/storage/portable\\.ts$",
       "^src/storage/portable-record\\.ts$",
       "^src/storage/portable-record-stream\\.ts$",
+      "^src/storage/portable-transfer\\.ts$",
+      "^src/storage/portable-index\\.ts$",
       "^src/storage/postgresql/project-storage\\.ts$",
     ],
   },
@@ -185,7 +193,7 @@ const expectedComponents = [
     component_id: "unit-transcripts-import",
     name: "Unit - Transcripts and Import",
     paths: [
-      // #1106 keeps all-project metadata discovery within this import owner.
+      // #1106 bounded custom-directory metadata stays within this import owner.
       "^src/codex-transcript\\.ts$",
       "^src/import-summary\\.ts$",
       "^src/import\\.ts$",
@@ -212,7 +220,7 @@ const expectedComponents = [
     component_id: "unit-compaction-summarization",
     name: "Unit - Compaction and Summarization",
     paths: [
-      // #1106 keeps batch metadata discovery within this compaction owner.
+      // #618 authenticated batch discovery remains within this compaction owner.
       "^src/batch-compact\\.ts$",
       "^src/compaction\\.ts$",
       "^src/large-files\\.ts$",
@@ -222,6 +230,7 @@ const expectedComponents = [
   {
     component_id: "unit-promotion",
     name: "Unit - Promotion",
+    // #1153 rank-independent exact deduplication remains promotion-owned.
     paths: ["src/promotion/"],
   },
   {
@@ -235,6 +244,7 @@ const expectedComponents = [
       "^src/codex-project-resolution\\.ts$",
       "^src/git-project\\.ts$",
       "^src/machine-identity\\.ts$",
+      // #618 knowledge provenance scoping remains owned by project/worktree operations.
       "^src/portable-knowledge\\.ts$",
       // #1049 keeps project metadata owner and single-link admission in this
       // existing component; no taxonomy, status, or policy change.
@@ -244,6 +254,8 @@ const expectedComponents = [
       // #1048 keeps target metadata leaf authentication in this owner.
       // #1069 preserves completed reconciliation evidence after retained
       // directory cleanup failures in this existing component.
+      // #1107 and #1109 keep pattern and journal leaf authentication in this
+      // existing component; no taxonomy, status, or policy change.
       // #1059 keeps retained journal-parent publication in this existing owner.
       // #1087 bounds canonical metadata publication in this existing owner.
       // #1091 preserves completion evidence across publication failures here.
@@ -280,7 +292,18 @@ const expectedComponents = [
       "^src/storage/postgresql/factory\\.ts$",
       "^src/storage/postgresql/index\\.ts$",
       "^src/storage/postgresql/runtime\\.ts$",
+      "^src/storage/postgresql/snapshot-session\\.ts$",
       "^src/storage/postgresql\\.ts$",
+    ],
+  },
+  {
+    component_id: "integration-postgresql-portable",
+    name: "Integration - PostgreSQL Portable Transfer",
+    paths: [
+      // #618 canonical self-provenance stays in PostgreSQL portable transfer.
+      "^src/storage/postgresql/portable-source\\.ts$",
+      "^src/storage/postgresql/portable-destination\\.ts$",
+      "^src/storage/postgresql/portable-mapping\\.ts$",
     ],
   },
   {
@@ -459,7 +482,7 @@ function forbiddenKeysIn(value: unknown, location = "config"): string[] {
 }
 
 describe("Codecov configuration", () => {
-  test("matches the literal 30-component ownership contract", () => {
+  test("matches the literal 31-component ownership contract", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -481,7 +504,7 @@ describe("Codecov configuration", () => {
     const componentNames = components.map((component) => component.name);
     const ownershipPaths = components.flatMap((component) => component.paths);
 
-    expect(components).toHaveLength(30);
+    expect(components).toHaveLength(31);
     expect(new Set(componentIds).size).toBe(componentIds.length);
     expect(new Set(componentNames).size).toBe(componentNames.length);
     expect(new Set(ownershipPaths).size).toBe(ownershipPaths.length);
@@ -490,7 +513,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(220);
+    expect(productionFiles).toHaveLength(236);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -520,7 +543,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(220);
+    expect(ownershipCounts.size).toBe(236);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106 files in their intended components", () => {
@@ -602,7 +625,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
       ["src/daemon/routes/recent.ts", "unit-daemon-routes"],
       ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
-      // #1106 keeps its three discovery readers in their established owners.
+      // #1106/#618 keep discovery-related files in their established owners.
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/import.ts", "unit-transcripts-import"],
       ["src/batch-compact.ts", "unit-compaction-summarization"],

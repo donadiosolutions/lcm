@@ -16,6 +16,7 @@ component_management:
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
+        - "^src/cli-storage\\.ts$"
     - component_id: "unit-installation"
       name: "Unit - Installation"
       paths:
@@ -97,9 +98,10 @@ component_management:
         - "^src/daemon/proxy-manager\\.ts$"
         - "^src/daemon/remediation\\.ts$"
         # Error sanitization, including #893 adjacent-path, #903 prefixed
-        # nested-file, #924 embedded-quote authority, #1010 pathless-tail
-        # bracket redaction, #1060 adjacent nested-file scheme preservation,
-        # and #1117 glued file-authority handling, remains daemon-core-owned.
+        # nested-file, #924 embedded-quote, #925/#1076 quoted-authority,
+        # quoted/root-only backslash handoff, #1010 pathless-tail brackets,
+        # #1060 adjacent nested-file schemes, #1117 glued authorities, and
+        # #1128 active file-URL own-query backslash paths remain daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -168,8 +170,12 @@ component_management:
         # opened-identity fencing local-persistence-owned.
         # #1020 keeps UTC message timestamp mapping in conversation-store-owned
         # local persistence paths.
+        # #1082 keeps SQLite promoted-content NUL admission and replay guards
+        # in local persistence; this change does not alter component ownership.
         # #1084/#1085/#1092 keep SQLite UTC timestamp parsing in this owner.
         - "src/db/"
+        # Captured UTF-8 decoding and immutable-file authority remain local-persistence-owned.
+        # #618 optional receipt schema admission stays local-persistence-owned.
         - "src/storage/sqlite/"
         - "src/store/"
     - component_id: "unit-storage-abstractions"
@@ -198,9 +204,14 @@ component_management:
         - "^src/storage/home-lock-topology\\.ts$"
         - "^src/storage/identity-context\\.ts$"
         - "^src/storage/index\\.ts$"
+        # Curated portable package API remains storage-abstractions-owned.
+        - "^src/storage/portable\\.ts$"
         - "^src/storage/portable-record\\.ts$"
         # The #763 manifest and #816 checkpoint negative-zero taxonomies remain storage-abstractions-owned.
         - "^src/storage/portable-record-stream\\.ts$"
+        # #618 shared canonical transfer and bounded validation index.
+        - "^src/storage/portable-transfer\\.ts$"
+        - "^src/storage/portable-index\\.ts$"
         - "^src/storage/postgresql/project-storage\\.ts$"
     - component_id: "unit-migration-cutover"
       name: "Unit - Migration and Cutover"
@@ -219,7 +230,7 @@ component_management:
     - component_id: "unit-transcripts-import"
       name: "Unit - Transcripts and Import"
       paths:
-        # #1106 keeps all-project metadata discovery within this import owner.
+        # #1106 bounded custom-directory metadata stays within this import owner.
         - "^src/codex-transcript\\.ts$"
         - "^src/import-summary\\.ts$"
         - "^src/import\\.ts$"
@@ -244,7 +255,7 @@ component_management:
     - component_id: "unit-compaction-summarization"
       name: "Unit - Compaction and Summarization"
       paths:
-        # #1106 keeps batch metadata discovery within this compaction owner.
+        # #618 authenticated batch discovery remains within this compaction owner.
         - "^src/batch-compact\\.ts$"
         - "^src/compaction\\.ts$"
         - "^src/large-files\\.ts$"
@@ -252,6 +263,7 @@ component_management:
     - component_id: "unit-promotion"
       name: "Unit - Promotion"
       paths:
+        # #1153 rank-independent exact deduplication remains promotion-owned.
         - "src/promotion/"
     - component_id: "unit-project-worktrees"
       name: "Unit - Projects and Worktrees"
@@ -266,6 +278,7 @@ component_management:
         - "^src/git-project\\.ts$"
         - "^src/machine-identity\\.ts$"
         # #889 keeps private import metadata publication in this owner.
+        # #618 knowledge provenance scoping remains owned by project/worktree operations.
         - "^src/portable-knowledge\\.ts$"
         # #1049 keeps project metadata owner and single-link admission in this
         # existing component; no taxonomy, status, or policy change.
@@ -275,6 +288,8 @@ component_management:
         # #1048 keeps target metadata leaf authentication in this owner.
         # #1069 preserves completed reconciliation evidence after retained
         # directory cleanup failures in this existing component.
+        # #1107 and #1109 keep pattern and journal leaf authentication in this
+        # existing component; no taxonomy, status, or policy change.
         # #1059 keeps retained journal-parent publication in this existing owner.
         # #1087 bounds canonical metadata publication in this existing owner.
         # #1091 preserves completion evidence across publication failures here.
@@ -319,7 +334,15 @@ component_management:
         - "^src/storage/postgresql/factory\\.ts$"
         - "^src/storage/postgresql/index\\.ts$"
         - "^src/storage/postgresql/runtime\\.ts$"
+        - "^src/storage/postgresql/snapshot-session\\.ts$"
         - "^src/storage/postgresql\\.ts$"
+    - component_id: "integration-postgresql-portable"
+      name: "Integration - PostgreSQL Portable Transfer"
+      paths:
+        # #618 canonical self-provenance stays in PostgreSQL portable transfer.
+        - "^src/storage/postgresql/portable-source\\.ts$"
+        - "^src/storage/postgresql/portable-destination\\.ts$"
+        - "^src/storage/postgresql/portable-mapping\\.ts$"
     - component_id: "integration-postgresql-schema"
       name: "Integration - PostgreSQL Schema"
       paths:

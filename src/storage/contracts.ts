@@ -403,6 +403,11 @@ export type TransactionRepositories = ProjectRepositories & Readonly<{
 }>;
 
 export interface ProjectStorage extends ProjectRepositories {
+  /** Native imports own their checkpoint transactions outside parsed-message transactions. */
+  readonly nativeTranscripts?: {
+    readonly machineId: string;
+    readonly repository: NativeTranscriptRepository & NativeTranscriptMessageSnapshotRepository;
+  };
   readonly backend: StorageBackendName;
   readonly projectId: string;
   readonly capabilities: StorageCapabilities;
