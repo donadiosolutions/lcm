@@ -54,6 +54,7 @@ const legacyPidFileFault = vi.hoisted(() => ({
   path: undefined as string | undefined,
   mode: undefined as
     | "missing"
+    | "missing-after-first-read"
     | "replacement"
     | "unsafe"
     | "close-error"
@@ -236,6 +237,14 @@ vi.mock("node:fs", async (importOriginal) => {
         throw new Error("injected legacy PID descriptor close failure");
       }
       const result = actual.closeSync(...args);
+      if (
+        legacyPidFileFault.mode === "missing-after-first-read"
+        && legacyPidFileFault.path !== undefined
+        && legacyPidFileFault.openCalls === 1
+      ) {
+        actual.unlinkSync(legacyPidFileFault.path);
+        legacyPidFileFault.mode = undefined;
+      }
       if (args[0] === legacyPidFileFault.formerCleanupDescriptor && legacyPidFileFault.path !== undefined) {
         legacyPidFileFault.formerCleanupDescriptor = undefined;
         const originalPath = `${legacyPidFileFault.path}.authenticated`;
@@ -540,6 +549,7 @@ type LegacyFixtureConfig = Readonly<{
   environment?: NodeJS.ProcessEnv;
   formerCleanupMutation?: "replacement" | "symlink" | "hardlink";
   pidCloseError?: boolean;
+  pidMissingAfterFirstRead?: boolean;
   pidValidationFaultAfterStop?: "missing" | "dangling-symlink";
   pidMissingParentFault?:
     | "first-missing"
@@ -647,6 +657,9 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
   if (config.stopBehavior === "leave-pid") legacyPidFileFault.path = pidPath;
   if (config.pidCloseError === true) {
     legacyPidFileFault.mode = "close-error";
+  }
+  if (config.pidMissingAfterFirstRead === true) {
+    legacyPidFileFault.mode = "missing-after-first-read";
   }
   if (config.pidValidationFaultAfterStop !== undefined) {
     legacyPidFileFault.mode = config.pidValidationFaultAfterStop === "missing"
@@ -2420,6 +2433,24 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     expect(fixture.supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
     expect(fixture.supervisor.start).not.toHaveBeenCalled();
     expect(fixture.ensure).not.toHaveBeenCalled();
+  });
+
+  it("refuses direct PID absence between reads before authentication or manager discovery", async () => {
+    const fixture = await runLegacyFixture({ pidMissingAfterFirstRead: true });
+    expect(fixture.result).toMatchObject({
+      connected: false,
+      restarted: false,
+      refusalReason: "ambiguous",
+    });
+    expect(fixture.result.warning).toContain("PID evidence disappeared between reads");
+    expect(legacyPidFileFault.openCalls).toBe(1);
+    expect(existsSync(fixture.pidPath)).toBe(false);
+    expect(fixture.fetch).not.toHaveBeenCalled();
+    expect(fixture.supervisor.discoverLegacySystemdUnits).not.toHaveBeenCalled();
+    expect(fixture.supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
+    expect(fixture.supervisor.start).not.toHaveBeenCalled();
+    expect(fixture.ensure).not.toHaveBeenCalled();
+    expect(fixture.kill).not.toHaveBeenCalled();
   });
 
   it("preserves normal absent startup when missing PID evidence has no legacy candidates", async () => {
