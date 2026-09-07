@@ -629,6 +629,15 @@ same publication workflow, then restart the daemon. Never leave identity
 commands configured with migration-owner credentials. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for
 the exact extension, role, ownership, ACL, backup, and recovery contracts.
 
+Daemon startup and `lcm postgres migrate` verify the SQL migration files shipped
+with the installed package. For the npm CLI, these files are under
+`dist/src/storage/postgresql/migrations/*.sql` inside the installed LCM package.
+If a file is missing or its SHA-256 checksum differs from the release manifest,
+startup or migration fails. Reinstall the complete package from a trusted release
+artifact; do not edit the SQL files or copy files from a source checkout into the
+installation. Source files cannot replace missing packaged migrations. A selected
+PostgreSQL backend never falls back to SQLite after an asset verification failure.
+
 The URL must use the `postgresql:` scheme. Do not add `ssl`, `sslmode`,
 `sslcert`, `sslkey`, `sslrootcert`, or other `ssl*` query parameters; LCM owns
 TLS configuration and uses the required CA file for certificate verification.
