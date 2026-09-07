@@ -138,6 +138,18 @@ connector, run `lcm connectors install <agent>`. Rerun doctor after repair.
 These commands retain their normal identity checks and fail-closed refusals.
 Do not manually stop an unidentified process or start a competing daemon.
 
+During foreground or detached startup, LCM publishes `daemon.pid` by replacing
+the final pathname atomically with a regular, single-link file in mode `0600`.
+An existing stale file, symlink, dangling symlink, or hardlink at that pathname
+is replaced without changing the linked target's bytes. PID publication also
+tightens the state directory to mode `0700`; startup fails if the directory
+permissions cannot be enforced or the final pathname cannot be replaced, such
+as when it names a directory. Publication occurs after foreground bind or
+detached spawn, so a publication failure reports startup failure without using
+the unpublished PID state to signal that process. The legacy-migration rules
+below still preserve untrusted PID evidence and refuse startup before
+publication is authorized.
+
 Doctor's MCP check observes registration and static protocol capability. It
 reports live protocol readiness as not probed and never spawns a server for a
 handshake. Verify tools through the intended agent after connector repair.

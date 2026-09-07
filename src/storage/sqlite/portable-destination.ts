@@ -76,14 +76,15 @@ function guard(token:object,signal?:AbortSignal,database?:DatabaseSync|null):voi
 }
 /** Bound each stored control before driver materialization, parsing or comparison. */
 function controlRow(db:DatabaseSync,table:"transfer_runs"|"transfer_batches",columns:readonly string[],where:string,values:readonly SQLInputValue[],fixed:readonly string[]=[],code:PortableTransferErrorCode="checkpoint-mismatch"):Record<string,unknown>|undefined {
+  const controls=[...columns,...fixed];
   const size=(column:string)=>`_portable_control_bytes_${column}`;
-  const lengths=columns.map(column=>`length(CAST(${column} AS BLOB)) AS ${size(column)}`);
-  const bounded=columns.map(column=>`CASE WHEN length(CAST(${column} AS BLOB))<=${PORTABLE_LIMITS.maxControlBytes} THEN ${column} END AS ${column}`);
-  const row=db.prepare(`SELECT ${sqliteUtf8Projection([...columns,...fixed])},${columns.map(size).join(",")} FROM (
-    SELECT ${[...bounded,...fixed,...lengths].join(",")} FROM ${table} WHERE ${where})`).get(...values);
+  const lengths=controls.map(column=>`length(CAST(${column} AS BLOB)) AS ${size(column)}`);
+  const bounded=controls.map(column=>`CASE WHEN length(CAST(${column} AS BLOB))<=${PORTABLE_LIMITS.maxControlBytes} THEN ${column} END AS ${column}`);
+  const row=db.prepare(`SELECT ${sqliteUtf8Projection(controls)},${controls.map(size).join(",")} FROM (
+    SELECT ${[...bounded,...lengths].join(",")} FROM ${table} WHERE ${where})`).get(...values);
   if(row===undefined)return undefined;
-  for(const column of columns)if(Number(row[size(column)])>PORTABLE_LIMITS.maxControlBytes)throw new PortableTransferError(code);
-  return decodeSqliteUtf8Row(row,[...columns,...fixed]);
+  for(const column of controls)if(Number(row[size(column)])>PORTABLE_LIMITS.maxControlBytes)throw new PortableTransferError(code);
+  return decodeSqliteUtf8Row(row,controls);
 }
 function ledgerExists(db:DatabaseSync):boolean {return db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transfer_runs'").get()!==undefined;}
 function checkpoint(text:string):PortableCheckpoint {return parsePortableCheckpoint(Buffer.from(text));}
