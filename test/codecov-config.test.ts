@@ -241,6 +241,8 @@ const expectedComponents = [
       // #1069 preserves completed reconciliation evidence after retained
       // directory cleanup failures in this existing component.
       // #1059 keeps retained journal-parent publication in this existing owner.
+      // #1087 bounds canonical metadata publication in this existing owner.
+      // #1091 preserves completion evidence across publication failures here.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
