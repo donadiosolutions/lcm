@@ -76,6 +76,7 @@ component_management:
       name: "Unit - Hooks"
       paths:
         # Includes native adapters and the #726/#737 publication-diagnostic flow.
+        # Claude's bounded session-completion acknowledgment remains hook-owned.
         - "src/hooks/"
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"

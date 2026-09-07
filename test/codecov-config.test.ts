@@ -677,6 +677,8 @@ describe("Codecov configuration", () => {
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],
+      // Bounded Claude completion delivery remains within the hook component.
+      ["src/hooks/session-end.ts", "unit-hooks"],
       // #793 search-limit schema remains owned by MCP tools.
       ["src/mcp/tools/lcm-search.ts", "unit-mcp"],
       ["src/mcp/tools/lcm-grep.ts", "unit-mcp"],
