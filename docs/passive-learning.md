@@ -332,9 +332,9 @@ By default, doctor scans up to 50 passive-learning sidecar DBs. Use `lcm doctor 
 
 When a bounded scan stops before the end of the admitted file list, the
 numeric skipped count includes every remaining sidecar, including the current
-file. Verbose output still emits one representative skipped row so diagnostics
-remain bounded; use its count to interpret that row as the total number of
-sidecars skipped by the scan budget.
+file. The doctor headline reports that total. Verbose output still emits one
+representative skipped row without repeating the count, so diagnostics remain
+bounded.
 
 Low nonzero backlog is reported as passing when both the daemon and its storage
 backend are healthy, because the daemon processes queued events automatically.

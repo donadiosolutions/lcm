@@ -210,6 +210,12 @@ describe("collectEventStats", () => {
     expect(sidecars).toHaveLength(2);
     expect(sidecars[1].scanSkipped).toContain("2 sidecars");
     expect(sidecars[1].scanSkippedCount).toBe(2);
+
+    const stats = await collectEventStats({ maxDbs: 1, startIndex: 1, pruneOrphanSidecars: false });
+    expect(stats.scanSkipped).toBe(2);
+    const detailed = await collectDetailedEventStats({ maxDbs: 1, startIndex: 1, pruneOrphanSidecars: false });
+    expect(detailed.scanSkipped).toBe(2);
+    expect(detailed.projects).toHaveLength(2);
   });
 
   it("omits exact reconciliation fences before ordering and scan budgets", async () => {
@@ -316,6 +322,12 @@ describe("collectEventStats", () => {
     expect(sidecars).toHaveLength(1);
     expect(sidecars[0].scanSkipped).toContain("100 sidecars");
     expect(sidecars[0].scanSkippedCount).toBe(100);
+
+    const stats = await collectEventStats({ maxDbs: 0, pruneOrphanSidecars: false });
+    expect(stats.scanSkipped).toBe(100);
+    const detailed = await collectDetailedEventStats({ maxDbs: 0, pruneOrphanSidecars: false });
+    expect(detailed.scanSkipped).toBe(100);
+    expect(detailed.projects).toHaveLength(1);
   });
 
   it("prunes empty orphan sidecars by default", async () => {

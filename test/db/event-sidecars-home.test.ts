@@ -283,6 +283,24 @@ describe("configured-home sidecar observation", () => {
     expect(existsSync(path)).toBe(true);
   });
 
+  it("retains a count of one for a single-file in-flight stop", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
+    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options) {
+      const result = await realOpen.call(this, path, options);
+      controller.abort();
+      return result;
+    });
+
+    const result = await collectEventSidecars({ homeDir, signal: controller.signal });
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ scanSkippedCount: 1 });
+    expect(result[0].scanSkipped).toContain("cancelled");
+    expect(openSpy).toHaveBeenCalledOnce();
+  });
+
   it("cancels a pending health read and closes without waiting for it", async () => {
     vi.useFakeTimers();
     const controller = new AbortController();
