@@ -2238,7 +2238,6 @@ describe("runtime home rename failures", () => {
 
   it("preserves migration entry validation and cleanup failures in order", () => {
     const paths = legacyHome();
-    const valuePath = join(paths.legacy, "value.txt");
     const cleanupError = Object.assign(new Error("synthetic migration entry cleanup failure"), { code: "EIO" });
     let valueFd: number | undefined;
     let valueCloses = 0;
