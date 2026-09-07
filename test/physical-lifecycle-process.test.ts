@@ -109,6 +109,8 @@ if (workerMode === "barrier") {
     const heldPath = join(root, "barrier-held");
     const releasePath = join(root, "barrier-release");
     const vitestPath = join(process.cwd(), "node_modules", "vitest", "vitest.mjs");
+    const childEnvironment = { ...process.env };
+    delete childEnvironment.LCM_TEST_ARTIFACT_ROOT;
     const child = spawn(process.execPath, [
       vitestPath,
       "run",
@@ -118,7 +120,7 @@ if (workerMode === "barrier") {
     ], {
       cwd: process.cwd(),
       env: {
-        ...process.env,
+        ...childEnvironment,
         HOME: homeDir,
         LCM_PHYSICAL_LIFECYCLE_WORKER: "barrier",
         LCM_PHYSICAL_LIFECYCLE_HOME: homeDir,

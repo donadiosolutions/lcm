@@ -159,8 +159,8 @@ describe("local outbox schema admission", () => {
     const path = join(events, "current.db");
     const factory = new SQLiteLocalHookOutboxFactory();
     const operation = async (token: Parameters<Parameters<typeof withBackendPublicationAppendBarrierAsync>[1]>[0]) => {
-      await (await factory.open(path, {}, token)).close();
-      await (await factory.openExisting(path, {}, token))!.close();
+      await (await factory.open(path, {}, token)).close(token);
+      await (await factory.openExisting(path, {}, token))!.close(token);
     };
     try {
       if (kind === "append") await withBackendPublicationAppendBarrierAsync(home, operation);
@@ -174,11 +174,19 @@ describe("local outbox schema admission", () => {
     fs.mkdirSync(events, { recursive: true, mode: 0o700 });
     const path = join(events, "current.db");
     const factory = new SQLiteLocalHookOutboxFactory();
-    let pending!: Promise<unknown>;
-    await withBackendPublicationAppendBarrierAsync(home, async () => {
-      pending = factory[operation](path);
-      await factory.close();
+    let enterHolder!: () => void;
+    let releaseHolder!: () => void;
+    const entered = new Promise<void>(resolve => { enterHolder = resolve; });
+    const release = new Promise<void>(resolve => { releaseHolder = resolve; });
+    const holder = withBackendPublicationAppendBarrierAsync(home, async () => {
+      enterHolder();
+      await release;
     });
+    await entered;
+    const pending = factory[operation](path);
+    await factory.close();
+    releaseHolder();
+    await holder;
     await expect(pending).rejects.toMatchObject({ code: "STORAGE_CLOSED", operation });
     expect(fs.existsSync(path)).toBe(false);
     expect(connections.isLcmConnectionOpen(path)).toBe(false);

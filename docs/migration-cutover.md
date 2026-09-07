@@ -132,6 +132,15 @@ hold, an absent or outdated outbox is refused; capture and dry-run never repair
 it. Prepare the project successfully before authenticating its source and
 entering maintenance.
 
+Successful enrollment publishes the registered machine identity only after the
+canonical project store, local outbox, sequence allocator, and receipt epoch are
+durable for that exact PostgreSQL identity. If local SQLite preparation fails,
+`machine.json` remains pending. A retry reuses an already committed exact epoch
+before it exposes the machine identity, including when identity publication was
+the interrupted step. Hooks captured while the identity is still pending remain
+unregistered legacy evidence and can still make migration refuse ambiguity;
+enrollment does not backdate an epoch or reclassify those events.
+
 A caller authenticates the SQLite source and source bytes, then enters held
 maintenance through the existing backend publication coordinator. The initial
 roster contains the verified machine, its last allocated sequence (or null

@@ -61,6 +61,7 @@ const expectedComponents = [
       // ordered descriptor, temporary-file, and parent cleanup evidence here.
       // #1223 keeps authenticated lock-owner disappearance recovery in this
       // existing configuration-security owner.
+      // #1231 keeps exact intended enrollment identity construction here.
       // PR #791 keeps generated Gitleaks hostname-literal normalization in
       // this existing configuration-security owner.
       "^src/generated-patterns\\.ts$",
@@ -128,6 +129,7 @@ const expectedComponents = [
   {
     component_id: "unit-daemon-routes",
     name: "Unit - Daemon Routes",
+    // #1230 keeps route project close on the live request token.
     paths: ["src/daemon/routes/"],
   },
   {
@@ -156,6 +158,7 @@ const expectedComponents = [
     // #618 optional receipt schema admission stays local-persistence-owned.
     // #622 keeps registered-project outbox preparation and admitted sidecar discovery here.
     // #1140 fixed transfer-ledger control bounds stay local-persistence-owned.
+    // #1231 prepares an intended enrollment epoch before identity publication.
     paths: ["src/db/", "src/storage/sqlite/", "src/store/"],
   },
   {
@@ -190,6 +193,7 @@ const expectedComponents = [
     component_id: "unit-migration-cutover",
     name: "Unit - Migration and Cutover",
     // #622 keeps immutable capture, preparation, and receipt evidence here.
+    // #1231 orders receipt epoch durability before machine identity visibility.
     paths: ["src/migration/"],
   },
   {

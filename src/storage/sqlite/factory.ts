@@ -24,9 +24,17 @@ import { assertSqliteReady, SqliteReadinessRollbackError } from "./health.js";
 import { SqliteProjectStorage } from "./project-storage.js";
 import type { BackendPublicationLockToken } from "../backend-publication.js";
 import { throwIfAborted } from "../../daemon/cancellation.js";
-import { readMachineIdentity } from "../../machine-identity.js";
+import {
+  createMachineIdentity,
+  readMachineIdentity,
+  type MachineIdentity,
+  type StoredMachineIdentity,
+} from "../../machine-identity.js";
 import { LocalHookEventSequenceAllocator } from "../local-hook-event-sequence.js";
-import { adoptMigrationReceiptEpoch } from "../../migration/receipts.js";
+import {
+  adoptMigrationReceiptEpoch,
+  assertMigrationReceiptEpochParticipant,
+} from "../../migration/receipts.js";
 import { SQLiteLocalHookOutboxFactory } from "../local-hook-outbox.js";
 import {
   assertBackendPublicationConsumerAccess,
@@ -58,6 +66,8 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
     detectFeatures?: (db: ReturnType<typeof getLcmConnection>) => LcmDbFeatures;
     /** @internal Deterministic physical-close admission seams. */
     _appendBarrierOptions?: BackendPublicationAppendBarrierOptions;
+    /** @internal Intended identity used only by migration enrollment. */
+    _migrationEnrollmentIdentity?: MachineIdentity;
   } = {}) {}
 
   async projectExists(
@@ -122,6 +132,9 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       await this.releaseOwnedConnectionsForPath(dbPath, publicationLockToken);
       throwIfAborted(signal);
       const sourceHome = sqliteProjectHomeDir(paths.dbPath);
+      if (sourceHome !== undefined && this.options._migrationEnrollmentIdentity !== undefined) {
+        this.enrollmentMachineIdentity(sourceHome, publicationLockToken);
+      }
       db = sourceHome === undefined
         ? (createIfMissing ? getLcmConnection(paths.dbPath) : getExistingLcmConnection(paths.dbPath) ?? undefined)
         : withBackendPublicationConsumerLock(sourceHome, (token) => {
@@ -168,10 +181,14 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       }
       const homeDir = admission.homeDir;
       if (homeDir !== undefined) {
-        const machine = readMachineIdentity(homeDir);
+        const machine = this.enrollmentMachineIdentity(homeDir, publicationLockToken);
         if (machine?.machineId !== null && machine?.machineId !== undefined) {
           await withBackendPublicationAppendBarrierAsync(homeDir, async (token) => {
             assertBackendPublicationConsumerAccess({ homeDir, backend: "sqlite", lockToken: token });
+            const admittedMachine = this.enrollmentMachineIdentity(homeDir, token);
+            if (admittedMachine?.machineId !== machine.machineId) {
+              throw new Error("SQLite migration enrollment identity changed before preparation");
+            }
             const outboxFactory = new SQLiteLocalHookOutboxFactory();
             try {
               await outboxFactory.open(join(homeDir, ".lcm", "events", `${paths.id}.db`), {}, token);
@@ -183,9 +200,18 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
             );
             try {
               const firstMachineSequence = allocator.peekNextSequence().toString().padStart(19, "0");
+              const currentMachine = this.enrollmentMachineIdentity(homeDir, token);
+              if (currentMachine?.machineId !== admittedMachine.machineId) {
+                throw new Error("SQLite migration enrollment identity changed before epoch adoption");
+              }
+              assertMigrationReceiptEpochParticipant(
+                db!,
+                paths.id,
+                admittedMachine.machineId,
+              );
               adoptMigrationReceiptEpoch(db!, {
                 projectId: paths.id,
-                machineId: machine.machineId!,
+                machineId: admittedMachine.machineId,
                 epochId: randomUUID(),
                 firstMachineSequence,
                 establishedAt: `${new Date().toISOString().slice(0, -1)}000Z`,
@@ -414,6 +440,44 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
     if (failures.length > 1) {
       throw new AggregateError(failures, "SQLite retained connection cleanup failed");
     }
+  }
+
+  private enrollmentMachineIdentity(
+    homeDir: string,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): StoredMachineIdentity | null {
+    const intended = this.options._migrationEnrollmentIdentity;
+    if (intended === undefined) return readMachineIdentity(homeDir);
+    if (publicationLockToken === undefined) {
+      throw new Error("SQLite migration enrollment identity requires a live publication token");
+    }
+    assertBackendPublicationConsumerAccess({
+      homeDir,
+      backend: "sqlite",
+      lockToken: publicationLockToken,
+    });
+    const current = readMachineIdentity(homeDir);
+    if (
+      current === null
+      || current.identityKey !== intended.identityKey
+      || (current.machineId !== null && current.machineId !== intended.machineId)
+    ) {
+      throw new Error("SQLite migration enrollment identity does not match machine.json");
+    }
+    const validated = createMachineIdentity(
+      current,
+      intended.machineId,
+      intended.displayName,
+    );
+    if (
+      intended.version !== validated.version
+      || intended.identityKey !== validated.identityKey
+      || intended.machineId !== validated.machineId
+      || intended.displayName !== validated.displayName
+    ) {
+      throw new Error("SQLite migration enrollment identity is invalid");
+    }
+    return validated;
   }
 
   private async releaseOwnedConnection(

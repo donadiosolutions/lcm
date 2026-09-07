@@ -122,6 +122,7 @@ describe("private mutation lock release recovery", () => {
         deleteRegularFile,
         _beforeOwnerReadPostStatForTesting: () => {
           renameSync(lockPath, strandedPath);
+          chmodSync(strandedPath, 0o400);
           if (kind === "regular") writeFileSync(lockPath, "replacement", { mode: 0o600 });
           else if (kind === "symlink") symlinkSync(strandedPath, lockPath);
           else mkdirSync(lockPath, { mode: 0o700 });

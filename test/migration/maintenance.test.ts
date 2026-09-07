@@ -35,6 +35,7 @@ import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
 import { closeLcmConnection } from "../../src/db/connection.js";
 import * as connectionApi from "../../src/db/connection.js";
 import { appendLocalHookEvents } from "../../src/hooks/local-enqueue.js";
+import { getMigrationReceiptEpoch } from "../../src/migration/receipts.js";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -633,17 +634,22 @@ describe("backend publication maintenance journal v3", () => {
     expect(identityApi.readMachineIdentity(fixture.homeDir)?.machineId).toBeNull();
   });
 
-  it.each(["selection", "identity"])("refuses %s drift between finalization and epoch adoption", async (change) => {
+  it.each(["selection", "identity"])("refuses %s drift between epoch adoption and identity publication", async (change) => {
     const fixture = enrollmentFixture();
-    const original = identityApi.finalizeMachineIdentity;
-    vi.spyOn(identityApi, "finalizeMachineIdentity").mockImplementationOnce((...args) => {
-      const finalized = original(...args);
+    const originalOpen = SqliteStorageBackendFactory.prototype.openProject;
+    vi.spyOn(SqliteStorageBackendFactory.prototype, "openProject").mockImplementationOnce(async function (...args) {
+      const project = await originalOpen.apply(this, args);
       if (change === "selection") writeFileSync(fixture.metadata, `${JSON.stringify({ cwd: fixture.cwd, changed: true })}\n`);
-      else writeFileSync(join(fixture.homeDir, ".lcm", "machine.json"), JSON.stringify({ ...finalized, machineId: "118f0b5d-1234-7abc-8def-1234567890ab" }));
-      return finalized;
+      else writeFileSync(join(fixture.homeDir, ".lcm", "machine.json"), JSON.stringify({
+        ...identityApi.readMachineIdentity(fixture.homeDir),
+        machineId: "118f0b5d-1234-7abc-8def-1234567890ab",
+      }));
+      return project;
     });
-    await expect(prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession })).rejects.toThrow("before receipt adoption");
-    expect(existsSync(join(fixture.projectDir, "db.sqlite"))).toBe(false);
+    await expect(prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession })).rejects.toThrow(
+      change === "selection" ? "before identity publication" : "before receipt adoption",
+    );
+    expect(existsSync(join(fixture.projectDir, "db.sqlite"))).toBe(true);
   });
 
   it("recovers an uncertain local finalization from authoritative readback without changing provenance", async () => {
@@ -687,8 +693,153 @@ describe("backend publication maintenance journal v3", () => {
         return registered;
       });
     await expect(prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession })).rejects.toThrow(change === "selection" ? "before recovery" : "identity changed");
-    expect(existsSync(join(fixture.projectDir, "db.sqlite"))).toBe(false);
+    const db = new DatabaseSync(join(fixture.projectDir, "db.sqlite"), { readOnly: true });
+    expect(getMigrationReceiptEpoch(db, fixture.local.id, REGISTERED_MACHINE))
+      .toMatchObject({ machineId: REGISTERED_MACHINE, firstMachineSequence: "0000000000000000000" });
+    db.close();
     expect(fixture.close).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps identity pending when SQLite preparation fails before epoch adoption", async () => {
+    const fixture = enrollmentFixture();
+    vi.stubEnv("HOME", fixture.homeDir);
+    const dbPath = join(fixture.projectDir, "db.sqlite");
+    const blocker = new DatabaseSync(dbPath);
+    blocker.exec("BEGIN EXCLUSIVE");
+    try {
+      await expect(prepareSqliteMigrationEnrollment(
+        fixture.request,
+        { openIdentitySession: fixture.openIdentitySession },
+      )).rejects.toMatchObject({ code: "STORAGE_INITIALIZATION_FAILED" });
+    } finally {
+      blocker.exec("ROLLBACK");
+      blocker.close();
+    }
+    expect(identityApi.readMachineIdentity(fixture.homeDir)?.machineId).toBeNull();
+
+    await appendLocalHookEvents({
+      cwd: fixture.cwd,
+      sessionId: "pending-after-failure",
+      sourceHook: "SessionStart",
+      events: [{ type: "decision", category: "decision", data: "unregistered", priority: 1 }],
+    });
+    const outbox = new DatabaseSync(join(fixture.homeDir, ".lcm", "events", `${fixture.local.id}.db`), { readOnly: true });
+    expect(outbox.prepare("SELECT machine_id, machine_sequence FROM events").all()).toEqual([{
+      machine_id: null,
+      machine_sequence: "0000000000000000000",
+    }]);
+    outbox.close();
+
+    await expect(prepareSqliteMigrationEnrollment(
+      fixture.request,
+      { openIdentitySession: fixture.openIdentitySession },
+    )).resolves.toMatchObject({ identity: { machineId: REGISTERED_MACHINE } });
+    const project = new DatabaseSync(dbPath, { readOnly: true });
+    expect(getMigrationReceiptEpoch(project, fixture.local.id, REGISTERED_MACHINE))
+      .toMatchObject({ firstMachineSequence: "0000000000000000001" });
+    project.close();
+    const source = await heldSource(fixture);
+    await expect(captureAuthenticatedSqliteMigrationSource(source.authority, source.options))
+      .rejects.toThrow("unknown identity");
+  });
+
+  it("preserves the committed epoch when identity publication fails and retries", async () => {
+    const fixture = enrollmentFixture();
+    vi.stubEnv("HOME", fixture.homeDir);
+    vi.spyOn(identityApi, "finalizeMachineIdentity").mockImplementationOnce(() => {
+      throw new Error("injected identity publication failure");
+    });
+    await expect(prepareSqliteMigrationEnrollment(
+      fixture.request,
+      { openIdentitySession: fixture.openIdentitySession },
+    )).rejects.toThrow("identity publication failure");
+    expect(identityApi.readMachineIdentity(fixture.homeDir)?.machineId).toBeNull();
+    const dbPath = join(fixture.projectDir, "db.sqlite");
+    let db = new DatabaseSync(dbPath, { readOnly: true });
+    expect(getMigrationReceiptEpoch(db, fixture.local.id, REGISTERED_MACHINE))
+      .toMatchObject({ firstMachineSequence: "0000000000000000000" });
+    db.close();
+
+    await appendLocalHookEvents({
+      cwd: fixture.cwd,
+      sessionId: "pending-after-epoch",
+      sourceHook: "SessionStart",
+      events: [{ type: "decision", category: "decision", data: "still unregistered", priority: 1 }],
+    });
+    await expect(prepareSqliteMigrationEnrollment(
+      fixture.request,
+      { openIdentitySession: fixture.openIdentitySession },
+    )).resolves.toMatchObject({ identity: { machineId: REGISTERED_MACHINE } });
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    expect(getMigrationReceiptEpoch(db, fixture.local.id, REGISTERED_MACHINE))
+      .toMatchObject({ firstMachineSequence: "0000000000000000000" });
+    db.close();
+  });
+
+  it("refuses a different remote machine after an epoch commits for a pending identity", async () => {
+    const fixture = enrollmentFixture();
+    vi.spyOn(identityApi, "finalizeMachineIdentity").mockImplementationOnce(() => {
+      throw new Error("injected identity publication failure");
+    });
+    await expect(prepareSqliteMigrationEnrollment(
+      fixture.request,
+      { openIdentitySession: fixture.openIdentitySession },
+    )).rejects.toThrow("identity publication failure");
+    expect(identityApi.readMachineIdentity(fixture.homeDir)?.machineId).toBeNull();
+
+    const conflictingMachine = "118f0b5d-1234-7abc-8def-1234567890ab";
+    const pending = identityApi.readMachineIdentity(fixture.homeDir)!;
+    const conflicting = {
+      machineId: conflictingMachine,
+      identityKey: pending.identityKey,
+      displayName: pending.displayName,
+    };
+    fixture.repository.registerMachine.mockResolvedValue(conflicting);
+    fixture.repository.recoverMachine.mockResolvedValue(conflicting);
+    await expect(prepareSqliteMigrationEnrollment(
+      fixture.request,
+      { openIdentitySession: fixture.openIdentitySession },
+    )).rejects.toMatchObject({ code: "STORAGE_INITIALIZATION_FAILED" });
+
+    const db = new DatabaseSync(join(fixture.projectDir, "db.sqlite"), { readOnly: true });
+    expect(getMigrationReceiptEpoch(db, fixture.local.id, REGISTERED_MACHINE))
+      .toMatchObject({ machineId: REGISTERED_MACHINE });
+    expect(getMigrationReceiptEpoch(db, fixture.local.id, conflictingMachine)).toBeNull();
+    db.close();
+    expect(identityApi.readMachineIdentity(fixture.homeDir)?.machineId).toBeNull();
+  });
+
+  it("keeps finalized enrollment idempotent and refuses a different remote identity", async () => {
+    const fixture = enrollmentFixture();
+    const first = await prepareSqliteMigrationEnrollment(
+      fixture.request,
+      { openIdentitySession: fixture.openIdentitySession },
+    );
+    const dbPath = join(fixture.projectDir, "db.sqlite");
+    let db = new DatabaseSync(dbPath, { readOnly: true });
+    const epoch = getMigrationReceiptEpoch(db, fixture.local.id, REGISTERED_MACHINE);
+    db.close();
+    await expect(prepareSqliteMigrationEnrollment(
+      fixture.request,
+      { openIdentitySession: fixture.openIdentitySession },
+    )).resolves.toMatchObject({ identity: first.identity });
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    expect(getMigrationReceiptEpoch(db, fixture.local.id, REGISTERED_MACHINE)).toEqual(epoch);
+    db.close();
+
+    const conflictingMachine = "118f0b5d-1234-7abc-8def-1234567890ab";
+    const conflicting = {
+      machineId: conflictingMachine,
+      identityKey: first.identity.identityKey,
+      displayName: first.identity.displayName,
+    };
+    fixture.repository.registerMachine.mockResolvedValue(conflicting);
+    fixture.repository.recoverMachine.mockResolvedValue(conflicting);
+    await expect(prepareSqliteMigrationEnrollment(
+      fixture.request,
+      { openIdentitySession: fixture.openIdentitySession },
+    )).rejects.toThrow("machine identity changed before receipt adoption");
+    expect(identityApi.readMachineIdentity(fixture.homeDir)).toEqual(first.identity);
   });
 
   it("does not report enrollment completion when finalization never runs", async () => {

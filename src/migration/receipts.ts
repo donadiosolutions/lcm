@@ -282,6 +282,28 @@ export function getMigrationReceiptEpoch(
   return row === undefined ? null : parseEpochRow(row);
 }
 
+/** Refuse enrollment if this project already committed another machine epoch. */
+export function assertMigrationReceiptEpochParticipant(
+  db: DatabaseSync,
+  projectId: string,
+  machineId: string,
+): void {
+  nulFree(projectId, "projectId");
+  canonicalUuid(machineId, "machineId");
+  const tables = exactReceiptTables(db);
+  if (tables.length === 0) return;
+  assertExactReceiptSchema(db);
+  const conflict = db.prepare(`
+    SELECT machine_id
+    FROM migration_receipt_v1_epochs
+    WHERE project_id = ? AND machine_id != ?
+    LIMIT 1
+  `).get(projectId, machineId);
+  if (conflict !== undefined) {
+    throw new Error("migration receipt epoch belongs to a different machine");
+  }
+}
+
 function validateEnvelope(envelope: MigrationReceiptEnvelope): void {
   canonicalUuid(envelope.eventUuid, "eventUuid");
   canonicalUuid(envelope.machineId, "machineId");

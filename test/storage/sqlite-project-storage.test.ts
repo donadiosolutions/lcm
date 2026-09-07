@@ -17,7 +17,12 @@ import { SqliteProjectStorage } from "../../src/storage/sqlite/project-storage.j
 import { sqliteExecutorFor, type SqliteOperationAdmission } from "../../src/storage/sqlite/executor.js";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import * as publication from "../../src/storage/backend-publication.js";
-import { recoverMachineIdentity } from "../../src/machine-identity.js";
+import {
+  createMachineIdentity,
+  ensurePendingMachineIdentity,
+  readMachineIdentity,
+  recoverMachineIdentity,
+} from "../../src/machine-identity.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 type Deferred<T = void> = {
@@ -141,6 +146,58 @@ describe("SQLite factory maintenance admission", () => {
       expect(readFileSync(context.dbPath)).toEqual(bytes);
       await project.close();
     } finally { await context.factory.close(); rmSync(context.homeDir, { recursive: true, force: true }); }
+  });
+
+  it("requires exact live authority for the internal enrollment identity", async () => {
+    const context = fixture();
+    const other = fixture();
+    const pending = ensurePendingMachineIdentity("Enrollment", context.homeDir).identity;
+    const intended = createMachineIdentity(
+      pending,
+      "018f0b5d-1234-7abc-8def-1234567890ab",
+      "Enrollment",
+    );
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: () => ({ id: context.identity.id, dbPath: context.dbPath }),
+      _migrationEnrollmentIdentity: intended,
+    });
+    const invalidFactory = new SqliteStorageBackendFactory({
+      resolveProject: () => ({ id: context.identity.id, dbPath: context.dbPath }),
+      _migrationEnrollmentIdentity: {
+        ...intended,
+        displayName: ` ${intended.displayName} `,
+      },
+    });
+    try {
+      await expect(factory.openProject(context.identity)).rejects.toMatchObject({
+        code: "STORAGE_INITIALIZATION_FAILED",
+      });
+      const revoked = await publication.withBackendPublicationConsumerLockAsync(
+        context.homeDir,
+        token => token,
+      );
+      await expect(factory.openProject(context.identity, revoked)).rejects.toMatchObject({
+        code: "STORAGE_INITIALIZATION_FAILED",
+      });
+      await publication.withBackendPublicationConsumerLockAsync(other.homeDir, async token => {
+        await expect(factory.openProject(context.identity, token)).rejects.toMatchObject({
+          code: "STORAGE_INITIALIZATION_FAILED",
+        });
+      });
+      await publication.withBackendPublicationConsumerLockAsync(context.homeDir, async token => {
+        await expect(invalidFactory.openProject(context.identity, token)).rejects.toMatchObject({
+          code: "STORAGE_INITIALIZATION_FAILED",
+        });
+      });
+      expect(readMachineIdentity(context.homeDir)?.machineId).toBeNull();
+    } finally {
+      await factory.close();
+      await invalidFactory.close();
+      await context.factory.close();
+      await other.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+      rmSync(other.homeDir, { recursive: true, force: true });
+    }
   });
 
   it("uses current operation admission for project close", async () => {

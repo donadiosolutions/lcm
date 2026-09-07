@@ -5,6 +5,7 @@ import { readDaemonConfigSnapshot, type ResolvedStorageConfig } from "../daemon/
 import { localProjectIdentity } from "../daemon/project.js";
 import {
   ensurePendingMachineIdentity,
+  createMachineIdentity,
   finalizeMachineIdentity,
   MachineIdentityRegistrationChangedError,
   recoverMachineIdentity,
@@ -358,6 +359,21 @@ export async function prepareSqliteMigrationEnrollment(
   if (backendPublicationCanonicalSha256(before) !== backendPublicationCanonicalSha256(afterRemote)) {
     throw new Error("SQLite migration source selection changed during machine enrollment");
   }
+  const intendedIdentity = createMachineIdentity(
+    pending.identity,
+    registered.machineId,
+    registered.displayName,
+  );
+  const assertEnrollmentIdentity = (identity: MachineIdentity): void => {
+    const current = readMachineIdentity(input.homeDir);
+    if (
+      current === null
+      || current.identityKey !== identity.identityKey
+      || (current.machineId !== null && current.machineId !== identity.machineId)
+    ) {
+      throw new Error("SQLite migration machine identity changed before receipt adoption");
+    }
+  };
   const adopt = async (
     identity: MachineIdentity,
     token: BackendPublicationLockToken,
@@ -366,12 +382,10 @@ export async function prepareSqliteMigrationEnrollment(
     if (backendPublicationCanonicalSha256(before) !== backendPublicationCanonicalSha256(finalSelection)) {
       throw new Error("SQLite migration source selection changed before receipt adoption");
     }
-    const authenticatedIdentity = requireMachineIdentity(input.homeDir);
-    if (authenticatedIdentity.machineId !== identity.machineId) {
-      throw new Error("SQLite migration machine identity changed before receipt adoption");
-    }
+    assertEnrollmentIdentity(identity);
     const factory = new SqliteStorageBackendFactory({
       resolveProject: () => ({ id: before.physicalProjectId, dbPath: before.projectDbPath }),
+      _migrationEnrollmentIdentity: identity,
     });
     try {
       const project = await factory.openProject({
@@ -382,6 +396,11 @@ export async function prepareSqliteMigrationEnrollment(
     } finally {
       await factory.close();
     }
+    const afterAdoption = staticSourceSelection(input.cwd, input.homeDir, token);
+    if (backendPublicationCanonicalSha256(before) !== backendPublicationCanonicalSha256(afterAdoption)) {
+      throw new Error("SQLite migration source selection changed before identity publication");
+    }
+    assertEnrollmentIdentity(identity);
   };
   let identity: MachineIdentity | undefined;
   try {
@@ -391,13 +410,13 @@ export async function prepareSqliteMigrationEnrollment(
       if (backendPublicationCanonicalSha256(before) !== backendPublicationCanonicalSha256(selection)) {
         throw new Error("SQLite migration source selection changed before finalization");
       }
+      await adopt(intendedIdentity, token);
       identity = finalizeMachineIdentity(
         pending.identity,
         registered.machineId,
         registered.displayName,
         input.homeDir,
       );
-      await adopt(identity, token);
     });
   } catch (error) {
     if (!(error instanceof MachineIdentityRegistrationChangedError)) throw error;
@@ -423,11 +442,11 @@ export async function prepareSqliteMigrationEnrollment(
         const localIdentity = readMachineIdentity(input.homeDir);
         if (localIdentity?.identityKey !== pending.identity.identityKey
           || (localIdentity.machineId !== null && localIdentity.machineId !== registered.machineId)) throw error;
+        await adopt(recovered, token);
         identity = recoverMachineIdentity(recovered, {
           homeDir: input.homeDir,
           force: true,
         }).identity;
-        await adopt(identity, token);
       });
     } finally {
       try { await recoverySession.close(); } catch { /* preserve recovery result */ }
