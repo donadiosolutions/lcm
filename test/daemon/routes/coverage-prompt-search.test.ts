@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServerResponse } from "node:http";
+import type { PromotedRecallCandidate } from "../../../src/storage/contracts.js";
 import type { SearchResult } from "../../../src/db/promoted.js";
 import type { RecallFeedback } from "../../../src/db/recall.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
@@ -12,7 +13,7 @@ const state = vi.hoisted(() => ({
   validateError: undefined as unknown,
   migrationError: undefined as unknown,
   connectionError: undefined as unknown,
-  searchResults: [] as SearchResult[],
+  searchResults: [] as PromotedRecallCandidate[],
   feedback: new Map<string, RecallFeedback>(),
   logError: undefined as unknown,
   closed: [] as string[],
@@ -42,9 +43,9 @@ vi.mock("../../../src/storage/index.js", () => ({
       if (state.connectionError !== undefined) throw state.connectionError;
       return {
         lexicalSearch: {
-          searchPromoted: async () => {
+          searchPromotedForRecall: async () => {
             if (state.migrationError !== undefined) throw state.migrationError;
-            return state.searchResults;
+            return { candidates: state.searchResults };
           },
         },
         recall: {
@@ -112,9 +113,10 @@ function response(): MockResponse {
   };
 }
 
-function result(overrides: Partial<SearchResult> = {}): SearchResult {
+function result(overrides: Partial<SearchResult> & { matchedTermCount?: number } = {}): PromotedRecallCandidate {
+  const { matchedTermCount = 4, ...record } = overrides;
   const id = overrides.id ?? "memory-1";
-  return {
+  return { result: {
     id,
     content: `remember unique implementation decision ${id}`,
     tags: [],
@@ -122,14 +124,13 @@ function result(overrides: Partial<SearchResult> = {}): SearchResult {
     sessionId: "session",
     confidence: 0.5,
     createdAt: new Date().toISOString(),
-    rank: -10,
-    ...overrides,
-  };
+    rank: -0.000001,
+    ...record,
+  }, evidence: { matchedTermCount, queryTermCount: 20 } };
 }
 
 function config(): DaemonConfig {
   const value = loadDaemonConfig("/does-not-exist");
-  value.restoration.promptSearchMinScore = -100;
   value.restoration.maxInjectedMemoryBytes = 10_000;
   value.restoration.reservedForLearningInstruction = 0;
   value.restoration.maxInjectedMemoryItems = 20;
@@ -199,7 +200,7 @@ describe("prompt-search route coverage", () => {
   it("admits PostgreSQL storage before returning a disabled empty result", async () => {
     const projectClose = vi.fn(async () => undefined);
     const project = {
-      lexicalSearch: { searchPromoted: vi.fn(async () => []) },
+      lexicalSearch: { searchPromotedForRecall: vi.fn(async () => ({ candidates: [] })) },
       recall: {
         getFeedback: vi.fn(async () => new Map()),
         logSurfacing: vi.fn(async () => undefined),
@@ -276,7 +277,7 @@ describe("prompt-search route coverage", () => {
     const factory = makeMockStorageFactory({
       projectExists: vi.fn(async () => true),
       openProject: vi.fn(async () => ({
-        lexicalSearch: { searchPromoted: vi.fn().mockRejectedValue(failure) },
+        lexicalSearch: { searchPromotedForRecall: vi.fn().mockRejectedValue(failure) },
         recall: { getFeedback: vi.fn(async () => new Map()), logSurfacing: vi.fn(async () => undefined) },
         close: projectClose,
       } as unknown as ProjectStorage)),
@@ -437,7 +438,7 @@ describe("prompt-search route coverage", () => {
     const close = vi.fn(async () => undefined);
     const projectClose = vi.fn(async () => undefined);
     const project = {
-      lexicalSearch: { searchPromoted: vi.fn(async () => []) },
+      lexicalSearch: { searchPromotedForRecall: vi.fn(async () => ({ candidates: [] })) },
       recall: { getFeedback: vi.fn(async () => new Map()), logSurfacing: vi.fn(async () => undefined) },
       close: projectClose,
     };
@@ -461,14 +462,14 @@ describe("prompt-search route coverage", () => {
       toJSON: () => 1,
     } as unknown as number;
     state.searchResults = [
-      result({ id: "base-high", rank: -2, confidence: 1, createdAt: now.toISOString() }),
-      result({ id: "boosted-base-low", rank: -1, confidence: 1, createdAt: now.toISOString() }),
-      result({ id: "confidence-low", rank: -3, confidence: 0.1, createdAt: now.toISOString() }),
-      result({ id: "confidence-high", rank: -3, confidence: 0.9, createdAt: now.toISOString() }),
-      result({ id: "created-z", rank: -4, createdAt: "z-invalid" }),
-      result({ id: "created-a", rank: -4, createdAt: "a-invalid" }),
-      result({ id: "invalid-surfaced", rank: -5, createdAt: now.toISOString() }),
-      result({ id: "defensive-denominator", rank: -6, createdAt: now.toISOString() }),
+      result({ id: "base-high", matchedTermCount: 2, confidence: 1, createdAt: now.toISOString() }),
+      result({ id: "boosted-base-low", matchedTermCount: 1, confidence: 1, createdAt: now.toISOString() }),
+      result({ id: "confidence-low", matchedTermCount: 3, confidence: 0.1, createdAt: now.toISOString() }),
+      result({ id: "confidence-high", matchedTermCount: 3, confidence: 0.9, createdAt: now.toISOString() }),
+      result({ id: "created-z", matchedTermCount: 4, createdAt: "z-invalid" }),
+      result({ id: "created-a", matchedTermCount: 4, createdAt: "a-invalid" }),
+      result({ id: "invalid-surfaced", matchedTermCount: 5, createdAt: now.toISOString() }),
+      result({ id: "defensive-denominator", matchedTermCount: 6, createdAt: now.toISOString() }),
     ];
     state.feedback.set("boosted-base-low", { usageCount: 1, surfacingCount: 0, lastSurfacedAt: null });
     state.feedback.set("invalid-surfaced", { usageCount: 0, surfacingCount: 0, lastSurfacedAt: "invalid" });
@@ -506,7 +507,7 @@ describe("prompt-search route coverage", () => {
   it("applies cross-session affinity to a memory from another session", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
-    state.searchResults = [result({ id: "other", sessionId: "other-session", rank: -2 })];
+    state.searchResults = [result({ id: "other", sessionId: "other-session", matchedTermCount: 2 })];
     const body = await call(
       JSON.stringify({ query: "q", cwd: "/tmp", session_id: "current", debug: true }),
       (value) => { value.restoration.crossSessionAffinity = 0.7; },
@@ -539,9 +540,9 @@ describe("prompt-search route coverage", () => {
 
   it("filters cooled results against the best non-cooled score", async () => {
     state.searchResults = [
-      result({ id: "fresh", rank: -10 }),
-      result({ id: "cooled-weak", rank: -1 }),
-      result({ id: "cooled-strong", rank: -20 }),
+      result({ id: "fresh", matchedTermCount: 10 }),
+      result({ id: "cooled-weak", matchedTermCount: 4 }),
+      result({ id: "cooled-strong", matchedTermCount: 20 }),
     ];
     const cooled: RecallFeedback = { usageCount: 0, surfacingCount: 1, lastSurfacedAt: new Date().toISOString() };
     state.feedback.set("cooled-weak", cooled);
@@ -560,12 +561,14 @@ describe("prompt-search route coverage", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
     state.searchResults = [
-      result({ id: "fresh", rank: -2, createdAt: "2026-01-01T00:00:00.000Z" }),
-      result({ id: "stale", rank: -4, createdAt: "2025-01-01T00:00:00.000Z" }),
+      result({ id: "fresh", matchedTermCount: 2, createdAt: "2026-01-01T00:00:00.000Z" }),
+      result({ id: "stale", matchedTermCount: 4, createdAt: "2025-01-01T00:00:00.000Z" }),
     ];
     const body = await call(
       JSON.stringify({ query: "q", cwd: "/tmp", debug: true }),
       (value) => {
+        // Negative admission isolates the staleness clamp coverage.
+        value.restoration.promptSearchMinScore = -100;
         value.restoration.staleAfterDays = 30;
         value.restoration.staleSurfacingWithoutUseLimit = 0;
         value.restoration.stalePenalty = 0.5;
@@ -587,12 +590,14 @@ describe("prompt-search route coverage", () => {
     vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
     const createdAt = "2025-12-31T23:59:59.000Z";
     state.searchResults = [
-      result({ id: "base-one", rank: -1, createdAt }),
-      result({ id: "base-two", rank: -2, createdAt }),
+      result({ id: "base-one", matchedTermCount: 1, createdAt }),
+      result({ id: "base-two", matchedTermCount: 2, createdAt }),
     ];
     const body = await call(
       JSON.stringify({ query: "q", cwd: "/tmp", debug: true }),
       (value) => {
+        // Zero admission isolates comparator ties after stale suppression.
+        value.restoration.promptSearchMinScore = 0;
         value.restoration.staleAfterDays = 0;
         value.restoration.staleSurfacingWithoutUseLimit = 0;
         value.restoration.allowStaleOnStrongMatch = false;

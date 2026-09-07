@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { JsonObject, JsonValue } from "../storage/contracts.js";
+import { collectPromotedRecallEvidence } from "./promoted-recall-evidence.js";
+import type { PromotedRecallSearchResult, JsonObject, JsonValue } from "../storage/contracts.js";
 import { parseStoredTimestamp } from "./stored-timestamp.js";
 
-// A fresh one-term fallback match clears the default prompt-search minimum of
-// two while still leaving room for recency, affinity, and feedback penalties.
+// Preserve the existing ordinary no-FTS public rank scale. Prompt recall uses
+// native evidence counts independently of this backend-specific rank.
 const FALLBACK_TERM_SCORE = 4;
 const MAX_ARRAY_LENGTH = 0xffff_ffff;
 
@@ -41,7 +42,7 @@ export type SearchResult = {
   sessionId: string | null;
   confidence: number;
   createdAt: string;
-  /** Native ranks are negative; fallback ranks are positive. Larger absolute values are stronger. */
+  /** Backend-native search rank; magnitudes are not comparable across backends or recall scores. */
   rank: number;
 };
 
@@ -416,6 +417,12 @@ export class PromotedStore {
     return results;
   }
 
+  searchForRecall(query: string, limit: number, filterTags?: string[], projectId?: string): PromotedRecallSearchResult {
+    return this.withFtsSavepoint(() => collectPromotedRecallEvidence(
+      this.db, this.search(query, limit, filterTags, projectId), query, this.fts5Available,
+    ));
+  }
+
   getAll(opts?: { projectId?: string; since?: string; tags?: string[] }): PromotedRow[] {
     let sql = `SELECT ${promotedContentProjection("promoted")} FROM promoted WHERE archived_at IS NULL`;
     const params: (string | number)[] = [];
@@ -540,11 +547,12 @@ export class PromotedStore {
     });
   }
 
-  private withFtsSavepoint(operation: () => void): void {
+  private withFtsSavepoint<T>(operation: () => T): T {
     this.db.exec("SAVEPOINT promoted_fts_sync");
     try {
-      operation();
+      const result = operation();
       this.db.exec("RELEASE SAVEPOINT promoted_fts_sync");
+      return result;
     } catch (error) {
       this.db.exec("ROLLBACK TO SAVEPOINT promoted_fts_sync");
       this.db.exec("RELEASE SAVEPOINT promoted_fts_sync");

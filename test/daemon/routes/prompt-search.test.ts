@@ -10,145 +10,6 @@ import { PromotedStore } from "../../../src/db/promoted.js";
 import { projectDbPath } from "../../../src/daemon/project.js";
 import { closeLcmConnection, getLcmConnection } from "../../../src/db/connection.js";
 
-// ---------------------------------------------------------------------------
-// Base scoring math — mirrors the pre-feedback score in prompt-search.
-// ---------------------------------------------------------------------------
-
-function scoreResult(opts: {
-  rank: number;
-  ageHours: number;
-  halfLife: number;
-  sessionId: string | null;
-  querySessionId: string | null | undefined;
-  crossSessionAffinity: number;
-}): number {
-  const recencyFactor = Math.pow(0.5, opts.ageHours / opts.halfLife);
-
-  let sessionAffinity: number;
-  if (opts.querySessionId == null) {
-    sessionAffinity = 1.0;
-  } else if (opts.sessionId === opts.querySessionId) {
-    sessionAffinity = 1.0;
-  } else {
-    sessionAffinity = opts.crossSessionAffinity;
-  }
-
-  return Math.abs(opts.rank) * recencyFactor * sessionAffinity;
-}
-
-const HALF_LIFE = 24;   // default recencyHalfLifeHours
-const AFFINITY = 0.85;  // default crossSessionAffinity
-const MIN_SCORE = 2;    // default promptSearchMinScore
-
-describe("composite scoring math", () => {
-  describe("recency_factor = Math.pow(0.5, ageHours / halfLife)", () => {
-    it("is 1.0 at age 0h", () => {
-      expect(Math.pow(0.5, 0 / HALF_LIFE)).toBeCloseTo(1.0, 10);
-    });
-
-    it("is 0.5 at age 24h (one half-life)", () => {
-      expect(Math.pow(0.5, 24 / HALF_LIFE)).toBeCloseTo(0.5, 10);
-    });
-
-    it("is 0.25 at age 48h (two half-lives)", () => {
-      expect(Math.pow(0.5, 48 / HALF_LIFE)).toBeCloseTo(0.25, 10);
-    });
-  });
-
-  describe("session_affinity", () => {
-    it("is 1.0 when query has no session context (session_id = null)", () => {
-      const score = scoreResult({
-        rank: -10, ageHours: 0, halfLife: HALF_LIFE,
-        sessionId: "sess-a", querySessionId: null,
-        crossSessionAffinity: AFFINITY,
-      });
-      expect(score).toBeCloseTo(10, 5);
-    });
-
-    it("is 1.0 for same-session result", () => {
-      const score = scoreResult({
-        rank: -10, ageHours: 0, halfLife: HALF_LIFE,
-        sessionId: "sess-x", querySessionId: "sess-x",
-        crossSessionAffinity: AFFINITY,
-      });
-      expect(score).toBeCloseTo(10, 5);
-    });
-
-    it("is crossSessionAffinity (0.85) for a different-session result", () => {
-      const score = scoreResult({
-        rank: -10, ageHours: 0, halfLife: HALF_LIFE,
-        sessionId: "sess-a", querySessionId: "sess-b",
-        crossSessionAffinity: AFFINITY,
-      });
-      expect(score).toBeCloseTo(8.5, 5);
-    });
-
-    it("is crossSessionAffinity (0.85) when result has null sessionId and query has a session", () => {
-      const score = scoreResult({
-        rank: -10, ageHours: 0, halfLife: HALF_LIFE,
-        sessionId: null, querySessionId: "sess-b",
-        crossSessionAffinity: AFFINITY,
-      });
-      expect(score).toBeCloseTo(8.5, 5);
-    });
-  });
-
-  describe("composite score = abs(rank) * recency * affinity", () => {
-    it("fresh same-session memory with rank -15 scores ~15 (above threshold 2)", () => {
-      // recency=1.0, affinity=1.0 → 15 * 1.0 * 1.0 = 15
-      const score = scoreResult({
-        rank: -15, ageHours: 0, halfLife: HALF_LIFE,
-        sessionId: "s1", querySessionId: "s1",
-        crossSessionAffinity: AFFINITY,
-      });
-      expect(score).toBeCloseTo(15, 5);
-      expect(score).toBeGreaterThanOrEqual(MIN_SCORE);
-    });
-
-    it("48h-old cross-session memory with rank -15 scores ~3.19 (above threshold 2)", () => {
-      // recency=0.25, affinity=0.85 → 15 * 0.25 * 0.85 = 3.1875
-      const score = scoreResult({
-        rank: -15, ageHours: 48, halfLife: HALF_LIFE,
-        sessionId: "sess-a", querySessionId: "sess-b",
-        crossSessionAffinity: AFFINITY,
-      });
-      expect(score).toBeCloseTo(3.1875, 5);
-      expect(score).toBeGreaterThanOrEqual(MIN_SCORE);
-    });
-
-    it("72h-old cross-session memory with rank -5 scores ~0.53 (below threshold 2)", () => {
-      // recency=Math.pow(0.5,3)=0.125, affinity=0.85 → 5 * 0.125 * 0.85 = 0.53125
-      const score = scoreResult({
-        rank: -5, ageHours: 72, halfLife: HALF_LIFE,
-        sessionId: "sess-a", querySessionId: "sess-b",
-        crossSessionAffinity: AFFINITY,
-      });
-      expect(score).toBeCloseTo(0.53125, 5);
-      expect(score).toBeLessThan(MIN_SCORE);
-    });
-  });
-
-  describe("threshold filter", () => {
-    it("passes results with score >= minScore", () => {
-      const score = scoreResult({
-        rank: -15, ageHours: 0, halfLife: HALF_LIFE,
-        sessionId: "s", querySessionId: "s",
-        crossSessionAffinity: AFFINITY,
-      });
-      expect(score).toBeGreaterThanOrEqual(MIN_SCORE);
-    });
-
-    it("rejects results with score < minScore", () => {
-      const score = scoreResult({
-        rank: -5, ageHours: 72, halfLife: HALF_LIFE,
-        sessionId: "sess-a", querySessionId: "sess-b",
-        crossSessionAffinity: AFFINITY,
-      });
-      expect(score).toBeLessThan(MIN_SCORE);
-    });
-  });
-});
-
 const tempDirs: string[] = [];
 
 afterEach(async () => {
@@ -200,8 +61,6 @@ describe("POST /prompt-search", () => {
 
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    // Set minScore to 0 so all FTS5 matches pass the filter (rank is always negative)
-    config.restoration.promptSearchMinScore = 0;
     const daemon = await createDaemon(config);
     const port = daemon.address().port;
 
@@ -209,7 +68,7 @@ describe("POST /prompt-search", () => {
       const res = await fetch(`http://127.0.0.1:${port}/prompt-search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: "React frontend", cwd: tempDir }),
+        body: JSON.stringify({ query: "React frontend decided", cwd: tempDir }),
       });
       const data = await res.json() as { hints: string[]; ids: string[] };
       expect(res.status).toBe(200);
@@ -368,7 +227,6 @@ describe("POST /prompt-search", () => {
 
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    config.restoration.promptSearchMinScore = 0; // let FTS rank decide
     const daemon = await createDaemon(config);
     const port = daemon.address().port;
 
@@ -376,7 +234,7 @@ describe("POST /prompt-search", () => {
       const res = await fetch(`http://127.0.0.1:${port}/prompt-search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: "TypeScript modules", cwd: tempDir, session_id: "sess-current" }),
+        body: JSON.stringify({ query: "TypeScript modules agreed", cwd: tempDir, session_id: "sess-current" }),
       });
       const data = await res.json() as { hints: string[] };
       expect(res.status).toBe(200);
@@ -440,7 +298,6 @@ describe("POST /prompt-search", () => {
 
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    config.restoration.promptSearchMinScore = 0;
     config.restoration.recallUsageBoost = 1.5;
     config.restoration.recallUsageSmoothing = 1;
     const daemon = await createDaemon(config);
@@ -450,7 +307,7 @@ describe("POST /prompt-search", () => {
       const res = await fetch(`http://127.0.0.1:${port}/prompt-search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: "SQLite storage", cwd: tempDir, debug: true }),
+        body: JSON.stringify({ query: "SQLite project storage", cwd: tempDir, debug: true }),
       });
       const data = await res.json() as {
         hints: string[];
@@ -485,7 +342,6 @@ describe("POST /prompt-search", () => {
 
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    config.restoration.promptSearchMinScore = 0;
     config.restoration.surfacingCooldownWindow = 24;
     config.restoration.resurfaceMargin = 10;
     config.restoration.unusedSurfacingPenalty = 0;
@@ -496,7 +352,7 @@ describe("POST /prompt-search", () => {
       const res = await fetch(`http://127.0.0.1:${port}/prompt-search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: "TypeScript build", cwd: tempDir, debug: true }),
+        body: JSON.stringify({ query: "TypeScript build convention", cwd: tempDir, debug: true }),
       });
       const data = await res.json() as {
         hints: string[];
@@ -539,7 +395,6 @@ describe("POST /prompt-search", () => {
 
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    config.restoration.promptSearchMinScore = 0;
     config.restoration.surfacingCooldownWindow = 24;
     config.restoration.resurfaceMargin = 10;
     const daemon = await createDaemon(config);
@@ -549,7 +404,7 @@ describe("POST /prompt-search", () => {
       const res = await fetch(`http://127.0.0.1:${port}/prompt-search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: "TypeScript build", cwd: tempDir, debug: true }),
+        body: JSON.stringify({ query: "TypeScript build convention", cwd: tempDir, debug: true }),
       });
       const data = await res.json() as {
         hints: string[];
@@ -588,7 +443,6 @@ describe("POST /prompt-search", () => {
 
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    config.restoration.promptSearchMinScore = 0;
     config.restoration.surfacingCooldownWindow = 0;
     config.restoration.unusedSurfacingPenalty = 1;
     const daemon = await createDaemon(config);
@@ -598,7 +452,7 @@ describe("POST /prompt-search", () => {
       const res = await fetch(`http://127.0.0.1:${port}/prompt-search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: "Bun test", cwd: tempDir, debug: true }),
+        body: JSON.stringify({ query: "Bun test runner", cwd: tempDir, debug: true }),
       });
       const data = await res.json() as {
         hints: string[];
@@ -645,7 +499,6 @@ describe("POST /prompt-search", () => {
 
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    config.restoration.promptSearchMinScore = 0;
     const daemon = await createDaemon(config);
     const port = daemon.address().port;
 
@@ -653,7 +506,7 @@ describe("POST /prompt-search", () => {
       const res = await fetch(`http://127.0.0.1:${port}/prompt-search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: "Node worker", cwd: tempDir, debug: true }),
+        body: JSON.stringify({ query: "Node worker pool", cwd: tempDir, debug: true }),
       });
       const data = await res.json() as {
         hints: string[];
@@ -689,7 +542,6 @@ describe("POST /prompt-search", () => {
 
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    config.restoration.promptSearchMinScore = 0;
     const daemon = await createDaemon(config);
     const port = daemon.address().port;
 
@@ -945,7 +797,6 @@ describe("stale memory demotion", () => {
 
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
-    config.restoration.promptSearchMinScore = 0;
     config.restoration.staleAfterDays = 90;
     config.restoration.staleSurfacingWithoutUseLimit = 5;
     config.restoration.stalePenalty = 0.5;

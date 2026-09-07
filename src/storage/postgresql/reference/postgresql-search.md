@@ -49,6 +49,31 @@ the final public ID. Regex results use descending creation time and ID.
 Primary full-text results always precede trigram fill results. Repeating a
 query against unchanged data therefore produces the same order.
 
+## Prompt recall evidence
+
+`searchPromotedForRecall` preserves the ordinary selected candidate sequence and
+public result shape inside a separate evidence envelope. It counts distinct
+positively polarized native query lexemes against the selected memory and its
+owner-scoped tags. Weight/prefix variants of the same lexeme count once when any
+positive variant matches. Negative-only queries retain selected fallback rows
+with zero evidence. Phrase operators continue to govern retrieval; evidence
+counts constituent positive terms, not phrase acceptance. Native compounds such
+as `state-of-the-art` contain five distinct lexemes, including the joined form;
+repeated query lexemes still count once.
+
+The canonical query comes from the existing configured PostgreSQL parser. The
+private iterative parser preserves exact atom serialization, including doubled
+quotes/backslashes and canonical prefix/weight suffixes. Selection and evidence
+share one SQL statement snapshot with the existing owner/source/tag/archive
+filters, limits and native ordering. No extra evidence fields are attached to
+ordinary search results, and ordinary search performs no evidence work.
+
+Prompt scoring uses matched counts plus four only for positive-evidence whole
+normalized content/query equality, followed by existing modifiers. Public ranks
+remain backend-native and are not score inputs. See
+[configuration](../../../../docs/configuration.md#prompt-recall-scores) for the
+formula, normalization, defaults, backend differences and failure behavior.
+
 ## Scopes, limits, and snippets
 
 Every query includes the repository's exact owner project. Optional

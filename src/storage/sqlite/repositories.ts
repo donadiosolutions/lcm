@@ -300,6 +300,8 @@ export function createSqliteRepositories(
       }, true),
     },
     lexicalSearch: {
+      searchPromotedForRecall: (query, limit, filterTags, sourceProjectId) => invoke("lexical-search", "searchPromotedForRecall", () =>
+        promoted.searchForRecall(query, limit, filterTags, sourceProjectId)),
       searchMessages: (input) => invoke("lexical-search", "searchMessages", () => conversations.searchMessages(input)),
       searchSummaries: (input) => invoke("lexical-search", "searchSummaries", () => summaries.searchSummaries(input)),
       searchPromoted: (query, limit, filterTags, sourceProjectId) => invoke("lexical-search", "searchPromoted", () =>

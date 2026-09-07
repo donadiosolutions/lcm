@@ -1,4 +1,4 @@
-import { describe, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { runLcmMigrations } from "../../src/db/migration.js";
 import {
   createSqliteRepositories,
@@ -88,6 +88,11 @@ describe("SQLite lexical-search golden conformance", () => {
       sourceProjectId: isolatedSourceProjectId,
       confidence: 0.6,
     });
+
+    const ordinary = await repositories.lexicalSearch.searchPromoted("primarydurable durable", 10, ["architecture"], sourceProjectId);
+    const recall = await repositories.lexicalSearch.searchPromotedForRecall("primarydurable durable", 10, ["architecture"], sourceProjectId);
+    expect(recall.candidates.map(({ result }) => result)).toEqual(ordinary);
+    expect(recall.candidates[0].evidence).toEqual({ queryTermCount: 2, matchedTermCount: 2 });
 
     await exerciseLexicalSearchRepositoryConformance(
       repositories.lexicalSearch,
