@@ -476,6 +476,18 @@ function isRegularFile(path: string): boolean {
   }
 }
 
+function isAdmittedSourcePatternsFile(path: string): boolean {
+  try {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) throw new Error(`refusing to reconcile symlink: ${path}`);
+    if (!stat.isFile()) throw new Error(`invalid legacy source patterns path: ${path}`);
+    return true;
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return false;
+    throw error;
+  }
+}
+
 function readJournal(path: string): ReconciliationJournal | null {
   if (!existsSync(path)) return null;
   const value = JSON.parse(readBoundedRegularFile(path, {
@@ -1898,7 +1910,7 @@ function mergePatterns(
 ): void {
   assertTarget();
   const sourcePath = join(source.projectDir, "sensitive-patterns.txt");
-  const sourceExists = isRegularFile(sourcePath);
+  const sourceExists = isAdmittedSourcePatternsFile(sourcePath);
   if (!expected.patterns && sourceExists) {
     throw new Error(
       `legacy patterns component appeared after the reconciliation snapshot for ${source.hash}`,
@@ -1998,7 +2010,7 @@ function sourceComponentSnapshot(
   source: WorktreeReconciliationSource,
 ): SourceComponentSnapshot {
   const patternsPath = join(source.projectDir, "sensitive-patterns.txt");
-  const patterns = isRegularFile(patternsPath);
+  const patterns = isAdmittedSourcePatternsFile(patternsPath);
   return {
     projectDb: isRegularFile(join(source.projectDir, "db.sqlite")),
     eventsDb: isRegularFile(source.eventsPath),
@@ -2201,7 +2213,7 @@ function assertArchivedPatternsMatch(
     backupName(source.hash, now),
   );
   const archivedPatternsPath = join(archivedProjectDir, "sensitive-patterns.txt");
-  const archivedPatterns = isRegularFile(archivedPatternsPath);
+  const archivedPatterns = isAdmittedSourcePatternsFile(archivedPatternsPath);
   if (!expected.patterns && archivedPatterns) {
     throw new Error(
       `legacy patterns component appeared after the reconciliation snapshot for ${source.hash}`,
