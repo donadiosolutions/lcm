@@ -332,7 +332,17 @@ export interface RedactionPurgeResult {
   sessionInstructions: number;
 }
 
+export interface PromotedRecallCandidate {
+  result: import("../db/promoted.js").SearchResult;
+  evidence: { queryTermCount: number; matchedTermCount: number };
+}
+
+export interface PromotedRecallSearchResult {
+  candidates: PromotedRecallCandidate[];
+}
+
 export interface LexicalSearchRepository {
+  searchPromotedForRecall(query: string, limit: number, filterTags?: string[], sourceProjectId?: string): Promise<PromotedRecallSearchResult>;
   searchMessages(input: MessageSearchInput): Promise<MessageSearchResult[]>;
   searchSummaries(input: SummarySearchInput): Promise<SummarySearchResult[]>;
   searchPromoted(query: string, limit: number, filterTags?: string[], sourceProjectId?: string): Promise<import("../db/promoted.js").SearchResult[]>;

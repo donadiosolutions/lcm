@@ -350,6 +350,78 @@ For coding conversations with tool calls (which generate many messages per logic
 
 The actual summary size depends on the LLM's output; these values are guidelines passed in the prompt's token target instruction.
 
+### Prompt recall scores
+
+Prompt recall scores selected memories in native matched-term units rather than
+using backend search-rank magnitudes. Its initial score is `m + bonus`, where `m`
+is the number of distinct native query terms matching the memory content or tags.
+The bonus is **4** only when there is positive native evidence and the entire
+normalized memory content equals the entire normalized query. Normalization uses
+NFKC, lowercase, Unicode whitespace (including BOM) collapsed to single spaces,
+and trimming. It preserves punctuation, word order, and repeated words. Tags,
+substrings, accent removal, and stemming alone never earn this whole-text bonus.
+
+For example, exact content and query `quince espalier pollination orchard` score
+8 (four matched terms plus four). Exact `orchard` scores 5. A four-term SQLite
+Porter match such as `running swimming jumping walking` against `run swim jump
+walk` scores 4; an incidental single-term match scores 1. An unrelated term added
+to a non-whole query does not divide or lower its matched-term score. Adding text
+to a whole-text-exact query can remove the four-point bonus.
+
+The existing defaults remain `restoration.promptSearchMinScore: 2`,
+`crossSessionAffinity: 0.85`, `promptSearchMaxResults: 3`, and
+`recencyHalfLifeHours: 24`. Age and session affinity multiply the initial
+score before feedback: four matched terms score 2 at one half-life, 1 at two,
+and 3.4 when fresh in another session. The minimum is inclusive. Usage applies
+the existing `1 + recallUsageBoost * usageCount / (usageCount +
+max(0, recallUsageSmoothing))` multiplier when usage and boost are positive.
+Without usage, each prior surfacing subtracts `unusedSurfacingPenalty` (default
+0.15); stale memories also subtract `stalePenalty` (default 0.5), or are capped
+at zero when `allowStaleOnStrongMatch` is disabled. Thus a fresh four-term
+non-whole match with one unused surfacing scores 3.85; its whole-text-exact
+counterpart scores 7.85. Cooldown, confidence/date tie ordering, and byte budgets
+still apply. Configured stricter minimum scores are honored, including for exact
+matches. Existing thresholds can produce different recall sets because the score
+domain changed; additive penalties have less relative influence on high-coverage
+matches. No threshold adjustment is required to fix PostgreSQL exact recall.
+
+Each backend retains its existing candidate search language. SQLite sanitizes to
+ASCII word terms joined by OR and uses Porter stemming; repeated words and stem
+aliases count once. An underscore term such as `foo_bar` remains one quoted
+phrase and counts only when that complete phrase matches. Without FTS, SQLite
+retains its existing whole-word matching without stemming. PostgreSQL uses its
+configured native web-search language, including quoted phrases, OR and negative
+terms, and its simple dictionary does not perform Porter stemming. Only distinct
+positive native lexemes count, with repeated lexemes and weight/prefix variants
+counted once. Native compounds can contain several terms: `state-of-the-art`
+produces five distinct PostgreSQL lexemes, while separated `state of the art`
+produces four. Quoted multiword phrases retain their constituent term counts;
+URL and numeric tokenization can also differ between backends. Term counts
+measure lexical evidence, not guaranteed semantic relevance. A typo-only fallback
+with no positive native matches scores zero.
+
+Recall adds evidence only for the existing selected candidates; it does not widen
+scope or change native order or limits. The candidate window is
+`max(5 * promptSearchMaxResults, 10)` (15 by default). SQLite processes all distinct
+query units and selected IDs in batches of at most 256, without truncating longer
+queries. Work grows with both the distinct query units and selected candidates;
+larger candidate windows and longer prompts require more matching work.
+PostgreSQL uses one statement snapshot for selected contents and evidence under
+its existing statement timeout. Incomplete evidence produces no partial hints:
+SQLite retains its best-effort HTTP 200 response with empty hints and no new
+diagnostic logging; selected PostgreSQL storage failures return sanitized HTTP
+503 errors. No feedback reads or surfacing writes follow incomplete evidence.
+
+When requesting `/prompt-search` with `debug: true`, each result reports
+`matchedTermCount`, `queryTermCount`, `wholeTextMatch`, `strongMatchBonus`, and
+`lexicalScore`, alongside existing modifiers and the unchanged native `rank`.
+`queryTermCount` is diagnostic metadata, never a score denominator. Ordinary
+`/search` results keep their existing shape and native ranks. Public PostgreSQL
+factory consumers retain the existing search methods and gain the required recall
+method. Hand-built `ProjectStorage` objects or structural test doubles must now
+implement `lexicalSearch.searchPromotedForRecall` and return complete evidence
+envelopes; the method is not optional.
+
 ### Prompt recall budgeting
 
 Prompt-time recall now has a second budget layer after `/prompt-search` ranking.

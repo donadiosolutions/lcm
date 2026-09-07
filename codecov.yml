@@ -149,6 +149,7 @@ component_management:
         # #1062 keeps missing promote metadata no-clobber handling route-owned.
         # #1158 keeps PostgreSQL passive promotion route behavior route-owned;
         # deduplication implementation remains in unit-promotion below.
+        # #1203 keeps evidence-based prompt scoring and debug output route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -194,6 +195,7 @@ component_management:
         # #1082 keeps SQLite promoted-content NUL admission and replay guards
         # in local persistence; this change does not alter component ownership.
         # #1084/#1085/#1092 keep SQLite UTC timestamp parsing in this owner.
+        # #1203 keeps selected SQLite recall evidence and its owned query tokenizer here.
         - "src/db/"
         # Captured UTF-8 decoding and immutable-file authority remain local-persistence-owned.
         # #618 optional receipt schema admission stays local-persistence-owned.
@@ -223,6 +225,7 @@ component_management:
         # #910 keeps shared publication retry deadlines monotonic in this owner.
         - "^src/storage/publication-convergence\\.ts$"
         - "^src/storage/capabilities\\.ts$"
+        # #1203 retains the required recall evidence envelope in shared contracts.
         - "^src/storage/contracts\\.ts$"
         - "^src/storage/errors\\.ts$"
         - "^src/storage/factory\\.ts$"
@@ -405,7 +408,9 @@ component_management:
     - component_id: "integration-postgresql-search"
       name: "Integration - PostgreSQL Search"
       paths:
+        # #1203 owns native canonical recall parsing and selected evidence here.
         - "^src/storage/postgresql/lexical-search-repository\\.ts$"
+        - "^src/storage/postgresql/tsquery-evidence\\.ts$"
         - "^src/storage/postgresql/search-configuration\\.ts$"
     - component_id: "integration-postgresql-transcripts"
       name: "Integration - PostgreSQL Transcripts"

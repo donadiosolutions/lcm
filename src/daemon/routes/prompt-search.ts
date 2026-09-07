@@ -1,6 +1,7 @@
 import type { DaemonConfig } from "../config.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
+import type { PromotedRecallCandidate } from "../../storage/contracts.js";
 import type { SearchResult } from "../../db/promoted.js";
 import type { RecallFeedback } from "../../db/recall.js";
 import { parseStoredTimestamp } from "../../db/stored-timestamp.js";
@@ -17,6 +18,11 @@ const CANDIDATE_LIMIT_MULTIPLIER = 5;
 const MIN_CANDIDATE_LIMIT = 10;
 
 type RankedPromptSearchResult = SearchResult & {
+  lexicalScore: number;
+  matchedTermCount: number;
+  queryTermCount: number;
+  wholeTextMatch: boolean;
+  strongMatchBonus: number;
   baseScore: number;
   finalScore: number;
   usageBoost: number;
@@ -33,8 +39,13 @@ function compareRankedResults(a: RankedPromptSearchResult, b: RankedPromptSearch
   return a.createdAt.localeCompare(b.createdAt);
 }
 
+function normalizeWholeText(text: string): string {
+  return text.normalize("NFKC").toLowerCase().replace(/[\p{White_Space}\uFEFF]+/gu, " ").trim();
+}
+
 function computeBaseScore(
   result: SearchResult,
+  lexicalScore: number,
   querySessionId: string | null | undefined,
   now: number,
   halfLife: number,
@@ -55,7 +66,7 @@ function computeBaseScore(
     sessionAffinity = crossSessionAffinity;
   }
 
-  return Math.abs(result.rank) * recencyFactor * sessionAffinity;
+  return lexicalScore * recencyFactor * sessionAffinity;
 }
 
 function computeUsageBoost(usageCount: number, boost: number, smoothing: number): number {
@@ -74,9 +85,10 @@ function isWithinCooldown(lastSurfacedAt: string | null, now: number, cooldownWi
 }
 
 function rankResults(
-  results: SearchResult[],
+  candidates: PromotedRecallCandidate[],
   feedbackById: Map<string, RecallFeedback>,
   options: {
+    queryText: string;
     querySessionId: string | null | undefined;
     now: number;
     halfLife: number;
@@ -91,8 +103,14 @@ function rankResults(
     allowStaleOnStrongMatch: boolean;
   },
 ): RankedPromptSearchResult[] {
-  return results
-    .map((result) => {
+  return candidates
+    .map(({ result, evidence }) => {
+      const { matchedTermCount, queryTermCount } = evidence;
+      const wholeTextMatch = matchedTermCount > 0
+        && options.queryText.length > 0
+        && normalizeWholeText(result.content) === options.queryText;
+      const strongMatchBonus = wholeTextMatch ? 4 : 0;
+      const lexicalScore = matchedTermCount + strongMatchBonus;
       const feedback = feedbackById.get(result.id) ?? {
         usageCount: 0,
         surfacingCount: 0,
@@ -100,6 +118,7 @@ function rankResults(
       };
       const baseScore = computeBaseScore(
         result,
+        lexicalScore,
         options.querySessionId,
         options.now,
         options.halfLife,
@@ -130,6 +149,11 @@ function rankResults(
 
       return {
         ...result,
+        lexicalScore,
+        matchedTermCount,
+        queryTermCount,
+        wholeTextMatch,
+        strongMatchBonus,
         baseScore,
         finalScore,
         usageBoost,
@@ -261,11 +285,29 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
           const allowStaleOnStrongMatch = config.restoration.allowStaleOnStrongMatch;
 
           const candidateLimit = Math.max(maxResults * CANDIDATE_LIMIT_MULTIPLIER, MIN_CANDIDATE_LIMIT);
-          const results = await project.lexicalSearch.searchPromoted(query, candidateLimit);
+          const { candidates } = await project.lexicalSearch.searchPromotedForRecall(query, candidateLimit);
+          // Validate the complete evidence envelope before feedback reads or writes.
+          for (const { evidence } of candidates) {
+            const matchedTermCount = evidence?.matchedTermCount;
+            const queryTermCount = evidence?.queryTermCount;
+            if (
+              !Number.isSafeInteger(queryTermCount)
+              || !Number.isSafeInteger(matchedTermCount)
+              || queryTermCount < 0
+              || matchedTermCount < 0
+              || matchedTermCount > queryTermCount
+            ) {
+              throw new StorageOperationError(
+                "STORAGE_OPERATION_FAILED", config.storage.backend, project.projectId,
+                "lexical-search", "searchPromotedForRecall",
+              );
+            }
+          }
 
           const now = Date.now();
-          const feedbackById = await project.recall.getFeedback(results.map((result) => result.id));
-          const ranked = rankResults(results, feedbackById, {
+          const feedbackById = await project.recall.getFeedback(candidates.map(({ result }) => result.id));
+          const ranked = rankResults(candidates, feedbackById, {
+            queryText: normalizeWholeText(query),
             querySessionId: session_id,
             now,
             halfLife,
@@ -303,6 +345,11 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
             ? {
                 candidates: ranked.map((result) => ({
                   id: result.id,
+                  lexicalScore: result.lexicalScore,
+                  matchedTermCount: result.matchedTermCount,
+                  queryTermCount: result.queryTermCount,
+                  wholeTextMatch: result.wholeTextMatch,
+                  strongMatchBonus: result.strongMatchBonus,
                   baseScore: result.baseScore,
                   finalScore: result.finalScore,
                   rank: result.rank,

@@ -367,6 +367,7 @@ const expectedComponents = [
     name: "Integration - PostgreSQL Search",
     paths: [
       "^src/storage/postgresql/lexical-search-repository\\.ts$",
+      "^src/storage/postgresql/tsquery-evidence\\.ts$",
       "^src/storage/postgresql/search-configuration\\.ts$",
     ],
   },
@@ -530,7 +531,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(237);
+    expect(productionFiles).toHaveLength(239);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -560,7 +561,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(237);
+    expect(ownershipCounts.size).toBe(239);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106 files in their intended components", () => {
@@ -639,6 +640,12 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/review-stale.ts", "unit-daemon-routes"],
       // #1148 keeps promoted created_at UTC parsing in the existing daemon
       // routes owner; prompt-search and restore retain their route ownership.
+      // #1203 adds native recall evidence without changing component topology.
+      ["src/db/promoted-recall-evidence.ts", "unit-local-persistence"],
+      ["src/storage/postgresql/tsquery-evidence.ts", "integration-postgresql-search"],
+      ["src/storage/contracts.ts", "unit-storage-abstractions"],
+      ["src/storage/sqlite/repositories.ts", "unit-local-persistence"],
+      ["src/storage/postgresql/lexical-search-repository.ts", "integration-postgresql-search"],
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
       // #833 passive-event identity admission remains route-owned.
