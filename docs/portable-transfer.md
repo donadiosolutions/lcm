@@ -9,7 +9,7 @@ LCM has three separate import and export contracts:
 | Canonical storage adapters | All 22 domains of the version 1 canonical record stream | Each bounded batch has a durable receipt. A retry resumes from authenticated destination progress. |
 
 Ordinary knowledge export keeps its existing format. Canonical transfer is a
-library integration API in the [storage facade](../src/storage/index.ts), not a
+library integration API at `@donadiosolutions/lcm/storage/portable`, not a
 new CLI command. It prepares and verifies an isolated destination. It does not
 select a backend, publish a generation, replace an active project, activate an
 outbox, or perform a cutover.
@@ -123,7 +123,7 @@ import {
   createPostgreSqlPortableDestination,
   openSqlitePortableSource,
   runPortableTransfer,
-} from "../src/storage/index.js";
+} from "@donadiosolutions/lcm/storage/portable";
 
 const sourceHandle = await openSqlitePortableSource(verifiedSourceInput);
 const source = await createPortableRecordStream(sourceHandle);
@@ -170,6 +170,12 @@ prefix and source boundaries, and applies batches in dependency order. Empty
 domains also receive durable terminal checkpoints. Progress is emitted only
 for an exact acknowledged checkpoint. The final result requires all domain
 counts and hashes to agree with SQL readback and the source to remain stable.
+
+The package subpath exports both backend adapters, the record/manifest/checkpoint
+codecs, stream construction, transfer execution, constants, and their TypeScript
+types. It does not expose backend publication, coordinator or factory authority.
+Importing the module does not open storage; opening an adapter requires the
+explicit verified inputs described above.
 
 For the opposite direction, use `createPostgreSqlPortableSource` followed by
 `createPortableRecordStream`, and `openSqlitePortableDestination`. The SQLite

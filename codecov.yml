@@ -201,6 +201,8 @@ component_management:
         - "^src/storage/home-lock-topology\\.ts$"
         - "^src/storage/identity-context\\.ts$"
         - "^src/storage/index\\.ts$"
+        # Curated portable package API remains storage-abstractions-owned.
+        - "^src/storage/portable\\.ts$"
         - "^src/storage/portable-record\\.ts$"
         # The #763 manifest and #816 checkpoint negative-zero taxonomies remain storage-abstractions-owned.
         - "^src/storage/portable-record-stream\\.ts$"
