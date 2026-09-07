@@ -208,8 +208,8 @@ uncommitted fence, so the source bytes remain intact and can be repaired in
 place. A target check rolls back the target transaction; its source fence may
 already be committed, so repair the target database in place and rerun
 reconciliation. Use the offline diagnostic and replacement procedure above to
-inspect and deliberately repair affected rows before retrying. The limitation
-is tracked in [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
+inspect and deliberately repair affected rows before retrying. This refusal
+behavior is implemented by [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
 
 No data is sent to any Long Context Manager (LCM) server. There is no telemetry.
 An explicitly configured PostgreSQL backend is a user-operated remote-primary
