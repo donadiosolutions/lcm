@@ -59,6 +59,8 @@ component_management:
         - "^src/scrub\\.ts$"
         - "^src/secret-key\\.ts$"
         - "^src/security-files\\.ts$"
+        # #1133 keeps project-pattern owner/single-link admission and authenticated
+        # single-snapshot scrubbing in this existing configuration-security owner.
         - "^src/sensitive\\.ts$"
         - "^src/shell-quote\\.ts$"
         - "^src/terminal-sanitize\\.ts$"
