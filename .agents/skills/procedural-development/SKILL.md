@@ -29,20 +29,20 @@ Honor draft-only/no-merge limits and caller-specific tracker closure authority.
 These are invocation parameters, not shell variables or CLI flags. Each role has
 `<ROLE>_MODEL`, `<ROLE>_REASONING` and `<ROLE>_TIER` parameters:
 
-| ROLE | Reasoning default | Tier default |
-| --- | --- | --- |
-| `OWNER` | medium | default |
-| `IMPLEMENTER` | high | priority |
-| `SECURITY_IMPLEMENTER` | high | default |
-| `ESCALATED_IMPLEMENTER` | high | default |
-| `REVIEWER_A` | maximum supported | default |
-| `REVIEWER_B` | medium | default |
-| `SYNTHESIS_REVIEWER` | medium | default |
+| ROLE | Model default | Reasoning default | Tier default |
+| --- | --- | --- | --- |
+| `OWNER` | Astra | medium | default |
+| `IMPLEMENTER` | Luna | high | priority |
+| `SECURITY_IMPLEMENTER` | Daybreak Blue | high | default |
+| `ESCALATED_IMPLEMENTER` | Astra | high | default |
+| `REVIEWER_A` | GLM-5.3 | maximum supported | default |
+| `REVIEWER_B` | Grok 4.6 | medium | default |
+| `SYNTHESIS_REVIEWER` | Opus 5 | medium | default |
 
-Model bindings come from invocation or caller/local role configuration, not named
-models in this skill. Resolve explicit invocation overrides, then caller overrides,
-then defaults above; inherited values are not overrides. Pass resolved settings
-unchanged to nested calls and apply these rules to caller-defined roles too.
+All defaults, including model choices, can be overridden on invocation.
+Resolve explicit invocation overrides, then caller/local overrides, then defaults
+above; inherited values are not overrides. Pass resolved settings unchanged to
+nested calls and apply these rules to caller-defined roles too.
 `MAX_ACTIVE_OWNERS=7`, `WATCHDOG_MINUTES=30`; the initial P2 budget is **three
 completed candidate rounds per item**. Record user-authorized revisions explicitly.
 
@@ -51,7 +51,7 @@ completed candidate rounds per item**. Record user-authorized revisions explicit
 Before issue mutation or worker launch, resolve exact model IDs and supported
 reasoning through local mappings and the live dispatch schema/catalog. Explicit
 routes need not appear in a default listing. Do not invent IDs, infer availability
-from a working proxy, or infer unavailability from an unfamiliar model. Missing
+from a working proxy, or infer unavailability from an unfamiliar model. Unresolved
 bindings or unavailable required model/reasoning routes need a concrete blocker
 and explicit substitution; never silently lower reasoning or omit a reviewer.
 

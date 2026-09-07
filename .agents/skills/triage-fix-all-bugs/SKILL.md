@@ -11,10 +11,10 @@ Execution authorizes two sequential phases within user scope: **triage, then
 remediation**. Reading/editing/testing skills never authorizes workers, issue
 mutations or environment replacement.
 
-Bind `TRIAGE_MODEL` through invocation or caller/local role configuration;
-`TRIAGE_REASONING=high`, `TRIAGE_TIER=priority`. This role also adjudicates duplicates.
+Defaults: `TRIAGE_MODEL=Luna`, `TRIAGE_REASONING=high`, `TRIAGE_TIER=priority`.
+All can be overridden on invocation. This role also adjudicates duplicates.
 Inherit [shared role parameters and limits](../procedural-development/SKILL.md#configuration).
-Explicit invocation overrides caller configuration, then shared defaults; pass
+Explicit invocation overrides caller configuration, then skill defaults; pass
 resolved settings unchanged. These are invocation instructions, not CLI flags.
 Shared route preflight and best-effort tier rules apply to every role.
 
