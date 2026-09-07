@@ -73,6 +73,7 @@ import {
 } from "../storage/backend.js";
 import {
   createPublicationConvergence,
+  PUBLICATION_CONVERGENCE_MS,
   withPublicationAdmissionRetry,
   type PublicationConvergence,
 } from "../storage/publication-convergence.js";
@@ -81,6 +82,7 @@ import {
   readPrivateMutationLockOwner,
   PrivateMutationLockContentionError,
 } from "../private-mutation-lock.js";
+import { readBoundedRegularFileWithStat } from "../security-files.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
@@ -109,6 +111,33 @@ type LifecycleAdmissionPins = Readonly<{
   birthAfter: string | null;
   tokenAfter: string | null;
 }>;
+
+type PublicationAdmissionWrapper = <T>(
+  step: () => T | Promise<T>,
+) => Promise<T>;
+
+type LifecyclePublicationCaptureMode =
+  | Readonly<{ kind: "current" }>
+  | Readonly<{ kind: "replacement-manager"; managerPid: number }>
+  | Readonly<{ kind: "replacement-owned" }>;
+
+type LifecyclePublicationEvidence = Readonly<{
+  pid: number;
+  version: string;
+  storageBackend: StorageBackend;
+  entrypoint: string;
+  runtimeDigest: string;
+  birth: string;
+  token: string;
+  readToken: () => string | null;
+  processBirth: typeof processStartTime;
+  readOwner: typeof readPrivateMutationLockOwner;
+}>;
+
+type LifecyclePublicationRetryBudget = {
+  remainingMs: number;
+  firstContention?: PrivateMutationLockContentionError;
+};
 
 function publicationHomeForPidPath(pidFilePath: string): string | undefined {
   const pidPath = resolve(pidFilePath);
@@ -238,7 +267,11 @@ export type EnsureDaemonOptions = {
   /** @internal Test-only publication admission seam. */
   _assertBackendPublication?: (homeDir: string | undefined, backend: StorageBackend) => void;
   /** @internal Bounded admission convergence for one lifecycle publication assert. */
-  _withPublicationAdmissionRetry?: <T>(step: () => T | Promise<T>) => Promise<T>;
+  _withPublicationAdmissionRetry?: PublicationAdmissionWrapper;
+  /** @internal Restart-scoped convergence for the initial publication assert only. */
+  _withInitialPublicationAdmissionRetry?: PublicationAdmissionWrapper;
+  /** @internal Active-time budget shared by explicit-restart replacement assertions. */
+  _restartPublicationRetryBudget?: LifecyclePublicationRetryBudget;
   /** @internal Inject only the manager transport environment for lifecycle tests. */
   _managerTransportEnvironmentOverride?: NodeJS.ProcessEnv;
   /** @internal Deterministic per-start nonce seam for lifecycle tests. */
@@ -693,15 +726,18 @@ type ScopedStateAccess = Readonly<({
 
 class LifecycleTestScopeStateError extends Error {}
 
-function assertScopedStateAccess(access: ScopedStateAccess): void {
-  const ownsState = "scope" in access
+function scopedStateAccessOwnsExactPaths(access: ScopedStateAccess): boolean {
+  return "scope" in access
     ? lifecycleScopeOwnsExactStatePaths(access.scope, access.pidPath, access.tokenPath)
     : lifecycleHermeticSeamsOwnsExactStatePaths(
         access.hermeticSeams,
         access.pidPath,
         access.tokenPath,
       );
-  if (!ownsState) {
+}
+
+function assertScopedStateAccess(access: ScopedStateAccess): void {
+  if (!scopedStateAccessOwnsExactPaths(access)) {
     throw new LifecycleTestScopeStateError(
       "daemon lifecycle test state paths changed or escaped their canonical scope",
     );
@@ -1539,6 +1575,455 @@ async function checkDaemonDiagnostics(
     : null;
 }
 
+function publicationCaptureScopedState(
+  opts: EnsureDaemonOptions,
+  tokenPath: string,
+): ScopedStateAccess | undefined | null {
+  const hasTestScope = Object.prototype.hasOwnProperty.call(opts, "_testScope");
+  if (hasTestScope && !isDaemonLifecycleTestScope(opts._testScope)) return null;
+  const hasHermeticSeams = Object.prototype.hasOwnProperty.call(opts, "_hermeticTestSeams");
+  if (hasHermeticSeams && !isDaemonLifecycleHermeticTestSeams(opts._hermeticTestSeams)) return null;
+  if (opts._testScope !== undefined && opts._hermeticTestSeams !== undefined) return null;
+  if (
+    opts._testScope !== undefined
+    && !lifecycleScopeOwnsExactStatePaths(opts._testScope, opts.pidFilePath, tokenPath)
+  ) return null;
+  if (
+    opts._hermeticTestSeams !== undefined
+    && !lifecycleHermeticSeamsOwnsExactStatePaths(
+      opts._hermeticTestSeams,
+      opts.pidFilePath,
+      tokenPath,
+    )
+  ) return null;
+  if (
+    opts._testScope === undefined
+    && opts._hermeticTestSeams === undefined
+    && isVitestWorkerEntrypoint(process.argv[1])
+  ) return null;
+  if (opts._testScope !== undefined) {
+    return { scope: opts._testScope, pidPath: opts.pidFilePath, tokenPath };
+  }
+  if (opts._hermeticTestSeams !== undefined) {
+    return { hermeticSeams: opts._hermeticTestSeams, pidPath: opts.pidFilePath, tokenPath };
+  }
+  return undefined;
+}
+
+function readPublicationPidEvidence(
+  pidPath: string,
+  scopedState: ScopedStateAccess | undefined,
+  expectedUid: number | undefined,
+): LegacyPidFileEvidence {
+  if (scopedState !== undefined && !scopedStateAccessOwnsExactPaths(scopedState)) {
+    return { kind: "unsafe" };
+  }
+  let evidence: LegacyPidFileEvidence;
+  try {
+    const result = readBoundedRegularFileWithStat(pidPath, {
+      allowedRoot: dirname(pidPath),
+      maxBytes: 64,
+      expectedUid,
+      requireSingleLink: true,
+    });
+    const value = result.content.trim();
+    const pid = Number(value);
+    evidence = /^[1-9][0-9]*$/u.test(value) && Number.isSafeInteger(pid) && pid > 0
+      ? { kind: "present", pid, device: result.dev, inode: result.ino }
+      : { kind: "unsafe" };
+  } catch (error) {
+    evidence = (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { kind: "missing" }
+      : { kind: "unsafe" };
+  }
+  return scopedState !== undefined && !scopedStateAccessOwnsExactPaths(scopedState)
+    ? { kind: "unsafe" }
+    : evidence;
+}
+
+function readPublicationToken(
+  tokenPath: string,
+  scopedState: ScopedStateAccess | undefined,
+  expectedUid: number | undefined,
+): string | null {
+  if (scopedState !== undefined && !scopedStateAccessOwnsExactPaths(scopedState)) return null;
+  let token: string | null;
+  try {
+    token = readBoundedRegularFileWithStat(tokenPath, {
+      allowedRoot: dirname(tokenPath),
+      maxBytes: 4_096,
+      expectedUid,
+      requireSingleLink: true,
+    }).content.trim() || null;
+  } catch {
+    token = null;
+  }
+  return scopedState !== undefined && !scopedStateAccessOwnsExactPaths(scopedState)
+    ? null
+    : token;
+}
+
+function publicationPidMatchesMode(
+  evidence: LegacyPidFileEvidence,
+  mode: LifecyclePublicationCaptureMode,
+): number | null {
+  if (mode.kind === "replacement-manager") {
+    if (evidence.kind === "unsafe") return null;
+    if (evidence.kind === "present" && evidence.pid !== mode.managerPid) return null;
+    return mode.managerPid;
+  }
+  return evidence.kind === "present" ? evidence.pid : null;
+}
+
+function samePublicationPidAuthority(
+  first: LegacyPidFileEvidence,
+  second: LegacyPidFileEvidence,
+  mode: LifecyclePublicationCaptureMode,
+  pid: number,
+): boolean {
+  if (mode.kind === "replacement-manager" && first.kind === "missing") {
+    return second.kind === "missing"
+      || (second.kind === "present" && second.pid === pid);
+  }
+  return first.kind === "present"
+    && second.kind === "present"
+    && sameLegacyPidFileIdentity(first, second)
+    && second.pid === pid;
+}
+
+async function captureLifecyclePublicationEvidence(
+  opts: EnsureDaemonOptions,
+  mode: LifecyclePublicationCaptureMode,
+  deadline: number,
+): Promise<LifecyclePublicationEvidence | undefined> {
+  const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
+  const scopedState = publicationCaptureScopedState(opts, tokenPath);
+  if (scopedState === null) return undefined;
+  const homeDir = publicationHomeForLifecycle(opts);
+  if (homeDir === undefined) return undefined;
+  const expectedVersion = opts.expectedVersion ?? PKG_VERSION;
+  const expectedStorageBackend = opts.expectedStorageBackend ?? "sqlite";
+  const expectedEntrypoint = opts._testScope?.entrypoint
+    ?? opts.expectedEntrypoint
+    ?? opts._packagedEntrypointOverride
+    ?? PACKAGED_RUNTIME_ENTRYPOINT;
+  const expectedRuntimeDigest = opts.expectedRuntimeDigest ?? RUNTIME_DIGEST;
+  if (
+    typeof expectedEntrypoint !== "string"
+    || expectedEntrypoint.length === 0
+    || (
+      mode.kind !== "current"
+      && (
+        typeof expectedVersion !== "string"
+        || expectedVersion.length === 0
+        || typeof expectedRuntimeDigest !== "string"
+        || expectedRuntimeDigest.length === 0
+      )
+    )
+  ) return undefined;
+
+  const dependencies = resolveLifecycleDependencies(opts);
+  const publicationExpectedUid = dependencies.uid ?? process.getuid?.();
+  const now = opts._monotonicNowOverride ?? performance.now.bind(performance);
+  const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
+  const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
+  const remainingDeadline = (): RequestDeadline | null => {
+    const timeoutMs = deadline - now();
+    return timeoutMs <= 0
+      ? null
+      : { timeoutMs, setTimeoutFn, clearTimeoutFn, abortSignal: opts._abortSignal };
+  };
+  const processBirth = opts._processStartTimeForTesting
+    ?? (scopedState !== undefined ? (() => null) : processStartTime);
+  const readOwner = opts._readPrivateMutationLockOwnerForTesting
+    ?? (scopedState !== undefined ? (() => null) : readPrivateMutationLockOwner);
+  const readBirth = (pid: number): string | null => {
+    if (opts._abortSignal?.aborted) return null;
+    const remainingMs = deadline - now();
+    if (remainingMs < 1) return null;
+    const timeoutMs = Math.min(100, Math.floor(remainingMs / 4));
+    if (timeoutMs < 1) return null;
+    try {
+      return processBirth(pid, undefined, { timeoutMs });
+    } catch {
+      return null;
+    }
+  };
+
+  const firstPidEvidence = readPublicationPidEvidence(
+    opts.pidFilePath,
+    scopedState,
+    publicationExpectedUid,
+  );
+  const pid = publicationPidMatchesMode(firstPidEvidence, mode);
+  if (pid === null || !Number.isSafeInteger(pid) || pid <= 0 || !dependencies.isProcessAlive(pid)) {
+    return undefined;
+  }
+  const birthBefore = readBirth(pid);
+  if (birthBefore === null) return undefined;
+  const publicDeadline = remainingDeadline();
+  if (publicDeadline === null) return undefined;
+  const publicHealth = await checkDaemonHealth(opts.port, dependencies.fetch, publicDeadline);
+  const publicStorageBackend = publicHealth?.storageBackend === "sqlite"
+    || publicHealth?.storageBackend === "postgresql"
+    ? publicHealth.storageBackend
+    : null;
+  if (
+    !isRecognizedDaemonHealth(publicHealth)
+    || publicHealth.pid !== pid
+    || !Number.isSafeInteger(publicHealth.pid)
+    || publicHealth.pid <= 0
+    || typeof publicHealth.version !== "string"
+    || publicHealth.version.length === 0
+    || publicStorageBackend === null
+    || (opts._testScope !== undefined && publicHealth.ownerId !== opts._testScope.ownerId)
+  ) return undefined;
+  if (
+    mode.kind !== "current"
+    && (
+      publicHealth.version !== expectedVersion
+      || publicStorageBackend !== expectedStorageBackend
+    )
+  ) return undefined;
+
+  const tokenBefore = readPublicationToken(tokenPath, scopedState, publicationExpectedUid);
+  if (tokenBefore === null) return undefined;
+  const authenticatedHealth = await checkDaemonDiagnostics(
+    opts.port,
+    tokenPath,
+    dependencies.fetch,
+    remainingDeadline,
+    publicHealth,
+    publicStorageBackend,
+    () => {
+      const token = readPublicationToken(tokenPath, scopedState, publicationExpectedUid);
+      return token === tokenBefore ? token : null;
+    },
+  );
+  if (
+    authenticatedHealth === null
+    || typeof authenticatedHealth.version !== "string"
+    || authenticatedHealth.version.length === 0
+    || (
+      authenticatedHealth.storageBackend !== "sqlite"
+      && authenticatedHealth.storageBackend !== "postgresql"
+    )
+    || typeof authenticatedHealth.entrypoint !== "string"
+    || typeof authenticatedHealth.runtimeDigest !== "string"
+    || authenticatedHealth.runtimeDigest.length === 0
+    || !daemonEntrypointMatches(
+      authenticatedHealth.entrypoint,
+      expectedEntrypoint,
+      dependencies.platform,
+      dependencies.realpath,
+    )
+  ) return undefined;
+  if (
+    mode.kind !== "current"
+    && authenticatedHealth.runtimeDigest !== expectedRuntimeDigest
+  ) return undefined;
+
+  const secondPidEvidence = readPublicationPidEvidence(
+    opts.pidFilePath,
+    scopedState,
+    publicationExpectedUid,
+  );
+  if (!samePublicationPidAuthority(firstPidEvidence, secondPidEvidence, mode, pid)) return undefined;
+  const tokenAfter = readPublicationToken(tokenPath, scopedState, publicationExpectedUid);
+  const birthAfter = readBirth(pid);
+  if (
+    tokenAfter !== tokenBefore
+    || birthAfter !== birthBefore
+    || !dependencies.isProcessAlive(pid)
+    || opts._abortSignal?.aborted
+  ) return undefined;
+
+  return {
+    pid,
+    version: publicHealth.version,
+    storageBackend: publicStorageBackend,
+    entrypoint: expectedEntrypoint,
+    runtimeDigest: authenticatedHealth.runtimeDigest,
+    birth: birthBefore,
+    token: tokenBefore,
+    readToken: () => {
+      const token = readPublicationToken(tokenPath, scopedState, publicationExpectedUid);
+      return token === tokenBefore ? token : null;
+    },
+    processBirth,
+    readOwner,
+  };
+}
+
+function lifecycleAbortError(): Error {
+  return new Error("lifecycle aborted during publication convergence");
+}
+
+async function raceLifecycleAbort<T>(
+  operation: () => Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  if (signal.aborted) throw lifecycleAbortError();
+  let rejectAbort!: (reason?: unknown) => void;
+  const abortPromise = new Promise<never>((_, reject) => { rejectAbort = reject; });
+  const onAbort = (): void => rejectAbort(lifecycleAbortError());
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    return await Promise.race([Promise.resolve().then(operation), abortPromise]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+function createLifecyclePublicationConvergence(
+  opts: EnsureDaemonOptions,
+  evidence: LifecyclePublicationEvidence,
+  deadline?: number,
+  requireExplicitRuntimeFields = false,
+): PublicationConvergence {
+  const dependencies = resolveLifecycleDependencies(opts);
+  const baseSleep = dependencies.sleep;
+  const sleep = async (delayMs: number): Promise<void> => {
+    if (opts._abortSignal === undefined) return await baseSleep(delayMs);
+    await raceLifecycleAbort(() => baseSleep(delayMs), opts._abortSignal);
+  };
+  const fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const signal = opts._abortSignal === undefined
+      ? init!.signal!
+      : AbortSignal.any([init!.signal!, opts._abortSignal]);
+    const request = { ...init, signal };
+    const response = await raceLifecycleAbort(() => dependencies.fetch(input, request), signal);
+    const body = response.json.bind(response);
+    return new Proxy(response, {
+      get(target, property) {
+        if (property !== "json") return Reflect.get(target, property, target);
+        return async (): Promise<unknown> => {
+          const parsed = await raceLifecycleAbort(
+            () => Promise.resolve().then(body),
+            signal,
+          );
+          if (!requireExplicitRuntimeFields) return parsed;
+          if (
+            typeof parsed !== "object"
+            || parsed === null
+            || typeof (parsed as HealthResponse).status !== "string"
+            || typeof (parsed as HealthResponse).pid !== "number"
+            || !Number.isSafeInteger((parsed as HealthResponse).pid)
+            || (parsed as HealthResponse).pid! <= 0
+            || typeof (parsed as HealthResponse).version !== "string"
+            || (parsed as HealthResponse).version!.length === 0
+            || (
+              (parsed as HealthResponse).storageBackend !== "sqlite"
+              && (parsed as HealthResponse).storageBackend !== "postgresql"
+            )
+            || typeof (parsed as HealthResponse).entrypoint !== "string"
+            || (parsed as HealthResponse).entrypoint!.length === 0
+            || typeof (parsed as HealthResponse).runtimeDigest !== "string"
+            || (parsed as HealthResponse).runtimeDigest!.length === 0
+          ) return null;
+          return parsed;
+        };
+      },
+    });
+  };
+  const convergence = createPublicationConvergence({
+    port: opts.port,
+    identity: {
+      pid: evidence.pid,
+      version: evidence.version,
+      storageBackend: evidence.storageBackend,
+      entrypoint: evidence.entrypoint,
+      runtimeDigest: evidence.runtimeDigest,
+    },
+    deps: {
+      now: opts._monotonicNowOverride ?? performance.now.bind(performance),
+      sleep,
+      fetch,
+      readToken: evidence.readToken,
+      readOwner: evidence.readOwner,
+      processBirth: (pid, observer, options) => {
+        const observed = evidence.processBirth(pid, observer, options);
+        return observed === evidence.birth ? observed : null;
+      },
+      platform: dependencies.platform,
+      homeDir: publicationHomeForLifecycle(opts),
+    },
+  });
+  convergence.deadline = deadline;
+  return convergence;
+}
+
+function abortPreservingPublicationWrapper(
+  opts: EnsureDaemonOptions,
+  convergence: PublicationConvergence,
+): PublicationAdmissionWrapper {
+  let firstContention: PrivateMutationLockContentionError | undefined;
+  return async <T>(step: () => T | Promise<T>): Promise<T> => {
+    try {
+      return await withPublicationAdmissionRetry(async () => {
+        try {
+          if (opts._abortSignal?.aborted) {
+            throw new Error("lifecycle aborted before publication assertion");
+          }
+          return await step();
+        } catch (error) {
+          if (error instanceof PrivateMutationLockContentionError) firstContention ??= error;
+          throw error;
+        }
+      }, convergence);
+    } catch (error) {
+      if (opts._abortSignal?.aborted && firstContention !== undefined) throw firstContention;
+      throw error;
+    }
+  };
+}
+
+function restartPublicationWrapper(
+  opts: EnsureDaemonOptions,
+  mode: LifecyclePublicationCaptureMode,
+  budget: LifecyclePublicationRetryBudget,
+): PublicationAdmissionWrapper {
+  return async <T>(step: () => T | Promise<T>): Promise<T> => {
+    try {
+      return await step();
+    } catch (error) {
+      if (!(error instanceof PrivateMutationLockContentionError)) throw error;
+      budget.firstContention ??= error;
+      const now = opts._monotonicNowOverride ?? performance.now.bind(performance);
+      const startedAt = now();
+      const deadline = startedAt + budget.remainingMs;
+      if (budget.remainingMs <= 0 || opts._abortSignal?.aborted) throw budget.firstContention;
+      try {
+        const evidence = await captureLifecyclePublicationEvidence(opts, mode, deadline);
+        if (evidence === undefined) throw error;
+        const convergence = createLifecyclePublicationConvergence(opts, evidence, deadline, true);
+        const retry = abortPreservingPublicationWrapper(opts, convergence);
+        let authenticateInitialCollision = true;
+        return await retry(async () => {
+          if (authenticateInitialCollision) {
+            authenticateInitialCollision = false;
+            throw error;
+          }
+          return await step();
+        });
+      } catch (retryError) {
+        if (
+          opts._abortSignal?.aborted
+          || (retryError instanceof PrivateMutationLockContentionError && now() >= deadline)
+        ) throw budget.firstContention;
+        throw retryError;
+      } finally {
+        const elapsed = Math.max(0, now() - startedAt);
+        budget.remainingMs = Math.max(0, budget.remainingMs - elapsed);
+      }
+    }
+  };
+}
+
+function rethrowPublicationContention(error: unknown): void {
+  if (error instanceof PrivateMutationLockContentionError) throw error;
+}
+
 function startViaDetachedSpawn(
   opts: EnsureDaemonOptions,
   spawnCommand: string,
@@ -1621,9 +2106,10 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
   validateSpawnTimeout(opts.spawnTimeoutMs);
   const wrap = opts._withPublicationAdmissionRetry
     ?? (async <T>(step: () => T | Promise<T>) => await step());
+  const initialWrap = opts._withInitialPublicationAdmissionRetry ?? wrap;
   // Keep publication admission short. The child performs its own config
   // admission, so retaining the lock over spawn and health waits would deadlock.
-  await wrap(() => assertLifecycleBackendPublication(opts));
+  await initialWrap(() => assertLifecycleBackendPublication(opts));
   let admissionEvidence: LifecycleAdmissionEvidence | undefined;
   const result = await ensureDaemonUnlocked({
     ...opts,
@@ -1642,91 +2128,25 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     && result.pid === evidence.health.pid
     && !opts._abortSignal?.aborted
   ) {
-    const dependencies = resolveLifecycleDependencies(opts);
-    const baseSleep = dependencies.sleep;
-    const processBirth = evidence.processBirth;
-    const readOwner = evidence.readOwner;
-    const abortError = (): Error => new Error("lifecycle aborted during publication convergence");
-    const raceAbort = async <T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> => {
-      if (signal.aborted) throw abortError();
-      let rejectAbort!: (reason?: unknown) => void;
-      const abortPromise = new Promise<never>((_, reject) => { rejectAbort = reject; });
-      const onAbort = (): void => rejectAbort(abortError());
-      signal.addEventListener("abort", onAbort, { once: true });
-      try {
-        return await Promise.race([
-          Promise.resolve().then(operation),
-          abortPromise,
-        ]);
-      } finally {
-        signal.removeEventListener("abort", onAbort);
-      }
-    };
-    const sleep = async (delayMs: number): Promise<void> => {
-      if (opts._abortSignal === undefined) return await baseSleep(delayMs);
-      await raceAbort(() => baseSleep(delayMs), opts._abortSignal);
-    };
-    const readToken = (): string | null => {
-      const current = evidence.readToken();
-      return current === evidence.token ? current : null;
-    };
-    const fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-      const signal = opts._abortSignal === undefined
-        ? init!.signal!
-        : AbortSignal.any([init!.signal!, opts._abortSignal]);
-      const request = { ...init, signal };
-      const response = await raceAbort(() => dependencies.fetch(input, request), signal);
-      const body = response.json.bind(response);
-      return new Proxy(response, {
-        get(target, property, receiver) {
-          if (property !== "json") return Reflect.get(target, property, target);
-          return async (): Promise<unknown> => await raceAbort(() => Promise.resolve().then(body), signal);
-        },
-      });
-    };
-    childConvergence = createPublicationConvergence({
-      port: opts.port,
-      identity: {
-        pid: evidence.health.pid!,
-        version: evidence.expectedVersion,
-        storageBackend: evidence.expectedStorageBackend,
-        entrypoint: evidence.expectedEntrypoint,
-        runtimeDigest: evidence.expectedRuntimeDigest,
+    childConvergence = createLifecyclePublicationConvergence(opts, {
+      pid: evidence.health.pid!,
+      version: evidence.expectedVersion,
+      storageBackend: evidence.expectedStorageBackend,
+      entrypoint: evidence.expectedEntrypoint,
+      runtimeDigest: evidence.expectedRuntimeDigest,
+      birth: evidence.birthBefore,
+      token: evidence.token,
+      readToken: () => {
+        const current = evidence.readToken();
+        return current === evidence.token ? current : null;
       },
-      deps: {
-        now: opts._monotonicNowOverride ?? performance.now.bind(performance),
-        sleep,
-        fetch,
-        readToken,
-        readOwner,
-        processBirth: (pid, observer, options) => {
-          const observed = processBirth(pid, observer, options);
-          return observed === evidence.birthBefore ? observed : null;
-        },
-        platform: dependencies.platform,
-        homeDir: publicationHomeForLifecycle(opts),
-      },
+      processBirth: evidence.processBirth,
+      readOwner: evidence.readOwner,
     });
   }
-  let firstContention: unknown;
   const finalWrap = childConvergence === undefined
     ? wrap
-    : async <T>(step: () => T | Promise<T>): Promise<T> => {
-        try {
-          return await withPublicationAdmissionRetry(async () => {
-            try {
-              if (opts._abortSignal?.aborted) throw new Error("lifecycle aborted before publication assertion");
-              return await step();
-            } catch (error) {
-              if (error instanceof PrivateMutationLockContentionError) firstContention ??= error;
-              throw error;
-            }
-          }, childConvergence);
-        } catch (error) {
-          if (opts._abortSignal?.aborted && firstContention !== undefined) throw firstContention;
-          throw error;
-        }
-      };
+    : abortPreservingPublicationWrapper(opts, childConvergence);
   await finalWrap(() => assertLifecycleBackendPublication(opts));
   return result;
 }
@@ -3564,9 +3984,24 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
  */
 export async function restartDaemon(opts: RestartDaemonOptions): Promise<RestartDaemonResult> {
   validateSpawnTimeout(opts.spawnTimeoutMs);
-  assertLifecycleBackendPublication(opts);
-  const result = await restartDaemonUnlocked(opts);
-  assertLifecycleBackendPublication(opts);
+  const currentBudget: LifecyclePublicationRetryBudget = {
+    remainingMs: PUBLICATION_CONVERGENCE_MS,
+  };
+  const replacementBudget: LifecyclePublicationRetryBudget = {
+    remainingMs: PUBLICATION_CONVERGENCE_MS,
+  };
+  const currentWrap = restartPublicationWrapper(opts, { kind: "current" }, currentBudget);
+  const replacementWrap = restartPublicationWrapper(
+    opts,
+    { kind: "replacement-owned" },
+    replacementBudget,
+  );
+  await currentWrap(() => assertLifecycleBackendPublication(opts));
+  const result = await restartDaemonUnlocked({
+    ...opts,
+    _restartPublicationRetryBudget: replacementBudget,
+  });
+  await replacementWrap(() => assertLifecycleBackendPublication(opts));
   return result;
 }
 
@@ -3654,8 +4089,11 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
     validateBeforeRestart,
     _ensureDaemonOverride,
     _isManagedProcessOverride,
+    _restartPublicationRetryBudget,
+    _withInitialPublicationAdmissionRetry: _ignoredInitialPublicationRetry,
     ...ensureOptions
   } = opts;
+  void _ignoredInitialPublicationRetry;
   await validateBeforeRestart?.();
   if (
     testScope
@@ -3876,6 +4314,17 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
       stoppedPidOverride?: number,
     ): Promise<RestartDaemonResult> => {
       const remainingSpawnTimeoutMs = Math.max(0, Math.floor(verificationDeadline - monotonicNow()));
+      const managerPidIsValid = managerPid !== undefined
+        && Number.isSafeInteger(managerPid)
+        && managerPid > 0;
+      const initialPublicationWrap = managerPidIsValid
+        && _restartPublicationRetryBudget !== undefined
+        ? restartPublicationWrapper(
+            opts,
+            { kind: "replacement-manager", managerPid },
+            _restartPublicationRetryBudget,
+          )
+        : undefined;
       const ensured = await ensure({
         ...ensureOptions,
         spawnTimeoutMs: remainingSpawnTimeoutMs,
@@ -3883,6 +4332,9 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
         _monotonicNowOverride: monotonicNow,
         _suppressDetachedFallback: true,
         _managedOperationAuthorized: true,
+        ...(initialPublicationWrap === undefined
+          ? {}
+          : { _withInitialPublicationAdmissionRetry: initialPublicationWrap }),
         ...(managerPid === undefined ? {} : { _managedOperationManagerPid: managerPid }),
         ...(admittedSpec === undefined ? {} : {
           _supervisorNonceOverride: () => admittedSpec.nonce,
@@ -4102,6 +4554,7 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
       try {
         return await stopStartAndEnsure();
       } catch (error) {
+        rethrowPublicationContention(error);
         return restartRefusal(
           "startup-failure",
           error instanceof SupervisorDaemonTempCreationError
@@ -4123,6 +4576,7 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
         try {
           return await startStableAndEnsure(legacyMigration.stoppedPid);
         } catch (error) {
+          rethrowPublicationContention(error);
           return restartRefusal(
             "startup-failure",
             error instanceof SupervisorDaemonTempCreationError
@@ -4224,6 +4678,7 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
     try {
       return await stopStartAndEnsure();
     } catch (error) {
+      rethrowPublicationContention(error);
       return restartRefusal(
         "startup-failure",
         error instanceof SupervisorDaemonTempCreationError

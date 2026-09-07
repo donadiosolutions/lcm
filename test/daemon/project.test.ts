@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { chmodSync, existsSync, fchmodSync, fstatSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, fchmodSync, fstatSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, resolve } from "node:path";
@@ -9,6 +9,7 @@ import {
   localProjectIdentity,
   localProjectDir,
   localProjectId,
+  MAX_PROJECT_METADATA_BYTES,
   projectId,
   projectIdentity,
   projectDbPath,
@@ -25,6 +26,22 @@ const POSTGRESQL_STORAGE = {
 } as unknown as ResolvedStorageConfig;
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const REMOTE_PROJECT_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
+
+function paddedProjectMetadata(
+  storedCwd: string,
+  publishedCwd: string,
+  publishedBytes: number,
+): Readonly<{ compact: string; published: string }> {
+  const prefix = `{\n  "cwd": "${publishedCwd}",\n  "padding": "`;
+  const suffix = `"\n}\n`;
+  const paddingBytes = publishedBytes - Buffer.byteLength(prefix + suffix, "utf8");
+  expect(paddingBytes).toBeGreaterThanOrEqual(0);
+  const padding = "x".repeat(paddingBytes);
+  return {
+    compact: `{"cwd":"${storedCwd}","padding":"${padding}"}`,
+    published: `${prefix}${padding}${suffix}`,
+  };
+}
 
 function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T): T {
   const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
@@ -248,6 +265,132 @@ describe("secure project-root handoff", () => {
       cwd: "/project",
       extra: true,
     });
+  });
+
+  it("publishes and rereads preliminary metadata at the exact serialized limit", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "0".repeat(64), canonical: "/current" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    const metaPath = join(dir, "meta.json");
+    const fixture = paddedProjectMetadata("/stale-x", identity.canonical, MAX_PROJECT_METADATA_BYTES);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(metaPath, fixture.compact, { mode: 0o600 });
+
+    expect(Buffer.byteLength(fixture.compact, "utf8")).toBeLessThan(MAX_PROJECT_METADATA_BYTES);
+    expect(Buffer.byteLength(fixture.published, "utf8")).toBe(MAX_PROJECT_METADATA_BYTES);
+    expect(ensureProjectDirForIdentity(identity)).toBe(dir);
+    expect(readFileSync(metaPath, "utf8")).toBe(fixture.published);
+
+    const published = statSync(metaPath, { bigint: true });
+    expect(ensureProjectDirForIdentity(identity)).toBe(dir);
+    const reread = statSync(metaPath, { bigint: true });
+    expect(readFileSync(metaPath, "utf8")).toBe(fixture.published);
+    expect(reread.ino).toBe(published.ino);
+    expect(reread.mtimeNs).toBe(published.mtimeNs);
+  });
+
+  it("rejects a one-byte oversized preliminary replacement without publishing", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "1".repeat(64), canonical: "/current" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    const metaPath = join(dir, "meta.json");
+    const fixture = paddedProjectMetadata("/stale-x", identity.canonical, MAX_PROJECT_METADATA_BYTES + 1);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(metaPath, fixture.compact, { mode: 0o600 });
+    const before = statSync(metaPath, { bigint: true });
+    const writeSpy = vi.spyOn(securityFiles, "atomicWritePrivateFile");
+
+    try {
+      expect(Buffer.byteLength(fixture.compact, "utf8")).toBeLessThan(MAX_PROJECT_METADATA_BYTES);
+      expect(Buffer.byteLength(fixture.published, "utf8")).toBe(MAX_PROJECT_METADATA_BYTES + 1);
+      expect(() => ensureProjectDirForIdentity(identity)).toThrow("project metadata exceeds size limit");
+      expect(writeSpy).not.toHaveBeenCalled();
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    const after = statSync(metaPath, { bigint: true });
+    expect(readFileSync(metaPath, "utf8")).toBe(fixture.compact);
+    expect(after.mode & 0o777n).toBe(0o600n);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mtimeNs).toBe(before.mtimeNs);
+  });
+
+  it("leaves matching compact metadata unchanged when pretty output would be oversized", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "2".repeat(64), canonical: "/current" };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    const metaPath = join(dir, "meta.json");
+    const fixture = paddedProjectMetadata(identity.canonical, identity.canonical, MAX_PROJECT_METADATA_BYTES + 1);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(metaPath, fixture.compact, { mode: 0o600 });
+    const before = statSync(metaPath, { bigint: true });
+    const writeSpy = vi.spyOn(securityFiles, "atomicWritePrivateFile");
+
+    try {
+      expect(Buffer.byteLength(fixture.compact, "utf8")).toBeLessThan(MAX_PROJECT_METADATA_BYTES);
+      expect(Buffer.byteLength(fixture.published, "utf8")).toBe(MAX_PROJECT_METADATA_BYTES + 1);
+      expect(ensureProjectDirForIdentity(identity)).toBe(dir);
+      expect(writeSpy).not.toHaveBeenCalled();
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    const after = statSync(metaPath, { bigint: true });
+    expect(readFileSync(metaPath, "utf8")).toBe(fixture.compact);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mtimeNs).toBe(before.mtimeNs);
+  });
+
+  it("counts multibyte UTF-8 when bounding preliminary metadata publication", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = { id: "3".repeat(64), canonical: `/${"é".repeat(MAX_PROJECT_METADATA_BYTES / 2)}` };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    const metaPath = join(dir, "meta.json");
+    const original = '{"cwd":"/stale"}\n';
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(metaPath, original, { mode: 0o600 });
+    const before = statSync(metaPath, { bigint: true });
+    const serialized = JSON.stringify({ cwd: identity.canonical }, null, 2) + "\n";
+    const writeSpy = vi.spyOn(securityFiles, "atomicWritePrivateFile");
+
+    try {
+      expect(serialized.length).toBeLessThan(MAX_PROJECT_METADATA_BYTES);
+      expect(Buffer.byteLength(serialized, "utf8")).toBeGreaterThan(MAX_PROJECT_METADATA_BYTES);
+      expect(() => ensureProjectDirForIdentity(identity)).toThrow("project metadata exceeds size limit");
+      expect(writeSpy).not.toHaveBeenCalled();
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    const after = statSync(metaPath, { bigint: true });
+    expect(readFileSync(metaPath, "utf8")).toBe(original);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mtimeNs).toBe(before.mtimeNs);
+  });
+
+  it("rejects oversized metadata for a missing file without leaving publication scratch", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const serializedOverhead = Buffer.byteLength('{\n  "cwd": ""\n}\n', "utf8");
+    const identity = {
+      id: "4".repeat(64),
+      canonical: `/${"x".repeat(MAX_PROJECT_METADATA_BYTES - serializedOverhead)}`,
+    };
+    const dir = join(home, ".lcm", "projects", identity.id);
+    const metaPath = join(dir, "meta.json");
+    const serialized = JSON.stringify({ cwd: identity.canonical }, null, 2) + "\n";
+    const writeSpy = vi.spyOn(securityFiles, "atomicWritePrivateFile");
+
+    try {
+      expect(Buffer.byteLength(serialized, "utf8")).toBe(MAX_PROJECT_METADATA_BYTES + 1);
+      expect(() => ensureProjectDirForIdentity(identity)).toThrow("project metadata exceeds size limit");
+      expect(writeSpy).not.toHaveBeenCalled();
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    expect(existsSync(metaPath)).toBe(false);
+    expect(readdirSync(dir)).toEqual([]);
   });
 
   it.each([

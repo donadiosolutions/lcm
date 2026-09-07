@@ -72,8 +72,13 @@ vi.mock("../../../src/db/promoted.js", () => ({
 vi.mock("../../../src/storage/index.js", () => ({
   createStorageBackendFactory: mocks.createFactory,
 }));
-vi.mock("../../../src/stats.js", () => ({ collectStats: mocks.stats }));
+vi.mock("../../../src/stats.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/stats.js")>(), collectStats: mocks.stats,
+}));
 
+
+import { backendDiagnosticFailure } from "../../../src/storage/diagnostics.js";
+import { StatsUnavailableError } from "../../../src/stats.js";
 import { createDescribeHandler } from "../../../src/daemon/routes/describe.js";
 import { createExpandHandler } from "../../../src/daemon/routes/expand.js";
 import { createGrepHandler } from "../../../src/daemon/routes/grep.js";
@@ -232,6 +237,33 @@ describe("persistence read route boundaries", () => {
     expectLast(200, {
       expanded: null,
       error: "expand failed for https://outer.test/x?next=file://host.invalid<path>",
+    });
+  });
+
+  it("preserves adjacent nested file URL schemes in describe wire errors", async () => {
+    mocks.describe.mockRejectedValueOnce(
+      new Error(
+        "read failed for https://outer.test/x?q=file://h.invalid/Users/a-file://h2.invalid/Users/b",
+      ),
+    );
+    await invoke(createDescribeHandler(config), { nodeId: "n", cwd: "/ok" });
+    expectLast(200, {
+      node: null,
+      error: "read failed for https://outer.test/x?q=file://h.invalid<path>file://h2.invalid<path>",
+    });
+  });
+
+  it("preserves adjacent nested file URL schemes in expand wire errors", async () => {
+    mocks.expand.mockRejectedValueOnce(
+      new Error(
+        "expand failed for https://outer.test/x?q=file://h.invalid/Users/a-file://h2.invalid/Users/b",
+      ),
+    );
+    await invoke(createExpandHandler(config), { nodeId: "n", cwd: "/ok" });
+    expect(mocks.expand).toHaveBeenCalled();
+    expectLast(200, {
+      expanded: null,
+      error: "expand failed for https://outer.test/x?q=file://h.invalid<path>file://h2.invalid<path>",
     });
   });
 
@@ -755,21 +787,25 @@ describe("persistence read route boundaries", () => {
     expect(mocks.recentSummaries).not.toHaveBeenCalled();
   });
 
-  it("covers pool and aggregate stats success and failure payloads", async () => {
-    await invoke(createPoolStatsHandler(), {});
-    expectLast(200, { totalConnections: 0 });
-    mocks.poolStats.mockImplementationOnce(() => { throw new Error("pool broke"); });
-    await invoke(createPoolStatsHandler(), {});
-    expectLast(500, { error: "pool broke" });
-    mocks.poolStats.mockImplementationOnce(() => { throw "failure"; });
-    await invoke(createPoolStatsHandler(), {});
-    expectLast(500, { error: "pool stats failed" });
+  it("returns common diagnostic snapshots and sanitizes aggregate failures", async () => {
+    const diagnostics = backendDiagnosticFailure(new Error("private diagnostic canary"), "sqlite");
+    const factory = injectedFactory();
+    const controller = new AbortController();
+    mocks.stats.mockReturnValueOnce({ projects: 0, backendDiagnostics: diagnostics } as never);
+    await invoke(createPoolStatsHandler("/configured-home", factory), {}, { signal: controller.signal });
+    expectLast(200, { backendDiagnostics: diagnostics });
+    expect(mocks.stats).toHaveBeenCalledWith({ homeDir: "/configured-home", storageFactory: factory, signal: controller.signal });
 
-    await invoke(createStatsHandler(), {});
+    await invoke(createStatsHandler("/configured-home", factory), {}, { signal: controller.signal });
     expectLast(200, { projects: 0 });
-    mocks.stats.mockImplementationOnce(() => { throw new Error("stats broke"); });
+    expect(mocks.stats).toHaveBeenCalledWith({ homeDir: "/configured-home", storageFactory: factory, signal: controller.signal });
+    mocks.stats.mockImplementationOnce(() => { throw new Error("private diagnostic canary"); });
     await invoke(createStatsHandler(), {});
-    expectLast(500, { error: "Stats collection failed" });
+    expectLast(200, { backendDiagnostics: backendDiagnosticFailure(new Error("unobserved")) });
+    mocks.stats.mockImplementationOnce(() => { throw new StatsUnavailableError(diagnostics); });
+    await invoke(createStatsHandler(), {});
+    expectLast(200, { backendDiagnostics: diagnostics });
+    expect(JSON.stringify(mocks.end.mock.calls)).not.toContain("private diagnostic canary");
   });
 
   it("covers layered search validation, filtering, failures, and disabled layers", async () => {

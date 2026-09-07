@@ -1,3 +1,4 @@
+import { basename, dirname, isAbsolute, join } from "node:path";
 import type { DaemonConfig } from "../config.js";
 import {
   MAX_PROJECT_METADATA_BYTES,
@@ -93,6 +94,124 @@ function errorCode(error: unknown): string | undefined {
     && typeof error.code === "string"
     ? error.code
     : undefined;
+}
+
+const METADATA_TOPOLOGY_ERROR =
+  "project directory topology changed before metadata publication";
+
+type RetainedMetadataDirectory = Readonly<{
+  path: string;
+  handle: PrivateDirectoryHandle;
+}>;
+
+type MetadataDirectoryChain = readonly [
+  RetainedMetadataDirectory,
+  RetainedMetadataDirectory,
+  RetainedMetadataDirectory,
+];
+
+function metadataTopologyError(cause?: unknown): PrivateDirectoryTopologyError {
+  return cause === undefined
+    ? new PrivateDirectoryTopologyError(METADATA_TOPOLOGY_ERROR)
+    : new PrivateDirectoryTopologyError(METADATA_TOPOLOGY_ERROR, { cause });
+}
+
+function metadataDirectoryPaths(
+  paths: Readonly<{ dir: string; metaPath: string }>,
+  projectId: string,
+): readonly [string, string, string] {
+  const leafPath = paths.dir;
+  const projectsPath = dirname(leafPath);
+  const rootPath = dirname(projectsPath);
+  if (
+    !isAbsolute(leafPath)
+    || !isAbsolute(paths.metaPath)
+    || basename(leafPath) !== projectId
+    || basename(projectsPath) !== "projects"
+    || paths.metaPath !== join(leafPath, "meta.json")
+  ) {
+    throw metadataTopologyError();
+  }
+  return [rootPath, projectsPath, leafPath];
+}
+
+function assertMetadataDirectoryEntries(
+  entries: readonly RetainedMetadataDirectory[],
+): void {
+  try {
+    for (const entry of entries) {
+      assertPrivateDirectoryEntry(entry.handle, entry.path, entry.handle.witness.uid);
+    }
+  } catch (error) {
+    throw metadataTopologyError(error);
+  }
+}
+
+function closeMetadataDirectories(
+  entries: readonly RetainedMetadataDirectory[],
+  primary?: Readonly<{ error: unknown }>,
+): void {
+  const cleanupErrors: unknown[] = [];
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index]!;
+    try {
+      entry.handle.close();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (primary !== undefined) {
+    if (isCriticalMetadataError(primary.error) || cleanupErrors.length === 0) {
+      throw primary.error;
+    }
+    throw new AggregateError(
+      [primary.error, ...cleanupErrors],
+      "project metadata publication and directory cleanup failed",
+      { cause: primary.error },
+    );
+  }
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length > 1) {
+    throw new AggregateError(cleanupErrors, "project metadata directory cleanup failed");
+  }
+}
+
+function openMetadataDirectoryChain(
+  paths: Readonly<{ dir: string; metaPath: string }>,
+  projectId: string,
+  expectedUid: number | undefined,
+): MetadataDirectoryChain {
+  const directoryPaths = metadataDirectoryPaths(paths, projectId);
+  const entries: RetainedMetadataDirectory[] = [];
+  try {
+    for (const path of directoryPaths) {
+      let handle: PrivateDirectoryHandle;
+      try {
+        handle = openPrivateDirectory(path, { expectedUid });
+      } catch (error) {
+        const code = errorCode(error);
+        if (
+          !isCriticalMetadataError(error)
+          && (code === "EMFILE" || code === "ENFILE" || code === "ENOSPC")
+        ) throw error;
+        throw metadataTopologyError(error);
+      }
+      entries.push({ path, handle });
+      assertMetadataDirectoryEntries(entries);
+    }
+    return [entries[0]!, entries[1]!, entries[2]!];
+  } catch (error) {
+    let primary = error;
+    if (!isCriticalMetadataError(error)) {
+      try {
+        assertMetadataDirectoryEntries(entries);
+      } catch (topologyError) {
+        primary = topologyError;
+      }
+    }
+    closeMetadataDirectories(entries, { error: primary });
+    throw primary;
+  }
 }
 
 export function createPromoteHandler(
@@ -324,26 +443,14 @@ export function createPromoteHandler(
           await withCommitAdmission(async () => {
             const writeMetadata = (): void => {
               const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
-              let parent: PrivateDirectoryHandle;
-              try {
-                parent = openPrivateDirectory(paths.dir, { expectedUid });
-              } catch (error) {
-                const code = errorCode(error);
-                if (
-                  !isCriticalMetadataError(error)
-                  && (code === "EMFILE" || code === "ENFILE" || code === "ENOSPC")
-                ) throw error;
-                throw new PrivateDirectoryTopologyError(
-                  "project directory topology changed before metadata publication",
-                  { cause: error },
-                );
-              }
-              let primaryError: unknown;
-              let hasPrimaryError = false;
+              const chain = openMetadataDirectoryChain(paths, localIdentity.id, expectedUid);
+              const parent = chain[2].handle;
+              let primary: Readonly<{ error: unknown }> | undefined;
               try {
                 try {
                   let meta: Record<string, unknown> = {};
                   try {
+                    assertMetadataDirectoryEntries(chain);
                     const observed = readBoundedRegularFileWithStat(paths.metaPath, {
                       allowedRoot: paths.dir,
                       maxBytes: MAX_PROJECT_METADATA_BYTES,
@@ -354,9 +461,7 @@ export function createPromoteHandler(
                       observed.parentDev !== parent.witness.dev
                       || observed.parentIno !== parent.witness.ino
                     ) {
-                      throw new PrivateDirectoryTopologyError(
-                        "project directory topology changed before metadata publication",
-                      );
+                      throw metadataTopologyError();
                     }
                     const parsed: unknown = JSON.parse(observed.content);
                     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -372,40 +477,19 @@ export function createPromoteHandler(
                   if (Buffer.byteLength(serialized, "utf8") > MAX_PROJECT_METADATA_BYTES) {
                     throw new Error("project metadata exceeds size limit");
                   }
+                  assertMetadataDirectoryEntries(chain);
                   atomicWritePrivateFile(paths.metaPath, serialized, {}, parent);
+                  assertMetadataDirectoryEntries(chain);
                 } catch (error) {
                   if (isCriticalMetadataError(error)) throw error;
-                  try {
-                    assertPrivateDirectoryEntry(parent, paths.dir, parent.witness.uid);
-                  } catch (topologyError) {
-                    throw new PrivateDirectoryTopologyError(
-                      "project directory topology changed before metadata publication",
-                      { cause: topologyError },
-                    );
-                  }
+                  assertMetadataDirectoryEntries(chain);
                   throw error;
                 }
               } catch (error) {
-                hasPrimaryError = true;
-                primaryError = error;
+                primary = { error };
               } finally {
-                try {
-                  parent.close();
-                } catch (error) {
-                  if (hasPrimaryError) {
-                    if (!isCriticalMetadataError(primaryError)) {
-                      throw new AggregateError(
-                        [primaryError, error],
-                        "project metadata publication and directory cleanup failed",
-                        { cause: primaryError },
-                      );
-                    }
-                  } else {
-                    throw error;
-                  }
-                }
+                closeMetadataDirectories(chain, primary);
               }
-              if (hasPrimaryError) throw primaryError;
             };
             if (context?.withPublicationAdmission !== undefined) {
               await context.withPublicationAdmission(() => writeMetadata());

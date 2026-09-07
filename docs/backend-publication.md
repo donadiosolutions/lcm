@@ -11,9 +11,13 @@ This boundary is now consumed by the daemon and MCP project-storage routes.
 SQLite remains the default, while an explicitly published PostgreSQL selection
 becomes authoritative only after runtime readiness, machine identity, project
 binding, and terminal publication evidence all verify. Issue #618 still owns
-CLI/import-export and portable transfer; #619 still owns stats, pool
-diagnostics, status, and doctor parity. Those boundaries do not weaken daemon
-route admission or authorize a SQLite fallback.
+CLI/import-export and portable transfer. Stats, pool diagnostics, status, and
+doctor share an [observational backend snapshot](cli.md#observational-diagnostics).
+It authenticates publication/configuration evidence before and after probes;
+changed witnesses discard collected metrics and report `stale-publication`.
+This optimistic observation is not a transaction-wide authority guarantee.
+Diagnostics neither write publication evidence nor acquire mutation locks,
+and never authorize a SQLite fallback.
 
 ## Current backend boundaries
 
@@ -32,8 +36,8 @@ LCM keeps the following Epic #79 invariants:
   fails closed. LCM never treats a partially written configuration or project
   map as proof that a backend is active.
 - The publication boundary is the single coordination seam for active daemon
-  and MCP routing. Future #618/#619 work must consume it rather than introduce
-  a second lock, journal, or fencing protocol.
+  and MCP routing and observational diagnostics. CLI/import-export work must
+  consume it rather than introduce a second lock, journal, or fencing protocol.
 
 For ordinary SQLite installations, this machinery is dormant after the
 private state root is authenticated. It does not change SQLite's storage
@@ -356,6 +360,13 @@ open flags where the platform provides them. Configuration reads and writes
 are bounded and descriptor-aware; a config symlink, non-regular file, or
 oversized file is rejected before mutation.
 
+If a bootstrap directory fails authentication after its descriptor is opened,
+LCM attempts to close that descriptor once. A successful close preserves the
+original authentication error. If the close also fails, the reported error
+preserves both failures and identifies the authentication error as its cause,
+so operators can diagnose the rejected directory without losing cleanup
+evidence.
+
 Read-only publication probes distinguish an absent root at the initial open
 from an authentication failure after that root was opened. The former remains
 compatible with legacy SQLite installations and is rechecked at later
@@ -484,12 +495,44 @@ The check is deliberately short-lived around each operation; it is not held
 across network calls, request bodies, model work, daemon spawning, or unrelated
 health waits.
 
-When directory authentication rejects a consumer admission, LCM attempts to
-release the temporary root and publication descriptors acquired for that
-check. If cleanup succeeds, LCM returns the original authentication refusal.
-If cleanup also fails, the reported error preserves both failures and records
-the authentication failure as its cause. The rejection remains fail-closed;
-releasing those resources does not repair or change the publication state.
+An explicit daemon restart authenticates publication lock contention at three
+separate assertions: before it changes the current daemon, at the replacement
+daemon's initial admission, and after the replacement has been admitted. LCM
+may wait up to two seconds for the authenticated current daemon's publication
+sweep and up to another two seconds shared by the replacement's initial and
+final assertions. Manager stop/start and daemon admission time do not consume
+these retry windows, so the maximum added contention wait is approximately four
+seconds. The replacement daemon's existing final-admission wait has its own
+independent two-second allowance, so a restart can spend approximately six
+seconds waiting if all three windows encounter contention. Each restart and
+ensure operation still runs once; only the blocked publication assertion is
+retried.
+
+The wait remains fail-closed. The current daemon must have a canonical owned
+PID and token, matching public and authenticated health, stable process-birth
+evidence, and the installed entrypoint. The replacement additionally must match
+the installed version, backend, entrypoint, and packaged-runtime digest. A
+replacement managed by systemd or launchd may briefly lack its PID file during
+its initial sweep, but only when the manager supplied the same positive PID
+reported by authenticated health. LCM does not wait when that manager PID is
+missing, health is unavailable or staged, the current daemon's owned PID is
+absent, or any PID, token, birth, owner, entrypoint, or runtime field changes.
+Lock-owner metadata only checks the independently authenticated PID; it never
+supplies restart authority.
+
+If identity capture is refused or a retry allowance expires, LCM preserves the
+original typed publication-contention error and the restart command fails. An
+ordinary publication error observed on a later assertion remains the reported
+failure even when the contention allowance has just expired.
+
+After a consumer operation, LCM attempts to release the temporary publication
+and root descriptors in that order. A single cleanup failure is reported
+directly when the operation succeeded; multiple cleanup failures are reported
+together in release order. If the operation and cleanup both fail, the
+reported error preserves the operation failure first, records it as the cause,
+and then includes every cleanup failure. Typed publication admission and lock
+contention failures retain their classification so callers remain fail-closed.
+Releasing those resources does not repair or change the publication state.
 
 - **Daemon and health:** an unresolved or inconsistent publication returns a
   sanitized HTTP `503` with `status: "blocked"` and no filesystem, SQL, URL,
@@ -577,7 +620,8 @@ administrator. The runtime role must not own the schema or run migrations.
 The [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md)
 and [configuration guide](configuration.md#provisioning-a-postgresql-database)
 contain the complete deployment sequence. Applying that sequence enables the
-selected daemon project routes; #618 and #619 remain outside this boundary.
+selected daemon project routes and observational diagnostics. CLI/import-export
+activation remains tracked by #618.
 
 The final audit found the SQL changes already implemented for chore #408
 sufficient; this documentation lane required no additional SQL correction:

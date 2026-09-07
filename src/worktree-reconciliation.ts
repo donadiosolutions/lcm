@@ -310,6 +310,7 @@ function withRetainedReconciliationTarget<T>(
   targetHash: string,
   homeDir: string | undefined,
   operation: (target: RetainedReconciliationTarget) => T,
+  onCompleted: () => void,
 ): T {
   const rootPath = lcmHomeDir(homeDir);
   const projectsPath = projectsDir(homeDir);
@@ -340,6 +341,7 @@ function withRetainedReconciliationTarget<T>(
     assertRetainedReconciliationTarget(retained);
     result = operation(retained);
     assertRetainedReconciliationTarget(retained);
+    onCompleted();
   } catch (error) {
     primaryError = error;
   }
@@ -1229,6 +1231,25 @@ function withSourceWriteFence<T>(
   }
 }
 
+function rollbackTargetReconciliationTransaction(
+  target: DatabaseSync,
+  committed: boolean,
+  primaryError: unknown,
+): never {
+  if (!committed && target.isTransaction !== false) {
+    try {
+      target.exec("ROLLBACK");
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [primaryError, rollbackError],
+        `worktree reconciliation target transaction failed: ${String(primaryError)}`,
+        { cause: primaryError },
+      );
+    }
+  }
+  throw primaryError;
+}
+
 function mergeMainDatabase(
   sourcePath: string,
   targetPath: string,
@@ -1266,6 +1287,7 @@ function mergeMainDatabase(
           `);
           assertTarget();
           target.exec("BEGIN IMMEDIATE");
+          let committed = false;
           try {
             afterSourceFenceCommit?.();
             assertTarget();
@@ -1278,6 +1300,7 @@ function mergeMainDatabase(
             ) {
               assertTarget();
               target.exec("COMMIT");
+              committed = true;
               assertTarget();
               return;
             }
@@ -1336,10 +1359,10 @@ function mergeMainDatabase(
               .run(sourceHash);
             assertTarget();
             target.exec("COMMIT");
+            committed = true;
             assertTarget();
           } catch (error) {
-            target.exec("ROLLBACK");
-            throw error;
+            rollbackTargetReconciliationTransaction(target, committed, error);
           }
         } finally {
           closeLcmConnection(targetPath, target);
@@ -1390,6 +1413,7 @@ function mergeEventsDatabase(
       `);
       assertTarget();
       target.exec("BEGIN IMMEDIATE");
+      let committed = false;
       try {
         if (
           row(
@@ -1402,6 +1426,7 @@ function mergeEventsDatabase(
           afterSourceFenceCommit?.();
           assertTarget();
           target.exec("COMMIT");
+          committed = true;
           assertTarget();
           return;
         }
@@ -1718,10 +1743,10 @@ function mergeEventsDatabase(
         afterSourceFenceCommit?.();
         assertTarget();
         target.exec("COMMIT");
+        committed = true;
         assertTarget();
       } catch (error) {
-        target.exec("ROLLBACK");
-        throw error;
+        rollbackTargetReconciliationTransaction(target, committed, error);
       }
     } finally {
       closeLcmConnection(targetPath, target);
@@ -1819,6 +1844,8 @@ function writeCanonicalTargetMetadata(
     const parsed = JSON.parse(readBoundedRegularFile(metaPath, {
       allowedRoot: targetDir,
       maxBytes: MAX_PROJECT_METADATA_BYTES,
+      expectedUid: targetParent.witness.uid,
+      requireSingleLink: true,
     })) as unknown;
     assertTarget();
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -2226,7 +2253,10 @@ export function reconcileWorktrees(
       return resultFromJournal(fastJournal, journalFile);
     }
   }
-  const executeLocked = (map: Record<string, ProjectMapEntry>): WorktreeReconciliationResult => {
+  const executeLocked = (
+    map: Record<string, ProjectMapEntry>,
+    completion: { marked: boolean },
+  ): WorktreeReconciliationResult => {
     opts._observer?.("after-map-preflight");
     const existingJournal = readJournal(journalFile);
     if (
@@ -2607,25 +2637,32 @@ export function reconcileWorktrees(
         targetHash,
         opts.homeDir,
         reconcileRetainedTarget,
+        () => {
+          completion.marked = true;
+        },
       );
     } catch (error) {
       if (error instanceof BackendPublicationJournalError) throw error;
-      journal.blockedFrom = journal.phase === "merged" || journal.phase === "archived"
-        ? journal.phase
-        : journal.blockedFrom ?? "planned";
-      journal.phase = "blocked";
-      journal.reason = String(error);
-      writeJournal(journalFile, journal);
+      if (!completion.marked) {
+        journal.blockedFrom = journal.phase === "merged" || journal.phase === "archived"
+          ? journal.phase
+          : journal.blockedFrom ?? "planned";
+        journal.phase = "blocked";
+        journal.reason = String(error);
+        writeJournal(journalFile, journal);
+      }
       throw error;
     }
   };
 
   const execute = (map: Record<string, ProjectMapEntry>): WorktreeReconciliationResult => {
+    const completion = { marked: false };
     try {
-      return executeLocked(map);
+      return executeLocked(map, completion);
     } catch (error) {
       if (error instanceof BackendPublicationJournalError) throw error;
       if (opts.dryRun) throw error;
+      if (completion.marked) throw error;
       const current = readJournal(journalFile);
       if (current && resolve(current.canonical) !== canonical) throw error;
       {
@@ -2699,7 +2736,7 @@ export function ensureWorktreeProjectReconciled(
   opts: {
     /** @internal Override the bounded process-cache lifetime for deterministic tests. */
     readonly _cacheTtlMs?: number;
-    /** @internal Override wall-clock time for deterministic cache tests. */
+    /** @internal Override monotonic elapsed milliseconds for deterministic cache tests. */
     readonly _nowMs?: number;
     /** @internal Override ~/.codex for deterministic catalogue tests. */
     readonly _codexDir?: string;
@@ -2728,7 +2765,7 @@ export function ensureWorktreeProjectReconciled(
     id: hashProjectPath(anchor!.canonical),
     canonical: anchor!.canonical,
   };
-  const now = opts._nowMs ?? Date.now();
+  const now = opts._nowMs ?? performance.now();
   const ttlMs = cacheTtlMs(opts._cacheTtlMs);
   const identityCanonical = resolve(project.canonical);
   const cached = reconciledThisProcess.get(project.id);

@@ -25,6 +25,7 @@ interface UrlPathStarts {
   authority: Uint8Array;
   file: Uint8Array;
   fileQuote: Uint8Array;
+  nestedFileSchemeStarts: Uint8Array;
 }
 
 function quoteCode(char: string | undefined): number {
@@ -60,6 +61,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const authority = new Uint8Array(chars.length);
   const file = new Uint8Array(chars.length);
   const fileQuote = new Uint8Array(chars.length);
+  const nestedFileSchemeStarts = new Uint8Array(chars.length);
   let schemeLength = 0;
   let fileSchemeLength = 0;
   let schemeQuote = 0;
@@ -97,6 +99,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         ? index + 1
         : -1;
     if ((separator >= 0 || restartedPathlessFile) && nestedFileSchemeStart >= 0) {
+      nestedFileSchemeStarts[nestedFileSchemeStart] = 1;
       separator = nestedFileSchemeStart + 4;
       brackets = 0;
       exactFileScheme = true;
@@ -258,7 +261,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
   }
 
-  return { authority, file, fileQuote };
+  return { authority, file, fileQuote, nestedFileSchemeStarts };
 }
 
 function isPosixPathStart(chars: readonly string[], index: number, urlAuthorityPathStarts: Uint8Array): boolean {
@@ -300,6 +303,7 @@ function scanAbsolutePath(
   start: number,
   windows: boolean,
   driveColonIndex: number,
+  nestedFileSchemeStarts: Uint8Array,
   quote?: string,
 ): { end: number; sawNonSeparator: boolean } {
   let index = start;
@@ -309,6 +313,7 @@ function scanAbsolutePath(
   let sawNonSeparator = false;
   while (index < chars.length) {
     const char = chars[index];
+    if (quote === undefined && nestedFileSchemeStarts[index] === 1) break;
     if (isPathWord(char)) {
       sawPathCharacter = true;
       sawNonSeparator = true;
@@ -385,7 +390,14 @@ function sanitizeAbsolutePaths(message: string): string {
     }
     const quote = fileUrl ? quoteFromCode(urlPathStarts.fileQuote[index]) : openingQuote;
     const driveColonIndex = fileUrl ? fileUrlDriveColonIndex(chars, start) : windowsDrive ? start + 1 : -1;
-    const { end, sawNonSeparator } = scanAbsolutePath(chars, start, windows, driveColonIndex, quote);
+    const { end, sawNonSeparator } = scanAbsolutePath(
+      chars,
+      start,
+      windows,
+      driveColonIndex,
+      urlPathStarts.nestedFileSchemeStarts,
+      quote,
+    );
     if (
       ((fileUrl || posix) && !sawNonSeparator) ||
       (!fileUrl && end <= start + (windowsDrive ? 3 : 1))

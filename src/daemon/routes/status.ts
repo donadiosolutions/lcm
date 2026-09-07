@@ -1,111 +1,53 @@
-import { existsSync } from "node:fs";
-import { dirname } from "node:path";
-import { readBoundedRegularFile } from "../../security-files.js";
 import type { DaemonConfig } from "../config.js";
-import { MAX_PROJECT_METADATA_BYTES, projectDbPath, projectMetaPath } from "../project.js";
-import { sendJson } from "../server.js";
-import type { RouteHandler } from "../server.js";
-import { PKG_VERSION } from "../server.js";
+import { sendJson, PKG_VERSION, type RouteHandler } from "../server.js";
 import { validateCwd } from "../validate-cwd.js";
-import { sanitizeError } from "../safe-error.js";
-import { closeLcmConnection, getLcmConnection } from "../../db/connection.js";
+import { collectStats, StatsUnavailableError } from "../../stats.js";
+import { backendDiagnosticFailure } from "../../storage/diagnostics.js";
+import type { StorageBackendFactory } from "../../storage/contracts.js";
 
-export function createStatusHandler(config: DaemonConfig, startTime: number, actualPort?: number): RouteHandler {
-  return async (_req, res, body) => {
+export function createStatusHandler(
+  config: DaemonConfig,
+  startTime: number,
+  actualPort?: number,
+  homeDir?: string,
+  storageFactory?: StorageBackendFactory,
+): RouteHandler {
+  return async (_req, res, body, context) => {
+    let input: unknown;
+    try { input = JSON.parse(body || "{}"); }
+    catch { sendJson(res, 400, { error: "invalid request body" }); return; }
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      sendJson(res, 400, { error: "invalid request body" }); return;
+    }
+    const candidate = (input as Record<string, unknown>).cwd;
+    if (!candidate) { sendJson(res, 400, { error: "cwd is required" }); return; }
+    if (typeof candidate !== "string") { sendJson(res, 400, { error: "invalid cwd" }); return; }
+    let cwd: string;
+    try { cwd = validateCwd(candidate); }
+    catch { sendJson(res, 400, { error: "invalid cwd" }); return; }
+
+    const daemon = {
+      version: PKG_VERSION,
+      uptime: Math.max(0, Math.floor((Date.now() - startTime) / 1000)),
+      port: actualPort ?? config.daemon.port,
+    };
     try {
-      const input = JSON.parse(body || "{}");
-      if (input === null || typeof input !== "object" || Array.isArray(input)) {
-        sendJson(res, 400, { error: "invalid request body" });
-        return;
-      }
-
-      if (!input.cwd) {
-        sendJson(res, 400, { error: "cwd is required" });
-        return;
-      }
-
-      let cwd: string;
-      try {
-        cwd = validateCwd(input.cwd);
-      } catch (err) {
-        sendJson(res, 400, { error: sanitizeError(err instanceof Error ? err.message : "invalid cwd") });
-        return;
-      }
-
-      // Calculate daemon uptime in seconds
-      const uptime = Math.floor((Date.now() - startTime) / 1000);
-
-      // Use actual port if provided, otherwise fall back to config port
-      const port = actualPort ?? config.daemon.port;
-
-      // Query project database for stats
-      let messageCount = 0;
-      let summaryCount = 0;
-      let promotedCount = 0;
-
-      const dbPath = projectDbPath(cwd);
-      if (existsSync(dbPath)) {
-        const db = getLcmConnection(dbPath);
-        try {
-          // Count messages
-          const msgResult = db.prepare("SELECT COUNT(*) as count FROM messages").get() as { count: number };
-          messageCount = msgResult?.count ?? 0;
-
-          // Count summaries
-          const sumResult = db.prepare("SELECT COUNT(*) as count FROM summaries").get() as { count: number };
-          summaryCount = sumResult?.count ?? 0;
-
-          // Count promoted
-          const promResult = db.prepare("SELECT COUNT(*) as count FROM promoted").get() as { count: number };
-          promotedCount = promResult?.count ?? 0;
-        } catch {
-          // If database query fails, return zeros
-          messageCount = 0;
-          summaryCount = 0;
-          promotedCount = 0;
-        } finally {
-          closeLcmConnection(dbPath, db);
-        }
-      }
-
-      // Read meta.json for timestamps
-      let lastIngest: string | null = null;
-      let lastCompact: string | null = null;
-      let lastPromote: string | null = null;
-
-      const metaPath = projectMetaPath(cwd);
-      try {
-        const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
-        const meta = JSON.parse(readBoundedRegularFile(metaPath, {
-          allowedRoot: dirname(metaPath),
-          maxBytes: MAX_PROJECT_METADATA_BYTES,
-          expectedUid,
-          requireSingleLink: true,
-        }));
-        lastIngest = meta.lastIngest ?? null;
-        lastCompact = meta.lastCompact ?? null;
-        lastPromote = meta.lastPromote ?? null;
-      } catch {
-        // Missing, malformed, rejected, or concurrently replaced metadata is best-effort.
-      }
-
+      const stats = await collectStats({ cwd, homeDir, storageFactory, signal: context?.signal });
       sendJson(res, 200, {
-        daemon: {
-          version: PKG_VERSION,
-          uptime,
-          port,
-        },
+        daemon,
+        backendDiagnostics: stats.backendDiagnostics,
         project: {
-          messageCount,
-          summaryCount,
-          promotedCount,
-          lastIngest,
-          lastCompact,
-          lastPromote,
+          messageCount: stats.messages,
+          summaryCount: stats.summaries,
+          promotedCount: stats.promotedCount,
         },
       });
-    } catch (err) {
-      sendJson(res, 500, { error: sanitizeError(err instanceof Error ? err.message : "status failed") });
+    } catch (error) {
+      sendJson(res, 200, {
+        daemon,
+        backendDiagnostics: error instanceof StatsUnavailableError
+          ? error.diagnostics : backendDiagnosticFailure(error, config.storage.backend),
+      });
     }
   };
 }

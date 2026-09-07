@@ -107,6 +107,12 @@ meaning across search modes or hit types. The input `sessionId` is a string
 filter resolved to a conversation and is not returned on hits, and neither hit
 type has a `type` field.
 
+Message timestamps stored by the local SQLite backend without a timezone
+designator (for example, `YYYY-MM-DD HH:mm:ss`) are UTC instants and are
+converted to the same UTC representation on reads. Fractional seconds are
+preserved to JavaScript `Date` millisecond precision; already-qualified `Z` or
+numeric-offset timestamps retain their represented instant.
+
 A successful search with no matches, including an unknown `sessionId`, returns
 `{ "messages": [], "summaries": [], "totalMatches": 0 }`. If `cwd` is
 missing or invalid, the project is unavailable, or an unclassified error is
@@ -328,17 +334,28 @@ lcm_store(
 
 ### lcm_stats
 
-Show token savings, compression ratios, and usage statistics across all Long Context Manager (LCM) projects.
+Show observed token savings, compression ratios, and numeric usage statistics
+for the selected SQLite or PostgreSQL backend. The result uses the
+[shared sanitized diagnostic snapshot](cli.md#observational-diagnostics), with
+explicit readiness/failure states and a 2000-millisecond collection deadline.
+Unavailable metrics are omitted, and no recalled-text previews, memory
+payloads, raw errors, credentials, or local paths are returned. The invocation
+does not bootstrap a daemon, migrate schema, register projects, or prune
+sidecars. Starting an MCP connection remains a separate operational action.
 
 **Parameters:**
 
 | Param | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `verbose` | boolean | | `false` | Include per-conversation breakdown |
+| `verbose` | boolean | | `false` | Include available detailed numeric statistics; the same privacy boundary applies |
 
 ### lcm_doctor
 
-Run diagnostics on the Long Context Manager (LCM) installation. Checks daemon, hooks, MCP config, and summarizer health.
+Observe the Long Context Manager (LCM) installation: existing-daemon health,
+hooks, static MCP registration, and summarizer configuration. Reports findings
+and explicit repair commands without starting or restarting services, changing
+configuration, or repairing files. Live MCP protocol readiness is not probed;
+doctor does not spawn a server for a handshake.
 
 **Parameters:** none.
 
@@ -368,5 +385,5 @@ listing something you need, use `lcm_expand` with that summary's node ID.
 
 - `lcm_search`, `lcm_grep`, and `lcm_describe` are fast (direct database queries)
 - `lcm_expand` traverses the DAG and reads source messages — cost scales with depth
-- `lcm_stats` performs full-table scans — use sparingly, not in request handlers
+- `lcm_stats` may scan aggregate counters across projects; collection is bounded, but use it sparingly rather than in request handlers
 - Token caps (`LCM_MAX_EXPAND_TOKENS`) prevent runaway expansion

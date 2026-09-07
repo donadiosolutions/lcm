@@ -79,6 +79,23 @@ The database and passive-learning sidecar remain under:
 ~/.lcm/events/<local-hash>.db
 ```
 
+## Metadata-backed map discovery
+
+When a project hash is absent from `~/.lcm/map.json`, project listing and
+identity resolution can recover its canonical path from
+`~/.lcm/projects/<local-hash>/meta.json`. LCM accepts this metadata only from a
+regular file with one hard link. On platforms that expose the effective user
+ID, the file must also belong to that user. Ownership and link-count checks
+happen before LCM consumes the file contents.
+
+Foreign-owner and multiply linked metadata is silently omitted from discovery;
+unrelated valid projects are still discovered, and existing map entries remain
+unchanged. LCM does not repair rejected metadata automatically. If a legitimate
+project is missing, restore an owner-local, single-link `meta.json` from trusted
+project state and rerun the project command. Avoid sharing the file or its
+`cwd` value in diagnostics unless needed, because local paths can identify
+users, organizations, and repositories; see [Privacy and data handling](privacy.md).
+
 PostgreSQL adds an explicit identity layer. A registered machine has a UUIDv7,
 and a local project may be bound to a PostgreSQL project UUIDv7. The binding
 lets two machines—or two unrelated paths—address the same remote project
@@ -122,6 +139,12 @@ database sidecars move to timestamped private backups under
 remain at the retired project and event paths so an older LCM process cannot
 recreate a split store. The project map then folds live and deleted worktree
 paths into canonical aliases. Legacy data remains recoverable in the backups.
+If the retained target identity changes immediately after a database commit,
+reconciliation keeps the topology diagnostic as the primary error and records
+the journal as blocked. It does not issue a second rollback against a
+transaction that has already committed. When an active transaction rollback
+itself fails, the original merge error remains first and the rollback failure
+is retained as secondary cause evidence.
 An event-path sentinel is recognized only when the hash-named
 `~/.lcm/events/<local-hash>.db` path is a real directory containing exactly one
 bounded, regular `fence.json` marker whose version, hash, kind, JSON bytes, and
@@ -138,6 +161,20 @@ PostgreSQL UUID bindings fail closed. The journal retains a blocked,
 operator-visible result, and LCM does not publish a partially reconciled map.
 After the conflict is corrected, rerun reconciliation; the durable journal and
 merge markers continue from the verified state.
+
+The canonical target's `meta.json` is a separate leaf-file trust boundary. LCM
+refuses to parse or reuse it when its owner differs from the admitted project
+directory owner (`file owner is not trusted`) or when it has more than one hard
+link (`file has multiple hard links`). A deliberate user-created hard link also
+blocks reconciliation by design. Preserve the refused inode for inspection,
+then copy its verified content into a newly created owner-only temporary file in
+the target directory and atomically replace the `meta.json` directory entry.
+Copying over the existing hard-linked path does not break the link and does not
+repair the refusal. Rerun `lcm project reconcile-worktrees` after replacement;
+`lcm doctor` reports the blocked journal but does not retry it. Target database
+or pattern merges may already have completed before this late metadata check,
+so a journal blocked from the planned phase does not promise rollback; the
+durable merge markers make the explicit retry resumable.
 
 Reconciliation also fingerprints every mapped path so a repaired or remounted
 worktree invalidates a completed discovery result. An `ENOTDIR` observation for
@@ -183,6 +220,13 @@ and project-map publication. If that chain is replaced or loses its private
 owner-only mode, reconciliation blocks before the next observable mutation;
 snapshot cleanup also leaves a private residual snapshot rather than removing
 a pathname that may have been rebound.
+
+If a retained target directory handle fails while closing after the journal has
+been durably marked completed and the final target validation has passed, LCM
+still reports the cleanup error and closes every handle, while preserving the
+completed journal and its folded map and archived-source evidence. A later run
+can therefore discover and enqueue newly eligible work. Cleanup failures before
+that completion boundary remain blocked and retain their failure reason.
 
 `lcm doctor` reports completed, partial, and blocked journals without retrying a
 blocked reconciliation while collecting project-sensitive-pattern diagnostics.
@@ -365,8 +409,10 @@ target is SQLite, then restart the daemon; do not edit `map.json` or
 `config.json` independently.
 
 CLI/import-export and portable transfer remain #618-owned. Stats, pool
-diagnostics, status, and doctor presentation remain #619-owned; their current
-limitations do not change the daemon's project identity or publication gate.
+diagnostics, status, and doctor use the selected-backend
+[observational snapshot](cli.md#observational-diagnostics), with safe identity
+fields and no project registration or repair. Diagnostic observations do not
+weaken the daemon's project identity or publication gate.
 
 ## Same-machine aliases
 
@@ -611,7 +657,8 @@ lcm project list --json
 lcm doctor
 ```
 
-`lcm doctor` validates `map.json`, reports invalid JSON/schema/UUIDs and
-cross-entry collisions, and can normalize formatting or remove same-entry
-duplicate aliases. It preserves the last valid daemon map during transient
-invalid editor saves and never auto-repairs an ambiguous mapping by guessing.
+`lcm doctor` validates `map.json` and reports invalid JSON/schema/UUIDs and
+cross-entry collisions. It does not normalize formatting, remove duplicate
+aliases, reconcile worktrees, or write the map. Review the findings and resolve
+the intended mapping through explicit project commands before rerunning
+doctor. Ambiguous mappings are never resolved by guessing.

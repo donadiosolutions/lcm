@@ -50,6 +50,10 @@ In `lcm store`, `--tag` and `--tags` are repeatable single-tag aliases. This is
 different from `lcm export --tags`, which remains a comma-separated filter,
 for example `lcm export --tags decision,architecture`.
 
+`lcm export` writes JSON by default. The optional `--format` value accepts
+only `json`; unsupported values are rejected before export work or output
+writes begin.
+
 An unknown command writes an error and the complete command list to the
 terminal, completes both outputs, and then exits with status 1.
 
@@ -65,25 +69,13 @@ client for each read:
 | `lcm grep <query>` | Search messages and summaries by exact text or regular expression; optional inclusive `--since` accepts `YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm)` with normalized UTC years 0001-9999, and malformed or out-of-range values return HTTP 400 |
 | `lcm describe <nodeId>` | Read summary or stored-memory metadata |
 | `lcm expand <nodeId>` | Expand a summary into source detail |
-| `lcm status` | Read daemon and project status |
-| `lcm stats --pool` | Read daemon connection-pool statistics |
-
-Project timestamps reported by `lcm status` are best-effort metadata. Missing,
-malformed, policy-rejected, or concurrently replaced project metadata does not
-fail the status request: the JSON response keeps `lastIngest`, `lastCompact`,
-and `lastPromote` as `null`, and the human-readable output omits those null
-timestamps. Policy rejection includes metadata that exceeds 1 MiB or is not a
-single-link regular file at the expected project metadata path. On platforms
-with a numeric UID, the file must also be owned by the current UID; where UIDs
-are unavailable, that ownership check is skipped. Daemon details and available
-project counts are still reported.
 
 When `--since` is supplied, its value is forwarded to the daemon exactly as
 provided. An empty or whitespace-only value is therefore invalid and returns
 HTTP 400; omit the option when no lower-bound filter is wanted.
 
 The local inspection commands `machine show`, `project list`, `project show`,
-`config get`, `stats` (without `--pool`), `events status`, `events validate`,
+`config get`, `events status`, `events validate`,
 `events quarantine`, `sensitive list`, `sensitive test`, and `export` also
 complete the authenticated legacy-home migration gate. When a healthy managed
 daemon is the owner of a private publication lock, the gate and the selected
@@ -110,23 +102,9 @@ rejected export admission exits unsuccessfully, including with `--output` or
 `--all`. An `--all` export may have already written earlier projects when a
 later project fails; those outputs remain, and no successful total is printed.
 
-The local `lcm stats` project-database scan authenticates the LCM state root,
-the `projects` directory, and each project directory as owner-held directories
-with exact mode `0700`. It opens only an existing regular `db.sqlite`; a missing
-state root or `projects` directory returns empty project statistics, and a
-missing project database is skipped without creating it. An authenticated
-legacy database may be migrated before its statistics are read. Busy, locked,
-or malformed project databases remain best-effort skips. Unsafe state or
-projects topology, a project replaced after enumeration, and an unsafe or
-replaced database leaf abort the scan with a path-free remediation message. A
-project that is already a symlink when enumeration begins is excluded.
-
-This boundary starts at the `.lcm` state root; operating-system directories
-above it are outside the project-statistics admission policy. The portable
-SQLite API opens a pathname rather than a retained file descriptor, so the
-scan checks directory and database identity before and after opening but cannot
-eliminate a same-account swap-and-restore race. Event statistics use their own
-storage scan and are outside this project-database no-creation guarantee.
+The process-local catalogue discovery cache uses a monotonic elapsed-time TTL
+capped at 1,000 milliseconds; wall-clock corrections do not extend or shorten
+it, and identity and state guards still invalidate stale entries.
 
 `lcm search <query> --limit <n>` accepts a positive integer from 1 through
 1000 and defaults to 5. The limit is a maximum applied independently to each
@@ -215,46 +193,22 @@ including an explicit transport
 preference, still takes the normal authenticated mutation lock and remains fail
 closed if that lock is held by another operation.
 
-The remaining doctor stages that take the exclusive publication lock (the
-project-map validation and repair, the worktree reconciliation listing, and
-the daemon lifecycle admission on both the healthy and the auto-start paths)
-keep their locks. When one of them is refused because the lock is held, doctor
-retries that stage only if the lock owner is the exact managed daemon it
-already observed: the lock record's PID and process start time must match a
-live process, and a fresh token-authenticated health exchange must return the
-same PID, version, storage backend, entrypoint, and packaged runtime digest.
-A foreign, ambiguous, malformed, stale, missing, or unreadable owner, an
-identity mismatch, a failed authenticated probe, or any error other than lock
-contention propagates unchanged and doctor reports the stage as failed.
+Doctor's map validation and worktree inspection are observational. It reports
+invalid or ambiguous mappings without normalization, duplicate removal, or
+reconciliation writes. Existing-daemon health is bounded and authenticated;
+readiness is not inferred from public liveness. Missing installed version or
+packaged runtime digest, mismatched identity, and unreadable credentials leave
+managed-daemon readiness unverified. Run doctor from the installed `lcm.mjs`
+artifact; reinstall LCM if that artifact is unreadable or damaged.
 
-Doctor must also resolve and hash its own packaged runtime before it can retry
-publication contention. If that local runtime identity is unavailable, doctor
-does not infer a digest from daemon health or treat the missing value as a
-wildcard; it reports the original contention for the affected stage. Run
-doctor from the installed `lcm.mjs` artifact. If that artifact is unreadable or
-damaged, reinstall LCM and rerun `lcm doctor`.
+Doctor does not acquire publication mutation locks, wait for a lock holder to
+repair state, or retry lifecycle stages. Use `lcm daemon restart` for an
+explicit lifecycle repair, `lcm install` for Claude Code settings/hooks/managed
+guidance, or `lcm connectors install <agent>` for another connector. Review and
+resolve project mapping findings explicitly, then rerun doctor. There is no
+automatic-repair mode.
 
-Doctor also requires a nonempty version from the installed package metadata
-before it can retry publication contention. It never derives that expected
-version from daemon health; if the installed version is unavailable or blank,
-doctor reports the original contention for the affected stage.
-
-The retry budget is a single two-second monotonic elapsed window shared by
-every stage of one doctor run, polled at most every 50 milliseconds. Time spent
-inside a refused attempt, the platform process-birth probe, and the
-authenticated health probe counts against that window. On platforms that need
-an external trusted process-birth helper, its timeout is shortened to the
-remaining shared budget; doctor recomputes the budget again before reading the
-daemon token or starting the health exchange. The final wait is likewise
-shortened to whatever remains. Once the window is spent no further retries
-occur in that run. This is what prevents a healthy managed daemon's short
-background publication reconciliation immediately after `lcm install` from
-failing the next `lcm doctor`; `lcm connectors install codex` retains the
-ordinary root-migration path and connector-owned verification, without the
-top-level installer's publication-convergence retry. The retry does not wait
-for a stuck or foreign lock holder.
-
-`lcm install` uses the same bounded publication admission for its preflight
+`lcm install` uses bounded publication admission for its preflight
 migration and each installer lock-taking stage, including daemon lifecycle
 publication assertions. A retry re-attempts only a lock-acquisition callback;
 the callback body has not run when contention is raised, so prompts, settings
@@ -286,6 +240,110 @@ exact directory entry is checked again around the final reads. If any of that
 evidence changes, the captured identity is discarded; rerun `lcm install` once
 publication settles if lock contention remains. A legacy non-private SQLite
 root without publication evidence keeps its existing read compatibility.
+
+## Observational diagnostics
+
+`lcm stats`, `lcm stats --pool`, `lcm status`, and `lcm doctor` inspect the
+selected SQLite or PostgreSQL backend without starting or restarting the
+daemon. They skip legacy-home bootstrap migration and publication-convergence
+retries. These commands do not register machines or projects, repair settings
+or identity maps, migrate schema, prune orphan event sidecars, or create
+missing project databases. Repairs remain explicit operator actions.
+
+The CLI, local MCP `lcm_stats`, and daemon `/stats`, `/stats/pool`, and `/status`
+surfaces use the same sanitized backend diagnostic snapshot. It includes the
+selected backend, publication admission, verified TLS readiness where
+applicable, schema/migration and extension readiness, safe project and machine
+identifiers, pool observations, and local outbox counts when available.
+Configuration alone never proves readiness. Unobserved subfacts are
+`unverified`, failed observations are `unavailable`, and facts that do not apply
+to the selected backend are `not-applicable`; verified facts are `ready`.
+
+Text output shows these readiness fields even when statistics are unavailable,
+including search readiness, pool origin and counts, project scope, machine
+identity, local outbox delivery counts, and a fixed next action. It never
+renders a database error or arbitrary configuration value as guidance.
+
+The `project` snapshot field distinguishes `aggregate` observations from a
+`selected` project. A ready selection includes its admitted PostgreSQL UUID
+or SQLite project hash and, when available, the associated local hash used
+for outbox counts. No project paths are printed. An unknown selection is
+reported as unavailable and never falls back to aggregating all projects.
+A selected remote UUID without an observed local binding leaves the local
+outbox unverified. Failures retain the requested scope but discard identifiers
+when their observation cannot be trusted.
+
+SQLite does not require machine registration: an absent machine identity is
+`not-applicable`. If a machine UUID is present and validated, it is shown as
+an identity observed in this configured home. PostgreSQL still requires its
+machine identity to be verified. Aggregate project scope means no individual
+project ID was selected; an absent ID is not evidence of a missing project.
+
+| Snapshot state | Meaning and next action |
+|---|---|
+| `healthy` | All required readiness observations verified. |
+| `degraded` | Readiness verified, but the observed pool still reports a recovery failure condition. Inspect the backend service and repeat the diagnostic after recovery. |
+| `unavailable` | Storage could not be safely read or a required observation could not be verified. Check configuration, service readiness, and the fixed guidance in the output. |
+| `permission-denied` | A trusted local or database permission failure prevented observation. Restore the intended access or runtime grants, then retry. |
+| `timeout` | Collection reached its deadline or the caller cancelled it. Check service responsiveness and retry. |
+| `stale-publication` | Publication evidence is unresolved or inconsistent, or authenticated evidence changed during collection. Preserve the evidence and follow the [publication recovery guidance](backend-publication.md#journal-less-publication-evidence). |
+
+Backend snapshot collection has a default deadline of 2000 milliseconds and
+honors caller cancellation. SQLite project and event-sidecar reads share one
+owned child process for the complete snapshot, so additional projects do not
+incur a new process launch for every database. All discovered sidecars are
+considered within that same deadline. A timeout is reported even if a probe stalls;
+cleanup does not replace the primary failure classification. A diagnostic
+probe owns and closes its own resources, while a daemon's shared pool stays
+open. `lcm stats --pool` reports safe pool counts and whether they came from
+the daemon or a diagnostic probe. PostgreSQL observations include configured
+maximum, total, idle, and waiting connections and the observed failure latch.
+Daemon pool counts are observed independently before the remote probe starts.
+They may remain available when that probe times out or fails, provided the
+publication and configuration still authenticate. A ready pool observation
+means its counts were available; it does not establish remote backend health.
+The snapshot retains its failure classification and recovery action.
+Unavailable counts are omitted rather than reported as zero.
+
+Numeric statistics such as token totals, compression, recall counters, and
+local outbox counts are included only when observed. Partial or unavailable
+remote metrics do not become empty-project totals. Diagnostic output contains
+no recalled-text previews (`topRecalled`), transcript or memory payloads, raw
+errors, SQL values, connection URLs, role names, CA paths, or arbitrary local
+paths. Verbose output follows the same boundary.
+
+Publication and configuration are authenticated before and after asynchronous
+probes. If their witnesses differ, the result is `stale-publication` and the
+collected metrics are discarded. This is an optimistic observation of matching
+evidence; it is not a transaction-wide authority or consistency guarantee.
+The snapshot takes no publication mutation lock and writes no authority,
+configuration, or witness files.
+
+SQLite statistics open existing databases read-only after authenticating the
+LCM root, project directories, and database leaves. The root and project
+directories must be owner-held with exact mode `0700`. Missing databases remain
+missing. An old or unreadable schema is reported without migration. Reads
+include committed data in the live WAL; SQLite may create necessary `-wal` or
+`-shm` read-coordination artifacts. This engine bookkeeping does not authorize
+checkpointing, journal-mode changes, repair, or sidecar deletion. If a safe
+read requires durable content changes, the diagnostic reports `unavailable`.
+
+The SQLite pathname API still leaves a narrow same-account swap-and-restore
+race between identity checks. Authentication checks surround opening and
+reading, but do not provide isolation from another process with the same
+filesystem authority. Event scans likewise preserve existing sidecars and
+report skipped or failed observations without pruning them.
+
+`lcm status` reports verified daemon details, available numeric project counts,
+and the same backend diagnostic snapshot. If authenticated daemon health is
+available but its status request fails, the daemon remains reported as up and
+the command performs a fresh local diagnostic observation. The output identifies
+that fallback; backend readiness can change between the two observations.
+It omits the former `lastIngest`,
+`lastCompact`, and `lastPromote` fields: project metadata values are not part of
+the diagnostic allowlist. A missing or unreadable project has no numeric
+project object, so an unavailable observation cannot be confused with an
+observed empty database.
 
 ## Daemon-dependent resilience
 
@@ -342,12 +400,25 @@ lcm doctor
 lcm daemon restart
 ```
 
-`lcm doctor` checks the daemon, hooks, connector registration, MCP server, and
-summarizer without asking an unknown process to stop. `lcm daemon restart`
+`lcm doctor` observes the daemon, hooks, connector registration, static MCP
+setup, and summarizer configuration. Its MCP protocol capability check is
+reported as not probed: doctor does not spawn an MCP server or perform a live
+handshake. It never starts, stops, or repairs a daemon. `lcm daemon restart`
 validates the effective configuration, asks the host service manager to replace
 the exact LCM service, and waits for authenticated health before returning.
 After changing configuration, run the restart command once; do not start a
 second daemon to work around a health failure.
+
+When a failed start or restart reports a newly created daemon temporary
+directory with clipped owner permissions, the CLI retains the mapped recovery
+command and the trusted lifecycle guidance on one line:
+
+```text
+lcm daemon unavailable (startup-failure); run 'lcm daemon restart' or 'lcm doctor'. newly created daemon temp directory lacked required owner permissions, was removed, and retry should use an owner-preserving umask such as 0077
+```
+
+Follow the [managed-daemon temporary-storage recovery](daemon-temporary-storage.md)
+steps before retrying under an owner-preserving umask such as `0077`.
 
 Linux uses the current user's `systemd --user` manager and macOS uses the
 current user's `launchd` agent. Both integrations are deliberately one-shot:
