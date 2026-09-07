@@ -170,6 +170,13 @@ storage APIs.
 To run the checkout without changing your global installation, build it and
 invoke `node dist/lcm.mjs ...`.
 
+Source checkouts run the SQLite diagnostic child from its TypeScript asset with
+explicit type-stripping and SQLite runtime flags. Built packages run the
+compiled JavaScript asset with the SQLite flag required by the minimum supported
+Node.js 22.12 runtime. Both launch forms use an empty child environment and do
+not inherit parent preload arguments. Current Node releases may no longer
+require these compatibility flags, but continue to accept them.
+
 To install the built package, use an exact tarball rather than a global link:
 
 ```bash

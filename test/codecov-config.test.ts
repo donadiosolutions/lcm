@@ -54,6 +54,10 @@ const expectedComponents = [
     paths: [
       "^src/config-manager\\.ts$",
       "^src/config-projection\\.ts$",
+      // #1086/#1095/#1119 keep cleanup-error precedence in this existing
+      // configuration-security owner without changing component topology.
+      // PR #791 keeps generated Gitleaks hostname-literal normalization in
+      // this existing configuration-security owner.
       "^src/generated-patterns\\.ts$",
       "^src/home-parent-auth\\.ts$",
       "^src/legacy-names\\.ts$",
@@ -101,8 +105,8 @@ const expectedComponents = [
       // Error sanitization, including #893 adjacent-path, #903 prefixed
       // nested-file, #924 embedded-quote, #925/#1076 quoted-authority,
       // bracketed path quote closure, #1060 adjacent nested-file scheme
-      // preservation, and #1128 active file-URL own-query backslash paths,
-      // remains daemon-core-owned.
+      // preservation, #1117 glued file-authority handling, and #1128 active
+      // file-URL own-query backslash paths remain daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -237,6 +241,7 @@ const expectedComponents = [
       // #1048 keeps target metadata leaf authentication in this owner.
       // #1069 preserves completed reconciliation evidence after retained
       // directory cleanup failures in this existing component.
+      // #1059 keeps retained journal-parent publication in this existing owner.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
@@ -250,7 +255,8 @@ const expectedComponents = [
     name: "Integration - Service Managers and Legacy Migration",
     paths: [
       "^src/daemon/health-observation\\.ts$",
-      // #865 convergence and #966 birth-sample budgeting remain lifecycle-owned.
+      // #865/#966 convergence and birth budgeting remain lifecycle-owned;
+      // #1073 bounds legacy PID/token evidence within that same owner.
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",
@@ -537,12 +543,15 @@ describe("Codecov configuration", () => {
     // #948 keeps promote metadata parent-first admission, sampled read binding,
     // and retained identity revalidation in the daemon-routes component.
     // #964 keeps the path-bound root/projects/leaf metadata lifetime there too.
+    // #1062 keeps retained-parent create-if-absent filesystem semantics in
+    // configuration-security and promote collision handling in daemon-routes.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     // #814 fresh-root descriptor and pre-handoff content checks remain
     // configuration-security-owned.
     const expectedOwners = [
       // #866 export admission failures and sensitive result emission stay CLI-owned.
       // #1081 keeps unsupported export-format admission CLI-owned.
+      // #1088 keeps unsupported connector-list-format admission CLI-owned.
       // #978 keeps compact replacement runtime-digest admission CLI-owned.
       // #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
       ["bin/lcm.ts", "unit-cli"],
@@ -615,6 +624,7 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.
+      // #1101 numeric skipped-sidecar counts stay local-persistence-owned.
       ["src/db/event-sidecars.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"],

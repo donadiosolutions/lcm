@@ -52,17 +52,36 @@ With the default SQLite backend, all storage is on your machine:
   hierarchy substituted before that phase can be admitted. When promotion
   retains the metadata parent, the atomic writer reasserts that parent after
   creating its temporary file, before writing content, and again immediately
-  before rename. It also requires the temporary pathname to still identify the
-  regular file it created. Observed drift at either point refuses publication.
-  These checks are bounded observations rather than an atomic pin on the parent
-  pathname: they do not detect every transient replacement or prevent a change
-  during rename. If rename returns and the following parent check fails, the
-  error outcome is `published`; this means rename completed, not that it reached
-  the retained directory. If rename throws and the parent check also fails, the
-  outcome is `unknown`. Either outcome means bytes may have been published and
-  must not authorize automatic rollback or retry. Calls without a retained
-  parent, including a missing-file race with no sampled parent identity, remain
-  outside this guarantee.
+  before rename or exclusive link. It also requires the temporary pathname to
+  still identify the regular file it created. Observed drift at either point
+  refuses publication. These checks are bounded observations rather than an
+  atomic pin on the parent pathname: they do not detect every transient
+  replacement or prevent a change during publication. If rename or link returns
+  and the following parent check fails, the error outcome is `published`; this
+  means the operation completed, not that it reached the retained directory. If
+  rename or a non-collision link attempt throws and the parent check also fails,
+  the outcome is `unknown`. Either outcome means bytes may have been published
+  and must not authorize automatic rollback or retry.
+
+  When `meta.json` is missing, promotion creates it only if the retained project
+  directory still has no destination entry at publication. A restored file or
+  concurrent creation is refused with the existing topology error and is not
+  overwritten. This portable create briefly links the complete private file at
+  both its temporary and final names; a concurrent bounded reader can fail
+  closed during that interval. The earlier missing-file observation is not
+  proof of historical absence. Calls without a retained parent and the bounded
+  pathname windows described above remain outside the guarantee; these checks
+  do not provide descriptor-relative pathname mutation.
+
+  A post-link cleanup or single-link verification failure reports
+  `private file link completed, but published file topology is not trusted`.
+  The completed `meta.json` can remain linked to a hidden
+  `.meta.json.*.tmp` name, with link count two, and later metadata admission
+  will refuse it. Before retrying, inspect both entries with an inode-reporting
+  tool such as `ls -li`. If they have the same inode and the expected owner,
+  mode, and content, remove only the hidden temporary name, then verify that
+  `meta.json` has link count one and mode `0600`. If those identities do not
+  match, preserve both entries and investigate rather than deleting either one.
 - **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
 - **`~/.lcm/daemon.pid`** — Daemon process ID (transient).
@@ -146,6 +165,10 @@ manual-store content and tags, and portable exports/imports. It combines the
 bundled Gitleaks rules, built-in patterns, global `security.sensitivePatterns`,
 and the project's `sensitive-patterns.txt`. Previously captured passive events
 are scrubbed again before promotion.
+
+Bundled rules scoped to a service hostname match that literal hostname,
+including its dots. A lookalike hostname is not treated or redacted as that
+service; add a custom pattern when your environment intentionally uses one.
 
 For PostgreSQL native transcripts, the embedded caller must explicitly
 load and pass both effective custom-pattern arrays: global
@@ -324,13 +347,24 @@ The `Security` section of the doctor output shows:
   inside any URL starts a nested file URL. Once an outer URL has entered its
   query or fragment, the same literal also starts a nested file URL after any
   character other than an ASCII letter, including query value wrappers,
-  punctuation, and digits. ASCII-letter-glued names such as `profile://` and
-  `xfile://` remain ordinary URL text. LCM preserves the outer URL and replaces
-  only the nested file path. When recognized nested `file://` literals are
-  adjacent within an outer URL query or fragment, each unquoted literal ends
-  the preceding redacted path and keeps its complete scheme for independent
-  redaction. A quoted path still consumes a nested scheme through its matching
-  closing quote. This bounded rule does not decode percent-encoded schemes or
+  punctuation, and digits. At top level and in fresh query or fragment state,
+  ASCII-letter-glued names such as `profile://` and `xfile://` remain ordinary
+  URL text. Once an unquoted absolute path has started, an adjacent token whose
+  suffix is the exact case-insensitive `file://` spelling is conservatively
+  absorbed into the same redacted span. Its authority, including optional
+  userinfo, port, or bracketed host, and its following path are removed. This
+  can remove a non-secret host or port glued to a private path, preventing the
+  private tail from remaining visible after one sanitization pass. Ordinary
+  authority delimiters still end the absorbed span; later word-glued text is
+  classified independently and can remain visible even when it resembles a
+  local path. An opening `(` instead resumes the already active path scan, so
+  its following text remains in the redacted span. LCM preserves the outer URL
+  and replaces only the nested file path. When
+  recognized nested `file://` literals are adjacent within an outer URL query
+  or fragment, each unquoted literal ends the preceding redacted path and keeps
+  its complete scheme for independent redaction. A quoted path still consumes
+  a nested scheme through its matching closing quote. This bounded rule does
+  not decode percent-encoded schemes or
   recognize `file://` text in an ordinary URL path. Outer-quoted pathless file
   URLs retain their conservative file-path classification through `?` and `#`,
   so a nested non-file URL in that quoted span may still be redacted as a path.

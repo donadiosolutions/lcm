@@ -90,7 +90,7 @@ export async function collectEventStats(options: EventStatsOptions = {}): Promis
       continue;
     }
     if (sidecar.scanSkipped) {
-      result.scanSkipped = result.scanSkipped! + 1;
+      result.scanSkipped = result.scanSkipped! + (sidecar.scanSkippedCount ?? 1);
       continue;
     }
     result.captured += sidecar.captured;
@@ -147,7 +147,7 @@ export async function collectDetailedEventStats(options: EventStatsOptions = {})
     if (sidecar.pruned) {
       result.prunedSidecars = result.prunedSidecars! + 1;
     } else if (sidecar.scanSkipped) {
-      result.scanSkipped = result.scanSkipped! + 1;
+      result.scanSkipped = result.scanSkipped! + (sidecar.scanSkippedCount ?? 1);
     } else {
       result.captured += sidecar.captured;
       result.unprocessed += sidecar.unprocessed;
