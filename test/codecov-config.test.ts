@@ -59,6 +59,8 @@ const expectedComponents = [
       // configuration-security owner without changing component topology.
       // #1134/#1135/#1136 preserve private-write failures while retaining
       // ordered descriptor, temporary-file, and parent cleanup evidence here.
+      // #1223 keeps authenticated lock-owner disappearance recovery in this
+      // existing configuration-security owner.
       // PR #791 keeps generated Gitleaks hostname-literal normalization in
       // this existing configuration-security owner.
       "^src/generated-patterns\\.ts$",

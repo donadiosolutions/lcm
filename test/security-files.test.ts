@@ -54,6 +54,7 @@ import {
   writePrivateFileExclusive,
   OWNER_ONLY_FILE_MODES,
 } from "../src/security-files.js";
+import * as securityFiles from "../src/security-files.js";
 
 const roots: string[] = [];
 
@@ -2775,6 +2776,77 @@ describe("private filesystem primitives", () => {
       content: "content",
       mtimeMs: statSync(path).mtimeMs,
     });
+  });
+
+  it("authenticates exact retained-parent absence and rejects every present leaf type", () => {
+    const root = makeRoot();
+    const path = join(root, "candidate");
+    const absence = (securityFiles as unknown as {
+      privateFileAbsentAtRetainedParent(path: string): boolean;
+    }).privateFileAbsentAtRetainedParent;
+    expect(absence(path)).toBe(true);
+
+    writeFileSync(path, "present", { mode: 0o600 });
+    expect(absence(path)).toBe(false);
+    unlinkSync(path);
+    mkdirSync(path, { mode: 0o700 });
+    expect(absence(path)).toBe(false);
+    rmSync(path, { recursive: true });
+    symlinkSync(join(root, "missing-target"), path);
+    expect(absence(path)).toBe(false);
+  });
+
+  it("fails closed on absence lookup, retained-parent rebind, and close failures", () => {
+    const root = makeRoot();
+    const parent = join(root, "parent");
+    const path = join(parent, "candidate");
+    mkdirSync(parent, { mode: 0o700 });
+    const absence = (securityFiles as unknown as {
+      privateFileAbsentAtRetainedParent(
+        path: string,
+        options?: Readonly<{
+          _beforeLookupForTesting?: () => void;
+          _lstatForTesting?: typeof lstatSync;
+          _closeParentForTesting?: (handle: ReturnType<typeof openPrivateDirectory>) => void;
+        }>,
+      ): boolean;
+    }).privateFileAbsentAtRetainedParent;
+    const lookupFailure = new Error("absence lookup failed");
+    expect(() => absence(path, {
+      _lstatForTesting: (() => { throw lookupFailure; }) as typeof lstatSync,
+    })).toThrow(lookupFailure);
+
+    const moved = join(root, "parent-original");
+    expect(() => absence(path, {
+      _beforeLookupForTesting: () => {
+        renameSync(parent, moved);
+        mkdirSync(parent, { mode: 0o700 });
+      },
+    })).toThrow("topology");
+
+    const closeFailure = new Error("absence parent close failed");
+    expect(() => absence(join(parent, "absent"), {
+      _closeParentForTesting: (handle) => {
+        handle.close();
+        throw closeFailure;
+      },
+    })).toThrow(closeFailure);
+
+    let aggregate: unknown;
+    try {
+      absence(join(parent, "aggregate"), {
+        _lstatForTesting: (() => { throw lookupFailure; }) as typeof lstatSync,
+        _closeParentForTesting: (handle) => {
+          handle.close();
+          throw closeFailure;
+        },
+      });
+    } catch (error) {
+      aggregate = error;
+    }
+    expect(aggregate).toBeInstanceOf(AggregateError);
+    expect((aggregate as AggregateError).cause).toBe(lookupFailure);
+    expect((aggregate as AggregateError).errors).toEqual([lookupFailure, closeFailure]);
   });
 
   it("enforces the byte limit when a file grows after descriptor metadata is read", () => {

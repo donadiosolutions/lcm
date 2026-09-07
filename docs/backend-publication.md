@@ -472,6 +472,13 @@ settles failed at or after the armed deadline preserves the original
 contention without another wait; the same failed evidence while time remains
 reports the later contention, and admission stays fail-closed in both cases.
 
+If a valid lock owner removes its lock while another process is reading that
+owner record, LCM retries acquisition once only when a retained-parent check
+proves the exact lock leaf is now absent. A present replacement of any type,
+changed parent, malformed owner, uncertain lookup, or cleanup failure still
+fails closed. The next acquisition authenticates the lock again before any
+protected callback runs.
+
 The terminal journal deliberately does not rehash mutable `~/.lcm/` content on
 later startups. Normal database, daemon, transcript, and configuration writes
 therefore cannot freeze startup against the publication-time hash. Startup
