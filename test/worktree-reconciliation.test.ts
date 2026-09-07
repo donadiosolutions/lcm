@@ -8978,7 +8978,7 @@ describe("worktree reconciliation", () => {
     expect(ensureWorktreeProjectReconciled(main, identity).status).toBe("not-needed");
   }, 15_000);
 
-  it("re-fences source stores without auditing a completed target merge", () => {
+  it("re-fences unsupported source content after a completed target merge", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
@@ -8992,6 +8992,11 @@ describe("worktree reconciliation", () => {
     const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
     makeDatabase(targetPath, "marker-target", "target", targetHash);
     makeDatabase(sourcePath, "marker-source", "source", sourceHash);
+    const source = new DatabaseSync(sourcePath);
+    source.exec(
+      "UPDATE promoted SET content = CAST(X'6D656D6F727900736F75726365' AS TEXT)",
+    );
+    source.close();
     const target = new DatabaseSync(targetPath);
     target.exec(`
       CREATE TABLE worktree_reconciliation_sources (
@@ -9002,9 +9007,14 @@ describe("worktree reconciliation", () => {
     target.prepare(
       "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
     ).run(sourceHash);
-    target.exec(
-      "UPDATE promoted SET content = CAST(X'6D656D6F727900746172676574' AS TEXT)",
-    );
+    target.exec(`
+      UPDATE promoted
+      SET id = 'memory-marker-source',
+          content = 'memory',
+          source_summary_id = 'summary-marker-source',
+          project_id = '${targetHash}',
+          session_id = 'marker-source'
+    `);
     target.close();
     const targetEvents = join(home, ".lcm", "events", `${targetHash}.db`);
     const sourceEvents = join(home, ".lcm", "events", `${sourceHash}.db`);
@@ -9022,13 +9032,19 @@ describe("worktree reconciliation", () => {
     ).run(sourceHash);
     events.close();
 
-    expect(reconcileWorktrees(main).status).toBe("completed");
+    const result = reconcileWorktrees(main);
+    expect(result.status).toBe("completed");
     const merged = new DatabaseSync(targetPath, { readOnly: true });
     expect(merged.prepare("SELECT COUNT(*) AS count FROM conversations").get())
       .toEqual({ count: 1 });
     expect(merged.prepare("SELECT hex(content) AS content FROM promoted").get())
-      .toEqual({ content: "6D656D6F727900746172676574" });
+      .toEqual({ content: "6D656D6F7279" });
     merged.close();
+    const backup = result.backupPaths.find((path) => path.includes("oldprojects"))!;
+    const evidence = new DatabaseSync(join(backup, "db.sqlite"), { readOnly: true });
+    expect(evidence.prepare("SELECT hex(content) AS content FROM promoted").get())
+      .toEqual({ content: "6D656D6F727900736F75726365" });
+    evidence.close();
   }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
 
   it("fails closed when a planned source disappears or its binding changes", () => {

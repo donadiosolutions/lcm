@@ -744,6 +744,21 @@ function assertSupportedPromotedContent(db: DatabaseSync): void {
   }
 }
 
+function hasCompletedMainSource(targetPath: string, sourceHash: string): boolean {
+  if (!isRegularFile(targetPath)) return false;
+  const target = new DatabaseSync(targetPath, { readOnly: true });
+  try {
+    return tableExists(target, "worktree_reconciliation_sources")
+      && row(
+        target,
+        "SELECT source_hash FROM worktree_reconciliation_sources WHERE source_hash = ?",
+        sourceHash,
+      ) !== undefined;
+  } finally {
+    target.close();
+  }
+}
+
 function assertNoRuntimeNativeTranscriptState(db: DatabaseSync): void {
   const nativeTables = db.prepare(
     "SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') AND lower(name) GLOB 'runtime_native_*'",
@@ -1408,11 +1423,13 @@ function mergeMainDatabase(
   afterSourceFenceCommit?: () => void,
 ): void {
   assertTarget();
+  const sourceWasMerged = hasCompletedMainSource(targetPath, sourceHash);
+  assertTarget();
   withSourceWriteFence(sourcePath, sourceHash, "project", busyTimeoutMs, (
     source,
     commitFence,
   ) => {
-    assertSupportedPromotedContent(source);
+    if (!sourceWasMerged) assertSupportedPromotedContent(source);
     commitFence();
     assertTarget();
     return withNormalizedMainSnapshot(
