@@ -1,108 +1,84 @@
 ---
 name: lcm-release
-description: "Use when the user says 'cut a release', 'release vX.Y.Z', 'publish a new version', or 'bump the version'. Covers the full release flow: version bump → PR to main → CI → merge → publish."
+description: Use when explicitly asked to cut or recover a manual LCM release. Not for ordinary version bumps or Changesets release-note/version PR work.
 ---
 
-# lcm-release
+# Manual LCM release
 
-Cut a versioned release of donadiosolutions/lcm. This is a **public npm package** — never delete or overwrite existing git tags.
+## Directives
 
-> **Note on release flow:** Changesets remains the normal release-note and version PR workflow. Use this script only when explicitly cutting or recovering a manual release.
+The helper ends at a **draft GitHub release, not npm publication**. Changesets
+remains the normal release-note/version PR flow. Read repository/local rules first;
+a maintainer reviews and publishes the draft manually. Only `release: published`
+publishes npm; a tag-triggered run must leave npm unpublished.
 
-## Normal flow — use the script
+Never delete, move or overwrite release tags. Signed annotated tags must identify
+the exact release PR merge commit, not a later main HEAD. Existing local/remote tag
+objects must match exactly and verify cryptographically; valid one-sided tags are
+recovered by fetching or pushing, not recreating them.
 
-Run `.agents/skills/lcm-release/scripts/release.sh` from the repo root:
+`package.json` is the version source; generated runtime/connector resources have no
+independent version. Version-only edits leave `pnpm-lock.yaml` unchanged and stage
+only `package.json` and `CHANGELOG.md`; the release changelog block must exist.
+Build/check with pnpm; npm retains packing (`npm pack --ignore-scripts`) and trusted
+publication. Stable releases update `latest` to the highest stable version; beta
+releases update `beta`. Changesets' internal channel label on the open version PR
+preserves manual beta/stable intent across main pushes until that PR merges/closes.
+
+## Preflight
+
+Require merged feature PRs, authenticated `gh`, an available signing key/agent and
+trusted local signature verification. Choose canonical `MAJOR.MINOR.PATCH` or
+`MAJOR.MINOR.PATCH-beta.N` above the corresponding npm dist-tag; other prereleases
+and build metadata are unsupported. The helper rejects stale/published versions
+before repository/tag mutation.
+
+Use the [verified pnpm bootstrap](../../../docs/development.md) and
+`pnpm install --frozen-lockfile`, not a global pnpm install. New unpublished tags
+must contain `pnpm-lock.yaml`, `.npmrc`, `pnpm-workspace.yaml`, integrity-pinned
+`packageManager` and bootstrap script. npm-only historical tags cannot be rebuilt;
+already-published versions use the publication workflow's verification-only recovery,
+not this helper's unpublished-version path.
+
+## Procedure
+
+Run at repository root:
 
 ```bash
-bash .agents/skills/lcm-release/scripts/release.sh <version>
-# e.g.
-bash .agents/skills/lcm-release/scripts/release.sh 0.4.2
 bash .agents/skills/lcm-release/scripts/release.sh 0.5.0-beta.0
+# Resume only after verifying earlier steps really completed:
+bash .agents/skills/lcm-release/scripts/release.sh 0.5.0-beta.0 --from-step 8
 ```
 
-**Resuming after a failure** — pass `--from-step N` to skip already-completed steps:
+| Step | Operation |
+| --- | --- |
+| 0 | Verify clean tracked state; check out main and fast-forward from origin |
+| 1 | Reject existing release tag or published npm version |
+| 2 | Create `release/v<version>` from main |
+| 3 | Update/verify package version and changelog |
+| 4 | Commit with signoff and push |
+| 5 | Open release PR targeting main |
+| 6 | Require successful CI; missing/unqueryable checks are not a pass |
+| 7 | Revalidate exact-head checks, merge with expected-head guard and `--merge`, then confirm `MERGED` |
+| 8 | Create/verify signed annotated tag at exact merge SHA, push if absent, verify successful tag-triggered draft creation and npm still unpublished |
 
-```bash
-bash .agents/skills/lcm-release/scripts/release.sh 0.4.2 --from-step 8  # create/verify tag and re-watch draft creation
-```
+`--from-step N` accepts 0–8. Resuming step 7 does not bypass admission. Step 8
+resolves the merged `release/v<version>` PR; do not assume it discovers arbitrary
+Changesets/version branch names. Review the resulting draft and publish manually.
 
-The script handles everything end-to-end:
+## Recovery
 
-| Step | What it does |
-|------|--------------|
-| 0 | Checkout main, pull, verify clean |
-| 1 | Guard: abort if tag or npm version already exists |
-| 2 | Create `release/vX.Y.Z` branch from main |
-| 3 | Bump the package version, add `CHANGELOG.md` entry, and verify it |
-| 4 | Commit and push |
-| 5 | Open PR targeting `main` |
-| 6 | Wait for CI (skips gracefully if no CI configured) |
-| 7 | Merge with `--merge` (preserves commit SHA on main) |
-| 8 | Create or verify the signed annotated stable or `beta.N` tag at the exact merge commit, push it if absent, wait for `publish.yml` to create the draft GitHub release, and verify npm is still unpublished |
+| Failure | Action |
+| --- | --- |
+| Version taken; conflicting target/object; lightweight/unsigned/misnamed tag | Stop and inspect; never overwrite public history; choose a higher version when taken |
+| Main diverged or merge SHA unreachable from origin/main | Preserve work and reconcile/verify selected release PR before retrying |
+| CI absent/failing, query failure or head drift | Resolve admission/evidence and resume step 6; do not skip to an unchecked merge |
+| `publish.yml` skipped or not successful | Inspect printed run URL, tag and draft before retrying step 8 |
+| Invalid `PUBLISH_MAX_WAIT` | Use integer seconds 0–9223372036854775807; default 900 bounds draft-run discovery |
+| Draft exists but npm already has the version | Stop and audit bypassed manual publication; do not retag |
+| Published release restored to draft | Fix failed/cancelled publication and manually publish the restored draft again; existing npm versions are verified without republishing |
+| Earlier failed public release blocks later release | Complete the earlier event successfully or withdraw it to draft before retrying |
+| Earlier failure for the same republished tag | Expected retry history; same-tag failure is ignored while native FIFO concurrency still serializes different release runs |
 
-After step 8 succeeds, review the draft on GitHub and publish it manually. The
-`release: published` workflow event is the only path that publishes the package
-to npm.
-
-## Prerequisites
-
-- Use the verified pnpm bootstrap described in [development guidance](../../../../docs/development.md) for development installs and commands. Install dependencies with `pnpm install --frozen-lockfile`; do not install pnpm globally.
-- New unpublished release tags must contain `pnpm-lock.yaml`, `.npmrc`, `pnpm-workspace.yaml`, the integrity-pinned `packageManager`, and the bootstrap script. npm-only historical tags cannot be rebuilt; already published versions retain verification-only recovery before pnpm prerequisites.
-
-- All feature PRs for this release are merged into `main`
-- `gh` CLI is authenticated
-- Git tag signing is configured with an available signing key and agent, and
-  local signed-tag verification succeeds with the trusted public key
-- You have either a canonical stable `MAJOR.MINOR.PATCH` or beta
-  `MAJOR.MINOR.PATCH-beta.N` version that is higher than the corresponding npm
-  dist-tag; alpha, RC, other prerelease identifiers, and build metadata are not
-  supported
-
-## Key invariants
-
-- **Never delete tags** on a public package — if a version is taken, pick a higher one
-- **Release tags are signed and annotated** and must resolve to the exact release PR merge commit
-- **Step 8 is idempotent** for a valid one-sided tag by pushing the local copy or fetching the remote copy; when both copies exist, their signed tag object and expected commit must match exactly
-- **Release PRs target `main`**
-- **Use `--merge`** (not squash) so the version bump SHA is preserved on main
-- **Version-only changes leave `pnpm-lock.yaml` unchanged**. Step 3 writes the validated version with Node; step 4 stages `package.json` and `CHANGELOG.md`.
-- **npm owns distribution**: builds and checks use `pnpm run`, while packing stays `npm pack --ignore-scripts` and trusted publishing stays npm.
-- **`package.json` is the package version source of truth**; generated runtime
-  and native connector resources carry no independent release version
-- **CHANGELOG.md must include the release version block** before `publish.yml` creates the draft
-- **The tag-triggered run never publishes npm**; it must leave an action-created
-  draft, and a maintainer must publish that draft to trigger npm
-- **npm dist-tags are channel-safe**: beta releases update `beta`; stable releases
-  update `latest`, which must remain the highest stable version
-- **Changesets channel intent lives on the open version PR**: manual beta or
-  stable runs apply one internal release-channel label that later main pushes
-  reuse until the PR merges or closes
-- **The helper checks npm channel ordering before mutation**: stale beta or
-  stable requests stop before pulling, branching, committing, or tagging
-- **GitHub publication is not transactional with npm**: GitHub briefly makes a
-  release public before the event workflow can restore a failed preflight or
-  last-moment guard to draft
-
-## Failure modes
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| Guard fails: tag exists | Version already tagged | Pick a higher version |
-| Guard fails: npm version exists | Already published | Pick a higher version |
-| Local or remote tag targets another commit | The version was already tagged from different history | Stop; never move or overwrite the tag, and choose a higher version if it is public |
-| Existing tag is lightweight, unsigned, or differs between local and origin | The tag does not satisfy the release-signing invariant | Stop and inspect it manually; never overwrite a public release tag |
-| Merge commit is not reachable from `origin/main` | The wrong PR/SHA was selected or main has not updated | Verify the merged release PR before retrying step 8 |
-| publish.yml conclusion is `skipped` | The tag-triggered draft job did not run | Inspect the tag and existing draft before retrying step 8 |
-| `PUBLISH_MAX_WAIT` is invalid | The override is not a non-negative integer number of seconds within Bash's signed arithmetic range | Set it to `0` or a positive whole number no greater than `9223372036854775807`; the default is `900` |
-| main diverged from origin/main | Local branch was manually changed or cherry-picked | Reconcile local `main` with `origin/main`, then rerun |
-| publish.yml conclusion is not `success` | Validation, tests, Highlights generation, or draft creation failed | Check the run URL printed by the script |
-| Draft exists but npm already has the version | Publication bypassed the required manual draft transition | Stop and audit the release; never move or overwrite the tag |
-| Published release returns to draft | Trusted preflight or the publish job failed or was cancelled | Fix the workflow failure, then publish the restored draft manually again; an existing npm version is detected and verified without republishing |
-| Earlier failed publication blocks a later release | The earlier release is still public and its run has not succeeded | Rerun the earlier event successfully, or withdraw its release to draft before retrying the later release |
-| Republished restored draft has an earlier failed run for the same tag | Expected retry history | The same-tag failure is ignored; native FIFO concurrency still prevents overlap with every other release run |
-
-## Scripts
-
-```
-.agents/skills/lcm-release/scripts/release.sh       ← full end-to-end, supports --from-step N
-```
+GitHub publication is not transactional with npm: the release may briefly be public
+before failed preflight or last-moment guards restore it to draft.

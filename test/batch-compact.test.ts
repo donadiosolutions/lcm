@@ -1,5 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -8,7 +18,11 @@ import { DaemonClient } from "../src/daemon/client.js";
 import { closeLcmConnection, getLcmConnection, getPoolStats } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { addProjectAlias, clearProjectMapCache, projectMapPath } from "../src/project-map.js";
-import { ensureProjectDir, projectPaths } from "../src/daemon/project.js";
+import {
+  ensureProjectDir,
+  MAX_PROJECT_METADATA_BYTES,
+  projectPaths,
+} from "../src/daemon/project.js";
 
 const FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS = 15_000;
 
@@ -60,6 +74,14 @@ function seedConversations(dbPath: string, ids: readonly number[] = [1, 2]): voi
   } finally {
     closeLcmConnection(dbPath);
   }
+}
+
+function sizedProjectMetadata(cwd: string, targetBytes: number): string {
+  const prefix = `{"cwd":${JSON.stringify(cwd)},"padding":"`;
+  const suffix = `"}`;
+  const paddingBytes = targetBytes - Buffer.byteLength(prefix + suffix, "utf8");
+  if (paddingBytes < 0) throw new Error("project metadata target is too small");
+  return `${prefix}${"x".repeat(paddingBytes)}${suffix}`;
 }
 
 describe("batch compaction discovery", () => {
@@ -309,6 +331,192 @@ describe("batch compaction discovery", () => {
     expect(log).not.toHaveBeenCalledWith("Nothing to compact — no sessions are currently eligible.");
   });
 
+  it("admits bounded metadata and rejects unsafe leaves before opening their databases", async () => {
+    const projectsDir = join(homedir(), ".lcm", "projects");
+    const addProject = (name: string, cwd: string, metadata: string, validDb = false): string => {
+      const projectDir = join(projectsDir, name);
+      mkdirSync(projectDir, { recursive: true });
+      const metaPath = join(projectDir, "meta.json");
+      writeFileSync(metaPath, metadata);
+      if (validDb) seedConversation(join(projectDir, "db.sqlite"));
+      else writeFileSync(join(projectDir, "db.sqlite"), "must not be opened");
+      return metaPath;
+    };
+
+    const trustedCwd = makeDir("compact-trusted-metadata");
+    addProject("trusted-metadata", trustedCwd, JSON.stringify({ cwd: trustedCwd }), true);
+    const exactCwd = makeDir("compact-exact-metadata");
+    const exactMetadata = sizedProjectMetadata(exactCwd, MAX_PROJECT_METADATA_BYTES);
+    expect(Buffer.byteLength(exactMetadata, "utf8")).toBe(MAX_PROJECT_METADATA_BYTES);
+    addProject("exact-metadata", exactCwd, exactMetadata, true);
+
+    const hardlinkCwd = "/hardlink-compact-canary";
+    const hardlinkMeta = addProject("hardlink-metadata", hardlinkCwd, JSON.stringify({ cwd: hardlinkCwd }));
+    linkSync(hardlinkMeta, join(tempHome!, "hardlink-meta-alias.json"));
+
+    const symlinkCwd = "/symlink-compact-canary";
+    const symlinkProject = join(projectsDir, "symlink-metadata");
+    mkdirSync(symlinkProject);
+    writeFileSync(join(symlinkProject, "db.sqlite"), "must not be opened");
+    const symlinkTarget = join(tempHome!, "symlink-meta-target.json");
+    writeFileSync(symlinkTarget, JSON.stringify({ cwd: symlinkCwd }));
+    symlinkSync(symlinkTarget, join(symlinkProject, "meta.json"));
+
+    const oversizedCwd = "/oversized-compact-canary";
+    const oversizedMetadata = sizedProjectMetadata(oversizedCwd, MAX_PROJECT_METADATA_BYTES + 1);
+    expect(Buffer.byteLength(oversizedMetadata, "utf8")).toBe(MAX_PROJECT_METADATA_BYTES + 1);
+    addProject("oversized-metadata", oversizedCwd, oversizedMetadata);
+
+    const directoryProject = join(projectsDir, "directory-metadata");
+    mkdirSync(join(directoryProject, "meta.json"), { recursive: true });
+    writeFileSync(join(directoryProject, "db.sqlite"), "must not be opened");
+
+    expect(findUncompacted(100, true).map(conversation => conversation.cwd).sort())
+      .toEqual([exactCwd, trustedCwd].sort());
+
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const progress: Array<Partial<ProgressState>> = [];
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: true,
+      port: 3737,
+      onProgress: patch => progress.push(patch),
+    });
+
+    expect(result).toMatchObject({ failures: 4 });
+    expect(progress[0]?.phaseErrors).toEqual(expect.arrayContaining([
+      { phase: "Compact", target: "hardlink-metadata", message: "project metadata is unreadable or malformed" },
+      { phase: "Compact", target: "symlink-metadata", message: "project metadata is unreadable or malformed" },
+      { phase: "Compact", target: "oversized-metadata", message: "project metadata is unreadable or malformed" },
+      { phase: "Compact", target: "directory-metadata", message: "project metadata is unreadable or malformed" },
+    ]));
+    expect(JSON.stringify(progress)).not.toMatch(/compact-canary/u);
+  });
+
+  it("reports unsafe metadata through the existing cwd-filter failure path", async () => {
+    const cwd = makeDir("compact-filtered-unsafe-metadata");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    linkSync(paths.metaPath, join(tempHome!, "filtered-meta-alias.json"));
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: true,
+      port: 3737,
+      cwd,
+      onProgress: patch => progress.push(patch),
+    })).toMatchObject({ failures: 1 });
+    expect(progress[0]?.phaseErrors).toEqual([
+      { phase: "Compact", target: paths.id, message: "project metadata is unreadable or malformed" },
+    ]);
+  });
+
+  it("rejects FIFO metadata without blocking compaction discovery", async () => {
+    const projectDir = join(homedir(), ".lcm", "projects", "fifo-metadata");
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, "db.sqlite"), "must not be opened");
+    const metaPath = join(projectDir, "meta.json");
+    execFileSync("mkfifo", ["-m", "600", metaPath]);
+    const writer = spawn(process.execPath, ["-e", `
+      setTimeout(() => {
+        const fs = require("node:fs");
+        try {
+          const fd = fs.openSync(process.argv[1], fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+          fs.writeSync(fd, JSON.stringify({ cwd: "/fifo-compact-canary" }));
+          fs.closeSync(fd);
+        } catch {}
+      }, 1500);
+    `, metaPath], { stdio: "ignore", env: {} });
+    const exited = once(writer, "exit");
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    try {
+      const started = performance.now();
+      const result = await batchCompact({
+        minTokens: 100,
+        dryRun: true,
+        port: 3737,
+        onProgress: patch => progress.push(patch),
+      });
+      expect(performance.now() - started).toBeLessThan(1000);
+      expect(result).toMatchObject({ failures: 1 });
+      expect(progress[0]?.phaseErrors).toEqual([{
+        phase: "Compact",
+        target: "fifo-metadata",
+        message: "project metadata is unreadable or malformed",
+      }]);
+    } finally {
+      writer.kill("SIGKILL");
+      await exited;
+    }
+  });
+
+  it("enforces metadata ownership and supports platforms without getuid", async () => {
+    const cwd = makeDir("compact-uid-metadata");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+
+    try {
+      vi.resetModules();
+      vi.doMock("node:fs", async (importOriginal) => {
+        const actual = await importOriginal<typeof import("node:fs")>();
+        const metadataIdentity = actual.statSync(paths.metaPath);
+        const isMetadataIdentity = (stat: { dev: bigint | number; ino: bigint | number }): boolean =>
+          String(stat.dev) === String(metadataIdentity.dev)
+          && String(stat.ino) === String(metadataIdentity.ino);
+        const withForeignUid = <T extends { uid: bigint | number }>(stat: T): T => new Proxy(stat, {
+          get(target, property, receiver) {
+            if (property === "uid") {
+              return typeof target.uid === "bigint"
+                ? target.uid + 1n
+                : target.uid + 1;
+            }
+            return Reflect.get(target, property, receiver);
+          },
+        });
+        return {
+          ...actual,
+          fstatSync: (fd: number, options?: unknown) => {
+            const stat = actual.fstatSync(fd, options as never);
+            return isMetadataIdentity(stat) ? withForeignUid(stat) : stat;
+          },
+          statSync: (path: Parameters<typeof actual.statSync>[0], options?: unknown) => {
+            const stat = actual.statSync(path, options as never);
+            return path === paths.metaPath && isMetadataIdentity(stat) ? withForeignUid(stat) : stat;
+          },
+        };
+      });
+      const isolated = await import("../src/batch-compact.js");
+      expect(isolated.findUncompacted(100, true)).toEqual([]);
+
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+      const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+      Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+      try {
+        expect(findUncompacted(100, true)).toEqual([
+          expect.objectContaining({ cwd: paths.canonical }),
+        ]);
+      } finally {
+        if (descriptor) Object.defineProperty(process, "getuid", descriptor);
+        else delete (process as { getuid?: unknown }).getuid;
+      }
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
   it("reports mapped metadata failures for a cwd-filtered scan", async () => {
     const cwd = makeDir("compact-filtered-missing-metadata");
     const paths = projectPaths(cwd);
@@ -497,6 +705,33 @@ describe("batch compaction discovery", () => {
     });
 
     expect(onTransportFailure).toHaveBeenCalledWith(transportError);
+  });
+
+  it("preserves a safe upstream failure message in batch output and progress", async () => {
+    const cwd = makeDir("compact-upstream-failure");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    const safeMessage = "Codex compaction upstream request failed. Retry later or choose another available model.";
+    vi.spyOn(DaemonClient.prototype, "post").mockRejectedValue(new Error(safeMessage));
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Partial<ProgressState>> = [];
+
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      onProgress: patch => progress.push(patch),
+    });
+
+    expect(result.failures).toBe(1);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(`FAILED (${safeMessage})`));
+    expect(progress.find(patch => patch.errors)?.errors).toEqual([
+      { sessionId: "session-1", message: safeMessage },
+    ]);
   });
 
   it("reports daemon no-ops as unchanged and excludes them from promotion projects", async () => {

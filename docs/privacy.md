@@ -120,9 +120,12 @@ prompt-cache key. The payload explicitly uses `tools: []`,
 `tool_choice: "none"`, `parallel_tool_calls: false`, `store: false`, and
 `stream: true` in the standard Responses dialect. Responses Lite instead uses
 an explicit empty `additional_tools` inventory and omits top-level `tools`.
-Both dialects discard inherited prompt/input/tools state; `include` and
-`stream_options` are omitted. Managed authentication is forwarded only through
-an explicit header allowlist, and a configured Codex `openai_base_url` is
+For the exact `gpt-5.3-codex-spark` model, the gateway removes the Lite marker
+and always emits the standard payload with top-level `tools: []`; it retains
+only a validated reasoning `effort`. Other models preserve Codex's selected
+dialect. Both dialects discard inherited prompt/input/tools state; `include`
+and `stream_options` are omitted. Managed authentication is forwarded only
+through an explicit header allowlist, and a configured Codex `openai_base_url` is
 authoritative for both bearer classes. When that value is absent or `null`,
 `sk-`-prefixed bearer credentials use the public OpenAI route while other
 managed bearers use the ChatGPT route, even when account ID is absent. A
@@ -135,6 +138,13 @@ raw request bodies, prompts, or upstream response bodies. If authentication,
 request shape, routing, streaming, or gateway shutdown is ambiguous, the
 compaction fails closed. The selected provider's retention policy still
 applies to the minimized request sent outside the machine.
+
+For an upstream HTTP 400, the gateway may inspect at most 64 KiB of response
+body to recognize one exact structured Spark protocol rejection. It does not
+render, log, persist, or relay those bytes. Malformed, oversized, interrupted,
+or unknown responses receive a fixed generic upstream category, and the body
+stream is canceled. Other upstream status bodies are not parsed for protocol
+classification.
 
 The daemon's PostgreSQL project routes store scrubbed messages, summaries,
 promoted memories, and related repository data only after local validation and
@@ -343,9 +353,15 @@ The `Security` section of the doctor output shows:
   state: a nested non-file URL remains intact, while standalone POSIX, Windows,
   and UNC paths retain redaction. The first backslash-based path also remains
   redacted across forward slashes and file-authority punctuation (semicolons,
-  commas, apostrophes, closing parentheses, and closing braces). Whitespace, a
-  freshly recognized URL, or other URL-ending punctuation ends that context. A
-  recognizable nested exact `file://` path is also redacted. An exact
+  commas, apostrophes, closing parentheses, and closing braces). Brackets in
+  this restarted tail are tracked independently. A slash inside a still-open
+  bracket is conservatively treated as a path marker even when it follows a
+  word character, and a matched closing bracket keeps the context active so a
+  later backslash-based path is also redacted. Once the brackets are balanced,
+  ordinary word-adjacent slash text remains unchanged. Whitespace, an unmatched
+  closing bracket, a freshly recognized URL, or other URL-ending punctuation
+  ends the context and clears its bracket state. A recognizable nested exact
+  `file://` path is also redacted. An exact
   case-insensitive `file://` literal immediately after `?`, `#`, `&`, or `=`
   inside any URL starts a nested file URL. Once an outer URL has entered its
   query or fragment, the same literal also starts a nested file URL after any

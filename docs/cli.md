@@ -349,6 +349,14 @@ include committed data in the live WAL; SQLite may create necessary `-wal` or
 checkpointing, journal-mode changes, repair, or sidecar deletion. If a safe
 read requires durable content changes, the diagnostic reports `unavailable`.
 
+For aggregate SQLite diagnostics, `Projects` counts only initialized project
+databases that exist and pass admission at the time of observation. Admitted
+project directories without a `db.sqlite` file, including metadata-only
+registrations, remain unchanged and are omitted from aggregate numeric totals.
+If every admitted project directory is uninitialized, the aggregate can be
+healthy with `Projects: 0`; this does not establish the health of the skipped
+registrations. Selecting an uninitialized project remains unavailable.
+
 The SQLite pathname API still leaves a narrow same-account swap-and-restore
 race between identity checks. Authentication checks surround opening and
 reading, but do not provide isolation from another process with the same
@@ -411,6 +419,14 @@ These failures produce a nonzero exit status and are not reported as “Nothing 
 compact.” A failed scan does not mark any session as processed. Back up the
 reported project database, resolve the SQLite or schema error, and rerun the
 command; the still-eligible sessions will be discovered again.
+
+Before opening a project database, `lcm compact --all` accepts `meta.json` only
+as an owner-local, single-link regular file of at most 1 MiB. Unsafe or malformed
+metadata is reported as `project metadata is unreadable or malformed`; missing
+metadata retains its separate missing-file message. A concurrent atomic
+publication can briefly fail the single-link or descriptor checks, so retry
+after that activity settles. Persistent failures require restoring trusted
+project metadata; the command does not weaken admission or repair the file.
 
 ### Managed-daemon recovery
 

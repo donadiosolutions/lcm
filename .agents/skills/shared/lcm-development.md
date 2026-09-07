@@ -1,88 +1,79 @@
-# LCM integration for development callers
+# LCM development integration
 
-Read this from the triage or Epic caller before preflight. It is repository policy
-supplied to the portable workflow, not a separate campaign.
+Triage/Epic callers supply this repository policy to the shared workflow; it is
+not a separate run.
 
-## Repository admission and ownership
+## Directives
 
-Read [AGENTS.md](../../../AGENTS.md), [WORKFLOW.md](../../../WORKFLOW.md) and
-applicable `AGENTS.local.md`. For a non-primary local worktree, find the primary
-with `git worktree list --porcelain` and read its local instructions. Use the
-available `lcm-memory` skill for project context. Never copy/commit local rules.
+Read [AGENTS.md](../../../AGENTS.md), [WORKFLOW.md](../../../WORKFLOW.md), applicable
+`AGENTS.local.md` and available `lcm-memory` context. In linked worktrees, locate
+the primary with `git worktree list --porcelain` and read its local rules too.
+Never copy or commit local instructions.
 
-The root executes pushes, PR creation and merge commits only (no squash or rebase
-merge); owners supply evidence
-and remain responsible through verified source resolution. Preserve signed commits
-when required, DCO signoff, PR template/assignment, relevant local tests, required
-exact-head CI with full 100% coverage, review-thread handling, docs and Changesets.
-Maintain Codecov ownership atomically when production classification changes.
-Do not bypass admission, force-push without authorization or weaken gates.
+The root owns pushes, PR creation and merge commits; no squash/rebase merges.
+Owners retain responsibility through verified source resolution. Preserve required
+signatures, DCO, PR template/assignment, relevant local tests, exact-head required
+CI with full 100% coverage, review-thread rules, docs and Changesets. Update Codecov
+ownership atomically when production classification changes. Never bypass admission,
+weaken gates or force-push without authorization.
 
-Before any global mutation, establish the root as Environment Coordinator. If
-another coordinator owns that responsibility, arrange explicit handoff; its
-responsibility and a run-record entry are not proof of lock ownership. No owner,
-implementer, reviewer, triage worker or duplicate adjudicator may install LCM
-globally, mutate the main daemon or acquire its lock on the root's behalf.
+Only the root acting as Environment Coordinator may replace the global installation,
+mutate/recover the main daemon or acquire its lock. Arrange explicit handoff from
+an existing coordinator; titles and recorded responsibility are not lock ownership.
+No owner, implementer, reviewer, triage worker or adjudicator acts on its behalf.
 
-## Mutex and operation lifetime
+## Exclusive resource and lifetime
 
-Use the repository [flock skill](../flock/SKILL.md) to acquire **and release**
-`lcm-daemon-update`. The exact resource is shared across cooperating tasks on
-this host, including both callers. It is the only workflow mutex: do not add
-file, worktree, test, database, review, publication or merge reservations.
-Use worker-local fixtures and keep LCM internal correctness locks intact.
+The only workflow mutex is **`lcm-daemon-update`**, shared across runs on this host.
+Use the [flock skill](../flock/SKILL.md), including canonical identity and a common
+host runtime directory. Do not use worker fixture XDG roots for this mutex. No file,
+worktree, test, database, review, publication or merge reservations; worker-local
+fixtures and application-internal correctness locks remain in use.
 
-Follow flock's identity/runtime-directory rules. In a dedicated shell at the
-repository root, source its helper and acquire before global install, daemon
-mutation or recovery. Retain the same shell/descriptor through the full installation,
-connector, test and health workflow. A completed one-shot acquisition protects no
-later call. The current helper reserves descriptor 9; release with `exec 9>&-`
-or shell exit on completion/abort. Close it in children that must outlive the
-operation, including a directly launched daemon. Hold no lock while idle or
-waiting on unrelated workers/CI.
+Acquire in a dedicated live shell before global installation, daemon mutation or
+recovery; retain descriptor 9 through artifact, connector, tests and health checks.
+Release with `exec 9>&-` or shell exit on completion/abort. Close the descriptor in
+long-lived children, including a directly launched daemon. One-shot acquisition
+protects no later call; never hold ownership while waiting on unrelated work/CI.
 
-Status 75 means contention: report observed metadata, defer only the LCM update,
-continue unrelated work. Retry after release/handoff, without stealing, deleting
-or replacing a lockfile or killing its holder. Other acquisition failures also
-prohibit mutation. Handoff requires old holder release and new root acquisition.
-On lost shell/resume, reacquire and reconcile installed state before mutation.
-Read-only health checks need no lock; repairs do.
+Status 75 defers only the update: report observed metadata and continue unrelated
+work. Other acquisition failures also prohibit mutation. Never steal/delete/replace
+locks or kill holders. Handoff requires old release and new acquisition. After shell
+loss/resume, reacquire and reconcile installed state. Read-only health checks need
+no lock; repairs do.
 
-## Operations supplied to procedural-development
+## Environment procedure
 
-| Trigger | LCM operation |
+| Trigger | Required operation |
 | --- | --- |
-| Startup | Verify main daemon health; preserve evidence and acquire before necessary recovery |
-| Observed default-branch advance / post-merge convergence | Refresh exact installed artifact and verify health under mutex |
-| Watchdog | Read-only daemon health; report failures, authorized recovery under mutex |
-| Final audit | Prove installed revision matches current observed default branch, complete artifact/test/connector evidence and healthy daemon |
+| Startup | Verify main daemon health; preserve failure evidence and acquire before recovery |
+| Observed default-branch advance/post-merge | Refresh exact installed artifact and verify under mutex |
+| Watchdog | Read-only health check; report failures and perform authorized locked recovery |
+| Final audit | Prove installed revision matches current observed default branch, with complete artifact/test/connector evidence and healthy daemon |
 
-Also verify health immediately before/after replacement and when evidence suggests
-failure. The root owns recovery without editing owner worktrees.
+Check health before/after replacement and whenever evidence suggests failure.
+The root owns recovery, not edits to owner worktrees.
 
-On target advance, record pending merge events, acquire, then **re-read** current
-default-branch SHA. Verify the batch's ancestry and install that exact version using
-the prescribed [artifact workflow](../../../AGENTS.md#local-environment-stability)
-and [verified toolchain](../../../docs/development.md). Use the primary worktree
-without disturbing unrelated changes; fast-forward clean main. Install the packed
-independent artifact, never a global link. Verify installed identity/contents against
-that tarball, installation, `lcm doctor` (zero failures), required tests and only
-the active agent's native connector install/doctor.
+For target advancement, record pending merges, acquire, then re-read current
+default-branch SHA and verify the batch's ancestry. Use the primary worktree,
+preserving unrelated changes and fast-forwarding clean main. Follow the exact
+[artifact procedure](../../../AGENTS.md#local-environment-stability) and
+[verified toolchain](../../../docs/development.md): build, pack and install an
+independent tarball, never a global link. Verify installed identity/contents against
+that artifact, installation, `lcm doctor` with zero failures, required tests and
+only the active runtime's native connector install/doctor.
 
-Record installed SHA, artifact identity and health/test evidence before release.
-Coalesce observed merges to newest current target, not obsolete intermediates.
-If more arrive during refresh, retain them and converge afterward; do not mark
-later merges installed from older evidence. Pending refresh or failed required
-verification blocks final environment audit, not unrelated coding, review or
-otherwise ready PR operations.
+Record installed SHA, artifact identity and test/health evidence before releasing.
+Coalesce to the newest observed target; retain arrivals during refresh and converge
+afterward. Older artifact evidence cannot certify later merges. Pending refresh or
+failed verification blocks final environment audit, not unrelated work or ready PRs.
 
-Preserve original failed environment logs; file discovered Bugs outside run scope
-under repository policy. A reduced-concurrency retry may diagnose contention but
-cannot prove the original failure fixed. Lost watchers require process/log/exit
-reconciliation. Do not change assertions, timeouts, skips or gates to obtain a pass.
+Preserve original failure logs and file discovered Bugs outside run scope under
+repository policy. Reduced-concurrency retries diagnose contention, not prove the
+original failure fixed. Reconcile lost watchers through process/log/exit evidence;
+do not weaken assertions, timeouts, skips or gates.
 
-LCM authority does not authorize restarting/reconfiguring the user's model proxy,
-Codex app-server or desktop connector infrastructure. Diagnose the actual boundary,
-report broader repairs, preserve candidates and continue unrelated work. Shared
-routing uses local/runtime evidence; service-tier control remains best-effort,
-never an LCM readiness requirement.
+LCM authority does not authorize model-proxy, runtime app-server or desktop connector
+reconfiguration. Diagnose and report that boundary, preserve candidates and continue
+unrelated work. Route evidence is local/runtime-specific; tier control is best-effort,
+never an LCM readiness gate.

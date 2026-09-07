@@ -339,21 +339,33 @@ else
 fi
 
 # ─── STEP 6: Wait for CI ─────────────────────────────────────────────────────
+CHECKED_HEAD=""
+verify_release_checks() {
+  local current_head required_pass
+  current_head=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid') ||
+    err "Could not read PR #$PR_NUMBER head; refusing an unchecked merge."
+  [[ "$current_head" =~ ^[0-9a-fA-F]{40}$ ]] ||
+    err "Invalid PR head SHA: $current_head"
+  [[ -z "$CHECKED_HEAD" || "$current_head" == "$CHECKED_HEAD" ]] ||
+    err "PR head changed after CI verification. Inspect the new candidate and resume from step 6."
+  CHECKED_HEAD=$current_head
+  gh pr checks "$PR_NUMBER" --repo "$REPO" --watch ||
+    err "CI is absent or did not pass. Resolve admission and resume from step 6."
+  required_pass=$(gh pr checks "$PR_NUMBER" --repo "$REPO" --required --json bucket \
+    --jq 'length > 0 and all(.[]; .bucket == "pass")') ||
+    err "Could not verify required checks; refusing an unchecked merge."
+  [[ "$required_pass" == true ]] ||
+    err "Required checks must be present and successful; skipping is not success."
+  current_head=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid') ||
+    err "Could not recheck PR head after CI."
+  [[ "$current_head" == "$CHECKED_HEAD" ]] ||
+    err "PR head changed while checking CI. Inspect the new candidate and resume from step 6."
+}
+
 if run_step 6; then
   step "Step 6 — Wait for CI"
-  if gh pr checks "$PR_NUMBER" --repo "$REPO" --watch; then
-    ok "CI green."
-  else
-    if CHECK_COUNT=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json statusCheckRollup --jq '.statusCheckRollup | length' 2>/dev/null); then
-      if [[ "$CHECK_COUNT" -eq 0 ]]; then
-        echo "  (No CI checks configured — skipping.)"
-      else
-        err "CI checks did not pass ($CHECK_COUNT configured). Inspect the PR and rerun with --from-step 6 when resolved."
-      fi
-    else
-      err "Failed to query CI checks for PR #$PR_NUMBER. Verify GitHub CLI auth/network and rerun with --from-step 6 when resolved."
-    fi
-  fi
+  verify_release_checks
+  ok "Required CI verified for $CHECKED_HEAD."
 else
   step "Step 6 — Wait for CI"; skip
 fi
@@ -361,7 +373,11 @@ fi
 # ─── STEP 7: Merge release PR ────────────────────────────────────────────────
 if run_step 7; then
   step "Step 7 — Merge release PR #$PR_NUMBER"
-  gh pr merge "$PR_NUMBER" --repo "$REPO" --merge --delete-branch
+  # Resume must not bypass admission; pin the server-side merge to the checked head.
+  verify_release_checks
+  gh pr merge "$PR_NUMBER" --repo "$REPO" --merge --delete-branch --match-head-commit "$CHECKED_HEAD"
+  PR_STATE=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state --jq '.state')
+  [[ "$PR_STATE" == MERGED ]] || err "PR #$PR_NUMBER is not MERGED; refusing to tag."
   MERGE_SHA=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeCommit --jq '.mergeCommit.oid')
   [[ -z "$MERGE_SHA" || "$MERGE_SHA" == "null" ]] && \
     err "Could not determine merge commit SHA for PR #$PR_NUMBER. Check https://github.com/$REPO/pull/$PR_NUMBER."

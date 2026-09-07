@@ -2,11 +2,13 @@ import { DatabaseSync } from "node:sqlite";
 import {
   chmodSync,
   readFileSync,
+  readdirSync,
   statSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -83,6 +85,17 @@ function seedProject(projectsDir: string, projectId: string): void {
   } finally {
     database.close();
   }
+}
+
+function seedMetadataOnlyProject(
+  projectsDir: string,
+  projectId: string,
+): { projectDir: string; metadataPath: string; metadata: Buffer } {
+  const projectDir = privateDirectory(projectsDir, projectId);
+  const metadataPath = join(projectDir, "meta.json");
+  const metadata = Buffer.from(`${JSON.stringify({ cwd: `/private/${projectId}` })}\n`);
+  writeFileSync(metadataPath, metadata, { mode: 0o600 });
+  return { projectDir, metadataPath, metadata };
 }
 
 function seedLegacyProject(projectsDir: string, projectId: string): string {
@@ -195,7 +208,7 @@ describe("stats database admission", () => {
     })).toThrow();
   });
 
-  it("returns an empty aggregate without creating missing projects or database entries", async () => {
+  it("rejects an absent projects directory without creating it", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "lcm-stats-security-"));
     tempDirs.push(scratch);
     chmodSync(scratch, 0o700);
@@ -203,10 +216,61 @@ describe("stats database admission", () => {
     fixture.projectsDir = join(stateRoot, "projects");
 
     await expect(collectStats()).rejects.toMatchObject({ name: "StatsUnavailableError" });
+    expect(() => statSync(fixture.projectsDir)).toThrow();
+  });
 
-    const projectsDir = privateDirectory(stateRoot, "projects");
+  it("returns an empty aggregate for metadata-only projects without materializing databases", async () => {
+    const { projectsDir } = makeFixture();
+    const registrations = [
+      seedMetadataOnlyProject(projectsDir, "metadata-one"),
+      seedMetadataOnlyProject(projectsDir, "metadata-two"),
+    ];
+
+    await expect(collectStats()).resolves.toMatchObject({
+      projects: 0,
+      conversations: 0,
+      messages: 0,
+      backendDiagnostics: { classification: "healthy" },
+    });
+
+    for (const { projectDir, metadataPath, metadata } of registrations) {
+      expect(readFileSync(metadataPath)).toEqual(metadata);
+      expect(readdirSync(projectDir)).toEqual(["meta.json"]);
+      expect(() => statSync(join(projectDir, "db.sqlite"))).toThrow();
+    }
+  });
+
+  it("aggregates initialized projects while preserving metadata-only registrations", async () => {
+    const { projectsDir } = makeFixture();
+    seedProject(projectsDir, "initialized");
+    const registration = seedMetadataOnlyProject(projectsDir, "metadata-only");
+
+    await expect(collectStats()).resolves.toMatchObject({
+      projects: 1,
+      conversations: 1,
+      messages: 1,
+      backendDiagnostics: { classification: "healthy" },
+    });
+    expect(readFileSync(registration.metadataPath)).toEqual(registration.metadata);
+    expect(readdirSync(registration.projectDir)).toEqual(["meta.json"]);
+  });
+
+  it("reports a selected metadata-only registration as unavailable", async () => {
+    const { projectsDir } = makeFixture();
+    const registration = seedMetadataOnlyProject(projectsDir, "metadata-only");
+
+    await expect(collectStats({ projectId: "metadata-only" })).rejects.toMatchObject({
+      name: "StatsUnavailableError",
+    });
+    expect(readFileSync(registration.metadataPath)).toEqual(registration.metadata);
+    expect(readdirSync(registration.projectDir)).toEqual(["meta.json"]);
+    expect(() => statSync(join(registration.projectDir, "db.sqlite"))).toThrow();
+  });
+
+  it("returns an empty aggregate without creating a missing database", async () => {
+    const { projectsDir } = makeFixture();
     const projectDir = privateDirectory(projectsDir, "missing-db");
-    await expect(collectStats()).rejects.toMatchObject({ name: "StatsUnavailableError" });
+    await expect(collectStats()).resolves.toMatchObject({ projects: 0, messages: 0 });
     expect(() => new DatabaseSync(join(projectDir, "db.sqlite"), { readOnly: true })).toThrow();
   });
 
