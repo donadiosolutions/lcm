@@ -4,6 +4,13 @@ import {
   normalizeGitleaksRegex,
   ScrubEngine,
 } from "../src/scrub.js";
+import { GITLEAKS_PATTERNS } from "../src/generated-patterns.js";
+
+function compiledGitleaksRule(id: string): RegExp {
+  const pattern = GITLEAKS_PATTERNS.find((candidate) => candidate.id === id);
+  expect(pattern, `missing generated Gitleaks rule ${id}`).toBeDefined();
+  return new RegExp(pattern!.regex, pattern!.flags);
+}
 
 describe("ScrubEngine — built-in patterns", () => {
   const engine = new ScrubEngine([], []);
@@ -141,6 +148,71 @@ describe("Gitleaks RE2 normalization", () => {
       expect(engine.scrub(`postgres://user:${"p".repeat(20_000)}`)).toContain("postgres://");
     },
   );
+});
+
+describe("hostname-scoped Gitleaks rules", () => {
+  const sidekiqCredential = ["deadbeef", "cafebabe"].join(":");
+  const slackTail = ["A".repeat(21), "B".repeat(22)].join("");
+
+  it("matches both Sidekiq hosts at every supported URL boundary", () => {
+    const rule = compiledGitleaksRule("sidekiq-sensitive-url");
+    const hosts = ["gems.contribsys.com", "enterprise.contribsys.com"];
+    const boundaries = ["", "/", ":443", "?queue=critical", "#workers"];
+
+    for (const host of hosts) {
+      for (const boundary of boundaries) {
+        expect(
+          rule.test(`https://${sidekiqCredential}@${host}${boundary}`),
+          `${host}${boundary}`,
+        ).toBe(true);
+      }
+    }
+    expect(
+      rule.test(`HTTPS://${sidekiqCredential.toUpperCase()}@GEMS.CONTRIBSYS.COM/`),
+    ).toBe(true);
+  });
+
+  it("rejects wildcard substitutions for Sidekiq hostnames", () => {
+    const rule = compiledGitleaksRule("sidekiq-sensitive-url");
+    const lookalikes = [
+      "gemsxcontribsyszcom",
+      "enterprisexcontribsyszcom",
+      "gems-contribsys-com",
+    ];
+
+    for (const host of lookalikes) {
+      expect(rule.test(`https://${sidekiqCredential}@${host}/`), host).toBe(false);
+    }
+  });
+
+  it("matches all supported Slack webhook path prefixes", () => {
+    const rule = compiledGitleaksRule("slack-webhook-url");
+    for (const prefix of ["services", "workflows", "triggers"]) {
+      const webhook = ["https://hooks.slack.com", prefix, slackTail].join("/");
+      expect(rule.test(webhook), prefix).toBe(true);
+    }
+  });
+
+  it("rejects wildcard substitutions for the Slack webhook host", () => {
+    const rule = compiledGitleaksRule("slack-webhook-url");
+    const lookalikes = [
+      "hooksxslackycom",
+      "hooks-slack-com",
+      "hooks_slack_com",
+    ];
+
+    for (const host of lookalikes) {
+      const webhook = [`https://${host}`, "services", slackTail].join("/");
+      expect(rule.test(webhook), host).toBe(false);
+    }
+  });
+
+  it("preserves the source rules' case flags", () => {
+    expect(GITLEAKS_PATTERNS.find(({ id }) => id === "sidekiq-sensitive-url")?.flags)
+      .toBe("i");
+    expect(GITLEAKS_PATTERNS.find(({ id }) => id === "slack-webhook-url")?.flags)
+      .toBe("");
+  });
 });
 
 describe("ScrubEngine — custom patterns", () => {

@@ -123,6 +123,34 @@ function convertGoRegex(goRegex: string): { regex: string; flags: string } {
   return { regex: jsRegex, flags };
 }
 
+// Pinned gitleaks revision 4c232b5014f7618360bd992b4c489cb055881c6b
+// spells these service hostnames with wildcard dots. Keep the correction in
+// the generator so weekly regeneration preserves the fixes for CodeQL alerts
+// 190, 191, and 192. replaceAll is also a no-op if upstream restores escapes.
+const HOST_LITERALS_BY_RULE: Readonly<Record<string, readonly string[]>> = {
+  "sidekiq-sensitive-url": [
+    "gems.contribsys.com",
+    "enterprise.contribsys.com",
+  ],
+  "slack-webhook-url": ["hooks.slack.com"],
+};
+
+export function normalizeGitleaksHostnameLiterals(
+  ruleId: string,
+  regex: string,
+): string {
+  const hostnames = HOST_LITERALS_BY_RULE[ruleId];
+  if (!hostnames) return regex;
+
+  return hostnames.reduce(
+    (normalized, hostname) => normalized.replaceAll(
+      hostname,
+      hostname.replaceAll(".", "\\."),
+    ),
+    regex,
+  );
+}
+
 // ─── Smoke Tests ──────────────────────────────────────────────────────────────
 
 const COMMON_ENGLISH_WORDS = [
@@ -177,7 +205,8 @@ async function main(): Promise<void> {
   const skipped: Array<{ id: string; reason: string }> = [];
 
   for (const rule of rawRules) {
-    const { regex, flags } = convertGoRegex(rule.regex);
+    const { regex: convertedRegex, flags } = convertGoRegex(rule.regex);
+    const regex = normalizeGitleaksHostnameLiterals(rule.id, convertedRegex);
 
     // Test compilability
     let compiled: RegExp;
