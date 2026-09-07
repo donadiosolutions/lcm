@@ -255,6 +255,33 @@ describe("promote metadata files", () => {
     expect(readFileSync(metadataPath, "utf8")).toBe(winner);
   });
 
+  it("reports post-link cleanup failure and retains the complete destination", async () => {
+    const admittedDir = tempDirs[0]!;
+    const metadataPath = join(admittedDir, "meta.json");
+    const cleanupFailure = Object.assign(new Error("cleanup denied"), { code: "EACCES" });
+    mocks.metadataWriteOperations.mockReturnValue({
+      remove: () => { throw cleanupFailure; },
+    });
+
+    await createPromoteHandler(config, makeMockStorageFactory({
+      projectExists: mocks.projectExists,
+      openProject: mocks.openProject,
+      close: mocks.closeFactory,
+    }))({} as never, response, JSON.stringify({ cwd: "/integration/project" }));
+
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "private file link completed, but published file topology is not trusted",
+    });
+    expect(JSON.parse(readFileSync(metadataPath, "utf8"))).toMatchObject({
+      cwd: "/integration/project",
+      lastPromote: expect.any(String),
+    });
+    expect(lstatSync(metadataPath).nlink).toBe(2);
+    expect(readdirSync(admittedDir).filter(
+      name => /^\.meta\.json\..+\.tmp$/u.test(name),
+    )).toHaveLength(1);
+  });
+
   it.each(["root", "projects"] as const)(
     "refuses a preexisting %s symlink instead of publishing through it",
     async (component) => {

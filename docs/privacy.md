@@ -49,17 +49,39 @@ With the default SQLite backend, all storage is on your machine:
   closed. Promotion database work and a metadata update completed before a
   post-publication failure are not rolled back. The guarantee begins when the
   metadata phase acquires this chain, so an independently valid private
-  hierarchy substituted before that phase can be admitted. Pathname operations
-  inside the atomic writer also leave a bounded race where a replacement can
-  receive a write before the postcondition reports failure. These checks do not
-  claim detection of every transient replacement. When `meta.json` is missing,
-  promotion creates it only if the retained project directory still has no
-  destination entry at publication. A restored file or concurrent creation is
-  refused with the existing topology error and is not overwritten. This
-  portable create briefly links the complete private file at both its temporary
-  and final names; a concurrent bounded reader can fail closed during that
-  interval. The earlier missing-file observation is not proof of historical
-  absence and does not provide descriptor-relative pathname mutation.
+  hierarchy substituted before that phase can be admitted. When promotion
+  retains the metadata parent, the atomic writer reasserts that parent after
+  creating its temporary file, before writing content, and again immediately
+  before rename or exclusive link. It also requires the temporary pathname to
+  still identify the regular file it created. Observed drift at either point
+  refuses publication. These checks are bounded observations rather than an
+  atomic pin on the parent pathname: they do not detect every transient
+  replacement or prevent a change during publication. If rename or link returns
+  and the following parent check fails, the error outcome is `published`; this
+  means the operation completed, not that it reached the retained directory. If
+  rename or a non-collision link attempt throws and the parent check also fails,
+  the outcome is `unknown`. Either outcome means bytes may have been published
+  and must not authorize automatic rollback or retry.
+
+  When `meta.json` is missing, promotion creates it only if the retained project
+  directory still has no destination entry at publication. A restored file or
+  concurrent creation is refused with the existing topology error and is not
+  overwritten. This portable create briefly links the complete private file at
+  both its temporary and final names; a concurrent bounded reader can fail
+  closed during that interval. The earlier missing-file observation is not
+  proof of historical absence. Calls without a retained parent and the bounded
+  pathname windows described above remain outside the guarantee; these checks
+  do not provide descriptor-relative pathname mutation.
+
+  A post-link cleanup or single-link verification failure reports
+  `private file link completed, but published file topology is not trusted`.
+  The completed `meta.json` can remain linked to a hidden
+  `.meta.json.*.tmp` name, with link count two, and later metadata admission
+  will refuse it. Before retrying, inspect both entries with an inode-reporting
+  tool such as `ls -li`. If they have the same inode and the expected owner,
+  mode, and content, remove only the hidden temporary name, then verify that
+  `meta.json` has link count one and mode `0600`. If those identities do not
+  match, preserve both entries and investigate rather than deleting either one.
 - **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
 - **`~/.lcm/daemon.pid`** — Daemon process ID (transient).

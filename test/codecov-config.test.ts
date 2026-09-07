@@ -62,6 +62,7 @@ const expectedComponents = [
       "^src/runtime-root\\.ts$",
       "^src/scrub\\.ts$",
       "^src/secret-key\\.ts$",
+      // #1032 keeps retained-parent atomic-write outcome hardening in this owner.
       "^src/security-files\\.ts$",
       "^src/sensitive\\.ts$",
       "^src/shell-quote\\.ts$",
@@ -524,6 +525,8 @@ describe("Codecov configuration", () => {
     // #890 keeps bounded best-effort status metadata reads route-owned.
     // #1003 keeps preliminary metadata admission daemon-core-owned.
     // #1050 keeps bounded preliminary metadata serialization there too.
+    // #1032 keeps the shared private-file writer's retained-parent checks and
+    // publication outcomes configuration-security-owned.
     // #947 keeps promote metadata-parent resource handling and fail-closed
     // topology behavior in the existing daemon-routes component.
     // #948 keeps promote metadata parent-first admission, sampled read binding,

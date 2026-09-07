@@ -37,6 +37,8 @@ component_management:
         # pre-handoff content within this configuration-security boundary.
         # #828 authenticates project-directory topology with retained
         # no-follow descriptors and borrowed publication parents.
+        # #1032 adds early retained-parent refusal, temp-leaf binding, and
+        # truthful post-rename outcomes to the shared private-file writer.
         # #1041 preserves bootstrap directory authentication errors when
         # descriptor cleanup also fails.
         # #1062 keeps retained-parent create-if-absent publication within the

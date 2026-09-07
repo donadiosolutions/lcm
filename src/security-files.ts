@@ -68,6 +68,32 @@ export class PrivateFileCollisionError extends PrivateDirectoryTopologyError {
   }
 }
 
+export type PrivateFilePublicationOutcome = "published" | "unknown";
+
+/** A publication attempt and retained-parent topology check could not agree. */
+export class PrivateFilePublicationTopologyError extends PrivateDirectoryTopologyError {
+  readonly outcome: PrivateFilePublicationOutcome;
+  readonly topologyError: PrivateDirectoryTopologyError;
+
+  constructor(
+    outcome: PrivateFilePublicationOutcome,
+    topologyError: PrivateDirectoryTopologyError,
+    cause: unknown,
+    operation: "rename" | "link" = "rename",
+  ) {
+    super(
+      outcome === "published"
+        ? operation === "rename"
+          ? "private file rename completed, but retained parent topology is not trusted"
+          : "private file link completed, but published file topology is not trusted"
+        : `private file publication outcome is unknown because ${operation} and retained parent topology checks failed`,
+      { cause },
+    );
+    this.outcome = outcome;
+    this.topologyError = topologyError;
+  }
+}
+
 type BigIntDirectoryStat = Readonly<{
   isDirectory: () => boolean;
   mode: bigint;
@@ -486,6 +512,27 @@ function unlinkPrivateFileIfIdentityMatches(
   return true;
 }
 
+function assertPrivateTemporaryFileIdentity(
+  path: string,
+  expected: PrivateFileIdentity,
+): void {
+  try {
+    const current = lstatSync(path, { bigint: true }) as unknown as BigIntFileStat;
+    if (
+      !current.isFile()
+      || current.dev !== expected.dev
+      || current.ino !== expected.ino
+    ) {
+      throw new Error("private temporary file changed during validation");
+    }
+  } catch (error) {
+    throw new PrivateDirectoryTopologyError(
+      "private temporary file topology is not trusted",
+      { cause: error },
+    );
+  }
+}
+
 function validateBoundedBigIntFileMetadata(
   stat: BigIntBoundedFileStat,
   options: BoundedFileOptions,
@@ -889,19 +936,35 @@ export function atomicWritePrivateFile(
     let tempIdentity: PrivateFileIdentity | undefined;
     let primaryError: unknown;
     try {
-      const fd = (operations.open ?? openSync)(tempPath, "wx", PRIVATE_FILE_MODE);
-      ownsTempPath = true;
-      tempIdentity = privateFileIdentity(
-        fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
-        parentIdentity,
-      );
+      let fd: number;
       try {
+        fd = (operations.open ?? openSync)(tempPath, "wx", PRIVATE_FILE_MODE);
+      } catch (error) {
+        try {
+          assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+        } catch {
+          throw new PrivateDirectoryTopologyError(
+            "private directory topology is not trusted after temporary file open failed",
+            { cause: error },
+          );
+        }
+        throw error;
+      }
+      ownsTempPath = true;
+      try {
+        tempIdentity = privateFileIdentity(
+          fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
+          parentIdentity,
+        );
+        assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
         (operations.write ?? writeFileSync)(fd, content, "utf-8");
         (operations.fchmod ?? fchmodSync)(fd, PRIVATE_FILE_MODE);
         (operations.sync ?? fsyncSync)(fd);
       } finally {
         (operations.close ?? closeSync)(fd);
       }
+      assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+      assertPrivateTemporaryFileIdentity(tempPath, tempIdentity);
       try {
         (operations.link ?? linkSync)(tempPath, path);
       } catch (error) {
@@ -909,6 +972,16 @@ export function atomicWritePrivateFile(
           throw new PrivateFileCollisionError(
             "private file was created concurrently",
             { cause: error },
+          );
+        }
+        try {
+          assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+        } catch (topologyError) {
+          throw new PrivateFilePublicationTopologyError(
+            "unknown",
+            topologyError as PrivateDirectoryTopologyError,
+            error,
+            "link",
           );
         }
         throw error;
@@ -929,7 +1002,27 @@ export function atomicWritePrivateFile(
       assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
     } catch (error) {
       primaryError = error;
-      if (!(error instanceof PrivateDirectoryTopologyError)) {
+      if (
+        published
+        && !(error instanceof PrivateFileCollisionError)
+        && !(error instanceof PrivateFilePublicationTopologyError)
+      ) {
+        let topologyError: PrivateDirectoryTopologyError | undefined;
+        try {
+          assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+        } catch (observedTopologyError) {
+          topologyError = observedTopologyError as PrivateDirectoryTopologyError;
+        }
+        primaryError = new PrivateFilePublicationTopologyError(
+          "published",
+          topologyError ?? new PrivateDirectoryTopologyError(
+            "private file link publication topology is not trusted",
+            { cause: error },
+          ),
+          error,
+          "link",
+        );
+      } else if (!(error instanceof PrivateDirectoryTopologyError)) {
         try {
           assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
         } catch (topologyError) {
@@ -974,23 +1067,33 @@ export function atomicWritePrivateFile(
       if (parent !== undefined) {
         try {
           assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
-        } catch (topologyError) {
-          throw topologyError;
+        } catch {
+          throw new PrivateDirectoryTopologyError(
+            "private directory topology is not trusted after temporary file open failed",
+            { cause: error },
+          );
         }
       }
       throw error;
     }
     ownsTempPath = true;
-    tempIdentity = privateFileIdentity(
-      fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
-      parentIdentity ?? privatePathIdentity(directory),
-    );
     try {
+      tempIdentity = privateFileIdentity(
+        fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
+        parentIdentity ?? privatePathIdentity(directory),
+      );
+      if (parent !== undefined) {
+        assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+      }
       (operations.write ?? writeFileSync)(fd, content, "utf-8");
       (operations.fchmod ?? fchmodSync)(fd, PRIVATE_FILE_MODE);
       (operations.sync ?? fsyncSync)(fd);
     } finally {
       (operations.close ?? closeSync)(fd);
+    }
+    if (parent !== undefined) {
+      assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+      assertPrivateTemporaryFileIdentity(tempPath, tempIdentity);
     }
     try {
       (operations.rename ?? renameSync)(tempPath, path);
@@ -999,14 +1102,26 @@ export function atomicWritePrivateFile(
         try {
           assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
         } catch (topologyError) {
-          throw topologyError;
+          throw new PrivateFilePublicationTopologyError(
+            "unknown",
+            topologyError as PrivateDirectoryTopologyError,
+            error,
+          );
         }
       }
       throw error;
     }
     ownsTempPath = false;
     if (parent !== undefined) {
-      assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+      try {
+        assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+      } catch (topologyError) {
+        throw new PrivateFilePublicationTopologyError(
+          "published",
+          topologyError as PrivateDirectoryTopologyError,
+          topologyError,
+        );
+      }
     }
   } finally {
     if (ownsTempPath && tempIdentity !== undefined) {
