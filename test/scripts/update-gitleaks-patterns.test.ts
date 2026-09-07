@@ -41,11 +41,14 @@ describe("Gitleaks hostname normalization", () => {
     )).toBe("[Hh][Oo][Oo][Kk][Ss]\\.[Ss][Ll][Aa][Cc][Kk]\\.[Cc][Oo][Mm]/services");
   });
 
-  it("leaves already paired Slack and escaped Sidekiq hostnames byte-identical", () => {
+  it("leaves escaped Sidekiq hostnames byte-identical", () => {
     const sidekiq = "(?:gems\\.contribsys\\.com|enterprise\\.contribsys\\.com)";
-    const slack = "[Hh][Oo][Oo][Kk][Ss]\\.[Ss][Ll][Aa][Cc][Kk]\\.[Cc][Oo][Mm]/services";
     expect(normalizeGitleaksHostnameLiterals("sidekiq-sensitive-url", sidekiq))
       .toBe(sidekiq);
+  });
+
+  it("leaves already paired Slack hostnames byte-identical", () => {
+    const slack = "[Hh][Oo][Oo][Kk][Ss]\\.[Ss][Ll][Aa][Cc][Kk]\\.[Cc][Oo][Mm]/services";
     expect(normalizeGitleaksHostnameLiterals("slack-webhook-url", slack)).toBe(slack);
   });
 

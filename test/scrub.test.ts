@@ -198,7 +198,7 @@ describe("hostname-scoped Gitleaks rules", () => {
   it("rejects uppercase and mixed-case Slack webhook path prefixes", () => {
     const rule = compiledGitleaksRule("slack-webhook-url");
     for (const prefix of ["SERVICES", "WORKFLOWS", "TRIGGERS", "Services"]) {
-      const webhook = ["https://hooks.slack.com", prefix, slackTail].join("/");
+      const webhook = ["https://HoOkS.SlAcK.CoM", prefix, slackTail].join("/");
       expect(rule.test(webhook), prefix).toBe(false);
     }
   });
