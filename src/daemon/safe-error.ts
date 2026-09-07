@@ -302,6 +302,46 @@ function scanAbsolutePath(
       index += 1;
       continue;
     }
+    if (
+      quote === undefined &&
+      char === ":" &&
+      index >= start + FILE_SCHEME.length &&
+      isFileUrlLiteral(chars, index - FILE_SCHEME.length)
+    ) {
+      let cursor = index + 3;
+      let authorityBrackets = 0;
+      while (cursor < chars.length) {
+        const authorityChar = chars[cursor];
+        if (authorityChar === "/" || authorityChar === "\\") break;
+        if (
+          authorityChar === " " ||
+          authorityChar === "\t" ||
+          authorityChar === "\n" ||
+          authorityChar === "\r"
+        ) {
+          break;
+        }
+        if (authorityChar === "[") {
+          authorityBrackets += 1;
+          cursor += 1;
+          continue;
+        }
+        if (authorityChar === "]") {
+          if (authorityBrackets === 0) break;
+          authorityBrackets -= 1;
+          cursor += 1;
+          continue;
+        }
+        if (authorityChar === ":" || authorityChar === "@" || isPathWord(authorityChar)) {
+          cursor += 1;
+          continue;
+        }
+        break;
+      }
+      sawNonSeparator = true;
+      index = cursor;
+      continue;
+    }
     if (char === "/" || (windows && char === "\\")) {
       sawPathCharacter = true;
       index += 1;

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServerResponse } from "node:http";
 import { loadDaemonConfig, type DaemonConfig } from "../../../src/daemon/config.js";
+import { sanitizeError } from "../../../src/daemon/safe-error.js";
 import type { ProjectStorage, StorageBackendFactory } from "../../../src/storage/index.js";
 import { StorageOperationError } from "../../../src/storage/errors.js";
 import type { RouteExecutionContext } from "../../../src/daemon/server.js";
@@ -265,6 +266,28 @@ describe("persistence read route boundaries", () => {
       expanded: null,
       error: "expand failed for https://outer.test/x?q=file://h.invalid<path>file://h2.invalid<path>",
     });
+  });
+
+  it("absorbs an adjacent file suffix in describe wire errors", async () => {
+    const message =
+      "read failed for https://outer.test/x?q=file://h.invalid/Users/afile://h2.invalid/Users/b";
+    const expected = "read failed for https://outer.test/x?q=file://h.invalid<path>";
+    mocks.describe.mockRejectedValueOnce(new Error(message));
+
+    expect(sanitizeError(message)).toBe(expected);
+    await invoke(createDescribeHandler(config), { nodeId: "n", cwd: "/ok" });
+    expectLast(200, { node: null, error: expected });
+  });
+
+  it("absorbs an adjacent file suffix in expand wire errors", async () => {
+    const message = "expand failed for file://host.invalid?x=a\\Users\\a-file://h2.invalid/Users/b";
+    const expected = "expand failed for file://host.invalid?x=a<path>";
+    mocks.expand.mockRejectedValueOnce(new Error(message));
+
+    expect(sanitizeError(message)).toBe(expected);
+    await invoke(createExpandHandler(config), { nodeId: "n", cwd: "/ok" });
+    expect(mocks.expand).toHaveBeenCalled();
+    expectLast(200, { expanded: null, error: expected });
   });
 
   it("sanitizes adjacent post-bracket paths in describe read errors", async () => {
