@@ -21,7 +21,7 @@ function renderBar(barWidth: number): string {
   return '[' + '█'.repeat(barWidth) + ']';
 }
 
-/** Print the compact (non-verbose) summary table to stdout. */
+/** Print the compact (non-verbose) summary table to the supplied output stream. */
 export function printSummary(state: ProgressState, opts: RenderOpts, output: Pick<NodeJS.WriteStream, "write"> = process.stdout): void {
   const elapsed = (Date.now() - state.startedAt) / 1_000;
   const processed = state.completed + state.errors.length;

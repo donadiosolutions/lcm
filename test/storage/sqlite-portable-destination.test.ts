@@ -79,7 +79,7 @@ describe("SQLite canonical destination", () => {
     const get=StatementSync.prototype.get;
     const spy=vi.spyOn(StatementSync.prototype,"get").mockImplementation(function(this:StatementSync,...args){
       const result=get.apply(this,args);
-      if(result&&"checkpoints_json" in result){
+      if (result && ("checkpoints_json" in result)) {
         const value=result.checkpoints_json;
         if(typeof value==="string")largestReturnedControl=Math.max(largestReturnedControl,Buffer.byteLength(value));
         else if(value instanceof Uint8Array)largestReturnedControl=Math.max(largestReturnedControl,value.byteLength);
@@ -100,7 +100,7 @@ describe("SQLite canonical destination", () => {
     const get=StatementSync.prototype.get;
     const spy=vi.spyOn(StatementSync.prototype,"get").mockImplementation(function(this:StatementSync,...args){
       const result=get.apply(this,args);
-      if(result&&"checkpoints_json" in result){
+      if (result && ("checkpoints_json" in result)) {
         const value=result.checkpoints_json;
         if(typeof value==="string")largestReturnedControl=Math.max(largestReturnedControl,Buffer.byteLength(value));
         else if(value instanceof Uint8Array)largestReturnedControl=Math.max(largestReturnedControl,value.byteLength);

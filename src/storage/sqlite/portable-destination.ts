@@ -285,7 +285,7 @@ export async function openSqlitePortableDestination(input:OpenSqlitePortableDest
               if(found&&found.batch_sha===canonicalSha256(batch))return checkpoint(String(found.checkpoint_json));
               if(found)throw new PortableTransferError("checkpoint-mismatch");
             }catch(reconciliation){
-              if(reconciliation instanceof PortableTransferError&&reconciliation.code==="checkpoint-mismatch")throw reconciliation;
+              if ((reconciliation instanceof PortableTransferError) && reconciliation.code === "checkpoint-mismatch")throw reconciliation;
               throw new PortableTransferError("destination-uncertain",true);
             }
             throw new PortableTransferError("destination-failed",true);

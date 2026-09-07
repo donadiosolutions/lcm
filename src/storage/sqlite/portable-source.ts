@@ -668,7 +668,7 @@ export async function openSqlitePortableSource(input:OpenSqlitePortableSourceInp
               || (actual.last?.identitySha256??null)!==boundary.lastRecordIdentitySha256)return "changed" as const;
           }
           await guard(verification.signal);return "unchanged" as const;
-        });}catch(error){if(error instanceof PortableTransferError&&error.code==="aborted")throw error;return "changed";}
+        });}catch(error){if ((error instanceof PortableTransferError) && error.code === "aborted")throw error;return "changed";}
       },
       close(){
         if(closePromise)return closePromise.catch(() => {});
