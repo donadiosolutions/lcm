@@ -37,7 +37,9 @@ describe("event stats aggregation boundaries", () => {
   it("aggregates pruned, skipped, failed, orphaned, and healthy sidecars", async () => {
     sidecarMock.mockResolvedValue([
       sidecar({ file: "pruned.db", pruned: true }),
-      sidecar({ file: "skipped.db", scanSkipped: "budget" }),
+      sidecar({ file: "skipped.db", scanSkipped: "budget", scanSkippedCount: 7 }),
+      sidecar({ file: "legacy-skipped.db", scanSkipped: "legacy" }),
+      sidecar({ file: "count-without-prose.db", scanSkippedCount: 9 }),
       sidecar({ file: "failed.db", captured: 2, unprocessed: 1, metadataMissing: true, scanError: "bad", lastCapture: "2025-01-01" }),
       sidecar({ file: "healthy.db", captured: 3, unprocessed: 1, errors: 4, lastCapture: "2026-01-01" }),
       sidecar({ file: "older.db", captured: 1, lastCapture: "2024-01-01" }),
@@ -48,10 +50,10 @@ describe("event stats aggregation boundaries", () => {
       unprocessed: 2,
       errors: 4,
       scanErrors: 1,
-      scanSkipped: 1,
+      scanSkipped: 8,
       prunedSidecars: 1,
       lastCapture: "2026-01-01",
-      sidecars: 5,
+      sidecars: 7,
       sidecarsWithUnprocessed: 2,
       orphanedSidecarsWithUnprocessed: 1,
       deliveryPending: 0,
@@ -74,7 +76,9 @@ describe("event stats aggregation boundaries", () => {
     }));
     sidecarMock.mockResolvedValue([
       sidecar({ file: "pruned.db", pruned: true, pruneReason: "empty" }),
-      sidecar({ file: "skipped.db", scanSkipped: "timeout" }),
+      sidecar({ file: "skipped.db", scanSkipped: "timeout", scanSkippedCount: 7 }),
+      sidecar({ file: "legacy-skipped.db", scanSkipped: "legacy" }),
+      sidecar({ file: "count-without-prose.db", scanSkippedCount: 9 }),
       sidecar({ file: "failed.db", metadataMissing: true, unprocessed: 1, scanError: "bad", recentErrors: errors.slice(0, 4), lastCapture: "2025-01-01" }),
       sidecar({ file: "healthy.db", captured: 3, unprocessed: 1, errors: 2, recentErrors: errors.slice(4), lastCapture: "2026-01-01", cwd: "/project" }),
       sidecar({ file: "empty-errors.db", recentErrors: undefined }),
@@ -86,14 +90,14 @@ describe("event stats aggregation boundaries", () => {
       unprocessed: 2,
       errors: 2,
       scanErrors: 1,
-      scanSkipped: 1,
+      scanSkipped: 8,
       prunedSidecars: 1,
       lastCapture: "2026-01-01",
-      sidecars: 5,
+      sidecars: 7,
       sidecarsWithUnprocessed: 2,
       orphanedSidecarsWithUnprocessed: 1,
     });
-    expect(result.projects).toHaveLength(5);
+    expect(result.projects).toHaveLength(7);
     expect(result.recentErrors).toHaveLength(5);
     expect(result.recentErrors.map((entry) => entry.created_at)).toEqual([
       "2026-01-07", "2026-01-06", "2026-01-05", "2026-01-04", "2026-01-03",
