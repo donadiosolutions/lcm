@@ -535,6 +535,8 @@ describe("Codecov configuration", () => {
     // #948 keeps promote metadata parent-first admission, sampled read binding,
     // and retained identity revalidation in the daemon-routes component.
     // #964 keeps the path-bound root/projects/leaf metadata lifetime there too.
+    // #1062 keeps retained-parent create-if-absent filesystem semantics in
+    // configuration-security and promote collision handling in daemon-routes.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     // #814 fresh-root descriptor and pre-handoff content checks remain
     // configuration-security-owned.
