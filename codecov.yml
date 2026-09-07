@@ -76,7 +76,8 @@ component_management:
       paths:
         # Keep the #691/#700 response fences, #701 terminal factory-close retry,
         # runtime identity, #825 bounded project metadata, #1003 owner/single-link
-        # admission, and #1050 bounded preliminary serialization here.
+        # admission, #1050 bounded preliminary serialization, and #1106 periodic
+        # transcript metadata admission here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
@@ -205,6 +206,7 @@ component_management:
     - component_id: "unit-transcripts-import"
       name: "Unit - Transcripts and Import"
       paths:
+        # #1106 keeps all-project metadata discovery within this import owner.
         - "^src/codex-transcript\\.ts$"
         - "^src/import-summary\\.ts$"
         - "^src/import\\.ts$"
@@ -228,6 +230,7 @@ component_management:
     - component_id: "unit-compaction-summarization"
       name: "Unit - Compaction and Summarization"
       paths:
+        # #1106 keeps batch metadata discovery within this compaction owner.
         - "^src/batch-compact\\.ts$"
         - "^src/compaction\\.ts$"
         - "^src/large-files\\.ts$"

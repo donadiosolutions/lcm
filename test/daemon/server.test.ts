@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import {
   chmodSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -11,6 +12,8 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -63,6 +66,46 @@ function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(resolvePromise => { resolve = resolvePromise; });
   return { promise, resolve };
+}
+
+type TranscriptScanHarness = {
+  run: () => Promise<void>;
+};
+
+function captureActualTranscriptScanner(): TranscriptScanHarness {
+  let scheduledScan: (() => unknown) | undefined;
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  const scanInterval = { unref: vi.fn() } as unknown as NodeJS.Timeout;
+  vi.spyOn(globalThis, "setInterval").mockImplementation((
+    (handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 10 * 60 * 1000 && typeof handler === "function") {
+        scheduledScan = () => handler(...args);
+        return scanInterval;
+      }
+      return realSetInterval(handler, timeout, ...args);
+    }
+  ) as typeof setInterval);
+  vi.spyOn(globalThis, "clearInterval").mockImplementation((
+    (timer?: NodeJS.Timeout | number | string) => {
+      if (timer === scanInterval) return;
+      realClearInterval(timer as NodeJS.Timeout);
+    }
+  ) as typeof clearInterval);
+  return {
+    run: async () => {
+      if (!scheduledScan) throw new Error("periodic transcript scanner was not registered");
+      await scheduledScan();
+    },
+  };
+}
+
+function sizedProjectMetadata(cwd: string, targetBytes: number): string {
+  const prefix = `{"cwd":${JSON.stringify(cwd)},"padding":"`;
+  const suffix = `"}`;
+  const paddingBytes = targetBytes - Buffer.byteLength(prefix + suffix, "utf8");
+  if (paddingBytes < 0) throw new Error("project metadata target is too small");
+  return `${prefix}${"x".repeat(paddingBytes)}${suffix}`;
 }
 
 type IdleTimerEntry = {
@@ -1020,6 +1063,177 @@ describe("daemon server", () => {
       db.close();
       rmSync(canonical, { recursive: true, force: true });
       rmSync(alias, { recursive: true, force: true });
+    }
+  });
+
+  it("periodic discovery ingests a trusted sibling and rejects unsafe metadata leaves", async () => {
+    const scanner = captureActualTranscriptScanner();
+    const lcmDir = join(homedir(), ".lcm");
+    const projectsDir = join(lcmDir, "projects");
+    const configPath = join(lcmDir, "config.json");
+    mkdirSync(projectsDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    const canaryCwds: string[] = [];
+    const addTranscript = (cwd: string, sessionId: string): void => {
+      const sessionsDir = join(homedir(), ".claude", "projects", claudeProjectDirName(cwd));
+      mkdirSync(sessionsDir, { recursive: true });
+      writeFileSync(join(sessionsDir, `${sessionId}.jsonl`), [
+        JSON.stringify({ message: { role: "user", content: [{ type: "text", text: `${sessionId} question` }] } }),
+        JSON.stringify({ message: { role: "assistant", content: [{ type: "text", text: `${sessionId} answer` }] } }),
+      ].join("\n") + "\n");
+    };
+    const addProject = (name: string, cwd: string, metadata: string): string => {
+      const projectDir = join(projectsDir, name);
+      mkdirSync(projectDir);
+      const metaPath = join(projectDir, "meta.json");
+      writeFileSync(metaPath, metadata);
+      addTranscript(cwd, name);
+      return metaPath;
+    };
+
+    const trustedCwd = join(tempHome!, "trusted-scan-project");
+    mkdirSync(trustedCwd);
+    addProject("trusted", trustedCwd, JSON.stringify({ cwd: trustedCwd }));
+
+    const hardlinkCwd = join(tempHome!, "hardlink-daemon-canary");
+    mkdirSync(hardlinkCwd);
+    const hardlinkMeta = addProject("hardlink", hardlinkCwd, JSON.stringify({ cwd: hardlinkCwd }));
+    linkSync(hardlinkMeta, join(tempHome!, "hardlink-daemon-alias.json"));
+    canaryCwds.push(hardlinkCwd);
+
+    const symlinkCwd = join(tempHome!, "symlink-daemon-canary");
+    mkdirSync(symlinkCwd);
+    const symlinkProject = join(projectsDir, "symlink");
+    mkdirSync(symlinkProject);
+    const symlinkTarget = join(tempHome!, "symlink-daemon-target.json");
+    writeFileSync(symlinkTarget, JSON.stringify({ cwd: symlinkCwd }));
+    symlinkSync(symlinkTarget, join(symlinkProject, "meta.json"));
+    addTranscript(symlinkCwd, "symlink");
+    canaryCwds.push(symlinkCwd);
+
+    const oversizedCwd = join(tempHome!, "oversized-daemon-canary");
+    mkdirSync(oversizedCwd);
+    const oversizedMetadata = sizedProjectMetadata(
+      oversizedCwd,
+      projectModule.MAX_PROJECT_METADATA_BYTES + 1,
+    );
+    expect(Buffer.byteLength(oversizedMetadata, "utf8"))
+      .toBe(projectModule.MAX_PROJECT_METADATA_BYTES + 1);
+    addProject("oversized", oversizedCwd, oversizedMetadata);
+    canaryCwds.push(oversizedCwd);
+
+    const directoryCwd = "/directory-daemon-canary";
+    mkdirSync(join(projectsDir, "directory", "meta.json"), { recursive: true });
+    addTranscript(directoryCwd, "directory");
+    canaryCwds.push(directoryCwd);
+
+    daemon = await createDaemon(
+      loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } }),
+      { publicationConfigPath: configPath },
+    );
+    await scanner.run();
+
+    const trustedDb = new DatabaseSync(projectDbPath(trustedCwd));
+    try {
+      expect(trustedDb.prepare("SELECT COUNT(*) AS count FROM messages").get())
+        .toEqual({ count: 2 });
+    } finally {
+      trustedDb.close();
+    }
+    for (const cwd of canaryCwds) {
+      const canaryDb = join(projectsDir, projectModule.projectId(cwd), "db.sqlite");
+      expect(existsSync(canaryDb), cwd).toBe(false);
+    }
+  });
+
+  it("periodic discovery rejects FIFO metadata without blocking", async () => {
+    const scanner = captureActualTranscriptScanner();
+    const lcmDir = join(homedir(), ".lcm");
+    const projectDir = join(lcmDir, "projects", "fifo");
+    const configPath = join(lcmDir, "config.json");
+    mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    const metaPath = join(projectDir, "meta.json");
+    execFileSync("mkfifo", ["-m", "600", metaPath]);
+    const canaryCwd = join(tempHome!, "fifo-daemon-canary");
+    mkdirSync(canaryCwd);
+    const sessionsDir = join(homedir(), ".claude", "projects", claudeProjectDirName(canaryCwd));
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "fifo.jsonl"), [
+      JSON.stringify({ message: { role: "user", content: "fifo question" } }),
+      JSON.stringify({ message: { role: "assistant", content: "fifo answer" } }),
+    ].join("\n") + "\n");
+    daemon = await createDaemon(
+      loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } }),
+      { publicationConfigPath: configPath },
+    );
+    const writer = spawn(process.execPath, ["-e", `
+      setTimeout(() => {
+        const fs = require("node:fs");
+        try {
+          const fd = fs.openSync(process.argv[1], fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+          fs.writeSync(fd, JSON.stringify({ cwd: process.argv[2] }));
+          fs.closeSync(fd);
+        } catch {}
+      }, 1500);
+    `, metaPath, canaryCwd], { stdio: "ignore", env: {} });
+    const exited = once(writer, "exit");
+
+    try {
+      const started = performance.now();
+      await scanner.run();
+      expect(performance.now() - started).toBeLessThan(1000);
+      expect(existsSync(join(
+        lcmDir,
+        "projects",
+        projectModule.projectId(canaryCwd),
+        "db.sqlite",
+      ))).toBe(false);
+    } finally {
+      writer.kill("SIGKILL");
+      await exited;
+    }
+  });
+
+  it("periodic discovery enforces owner UID and supports platforms without getuid", async () => {
+    const scanner = captureActualTranscriptScanner();
+    const lcmDir = join(homedir(), ".lcm");
+    const projectsDir = join(lcmDir, "projects");
+    const projectDir = join(projectsDir, "uid");
+    const configPath = join(lcmDir, "config.json");
+    mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    const cwd = join(tempHome!, "uid-scan-project");
+    mkdirSync(cwd);
+    writeFileSync(join(projectDir, "meta.json"), JSON.stringify({ cwd }));
+    const sessionsDir = join(homedir(), ".claude", "projects", claudeProjectDirName(cwd));
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "uid.jsonl"), [
+      JSON.stringify({ message: { role: "user", content: "uid question" } }),
+      JSON.stringify({ message: { role: "assistant", content: "uid answer" } }),
+    ].join("\n") + "\n");
+    daemon = await createDaemon(
+      loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } }),
+      { publicationConfigPath: configPath },
+    );
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    const actualUid = process.getuid?.() ?? 0;
+    const dbPath = join(projectsDir, projectModule.projectId(cwd), "db.sqlite");
+
+    try {
+      Object.defineProperty(process, "getuid", {
+        value: () => actualUid + 1,
+        configurable: true,
+      });
+      await scanner.run();
+      expect(existsSync(dbPath)).toBe(false);
+
+      Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+      await scanner.run();
+      expect(existsSync(dbPath)).toBe(true);
+    } finally {
+      if (descriptor) Object.defineProperty(process, "getuid", descriptor);
+      else delete (process as { getuid?: unknown }).getuid;
     }
   });
 });

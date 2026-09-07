@@ -391,6 +391,14 @@ compact.” A failed scan does not mark any session as processed. Back up the
 reported project database, resolve the SQLite or schema error, and rerun the
 command; the still-eligible sessions will be discovered again.
 
+Before opening a project database, `lcm compact --all` accepts `meta.json` only
+as an owner-local, single-link regular file of at most 1 MiB. Unsafe or malformed
+metadata is reported as `project metadata is unreadable or malformed`; missing
+metadata retains its separate missing-file message. A concurrent atomic
+publication can briefly fail the single-link or descriptor checks, so retry
+after that activity settles. Persistent failures require restoring trusted
+project metadata; the command does not weaken admission or repair the file.
+
 ### Managed-daemon recovery
 
 Use the public commands for daemon recovery:

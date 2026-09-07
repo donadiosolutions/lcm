@@ -1,12 +1,23 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, utimesSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  linkSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  rmSync,
+  utimesSync,
+  symlinkSync,
+} from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import { cwdToProjectHash, findSessionFiles, importSessions } from "../src/import.js";
 import type { DaemonClient } from "../src/daemon/client.js";
-import { projectId } from "../src/daemon/project.js";
+import { MAX_PROJECT_METADATA_BYTES, projectId } from "../src/daemon/project.js";
 import {
   clearProjectMapCache,
   hashProjectPath,
@@ -234,6 +245,14 @@ function makeMockClient(postImpl: (path: string, body: unknown) => Promise<unkno
   } as unknown as DaemonClient;
 }
 
+function sizedProjectMetadata(cwd: string, targetBytes: number): string {
+  const prefix = `{"cwd":${JSON.stringify(cwd)},"padding":"`;
+  const suffix = `"}`;
+  const paddingBytes = targetBytes - Buffer.byteLength(prefix + suffix, "utf8");
+  if (paddingBytes < 0) throw new Error("project metadata target is too small");
+  return `${prefix}${"x".repeat(paddingBytes)}${suffix}`;
+}
+
 describe("importSessions", () => {
   const dirs: string[] = [];
 
@@ -323,6 +342,177 @@ describe("importSessions", () => {
     const client = makeMockClient(async () => ({ ingested: 1, totalTokens: 1 }));
     const result = await importSessions(client, { all: true, _claudeProjectsDir: claudeProjectsDir, _lcmDir: lcmDir });
     expect(result.imported).toBe(1);
+  });
+
+  it("admits bounded project metadata and skips unsafe discovery leaves", async () => {
+    const claudeProjectsDir = makeTmpDir();
+    const lcmDir = makeTmpDir();
+    const projectsDir = join(lcmDir, "projects");
+    mkdirSync(projectsDir, { recursive: true });
+    const discoveredCwds: string[] = [];
+    const addTranscript = (cwd: string): void => {
+      const claudeProjectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
+      mkdirSync(claudeProjectDir, { recursive: true });
+      writeFileSync(join(claudeProjectDir, "session.jsonl"), "");
+    };
+    const addProject = (name: string, cwd: string, metadata: string): string => {
+      const projectDir = join(projectsDir, name);
+      mkdirSync(projectDir);
+      writeFileSync(join(projectDir, "meta.json"), metadata);
+      addTranscript(cwd);
+      return join(projectDir, "meta.json");
+    };
+
+    const trustedCwd = "/trusted-import-project";
+    addProject("trusted", trustedCwd, JSON.stringify({ cwd: trustedCwd }));
+    const exactCwd = "/exact-limit-import-project";
+    const exactMetadata = sizedProjectMetadata(exactCwd, MAX_PROJECT_METADATA_BYTES);
+    expect(Buffer.byteLength(exactMetadata, "utf8")).toBe(MAX_PROJECT_METADATA_BYTES);
+    addProject("exact", exactCwd, exactMetadata);
+
+    const hardlinkCwd = "/hardlink-import-canary";
+    const hardlinkMeta = addProject("hardlink", hardlinkCwd, JSON.stringify({ cwd: hardlinkCwd }));
+    linkSync(hardlinkMeta, join(lcmDir, "hardlink-alias.json"));
+
+    const symlinkCwd = "/symlink-import-canary";
+    const symlinkProject = join(projectsDir, "symlink");
+    mkdirSync(symlinkProject);
+    const symlinkTarget = join(lcmDir, "symlink-target.json");
+    writeFileSync(symlinkTarget, JSON.stringify({ cwd: symlinkCwd }));
+    symlinkSync(symlinkTarget, join(symlinkProject, "meta.json"));
+    addTranscript(symlinkCwd);
+
+    const oversizedCwd = "/oversized-import-canary";
+    const oversizedMetadata = sizedProjectMetadata(oversizedCwd, MAX_PROJECT_METADATA_BYTES + 1);
+    expect(Buffer.byteLength(oversizedMetadata, "utf8")).toBe(MAX_PROJECT_METADATA_BYTES + 1);
+    addProject("oversized", oversizedCwd, oversizedMetadata);
+
+    const directoryCwd = "/directory-import-canary";
+    const directoryProject = join(projectsDir, "directory");
+    mkdirSync(join(directoryProject, "meta.json"), { recursive: true });
+    addTranscript(directoryCwd);
+
+    const client = makeMockClient(async (_path, body) => {
+      discoveredCwds.push((body as { cwd: string }).cwd);
+      return { ingested: 1, totalTokens: 1 };
+    });
+    const result = await importSessions(client, {
+      all: true,
+      _claudeProjectsDir: claudeProjectsDir,
+      _lcmDir: lcmDir,
+    });
+
+    expect(result.imported).toBe(2);
+    expect(discoveredCwds.sort()).toEqual([exactCwd, trustedCwd].sort());
+    expect(discoveredCwds.join("\n")).not.toMatch(/import-canary/u);
+  });
+
+  it("rejects FIFO project metadata without blocking all-project import", async () => {
+    const claudeProjectsDir = makeTmpDir();
+    const lcmDir = makeTmpDir();
+    const canaryCwd = "/fifo-import-canary";
+    const projectDir = join(lcmDir, "projects", "fifo");
+    mkdirSync(projectDir, { recursive: true });
+    const metaPath = join(projectDir, "meta.json");
+    execFileSync("mkfifo", ["-m", "600", metaPath]);
+    const transcriptDir = join(claudeProjectsDir, cwdToProjectHash(canaryCwd));
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(join(transcriptDir, "session.jsonl"), "");
+    const writer = spawn(process.execPath, ["-e", `
+      setTimeout(() => {
+        const fs = require("node:fs");
+        try {
+          const fd = fs.openSync(process.argv[1], fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+          fs.writeSync(fd, JSON.stringify({ cwd: "/fifo-import-canary" }));
+          fs.closeSync(fd);
+        } catch {}
+      }, 1500);
+    `, metaPath], { stdio: "ignore", env: {} });
+    const exited = once(writer, "exit");
+    const client = makeMockClient(async () => ({ ingested: 1, totalTokens: 1 }));
+
+    try {
+      const started = performance.now();
+      const result = await importSessions(client, {
+        all: true,
+        _claudeProjectsDir: claudeProjectsDir,
+        _lcmDir: lcmDir,
+      });
+      expect(performance.now() - started).toBeLessThan(1000);
+      expect(result.imported).toBe(0);
+      expect(client.post).not.toHaveBeenCalled();
+    } finally {
+      writer.kill("SIGKILL");
+      await exited;
+    }
+  });
+
+  it("enforces metadata ownership when getuid exists and remains portable without it", async () => {
+    const home = makeTmpDir();
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home);
+    const claudeProjectsDir = makeTmpDir();
+    const lcmDir = makeTmpDir();
+    const cwd = "/uid-import-canary";
+    const projectDir = join(lcmDir, "projects", "uid");
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, "meta.json"), JSON.stringify({ cwd }));
+    const transcriptDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(join(transcriptDir, "session.jsonl"), "");
+    const client = makeMockClient(async () => ({ ingested: 1, totalTokens: 1 }));
+
+    try {
+      vi.resetModules();
+      vi.doMock("node:fs", async (importOriginal) => {
+        const actual = await importOriginal<typeof import("node:fs")>();
+        return {
+          ...actual,
+          fstatSync: (fd: number, options?: unknown) => {
+            const stat = actual.fstatSync(fd, options as never);
+            let descriptorPath: string | undefined;
+            try { descriptorPath = actual.readlinkSync(`/proc/self/fd/${fd}`); } catch {}
+            if (descriptorPath !== join(projectDir, "meta.json")) return stat;
+            return new Proxy(stat, {
+              get(target, property, receiver) {
+                if (property === "uid") {
+                  return typeof target.uid === "bigint"
+                    ? target.uid + 1n
+                    : target.uid + 1;
+                }
+                return Reflect.get(target, property, receiver);
+              },
+            });
+          },
+        };
+      });
+      const isolated = await import("../src/import.js");
+      await expect(isolated.importSessions(client, {
+        all: true,
+        _claudeProjectsDir: claudeProjectsDir,
+        _lcmDir: lcmDir,
+      })).resolves.toMatchObject({ imported: 0 });
+      expect(client.post).not.toHaveBeenCalled();
+
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+      const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+      Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+      try {
+        await expect(importSessions(client, {
+          all: true,
+          _claudeProjectsDir: claudeProjectsDir,
+          _lcmDir: lcmDir,
+        })).resolves.toMatchObject({ imported: 1 });
+        expect(client.post).toHaveBeenCalledWith("/ingest", expect.objectContaining({ cwd }));
+      } finally {
+        if (descriptor) Object.defineProperty(process, "getuid", descriptor);
+        else delete (process as { getuid?: unknown }).getuid;
+      }
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
   });
 
   it("handles absent project maps and default path options", async () => {
