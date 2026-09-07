@@ -221,6 +221,13 @@ describe("persistent SQLite leaf initialization admission", () => {
         symlinkSync(victimPath, dbPath);
       } else {
         mkdirSync(dbPath, { mode: 0o755 });
+        const trackedTargetPath = fsState.targetPath;
+        fsState.targetPath = "";
+        try {
+          chmodSync(dbPath, 0o755);
+        } finally {
+          fsState.targetPath = trackedTargetPath;
+        }
         fsState.cleanupDirectories.add(dbPath);
       }
     });

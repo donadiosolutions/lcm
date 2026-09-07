@@ -476,6 +476,8 @@ describe("runDoctor project map checks", () => {
       const home = mkdtempSync(join(tmpdir(), `lcm-doctor-legacy-${rootShape}-root-`));
       if (rootShape === "non-private") {
         mkdirSync(join(home, ".lcm"), { mode: 0o755 });
+        chmodSync(join(home, ".lcm"), 0o755);
+        expect(statSync(join(home, ".lcm")).mode & 0o777).toBe(0o755);
         writeFileSync(join(home, ".lcm", "config.json"), "{}\n", { mode: 0o600 });
       }
       try {
@@ -862,10 +864,14 @@ describe("runDoctor project map checks", () => {
     try {
       const canonical = join(home, "project");
       mkdirSync(join(home, ".lcm"), { recursive: true });
+      chmodSync(join(home, ".lcm"), 0o755);
       mkdirSync(canonical, { recursive: true });
       writeFileSync(join(home, ".lcm", "oldmaps"), "not a directory");
       const hash = hashProjectPath(normalizeProjectPath(canonical));
       writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({ [hash]: { canonical, aliases: [] } }));
+      chmodSync(join(home, ".lcm", "map.json"), 0o644);
+      expect(statSync(join(home, ".lcm")).mode & 0o777).toBe(0o755);
+      expect(statSync(join(home, ".lcm", "map.json")).mode & 0o777).toBe(0o644);
 
       const results = await runDoctor(minimalDeps({ homedir: home, cwd: "/tmp/nonexistent-project-xyz" }));
       const check = results.find((r) => r.name === "project-map");
