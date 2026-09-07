@@ -909,6 +909,7 @@ describe("daemon lifecycle test-scope validation", () => {
       const externalToken = join(externalHome, "state", "daemon.token");
       writeFileSync(externalPid, "8383");
       writeFileSync(externalToken, "external-swap-token", { mode: 0o640 });
+      chmodSync(externalToken, 0o640);
       const swap = vi.fn(() => {
         renameSync(join(root, "owned"), join(root, "owned-original"));
         symlinkSync(externalParent, join(root, "owned"), "dir");
@@ -1347,6 +1348,7 @@ describe("run-owned lifecycle resources", () => {
     const stateFile = join(fixture.scope.stateDir, "descriptor-target");
     const secondLink = join(fixture.root, "descriptor-second-link");
     writeFileSync(stateFile, "unchanged", { mode: 0o640 });
+    chmodSync(stateFile, 0o640);
     linkSync(stateFile, secondLink);
     const hardlinkedDescriptor = openSync(stateFile, "r");
     try {
@@ -1870,6 +1872,8 @@ describe("run-owned lifecycle resources", () => {
     roots.push(targetRoot);
     writeFileSync(join(targetRoot, "daemon.pid"), "9191", { mode: 0o640 });
     writeFileSync(join(targetRoot, "daemon.token"), "target-secret", { mode: 0o640 });
+    chmodSync(join(targetRoot, "daemon.pid"), 0o640);
+    chmodSync(join(targetRoot, "daemon.token"), 0o640);
     const swapState = (): void => {
       rmSync(fixture.scope.stateDir, { recursive: true, force: true });
       symlinkSync(targetRoot, fixture.scope.stateDir, "dir");
@@ -1953,6 +1957,8 @@ describe("run-owned lifecycle resources", () => {
     roots.push(targetRoot);
     writeFileSync(join(targetRoot, "daemon.pid"), "9393", { mode: 0o640 });
     writeFileSync(join(targetRoot, "daemon.token"), "target-secret", { mode: 0o640 });
+    chmodSync(join(targetRoot, "daemon.pid"), 0o640);
+    chmodSync(join(targetRoot, "daemon.token"), 0o640);
     const stopUnit = vi.fn(async () => {
       rmSync(fixture.scope.stateDir, { recursive: true, force: true });
       symlinkSync(targetRoot, fixture.scope.stateDir, "dir");
@@ -1985,10 +1991,12 @@ describe("run-owned lifecycle resources", () => {
     const entrypointLink = join(targetRoot, "host-entrypoint.mjs");
     const credentialTarget = join(targetRoot, "host-credentials");
     writeFileSync(pidTarget, "8282", { mode: 0o640 });
+    chmodSync(pidTarget, 0o640);
     mkdirSync(credentialTarget);
     writeFileSync(join(credentialTarget, "sentinel"), "credential-target", {
       mode: 0o640,
     });
+    chmodSync(join(credentialTarget, "sentinel"), 0o640);
 
     const stopUnit = vi.fn(async () => {
       rmSync(fixture.pidPath, { force: true });

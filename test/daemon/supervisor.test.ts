@@ -254,6 +254,8 @@ describe("canonical supervisor identity", () => {
     const root = makeRoot();
     const daemonTemp = join(root, "daemon-tmp");
     mkdirSync(daemonTemp, { mode: 0o755 });
+    chmodSync(daemonTemp, 0o755);
+    expect(lstatSync(daemonTemp).mode & 0o777).toBe(0o755);
     const spec = makeSpec("systemd-user", root);
     const runner = fakeRunner([{ code: 1, stderr: "Unit is not-found" }]);
     await expect(createSupervisor("systemd-user", {

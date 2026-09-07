@@ -2102,6 +2102,8 @@ describe("BackendPublicationCoordinator", () => {
     mkdirSync(directory, { mode: 0o700 });
     const path = join(directory, "group-readable");
     writeFileSync(path, "observed", { mode: 0o640 });
+    chmodSync(path, 0o640);
+    expect(statSync(path).mode & 0o777).toBe(0o640);
 
     expect(() => captureBackendPublicationFileWitness(path, directory)).toThrow("mode is not trusted");
   });
@@ -3248,6 +3250,7 @@ describe("BackendPublicationCoordinator", () => {
     rmSync(history, { recursive: true });
     const victim = join(symlinkHome, "history-victim");
     mkdirSync(victim, { mode: 0o755 });
+    chmodSync(victim, 0o755);
     symlinkSync(victim, history, "dir");
     await expect(coordinator(symlinkHome, makeDriver(symlinkInput).driver).prepare({
       ...inputFor(symlinkInput),
