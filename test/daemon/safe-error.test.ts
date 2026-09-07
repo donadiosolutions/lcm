@@ -524,6 +524,15 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(input))).toBe(expected);
   });
 
+  it.each([
+    ["'file://host'name\"/'\\Users\\SECRET", "'file://host'name\"/'<path>"],
+    ["'file://host'name\"//'\\Users\\SECRET", "'file://host'name\"//'<path>"],
+    ["'file://host'name\"/private'\\Users\\SECRET", "'file://host'name\"<path>'<path>"],
+  ] as const)("redacts immediate backslash tails after root-only quoted file paths: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
+    expect(sanitizeError(sanitizeError(input))).toBe(expected);
+  });
+
   it("preserves the deferred word-bearing query tail boundary", () => {
     const result = sanitizeError("'file://host'['/private']?next/Users/SECRET");
 

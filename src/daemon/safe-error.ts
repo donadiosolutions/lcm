@@ -212,6 +212,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       URL_END_DELIMITERS.has(char) &&
       !fileAuthorityDelimiter
     ) {
+      // A closed quoted file path can hand off a root-relative Windows tail,
+      // even when the preceding path contains only root separators.
+      if (closesQuotedFilePath && chars[index + 1] === "\\") file[index + 1] = 1;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;
