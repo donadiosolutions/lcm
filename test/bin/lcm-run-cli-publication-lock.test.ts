@@ -9,6 +9,7 @@ const originalUserProfile = process.env.USERPROFILE;
 
 const state = vi.hoisted(() => ({
   afterHealth: undefined as (() => void) | undefined,
+  afterObservation: undefined as (() => void) | undefined,
   backend: "sqlite" as "sqlite" | "postgresql",
 }));
 
@@ -29,6 +30,15 @@ vi.mock("../../src/daemon/client.js", () => ({
         storageBackend: state.backend,
         entrypoint: "/opt/lcm/lcm.mjs",
         runtimeDigest: "runtime",
+      };
+    }
+
+    async observe() {
+      state.afterObservation?.();
+      return {
+        status: "ok", observation: "identity-only", storage: { status: "unverified" },
+        version: "test", storageBackend: state.backend, entrypoint: "/opt/lcm/lcm.mjs",
+        runtimeDigest: "runtime", pid: 42, uptime: 0, daemonInstanceId: "generation",
       };
     }
 
@@ -74,6 +84,7 @@ vi.mock("../../src/runtime-paths.js", async importOriginal => {
 
 afterEach(() => {
   state.afterHealth = undefined;
+  state.afterObservation = undefined;
   state.backend = "sqlite";
   vi.unstubAllEnvs();
   if (originalHome === undefined) delete process.env.HOME;
@@ -159,6 +170,32 @@ describe("runCli healthy-daemon reads during publication", () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+  it.each(["status", "pool"])("refuses changed configuration after %s identity observation", async command => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-cli-observe-drift-"));
+    const root = join(home, ".lcm");
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    mkdirSync(root, { mode: 0o700 });
+    const configPath = join(root, "config.json");
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    writeFileSync(join(root, "daemon.token"), "test-token", { mode: 0o600 });
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    state.afterObservation = () => {
+      writeFileSync(configPath, JSON.stringify({ daemon: { port: 3738 } }), { mode: 0o600 });
+    };
+    try {
+      const { runCli } = await import("../../bin/lcm.js");
+      await expect(runCli(["node", "lcm", ...(command === "status" ? ["status", "--json"] : ["stats", "--pool", "--json"])]))
+        .resolves.toBeUndefined();
+      const result = JSON.parse(String(stdout.mock.calls.at(-1)?.[0]));
+      if (command === "status") expect(result).toMatchObject({ daemon: { status: "down" }, diagnosticSource: "local" });
+      else expect(result.backendDiagnostics.pool.origin).not.toBe("daemon");
+    } finally {
+      stdout.mockRestore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("observes configured PostgreSQL pool stats without operational bootstrap", async () => {
     const home=mkdtempSync(join(tmpdir(),"lcm-cli-pool-pg-"));
     const root=join(home,".lcm");
@@ -172,13 +209,13 @@ describe("runCli healthy-daemon reads during publication", () => {
     vi.stubEnv("LCM_POSTGRES_URL","postgresql://user:password@db.example.com/lcm");
     vi.stubEnv("LCM_POSTGRES_CA_FILE",ca);
     vi.stubEnv("LCM_POSTGRES_MIGRATION_ROLE","lcm_test_migrator");
-    const health=vi.fn();
-    state.afterHealth=health;
+    const observation=vi.fn();
+    state.afterObservation=observation;
     state.backend="postgresql";
     try {
       const {runCli}=await import("../../bin/lcm.js");
       await expect(runCli(["node","lcm","stats","--pool"])).resolves.toBeUndefined();
-      expect(health).toHaveBeenCalledOnce();
+      expect(observation).toHaveBeenCalledOnce();
     } finally {rmSync(home,{recursive:true,force:true});}
   });
 

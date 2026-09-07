@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
+import { backendDiagnosticFailure, type BackendDiagnosticSnapshot } from "../../src/storage/diagnostics.js";
 import type { DoctorDeps } from "../../src/doctor/types.js";
 import { doctorConfigReadFailureSeams, doctorConfigSeams } from "./config-seams.js";
 import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-publication-journal.js";
@@ -51,6 +52,15 @@ const mockCollectDetailedEventStats = vi.mocked(collectDetailedEventStats);
 let defaultDoctorHome: string;
 const TEST_RUNTIME_ENTRYPOINT = packageExecutable(import.meta.url, 3);
 const EXPECTED_RUNTIME_DIGEST = "a".repeat(64);
+
+const DAEMON_OBSERVATION = {
+  status: "ok", observation: "identity-only", storage: { status: "unverified" },
+  version: "0.5.0", storageBackend: "sqlite", uptime: 10, pid: 4242,
+  daemonInstanceId: "00000000-0000-4000-8000-000000000001",
+  entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: EXPECTED_RUNTIME_DIGEST,
+};
+const IDENTITY_VERIFIED_MESSAGE = "Authenticated daemon version and runtime identity verified; active storage readiness was not probed";
+const QUEUE_UNVERIFIED_MESSAGE = "Active storage readiness was not probed; queue draining is unverified";
 
 beforeEach(() => {
   defaultDoctorHome = mkdtempSync(join(tmpdir(), "lcm-doctor-default-home-"));
@@ -1144,8 +1154,8 @@ describe("runDoctor configuration validation", () => {
     delete process.env.LCM_POSTGRES_CA_FILE;
     try {
       const fetch = vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242, entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: EXPECTED_RUNTIME_DIGEST }),
+        ok: true, status: 200,
+        json: async () => DAEMON_OBSERVATION,
       });
       const results = await runDoctor(minimalDeps({
         fetch,
@@ -1219,7 +1229,7 @@ describe("runDoctor configuration validation", () => {
     }
   });
 
-  it("uses authenticated staged PostgreSQL health for an already-running daemon", async () => {
+  it.each(["unavailable", "healthy"] as const)("observes PostgreSQL identity independently of a %s backend read snapshot", async classification => {
     const dir = mkdtempSync(join(tmpdir(), "lcm-doctor-postgres-staged-"));
     const caFile = join(dir, "ca.pem");
     writeFileSync(caFile, "test-ca");
@@ -1229,12 +1239,18 @@ describe("runDoctor configuration validation", () => {
     process.env.LCM_POSTGRES_URL = "postgresql://user:password@db.example/lcm";
     process.env.LCM_POSTGRES_CA_FILE = caFile;
     process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
-    const stagedHealth = {
-      status: "unavailable", version: "0.5.0", storageBackend: "postgresql", uptime: 10, pid: 4242,
-      entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: EXPECTED_RUNTIME_DIGEST,
-      storage: { status: "unavailable", error: { code: "STORAGE_INITIALIZATION_FAILED", backend: "postgresql", domain: "factory", operation: "health" } },
-    };
-    const fetch = vi.fn().mockResolvedValue({ ok: false, status: 503, json: async () => stagedHealth });
+    const observation = { ...DAEMON_OBSERVATION, storageBackend: "postgresql" };
+    const fetch = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => observation });
+    const diagnostics: BackendDiagnosticSnapshot = classification === "unavailable"
+      ? backendDiagnosticFailure(new Error("private backend failure"), "postgresql")
+      : {
+        backend: "postgresql", classification: "healthy", publication: "ready", tls: "ready",
+        schema: "ready", extensions: "ready", search: "ready",
+        pool: { origin: "diagnostic-probe", status: "ready" },
+        project: { scope: "aggregate", status: "ready" }, identity: { status: "ready" },
+        outbox: { status: "ready", captured: 100, unprocessed: 5, errors: 0 },
+        remediation: "No action required.",
+      };
     mockCollectEventStats.mockReturnValue({
       captured: 100,
       unprocessed: 5,
@@ -1242,7 +1258,7 @@ describe("runDoctor configuration validation", () => {
       lastCapture: "2026-03-26 10:00:00",
     });
     try {
-      const results = await runDoctor(minimalDeps({
+      const deps = minimalDeps({
         fetch,
         _expectedRuntimeDigestForTesting: EXPECTED_RUNTIME_DIGEST,
         readFileSync: (path: string) => {
@@ -1252,19 +1268,26 @@ describe("runDoctor configuration validation", () => {
           if (path.endsWith("daemon.token")) return "doctor-token";
           return minimalDeps().readFileSync(path);
         },
-      }));
+      });
+      deps.collectBackendSnapshot = vi.fn().mockResolvedValue(diagnostics);
+      const results = await runDoctor(deps);
 
       expect(ensureDaemon).not.toHaveBeenCalled();
-      expect(fetch).toHaveBeenCalledExactlyOnceWith("http://127.0.0.1:3737/health", {
+      expect(fetch).toHaveBeenCalledExactlyOnceWith("http://127.0.0.1:3737/health/observe", {
         headers: { Authorization: "Bearer doctor-token" }, signal: expect.any(AbortSignal),
       });
-      expect(results.find(r => r.name === "daemon")).toMatchObject({ status: "warn" });
+      expect(results.find(r => r.name === "daemon")).toMatchObject({ status: "pass", message: IDENTITY_VERIFIED_MESSAGE });
       expect(results.find((result) => result.name === "events-capture")).toMatchObject({
         status: "warn",
-        message: expect.stringContaining("queue cannot drain until storage is healthy"),
+        message: expect.stringContaining(QUEUE_UNVERIFIED_MESSAGE),
       });
       expect(results.find((result) => result.name === "events-capture")?.message)
         .not.toContain("queued for automatic daemon processing");
+      expect(results.find(result => result.name === "backend-health")).toMatchObject({
+        status: classification === "healthy" ? "pass" : "fail", backendDiagnostics: diagnostics,
+        message: expect.stringContaining(`Classification: ${classification}`),
+      });
+      expect(restartDaemon).not.toHaveBeenCalled();
     } finally {
       if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
       else process.env.LCM_POSTGRES_URL = previousUrl;
@@ -1353,33 +1376,24 @@ describe("Passive Learning checks", () => {
     expect(capture?.message).toContain("No events captured");
   });
 
-  it("passes when events exist and low backlog awaits automatic processing", async () => {
-    vi.mocked(ensureDaemon).mockResolvedValueOnce({
-      connected: true,
-      port: 3737,
-      spawned: false,
-      pid: 4242,
-      startMethod: "existing",
-    });
-    mockCollectEventStats.mockReturnValue({ captured: 100, unprocessed: 5, errors: 0, lastCapture: "2026-03-26 10:00:00" });
-    const results = await runDoctor(minimalDeps({
-      cwd: "/tmp/test-proj",
-      fetch: vi.fn()
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242, entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: EXPECTED_RUNTIME_DIGEST }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242, entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: EXPECTED_RUNTIME_DIGEST }),
-        }),
-      readFileSync: (path: string) => path.endsWith("daemon.token")
-        ? "doctor-token"
-        : minimalDeps().readFileSync(path),
+  it.each([0, 1, 199, 200])("reports %i pending events without asserting active readiness", async unprocessed => {
+    mockCollectEventStats.mockReturnValue({ captured: 1000, unprocessed, errors: 0, lastCapture: null });
+    const fetch = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => DAEMON_OBSERVATION });
+    const results = await runDoctor(minimalDeps({ fetch,
+      readFileSync: path => path.endsWith("daemon.token") ? "doctor-token" : minimalDeps().readFileSync(path),
     }));
-    const capture = results.find(r => r.name === "events-capture");
-    expect(capture?.status).toBe("pass");
-    expect(capture?.message).toContain("queued for automatic daemon processing");
+    expect(results.find(result => result.name === "daemon")).toMatchObject({ status: "pass", message: IDENTITY_VERIFIED_MESSAGE });
+    const capture = results.find(result => result.name === "events-capture");
+    expect(capture?.status).toBe(unprocessed === 0 ? "pass" : "warn");
+    if (unprocessed === 0) expect(capture?.message).toBe("1000 events captured; queue empty");
+    else expect(capture?.message).toContain(QUEUE_UNVERIFIED_MESSAGE);
+    if (unprocessed === 200) expect(capture?.message).toContain("lcm events promote --all");
+    expect(capture?.message).not.toContain("queued for automatic daemon processing");
+    expect(fetch).toHaveBeenCalledExactlyOnceWith("http://127.0.0.1:3737/health/observe", {
+      headers: { Authorization: "Bearer doctor-token" }, signal: expect.any(AbortSignal),
+    });
+    expect(ensureDaemon).not.toHaveBeenCalled();
+    expect(restartDaemon).not.toHaveBeenCalled();
   });
 
   it("warns when unprocessed events reach the passive backlog threshold", async () => {
@@ -1406,8 +1420,8 @@ describe("Passive Learning checks", () => {
     const results = await runDoctor(minimalDeps({
       cwd: "/tmp/test-proj",
       fetch: vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242, entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: EXPECTED_RUNTIME_DIGEST }),
+        ok: true, status: 200,
+        json: async () => DAEMON_OBSERVATION,
       }),
       readFileSync: (path: string) => path.endsWith("daemon.token")
         ? "doctor-token"
@@ -1416,6 +1430,8 @@ describe("Passive Learning checks", () => {
     const capture = results.find(r => r.name === "events-capture");
     expect(capture?.status).toBe("warn");
     expect(capture?.message).toContain("project metadata is missing");
+    expect(capture?.message).toContain("across 2 project sidecars; 2 sidecars missing metadata");
+    expect(capture?.message).toContain(QUEUE_UNVERIFIED_MESSAGE);
     expect(capture?.message).not.toContain("run: lcm events promote --all");
   });
 
@@ -1432,8 +1448,8 @@ describe("Passive Learning checks", () => {
     const results = await runDoctor(minimalDeps({
       cwd: "/tmp/test-proj",
       fetch: vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({ status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242, entrypoint: TEST_RUNTIME_ENTRYPOINT, runtimeDigest: EXPECTED_RUNTIME_DIGEST }),
+        ok: true, status: 200,
+        json: async () => DAEMON_OBSERVATION,
       }),
       readFileSync: (path: string) => path.endsWith("daemon.token")
         ? "doctor-token"
@@ -1443,6 +1459,8 @@ describe("Passive Learning checks", () => {
     expect(capture?.status).toBe("warn");
     expect(capture?.message).toContain("run: lcm events promote --all for metadata-backed sidecars");
     expect(capture?.message).toContain("orphaned sidecars need metadata repair or pruning");
+    expect(capture?.message).toContain("across 3 project sidecars; 1 sidecar missing metadata");
+    expect(capture?.message).toContain(QUEUE_UNVERIFIED_MESSAGE);
   });
 
   it("fails when errors >= 50", async () => {
@@ -1651,17 +1669,32 @@ describe("doctor authenticated daemon identity", () => {
       fetch: vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => health }),
     });
   }
-  const healthy = { status: "ok", version: "0.5.0", storageBackend: "sqlite", pid: 4242,
-    runtimeDigest: EXPECTED_RUNTIME_DIGEST, entrypoint: TEST_RUNTIME_ENTRYPOINT };
+  const healthy = DAEMON_OBSERVATION;
 
   it.each([
     ["version", undefined], ["version", "0.4.0"], ["runtimeDigest", undefined],
     ["runtimeDigest", "foreign-digest"], ["entrypoint", "/private/other-runtime"],
     ["storageBackend", "postgresql"], ["pid", undefined], ["pid", -1], ["pid", 1.5],
-    ["status", "unavailable"],
+    ["status", "unavailable"], ["observation", undefined], ["observation", "active"],
+    ["storage", undefined], ["storage", { status: "ready" }], ["storage", null],
+    ["uptime", undefined], ["uptime", -1], ["daemonInstanceId", undefined],
   ])("rejects unmatched or missing %s without repairing it", async (key, value) => {
     const results = await runDoctor(authenticatedDeps({ ...healthy, [key as string]: value }));
     expect(results.find(r => r.name === "daemon")?.status).toBe("fail");
+    expect(ensureDaemon).not.toHaveBeenCalled();
+    expect(restartDaemon).not.toHaveBeenCalled();
+  });
+
+  it.each([404, 503, 201])("refuses HTTP %i without retrying active health", async status => {
+    const deps = authenticatedDeps(healthy);
+    deps.fetch = vi.fn().mockResolvedValue({ ok: status < 300, status, json: async () =>
+      status === 503 ? { ...healthy, status: "unavailable", storageBackend: "postgresql",
+        storage: { status: "unavailable", error: { code: "STORAGE_INITIALIZATION_FAILED", backend: "postgresql", domain: "factory", operation: "health" } } } : healthy });
+    const results = await runDoctor(deps);
+    expect(results.find(result => result.name === "daemon")?.status).toBe("fail");
+    expect(deps.fetch).toHaveBeenCalledExactlyOnceWith("http://127.0.0.1:3737/health/observe", {
+      headers: { Authorization: "Bearer doctor-token" }, signal: expect.any(AbortSignal),
+    });
     expect(ensureDaemon).not.toHaveBeenCalled();
     expect(restartDaemon).not.toHaveBeenCalled();
   });

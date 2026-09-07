@@ -689,6 +689,21 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       }),
     });
   }, "read");
+  registerBuiltInRoute("GET", "/health/observe", async (_req, res) => {
+    sendJson(res, 200, {
+      status: "ok",
+      observation: "identity-only",
+      storage: { status: "unverified" },
+      version: PKG_VERSION,
+      storageBackend: config.storage.backend,
+      uptime: Math.floor((Date.now() - startTime) / 1000),
+      pid: process.pid,
+      entrypoint: daemonEntrypoint,
+      ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
+      daemonInstanceId: invocationCoordinator.daemonInstanceId,
+      ...(runtimeDigest ? { runtimeDigest } : {}),
+    });
+  }, "read");
   registerBuiltInRoute(
     "POST",
     "/compact",
@@ -916,6 +931,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       const rawAuth = req.headers["authorization"];
       const publicHealth = serverToken !== null && key === "GET /health" && rawAuth === undefined;
       if (key === "POST /invocation-control" && serverToken === null) {
+        sendJsonIfWritable(res, 401, { error: "unauthorized" });
+        return;
+      }
+      if (key === "GET /health/observe" && serverToken === null) {
         sendJsonIfWritable(res, 401, { error: "unauthorized" });
         return;
       }

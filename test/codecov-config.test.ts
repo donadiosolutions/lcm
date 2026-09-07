@@ -585,6 +585,7 @@ describe("Codecov configuration", () => {
       // #1088 keeps unsupported connector-list-format admission CLI-owned.
       // #978 keeps compact replacement runtime-digest admission CLI-owned.
       // #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
+      // #1201 keeps diagnostic identity admission CLI-owned.
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
       ["src/private-mutation-lock.ts", "unit-configuration-security"],
@@ -608,7 +609,9 @@ describe("Codecov configuration", () => {
       // #881 absent-config journal admission and #882 post-health identity
       // fencing remain installer-owned.
       ["installer/install.ts", "unit-installation"],
+      // #1201 observation parser/client, allowlist and server retain daemon-core ownership.
       ["src/daemon/client.ts", "unit-daemon-core"],
+      ["src/daemon/http-url.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
       ["src/daemon/project.ts", "unit-daemon-core"],
       ["src/daemon/routes/compact.ts", "unit-daemon-routes"],
@@ -646,6 +649,7 @@ describe("Codecov configuration", () => {
       ["src/llm/process-utils.ts", "unit-llm-prompts"],
       // #997 keeps doctor publication retry deadlines monotonic in this owner.
       // #619 keeps observational doctor refusal guidance in this owner.
+      // #1201 identity observation and unverified queue readiness retain this owner.
       ["src/doctor/doctor.ts", "unit-diagnostics"],
       // #944/#950/#966 keep typed daemon-tmp diagnostics, authenticated restart
       // convergence, and bounded birth samples in the service-manager component.

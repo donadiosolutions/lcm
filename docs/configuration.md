@@ -756,15 +756,32 @@ PID. It does not inspect project databases or expose installation paths.
 Supplying a valid daemon bearer token returns the full storage-backed health
 diagnostic; supplying an invalid credential returns `401`. Embedded and test
 callers that intentionally create a daemon without a token retain the full
-health response. `lcm doctor` treats public health as liveness only and uses the
-authenticated health result from an already-running managed daemon to decide
-whether passive-learning queues can drain. Doctor never starts one.
-Authenticated healthy storage is ready, authenticated unhealthy storage is
-unavailable, and a missing or unreadable managed-daemon token leaves
-readiness unverified. In that unverified state, doctor warns that access to the
-daemon token and authenticated diagnostics must be restored before it can
-promise that queued events will drain. Embedded and test-only tokenless servers
-do not relax this production doctor authentication requirement.
+health response.
+
+Diagnostic commands `lcm doctor`, `lcm status`, and `lcm stats --pool` instead use
+internal `GET /health/observe`. It requires the daemon bearer token, including
+refusing tokenless embedded servers with `401`, and remains subject to the
+normal configuration, publication, and shutdown admission checks. Its HTTP 200
+JSON has `status: "ok"`, `observation: "identity-only"`, and
+`storage: { "status": "unverified" }`, with version, selected backend, uptime,
+PID, entrypoint, daemon generation, and the actual runtime digest when available.
+An owner identifier is included when configured. No storage readiness or backend
+error result is included: observation never calls storage health or opens project
+storage. This endpoint is an internal diagnostic mechanism with no third-party
+compatibility promise.
+
+Doctor requires this explicit response and exact installed runtime identity;
+missing credentials, incompatible responses, or identity mismatches fail the
+daemon check without starting or repairing a daemon. A verified daemon check
+means identity was verified and active storage readiness was not probed. Doctor's
+separate backend diagnostic snapshot retains its healthy/degraded/unavailable
+classification for observed inventory, schema, and read availability. A staged
+or unavailable PostgreSQL backend can still expose process identity; unavailable
+backend reads fail the independent backend check. If reads succeed but write
+readiness would fail, doctor may report a healthy read snapshot while active
+storage readiness stays explicitly unverified. Pending queues therefore warn
+that queue draining is unverified. Authenticated active `GET /health` continues
+to probe storage readiness for lifecycle callers.
 
 Before sending the bearer token or admitting a daemon for ordinary use,
 lifecycle checks require the public `/health` PID and installed version, a
@@ -798,7 +815,7 @@ ports and performs no network I/O.
 Use `lcm daemon restart` after configuration changes. It validates the complete
 effective configuration before asking the host service manager to replace the
 managed process, then waits for authenticated health. `lcm doctor` is the
-canonical diagnostic command; it checks daemon health, service-manager
+canonical diagnostic command; it checks daemon identity, backend read diagnostics, service-manager
 availability, hooks, connector registration, MCP setup, and summarizer
 readiness. Do not start a second daemon to work around a health failure.
 
