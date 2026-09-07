@@ -130,6 +130,8 @@ component_management:
         # episodic search candidate recall, and #890 bounded best-effort status
         # metadata reads,
         # and #833 passive-event identity admission remain route-owned.
+        # #1148 keeps promoted created_at UTC parsing in this existing
+        # daemon-routes owner without changing the component taxonomy.
         # #828 promotes topology failures through the route boundary while
         # preserving ordinary best-effort metadata persistence.
         # #947 keeps direct metadata-parent resource exhaustion best-effort

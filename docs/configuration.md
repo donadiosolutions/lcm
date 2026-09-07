@@ -1410,6 +1410,11 @@ LCM identifies stale candidates by combining age with recall feedback signals:
 - **Stale penalty** (`restoration.stalePenalty`, default 0.5): score penalty applied to stale candidates during prompt-time ranking.
 - **Strong match override** (`restoration.allowStaleOnStrongMatch`, default true): when enabled, stale memories can still surface if their relevance score is high enough despite the penalty.
 
+For these promoted-memory `created_at` comparisons, SQLite timestamps written as
+`YYYY-MM-DD HH:MM:SS` are interpreted as UTC. This keeps prompt ranking,
+staleness, restore filtering, and passive-insight filtering stable across host
+timezones; timestamps with an explicit offset keep that offset.
+
 ### Inspecting stale candidates
 
 Call the `/review-stale` daemon endpoint with `{ "cwd": "/path/to/project" }` to list stale candidates with their surfacing and usage counts.
