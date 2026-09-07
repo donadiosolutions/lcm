@@ -99,8 +99,8 @@ const expectedComponents = [
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
       // Error sanitization, including #893 adjacent-path, #903 prefixed
-      // nested-file, and #924 embedded-quote file-authority redaction, remains
-      // daemon-core-owned.
+      // nested-file, #924 embedded-quote file-authority, and #1060 adjacent
+      // nested-file scheme preservation, remains daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -221,6 +221,8 @@ const expectedComponents = [
     component_id: "unit-project-worktrees",
     name: "Unit - Projects and Worktrees",
     paths: [
+      // #1070 preserves post-commit topology diagnostics in this existing
+      // reconciliation owner.
       // #974 keeps target-parent reconciliation hardening in this
       // existing component.
       "^src/codex-project-resolution\\.ts$",
@@ -232,6 +234,7 @@ const expectedComponents = [
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
       // #1044 keeps the existing owner; no taxonomy, status, or policy change.
+      // #1048 keeps target metadata leaf authentication in this owner.
       // #1069 preserves completed reconciliation evidence after retained
       // directory cleanup failures in this existing component.
       "^src/worktree-reconciliation\\.ts$",
@@ -240,14 +243,15 @@ const expectedComponents = [
   {
     component_id: "unit-diagnostics",
     name: "Unit - Diagnostics",
-    paths: ["^src/diagnose\\.ts$", "src/doctor/"],
+    paths: ["^src/diagnose\\.ts$", "^src/storage/diagnostics\\.ts$", "^src/storage/diagnostic-renderer\\.ts$", "^src/storage/diagnostic-project\\.ts$", "^src/storage/postgresql/diagnostics\\.ts$", "src/doctor/"],
   },
   {
     component_id: "integration-service-managers",
     name: "Integration - Service Managers and Legacy Migration",
     paths: [
       "^src/daemon/health-observation\\.ts$",
-      // #865 convergence and #966 birth-sample budgeting remain lifecycle-owned.
+      // #865/#966 convergence and birth budgeting remain lifecycle-owned;
+      // #1073 bounds legacy PID/token evidence within that same owner.
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",
@@ -486,7 +490,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(224);
+    expect(productionFiles).toHaveLength(230);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -516,7 +520,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(224);
+    expect(ownershipCounts.size).toBe(230);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964 files in their intended components", () => {
@@ -544,6 +548,8 @@ describe("Codecov configuration", () => {
     // #948 keeps promote metadata parent-first admission, sampled read binding,
     // and retained identity revalidation in the daemon-routes component.
     // #964 keeps the path-bound root/projects/leaf metadata lifetime there too.
+    // #1062 keeps retained-parent create-if-absent filesystem semantics in
+    // configuration-security and promote collision handling in daemon-routes.
     // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
     // #814 fresh-root descriptor and pre-handoff content checks remain
     // configuration-security-owned.
@@ -605,6 +611,7 @@ describe("Codecov configuration", () => {
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
       ["src/llm/process-utils.ts", "unit-llm-prompts"],
       // #997 keeps doctor publication retry deadlines monotonic in this owner.
+      // #619 keeps observational doctor refusal guidance in this owner.
       ["src/doctor/doctor.ts", "unit-diagnostics"],
       // #944/#950/#966 keep typed daemon-tmp diagnostics, authenticated restart
       // convergence, and bounded birth samples in the service-manager component.
@@ -622,6 +629,13 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.
       ["src/db/event-sidecars.ts", "unit-local-persistence"],
+      ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"],
+      ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"],
+      // #619 retained daemon pool observations stay diagnostics-owned.
+      ["src/storage/diagnostics.ts", "unit-diagnostics"],
+      ["src/storage/diagnostic-renderer.ts", "unit-diagnostics"],
+      ["src/storage/diagnostic-project.ts", "unit-diagnostics"],
+      ["src/storage/postgresql/diagnostics.ts", "unit-diagnostics"],
       // #992 keeps pre-initialization SQLite leaf admission and final
       // opened-identity fencing local-persistence-owned.
       ["src/db/connection.ts", "unit-local-persistence"],

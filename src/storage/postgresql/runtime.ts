@@ -3,6 +3,7 @@ import { Client, Pool, Query, type ClientConfig, type PoolClient, type PoolConfi
 import { StorageOperationError } from "../errors.js";
 import type {
   PostgreSqlConnectionSettings,
+  PostgreSqlDiagnosticPool,
   PostgreSqlOperationContext,
   PostgreSqlQueryExecutor,
   PostgreSqlQueryOptions,
@@ -763,7 +764,23 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     }
   }
 
-  async health(): Promise<PostgreSqlRuntimeHealth> {
+  poolDiagnostics(): PostgreSqlDiagnosticPool {
+    const count = (value: number): number => {
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new StorageOperationError("STORAGE_OPERATION_FAILED", "postgresql", undefined, "factory", "poolDiagnostics");
+      }
+      return value;
+    };
+    return {
+      configuredMax: count(this.settings.poolMax),
+      total: count(this.pool.totalCount),
+      idle: count(this.pool.idleCount),
+      waiting: count(this.pool.waitingCount),
+      failed: this.poolFailed,
+    };
+  }
+
+  async health(signal?: AbortSignal): Promise<PostgreSqlRuntimeHealth> {
     if (this.closed) return { status: "closed", backend: "postgresql" };
     const wasPoolFailed = this.poolFailed;
     try {
@@ -778,7 +795,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
                         FROM pg_catalog.pg_stat_ssl
                         WHERE pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid()
                       ), false) AS tls`,
-      }, { domain: "factory", operation: "health" });
+      }, { domain: "factory", operation: "health", signal });
       const row = result.rows[0];
       const serverMajorVersion = sanitizeServerMajorVersion(row?.server_version_num);
       const serverEncoding = sanitizePostgreSqlServerEncoding(row?.server_encoding);
@@ -813,6 +830,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       }
       const extensions = await inspectRequiredPostgreSqlExtensions(this, {
         operation: "healthRequiredExtensions",
+        signal,
       });
       const runtimeReady = row?.tls === true
         && row.timezone.toUpperCase() === "UTC";
@@ -836,6 +854,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       }
       const searchConfiguration = await inspectPostgreSqlSearchConfiguration(this, {
         operation: "healthSearchConfiguration",
+        signal,
       });
       const diagnostics = {
         ...connectionDiagnostics,

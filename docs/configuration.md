@@ -46,8 +46,8 @@ lcm doctor
 
 On Linux, an upgrade from LCM v1.4.1 to v1.4.2 can leave one authenticated
 legacy transient systemd service running while the new stable service name is
-absent. The first `lcm doctor` after the upgrade, or an explicit
-`lcm daemon restart`, performs a one-time migration only when the manager PID,
+absent. An explicit `lcm daemon restart` performs a one-time migration only
+when the manager PID,
 systemd invocation ID, canonical PID/token files, authenticated health
 identity, older same-line version, process entrypoint, and loopback listener
 all agree. A changing, ambiguous, symlinked, malformed, or unauthorized
@@ -74,7 +74,7 @@ start a second daemon manually during an upgrade.
 The hook commands and MCP server use absolute paths into the installed npm
 package. LCM owns the MCP entry's `type`, `command`, and `args`; `env` and any
 other compatible user- or Claude-managed options, sibling MCP servers, and
-unrelated settings are preserved across installation and doctor repair. When
+unrelated settings are preserved across installation. When
 normalizing an HTTP or SSE entry to `stdio`, LCM removes the incompatible
 `url`, `headers`, and `transport` fields. `lcm doctor` validates the native
 configuration and managed daemon; repair or reinstall with `lcm install`.
@@ -477,9 +477,13 @@ setting.
 These environment values are used by the daemon and MCP runtime as well as
 direct programmatic callers. Run `lcm daemon restart` after changing the
 selection or credentials so the managed daemon constructs a fresh verified
-factory. The CLI/import-export activation and parity work remain tracked by
-#618; stats, pool diagnostics, status, and doctor presentation remain tracked
-by #619.
+factory. CLI/import-export activation and parity remain tracked by #618.
+Stats, pool diagnostics, status, and doctor inspect the selected backend through
+a [shared observational snapshot](cli.md#observational-diagnostics). They report
+verified readiness or a sanitized failure state without opening projects for
+writes, running migrations, or falling back to SQLite. Missing metrics remain
+unavailable, and local outbox counts remain local even when PostgreSQL is
+selected. These diagnostics do not start or restart the daemon.
 
 ### Provisioning a PostgreSQL database
 
@@ -672,7 +676,8 @@ synthesized from the trusted packaged daemon entrypoint and fixed system
 directories so the service sees the same provider search path that `lcm doctor`
 checks, even when the command was invoked through a user-level wrapper. Default
 managed lifecycle calls use that same packaged entrypoint in their manager
-arguments, keeping start, doctor, and restart admission on one stable identity.
+arguments, keeping start and restart admission on one stable identity. Doctor
+observes that same packaged runtime identity without invoking lifecycle work.
 Service identity metadata and credential-file markers are passed as
 names and paths only. API keys and database URLs are never copied into argv,
 unit properties, plist contents, or logs; the daemon reads them from the
@@ -743,10 +748,10 @@ Supplying a valid daemon bearer token returns the full storage-backed health
 diagnostic; supplying an invalid credential returns `401`. Embedded and test
 callers that intentionally create a daemon without a token retain the full
 health response. `lcm doctor` treats public health as liveness only and uses the
-authenticated post-validation health result to decide whether passive-learning
-queues can drain, both when validating an already-running managed daemon and
-after starting one. Authenticated healthy storage is ready, authenticated
-storage is unavailable, and a missing or unreadable managed-daemon token leaves
+authenticated health result from an already-running managed daemon to decide
+whether passive-learning queues can drain. Doctor never starts one.
+Authenticated healthy storage is ready, authenticated unhealthy storage is
+unavailable, and a missing or unreadable managed-daemon token leaves
 readiness unverified. In that unverified state, doctor warns that access to the
 daemon token and authenticated diagnostics must be restored before it can
 promise that queued events will drain. Embedded and test-only tokenless servers
@@ -756,7 +761,8 @@ Before sending the bearer token or admitting a daemon for ordinary use,
 lifecycle checks require the public `/health` PID and installed version, a
 recognized active storage backend, the PID file, process liveness, and exact
 `127.0.0.1` listener ownership to agree. Authenticated full health and
-`/stats/pool` then prove diagnostic access and the entrypoint identity. An
+`/stats/pool` then verify authenticated access; the entrypoint identity is
+checked through authenticated health, while pool diagnostics omit paths. An
 occupied port with missing or unverifiable identity is rejected rather than
 trusted. Daemons that predate backend identity are recognized as SQLite-only,
 so selecting PostgreSQL cannot silently reuse an existing SQLite process.
@@ -823,10 +829,12 @@ user can read or modify that user's files and runtime state. Private file modes,
 canonical paths, authenticated metadata, and manager identity checks reduce
 accidental or cross-user access without providing capability-style isolation.
 
-The MCP handshake check is time-bounded. If its helper process exits early,
-stops accepting input, or encounters a pipe error, `lcm doctor` reports the
-diagnostic as a warning and continues instead of waiting indefinitely or
-crashing.
+Doctor inspects MCP registration and static protocol capability without
+spawning an MCP server. Live protocol readiness is explicitly not probed.
+After repairing registration with `lcm install` or
+`lcm connectors install <agent> --transport mcp`, verify tool availability in
+the intended agent; starting that agent's MCP connection is an operational
+action separate from doctor.
 
 Stored `daemon.port` values must be integers from `1` through `65535`; this includes values written with `lcm config set`. Port `0` is reserved for internal runtime overrides used by tests to request ephemeral binding and is not a valid `config.json` value because lifecycle commands must be able to reconnect to the configured port. `daemon.idleTimeoutMs` must be an integer from `0` through `86400000` milliseconds; `0` disables the idle timer.
 
@@ -837,11 +845,12 @@ in the same source, while runtime overrides continue to take precedence over
 stored configuration. `lcm config get` and `lcm config set` accept the legacy
 path and report its canonical `dedupCandidateLimit` spelling.
 
-When `lcm doctor` finds a malformed `mcpServers.lcm` value inside an otherwise
-valid settings object, it replaces that entry with the minimal managed fields.
-Malformed JSON, a non-object settings root, or a malformed `mcpServers`
-container fails closed and must be corrected before repair. Other fields are
-preserved when the settings root and server map are valid JSON objects.
+When `lcm doctor` finds a malformed `mcpServers.lcm` value, it reports the
+finding and recommends explicit repair with `lcm install`. It never writes
+settings, hooks, managed guidance, or remediation markers. Malformed JSON, a
+non-object settings root, or a malformed `mcpServers` container must be
+corrected before installation can repair the entry. The installer preserves
+other fields when the settings root and server map are valid JSON objects.
 
 Hook error fallback logs write to `~/.lcm/logs/events.log`.
 

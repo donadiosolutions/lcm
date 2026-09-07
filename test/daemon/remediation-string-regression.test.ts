@@ -97,7 +97,7 @@ describe("centralized remediation guidance", () => {
   it("documents configuration behavior for stale daemon recovery", () => {
     const source = readRepositoryFile("docs/daemon-restart-recovery.md");
     const staleConfigSection = source.match(
-      /### Doctor recovery for stale daemon configuration\n([\s\S]*?)(?=\n## |$)/u,
+      /### Doctor findings and explicit repair\n([\s\S]*?)(?=\n## |$)/u,
     )?.[1];
     const normalizedStaleConfigSection = staleConfigSection?.replace(/\s+/gu, " ");
 

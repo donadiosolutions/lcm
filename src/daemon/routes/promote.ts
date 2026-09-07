@@ -11,6 +11,7 @@ import {
   atomicWritePrivateFile,
   openPrivateDirectory,
   PrivateDirectoryTopologyError,
+  PrivateFileCollisionError,
   readBoundedRegularFileWithStat,
   type PrivateDirectoryHandle,
 } from "../../security-files.js";
@@ -449,14 +450,22 @@ export function createPromoteHandler(
               try {
                 try {
                   let meta: Record<string, unknown> = {};
+                  let metadataMissing = false;
+                  assertMetadataDirectoryEntries(chain);
+                  let observed: ReturnType<typeof readBoundedRegularFileWithStat> | undefined;
                   try {
-                    assertMetadataDirectoryEntries(chain);
-                    const observed = readBoundedRegularFileWithStat(paths.metaPath, {
+                    observed = readBoundedRegularFileWithStat(paths.metaPath, {
                       allowedRoot: paths.dir,
                       maxBytes: MAX_PROJECT_METADATA_BYTES,
                       expectedUid,
                       requireSingleLink: true,
                     });
+                  } catch (error) {
+                    if (errorCode(error) !== "ENOENT") throw error;
+                    metadataMissing = true;
+                    assertMetadataDirectoryEntries(chain);
+                  }
+                  if (observed !== undefined) {
                     if (
                       observed.parentDev !== parent.witness.dev
                       || observed.parentIno !== parent.witness.ino
@@ -468,8 +477,6 @@ export function createPromoteHandler(
                       throw new Error("invalid project metadata");
                     }
                     meta = parsed as Record<string, unknown>;
-                  } catch (error) {
-                    if (errorCode(error) !== "ENOENT") throw error;
                   }
                   meta.cwd = paths.canonical;
                   meta.lastPromote = new Date().toISOString();
@@ -478,7 +485,24 @@ export function createPromoteHandler(
                     throw new Error("project metadata exceeds size limit");
                   }
                   assertMetadataDirectoryEntries(chain);
-                  atomicWritePrivateFile(paths.metaPath, serialized, {}, parent);
+                  try {
+                    if (metadataMissing) {
+                      atomicWritePrivateFile(
+                        paths.metaPath,
+                        serialized,
+                        {},
+                        parent,
+                        { requireAbsent: true },
+                      );
+                    } else {
+                      atomicWritePrivateFile(paths.metaPath, serialized, {}, parent);
+                    }
+                  } catch (error) {
+                    if (error instanceof PrivateFileCollisionError) {
+                      throw metadataTopologyError(error);
+                    }
+                    throw error;
+                  }
                   assertMetadataDirectoryEntries(chain);
                 } catch (error) {
                   if (isCriticalMetadataError(error)) throw error;

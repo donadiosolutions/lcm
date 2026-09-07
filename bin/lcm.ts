@@ -1225,7 +1225,7 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   )) return false;
   if (topLevel && action === "post-tool") return false;
   if (topLevel && action === "status") return false;
-  if (topLevel && action === "stats") return actionCommand.opts<Record<string, unknown>>().pool !== true;
+  if (topLevel && (action === "stats" || action === "doctor")) return false;
   if (topLevel && (action === "diagnose" || action === "help")) return false;
   if ((action === "list" || action === "doctor") && actionCommand.parent?.name() === "connectors") return false;
   if (topLevel && ["daemon", "config", "machine", "project", "postgres", "events", "connectors"].includes(action)) return false;
@@ -1235,8 +1235,7 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
 function shouldUsePublicationConvergence(actionCommand: Command): boolean {
   const action = actionCommand.name();
   const topLevel = actionCommand.parent?.name() === "lcm";
-  if (topLevel && (action === "install" || action === "doctor")) return true;
-  if (topLevel && action === "stats") return actionCommand.opts<Record<string, unknown>>().pool !== true;
+  if (topLevel && action === "install") return true;
   if (topLevel && action === "export") return true;
   if (isNestedUnderRoot(actionCommand, "machine", "show")) return true;
   if (isNestedUnderRoot(actionCommand, "project", "list")
@@ -1253,10 +1252,8 @@ function shouldUsePublicationConvergence(actionCommand: Command): boolean {
 }
 
 type DaemonClientOptions = {
-  /** Temporary guard for the SQLite-only pool diagnostic. */
-  requireSqlite?: boolean;
-  readonly preflightStorage?: boolean;
   readonly rootBootstrapComplete?: boolean;
+  readonly diagnosticOnly?: boolean;
 };
 
 type DaemonClientProvider = (options?: DaemonClientOptions) => Promise<DaemonClient>;
@@ -2033,17 +2030,14 @@ type DaemonClientWithConfig = Readonly<{
   health?: DaemonHealth;
 }>;
 
-async function createDaemonClientOrExitWithConfig(
-  options: DaemonClientOptions = {},
-): Promise<DaemonClientWithConfig> {
+async function createDaemonClientOrExitWithConfig(): Promise<DaemonClientWithConfig> {
   const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
   const { loadDaemonConfig } = await import("../src/daemon/config.js");
   const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
 
   const configFile = defaultConfigPath();
   const config = loadDaemonConfig(configFile);
-  if (options.requireSqlite && config.storage.backend === "postgresql") throw new StorageBackendUnavailableError("postgresql");
-  if (options.preflightStorage !== false) selectStorageBackendForConfig(configFile, config.storage);
+  selectStorageBackendForConfig(configFile, config.storage);
   const port = config.daemon?.port ?? 3737;
   const pidFilePath = daemonPidPath();
   const tokenPath = daemonTokenPath();
@@ -2073,10 +2067,8 @@ async function createDaemonClientOrExitWithConfig(
   };
 }
 
-async function createDaemonClientOrExit(
-  options: DaemonClientOptions = {},
-): Promise<DaemonClient> {
-  return (await createDaemonClientOrExitWithConfig(options)).client;
+async function createDaemonClientOrExit(): Promise<DaemonClient> {
+  return (await createDaemonClientOrExitWithConfig()).client;
 }
 
 async function createDaemonReadClientOrExit(
@@ -2086,14 +2078,13 @@ async function createDaemonReadClientOrExit(
   const configPath = defaultConfigPath();
   try {
     const first = readDaemonConfigSnapshot(configPath);
-    if (options.requireSqlite && first.config.storage.backend === "postgresql") throw new StorageBackendUnavailableError("postgresql");
     const tokenPath = daemonTokenPath();
     const { readAuthToken } = await import("../src/daemon/auth.js");
     const token = readAuthToken(tokenPath);
     if (typeof token === "string" && token.length > 0) {
       const port = first.config.daemon.port;
       const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
-      const health = await client.health();
+      const health = await client.health(options.diagnosticOnly ? { timeoutMs: 2000 } : undefined);
       if (
         (health?.status === "ok" || health?.status === "healthy")
         && typeof PKG_VERSION === "string"
@@ -2121,11 +2112,12 @@ async function createDaemonReadClientOrExit(
         }
       }
     }
-  } catch (error) {
-    if (error instanceof StorageBackendUnavailableError) throw error;
+  } catch {
     // Any snapshot, token, health, or witness failure falls back to the
     // existing authenticated migration and lifecycle path below.
   }
+
+  if (options.diagnosticOnly) throw new Error("Daemon identity could not be verified; run lcm daemon status.");
 
   if (options.rootBootstrapComplete !== true) {
     await migrateLegacyHomeWithRetry({
@@ -2134,7 +2126,7 @@ async function createDaemonReadClientOrExit(
       attempt: preflightSeams?.attempt,
     });
   }
-  return createDaemonClientOrExitWithConfig(options);
+  return createDaemonClientOrExitWithConfig();
 }
 
 /** @internal CLI entry seam; defaults preserve the published executable behavior. */
@@ -2961,70 +2953,50 @@ export async function runCli(
         printHelp("status"); exit(0);
       }
       const jsonFlag: boolean = opts.json ?? false;
-      const readClient = await createDaemonReadClientOrExit(preflightSeams, { preflightStorage: false });
-      const { client, config } = readClient;
-
-      let daemonStatus = "down";
-      let statusData: any = null;
-
+      const { collectStats, StatsUnavailableError } = await import("../src/stats.js");
+      const { backendDiagnosticFailure } = await import("../src/storage/diagnostics.js");
+      const { renderBackendDiagnostics } = await import("../src/storage/diagnostic-renderer.js");
+      let observedDaemon: { status: string; version?: string; uptime?: number; port?: number } = { status: "down" };
+      let diagnosticSource: "daemon" | "local" = "local";
+      let statusData: {
+        daemon: { status?: string; version?: string; uptime?: number; port?: number };
+        project?: { messageCount: number; summaryCount: number; promotedCount: number };
+        backendDiagnostics?: import("../src/storage/diagnostics.js").BackendDiagnosticSnapshot;
+      };
       try {
-        const health = readClient.health ?? await client.health();
-        daemonStatus = (["down", "up"] as const)[Number(Boolean(health))]!;
-        const daemonHealth = health as DaemonHealth | null;
-        if (daemonHealth?.status === "unavailable") {
-          statusData = {
-            daemon: {
-              status: "up",
-              version: daemonHealth.version,
-              uptime: daemonHealth.uptime,
-              port: config.daemon.port,
-              storageBackend: daemonHealth.storageBackend,
-              storageStatus: "unavailable",
-            },
-          };
+        const { client, health, config } = await createDaemonReadClientOrExit(preflightSeams, { diagnosticOnly: true });
+        // Diagnostic-only admission returns only after authenticated health and
+        // runtime identity match. A later backend refusal cannot erase that fact.
+        observedDaemon = { status: "up", version: health!.version, uptime: health!.uptime, port: config.daemon.port };
+        statusData = await client.post("/status", { cwd: process.cwd() }, { timeoutMs: 2000 });
+        statusData.daemon.status = "up";
+        diagnosticSource = "daemon";
+      } catch {
+        try {
+          const stats = await collectStats({ cwd: process.cwd() });
+          statusData = { daemon: observedDaemon, backendDiagnostics: stats.backendDiagnostics,
+            project: { messageCount: stats.messages, summaryCount: stats.summaries, promotedCount: stats.promotedCount } };
+        } catch (error) {
+          statusData = { daemon: observedDaemon, backendDiagnostics: error instanceof StatsUnavailableError
+            ? error.diagnostics : backendDiagnosticFailure(error) };
         }
-
-        // Also fetch /status endpoint if daemon is up
-        if (daemonStatus === "up" && !statusData) {
-          statusData = await client.post("/status", { cwd: process.cwd() });
-        }
-      } catch {}
-
-      if (jsonFlag) {
-        const result = {
-          daemon: daemonStatus === "up" ? statusData?.daemon : { status: "down" },
-          project: statusData?.project,
-        };
-        stdout.write(JSON.stringify(result, null, 2) + "\n");
-      } else {
-        const provider = config.llm?.provider ?? "unknown";
-        const providerDisplay = provider === "auto"
-          ? "auto (Claude->claude-process, Codex->codex-process)"
-          : provider;
-
-        if (statusData) {
-          console.log(`Daemon: ${daemonStatus}`);
-          console.log(`  Version: ${statusData.daemon.version}`);
-          console.log(`  Uptime: ${statusData.daemon.uptime}s`);
-          console.log(`  Port: ${statusData.daemon.port}`);
-          console.log(`  Provider: ${providerDisplay}`);
-          if (statusData.daemon.storageBackend) {
-            console.log(
-              `  Storage: ${statusData.daemon.storageBackend} (${statusData.daemon.storageStatus})`,
-            );
-          }
-          if (statusData.project) {
-            console.log();
-            console.log("Project:");
-            console.log(`  Messages: ${statusData.project.messageCount}`);
-            console.log(`  Summaries: ${statusData.project.summaryCount}`);
-            console.log(`  Promoted: ${statusData.project.promotedCount}`);
-            if (statusData.project.lastIngest) console.log(`  Last Ingest: ${statusData.project.lastIngest}`);
-            if (statusData.project.lastCompact) console.log(`  Last Compact: ${statusData.project.lastCompact}`);
-            if (statusData.project.lastPromote) console.log(`  Last Promote: ${statusData.project.lastPromote}`);
-          }
-        } else {
-          console.log(`daemon: ${daemonStatus} · provider: ${providerDisplay}`);
+      }
+      if (jsonFlag) stdout.write(JSON.stringify({ ...statusData, diagnosticSource }, null, 2) + "\n");
+      else {
+        console.log(`Daemon: ${statusData.daemon.status}`);
+        console.log(diagnosticSource === "daemon"
+          ? "Diagnostics source: daemon response."
+          : observedDaemon.status === "up"
+            ? "Diagnostics source: local observation after daemon status request failed."
+            : "Diagnostics source: local observation.");
+        if (statusData.daemon.version) console.log(`  Version: ${statusData.daemon.version}`);
+        if (statusData.daemon.uptime !== undefined) console.log(`  Uptime: ${statusData.daemon.uptime}s`);
+        if (statusData.daemon.port !== undefined) console.log(`  Port: ${statusData.daemon.port}`);
+        if (statusData.backendDiagnostics) console.log(renderBackendDiagnostics(statusData.backendDiagnostics));
+        if (statusData.project) {
+          console.log(`Messages: ${statusData.project.messageCount}`);
+          console.log(`Summaries: ${statusData.project.summaryCount}`);
+          console.log(`Promoted: ${statusData.project.promotedCount}`);
         }
       }
     });
@@ -3035,7 +3007,7 @@ export async function runCli(
     .description("Show memory inventory and compression ratios")
     .option("-v, --verbose", "Show per-conversation breakdown")
     .option("--pool", "Show connection pool statistics from the daemon")
-    .option("--json", "Output structured JSON (use with --pool)")
+    .option("--json", "Output structured JSON")
     .helpOption(false)
     .option("-h, --help", "Show help")
     .action(async (opts) => {
@@ -3044,60 +3016,38 @@ export async function runCli(
         printHelp("stats"); exit(0);
       }
 
+      const { renderBackendDiagnostics } = await import("../src/storage/diagnostic-renderer.js");
       if (opts.pool) {
-        const jsonFlag: boolean = opts.json ?? false;
-        const { client } = await createDaemonReadClientOrExit(preflightSeams, { requireSqlite: true });
-
-        let poolData: any = null;
+        const { collectStats, StatsUnavailableError } = await import("../src/stats.js");
+        const { backendDiagnosticFailure } = await import("../src/storage/diagnostics.js");
+        let backendDiagnostics: import("../src/storage/diagnostics.js").BackendDiagnosticSnapshot;
         try {
-          poolData = await client.get("/stats/pool");
-        } catch (err) {
-          console.error(`Error: ${err instanceof Error ? err.message : "could not load pool stats"}`);
-          exit(1);
+          const { client } = await createDaemonReadClientOrExit(preflightSeams, { diagnosticOnly: true });
+          const response = await client.get<{ backendDiagnostics: typeof backendDiagnostics }>("/stats/pool", { timeoutMs: 2000 });
+          backendDiagnostics = response.backendDiagnostics;
+        } catch {
+          try { backendDiagnostics = (await collectStats()).backendDiagnostics; }
+          catch (error) { backendDiagnostics = error instanceof StatsUnavailableError
+            ? error.diagnostics : backendDiagnosticFailure(error); }
         }
-
-        if (jsonFlag) {
-          stdout.write(JSON.stringify(poolData, null, 2) + "\n");
-        } else {
-          const dim = "\x1b[2m";
-          const cyan = "\x1b[36m";
-          const bold = "\x1b[1m";
-          const reset = "\x1b[0m";
-          console.log();
-          console.log(`    ${bold}${cyan}🔌 Connection Pool${reset}`);
-          console.log();
-          const rows: [string, string][] = [
-            ["Total", String(poolData.totalConnections)],
-            ["Active", String(poolData.activeConnections)],
-            ["Idle", String(poolData.idleConnections)],
-          ];
-          const labelWidth = Math.max(...rows.map(([l]) => l.length));
-          for (const [label, value] of rows) {
-            console.log(`    ${dim}${label.padEnd(labelWidth)}${reset}  ${value}`);
-          }
-          if (poolData.connections && poolData.connections.length > 0) {
-            console.log();
-            console.log(`    ${dim}Connections:${reset}`);
-            for (const conn of poolData.connections) {
-              const status = conn.status === "active" ? `${cyan}active${reset}` : `${dim}idle${reset}`;
-              console.log(`    ${dim}refs=${conn.refs}${reset}  ${status}  ${conn.path}`);
-            }
-          }
-          console.log();
-        }
+        if (opts.json) stdout.write(JSON.stringify({ backendDiagnostics }, null, 2) + "\n");
+        else console.log(renderBackendDiagnostics(backendDiagnostics));
         return;
       }
 
       const verbose: boolean = opts.verbose ?? false;
-      const { loadDaemonConfig } = await import("../src/daemon/config.js");
-      const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
-      const configFile = defaultConfigPath();
-      const { collectStats, printStats } = await import("../src/stats.js");
-      const stats = await runWithPublicationRetry(async () => {
-        selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
-        return collectStats();
-      });
-      printStats(await stats, verbose);
+      const { collectStats, printStats, StatsUnavailableError } = await import("../src/stats.js");
+      const { backendDiagnosticFailure } = await import("../src/storage/diagnostics.js");
+      try {
+        const stats = await collectStats();
+        if (opts.json) stdout.write(JSON.stringify(stats, null, 2) + "\n");
+        else printStats(stats, verbose);
+      } catch (error) {
+        const diagnostics = error instanceof StatsUnavailableError ? error.diagnostics : backendDiagnosticFailure(error);
+        if (opts.json) stdout.write(JSON.stringify({ backendDiagnostics: diagnostics }, null, 2) + "\n");
+        else console.log(renderBackendDiagnostics(diagnostics));
+        exit(1);
+      }
     });
 
   // ─── doctor ────────────────────────────────────────────────────────────────

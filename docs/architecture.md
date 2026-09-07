@@ -45,9 +45,11 @@ the daemon never opens a project SQLite database as fallback. Request
 cancellation closes the active project, and daemon shutdown aborts and drains
 background consumers before closing the shared factory. The local SQLite hook
 outbox and metadata-only transcript quarantine remain local and are not
-general caches or activation paths. CLI/import-export remains #618-owned,
-while stats, pool diagnostics, status, and doctor presentation remain
-#619-owned. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for table ownership,
+general caches or activation paths. CLI/import-export remains #618-owned.
+Stats, pool diagnostics, status, and doctor use a shared sanitized,
+[observational snapshot](cli.md#observational-diagnostics) for both backends.
+Its publication checks authenticate matching evidence before and after probes;
+they do not provide a transaction-wide authority guarantee. See the [PostgreSQL schema reference](../src/storage/postgresql/reference/postgresql-schema.md) for table ownership,
 integrity, indexes, retention, extension policy, and recovery implications.
 
 ## Storage repository architecture
@@ -75,8 +77,9 @@ project database, separately from immutable canonical recovery archives. The
 production PostgreSQL factory, runtime, migration runner, identity repository,
 and isolated test-database lease support the
 daemon's selected project-storage routes. CLI/import-export and portable
-transfer remain #618-owned, while aggregate stats, status, pool diagnostics,
-and doctor parity remain #619-owned. Selecting `postgresql` never falls back to
+transfer remain #618-owned. Aggregate stats, status, pool diagnostics, and
+doctor use a separate read-only diagnostic path with classified outcomes and
+no operational project opens or migrations. Selecting `postgresql` never falls back to
 SQLite. See
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md) for the
 local-scrubbing, checkpoint, quarantine, and rollback boundaries.

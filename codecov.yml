@@ -42,6 +42,8 @@ component_management:
         # truthful post-rename outcomes to the shared private-file writer.
         # #1041 preserves bootstrap directory authentication errors when
         # descriptor cleanup also fails.
+        # #1062 keeps retained-parent create-if-absent publication within the
+        # existing filesystem-topology owner.
         - "^src/config-manager\\.ts$"
         - "^src/config-projection\\.ts$"
         - "^src/generated-patterns\\.ts$"
@@ -90,8 +92,8 @@ component_management:
         - "^src/daemon/proxy-manager\\.ts$"
         - "^src/daemon/remediation\\.ts$"
         # Error sanitization, including #893 adjacent-path, #903 prefixed
-        # nested-file, and #924 embedded-quote file-authority redaction, remains
-        # daemon-core-owned.
+        # nested-file, #924 embedded-quote file-authority, and #1060 adjacent
+        # nested-file scheme preservation, remains daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -119,6 +121,7 @@ component_management:
         # successful read's sampled parent, and retains failure-path identity.
         # #964 extends that retained metadata lifetime to the path-bound LCM
         # root, projects directory, and project leaf without changing ownership.
+        # #1062 keeps missing promote metadata no-clobber handling route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -241,6 +244,8 @@ component_management:
     - component_id: "unit-project-worktrees"
       name: "Unit - Projects and Worktrees"
       paths:
+        # #1070 preserves post-commit topology diagnostics in this existing
+        # reconciliation owner.
         # #974 keeps target-parent reconciliation hardening in this
         # existing component.
         # #866 export gather and project read preparation remain in this
@@ -255,6 +260,7 @@ component_management:
         - "^src/project-map\\.ts$"
         - "^src/worktree-reconciliation-fence\\.ts$"
         # #1044 keeps the existing owner; no taxonomy, status, or policy change.
+        # #1048 keeps target metadata leaf authentication in this owner.
         # #1069 preserves completed reconciliation evidence after retained
         # directory cleanup failures in this existing component.
         - "^src/worktree-reconciliation\\.ts$"
@@ -262,7 +268,13 @@ component_management:
       name: "Unit - Diagnostics"
       paths:
         - "^src/diagnose\\.ts$"
+        # #619 retains authenticated daemon pool observations across probe failures.
+        - "^src/storage/diagnostics\\.ts$"
+        - "^src/storage/diagnostic-renderer\\.ts$"
+        - "^src/storage/diagnostic-project\\.ts$"
+        - "^src/storage/postgresql/diagnostics\\.ts$"
         # #997 keeps doctor publication retry deadlines monotonic in this owner.
+        # #619 keeps observational doctor refusal guidance in this owner.
         - "src/doctor/"
     - component_id: "integration-service-managers"
       name: "Integration - Service Managers and Legacy Migration"
@@ -272,8 +284,9 @@ component_management:
         # #865/#950 keep post-start and explicit-restart publication convergence
         # inside the lifecycle owner, #944 keeps bounded daemon-tmp retry
         # guidance within the supervisor/lifecycle boundary, and #966 keeps
-        # optional birth-sample budgeting in lifecycle admission. Their paired
-        # managed lifecycle tests remain this component's coverage boundary.
+        # optional birth-sample budgeting in lifecycle admission. #1073 keeps
+        # bounded legacy PID/token evidence in the same lifecycle owner. Their
+        # paired managed lifecycle tests remain this component's coverage boundary.
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"

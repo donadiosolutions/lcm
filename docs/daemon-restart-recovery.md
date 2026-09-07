@@ -116,28 +116,31 @@ validates the complete effective configuration before asking the manager to
 replace the service, then waits for authenticated health. Run it once after a
 configuration or package update instead of starting a competing daemon.
 
-### Doctor recovery for stale daemon configuration
+### Doctor findings and explicit repair
 
-When the daemon is healthy and its version matches the installed LCM version,
-`lcm doctor` first performs the normal non-destructive daemon validation. If
-that validation identifies the managed service registration as exactly
-`stale-config`, doctor performs one authenticated restart using the same
-validated port, state paths, storage identity, executable, entrypoint, and
-user-service-manager safeguards. It then checks authenticated daemon health
-again before reporting the result.
+`lcm doctor` is observational. It checks existing-daemon identity and bounded
+authenticated health, then reports findings and operator commands. It does not
+start or restart the daemon, repair a service registration, clear notices, or
+write settings. A stale, unavailable, or unverified daemon remains unchanged.
 
-This behavior adds no new configuration options. It uses the existing daemon
-port, storage backend, runtime/entrypoint, state paths, and user manager
-configuration, and is invoked with `lcm doctor`.
+This inspection is invoked with `lcm doctor` and adds no new configuration options.
+Stale-configuration recovery uses the existing daemon port, storage backend,
+runtime/entrypoint, state paths, and user manager configuration. Doctor reports
+what it can verify from the current installation; it does not apply configuration
+changes or replace a stale service. Keep the intended configuration in place
+before requesting an explicit restart, which validates that configuration and
+the service identity before replacement.
 
-A successful repair is reported as a warning with `fixApplied: true` because
-doctor changed the managed service state; the output explicitly says that the
-stale configuration was repaired and the daemon restarted. Other lifecycle
-refusals are not converted into restart permission. If the explicit repair is
-refused, doctor reports a failure and keeps the lifecycle refusal's exact
-remediation, such as running `lcm daemon restart` for another explicit,
-fail-closed attempt. Do not manually stop a process or start a competing
-daemon.
+After a configuration or package change, use one explicit
+`lcm daemon restart` to request authenticated managed-service replacement.
+For stale Claude Code hooks or MCP settings, run `lcm install`; for another
+connector, run `lcm connectors install <agent>`. Rerun doctor after repair.
+These commands retain their normal identity checks and fail-closed refusals.
+Do not manually stop an unidentified process or start a competing daemon.
+
+Doctor's MCP check observes registration and static protocol capability. It
+reports live protocol readiness as not probed and never spawns a server for a
+handshake. Verify tools through the intended agent after connector repair.
 
 ## One-time migration after a Linux upgrade
 
@@ -146,8 +149,9 @@ inside the older generated transient systemd unit. v1.4.2 uses a stable
 state-root unit name, so the stable unit can initially appear absent while the
 older daemon is still serving requests.
 
-During `lcm doctor` or an explicit `lcm daemon restart`, LCM can migrate that
-old unit once, but only when all of these independent checks agree:
+During an explicit `lcm daemon restart`, LCM can migrate that old unit once,
+but only when all of these independent checks agree. `lcm doctor` leaves the
+legacy service unchanged:
 
 - the canonical `daemon.pid` is a stable, regular, non-symlink file naming a
   live process;
@@ -161,6 +165,12 @@ old unit once, but only when all of these independent checks agree:
   owns the configured `127.0.0.1` listener; and
 - a fresh discovery immediately before mutation still identifies the same
   single unit.
+
+Legacy migration reads at most 64 raw bytes from `daemon.pid` and 4,096 raw
+bytes from `daemon.token`, before trimming whitespace. LCM opens each leaf
+without following symlinks and in nonblocking mode. Oversized files, FIFOs,
+other non-regular leaves, and multiply-linked files are unsafe evidence, so
+migration refuses them without waiting for a FIFO writer.
 
 Discovery enumerates all systemd user services before applying the strict
 historical-name filter, so `reloading`, `refreshing`, `activating`,
@@ -198,12 +208,14 @@ LCM also treats descriptor cleanup as part of PID-evidence authentication. If
 closing the descriptor fails, the evidence is unsafe and migration stops before
 discovery, exact stop, unlink, or stable startup.
 
-If `daemon.pid` is already missing, LCM first performs the same bounded,
-strict legacy-unit discovery. A discovered historical unit cannot be
-authenticated without its PID evidence, so LCM preserves it and refuses a
-stable start. Normal absent startup continues only when discovery proves that
-no historical candidate exists. Unavailable or failed discovery also refuses
-rather than assuming absence.
+If `daemon.pid` is directly absent while its parent state directory retains
+the same identity, LCM first performs the same bounded, strict legacy-unit
+discovery. An access error, parent change, or disappearance during a bounded
+read is unsafe evidence rather than absence. A discovered historical unit
+cannot be authenticated without its PID evidence, so LCM preserves it and
+refuses a stable start. Normal absent startup continues only when discovery
+proves that no historical candidate exists. Unavailable or failed discovery
+also refuses rather than assuming absence.
 
 Ambiguous, replaced, symlinked, hardlinked, malformed, unauthorized, or
 otherwise incomplete evidence is left untouched. LCM refuses multiple or

@@ -9,6 +9,7 @@ const originalUserProfile = process.env.USERPROFILE;
 
 const state = vi.hoisted(() => ({
   afterHealth: undefined as (() => void) | undefined,
+  backend: "sqlite" as "sqlite" | "postgresql",
 }));
 
 vi.mock("../../src/daemon/version.js", async importOriginal => ({
@@ -25,7 +26,7 @@ vi.mock("../../src/daemon/client.js", () => ({
       return {
         status: "ok",
         version: "test",
-        storageBackend: "sqlite",
+        storageBackend: state.backend,
         entrypoint: "/opt/lcm/lcm.mjs",
         runtimeDigest: "runtime",
       };
@@ -49,7 +50,14 @@ vi.mock("../../src/daemon/client.js", () => ({
     }
 
     async get() {
-      return { totalConnections: 0, activeConnections: 0, idleConnections: 0, connections: [] };
+      return { backendDiagnostics: {
+        backend: state.backend, classification: "healthy", remediation: "No action required.",
+        publication: "ready", tls: "not-applicable", schema: "ready",
+        extensions: "not-applicable", search: "ready",
+        pool: { origin: "daemon", status: "ready", total: 0, idle: 0 },
+        project: { scope: "aggregate", status: "ready" },
+        identity: { status: "not-applicable" }, outbox: { status: "ready", captured: 0 },
+      } };
     }
   },
 }));
@@ -66,6 +74,7 @@ vi.mock("../../src/runtime-paths.js", async importOriginal => {
 
 afterEach(() => {
   state.afterHealth = undefined;
+  state.backend = "sqlite";
   vi.unstubAllEnvs();
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
@@ -137,6 +146,7 @@ describe("runCli healthy-daemon reads during publication", () => {
     writeFileSync(tokenPath, "test-token", { mode: 0o600 });
     state.afterHealth = () => {
       state.afterHealth = undefined;
+  state.backend = "sqlite";
   vi.unstubAllEnvs();
       writeFileSync(configPath, JSON.stringify({ storage: { backend: "postgresql" } }), { mode: 0o600 });
     };
@@ -149,7 +159,7 @@ describe("runCli healthy-daemon reads during publication", () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
-  it("refuses configured PostgreSQL pool stats from the snapshot before daemon health", async () => {
+  it("observes configured PostgreSQL pool stats without operational bootstrap", async () => {
     const home=mkdtempSync(join(tmpdir(),"lcm-cli-pool-pg-"));
     const root=join(home,".lcm");
     process.env.HOME=home;
@@ -164,11 +174,11 @@ describe("runCli healthy-daemon reads during publication", () => {
     vi.stubEnv("LCM_POSTGRES_MIGRATION_ROLE","lcm_test_migrator");
     const health=vi.fn();
     state.afterHealth=health;
+    state.backend="postgresql";
     try {
       const {runCli}=await import("../../bin/lcm.js");
-      await expect(runCli(["node","lcm","stats","--pool"]))
-        .rejects.toMatchObject({name:"StorageBackendUnavailableError"});
-      expect(health).not.toHaveBeenCalled();
+      await expect(runCli(["node","lcm","stats","--pool"])).resolves.toBeUndefined();
+      expect(health).toHaveBeenCalledOnce();
     } finally {rmSync(home,{recursive:true,force:true});}
   });
 
