@@ -141,6 +141,16 @@ retained chain remains stable. If contention coincides with journal-parent
 drift, LCM reports unsafe storage instead of retrying into the replacement;
 preserve the displaced entries and run `lcm doctor` before retrying.
 
+After source archival and project-map publication, a failure before the
+completed journal is durably published records a blocked journal from the
+archived phase and preserves the pending source hashes and backup evidence. A
+failure after durable completed publication leaves that completed journal in
+place, so a retry can return the published result without repeating merge or
+archival work. If an atomic completed-journal replacement reports an ambiguous
+published topology outcome before confirming success, LCM records the attempt
+as blocked from archived; a retry converges from the folded map and retained
+source evidence.
+
 LCM permanently fences legacy project and event databases against writes before
 committing their data to the canonical stores. After the merged databases pass
 foreign-key and FTS verification, the legacy project directory and event
@@ -179,6 +189,10 @@ link (`file has multiple hard links`). A deliberate user-created hard link also
 blocks reconciliation by design. Preserve the refused inode for inspection,
 then copy its verified content into a newly created owner-only temporary file in
 the target directory and atomically replace the `meta.json` directory entry.
+Before replacement, LCM serializes the complete canonical metadata once and
+requires that serialized form, including its trailing newline, to fit within
+the 1 MiB UTF-8 limit. An oversized candidate fails with `project metadata
+exceeds size limit` and leaves the existing metadata file unchanged.
 Copying over the existing hard-linked path does not break the link and does not
 repair the refusal. Rerun `lcm project reconcile-worktrees` after replacement;
 `lcm doctor` reports the blocked journal but does not retry it. Target database
