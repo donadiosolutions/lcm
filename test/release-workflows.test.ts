@@ -150,6 +150,9 @@ describe("release workflows", () => {
       version: "pnpm run version-packages",
       createGithubReleases: false,
     });
+    expect(changesets?.uses).toBe(
+      "changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d",
+    );
     expect(changesets?.env?.LCM_RELEASE_CHANNEL).toBe("${{ steps.channel.outputs.channel }}");
     expect(versionWorkflow.jobs.version.steps.indexOf(channel!)).toBeLessThan(
       versionWorkflow.jobs.version.steps.indexOf(changesets!),
