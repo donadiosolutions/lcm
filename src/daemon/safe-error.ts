@@ -133,15 +133,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (
       separator >= 0 &&
       exactFileScheme &&
-      (quotedPathEnded || (!foundFilePath && brackets === 0 && schemeQuote === 0)) &&
+      !foundFilePath &&
+      brackets === 0 &&
+      schemeQuote === 0 &&
       (char === "?" || char === "#")
     ) {
-      // A pathless authority or a closed quoted path has ended. Scan its
+      // An unquoted pathless file URL has finished its authority. Scan the
       // query or fragment from fresh state so nested URLs and standalone paths
-      // retain their own classification, including a leading backslash.
+      // retain their own classification.
       separator = -1;
-      brackets = 0;
-      quotedPathEnded = false;
       exactFileScheme = false;
       foundFilePath = false;
       filePathBracketDepth = 0;
@@ -204,7 +204,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (char === "/" && !quotedPathEnded) authority[index] = 1;
       if (
         exactFileScheme &&
-        // After an unquoted outer path, only a backslash in its query or
+        // After an outer path, only a backslash in its query or
         // fragment starts another file path. The delimiter must belong to
         // this URL, rather than an enclosing URL before its scheme separator.
         (!foundFilePath || (queryOrFragmentStart > separator && char === "\\")) &&

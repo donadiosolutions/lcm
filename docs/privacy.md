@@ -293,12 +293,10 @@ The `Security` section of the doctor output shows:
   existing path and prose delimiter behavior, and a matching quote closes the
   redacted path, even inside unmatched or path-wrapping brackets. The matching
   quote also stops that file URL from hiding a later standalone local path,
-  which is redacted in the same pass. A query or fragment after that closed
-  quoted path also redacts a root-relative Windows path beginning with a
-  backslash on the first pass, including after the closing wrapper. In an
-  unquoted file URL whose outer path was already redacted, a backslash path in
-  that URL's own query or fragment is also redacted while the file-URL context
-  remains active. Whitespace, URL-ending delimiters, and a nested non-file URL
+  which is redacted in the same pass. While an exact file URL's context remains
+  active, a backslash path in that URL's own query or fragment is redacted on
+  the first pass. This includes a query or fragment following a closed quoted
+  path, with or without a closing wrapper. Whitespace and URL-ending delimiters
   can end that context; this does not extend backslash redaction to unrelated
   text. A public URL glued directly after the closing quote or bracket without
   whitespace may be conservatively redacted:
@@ -309,9 +307,9 @@ The `Security` section of the doctor output shows:
   query-tail continuations. Separating the following public URL with whitespace
   preserves it byte-for-byte. Unspaced text after an apparent pathless closing
   apostrophe can be treated as continuing authority text, so an eventual path
-  can cause conservative redaction of that later text. Whitespace-separated following
-  prose or URLs are classified normally. Double quotes in non-file URLs or
-  structured text and ordinary quoted local paths retain their existing
+  can cause conservative redaction of that later text. Whitespace-separated
+  following prose or URLs are classified normally. Double quotes in non-file
+  URLs or structured text and ordinary quoted local paths retain their existing
   boundaries. Ordinary HTTP and HTTPS URLs retain their authorities, slashes,
   and paths. In an unquoted exact
   `file://` URL with no path, a `?` or `#` outside still-open brackets ends the

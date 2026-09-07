@@ -434,6 +434,58 @@ describe("sanitizeError", () => {
   });
 
   it.each([
+    ["'file://host'['/private'?a]\\Users\\SECRET", "'file://host'['<path>'?a]<path>"],
+    ["'file://host'['/private'#a]\\Users\\SECRET", "'file://host'['<path>'#a]<path>"],
+    ['"file://host["/private"?a]\\Users\\SECRET', '"file://host["<path>"?a]<path>'],
+    ['"file://host["/private"#a]\\Users\\SECRET', '"file://host["<path>"#a]<path>'],
+    ["'file://host'[['/private'?a]]\\Users\\SECRET", "'file://host'[['<path>'?a]]<path>"],
+    ["'file://host'[['/private'#a]]\\Users\\SECRET", "'file://host'[['<path>'#a]]<path>"],
+    ['"file://host[["/private"?a]]\\Users\\SECRET', '"file://host[["<path>"?a]]<path>'],
+    ['"file://host[["/private"#a]]\\Users\\SECRET', '"file://host[["<path>"#a]]<path>'],
+  ] as const)("retains open quoted wrapper context through query delimiters: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["'file://host'['/private']?https://y.test/p\\Users\\SECRET", "'file://host'['<path>']?https:<path>"],
+    ["'file://host'['/private']#https://y.test/p\\Users\\SECRET", "'file://host'['<path>']#https:<path>"],
+    ["'file://host'['/private']?http://y.test/p\\Users\\SECRET", "'file://host'['<path>']?http:<path>"],
+    ["'file://host'['/private']#http://y.test/p\\Users\\SECRET", "'file://host'['<path>']#http:<path>"],
+    ["'file://host'['/private']?https://y.test/p/Users/SECRET", "'file://host'['<path>']?https:<path>"],
+    ["'file://host'['/private']#https://y.test/p/Users/SECRET", "'file://host'['<path>']#https:<path>"],
+    ["'file://host'['/private']?http://y.test/p/Users/SECRET", "'file://host'['<path>']?http:<path>"],
+    ["'file://host'['/private']#http://y.test/p/Users/SECRET", "'file://host'['<path>']#http:<path>"],
+    ['"file://host["/private"]?https://y.test/p\\Users\\SECRET', '"file://host["<path>"]?https:<path>'],
+    ['"file://host["/private"]#https://y.test/p\\Users\\SECRET', '"file://host["<path>"]#https:<path>'],
+    ['"file://host["/private"]?http://y.test/p\\Users\\SECRET', '"file://host["<path>"]?http:<path>'],
+    ['"file://host["/private"]#http://y.test/p\\Users\\SECRET', '"file://host["<path>"]#http:<path>'],
+    ['"file://host["/private"]?https://y.test/p/Users/SECRET', '"file://host["<path>"]?https:<path>'],
+    ['"file://host["/private"]#https://y.test/p/Users/SECRET', '"file://host["<path>"]#https:<path>'],
+    ['"file://host["/private"]?http://y.test/p/Users/SECRET', '"file://host["<path>"]?http:<path>'],
+    ['"file://host["/private"]#http://y.test/p/Users/SECRET', '"file://host["<path>"]#http:<path>'],
+  ] as const)("retains conservative glued URL redaction after quoted query delimiters: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["'file://host'['/private']?x=[https://y.test/p]\\Users\\SECRET", "'file://host'['<path>']?x=[https:<path>]<path>"],
+    ["'file://host'['/private']#x=[http://y.test/p]\\Users\\SECRET", "'file://host'['<path>']#x=[http:<path>]<path>"],
+    ['"file://host["/private"]?x=[http://y.test/p]\\Users\\SECRET', '"file://host["<path>"]?x=[http:<path>]<path>'],
+    ['"file://host["/private"]#x=[https://y.test/p]\\Users\\SECRET', '"file://host["<path>"]#x=[https:<path>]<path>'],
+  ] as const)("redacts backslash tails after bracketed URLs in quoted file queries: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
     ["file://host.invalid/Users/outer.db?x=[a]\\Users\\canary\\private.db", "file://host.invalid<path>?x=[a]<path>"],
     ["file://host.invalid/Users/outer.db#x=[a]\\Users\\canary\\private.db", "file://host.invalid<path>#x=[a]<path>"],
     ["file://host.invalid/Users/outer.db?\\Users\\SECRET", "file://host.invalid<path>?<path>"],
