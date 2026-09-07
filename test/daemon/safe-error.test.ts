@@ -281,6 +281,231 @@ describe("sanitizeError", () => {
 
   it.each([
     [
+      "'file://host'name/Users/canary/private.db'",
+      "'file://host'name<path>'",
+    ],
+    [
+      "'file://ho'st'name/Users/canary/private.db'",
+      "'file://ho'st'name<path>'",
+    ],
+    [
+      "'file://host''name/Users/canary/private.db'",
+      "'file://host''name<path>'",
+    ],
+    [
+      "'file://host'name/My Files/private.db'",
+      "'file://host'name<path>'",
+    ],
+    [
+      "'file://host'name/Users/canary/private.db trailing prose",
+      "'file://host'name<path>",
+    ],
+    [
+      "'file://host'name/Users/canary/private.db\ntrailing prose",
+      "'file://host'name<path>\ntrailing prose",
+    ],
+    [
+      "'file://host'/Users/canary/private.db'",
+      "'file://host'<path>'",
+    ],
+    [
+      "'file://host'name/Users/canary/private.db' later'",
+      "'file://host'name<path>' later'",
+    ],
+    ["'file://host'name'", "'file://host'name'"],
+    ["'file://host'name/'", "'file://host'name/'"],
+    [
+      "'file://host'name' https://example.test/x'",
+      "'file://host'name' https://example.test/x'",
+    ],
+    [
+      "'https://host'name/Users/canary/private.db'",
+      "'https://host'name/Users/canary/private.db'",
+    ],
+    [
+      "'file://host'name/C:/Users/canary/private.db'",
+      "'file://host'name<path>'",
+    ],
+    [
+      "'file://host'name\\Users\\canary\\private.db'",
+      "'file://host'name<path>'",
+    ],
+    [
+      "'file://authority-authority-authority-authority-authority.invalid'name/Users/canary/private.db'",
+      "'file://authority-authority-authority-authority-authority.invalid'name<path>'",
+    ],
+    [
+      "'file://höst'name/Users/canary/private.db'",
+      "'file://höst'name<path>'",
+    ],
+    [
+      "'file://host;na,me')tail}/Users/canary/private.db'",
+      "'file://host;na,me')tail}<path>'",
+    ],
+    [
+      "'file://host'name?part/Users/canary/private.db'",
+      "'file://host'name?part<path>'",
+    ],
+    [
+      "'file://host'name#part/Users/canary/private.db'",
+      "'file://host'name#part<path>'",
+    ],
+    [
+      "'file://host'na me/Users/canary/private.db'",
+      "'file://host'na me/Users/canary/private.db'",
+    ],
+    [
+      "file://host'name/Users/canary/private.db",
+      "file://host'name<path>",
+    ],
+    [
+      '\"file://host\'name/Users/canary/private.db\"',
+      '\"file://host\'name<path>\"',
+    ],
+  ] as const)("handles ambiguous apostrophes in quoted file authorities: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    [
+      "'file://'file://host'/My Files/canary.db",
+      "'file://'file://host'<path>",
+    ],
+    [
+      "'file://'file://host'\\C:\\Users\\canary\\My Files\\canary.db",
+      "'file://'file://host'<path>",
+    ],
+    [
+      "ENOENT: 'file://'file://server'/Shared Docs/canary.db' not found",
+      "ENOENT: 'file://'file://server'<path>' not found",
+    ],
+    [
+      "'file://'FiLe://host'/My Files/canary.db",
+      "'file://'FiLe://host'<path>",
+    ],
+    [
+      "file://host'file://x/Users/canary/private.db",
+      "file://host'file:<path>",
+    ],
+    [
+      '\"file://host\'file://x/Users/canary/private.db\"',
+      '\"file://host\'file:<path>\"',
+    ],
+  ] as const)("redacts separately quoted nested file URL paths: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it("keeps compound nested file URL redaction idempotent", () => {
+    const input = "'file://host?;mefile://https://example.test/x'file://'file://}]'";
+    const first = sanitizeError(input);
+
+    expect(first).toBe("'file://host?;mefile:<path>'file://'file://}]'");
+    expect(sanitizeError(first)).toBe(first);
+  });
+
+  it("redacts a path after a bracket-wrapped quoted file path on the first pass", () => {
+    const result = sanitizeError("'file://host'['/private']?/Users/SECRET");
+
+    expect(result).toBe("'file://host'['<path>']?<path>");
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["'file://host'[['/private']]#/Users/SECRET", "'file://host'[['<path>']]#<path>"],
+    ['"file://host["/private"]?/Users/SECRET', '"file://host["<path>"]?<path>'],
+    ["'file://host'[\\C:\\private']?/Users/SECRET", "'file://host'[<path>']?<path>"],
+    ["'file://host'['/private'?/Users/SECRET", "'file://host'['<path>'?<path>"],
+  ] as const)("ends quoted file path classification inside brackets: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["'file://host'['/private']https://h]/Users/SECRET", "'file://host'['<path>']https:<path>]<path>"],
+    ["'file://host'['/private']\\Users\\SECRET", "'file://host'['<path>']<path>"],
+    ['"file://host["/private"]\\Users\\SECRET', '"file://host["<path>"]<path>'],
+    ["'file://host'['/private']\\D:\\SECRET", "'file://host'['<path>']<path>"],
+    ["'file://host'['/private'https://h)/Users/SECRET", "'file://host'['<path>'https:<path>)<path>"],
+    ["'file://host'['/private']https://h;/Users/SECRET", "'file://host'['<path>']https:<path>;<path>"],
+    ["'file://host'['/private']https://h\\D:\\SECRET", "'file://host'['<path>']https:<path>\\<path>"],
+    ["'file://host'['/private']https://pub.test/x\\C:\\Users\\SECRET", "'file://host'['<path>']https:<path>\\<path>"],
+    ['"file://host["/private"]https://h\\D:\\SECRET', '"file://host["<path>"]https:<path>\\<path>'],
+  ] as const)("redacts later paths after a bracketed path quote on the first pass: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["'file://host'['/private']https://pub.test/x", "'file://host'['<path>']https:<path>"],
+    ["'file://host'['/private'] https://pub.test/x", "'file://host'['<path>'] https://pub.test/x"],
+    ["'file://host'['/private'] at https://pub.test/x", "'file://host'['<path>'] at https://pub.test/x"],
+    ["'file://host'['/private'] https://h\\D:\\SECRET", "'file://host'['<path>'] https://h\\<path>"],
+    ["'file://host'['/private'] https://[fe80::1]/pub", "'file://host'['<path>'] https://[fe80::1]/pub"],
+  ] as const)("preserves public URLs after a bracketed path quote when separated by whitespace: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["/p\\D:\\E:\\SECRET", "<path>\\<path>"],
+    ["ENOENT: /private\\C:\\Users\\E:\\SECRET", "ENOENT: <path>\\<path>"],
+    ["'file://host'['/private']https://h\\D:\\E:\\SECRET", "'file://host'['<path>']https:<path>\\<path>"],
+    ["D:\\E:\\SECRET", "<path>"],
+  ] as const)("redacts nested Windows drives completely on the first pass: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["'file://host'name/a'/C:\\Users\\SECRET\\private.db", "'file://host'name<path>'<path>"],
+    ["'file://host'name/a'/c:\\Users\\SECRET\\private.db", "'file://host'name<path>'<path>"],
+    ['"file://host\'name/a"/C:\\Users\\SECRET\\private.db', '"file://host\'name<path>"<path>'],
+    ['"file://host\'name/a"/c:\\Users\\SECRET\\private.db', '"file://host\'name<path>"<path>'],
+    ["/C:\\Users\\SECRET", "<path>"],
+    ["/c:\\Users\\SECRET", "<path>"],
+    ["/private/C:\\Users\\SECRET", "<path>"],
+  ] as const)("redacts slash-prefixed Windows drives completely on the first pass: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["/AB:\\literal", "<path>:\\literal"],
+    ["/1:\\literal", "<path>:\\literal"],
+    ["/C:note\\literal", "<path>:note\\literal"],
+    ["/C:/public", "<path>:<path>"],
+  ] as const)("preserves non-drive colon boundaries after a POSIX span: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it("redacts a Windows drive following a bare POSIX path separately on the first pass", () => {
+    const result = sanitizeError("/private\\D:\\SECRET");
+
+    expect(result).toBe("<path>\\<path>");
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    [
       "file://remote.invalid[/Users/canary/one.db]/Users/canary/two.db",
       "file://remote.invalid[<path>]<path>",
     ],

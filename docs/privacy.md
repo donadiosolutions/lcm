@@ -294,15 +294,38 @@ The `Security` section of the doctor output shows:
   delimiters, including later colons, `?`, and `#`, end the redacted span, so
   text after those delimiters can remain visible. Before the first path
   separator, semicolons, commas, apostrophes, closing parentheses, and closing
-  braces remain part of an exact `file://` authority; after the path begins,
-  those characters retain their existing path and prose delimiter behavior.
-  A quote immediately before the `file` scheme establishes a quote boundary,
-  and its matching quote still terminates the URL. Before the first path
-  separator, an apostrophe inside an unquoted or double-quoted authority, or a
-  double quote inside an unquoted or apostrophe-quoted authority, remains
-  conservatively classified as authority text so a following local path is
-  redacted. Quotes after a file URL path begins, double quotes in non-file URLs
-  or structured text, and ordinary quoted local paths retain their existing
+  braces remain part of an exact `file://` authority. In a single-quoted exact
+  file URL, that includes an apostrophe matching the quote before the scheme;
+  it closes the current URL only when immediately followed by a fresh,
+  case-insensitive `file://` literal. That literal begins a separately quoted
+  nested file URL, preserving redaction of its path when the path contains
+  spaces. Otherwise, the matching apostrophe remains authority text. Before
+  the first path separator, an apostrophe inside an unquoted or double-quoted
+  authority, or a double quote inside an unquoted or apostrophe-quoted
+  authority, also remains conservatively classified as authority text so a
+  following local path is redacted. A matching double quote still closes a
+  double-quoted file URL. The existing outer-quoted query and fragment markers,
+  `?` and `#`, keep exact-file classification before the first path. Pre-path
+  whitespace resets classification. The remaining URL-ending punctuation
+  (`|`, `<`, `>`, and closing square brackets subject to the existing bracket
+  handling) ends it. After a path begins, these characters retain their
+  existing path and prose delimiter behavior, and a matching quote closes the
+  redacted path, even inside unmatched or path-wrapping brackets. The matching
+  quote also stops that file URL from hiding a later standalone local path,
+  which is redacted in the same pass. A public URL glued directly after the
+  closing quote or bracket without whitespace may be conservatively redacted:
+  `'file://host'['/private']https://pub.test/x` becomes
+  `'file://host'['<path>']https:<path>`. If that glued URL is followed by a
+  Windows drive path, the URL and drive path are redacted separately, as in
+  `https:<path>\<path>`. Conservative redaction can also extend through unspaced
+  query-tail continuations. Separating the following public URL with whitespace
+  preserves it byte-for-byte. A quoted path can contain spaces; redaction
+  continues to that matching quote, a newline, or EOF. Empty and root-only file
+  URLs remain unchanged. Unspaced text after an apparent pathless closing apostrophe can be
+  treated as continuing authority text, so an eventual path can cause
+  conservative redaction of that later text. Whitespace-separated following
+  prose or URLs are classified normally. Double quotes in non-file URLs or
+  structured text and ordinary quoted local paths retain their existing
   boundaries. Ordinary HTTP and HTTPS URLs retain their authorities, slashes,
   and paths. In an unquoted exact
   `file://` URL with no path, a `?` or `#` outside still-open brackets ends the
