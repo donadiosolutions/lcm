@@ -216,16 +216,19 @@ Reconciliation journals and project-sensitive pattern files are also
 authenticated before LCM reads their contents. A journal must be a regular
 file, have exactly one hard link, and use an
 owner-only mode (`0400`, `0500`, `0600`, or `0700`). Listing reconciliation
-state stops at the first journal that fails these checks instead of returning
-partially trusted results. Pattern files must be regular files with exactly
-one hard link. On platforms where Node.js exposes `process.getuid()`, both
+state checks only regular files with journal-shaped names and stops if one
+fails authentication. Non-regular entries, including symlinks, directories,
+and FIFOs, are currently skipped by listing. Pattern files that LCM reads must
+be regular files with exactly one hard link; an existing non-regular source
+pattern entry can currently be treated as absent before reaching that reader.
+On platforms where Node.js exposes `process.getuid()`, both
 readers also require the file to be owned by the current user; the ownership
 check is skipped when that API is unavailable. Historical pattern permissions,
 including `0644`, are accepted for reads. When reconciliation creates or
 rewrites a pattern file, the new file uses owner-only mode `0600`; a no-op
 merge leaves an existing pattern file and its permissions unchanged.
 
-An unauthenticated pattern blocks its current use and prevents publication of
+When a pattern read fails authentication, it blocks that use and publication of
 the folded project map. A later archive check can fail after the same verified
 content was merged, and the journal keeps that operation resumable. An
 unauthenticated journal is not overwritten with blocked state, so its original
