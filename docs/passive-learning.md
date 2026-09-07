@@ -330,6 +330,12 @@ recent errors, event payloads, and project paths are omitted from diagnostics.
 
 By default, doctor scans up to 50 passive-learning sidecar DBs. Use `lcm doctor --events-max-dbs <n>` to set another count limit, or `lcm doctor --events-max-dbs all` / `lcm doctor --events-max-dbs unlimited` to remove the count limit. Sidecars skipped because of the count or timeout budget are reported as skipped, not warnings.
 
+When a bounded scan stops before the end of the admitted file list, the
+numeric skipped count includes every remaining sidecar, including the current
+file. Verbose output still emits one representative skipped row so diagnostics
+remain bounded; use its count to interpret that row as the total number of
+sidecars skipped by the scan budget.
+
 Low nonzero backlog is reported as passing when both the daemon and its storage
 backend are healthy, because the daemon processes queued events automatically.
 If the daemon process is reachable while PostgreSQL storage is unavailable,
