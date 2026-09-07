@@ -655,9 +655,76 @@ describe("SQLite supplied canonical generation", () => {
     expect(await source.verifySource(description)).toBe("changed");
   });
 
+  it.each(["close", "final checkpoint", "transfer"])("rejects changed capture bytes with unchanged metadata at %s", async terminal => {
+    const file = fixture();
+    const source = await open(file);
+    const stream = await createPortableRecordStream(source);
+    const description = source.describeSource();
+    const before = filesystem.lstatSync(file.path, { bigint: true });
+    const beforeHash = sqlitePortableFileSha256(file.path);
+    const bytes = readFileSync(file.path); bytes[60] ^= 1; writeFileSync(file.path, bytes);
+    expect(sqlitePortableFileSha256(file.path)).not.toBe(beforeHash);
+    expect(filesystem.lstatSync(file.path, { bigint: true }).size).toBe(before.size);
+
+    // Model a same-size write inside filesystem timestamp granularity. Keep
+    // actual file bytes and every other identity field; mask both pathname and
+    // descriptor timestamps so final rejection must come from the real hash.
+    const originalLstat = filesystem.lstatSync;
+    vi.spyOn(filesystem, "lstatSync").mockImplementation(((path, options) => {
+      const stat = originalLstat(path, options as never);
+      return String(path) === file.path && (options as { bigint?: boolean })?.bigint
+        ? Object.assign(stat, { mtimeNs: before.mtimeNs, ctimeNs: before.ctimeNs }) : stat;
+    }) as typeof filesystem.lstatSync);
+    const originalOpen = filePromises.open;
+    let bytesRead = 0;
+    vi.spyOn(filePromises, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      if (String(args[0]) === file.path) {
+        const originalStat = handle.stat.bind(handle);
+        handle.stat = (async (...statArgs: Parameters<typeof handle.stat>) => Object.assign(
+          await originalStat(...statArgs), { mtimeNs: before.mtimeNs, ctimeNs: before.ctimeNs },
+        )) as typeof handle.stat;
+        const originalRead = handle.read.bind(handle);
+        handle.read = (async (...readArgs: Parameters<typeof handle.read>) => {
+          const result = await originalRead(...readArgs);
+          bytesRead += result.bytesRead;
+          return result;
+        }) as typeof handle.read;
+      }
+      return handle;
+    });
+    expect(source.describeSource()).toEqual(description);
+    await expect(source.readDomainPage(page("conversations")))
+      .resolves.toEqual({ predecessor: null, records: [], complete: true });
+    expect(await source.verifySource(description)).toBe("unchanged");
+    expect(bytesRead).toBe(0);
+    if (terminal === "close") await expect(source.close()).rejects.toMatchObject({ code: "source-changed" });
+    else if (terminal === "final checkpoint") {
+      const batch = await stream.readBatch({ domain: "passive-events", maxRecords: 500, maxBytes: PORTABLE_LIMITS.maxBatchBytes });
+      expect(bytesRead).toBe(0);
+      await expect(stream.verify(batch.checkpoint)).rejects.toMatchObject({ code: "source-changed" });
+    }
+    else {
+      const destination = await openSqlitePortableDestination({ databasePath: join(file.dir, "target.db"),
+        projectIdentity: identity, generationIdentitySha256: "b".repeat(64), mode: "create", scratchParent: file.dir });
+      try { await expect(runPortableTransfer({ source: stream, destination })).rejects.toMatchObject({ code: "source-changed" }); }
+      finally { await destination.close(); }
+    }
+    expect(bytesRead).toBe(Number(before.size));
+  });
+
   it.each(["bytes", "replacement", "permissions", "wal"])("revokes admitted authority on %s drift", async change => {
     const file = fixture(); const source = await open(file); const description = source.describeSource();
-    if (change === "bytes") { const bytes = readFileSync(file.path); bytes[60] ^= 1; writeFileSync(file.path, bytes); }
+    if (change === "bytes") {
+      const before = filesystem.lstatSync(file.path, { bigint: true });
+      const beforeHash = sqlitePortableFileSha256(file.path);
+      const bytes = readFileSync(file.path); bytes[60] ^= 1; writeFileSync(file.path, bytes);
+      // Immediate checks use metadata as a cache key. Advance mtime explicitly
+      // so this fixture cannot depend on the filesystem timestamp resolution.
+      filesystem.utimesSync(file.path, Number(before.atimeNs) / 1e9, Number(before.mtimeNs / 1_000_000_000n + 1n));
+      expect(filesystem.lstatSync(file.path, { bigint: true }).mtimeNs).toBeGreaterThan(before.mtimeNs);
+      expect(sqlitePortableFileSha256(file.path)).not.toBe(beforeHash);
+    }
     if (change === "replacement") { renameSync(file.path, `${file.path}.old`); writeFileSync(file.path, readFileSync(`${file.path}.old`), { mode: 0o600 }); }
     if (change === "permissions") chmodSync(file.path, 0o644);
     if (change === "wal") writeFileSync(`${file.path}-wal`, "unexpected captured WAL");

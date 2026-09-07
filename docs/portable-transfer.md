@@ -54,6 +54,14 @@ historical instant. The snapshot producer owns source quiescence and coherent
 capture across the database and sidecars. The snapshot workflow in #622 adds
 that guarantee; the transfer adapter does not create snapshots itself.
 
+During a SQLite capture's lifetime, ordinary reads recheck file identity and
+metadata and reuse the admitted digest while that metadata is unchanged. A
+same-size byte change with unchanged timestamps can therefore remain unseen by
+an intermediate raw read. Final transfer verification and source close force a
+full-file SHA-256 check: a capture that still differs from the admitted bytes
+cannot pass as a completed transfer. These checks do not replace the snapshot
+producer's responsibility to keep the source quiescent and its captures coherent.
+
 The PostgreSQL source first admits verified TLS, PostgreSQL 18, schema,
 privileges and the existing machine/project/path binding. It then holds a
 dedicated read-only repeatable-read session. All source reads are serialized on
