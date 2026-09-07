@@ -63,6 +63,8 @@ const expectedComponents = [
       "^src/legacy-names\\.ts$",
       "^src/private-mutation-lock\\.ts$",
       "^src/runtime-paths\\.ts$",
+      // #1195 keeps strict moduleAssetUrl resource resolution in this
+      // existing configuration-security owner.
       "^src/runtime-root\\.ts$",
       "^src/scrub\\.ts$",
       "^src/secret-key\\.ts$",
@@ -310,6 +312,8 @@ const expectedComponents = [
     name: "Integration - PostgreSQL Schema",
     paths: [
       "^src/storage/postgresql/extensions\\.ts$",
+      // #1195 keeps packaged SQL loading and checksum verification in
+      // the existing PostgreSQL schema owner.
       "^src/storage/postgresql/migrations\\.ts$",
       "^src/storage/postgresql/provisioning\\.ts$",
       "^src/storage/postgresql/runtime-readiness\\.ts$",
@@ -588,6 +592,8 @@ describe("Codecov configuration", () => {
       // #1041 preserves bootstrap directory authentication errors when
       // descriptor cleanup also fails in this existing owner.
       ["src/runtime-paths.ts", "unit-configuration-security"],
+      // #1195 strict module-relative asset resolution retains this owner.
+      ["src/runtime-root.ts", "unit-configuration-security"],
       ["src/security-files.ts", "unit-configuration-security"],
       ["src/sensitive.ts", "unit-configuration-security"],
       // #1049 keeps project metadata owner and single-link admission here.
@@ -653,6 +659,8 @@ describe("Codecov configuration", () => {
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
       ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
+      // #1195 checksummed packaged migration loading remains schema-owned.
+      ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"],
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.

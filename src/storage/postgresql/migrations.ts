@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { QueryResultRow } from "pg";
+import { moduleAssetUrl } from "../../runtime-root.js";
 import { StorageOperationError } from "../errors.js";
 import type {
   PostgreSqlMigration,
@@ -1111,7 +1112,11 @@ export function loadPostgreSqlMigrations(
   return MIGRATION_MANIFEST.map((entry) => {
     let sql: string;
     try {
-      sql = readMigration(new URL(`./migrations/${entry.filename}`, import.meta.url), "utf8");
+      sql = readMigration(moduleAssetUrl(
+        import.meta.url,
+        `./migrations/${entry.filename}`,
+        `./src/storage/postgresql/migrations/${entry.filename}`,
+      ), "utf8");
     } catch {
       throw migrationError("loadMigrations");
     }
