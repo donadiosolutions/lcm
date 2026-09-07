@@ -2278,6 +2278,7 @@ describe("runCli failure and alternate presentation branches", () => {
     expect((await invoke(["daemon", "start"]))?.message).toBe("exit:1");
     state.ensureDaemon.mockResolvedValueOnce({ connected: true, spawned: false, restartedForParent: true, pid: undefined, warning: "moved" });
     expect((await invoke(["daemon", "start"]))?.message).toBe("exit:0");
+    actualFs.rmSync(state.runtimeHome, { recursive: true, force: true });
     state.ensureDaemon.mockResolvedValueOnce({ connected: true, spawned: true, restartedForParent: false, pid: undefined });
     expect((await invoke(["daemon", "start"]))?.message).toBe("exit:0");
     state.ensureDaemon.mockResolvedValueOnce({ connected: true, spawned: false, restartedForParent: false, pid: undefined });
