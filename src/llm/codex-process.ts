@@ -73,6 +73,7 @@ const CODEX_FAILURE_MESSAGES = {
   "invalid-request": "Codex compaction request is invalid. Check the model, controls, or CLI compatibility.",
   "model-protocol": "Codex compaction model protocol was rejected. Retry later or choose another available model.",
   "upstream-request": "Codex compaction upstream request failed. Retry later or choose another available model.",
+  "upstream-stream": "Codex compaction upstream stream failed. Retry later or choose another available model.",
 } as const satisfies Readonly<Record<
   CodexResponsesGatewayFailureCategory | "model" | "invalid-request",
   string

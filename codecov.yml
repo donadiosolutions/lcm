@@ -160,6 +160,8 @@ component_management:
         # caller-cancellation handling during resolver teardown here.
         # #1154/#1157 keep Spark protocol normalization, bounded upstream
         # classification, and terminal sentinel handling in this owner.
+        # #1168 keeps accepted HTTP body and SSE failure classification in
+        # this LLM-owned component.
         - "src/llm/"
         - "src/prompts/"
     - component_id: "unit-local-persistence"
