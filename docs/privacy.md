@@ -321,13 +321,24 @@ The `Security` section of the doctor output shows:
   inside any URL starts a nested file URL. Once an outer URL has entered its
   query or fragment, the same literal also starts a nested file URL after any
   character other than an ASCII letter, including query value wrappers,
-  punctuation, and digits. ASCII-letter-glued names such as `profile://` and
-  `xfile://` remain ordinary URL text. LCM preserves the outer URL and replaces
-  only the nested file path. When recognized nested `file://` literals are
-  adjacent within an outer URL query or fragment, each unquoted literal ends
-  the preceding redacted path and keeps its complete scheme for independent
-  redaction. A quoted path still consumes a nested scheme through its matching
-  closing quote. This bounded rule does not decode percent-encoded schemes or
+  punctuation, and digits. At top level and in fresh query or fragment state,
+  ASCII-letter-glued names such as `profile://` and `xfile://` remain ordinary
+  URL text. Once an unquoted absolute path has started, an adjacent token whose
+  suffix is the exact case-insensitive `file://` spelling is conservatively
+  absorbed into the same redacted span. Its authority, including optional
+  userinfo, port, or bracketed host, and its following path are removed. This
+  can remove a non-secret host or port glued to a private path, preventing the
+  private tail from remaining visible after one sanitization pass. Ordinary
+  authority delimiters still end the absorbed span; later word-glued text is
+  classified independently and can remain visible even when it resembles a
+  local path. An opening `(` instead resumes the already active path scan, so
+  its following text remains in the redacted span. LCM preserves the outer URL
+  and replaces only the nested file path. When
+  recognized nested `file://` literals are adjacent within an outer URL query
+  or fragment, each unquoted literal ends the preceding redacted path and keeps
+  its complete scheme for independent redaction. A quoted path still consumes
+  a nested scheme through its matching closing quote. This bounded rule does
+  not decode percent-encoded schemes or
   recognize `file://` text in an ordinary URL path. Outer-quoted pathless file
   URLs retain their conservative file-path classification through `?` and `#`,
   so a nested non-file URL in that quoted span may still be redacted as a path.
