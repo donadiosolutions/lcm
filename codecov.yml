@@ -13,6 +13,7 @@ component_management:
         # #1088 keeps unsupported connector-list-format admission CLI-owned.
         # #978 keeps compact replacement runtime-digest admission CLI-owned.
         # #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
+        # #1132 keeps foreground PID publication at the CLI boundary.
         # #1201 keeps diagnostic-only identity admission CLI-owned.
         - "bin/"
         - "src/cli/"
@@ -84,6 +85,7 @@ component_management:
       paths:
         # Includes native adapters and the #726/#737 publication-diagnostic flow.
         # Claude's bounded session-completion acknowledgment remains hook-owned.
+        # #1155 keeps SessionStart local-outbox publication admission hook-owned.
         - "src/hooks/"
     # #1201 keeps process-only observation, its parser/client, and route allowlist here.
     - component_id: "unit-daemon-core"
@@ -195,6 +197,7 @@ component_management:
         # Includes current-token scopes and independently admitted factory health.
         # #622 keeps registered-project outbox preparation and admitted sidecar
         # discovery in the existing local-persistence component.
+        # #1140 fixed transfer-ledger control bounds stay local-persistence-owned.
         - "src/storage/sqlite/"
         - "src/store/"
     - component_id: "unit-storage-abstractions"
@@ -340,6 +343,7 @@ component_management:
         # optional birth-sample budgeting in lifecycle admission. #1073 keeps
         # bounded legacy PID/token evidence in the same lifecycle owner. Their
         # paired managed lifecycle tests remain this component's coverage boundary.
+        # #1132 keeps unscoped detached PID publication lifecycle-owned.
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"

@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Command } from "commander";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const state = vi.hoisted(() => ({
   exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
@@ -96,6 +98,10 @@ const state = vi.hoisted(() => ({
   progressState: undefined as undefined | Record<string, unknown>,
   writeFile: vi.fn(), unlink: vi.fn(), mkdir: vi.fn(),
   dispatchHook: vi.fn(async () => ({ stdout: "", exitCode: 0 })),
+  privateFsRoots: [] as string[],
+  runtimeHome: "/lcm",
+  runtimePidPath: "/lcm/daemon.pid",
+  runtimeTokenPath: "/lcm/daemon.token",
 }));
 
 vi.mock("../../src/daemon/version.js", async importOriginal => ({
@@ -113,21 +119,85 @@ vi.mock("node:process", async importOriginal => ({
   kill: state.killProcess,
   stdin: fakeStdin,
 }));
-vi.mock("node:fs", async importOriginal => ({
-  ...(await importOriginal<typeof import("node:fs")>()),
-  realpathSync: vi.fn((path: unknown) => String(path)),
-  readFileSync: vi.fn((path: unknown) => {
-    const key = String(path);
-    if (key.endsWith("package.json")) return JSON.stringify({ version: state.packageVersion });
-    if (state.readError !== undefined) throw state.readError;
-    return state.files.get(key) ?? state.fileText;
-  }),
-  existsSync: vi.fn((path: unknown) => state.exists.has(String(path))),
-  readdirSync: vi.fn(() => state.entries),
-  mkdirSync: state.mkdir,
-  writeFileSync: state.writeFile,
-  unlinkSync: state.unlink,
-}));
+vi.mock("node:fs", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const isPrivateFixturePath = (path: unknown): boolean => {
+    if (typeof path !== "string") return false;
+    return state.privateFsRoots.some(root => path === root || path.startsWith(`${root}/`));
+  };
+  const assertPrivatePidPath = (path: unknown): void => {
+    if (typeof path !== "string") return;
+    const separator = state.runtimePidPath.lastIndexOf("/");
+    const directory = state.runtimePidPath.slice(0, separator);
+    const basename = state.runtimePidPath.slice(separator + 1);
+    const isPidPublicationPath = path === directory
+      || path === state.runtimePidPath
+      || path.startsWith(`${directory}/.${basename}.`);
+    if (isPidPublicationPath && !isPrivateFixturePath(path)) {
+      throw new Error(`PID fixture path escaped its private root: ${path}`);
+    }
+  };
+  return {
+    ...actual,
+    realpathSync: vi.fn((path: unknown) => isPrivateFixturePath(path)
+      ? Reflect.apply(actual.realpathSync, actual, [path])
+      : String(path)),
+    readFileSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      if (isPrivateFixturePath(path)) {
+        return Reflect.apply(actual.readFileSync, actual, [path, ...args]);
+      }
+      const key = String(path);
+      if (key.endsWith("package.json")) return JSON.stringify({ version: state.packageVersion });
+      if (state.readError !== undefined) throw state.readError;
+      return state.files.get(key) ?? state.fileText;
+    }),
+    existsSync: vi.fn((path: unknown) => isPrivateFixturePath(path)
+      ? Reflect.apply(actual.existsSync, actual, [path])
+      : state.exists.has(String(path))),
+    readdirSync: vi.fn((path: unknown, ...args: unknown[]) => isPrivateFixturePath(path)
+      ? Reflect.apply(actual.readdirSync, actual, [path, ...args])
+      : state.entries),
+    mkdirSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      if (!isPrivateFixturePath(path)) return Reflect.apply(state.mkdir, state, [path, ...args]);
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.mkdirSync, actual, [path, ...args]);
+    }),
+    writeFileSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      if (typeof path === "number") {
+        return Reflect.apply(actual.writeFileSync, actual, [path, ...args]);
+      }
+      if (!isPrivateFixturePath(path)) return Reflect.apply(state.writeFile, state, [path, ...args]);
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.writeFileSync, actual, [path, ...args]);
+    }),
+    unlinkSync: vi.fn((path: unknown) => {
+      if (!isPrivateFixturePath(path)) return Reflect.apply(state.unlink, state, [path]);
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.unlinkSync, actual, [path]);
+    }),
+    chmodSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.chmodSync, actual, [path, ...args]);
+    }),
+    openSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.openSync, actual, [path, ...args]);
+    }),
+    lstatSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.lstatSync, actual, [path, ...args]);
+    }),
+    renameSync: vi.fn((source: unknown, destination: unknown) => {
+      assertPrivatePidPath(source);
+      assertPrivatePidPath(destination);
+      return Reflect.apply(actual.renameSync, actual, [source, destination]);
+    }),
+    rmSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.rmSync, actual, [path, ...args]);
+    }),
+  };
+});
 vi.mock("../../src/storage/backend-publication.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../../src/storage/backend-publication.js")>();
   return {
@@ -137,8 +207,8 @@ vi.mock("../../src/storage/backend-publication.js", async importOriginal => {
 });
 vi.mock("../../src/runtime-paths.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/runtime-paths.js")>()),
-  configPath: () => "/lcm/.lcm/config.json", daemonPidPath: () => "/lcm/daemon.pid",
-  daemonTokenPath: () => "/lcm/daemon.token", lcmHomeDir: () => "/lcm",
+  configPath: () => "/lcm/.lcm/config.json", daemonPidPath: () => state.runtimePidPath,
+  daemonTokenPath: () => state.runtimeTokenPath, lcmHomeDir: () => state.runtimeHome,
   migrateLegacyHomeIfNeeded: state.migrateLegacyHome, projectsDir: () => "/lcm/projects",
 }));
 vi.mock("../../src/daemon/config.js", async importOriginal => ({
@@ -258,6 +328,9 @@ const {
   compactFailureExitCode, registerMachineCommand, registerMemoryCommands, registerProjectCommand,
   resolveCompactRequestPolicyOverride, resolveManualCompactProvider, runCli, withHookOverrides,
 } = await import("../../bin/lcm.js");
+const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+
+let foregroundFixtureRoot: string | undefined;
 
 type ActionHandler = (...args: any[]) => unknown;
 
@@ -325,6 +398,12 @@ beforeEach(() => {
   state.cancelInvocation.mockClear();
   state.finishInvocation.mockClear();
   state.authToken = "test-token";
+  foregroundFixtureRoot = actualFs.mkdtempSync(join(tmpdir(), "lcm-run-cli-boundaries-pid-"));
+  state.privateFsRoots = [foregroundFixtureRoot];
+  state.runtimeHome = join(foregroundFixtureRoot, "state");
+  state.runtimePidPath = join(state.runtimeHome, "daemon.pid");
+  state.runtimeTokenPath = join(state.runtimeHome, "daemon.token");
+  actualFs.mkdirSync(state.runtimeHome, { recursive: true, mode: 0o700 });
   state.migrateLegacyHome.mockReset();
   state.portableResult = { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false };
   state.cliProjects = [];
@@ -366,6 +445,11 @@ afterEach(() => {
   if (stderrIsTTYDescriptor) Object.defineProperty(process.stderr, "isTTY", stderrIsTTYDescriptor);
   else Reflect.deleteProperty(process.stderr, "isTTY");
   vi.restoreAllMocks();
+  if (foregroundFixtureRoot !== undefined) {
+    actualFs.rmSync(foregroundFixtureRoot, { recursive: true, force: true });
+    foregroundFixtureRoot = undefined;
+  }
+  state.privateFsRoots = [];
 });
 
 describe("runCli identity boundaries", () => {
@@ -702,20 +786,25 @@ describe("runCli lifecycle and connector boundaries", () => {
     state.restartDaemon.mockResolvedValueOnce({ connected: true, restarted: false, spawned: true, pid: 9, warning: "started" });
     expect((await invoke(["daemon", "restart"]))?.message).toBe("exit:0");
 
-    state.files.set("/lcm/daemon.pid", String(process.pid));
     expect(await invoke(["daemon", "start", "--foreground"])).toBeUndefined();
+    expect(actualFs.readFileSync(state.runtimePidPath, "utf-8")).toBe(String(process.pid));
+    const published = actualFs.lstatSync(state.runtimePidPath);
+    expect(published.isFile()).toBe(true);
+    expect(published.nlink).toBe(1);
+    expect(published.mode & 0o777).toBe(0o600);
     const exitHandler = on.mock.calls.find(([event]) => event === "exit")?.[1] as (() => void);
     exitHandler();
-    expect(state.unlink).toHaveBeenCalledWith("/lcm/daemon.pid");
+    expect(actualFs.existsSync(state.runtimePidPath)).toBe(false);
     for (const signal of ["SIGTERM", "SIGINT"]) {
       const handler = on.mock.calls.find(([event]) => event === signal)?.[1] as (() => void);
       expect(() => handler()).toThrow("exit:0");
     }
 
-    state.files.set("/lcm/daemon.pid", "someone-else");
     await invoke(["daemon", "start", "--foreground"]);
     const mismatchCleanup = on.mock.calls.filter(([event]) => event === "exit").at(-1)?.[1] as (() => void);
+    actualFs.writeFileSync(state.runtimePidPath, "someone-else");
     mismatchCleanup();
+    expect(actualFs.readFileSync(state.runtimePidPath, "utf-8")).toBe("someone-else");
   });
 
   it("reports compact startup and health failures", async () => {

@@ -2237,7 +2237,8 @@ export async function runCli(
       const { createDaemon } = await import("../src/daemon/server.js");
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
       const { ensureAuthToken } = await import("../src/daemon/auth.js");
-      const { writeFileSync, mkdirSync, readFileSync, unlinkSync } = await import("node:fs");
+      const { mkdirSync, readFileSync, unlinkSync } = await import("node:fs");
+      const { atomicWritePrivateFile } = await import("../src/security-files.js");
       const lcDir = lcmHomeDir();
       const tokenPath = join(lcDir, "daemon.token");
       ensureAuthToken(tokenPath);
@@ -2260,7 +2261,7 @@ export async function runCli(
           : {}),
       });
       mkdirSync(lcDir, { recursive: true });
-      writeFileSync(pidFilePath, String(process.pid));
+      atomicWritePrivateFile(pidFilePath, String(process.pid));
       process.on("exit", cleanupPidFile);
       console.log(`lcm daemon started on port ${daemon.address().port}`);
       let stopping: Promise<void> | undefined;
