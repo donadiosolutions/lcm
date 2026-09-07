@@ -188,13 +188,16 @@ durable merge markers make the explicit retry resumable.
 
 Reconciliation journals and project-sensitive pattern files are also
 authenticated before LCM reads their contents. A journal must be a regular
-file owned by the current user, have exactly one hard link, and use an
+file, have exactly one hard link, and use an
 owner-only mode (`0400`, `0500`, `0600`, or `0700`). Listing reconciliation
 state stops at the first journal that fails these checks instead of returning
-partially trusted results. Pattern files must be regular files owned by the
-current user with exactly one hard link. Their historical permissions remain
-compatible, including `0644`; reconciliation does not impose an owner-only
-mode on patterns.
+partially trusted results. Pattern files must be regular files with exactly
+one hard link. On platforms where Node.js exposes `process.getuid()`, both
+readers also require the file to be owned by the current user; the ownership
+check is skipped when that API is unavailable. Historical pattern permissions,
+including `0644`, are accepted for reads. When reconciliation creates or
+rewrites a pattern file, the new file uses owner-only mode `0600`; a no-op
+merge leaves an existing pattern file and its permissions unchanged.
 
 An unauthenticated pattern blocks its current use and prevents publication of
 the folded project map. A later archive check can fail after the same verified
