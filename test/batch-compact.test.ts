@@ -470,23 +470,29 @@ describe("batch compaction discovery", () => {
       vi.resetModules();
       vi.doMock("node:fs", async (importOriginal) => {
         const actual = await importOriginal<typeof import("node:fs")>();
+        const metadataIdentity = actual.statSync(paths.metaPath);
+        const isMetadataIdentity = (stat: { dev: bigint | number; ino: bigint | number }): boolean =>
+          String(stat.dev) === String(metadataIdentity.dev)
+          && String(stat.ino) === String(metadataIdentity.ino);
+        const withForeignUid = <T extends { uid: bigint | number }>(stat: T): T => new Proxy(stat, {
+          get(target, property, receiver) {
+            if (property === "uid") {
+              return typeof target.uid === "bigint"
+                ? target.uid + 1n
+                : target.uid + 1;
+            }
+            return Reflect.get(target, property, receiver);
+          },
+        });
         return {
           ...actual,
           fstatSync: (fd: number, options?: unknown) => {
             const stat = actual.fstatSync(fd, options as never);
-            let descriptorPath: string | undefined;
-            try { descriptorPath = actual.readlinkSync(`/proc/self/fd/${fd}`); } catch {}
-            if (descriptorPath !== paths.metaPath) return stat;
-            return new Proxy(stat, {
-              get(target, property, receiver) {
-                if (property === "uid") {
-                  return typeof target.uid === "bigint"
-                    ? target.uid + 1n
-                    : target.uid + 1;
-                }
-                return Reflect.get(target, property, receiver);
-              },
-            });
+            return isMetadataIdentity(stat) ? withForeignUid(stat) : stat;
+          },
+          statSync: (path: Parameters<typeof actual.statSync>[0], options?: unknown) => {
+            const stat = actual.statSync(path, options as never);
+            return path === paths.metaPath && isMetadataIdentity(stat) ? withForeignUid(stat) : stat;
           },
         };
       });

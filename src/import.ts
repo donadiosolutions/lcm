@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, existsSync, lstatSync } from "node:fs";
+import { readdirSync, existsSync, lstatSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import type { DaemonClient } from "./daemon/client.js";

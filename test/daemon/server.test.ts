@@ -1212,28 +1212,79 @@ describe("daemon server", () => {
       JSON.stringify({ message: { role: "user", content: "uid question" } }),
       JSON.stringify({ message: { role: "assistant", content: "uid answer" } }),
     ].join("\n") + "\n");
-    daemon = await createDaemon(
-      loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } }),
-      { publicationConfigPath: configPath },
-    );
+    const metaPath = join(projectDir, "meta.json");
+    const ingestCwds: string[] = [];
     const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
-    const actualUid = process.getuid?.() ?? 0;
     const dbPath = join(projectsDir, projectModule.projectId(cwd), "db.sqlite");
 
     try {
-      Object.defineProperty(process, "getuid", {
-        value: () => actualUid + 1,
-        configurable: true,
+      vi.resetModules();
+      vi.doMock("node:fs", async (importOriginal) => {
+        const actual = await importOriginal<typeof import("node:fs")>();
+        const metadataIdentity = actual.statSync(metaPath);
+        const isMetadataIdentity = (stat: { dev: bigint | number; ino: bigint | number }): boolean =>
+          String(stat.dev) === String(metadataIdentity.dev)
+          && String(stat.ino) === String(metadataIdentity.ino);
+        const withForeignUid = <T extends { uid: bigint | number }>(stat: T): T => new Proxy(stat, {
+          get(target, property, receiver) {
+            if (property === "uid") {
+              return typeof target.uid === "bigint"
+                ? target.uid + 1n
+                : target.uid + 1;
+            }
+            return Reflect.get(target, property, receiver);
+          },
+        });
+        return {
+          ...actual,
+          fstatSync: (fd: number, options?: unknown) => {
+            const stat = actual.fstatSync(fd, options as never);
+            return isMetadataIdentity(stat) ? withForeignUid(stat) : stat;
+          },
+          statSync: (path: Parameters<typeof actual.statSync>[0], options?: unknown) => {
+            const stat = actual.statSync(path, options as never);
+            return path === metaPath && isMetadataIdentity(stat) ? withForeignUid(stat) : stat;
+          },
+        };
       });
+      vi.doMock("../../src/daemon/routes/ingest.js", async (importOriginal) => {
+        const actual = await importOriginal<typeof import("../../src/daemon/routes/ingest.js")>();
+        return {
+          ...actual,
+          createIngestHandler: (...args: Parameters<typeof actual.createIngestHandler>) => {
+            const handler = actual.createIngestHandler(...args);
+            return async (...handlerArgs: Parameters<typeof handler>) => {
+              const body = JSON.parse(handlerArgs[2]) as { cwd?: string };
+              if (body.cwd) ingestCwds.push(body.cwd);
+              return handler(...handlerArgs);
+            };
+          },
+        };
+      });
+      const isolated = await import("../../src/daemon/server.js");
+      daemon = await isolated.createDaemon(
+        loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } }),
+        { publicationConfigPath: configPath },
+      );
+
       await scanner.run();
+      expect(ingestCwds).toEqual([]);
       expect(existsSync(dbPath)).toBe(false);
 
       Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
       await scanner.run();
+      expect(ingestCwds).toEqual([cwd]);
       expect(existsSync(dbPath)).toBe(true);
     } finally {
       if (descriptor) Object.defineProperty(process, "getuid", descriptor);
       else delete (process as { getuid?: unknown }).getuid;
+      if (daemon) {
+        await daemon.stop();
+        daemon = undefined;
+      }
+      vi.doUnmock("node:fs");
+      vi.doUnmock("../../src/daemon/routes/ingest.js");
+      vi.resetModules();
     }
   });
 });
