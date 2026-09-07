@@ -165,6 +165,7 @@ export async function handleUserPromptSubmit(
         ensureProjectDir(cwd);
       }
     } catch (e) {
+      if (e instanceof LocalHookDurabilityTimeoutError) throw e;
       if (isBackendPublicationJournalError(e)) {
         if (isBackendPublicationEvidenceMissing(e)) return emptyHookResponse();
         throw e;
