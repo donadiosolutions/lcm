@@ -255,6 +255,8 @@ component_management:
         # #1048 keeps target metadata leaf authentication in this owner.
         # #1069 preserves completed reconciliation evidence after retained
         # directory cleanup failures in this existing component.
+        # #1107 and #1109 keep pattern and journal leaf authentication in this
+        # existing component; no taxonomy, status, or policy change.
         - "^src/worktree-reconciliation\\.ts$"
     - component_id: "unit-diagnostics"
       name: "Unit - Diagnostics"

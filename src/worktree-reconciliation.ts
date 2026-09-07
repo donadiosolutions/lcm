@@ -45,6 +45,7 @@ import {
   openPrivateDirectory,
   openPrivateDirectoryForCreation,
   openPrivateDirectoryIfExists,
+  OWNER_ONLY_FILE_MODES,
   readBoundedRegularFile,
   type PrivateDirectoryHandle,
 } from "./security-files.js";
@@ -392,6 +393,9 @@ function readJournal(path: string): ReconciliationJournal | null {
   const value = JSON.parse(readBoundedRegularFile(path, {
     allowedRoot: dirname(path),
     maxBytes: MAX_JOURNAL_BYTES,
+    expectedUid: process.getuid?.(),
+    allowedModes: OWNER_ONLY_FILE_MODES,
+    requireSingleLink: true,
   })) as Partial<ReconciliationJournal>;
   if (
     value.version !== RECONCILIATION_VERSION
@@ -1794,6 +1798,8 @@ function mergePatterns(
   const sourceContent = readBoundedRegularFile(sourcePath, {
     allowedRoot: source.projectDir,
     maxBytes: MAX_PATTERN_BYTES,
+    expectedUid: process.getuid?.(),
+    requireSingleLink: true,
   });
   if (
     expected.patternsDigest === undefined
@@ -1807,7 +1813,12 @@ function mergePatterns(
   assertTarget();
   const targetExists = isRegularFile(targetPath);
   const target = targetExists
-    ? readBoundedRegularFile(targetPath, { allowedRoot: targetDir, maxBytes: MAX_PATTERN_BYTES })
+    ? readBoundedRegularFile(targetPath, {
+        allowedRoot: targetDir,
+        maxBytes: MAX_PATTERN_BYTES,
+        expectedUid: process.getuid?.(),
+        requireSingleLink: true,
+      })
     : "";
   assertTarget();
   const targetEffective = new Set(effectivePatterns(target));
@@ -1881,6 +1892,8 @@ function sourceComponentSnapshot(
             readBoundedRegularFile(patternsPath, {
               allowedRoot: source.projectDir,
               maxBytes: MAX_PATTERN_BYTES,
+              expectedUid: process.getuid?.(),
+              requireSingleLink: true,
             }),
           ),
         }
@@ -2086,6 +2099,8 @@ function assertArchivedPatternsMatch(
   const archivedContent = readBoundedRegularFile(archivedPatternsPath, {
     allowedRoot: archivedProjectDir,
     maxBytes: MAX_PATTERN_BYTES,
+    expectedUid: process.getuid?.(),
+    requireSingleLink: true,
   });
   if (
     expected.patternsDigest === undefined
@@ -2663,7 +2678,12 @@ export function reconcileWorktrees(
       if (error instanceof BackendPublicationJournalError) throw error;
       if (opts.dryRun) throw error;
       if (completion.marked) throw error;
-      const current = readJournal(journalFile);
+      let current: ReconciliationJournal | null;
+      try {
+        current = readJournal(journalFile);
+      } catch {
+        throw error;
+      }
       if (current && resolve(current.canonical) !== canonical) throw error;
       {
         const now = new Date().toISOString();

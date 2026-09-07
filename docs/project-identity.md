@@ -176,6 +176,27 @@ or pattern merges may already have completed before this late metadata check,
 so a journal blocked from the planned phase does not promise rollback; the
 durable merge markers make the explicit retry resumable.
 
+Reconciliation journals and project-sensitive pattern files are also
+authenticated before LCM reads their contents. A journal must be a regular
+file owned by the current user, have exactly one hard link, and use an
+owner-only mode (`0400`, `0500`, `0600`, or `0700`). Listing reconciliation
+state stops at the first journal that fails these checks instead of returning
+partially trusted results. Pattern files must be regular files owned by the
+current user with exactly one hard link. Their historical permissions remain
+compatible, including `0644`; reconciliation does not impose an owner-only
+mode on patterns.
+
+An unauthenticated pattern blocks its current use and prevents publication of
+the folded project map. A later archive check can fail after the same verified
+content was merged, and the journal keeps that operation resumable. An
+unauthenticated journal is not overwritten with blocked state, so its original
+inode and bytes remain available for inspection. After verifying the content,
+recover either file by creating a separate user-owned file, copying the
+verified bytes into it, and atomically replacing the refused path. Do not
+repair a hard-linked file with `chmod`: that changes the shared inode and every
+external link while leaving the unsafe link count unchanged. Rerun
+`lcm project reconcile-worktrees` after replacing the file.
+
 Reconciliation also fingerprints every mapped path so a repaired or remounted
 worktree invalidates a completed discovery result. An `ENOTDIR` observation for
 an unrelated map entry is recorded as stable unavailable evidence instead of
