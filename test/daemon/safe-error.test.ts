@@ -896,6 +896,35 @@ describe("sanitizeError", () => {
   });
 
   it.each([
+    ["file://h?x=/a:[/\\]", "file://h?x=<path>:[<path>]"],
+    ["file://h#x=/a:[/\\\\]", "file://h#x=<path>:[<path>]"],
+    ["file://h?x=[word/\\]", "file://h?x=[word<path>]"],
+    ["file://h#x=[-/\\\\]", "file://h#x=[-<path>]"],
+    ["file://h?x=[/]", "file://h?x=[<path>]"],
+    [
+      "file://h#x=[/C:\\Users\\canary\\private.db]",
+      "file://h#x=[<path>]",
+    ],
+    [
+      "file://h?x=[/c:/Users/canary/private.db]",
+      "file://h?x=[<path>]",
+    ],
+    [
+      "file://h?x=[/\\\\server\\share\\private.db]",
+      "file://h?x=[<path>]",
+    ],
+    [
+      "file://h#x=[/Users/canary/private.db]",
+      "file://h#x=[<path>]",
+    ],
+  ] as const)("redacts forced bracket paths in one stable pass: %#", (input, expected) => {
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  it.each([
     [
       "'file://host.invalid?x=/Users/canary/My Files/x'",
       "'file://host.invalid?x=<path>'",
