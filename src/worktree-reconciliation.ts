@@ -1821,6 +1821,8 @@ function writeCanonicalTargetMetadata(
     const parsed = JSON.parse(readBoundedRegularFile(metaPath, {
       allowedRoot: targetDir,
       maxBytes: MAX_PROJECT_METADATA_BYTES,
+      expectedUid: targetParent.witness.uid,
+      requireSingleLink: true,
     })) as unknown;
     assertTarget();
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
