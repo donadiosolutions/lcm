@@ -9,6 +9,7 @@ import { loadDaemonConfig } from "../src/daemon/config.js";
 import { createRestoreHandler } from "../src/daemon/routes/restore.js";
 import type { StorageBackendFactory } from "../src/storage/index.js";
 import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
+import { getLcmDbFeatures } from "../src/db/features.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { PromotedStore } from "../src/db/promoted.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
@@ -33,7 +34,7 @@ function createRouteFixture(prefix: string): { dir: string; db: DatabaseSync; st
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   runLcmMigrations(db);
-  return { dir, db, store: new PromotedStore(db) };
+  return { dir, db, store: new PromotedStore(db, getLcmDbFeatures(db).fts5Available) };
 }
 
 async function routePost(daemon: Awaited<ReturnType<typeof createDaemon>>, path: string, body: Record<string, unknown>) {
@@ -297,7 +298,7 @@ describe("spawned timezone fixtures", () => {
       openExistingProject: async () => null,
       openProject: async () => {
         const routeDb = new DatabaseSync(projectDbPath(dir));
-        const routeStore = new PromotedStore(routeDb);
+        const routeStore = new PromotedStore(routeDb, getLcmDbFeatures(routeDb).fts5Available);
         return {
           summaries: { listRecentSummariesForSession: async () => [] },
           lexicalSearch: {
