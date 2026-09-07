@@ -54,6 +54,10 @@ for example `lcm export --tags decision,architecture`.
 only `json`; unsupported values are rejected before export work or output
 writes begin.
 
+`lcm connectors list` writes text by default. Its optional `--format` value
+accepts `text` or `json`; unsupported values are rejected before connector
+inventory is read or output is written.
+
 An unknown command writes an error and the complete command list to the
 terminal, completes both outputs, and then exits with status 1.
 
