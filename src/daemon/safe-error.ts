@@ -312,6 +312,7 @@ function scanAbsolutePath(
       let authorityBrackets = 0;
       while (cursor < chars.length) {
         const authorityChar = chars[cursor];
+        if (nestedFileSchemeStarts[cursor] === 1) break;
         if (authorityChar === "/" || authorityChar === "\\") break;
         if (
           authorityChar === " " ||

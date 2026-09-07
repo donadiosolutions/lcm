@@ -799,7 +799,7 @@ describe("sanitizeError", () => {
     expect(sanitizeError(firstPass)).toBe(expected);
   });
 
-  it("hands a recognized nested file marker off from a glued authority", () => {
+  it("hands a recognized nested file marker off after an authority delimiter", () => {
     const input =
       "https://outer.test/x?q=file://one.invalid/Users/afile://h1.invalid?x=file://h2.invalid/Users/c";
     const expected =
@@ -810,6 +810,48 @@ describe("sanitizeError", () => {
     expect(firstPass).not.toContain("/Users");
     expect(firstPass.match(/<path>/g)).toHaveLength(2);
     expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  it.each(["-", "1", "[", ".", "_", "@", "+", "~", "%", "$", "*", ":"] as const)(
+    "preserves an authority-internal nested file marker after %s glue",
+    (glue) => {
+      const input =
+        `https://outer.test/x?q=file://one.invalid/Users/afile://h1.invalid${glue}` +
+        "file://h2.invalid/Users/b";
+      const expected =
+        "https://outer.test/x?q=file://one.invalid<path>file://h2.invalid<path>";
+      const firstPass = sanitizeError(input);
+
+      expect(firstPass).toBe(expected);
+      expect(firstPass).not.toContain("/Users");
+      expect(firstPass.match(/<path>/g)).toHaveLength(2);
+      expect(sanitizeError(firstPass)).toBe(expected);
+      expect(sanitizeError(sanitizeError(firstPass))).toBe(expected);
+    },
+  );
+
+  it("keeps a word-glued private-looking tail beyond an ordinary authority delimiter", () => {
+    const input =
+      "https://outer.test/x?q=file://one.invalid/Users/afile://h]tail/Users/b";
+    const expected =
+      "https://outer.test/x?q=file://one.invalid<path>]tail/Users/b";
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+    expect(sanitizeError(sanitizeError(firstPass))).toBe(expected);
+  });
+
+  it("resumes active path scanning at an opening parenthesis after an authority", () => {
+    const input =
+      "https://outer.test/x?q=file://one.invalid/Users/afile://h(tail/Users/b";
+    const expected = "https://outer.test/x?q=file://one.invalid<path>";
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(firstPass).not.toContain("/Users");
+    expect(sanitizeError(firstPass)).toBe(expected);
+    expect(sanitizeError(sanitizeError(firstPass))).toBe(expected);
   });
 
   it("preserves recognized nested file handoff with a port", () => {

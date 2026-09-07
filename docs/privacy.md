@@ -305,8 +305,12 @@ The `Security` section of the doctor output shows:
   absorbed into the same redacted span. Its authority, including optional
   userinfo, port, or bracketed host, and its following path are removed. This
   can remove a non-secret host or port glued to a private path, preventing the
-  private tail from remaining visible after one sanitization pass. LCM
-  preserves the outer URL and replaces only the nested file path. When
+  private tail from remaining visible after one sanitization pass. Ordinary
+  authority delimiters still end the absorbed span; later word-glued text is
+  classified independently and can remain visible even when it resembles a
+  local path. An opening `(` instead resumes the already active path scan, so
+  its following text remains in the redacted span. LCM preserves the outer URL
+  and replaces only the nested file path. When
   recognized nested `file://` literals are adjacent within an outer URL query
   or fragment, each unquoted literal ends the preceding redacted path and keeps
   its complete scheme for independent redaction. A quoted path still consumes
