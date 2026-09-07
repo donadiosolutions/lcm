@@ -320,6 +320,25 @@ function isWindowsDrivePathStart(chars: readonly string[], index: number): boole
   return !isPathWord(chars[index - 1]);
 }
 
+function startsUrlSchemeLiteral(chars: readonly string[], index: number): boolean {
+  if (!URL_SCHEME_START_PATTERN.test(chars[index] ?? "")) return false;
+  let cursor = index + 1;
+  while (URL_SCHEME_CHARACTER_PATTERN.test(chars[cursor] ?? "")) cursor += 1;
+  return chars[cursor] === ":" && chars[cursor + 1] === "/" && chars[cursor + 2] === "/";
+}
+
+function isDoubledDriveColonInPath(chars: readonly string[], index: number, windows: boolean): boolean {
+  const boundary = chars[index - 2];
+  return (
+    chars[index] === ":" &&
+    chars[index + 1] === ":" &&
+    chars[index + 2] === "\\" &&
+    /^[A-Za-z]$/u.test(chars[index - 1] ?? "") &&
+    (boundary === "\\" || (windows && boundary === "/")) &&
+    !startsUrlSchemeLiteral(chars, index + 3)
+  );
+}
+
 function isUncPathStart(chars: readonly string[], index: number): boolean {
   if (chars[index] !== "\\" || chars[index + 1] !== "\\") return false;
   return !isPathWord(chars[index - 1]);
@@ -360,6 +379,7 @@ function scanAbsolutePath(
   quote?: string,
 ): { end: number; sawNonSeparator: boolean } {
   let index = start;
+  let windowsContext = windows;
   let parentheses = 0;
   let brackets = 0;
   let sawPathCharacter = false;
@@ -378,7 +398,13 @@ function scanAbsolutePath(
       continue;
     }
     if (char === ":" && chars[index + 1] === "\\" && isWindowsDrivePathStart(chars, index - 1)) {
+      windowsContext = true;
       index += 1;
+      continue;
+    }
+    if (isDoubledDriveColonInPath(chars, index, windowsContext)) {
+      windowsContext = true;
+      index += 2;
       continue;
     }
     if (
@@ -422,7 +448,7 @@ function scanAbsolutePath(
       index = cursor;
       continue;
     }
-    if (char === "/" || (windows && char === "\\")) {
+    if (char === "/" || (windowsContext && char === "\\")) {
       sawPathCharacter = true;
       index += 1;
       continue;
@@ -434,7 +460,12 @@ function scanAbsolutePath(
       index += 1;
       continue;
     }
-    if (!windows && char === "\\" && (isUncPathStart(chars, index) || isWindowsDrivePathStart(chars, index + 1))) break;
+    if (
+      !windowsContext &&
+      char === "\\" &&
+      (isUncPathStart(chars, index) || isWindowsDrivePathStart(chars, index + 1))
+    )
+      break;
     if (char === "(" && sawPathCharacter) {
       parentheses += 1;
       sawNonSeparator = true;

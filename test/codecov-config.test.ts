@@ -113,8 +113,9 @@ const expectedComponents = [
       // Error sanitization, including #893 adjacent-path, #903 prefixed
       // nested-file, #924 embedded-quote, #925/#1076 quoted-authority,
       // quoted/root-only backslash handoff, #1010 pathless-tail brackets,
-      // #1060 adjacent nested-file schemes, #1117 glued authorities, and
-      // #1128 active file-URL own-query backslash paths remain daemon-core-owned.
+      // #1060 adjacent nested-file schemes, #1113 doubled-colon drive tails,
+      // #1117 glued authorities, and #1128 active file-URL own-query
+      // backslash paths remain daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",

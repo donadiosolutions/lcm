@@ -595,6 +595,57 @@ describe("sanitizeError", () => {
   });
 
   it.each([
+    ["/p\\C:\\E::\\SECRET", "<path>\\<path>"],
+    ["/C:\\E::\\SECRET", "<path>"],
+    ["/private/C:\\E::\\SECRET", "<path>"],
+    ["/C:\\dir/E::\\SECRET", "<path>"],
+    ["D:\\E::\\SECRET", "<path>"],
+    ["d:\\e::\\secret", "<path>"],
+    ["\\\\host\\E::\\SECRET", "<path>"],
+    ["file://host.invalid/E::\\SECRET", "file://host.invalid<path>"],
+    ["file:///C:\\E::\\SECRET", "file://<path>"],
+    ["https://example.test/C:\\E::\\SECRET", "https://example.test/<path>"],
+    ["C:\\E::\\E::\\SECRET", "<path>"],
+    ["/p\\E::\\dir/F::\\SECRET", "<path>"],
+    ["C:\\E::\\1SECRET", "<path>"],
+    ["C:\\E::\\", "<path>"],
+    ["/p\\C:\\E::\\SECRET https://pub.test/x", "<path>\\<path> https://pub.test/x"],
+  ] as const)("redacts doubled-colon drive segments inside recognized paths: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["'C:\\E::\\SECRET'", "'<path>'"],
+    ['"C:\\E::\\SECRET"', '"<path>"'],
+    ["E::\\SECRET", "E::\\SECRET"],
+    ["/p/E::\\SECRET", "<path>::\\SECRET"],
+    ["C:\\E:::\\SECRET", "<path>:::\\SECRET"],
+    ["C:\\E::/SECRET", "<path>::<path>"],
+    ["C:\\E::", "<path>::"],
+    ["C:\\E::SECRET", "<path>::SECRET"],
+    ["C:\\AB::\\SECRET", "<path>::\\SECRET"],
+    ["C:\\1::\\SECRET", "<path>::\\SECRET"],
+    ["C:\\Ω::\\SECRET", "<path>::\\SECRET"],
+    ["C:\\É::\\SECRET", "<path>::\\SECRET"],
+    ["C:\\fe80::\\SECRET", "<path>::\\SECRET"],
+    ["C:\\a%25::\\SECRET", "<path>::\\SECRET"],
+    ["fooC:\\E::\\SECRET", "fooC:\\E::\\SECRET"],
+    ["https://pub.test/a::\\q", "https://pub.test/a::\\q"],
+    ["https://[::1]/secret", "https://[::1]/secret"],
+    ["/p\\C:\\E::\\https://private.example/SECRET", "<path>\\<path>::\\https://private.example/SECRET"],
+    ["/C:\\Users\\SECRET", "<path>"],
+    ["/p\\D:\\E:\\SECRET", "<path>\\<path>"],
+  ] as const)("preserves doubled-colon path rejection boundaries: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
     ["'file://host'name/a'/C:\\Users\\SECRET\\private.db", "'file://host'name<path>'<path>"],
     ["'file://host'name/a'/c:\\Users\\SECRET\\private.db", "'file://host'name<path>'<path>"],
     ['"file://host\'name/a"/C:\\Users\\SECRET\\private.db', '"file://host\'name<path>"<path>'],
