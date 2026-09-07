@@ -251,6 +251,8 @@ const expectedComponents = [
       // #1048 keeps target metadata leaf authentication in this owner.
       // #1069 preserves completed reconciliation evidence after retained
       // directory cleanup failures in this existing component.
+      // #1107 and #1109 keep pattern and journal leaf authentication in this
+      // existing component; no taxonomy, status, or policy change.
       // #1059 keeps retained journal-parent publication in this existing owner.
       // #1087 bounds canonical metadata publication in this existing owner.
       // #1091 preserves completion evidence across publication failures here.
