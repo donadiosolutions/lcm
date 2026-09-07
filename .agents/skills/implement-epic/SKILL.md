@@ -1,140 +1,103 @@
 ---
 name: implement-epic
-description: Use when asked to execute or resume an existing planned GitHub Epic and its required deliverables in this repository. Does not create a new roadmap, triage all open Bugs, or launch work when merely authoring or reviewing skills.
+description: Use when asked to execute or resume an existing planned native GitHub Epic and its required deliverables in this repository. Not for inventing a roadmap, triaging all Bugs, or merely authoring or reviewing skills.
 ---
 
 # Implement a planned Epic
 
-## Configuration
+## Directives and configuration
 
-| Parameter | Default |
-| --- | --- |
-| `EPIC` | Required existing Epic number or URL |
-| `PLAN_REFERENCES` | Supplied planning documents/tasks plus Epic references |
-| Shared role parameters | Inherit [procedural-development defaults](../procedural-development/SKILL.md#configuration) |
-| `MAX_ACTIVE_OWNERS` | Inherit |
-| `WATCHDOG_MINUTES` | Inherit |
+`EPIC` is a required existing number/URL. `PLAN_REFERENCES` includes supplied planning
+material and Epic references. Inherit [shared role parameters and limits](../procedural-development/SKILL.md#configuration);
+explicit invocation overrides caller configuration, then shared defaults. Pass
+resolved values unchanged; routing and best-effort tier rules apply to every role.
+These are invocation instructions, not CLI flags.
 
-Add shared overrides here or to the invocation: `OWNER_MODEL`, `OWNER_REASONING`,
-`OWNER_TIER` and corresponding implementation, security, escalation and reviewer
-parameters. Invocation wins over this block, which wins over inherited defaults.
-These are agent instructions, not CLI flags. Pass resolved values unchanged; use
-shared routing and best-effort tiers. Unavailable/unobservable priority never blocks.
-
-## Assess the existing journey
-
-An execution invocation authorizes delivery within the existing plan under
-repository rules and explicit user limits. Reading, authoring or testing this
-skill does not launch workers, mutate issues or authorize environment replacement.
-
+Execution follows the existing plan, repository rules and explicit user limits.
+Reading/editing/testing skills authorizes no workers, issue changes or installation.
 Read [LCM integration](../shared/lcm-development.md), repository/local rules and
-project memory. Read [procedural-development](../procedural-development/SKILL.md)
-and its references for routing preflight and shared mechanics. Resolve actual target
-branch and current SHA. Before mutation verify access to native types, hierarchy,
-dependencies, tracker updates and delivery operations. Require an existing native
-`Epic`, not a label/title approximation. Missing plan/capabilities is a reported
-boundary, not permission to invent a journey.
+memory, then [procedural-development](../procedural-development/SKILL.md) and both
+references. Preserve the same root/run/budgets; do not launch another coordinator.
 
-Fully paginate native descendants and dependencies recursively. Read the Epic,
-child acceptance criteria, supplied planning/task references, relevant code/merged
-changes and current PR/run records. Preserve explicit scope limits, acceptance and
-closure rules. Include all required planned types, including Features, Bugs, Chores
-and nested Epic outcomes; do not filter to features or only open issues.
+## Assess and freeze
 
-Record completed history and a fixed execution inventory of remaining required
-deliverables. Keep nested Epics as outcome/checkpoint nodes; allocate implementation
-owners to actionable deliverables, not duplicate owners for parent/child work.
-A parent with its own distinct deliverable keeps that explicit contract. Preserve
-optional/conditional decisions and evidence; required work closed `not planned`
-is not satisfied. Reconcile changing/partial enumeration before freezing, recording
-timestamp, target SHA and evidence links.
+1. Resolve actual target branch/SHA and preflight routes, native types, hierarchy,
+   dependencies, tracker and delivery access before mutation. Require a native
+   `Epic`; missing plan/capability is a blocker, not permission to invent substitutes.
+2. Fully paginate descendants and dependencies recursively. Read Epic/child
+   acceptance, planning references, relevant code/merged changes and PR/run records.
+   Include every required planned type and closed item, not merely open Features.
+3. Record completed history and freeze remaining required deliverables with timestamp,
+   target SHA and evidence after reconciling changing/partial enumeration. Nested
+   Epics are outcome/checkpoint nodes, not duplicate implementation assignments;
+   retain any distinct parent deliverable. Preserve optional/conditional decisions;
+   required work closed `not planned` is not satisfied.
+4. Before each dispatch recheck native parents, active ownership and PRs. Assignment
+   alone is not exclusive ownership. Resume established owners/budgets; never take
+   over another run, reparent its work or create competing owners. Externally owned
+   required work remains in outcome accounting until accepted.
 
-Inspect native parents, active worker/run ownership and relevant PRs before each
-dispatch. Assignment is context, not sufficient proof of exclusive ownership.
-Resume established owners and budgets with evidence; do not take over another
-active run, reparent its work or spawn competing owners. Externally owned required
-deliverables remain in outcome accounting until acceptance is verified.
+New discoveries/follow-ups stay outside frozen inventory unless explicitly admitted;
+resume does not admit new children simply because enumeration now returns them.
 
-## Readiness and best-effort execution
+## Readiness
 
-Record ready, dependency-blocked, externally owned, completed or decision-blocked
-items with reasons/evidence. Native blockers outside planned descendants are
-**external prerequisite references**, not added implementation items. Do not assume
-an owner; record one only from evidence. New discoveries/follow-ups stay outside
-the frozen inventory unless explicitly admitted.
+Record ready, dependency-blocked, externally owned, completed and decision-blocked
+items with reasons/evidence. Blockers outside planned descendants are **external
+prerequisite references**, not new implementation scope; record owners only from
+evidence. Build dependency edges with required acceptance, including GO/ADOPT results.
+Closure/merge alone does not satisfy those results. Surface cycles, contradictions
+and missing evidence while independent work proceeds.
 
-Build edges with caller-defined acceptance evidence, including required GO/ADOPT
-results. Closure/merge alone never replaces those results. Surface contradictions,
-missing evidence and cycles while continuing unrelated work. Refine implementation
-plans within the agreed journey; material scope/architecture changes go through
-the root to the user rather than silently rewriting the plan.
+The root remains readiness coordinator after internal merges, external changes and
+recovery: record edge acceptance and release ready members in the same run. Read-only
+preparation may precede prerequisites; dependent implementation waits for merged
+prerequisite implementations and accepted evidence. Dispatch ready work promptly up
+to the productive-owner limit, without a blanket phase barrier or perfect conflict
+schedule. Refine plans within the journey; material scope/architecture decisions
+belong with the user through the root.
 
-The root remains readiness coordinator throughout `procedural-development`.
-After internal merges, external prerequisite changes and recovery, reevaluate
-affected edges, record acceptance and release ready inventory members in the same
-run. Shared scheduling consumes those decisions; no second coordinator is created.
+## Execute and checkpoint
 
-Prepare contracts/investigate read-only before prerequisites finish. Dependent
-implementation starts only after prerequisite implementations merge and acceptance
-passes. Dispatch independent ready work promptly up to the productive-owner limit,
-without a perfect conflict-free schedule or blanket phase barrier. Shared review
-and round rules apply to every item and every later head change.
+Invoke the shared workflow with the same root/run/recovery record, remaining
+inventory, completed evidence, readiness graph, owners/budgets, resolved settings,
+target and repository delivery policy. Shared procedures own implementation,
+review, remediation, publication and recovery, including every later head change.
+Supply all [LCM environment operations](../shared/lcm-development.md): only the root
+owns global installation/daemon changes, and **`lcm-daemon-update` is the sole
+workflow mutex**, acquired/released through [flock](../flock/SKILL.md).
 
-## Only exclusive resource
+Reuse the Epic without rewriting planning text, diagrams, acceptance, estimates or
+unrelated comments. For a new run create one checkpoint comment and retain its ID;
+resume the existing channel, linking old evidence if changed. Update meaningful
+transitions, use safe relative public locations and read back uncertain writes.
 
-The only resource requiring hard mutual exclusion is `lcm-daemon-update`.
-Use the [flock skill](../flock/SKILL.md) to acquire and release it. Pass this
-resource and its protected operations to `procedural-development`; do not
-introduce additional workflow locks.
+Track total/completed required outcomes, remaining inventory, accepted/pending
+edges, active/waiting/parked/external items, PRs, escalation/security routes,
+follow-ups and verified environment revision. Watchdog reports include readiness;
+leaf chatter stays local.
 
-Supply the root acting as Environment Coordinator as sole executor for main LCM
-installation/replacement, daemon mutation and recovery, including verification
-before release. Use [shared integration](../shared/lcm-development.md) for startup,
-target-advance convergence, watchdog/final audit, handoff and live-shell ownership.
-All roles use isolated fixtures, with no file/worktree/test/database/review/
-publication/merge reservations. Internal correctness locks remain intact.
-
-## Invoke procedural-development and maintain the tracker
-
-Pass the same root/run/recovery record, fixed remaining inventory, completed evidence,
-readiness graph, owners/budgets, resolved roles, target branch, repository delivery
-policy and declared resource/environment operations. Delegate all bulk implementation,
-review, remediation, publication and recovery mechanics to the shared skill.
-
-Reuse the Epic without overwriting its planning body, diagrams, acceptance rules,
-estimates or unrelated comments. For a new run, create one dedicated checkpoint
-comment, record its ID and update at meaningful events. On resume retain the existing
-channel; if changed, link prior evidence and preserve run/budgets. Public checkpoints
-use safe relative evidence locations, not private absolute paths. Read back uncertain
-writes before retrying.
-
-Track total/completed required outcomes, remaining inventory, accepted/pending edges,
-active/waiting/parked/externally owned items, PRs, escalations, security routing,
-follow-ups and verified environment revision. Watchdog progress includes readiness;
-normal leaf chatter stays local.
-
-Deferred findings are native `Bug` issues with source, candidate/review and PR links
-under the shared pre-PR pending-link procedure. Never natively parent them under
-the executed Epic; use body links/cross-references. Resume does not admit follow-ups
-or new children just because GitHub now shows them.
+Deferred P2 findings are native `Bug` issues linked to source, candidate/review and
+PR using the shared pre-publication pending-link procedure. Keep them outside the
+executed Epic's native hierarchy and inventory; body links are sufficient.
 
 ## Outcome and closure
 
-Combine shared final audit with the Epic's actual closure contract:
+Combine shared audit with the Epic's actual closure contract:
 
-- Every required outcome, including certification/nested outcomes, has accepted
+- All required deliverables, certification and nested outcomes have accepted
   evidence on the relevant tested/merged revision.
-- Conditional outcomes have required affirmative decisions or explicitly permitted
-  optional non-adoption with evidence; never reinterpret NO-GO as success.
-- Source resolutions, dependency evidence, PRs, follow-ups and metadata agree;
-  preserve scope limits and externally managed work.
-- Current default-branch implementation and exact installed LCM artifact,
-  daemon/connector health and verification satisfy shared integration.
+- Conditional outcomes have affirmative decisions or explicitly permitted optional
+  non-adoption with evidence. NO-GO is not success.
+- Source resolutions, dependency evidence, PRs, follow-ups and metadata agree,
+  preserving scope limits and external ownership.
+- Current default-branch implementation, exact installed artifact, daemon/connector
+  health and verification satisfy LCM integration.
 
-Only the caller's root closes the Epic under invocation authority and the Epic's
-criteria. Empty/already-completed journeys still receive the audit, without
-unnecessary owners. Parked, delegated or genuinely externally blocked required
-outcomes leave the Epic open and delivery incomplete even with no workers.
-Report delivered/remaining work, blockers, follow-ups, target SHA and environment
-evidence. Closing this Epic does not authorize closing a parent or milestone
-with other required outcomes.
+Only the caller's root closes this Epic under invocation authority and those
+criteria. Requested draft/no-merge endpoints may finish their bounded task without
+satisfying Epic closure; leave the Epic open. Empty/completed journeys still receive
+audit without unnecessary workers. Parked, delegated or genuinely externally blocked
+required outcomes leave delivery incomplete and the Epic open. Report delivered/
+remaining work, blockers, follow-ups, target SHA and environment evidence. Closing
+this Epic never authorizes closing a parent/milestone with other required outcomes.

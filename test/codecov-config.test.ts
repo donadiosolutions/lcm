@@ -99,12 +99,14 @@ const expectedComponents = [
       "^src/daemon/orientation\\.ts$",
       "^src/daemon/project-queue\\.ts$",
       "^src/daemon/project\\.ts$",
+      // #1106 keeps periodic transcript metadata admission daemon-core-owned.
       // Monotonic proxy startup polling remains daemon-core-owned.
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
       // Error sanitization, including #893 adjacent-path, #903 prefixed
-      // nested-file, #924 embedded-quote file-authority, and #1060 adjacent
-      // nested-file scheme preservation, remains daemon-core-owned.
+      // nested-file, #924 embedded-quote authority, #1010 pathless-tail
+      // bracket redaction, #1060 adjacent nested-file scheme preservation,
+      // and #1117 glued file-authority handling, remains daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -185,6 +187,7 @@ const expectedComponents = [
     component_id: "unit-transcripts-import",
     name: "Unit - Transcripts and Import",
     paths: [
+      // #1106 bounded custom-directory metadata stays within this import owner.
       "^src/codex-transcript\\.ts$",
       "^src/import-summary\\.ts$",
       "^src/import\\.ts$",
@@ -211,6 +214,7 @@ const expectedComponents = [
     component_id: "unit-compaction-summarization",
     name: "Unit - Compaction and Summarization",
     paths: [
+      // #618 authenticated batch discovery remains within this compaction owner.
       "^src/batch-compact\\.ts$",
       "^src/compaction\\.ts$",
       "^src/large-files\\.ts$",
@@ -245,6 +249,8 @@ const expectedComponents = [
       // #1069 preserves completed reconciliation evidence after retained
       // directory cleanup failures in this existing component.
       // #1059 keeps retained journal-parent publication in this existing owner.
+      // #1087 bounds canonical metadata publication in this existing owner.
+      // #1091 preserves completion evidence across publication failures here.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
@@ -499,7 +505,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(230);
+    expect(productionFiles).toHaveLength(231);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -529,10 +535,10 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(230);
+    expect(ownershipCounts.size).toBe(231);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -611,11 +617,16 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
       ["src/daemon/routes/recent.ts", "unit-daemon-routes"],
       ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
+      // #1106/#618 keep discovery-related files in their established owners.
       ["src/daemon/server.ts", "unit-daemon-core"],
+      ["src/import.ts", "unit-transcripts-import"],
+      ["src/batch-compact.ts", "unit-compaction-summarization"],
       ["src/daemon/version.ts", "unit-daemon-core"],
       // #885 keeps the shared missing-Codex diagnostic and its resolver
       // identity handling within the existing LLM component. #934 keeps
       // caller-cancellation handling during resolver teardown in this owner.
+      // #1154/#1157 retain Spark protocol normalization, bounded upstream
+      // classification, and terminal sentinel handling in this owner.
       ["src/llm/codex-process.ts", "unit-llm-prompts"],
       ["src/llm/codex-config.ts", "unit-llm-prompts"],
       ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
@@ -638,6 +649,7 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.
+      // #1101 numeric skipped-sidecar counts stay local-persistence-owned.
       ["src/db/event-sidecars.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"],
@@ -654,6 +666,7 @@ describe("Codecov configuration", () => {
       // #1020 keeps message timestamp mapping in the existing local-persistence
       // component; conversation timestamps remain on their existing mapper.
       ["src/store/conversation-store.ts", "unit-local-persistence"],
+      ["src/db/stored-timestamp.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],

@@ -926,6 +926,13 @@ reassigned only from exact thread ownership or a unique repository URL under an
 existing `~/.codex/worktrees/<token>` tombstone; unresolved and ambiguous
 sessions are reported and skipped.
 
+Claude `lcm import --all` selects projects from authenticated local bindings.
+It does not enumerate `meta.json` files as project authority. The daemon's
+periodic Claude transcript scan still reads bounded, owner-local, single-link
+metadata; rejected metadata is skipped for that scan. See
+[Metadata-backed map discovery](project-identity.md#metadata-backed-map-discovery)
+for metadata recovery and concurrent-publication behavior.
+
 See [Machine registration and project identity](project-identity.md) for
 permissions, recovery, pairing, stored-data guards, backup behavior, migration,
 ambiguity rules, and the command reference.
@@ -1146,6 +1153,12 @@ Responses Lite dialect uses an explicit empty `additional_tools` inventory.
 Both force `tool_choice: "none"`, `parallel_tool_calls: false`, `store: false`,
 and `stream: true`.
 
+For the exact `gpt-5.3-codex-spark` model, the gateway always sends the
+standard Responses shape. It removes the Lite marker and `additional_tools`,
+uses top-level `tools: []`, and forwards only a validated reasoning `effort`.
+This compatibility rule is automatic and has no configuration setting. Other
+models retain the dialect selected by Codex.
+
 Only the validated model, reasoning controls, and supported service tier are
 retained from Codex's request. `instructions`, `previous_response_id`,
 `client_metadata`, `prompt_cache_key`, `include`, and `stream_options` are not
@@ -1161,13 +1174,21 @@ Redirects and ambiguous request or shutdown outcomes fail closed.
 Gateway success follows the Responses protocol rather than an exact Codex CLI
 version or HTTP transport EOF. LCM accepts only a complete, well-formed
 `response.completed` event whose response status is `completed`, then closes the
-one-use upstream stream itself. A client may close after consuming that terminal
-event without turning a successful compaction into a failure. EOF before a
-terminal event, malformed or mismatched SSE event data, bytes decoded after the
-terminal frame in the same upstream chunk, and `response.failed` or
+one-use upstream stream itself. A canonical optional `data: [DONE]` terminator,
+or its legal prefix at the terminal network-chunk boundary, may follow that
+event; it never establishes success by itself. A client may close after
+consuming the terminal event without turning a successful compaction into a
+failure. EOF before a terminal event, malformed or mismatched SSE event data,
+other decoded bytes after the terminal frame, and `response.failed` or
 `response.incomplete` events fail closed. Once a valid terminal frame is
 accepted, unread queued or future upstream bytes are canceled and never relayed.
 This behavior has no configuration option.
+
+Upstream authentication and usage failures retain their safe categories. The
+gateway also distinguishes a confirmed Spark protocol rejection from a generic
+upstream request failure, so neither is mislabeled as advice to upgrade Codex.
+Error bodies and provider diagnostics are never shown. Retry later or select a
+different available model when either safe upstream failure is reported.
 
 ```json
 {

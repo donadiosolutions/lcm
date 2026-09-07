@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { getLcmDbFeatures } from "./features.js";
+import { parseStoredTimestamp } from "./stored-timestamp.js";
 
 type SummaryColumnInfo = {
   name?: string;
@@ -333,7 +334,7 @@ function parseTimestamp(value: string | null | undefined): Date | null {
     return null;
   }
 
-  const direct = new Date(value);
+  const direct = parseStoredTimestamp(value);
   if (!Number.isNaN(direct.getTime())) {
     return direct;
   }

@@ -58,6 +58,7 @@ import {
 } from "./lifecycle-scope.js";
 import { configPath as defaultConfigPath, projectsDir as lcmProjectsDir } from "../runtime-paths.js";
 import { projectMapPathsForHash, watchProjectMap } from "../project-map.js";
+import { MAX_PROJECT_METADATA_BYTES } from "./project.js";
 import { createStorageBackendFactory, type StorageBackendFactory } from "../storage/index.js";
 import { assertStorageBackendPublication } from "../storage/backend.js";
 import {
@@ -806,7 +807,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     signal: AbortSignal = shutdownController.signal,
   ) => {
     try {
-      const { readdirSync, existsSync, readFileSync } = await import("node:fs");
+      const { readdirSync, existsSync } = await import("node:fs");
       const { join } = await import("node:path");
       const { homedir } = await import("node:os");
 
@@ -819,7 +820,14 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         if (!existsSync(metaPath)) continue;
 
         let meta: { cwd?: string; lastCompact?: string } = {};
-        try { meta = JSON.parse(readFileSync(metaPath, "utf-8")); } catch { continue; }
+        try {
+          meta = JSON.parse(readBoundedRegularFile(metaPath, {
+            allowedRoot: join(projectsDir, entry.name),
+            maxBytes: MAX_PROJECT_METADATA_BYTES,
+            expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+            requireSingleLink: true,
+          }));
+        } catch { continue; }
         if (!meta.cwd) continue;
 
         // Find Claude Code session files for this project's canonical cwd and aliases.

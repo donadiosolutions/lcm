@@ -466,6 +466,12 @@ compact.” A failed scan does not mark any session as processed. Back up the
 reported project database, resolve its storage or schema error, and rerun the
 command; the still-eligible sessions will be discovered again.
 
+`lcm compact --all` discovers projects from authenticated project bindings.
+It does not read `meta.json` to select projects or trust unbound metadata
+directories. Missing or unsafe discovery metadata therefore does not override
+a valid binding or become a separate metadata-scan failure. Storage and schema
+failures for selected projects are still reported as described above.
+
 ### Managed-daemon recovery
 
 Use the public commands for daemon recovery:
