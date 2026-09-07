@@ -16,7 +16,7 @@ import {
   symlinkSync,
   writeFileSync as fsWriteFileSync,
 } from "node:fs";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -413,13 +413,17 @@ function makeDatabase(path: string, sessionId: string, content: string, projectI
 
 function makeReconciliationLockFixture(home: string): {
   readonly main: string;
+  readonly linked: string;
+  readonly canonical: string;
+  readonly targetHash: string;
+  readonly sourceHash: string;
   readonly lock: string;
 } {
   const { main, linked } = makeRepository(home);
   const canonical = resolveGitProjectAnchor(main)!.canonical;
   const targetHash = hashProjectPath(canonical);
   const sourceHash = hashProjectPath(linked);
-  writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+  writePrivateFixtureFile(projectMapPath(home), `${JSON.stringify({
     [targetHash]: { canonical, aliases: [] },
     [sourceHash]: { canonical: linked, aliases: [] },
   }, null, 2)}\n`);
@@ -442,7 +446,7 @@ function makeReconciliationLockFixture(home: string): {
     nonce: "a".repeat(32),
     createdAtMs: 1,
   })}\n`);
-  return { main, lock };
+  return { main, linked, canonical, targetHash, sourceHash, lock };
 }
 
 function removeLegacyMainMetadataColumns(db: DatabaseSync): void {
@@ -6912,55 +6916,73 @@ describe("worktree reconciliation", () => {
     expect(reconcileWorktrees(main).status).toBe("completed");
   }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
-  it("waits for a competing first-use reconciliation and then re-reads state", () => {
-    const { main, linked } = makeRepository(home);
-    const canonical = resolveGitProjectAnchor(main)!.canonical;
-    const targetHash = hashProjectPath(canonical);
-    const sourceHash = hashProjectPath(linked);
-    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
-      [targetHash]: { canonical, aliases: [] },
-      [sourceHash]: { canonical: linked, aliases: [] },
-    }, null, 2)}\n`);
-    clearProjectMapCache();
-    makeDatabase(
-      join(home, ".lcm", "projects", sourceHash, "db.sqlite"),
-      "lock-wait",
-      "content",
-      sourceHash,
-    );
-    const lock = join(home, ".lcm", "reconciliations", `${targetHash}.lock`);
-    makePrivateFixtureDirectory(join(lock, ".."), { recursive: true });
-    const holder = spawn(process.execPath, [
-      "-e",
-      `
-        const fs = require("node:fs");
-        const lock = process.argv[1];
-        const fields = fs.readFileSync("/proc/" + process.pid + "/stat", "utf8")
-          .slice(fs.readFileSync("/proc/" + process.pid + "/stat", "utf8").lastIndexOf(")") + 2)
-          .split(" ");
-        fs.writeFileSync(lock, JSON.stringify({
-          version: 1,
-          pid: process.pid,
-          processStartTime: fields[19] || null,
-          nonce: "a".repeat(32),
-          createdAtMs: Date.now()
-        }) + "\\n", { mode: 0o600 });
-        setTimeout(() => fs.unlinkSync(lock), 150);
-      `,
-      lock,
-    ], { stdio: "ignore" });
-    const waitDeadline = Date.now() + 2_000;
-    while (!existsSync(lock) && Date.now() < waitDeadline) {
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-    }
-    expect(existsSync(lock)).toBe(true);
+  it(
+    "waits for a competing first-use reconciliation and merges refreshed map state",
+    () => {
+      const { main, linked, canonical, targetHash, sourceHash, lock } =
+        makeReconciliationLockFixture(home);
+      const remoteProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
+      expect(existsSync(lock)).toBe(true);
 
-    expect(reconcileWorktrees(main, {
-      _lockWaitMs: 2_000,
-      _lockRetryDelayMs: 10,
-    }).status).toBe("completed");
-    expect(holder.exitCode === 0 || holder.exitCode === null).toBe(true);
-  });
+      expect(() => reconcileWorktrees(main, { homeDir: home, _lockWaitMs: 0 })).toThrow(
+        PrivateMutationLockContentionError,
+      );
+      expect(listWorktreeReconciliationJournals(home)).toEqual([]);
+
+      let waits = 0;
+      let releases = 0;
+      let released = false;
+      const atomicsWait = vi.spyOn(Atomics, "wait").mockImplementation(
+        (_array, _index, _value, _timeout) => {
+          waits += 1;
+          if (released) throw new Error("reconciliation lock released more than once");
+          released = true;
+          writePrivateFixtureFile(projectMapPath(home), `${JSON.stringify({
+            [targetHash]: { canonical, aliases: [], remoteProjectId },
+            [sourceHash]: { canonical: linked, aliases: [], remoteProjectId },
+          }, null, 2)}\n`);
+          clearProjectMapCache();
+          rmSync(lock);
+          releases += 1;
+          return "timed-out";
+        },
+      );
+      try {
+        const result = reconcileWorktrees(main, {
+          homeDir: home,
+          _lockWaitMs: 100,
+          _lockRetryDelayMs: 50,
+        });
+        expect(result.status).toBe("completed");
+        expect(waits).toBe(1);
+        expect(releases).toBe(1);
+      } finally {
+        atomicsWait.mockRestore();
+      }
+
+      expect(listProjectMapEntries(home)).toEqual({
+        [targetHash]: { canonical, aliases: [linked], remoteProjectId },
+      });
+      const targetDb = new DatabaseSync(
+        join(home, ".lcm", "projects", targetHash, "db.sqlite"),
+        { readOnly: true },
+      );
+      expect(targetDb.prepare(
+        "SELECT session_id FROM conversations WHERE session_id = ?",
+      ).get("monotonic-lock-wait")).toEqual({ session_id: "monotonic-lock-wait" });
+      targetDb.close();
+
+      const journal = listWorktreeReconciliationJournals(home)[0]!;
+      expect(journal).toMatchObject({
+        phase: "completed",
+        sourceHashes: [sourceHash],
+        remoteProjectId,
+      });
+      expect(journal.backupPaths.some((path) => path.includes("oldprojects"))).toBe(true);
+      expect(statSync(join(home, ".lcm", "projects", sourceHash)).isFile()).toBe(true);
+    },
+    FULL_SUITE_PROCESS_TEST_TIMEOUT_MS,
+  );
 
   it.each([
     { name: "frozen", nextWallNow: () => 1_000 },
@@ -6982,6 +7004,7 @@ describe("worktree reconciliation", () => {
     });
     try {
       expect(() => reconcileWorktrees(main, {
+        homeDir: home,
         _lockWaitMs: 125,
         _lockRetryDelayMs: 50,
       })).toThrow(PrivateMutationLockContentionError);
@@ -7009,6 +7032,7 @@ describe("worktree reconciliation", () => {
     });
     try {
       expect(() => reconcileWorktrees(main, {
+        homeDir: home,
         _lockWaitMs: 2,
         _lockRetryDelayMs: 50,
       })).toThrow(PrivateMutationLockContentionError);
@@ -7028,7 +7052,7 @@ describe("worktree reconciliation", () => {
       throw new Error("zero-budget reconciliation must not wait");
     });
     try {
-      expect(() => reconcileWorktrees(main, { _lockWaitMs: 0 })).toThrow(
+      expect(() => reconcileWorktrees(main, { homeDir: home, _lockWaitMs: 0 })).toThrow(
         PrivateMutationLockContentionError,
       );
       expect(atomicsWait).not.toHaveBeenCalled();
@@ -7054,6 +7078,7 @@ describe("worktree reconciliation", () => {
     });
     try {
       expect(reconcileWorktrees(main, {
+        homeDir: home,
         _lockWaitMs: 100,
         _lockRetryDelayMs: 50,
       }).status).toBe("completed");
@@ -7083,6 +7108,7 @@ describe("worktree reconciliation", () => {
     );
     try {
       expect(reconcileWorktrees(main, {
+        homeDir: home,
         _lockWaitMs: 100,
         _lockRetryDelayMs: 50,
       }).status).toBe("completed");
