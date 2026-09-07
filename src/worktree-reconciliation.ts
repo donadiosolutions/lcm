@@ -78,6 +78,8 @@ const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9
 const MAX_DISCOVERY_ENTRIES = 50_000;
 const DEFAULT_SOURCE_BUSY_TIMEOUT_MS = 5_000;
 const RECONCILIATION_CACHE_TTL_MS = 1_000;
+const RECONCILIATION_JOURNAL_PARENT_DRIFT_DIAGNOSTIC =
+  "worktree reconciliation journal parent changed during retryable contention";
 // Reconciliation must be audited independently for every event schema. Do not
 // replace this ceiling with the live EventsDb schema version.
 const MAX_RECONCILIABLE_EVENT_SCHEMA_VERSION = 5;
@@ -339,21 +341,43 @@ function withRetainedReconciliationJournalParent<T>(
   let result: T | undefined;
   let operationFailed = false;
   let primaryError: unknown;
+  let retained: RetainedReconciliationJournalParent | undefined;
+  let retryTopologyError: unknown;
   try {
     const root = openPrivateDirectory(rootPath);
     handles.push(root);
     const directory = acquireRetainedChild(root, rootPath, directoryPath);
     handles.push(directory);
-    const retained = { rootPath, directoryPath, root, directory };
+    retained = { rootPath, directoryPath, root, directory };
     assertRetainedReconciliationJournalParent(retained);
     result = operation(retained);
     assertRetainedReconciliationJournalParent(retained);
   } catch (error) {
     operationFailed = true;
     primaryError = error;
+    if (error instanceof PrivateMutationLockContentionError && retained !== undefined) {
+      try {
+        assertRetainedReconciliationJournalParent(retained);
+      } catch (topologyError) {
+        retryTopologyError = topologyError;
+      }
+    }
   }
   const cleanupErrors = closePrivateDirectoryHandles(handles);
   if (operationFailed) {
+    if (retryTopologyError !== undefined) {
+      throw new BackendPublicationJournalError(
+        "unsafe-storage",
+        RECONCILIATION_JOURNAL_PARENT_DRIFT_DIAGNOSTIC,
+        {
+          cause: new AggregateError(
+            [primaryError, retryTopologyError],
+            "worktree reconciliation contention coincided with journal-parent topology drift",
+            { cause: primaryError },
+          ),
+        },
+      );
+    }
     if (preservesReconciliationErrorClassification(primaryError)) throw primaryError;
     if (cleanupErrors.length > 0) {
       throw new AggregateError(
