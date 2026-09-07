@@ -253,7 +253,11 @@ import {
   migrateLegacyHomeIfNeeded,
 } from "../src/runtime-paths.js";
 import { classifyHomeParent, observationFromPaths } from "../src/home-parent-auth.js";
-import { withBackendPublicationConsumerLock } from "../src/storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "../src/private-mutation-lock.js";
+import {
+  BackendPublicationJournalError,
+  withBackendPublicationConsumerLock,
+} from "../src/storage/backend-publication.js";
 
 const homes: string[] = [];
 afterEach(() => {
@@ -1650,6 +1654,95 @@ describe("runtime home rename failures", () => {
     expect(aggregate.cause).toBeUndefined();
     expect(Object.hasOwn(aggregate, "cause")).toBe(true);
     expectAdmissionDescriptorsClosed(tracked);
+  });
+
+  it.each([
+    {
+      label: "bootstrap contention",
+      primaryError: new BootstrapLockContentionError("synthetic bootstrap contention"),
+    },
+    {
+      label: "publication journal",
+      primaryError: new BackendPublicationJournalError(
+        "unexpected-state",
+        "synthetic publication journal failure",
+      ),
+    },
+    {
+      label: "private mutation contention",
+      primaryError: new PrivateMutationLockContentionError("synthetic private mutation contention"),
+    },
+  ])("preserves $label classification when callback cleanup also fails", ({ primaryError }) => {
+    const paths = legacyHome();
+    const tracked = trackAdmissionDescriptors(paths.home);
+    const cleanupError = new Error("synthetic home cleanup failure");
+    fsControl.lstatHook = (path, stat) => {
+      if (path === paths.legacy) throw primaryError;
+      return stat;
+    };
+    fsControl.closeAfterHook = (path) => {
+      if (path === tracked.paths.home) throw cleanupError;
+    };
+
+    let failure: unknown;
+    try {
+      migrateLegacyHomeIfNeeded(paths.home);
+    } catch (error) {
+      failure = error;
+    } finally {
+      fsControl.closeAfterHook = undefined;
+    }
+
+    expect(failure).toBeInstanceOf(primaryError.constructor);
+    expect(failure).not.toBe(primaryError);
+    expect((failure as Error).message).toBe(primaryError.message);
+    if (primaryError instanceof BackendPublicationJournalError) {
+      expect((failure as BackendPublicationJournalError).reason).toBe(primaryError.reason);
+    }
+    const aggregate = (failure as Error & { cause?: unknown }).cause;
+    expect(aggregate).toBeInstanceOf(AggregateError);
+    expect((aggregate as AggregateError & { cause?: unknown }).errors)
+      .toEqual([primaryError, cleanupError]);
+    expect((aggregate as AggregateError & { cause?: unknown }).cause).toBe(primaryError);
+    expectAdmissionDescriptorsClosed(tracked);
+  });
+
+  it("keeps acquisition contention classified when topology cleanup also fails", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-admission-contention-cleanup-"));
+    homes.push(home);
+    writeBootstrapLock(home, {
+      pid: process.pid,
+      processStartTime: processStartTime(),
+    });
+    const tracked = trackAdmissionDescriptors(home);
+    const cleanupError = new Error("synthetic home cleanup failure");
+    fsControl.closeAfterHook = (path) => {
+      if (path === tracked.paths.home) throw cleanupError;
+    };
+
+    let failure: unknown;
+    try {
+      migrateLegacyHomeIfNeeded(home);
+    } catch (error) {
+      failure = error;
+    } finally {
+      fsControl.closeAfterHook = undefined;
+    }
+
+    expect(failure).toBeInstanceOf(BootstrapLockContentionError);
+    const aggregate = (failure as Error & { cause?: unknown }).cause;
+    expect(aggregate).toBeInstanceOf(AggregateError);
+    expect((aggregate as AggregateError).errors[0]).toBeInstanceOf(BootstrapLockContentionError);
+    expect((aggregate as AggregateError).errors[1]).toBe(cleanupError);
+    expect(existsSync(tracked.paths.lock)).toBe(true);
+    for (const path of Object.values(tracked.paths)) {
+      const fd = tracked.fds.get(path);
+      expect(fd).toBeTypeOf("number");
+      expect(tracked.closeAttempts.get(path)).toBe(1);
+      expect(() => fstatSync(fd!, { bigint: true })).toThrowError(
+        expect.objectContaining({ code: "EBADF" }),
+      );
+    }
   });
 
   it("throws one exact cleanup failure after a successful no-op admission", () => {

@@ -21,9 +21,13 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { legacyLcmHomeDirname } from "./legacy-names.js";
-import { processStartTime } from "./private-mutation-lock.js";
+import {
+  PrivateMutationLockContentionError,
+  processStartTime,
+} from "./private-mutation-lock.js";
 import {
   assertBackendPublicationConsumerAccess,
+  BackendPublicationJournalError,
   withBackendPublicationConsumerLock,
   type BackendPublicationLockToken,
 } from "./storage/backend-publication.js";
@@ -1954,11 +1958,25 @@ function withPublicationAdmission<T>(homeDir: string, callback: (admission: Publ
       "publication admission descriptor cleanup failed",
     );
   }
-  throw new AggregateError(
+  const aggregate = new AggregateError(
     [outcome.error, ...cleanupErrors],
     "publication admission and descriptor cleanup failed",
     { cause: outcome.error },
   );
+  if (outcome.error instanceof BootstrapLockContentionError) {
+    throw new BootstrapLockContentionError(outcome.error.message, { cause: aggregate });
+  }
+  if (outcome.error instanceof BackendPublicationJournalError) {
+    throw new BackendPublicationJournalError(
+      outcome.error.reason,
+      outcome.error.message,
+      { cause: aggregate },
+    );
+  }
+  if (outcome.error instanceof PrivateMutationLockContentionError) {
+    throw new PrivateMutationLockContentionError(outcome.error.message, { cause: aggregate });
+  }
+  throw aggregate;
 }
 
 /**
