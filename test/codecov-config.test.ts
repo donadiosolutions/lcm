@@ -103,9 +103,9 @@ const expectedComponents = [
       "^src/daemon/proxy-manager\\.ts$",
       "^src/daemon/remediation\\.ts$",
       // Error sanitization, including #893 adjacent-path, #903 prefixed
-      // nested-file, #924 embedded-quote file-authority, #1060 adjacent
-      // nested-file scheme preservation, and #1117 glued file-authority
-      // handling remain daemon-core-owned.
+      // nested-file, #924 embedded-quote authority, #1010 pathless-tail
+      // bracket redaction, #1060 adjacent nested-file scheme preservation,
+      // and #1117 glued file-authority handling, remains daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
