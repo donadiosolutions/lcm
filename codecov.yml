@@ -89,8 +89,8 @@ component_management:
         - "^src/daemon/proxy-manager\\.ts$"
         - "^src/daemon/remediation\\.ts$"
         # Error sanitization, including #893 adjacent-path, #903 prefixed
-        # nested-file, and #924 embedded-quote file-authority redaction, remains
-        # daemon-core-owned.
+        # nested-file, #924 embedded-quote authority, and #1010 pathless-tail
+        # bracket redaction, remains daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"

@@ -291,9 +291,15 @@ The `Security` section of the doctor output shows:
   state: a nested non-file URL remains intact, while standalone POSIX, Windows,
   and UNC paths retain redaction. The first backslash-based path also remains
   redacted across forward slashes and file-authority punctuation (semicolons,
-  commas, apostrophes, closing parentheses, and closing braces). Whitespace, a
-  freshly recognized URL, or other URL-ending punctuation ends that context. A
-  recognizable nested exact `file://` path is also redacted. An exact
+  commas, apostrophes, closing parentheses, and closing braces). Brackets in
+  this restarted tail are tracked independently. A slash inside a still-open
+  bracket is conservatively treated as a path marker even when it follows a
+  word character, and a matched closing bracket keeps the context active so a
+  later backslash-based path is also redacted. Once the brackets are balanced,
+  ordinary word-adjacent slash text remains unchanged. Whitespace, an unmatched
+  closing bracket, a freshly recognized URL, or other URL-ending punctuation
+  ends the context and clears its bracket state. A recognizable nested exact
+  `file://` path is also redacted. An exact
   case-insensitive `file://` literal immediately after `?`, `#`, `&`, or `=`
   inside any URL starts a nested file URL. Once an outer URL has entered its
   query or fragment, the same literal also starts a nested file URL after any
