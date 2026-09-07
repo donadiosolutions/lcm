@@ -200,6 +200,8 @@ component_management:
       name: "Unit - Migration and Cutover"
       paths:
         # #681 leaves protocol-specific manifest replacement in this component.
+        # #622 keeps immutable SQLite capture, maintenance preparation, and
+        # private receipt evidence in this migration owner.
         - "src/migration/"
     - component_id: "unit-local-event-storage"
       name: "Unit - Local Event Storage"

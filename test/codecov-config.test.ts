@@ -167,6 +167,7 @@ const expectedComponents = [
   {
     component_id: "unit-migration-cutover",
     name: "Unit - Migration and Cutover",
+    // #622 keeps immutable capture, preparation, and receipt evidence here.
     paths: ["src/migration/"],
   },
   {
@@ -483,7 +484,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(215);
+    expect(productionFiles).toHaveLength(218);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -513,7 +514,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(215);
+    expect(ownershipCounts.size).toBe(218);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964 files in their intended components", () => {
@@ -616,6 +617,9 @@ describe("Codecov configuration", () => {
       // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
+      ["src/migration/maintenance.ts", "unit-migration-cutover"],
+      ["src/migration/receipts.ts", "unit-migration-cutover"],
+      ["src/migration/sqlite-snapshot.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
       ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],

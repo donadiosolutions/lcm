@@ -145,6 +145,22 @@ export class LocalHookEventSequenceAllocator {
     return this.allocateSequences(1)[0]!;
   }
 
+  /** Read the first post-cutoff sequence while the caller holds the append barrier. */
+  peekNextSequence(): bigint {
+    if (this.closed) throw new Error("local hook sequence allocator is closed");
+    const validationLease = getLcmConnection(this.sequencePath);
+    try {
+      const row = this.readCheckpoint.get() as { next_sequence?: unknown } | undefined;
+      return parseSequence(
+        row?.next_sequence,
+        "sequence checkpoint",
+        EXHAUSTED_SEQUENCE_CHECKPOINT,
+      );
+    } finally {
+      closeLcmConnection(this.sequencePath, validationLease);
+    }
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;

@@ -371,6 +371,16 @@ export interface CoordinationRepository {
   deleteSessionInstructions(scope: SessionInstructionsScope): Promise<void>;
 }
 
+export interface MigrationReceiptRepository {
+  getEpoch(machineId: string): Promise<import("../migration/receipts.js").MigrationReceiptEpoch | null>;
+  record(input: Readonly<{
+    epochId: string;
+    envelope: import("../migration/receipts.js").MigrationReceiptEnvelope;
+    effectWitness: import("../migration/receipts.js").MigrationReceiptEffectWitness;
+    committedAt: string;
+  }>): Promise<import("../migration/receipts.js").MigrationReceipt>;
+}
+
 export interface ProjectRepositories {
   readonly conversations: ConversationRepository;
   readonly summaries: SummaryRepository;
@@ -383,7 +393,10 @@ export interface ProjectRepositories {
   readonly coordination: CoordinationRepository;
 }
 
-export type TransactionRepositories = ProjectRepositories;
+export type TransactionRepositories = ProjectRepositories & Readonly<{
+  /** SQLite-private exactly-once evidence; never a canonical transfer domain. */
+  migrationReceipt?: MigrationReceiptRepository;
+}>;
 
 export interface ProjectStorage extends ProjectRepositories {
   readonly backend: StorageBackendName;

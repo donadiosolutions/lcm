@@ -1,4 +1,10 @@
 import { EventsDb } from "../hooks/events-db.js";
+import { basename, dirname, resolve } from "node:path";
+import {
+  withBackendPublicationAppendBarrierAsync,
+  withBackendPublicationConsumerLock,
+  readBackendMaintenanceJournal,
+} from "./backend-publication.js";
 import { StorageOperationError } from "./errors.js";
 
 export interface LocalHookEvent {
@@ -168,6 +174,8 @@ export interface LocalHookOutboxRepository {
 
 export interface LocalHookOutboxOpenOptions {
   busyTimeoutMs?: number;
+  /** @internal Refuse schema changes while migration maintenance is held. */
+  _requireCurrentSchema?: boolean;
 }
 
 /**
@@ -195,7 +203,22 @@ export class SQLiteLocalHookOutboxFactory {
       );
     }
 
-    return this.register(new EventsDb(dbPath, options));
+    const homeDir = localOutboxHomeDir(dbPath);
+    const maintenance = homeDir === undefined ? null : readBackendMaintenanceJournal(homeDir);
+    if (maintenance !== null && maintenance.phase !== "maintenance-aborted") {
+      const database = EventsDb.openExisting(dbPath, { ...options, _requireCurrentSchema: true });
+      if (database === null) {
+        throw new StorageOperationError(
+          "STORAGE_INITIALIZATION_FAILED",
+          "sqlite",
+          undefined,
+          "passive-events",
+          "open",
+        );
+      }
+      return this.register(database, dbPath);
+    }
+    return this.register(new EventsDb(dbPath, options), dbPath);
   }
 
   /** Open an existing local outbox without creating its file or parent directory. */
@@ -213,14 +236,20 @@ export class SQLiteLocalHookOutboxFactory {
       );
     }
 
-    const database = EventsDb.openExisting(dbPath, options);
-    return database === null ? null : this.register(database);
+    const homeDir = localOutboxHomeDir(dbPath);
+    const maintenance = homeDir === undefined ? null : readBackendMaintenanceJournal(homeDir);
+    const database = EventsDb.openExisting(dbPath, {
+      ...options,
+      _requireCurrentSchema: maintenance !== null && maintenance.phase !== "maintenance-aborted",
+    });
+    return database === null ? null : this.register(database, dbPath);
   }
 
-  private register(database: EventsDb): LocalHookOutboxRepository {
+  private register(database: EventsDb, dbPath: string): LocalHookOutboxRepository {
     let repository: SQLiteLocalHookOutboxRepository;
     repository = new SQLiteLocalHookOutboxRepository(
       database,
+      localOutboxHomeDir(dbPath),
       () => this.repositories.delete(repository),
     );
     this.repositories.add(repository);
@@ -241,22 +270,35 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
 
   constructor(
     private readonly database: EventsDb,
+    private readonly homeDir: string | undefined,
     private readonly onClose: () => void,
   ) {}
 
+  private admitted<T>(callback: () => T): T {
+    return this.homeDir === undefined
+      ? callback()
+      : withBackendPublicationConsumerLock(this.homeDir, callback);
+  }
+
+  private async append<T>(callback: () => T): Promise<T> {
+    return this.homeDir === undefined
+      ? callback()
+      : withBackendPublicationAppendBarrierAsync(this.homeDir, callback);
+  }
+
   async insertEvent(sessionId: string, event: LocalHookEvent, sourceHook: string): Promise<number> {
     this.assertOpen("insertEvent");
-    return this.database.insertEvent(sessionId, event, sourceHook);
+    return this.append(() => this.database.insertEvent(sessionId, event, sourceHook));
   }
 
   async getUnprocessed(limit?: number): Promise<LocalHookEventRow[]> {
     this.assertOpen("getUnprocessed");
-    return this.database.getUnprocessed(limit);
+    return this.admitted(() => this.database.getUnprocessed(limit));
   }
 
   async markProcessed(eventIds: number[]): Promise<void> {
     this.assertOpen("markProcessed");
-    this.database.markProcessed(eventIds);
+    this.admitted(() => this.database.markProcessed(eventIds));
   }
 
   async observeMissingCwd(
@@ -265,26 +307,26 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     requiredObservations: number,
   ): Promise<LocalHookMissingCwdState> {
     this.assertOpen("observeMissingCwd");
-    return this.database.observeMissingCwd(
+    return this.admitted(() => this.database.observeMissingCwd(
       observedAtMs,
       minimumIntervalMs,
       requiredObservations,
-    );
+    ));
   }
 
   async clearMissingCwd(): Promise<void> {
     this.assertOpen("clearMissingCwd");
-    this.database.clearMissingCwd();
+    this.admitted(() => this.database.clearMissingCwd());
   }
 
   async pruneProcessed(olderThanDays: number): Promise<number> {
     this.assertOpen("pruneProcessed");
-    return this.database.pruneProcessed(olderThanDays);
+    return this.admitted(() => this.database.pruneProcessed(olderThanDays));
   }
 
   async setPrevEventId(eventId: number, prevEventId: number): Promise<void> {
     this.assertOpen("setPrevEventId");
-    this.database.setPrevEventId(eventId, prevEventId);
+    this.admitted(() => this.database.setPrevEventId(eventId, prevEventId));
   }
 
   async getPatternReinforcement(
@@ -294,12 +336,12 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     maxAgeDays?: number,
   ): Promise<PatternReinforcementStats> {
     this.assertOpen("getPatternReinforcement");
-    return this.database.getPatternReinforcement(type, category, data, maxAgeDays);
+    return this.admitted(() => this.database.getPatternReinforcement(type, category, data, maxAgeDays));
   }
 
   async logHookError(hook: string, error: unknown, sessionId?: string): Promise<void> {
     this.assertOpen("logHookError");
-    this.database.logHookError(hook, error, sessionId);
+    this.admitted(() => this.database.logHookError(hook, error, sessionId));
   }
 
   async getHealthStats(): Promise<LocalHookOutboxHealth> {
@@ -314,17 +356,17 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
 
   async pruneUnprocessed(maxRows?: number, maxAgeDays?: number): Promise<{ pruned: number }> {
     this.assertOpen("pruneUnprocessed");
-    return this.database.pruneUnprocessed(maxRows, maxAgeDays);
+    return this.admitted(() => this.database.pruneUnprocessed(maxRows, maxAgeDays));
   }
 
   async pruneErrorLog(olderThanDays?: number): Promise<number> {
     this.assertOpen("pruneErrorLog");
-    return this.database.pruneErrorLog(olderThanDays);
+    return this.admitted(() => this.database.pruneErrorLog(olderThanDays));
   }
 
   async claimDeliveries(input: LocalHookDeliveryClaimInput): Promise<LocalHookEventRow[]> {
     this.assertOpen("claimDeliveries");
-    return this.database.claimDeliveries(input);
+    return this.admitted(() => this.database.claimDeliveries(input));
   }
 
   async markReplicated(
@@ -333,7 +375,7 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     remoteInboxId: bigint,
   ): Promise<boolean> {
     this.assertOpen("markReplicated");
-    return this.database.markReplicated(eventUuid, claimOwner, remoteInboxId);
+    return this.admitted(() => this.database.markReplicated(eventUuid, claimOwner, remoteInboxId));
   }
 
   async markDeliveryRetry(
@@ -343,7 +385,7 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     nextAttemptAt: string,
   ): Promise<boolean> {
     this.assertOpen("markDeliveryRetry");
-    return this.database.markDeliveryRetry(eventUuid, claimOwner, error, nextAttemptAt);
+    return this.admitted(() => this.database.markDeliveryRetry(eventUuid, claimOwner, error, nextAttemptAt));
   }
 
   async markDeliveryQuarantined(
@@ -352,7 +394,7 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     reason: string,
   ): Promise<boolean> {
     this.assertOpen("markDeliveryQuarantined");
-    return this.database.markDeliveryQuarantined(eventUuid, claimOwner, reason);
+    return this.admitted(() => this.database.markDeliveryQuarantined(eventUuid, claimOwner, reason));
   }
 
   async listAwaitingRemote(
@@ -360,17 +402,17 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     includeQuarantined?: boolean,
   ): Promise<LocalHookEventRow[]> {
     this.assertOpen("listAwaitingRemote");
-    return this.database.listAwaitingRemote(limit, includeQuarantined);
+    return this.admitted(() => this.database.listAwaitingRemote(limit, includeQuarantined));
   }
 
   async listQuarantined(limit?: number): Promise<LocalHookEventRow[]> {
     this.assertOpen("listQuarantined");
-    return this.database.listQuarantined(limit);
+    return this.admitted(() => this.database.listQuarantined(limit));
   }
 
   async markAcknowledged(eventUuid: string, remoteInboxId: bigint): Promise<boolean> {
     this.assertOpen("markAcknowledged");
-    return this.database.markAcknowledged(eventUuid, remoteInboxId);
+    return this.admitted(() => this.database.markAcknowledged(eventUuid, remoteInboxId));
   }
 
   async markQuarantined(
@@ -379,22 +421,22 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     reason: string,
   ): Promise<boolean> {
     this.assertOpen("markQuarantined");
-    return this.database.markQuarantined(eventUuid, remoteInboxId, reason);
+    return this.admitted(() => this.database.markQuarantined(eventUuid, remoteInboxId, reason));
   }
 
   async replayQuarantined(eventUuid: string): Promise<boolean> {
     this.assertOpen("replayQuarantined");
-    return this.database.replayQuarantined(eventUuid);
+    return this.admitted(() => this.database.replayQuarantined(eventUuid));
   }
 
   async listAcknowledgedForRemotePrune(limit?: number): Promise<LocalHookEventRow[]> {
     this.assertOpen("listAcknowledgedForRemotePrune");
-    return this.database.listAcknowledgedForRemotePrune(limit);
+    return this.admitted(() => this.database.listAcknowledgedForRemotePrune(limit));
   }
 
   async markRemotePruned(eventUuid: string): Promise<boolean> {
     this.assertOpen("markRemotePruned");
-    return this.database.markRemotePruned(eventUuid);
+    return this.admitted(() => this.database.markRemotePruned(eventUuid));
   }
 
   async getDeliveryDiagnostics(): Promise<LocalHookDeliveryDiagnostics> {
@@ -419,4 +461,12 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
       operation,
     );
   }
+}
+
+function localOutboxHomeDir(dbPath: string): string | undefined {
+  const eventsDirectory = dirname(resolve(dbPath));
+  const lcmDirectory = dirname(eventsDirectory);
+  return basename(eventsDirectory) === "events" && basename(lcmDirectory) === ".lcm"
+    ? dirname(lcmDirectory)
+    : undefined;
 }

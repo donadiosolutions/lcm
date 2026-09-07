@@ -1,4 +1,7 @@
 import type { ProjectIdentity } from "../../project-map.js";
+import { basename, dirname, resolve } from "node:path";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { projectPaths, ensureProjectDir } from "../../daemon/project.js";
 import {
   getExistingLcmConnection,
@@ -22,6 +25,10 @@ import { assertSqliteReady, SqliteReadinessRollbackError } from "./health.js";
 import { SqliteProjectStorage } from "./project-storage.js";
 import type { BackendPublicationLockToken } from "../backend-publication.js";
 import { throwIfAborted } from "../../daemon/cancellation.js";
+import { readMachineIdentity } from "../../machine-identity.js";
+import { LocalHookEventSequenceAllocator } from "../local-hook-event-sequence.js";
+import { adoptMigrationReceiptEpoch } from "../../migration/receipts.js";
+import { withBackendPublicationAppendBarrierAsync } from "../backend-publication.js";
 
 export class SqliteStorageBackendFactory implements StorageBackendFactory {
   readonly backend = "sqlite" as const;
@@ -106,6 +113,10 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
         paths.id,
         () => { invalidateLcmConnection(paths.dbPath, db!); },
       );
+      const admission = {
+        homeDir: sqliteProjectHomeDir(paths.dbPath),
+        ...(publicationLockToken === undefined ? {} : { lockToken: publicationLockToken }),
+      };
       let features: LcmDbFeatures;
       try {
         features = await executor.run("factory", operation, () => {
@@ -116,7 +127,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
           if (this.closed) this.assertOpen(identity, operation);
           runLcmMigrations(db!, detected);
           return detected;
-        });
+        }, admission);
       } catch (error) {
         if (error instanceof StorageOperationError && error.code === "STORAGE_CLOSED") {
           throw error;
@@ -129,6 +140,29 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
           operation,
         );
       }
+      const homeDir = admission.homeDir;
+      if (homeDir !== undefined) {
+        const machine = readMachineIdentity(homeDir);
+        if (machine?.machineId !== null && machine?.machineId !== undefined) {
+          await withBackendPublicationAppendBarrierAsync(homeDir, async () => {
+            const allocator = new LocalHookEventSequenceAllocator(
+              join(homeDir, ".lcm", "events", ".machine-sequence.sqlite"),
+            );
+            try {
+              const firstMachineSequence = allocator.peekNextSequence().toString().padStart(19, "0");
+              adoptMigrationReceiptEpoch(db!, {
+                projectId: paths.id,
+                machineId: machine.machineId!,
+                epochId: randomUUID(),
+                firstMachineSequence,
+                establishedAt: `${new Date().toISOString().slice(0, -1)}000Z`,
+              });
+            } finally {
+              allocator.close();
+            }
+          }, publicationLockToken);
+        }
+      }
       this.assertOpen(identity, operation);
       throwIfAborted(signal);
       storage = new SqliteProjectStorage(
@@ -138,6 +172,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
         executor,
         sqliteStorageCapabilities(features.fts5Available),
         (closed): void => { this.projects.delete(closed); },
+        admission,
       );
       throwIfAborted(signal);
       this.assertOpen(identity, operation);
@@ -214,7 +249,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
           }
           throw error;
         }
-      });
+      }, { homeDir: sqliteProjectHomeDir(project.dbPath) });
       return { status: "healthy", backend: "sqlite", projectId: project.id };
     } catch (error) {
       return {
@@ -267,4 +302,13 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       operation,
     );
   }
+}
+
+function sqliteProjectHomeDir(dbPath: string): string | undefined {
+  const projectDirectory = dirname(resolve(dbPath));
+  const projectsDirectory = dirname(projectDirectory);
+  const lcmDirectory = dirname(projectsDirectory);
+  return basename(projectsDirectory) === "projects" && basename(lcmDirectory) === ".lcm"
+    ? dirname(lcmDirectory)
+    : undefined;
 }

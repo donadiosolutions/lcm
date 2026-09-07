@@ -26,6 +26,10 @@ import {
   resolveProjectIdentity,
   setRemoteProjectBinding,
 } from "../../../src/project-map.js";
+import {
+  adoptMigrationReceiptEpoch,
+  readMigrationReceiptEvidence,
+} from "../../../src/migration/receipts.js";
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const PROJECT_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
@@ -216,6 +220,88 @@ describe("promote-events route", () => {
     expect(call.confidence).toBe(0.5);
     expect(call.tags).toContain("type:preference");
     expect(call.tags).toContain("source:passive-capture");
+  });
+
+  it("commits an applied receipt with a receipt-era SQLite promotion", async () => {
+    recoverMachineIdentity({
+      version: 1,
+      identityKey: `machine:${"b".repeat(64)}`,
+      machineId: MACHINE_ID,
+      displayName: "Machine A",
+    }, { homeDir });
+    const projectDb = setupProjectDb(dir);
+    adoptMigrationReceiptEpoch(projectDb, {
+      projectId: projectId(dir),
+      machineId: MACHINE_ID,
+      epochId: "118f22c4-6d2a-4f10-8a4c-6b8d3e5f9012",
+      firstMachineSequence: "0000000000000000000",
+      establishedAt: "2026-09-07T03:04:05.123456Z",
+    });
+    projectDb.close();
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", {
+      type: "decision",
+      category: "decision",
+      data: "receipt covered",
+      priority: 1,
+    }, "PostToolUse");
+    edb.close();
+
+    await createPromoteEventsHandler(makeConfig())(
+      request,
+      mockRes().res,
+      JSON.stringify({ cwd: dir }),
+    );
+
+    const verify = new DatabaseSync(projectDbPath(dir), { readOnly: true });
+    const evidence = readMigrationReceiptEvidence(verify, projectId(dir), MACHINE_ID);
+    expect(evidence.receipts).toMatchObject([{
+      outcome: "applied",
+      effectWitness: { promotedMemoryId: "mock-id" },
+    }]);
+    verify.close();
+  });
+
+  it("commits a no-effect receipt with the unreinforced lexical decision", async () => {
+    recoverMachineIdentity({
+      version: 1,
+      identityKey: `machine:${"c".repeat(64)}`,
+      machineId: MACHINE_ID,
+      displayName: "Machine A",
+    }, { homeDir });
+    const projectDb = setupProjectDb(dir);
+    adoptMigrationReceiptEpoch(projectDb, {
+      projectId: projectId(dir),
+      machineId: MACHINE_ID,
+      epochId: "318f22c4-6d2a-4f10-8a4c-6b8d3e5f9012",
+      firstMachineSequence: "0000000000000000000",
+      establishedAt: "2026-09-07T03:04:05.123456Z",
+    });
+    projectDb.close();
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", {
+      type: "file_read",
+      category: "file",
+      data: "only once",
+      priority: 3,
+    }, "PostToolUse");
+    edb.close();
+
+    const output = mockRes();
+    await createPromoteEventsHandler(makeConfig())(
+      request,
+      output.res,
+      JSON.stringify({ cwd: dir }),
+    );
+
+    expect(output.getBody()).toMatchObject({ promoted: 0, skipped: 1, errors: 0 });
+    const verify = new DatabaseSync(projectDbPath(dir), { readOnly: true });
+    expect(readMigrationReceiptEvidence(verify, projectId(dir), MACHINE_ID).receipts)
+      .toMatchObject([{
+        outcome: "no-effect",
+        effectWitness: { reason: "unreinforced-pattern" },
+      }]);
+    verify.close();
   });
 
   it("reuses the retained publication token through the single-project route", async () => {

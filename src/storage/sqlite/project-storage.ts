@@ -9,6 +9,7 @@ import type {
 } from "../contracts.js";
 import { normalizeStorageError, StorageOperationError } from "../errors.js";
 import { SqliteExecutor } from "./executor.js";
+import type { SqliteOperationAdmission } from "./executor.js";
 import { assertSqliteReady, SqliteReadinessRollbackError } from "./health.js";
 import {
   createSqliteRepositories,
@@ -39,6 +40,7 @@ export class SqliteProjectStorage implements ProjectStorage {
     private readonly executor: SqliteExecutor,
     readonly capabilities: StorageCapabilities,
     private readonly onClose: (storage: SqliteProjectStorage) => void,
+    private readonly admission?: SqliteOperationAdmission,
   ) {
     this.stores = createSqliteRepositoryStores(db, {
       fts5Available: capabilities.nativeFullTextSearch === "available",
@@ -49,8 +51,8 @@ export class SqliteProjectStorage implements ProjectStorage {
       async (domain, operation, callback, atomic) => {
         this.assertOpen(domain, operation);
         return atomic
-          ? this.executor.runAtomic(domain, operation, callback)
-          : this.executor.run(domain, operation, callback);
+          ? this.executor.runAtomic(domain, operation, callback, this.admission)
+          : this.executor.run(domain, operation, callback, this.admission);
       },
     );
     this.conversations = repositories.conversations;
@@ -78,7 +80,7 @@ export class SqliteProjectStorage implements ProjectStorage {
             : this.executor.runScoped(token, domain, operation, operationCallback),
       );
       return callback(repositories);
-    });
+    }, this.admission);
   }
 
   async health(): Promise<StorageHealth> {
@@ -96,7 +98,7 @@ export class SqliteProjectStorage implements ProjectStorage {
           }
           throw error;
         }
-      });
+      }, this.admission);
       candidate = { status: "healthy", backend: "sqlite", projectId: this.projectId };
     } catch (error) {
       const normalized = normalizeStorageError(error, {

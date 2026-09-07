@@ -95,11 +95,13 @@ describe("appendLocalHookEvents", () => {
     const root = join(home, ".lcm");
     mkdirSync(root, { mode: 0o700 });
     const originalAssert = securityFiles.assertPrivateDirectory;
-    let calls = 0;
+    let retainedRootCalls = 0;
+    let retainedRootFd: number | undefined;
     const assert = vi.spyOn(securityFiles, "assertPrivateDirectory").mockImplementation((handle, path, expected) => {
       const actual = originalAssert(handle, path, expected);
-      calls += 1;
-      return calls === 2 ? { ...actual, ino: `${actual.ino}-changed` } : actual;
+      if (path === root && retainedRootFd === undefined) retainedRootFd = handle.fd;
+      if (path === root && handle.fd === retainedRootFd) retainedRootCalls += 1;
+      return retainedRootCalls === 2 ? { ...actual, ino: `${actual.ino}-changed` } : actual;
     });
     try {
       await expect(appendLocalHookEvents(input())).rejects.toThrow("private directory witness changed");

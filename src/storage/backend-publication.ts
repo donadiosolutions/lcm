@@ -40,6 +40,7 @@ const HASH_PATTERN = /^[0-9a-f]{64}$/u;
 const PUBLICATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const MATERIAL_PATH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\.material$/u;
 const BACKEND_PUBLICATION_VERSION = 2 as const;
+const BACKEND_MAINTENANCE_VERSION = 3 as const;
 
 export type BackendPublicationPhase =
   | "preparing"
@@ -177,6 +178,65 @@ export type BackendPublicationJournal = Readonly<{
   checksumSha256: string;
 }>;
 
+export type BackendMaintenancePhase =
+  | "maintenance-entering"
+  | "maintenance-held"
+  | "selection-prepared"
+  | "selection-completed"
+  | "maintenance-aborted";
+
+export type BackendMaintenanceRosterEntry = Readonly<{
+  machineId: string;
+  queueCutoff: string | null;
+  evidenceSha256: string;
+}>;
+
+export type BackendMaintenanceJournal = Readonly<{
+  version: typeof BACKEND_MAINTENANCE_VERSION;
+  publicationId: string;
+  sourceBackend: "sqlite";
+  targetBackend: StorageBackendName | null;
+  phase: BackendMaintenancePhase;
+  createdAt: string;
+  updatedAt: string;
+  generationId: string;
+  sourceSelectionSha256: string;
+  queueEvidenceSha256: string;
+  roster: readonly BackendMaintenanceRosterEntry[];
+  selectedGenerationId: string | null;
+  terminalEvidenceSha256: string | null;
+  abortEvidenceSha256: string | null;
+  checksumSha256: string;
+}>;
+
+export type EnterBackendMaintenanceInput = Readonly<{
+  publicationId: string;
+  generationId: string;
+  sourceSelectionSha256: string;
+  queueEvidenceSha256: string;
+  roster: readonly BackendMaintenanceRosterEntry[];
+  now?: Date;
+}>;
+
+export type PrepareBackendMaintenanceSelectionInput = Readonly<{
+  expectedChecksumSha256: string;
+  generationId: string;
+  targetBackend: StorageBackendName;
+  terminalEvidenceSha256: string;
+}>;
+
+export type AbortBackendMaintenanceInput = Readonly<{
+  expectedChecksumSha256: string;
+  sourceSelectionSha256: string;
+  abortEvidenceSha256: string;
+}>;
+
+export type CompleteBackendMaintenanceSelectionInput = Readonly<{
+  expectedChecksumSha256: string;
+  generationId: string;
+  terminalEvidenceSha256: string;
+}>;
+
 export type BackendPublicationObserver = (event: string, path: string) => void;
 
 export type BackendPublicationDriverContext = Readonly<{
@@ -310,6 +370,8 @@ const activePublicationLockTokens = new WeakMap<BackendPublicationLockToken, {
   readonly rootPath: string;
   active: boolean;
 }>();
+const activeAppendBarrierTokens = new WeakSet<BackendPublicationLockToken>();
+const appendBarrierTails = new Map<string, Promise<void>>();
 
 function fail(reason: BackendPublicationJournalError["reason"], message: string): never {
   throw new BackendPublicationJournalError(reason, message);
@@ -873,6 +935,12 @@ function parseJournal(content: string): BackendPublicationJournal {
     return fail("malformed-journal", "backend publication journal is not valid JSON");
   }
   if (!isRecord(value)) return fail("malformed-journal", "backend publication journal is not an object");
+  if (value.version === BACKEND_MAINTENANCE_VERSION) {
+    return fail(
+      "unresolved-publication",
+      "backend publication is held for migration maintenance; use the maintenance recovery API",
+    );
+  }
   if (!exactKeys(value, [
     "checksumSha256", "createdAt", "expectedConfigSha256", "expectedProjectMapSha256",
     "intendedConfigSha256", "intendedProjectMapSha256", "phase", "projects", "publishedConfigSha256",
@@ -950,6 +1018,198 @@ function parseJournal(content: string): BackendPublicationJournal {
   return journal;
 }
 
+const MAINTENANCE_PHASES: readonly BackendMaintenancePhase[] = [
+  "maintenance-entering",
+  "maintenance-held",
+  "selection-prepared",
+  "selection-completed",
+  "maintenance-aborted",
+];
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const PADDED_SEQUENCE = /^\d{19}$/u;
+
+function maintenanceChecksum(
+  value: Omit<BackendMaintenanceJournal, "checksumSha256">,
+): string {
+  return backendPublicationCanonicalSha256(value);
+}
+
+function withMaintenanceChecksum(
+  value: Omit<BackendMaintenanceJournal, "checksumSha256">,
+): BackendMaintenanceJournal {
+  const { checksumSha256: _previousChecksum, ...payload } = value as
+    Omit<BackendMaintenanceJournal, "checksumSha256">
+    & Partial<Pick<BackendMaintenanceJournal, "checksumSha256">>;
+  return { ...payload, checksumSha256: maintenanceChecksum(payload) };
+}
+
+function parseMaintenanceRoster(value: unknown): readonly BackendMaintenanceRosterEntry[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    return fail("malformed-journal", "backend maintenance roster is empty or malformed");
+  }
+  const roster = value.map((item, index): BackendMaintenanceRosterEntry => {
+    if (
+      !isRecord(item)
+      || !exactKeys(item, ["evidenceSha256", "machineId", "queueCutoff"])
+      || typeof item.machineId !== "string"
+      || !CANONICAL_UUID.test(item.machineId)
+      || !HASH_PATTERN.test(String(item.evidenceSha256))
+      || !(item.queueCutoff === null || (
+        typeof item.queueCutoff === "string"
+        && PADDED_SEQUENCE.test(item.queueCutoff)
+        && item.queueCutoff <= "9223372036854775807"
+      ))
+    ) {
+      return fail("malformed-journal", `backend maintenance roster[${index}] is malformed`);
+    }
+    return {
+      machineId: item.machineId,
+      queueCutoff: item.queueCutoff,
+      evidenceSha256: item.evidenceSha256 as string,
+    };
+  });
+  const sorted = [...roster].sort((left, right) => left.machineId.localeCompare(right.machineId));
+  if (!sameValue(roster, sorted) || new Set(roster.map(({ machineId }) => machineId)).size !== roster.length) {
+    return fail("malformed-journal", "backend maintenance roster is not uniquely sorted");
+  }
+  return roster;
+}
+
+function parseMaintenanceJournal(content: string): BackendMaintenanceJournal {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    return fail("malformed-journal", "backend maintenance journal is not valid JSON");
+  }
+  if (
+    !isRecord(value)
+    || !exactKeys(value, [
+      "abortEvidenceSha256", "checksumSha256", "createdAt", "generationId",
+      "phase", "publicationId", "queueEvidenceSha256", "roster",
+      "selectedGenerationId", "sourceBackend", "sourceSelectionSha256",
+      "targetBackend", "terminalEvidenceSha256", "updatedAt", "version",
+    ])
+  ) {
+    return fail("malformed-journal", "backend maintenance journal has unknown fields");
+  }
+  const checksum = value.checksumSha256;
+  const payload = { ...value };
+  delete payload.checksumSha256;
+  if (
+    value.version !== BACKEND_MAINTENANCE_VERSION
+    || typeof checksum !== "string"
+    || !HASH_PATTERN.test(checksum)
+    || maintenanceChecksum(payload as Omit<BackendMaintenanceJournal, "checksumSha256">) !== checksum
+  ) {
+    return fail("checksum-mismatch", "backend maintenance journal checksum does not match");
+  }
+  if (
+    typeof value.publicationId !== "string"
+    || !PUBLICATION_ID_PATTERN.test(value.publicationId)
+    || value.sourceBackend !== "sqlite"
+    || !(value.targetBackend === null || value.targetBackend === "sqlite" || value.targetBackend === "postgresql")
+    || !MAINTENANCE_PHASES.includes(value.phase as BackendMaintenancePhase)
+    || typeof value.createdAt !== "string"
+    || typeof value.updatedAt !== "string"
+    || !Number.isFinite(Date.parse(value.createdAt))
+    || !Number.isFinite(Date.parse(value.updatedAt))
+    || typeof value.generationId !== "string"
+    || !PUBLICATION_ID_PATTERN.test(value.generationId)
+    || !HASH_PATTERN.test(String(value.sourceSelectionSha256))
+    || !HASH_PATTERN.test(String(value.queueEvidenceSha256))
+    || !(value.selectedGenerationId === null || (typeof value.selectedGenerationId === "string" && PUBLICATION_ID_PATTERN.test(value.selectedGenerationId)))
+    || !(value.terminalEvidenceSha256 === null || HASH_PATTERN.test(String(value.terminalEvidenceSha256)))
+    || !(value.abortEvidenceSha256 === null || HASH_PATTERN.test(String(value.abortEvidenceSha256)))
+  ) {
+    return fail("malformed-journal", "backend maintenance journal fields are malformed");
+  }
+  const roster = parseMaintenanceRoster(value.roster);
+  const journal = { ...value, roster } as unknown as BackendMaintenanceJournal;
+  if (
+    (journal.phase === "maintenance-entering" || journal.phase === "maintenance-held")
+      && (journal.targetBackend !== null || journal.selectedGenerationId !== null
+        || journal.terminalEvidenceSha256 !== null || journal.abortEvidenceSha256 !== null)
+  ) {
+    return fail("malformed-journal", "held backend maintenance contains terminal state");
+  }
+  if ((journal.phase === "selection-prepared" || journal.phase === "selection-completed") && (
+    journal.targetBackend === null
+    || journal.selectedGenerationId !== journal.generationId
+    || journal.terminalEvidenceSha256 === null
+    || journal.abortEvidenceSha256 !== null
+  )) {
+    return fail("malformed-journal", "backend maintenance selection is incomplete");
+  }
+  if (journal.phase === "maintenance-aborted" && (
+    journal.targetBackend !== null
+    || journal.selectedGenerationId !== null
+    || journal.terminalEvidenceSha256 !== null
+    || journal.abortEvidenceSha256 === null
+  )) {
+    return fail("malformed-journal", "backend maintenance abort is incomplete");
+  }
+  return journal;
+}
+
+function readMaintenanceJournalFromDirectory(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle | undefined,
+): BackendMaintenanceJournal | null {
+  if (directoryHandle === undefined) return null;
+  const directory = backendPublicationDirectory(homeDir);
+  try {
+    assertPrivateDirectory(directoryHandle, directory, directoryHandle.witness);
+    const observed = readBoundedRegularFileWithStat(backendPublicationJournalPath(homeDir), {
+      allowedRoot: directory,
+      maxBytes: MAX_JOURNAL_BYTES,
+      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      allowedModes: [0o600],
+      requireSingleLink: true,
+    });
+    if (observed.parentDev !== directoryHandle.witness.dev || observed.parentIno !== directoryHandle.witness.ino) {
+      return fail("unsafe-storage", "backend maintenance journal parent does not match");
+    }
+    let candidate: unknown;
+    try {
+      candidate = JSON.parse(observed.content);
+    } catch {
+      return fail("malformed-journal", "backend publication journal is not valid JSON");
+    }
+    if (!isRecord(candidate)) {
+      return fail("malformed-journal", "backend publication journal is not an object");
+    }
+    if (candidate.version !== BACKEND_MAINTENANCE_VERSION) return null;
+    const parsed = parseMaintenanceJournal(observed.content);
+    assertPrivateDirectory(directoryHandle, directory, directoryHandle.witness);
+    return parsed;
+  } catch (error) {
+    if (isMissing(error)) return null;
+    if (error instanceof BackendPublicationJournalError) throw error;
+    return fail("unsafe-storage", `backend maintenance journal cannot be read: ${(error as Error).message}`);
+  }
+}
+
+function writeMaintenanceJournal(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+  journal: BackendMaintenanceJournal,
+  expectedChecksumSha256?: string,
+): void {
+  const current = readMaintenanceJournalFromDirectory(homeDir, directoryHandle);
+  if (expectedChecksumSha256 === undefined) {
+    if (current !== null) return fail("unresolved-publication", "backend publication journal already exists");
+  } else if (current?.checksumSha256 !== expectedChecksumSha256) {
+    return fail("unexpected-state", "backend maintenance journal changed before update");
+  }
+  atomicWritePrivateFileDurable(
+    backendPublicationJournalPath(homeDir),
+    `${canonicalJson(journal)}\n`,
+    { requireAbsent: expectedChecksumSha256 === undefined, maxExistingBytes: MAX_JOURNAL_BYTES },
+  );
+  assertPrivateDirectory(directoryHandle, backendPublicationDirectory(homeDir), directoryHandle.witness);
+}
+
 type BackendPublicationDirectoryHandle = ReturnType<typeof openPrivateDirectory>;
 
 function openBackendPublicationDirectoryForRead(
@@ -1024,6 +1284,14 @@ function readJournal(homeDir?: string): BackendPublicationJournal | null {
 
 export function readBackendPublicationJournal(homeDir?: string): BackendPublicationJournal | null {
   return readJournal(homeDir);
+}
+
+/** Read the exact v3 migration-maintenance record without accepting v2 data. */
+export function readBackendMaintenanceJournal(homeDir?: string): BackendMaintenanceJournal | null {
+  return withBackendPublicationDirectoryRead(
+    homeDir,
+    (directoryHandle) => readMaintenanceJournalFromDirectory(homeDir, directoryHandle),
+  );
 }
 
 function assertBackendPublicationEvidenceDirectory(
@@ -1187,6 +1455,22 @@ function assertBackendPublicationConsumerAccessUnlocked(options: {
   readonly lockToken?: BackendPublicationLockToken;
 } = {}): void {
   if (options.permit === undefined) {
+    const maintenance = withBackendPublicationDirectoryRead(
+      options.homeDir,
+      (directoryHandle) => readMaintenanceJournalFromDirectory(options.homeDir, directoryHandle),
+    );
+    if (maintenance !== null) {
+      if (maintenance.phase !== "maintenance-aborted" && maintenance.phase !== "selection-completed") {
+        return fail("unresolved-publication", "backend publication is held for migration maintenance");
+      }
+      const selectedBackend = maintenance.phase === "maintenance-aborted"
+        ? "sqlite"
+        : maintenance.targetBackend!;
+      if (options.backend !== undefined && options.backend !== selectedBackend) {
+        return fail("backend-mismatch", "backend does not match terminal migration maintenance state");
+      }
+      return;
+    }
     return withConsumerPublicationJournal(options.homeDir, (journal) => {
       if (journal === null) {
         if (options.backend === "postgresql") {
@@ -1503,6 +1787,101 @@ export async function withBackendPublicationConsumerLockAsync<T>(
     outcome = { succeeded: false, error };
   }
   return completeConsumerOperation(publicationHandle, rootHandle, outcome);
+}
+
+/**
+ * Serialize the only source mutation admitted by a held migration: allocating
+ * a local machine sequence and inserting its matching outbox envelope.
+ */
+export function withBackendPublicationAppendBarrier<T>(
+  homeDir: string | undefined,
+  callback: (token: BackendPublicationLockToken) => T,
+  lockToken?: BackendPublicationLockToken,
+): T {
+  if (lockToken !== undefined && activeAppendBarrierTokens.has(lockToken)) {
+    assertLockToken(lockToken, homeDir);
+    return requireSynchronousResult(callback(lockToken), lockToken);
+  }
+  return withBackendPublicationConsumerLock(homeDir, (token) => {
+    const maintenance = withBackendPublicationDirectoryRead(
+      homeDir,
+      (directoryHandle) => readMaintenanceJournalFromDirectory(homeDir, directoryHandle),
+    );
+    if (maintenance === null) {
+      assertBackendPublicationConsumerAccessUnlocked({ homeDir, lockToken: token });
+    } else if (
+      maintenance.phase !== "maintenance-held"
+      && maintenance.phase !== "selection-prepared"
+      && maintenance.phase !== "selection-completed"
+      && maintenance.phase !== "maintenance-aborted"
+    ) {
+      return fail("unresolved-publication", "backend maintenance is not ready for local append");
+    }
+    return withPrivateMutationLock(
+      join(rootPath(homeDir), ".local-hook-append.lock"),
+      "local hook append barrier",
+      () => {
+        activeAppendBarrierTokens.add(token);
+        try {
+          return requireSynchronousResult(callback(token), token);
+        } finally {
+          activeAppendBarrierTokens.delete(token);
+        }
+      },
+    );
+  }, { allowUnresolved: true, lockToken });
+}
+
+/** Async local-append barrier with the same exact authority as the sync form. */
+export async function withBackendPublicationAppendBarrierAsync<T>(
+  homeDir: string | undefined,
+  callback: (token: BackendPublicationLockToken) => Promise<T> | T,
+  lockToken?: BackendPublicationLockToken,
+): Promise<T> {
+  if (lockToken !== undefined && activeAppendBarrierTokens.has(lockToken)) {
+    assertLockToken(lockToken, homeDir);
+    return callback(lockToken);
+  }
+  const key = rootPath(homeDir);
+  const previous = appendBarrierTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve): void => { release = resolve; });
+  const tail = previous.then(() => current);
+  appendBarrierTails.set(key, tail);
+  await previous;
+  try {
+    return await withBackendPublicationConsumerLockAsync(homeDir, async (token) => {
+    const maintenance = withBackendPublicationDirectoryRead(
+      homeDir,
+      (directoryHandle) => readMaintenanceJournalFromDirectory(homeDir, directoryHandle),
+    );
+    if (maintenance === null) {
+      assertBackendPublicationConsumerAccessUnlocked({ homeDir, lockToken: token });
+    } else if (
+      maintenance.phase !== "maintenance-held"
+      && maintenance.phase !== "selection-prepared"
+      && maintenance.phase !== "selection-completed"
+      && maintenance.phase !== "maintenance-aborted"
+    ) {
+      return fail("unresolved-publication", "backend maintenance is not ready for local append");
+    }
+    return withPrivateMutationLockAsync(
+      join(rootPath(homeDir), ".local-hook-append.lock"),
+      "local hook append barrier",
+      async () => {
+        activeAppendBarrierTokens.add(token);
+        try {
+          return await callback(token);
+        } finally {
+          activeAppendBarrierTokens.delete(token);
+        }
+      },
+    );
+    }, { allowUnresolved: true, lockToken });
+  } finally {
+    release();
+    if (appendBarrierTails.get(key) === tail) appendBarrierTails.delete(key);
+  }
 }
 
 export function assertBackendPublicationConsumerAccess(options: {
@@ -2482,6 +2861,158 @@ export class BackendPublicationCoordinator {
     this.#observer = input.observer ?? NOOP_OBSERVER;
   }
 
+  async enterMaintenance(
+    input: EnterBackendMaintenanceInput,
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<BackendMaintenanceJournal> {
+    return this.#locked(async (directoryHandle) => {
+      const existing = readJournalFromDirectory(this.#homeDir, directoryHandle);
+      if (existing !== null) {
+        if (existing.phase !== "completed" && existing.phase !== "aborted") {
+          return fail("unresolved-publication", "backend publication journal already exists");
+        }
+        archiveTerminalJournal(this.#homeDir, existing);
+      }
+      if (
+        !PUBLICATION_ID_PATTERN.test(input.publicationId)
+        || !PUBLICATION_ID_PATTERN.test(input.generationId)
+        || !HASH_PATTERN.test(input.sourceSelectionSha256)
+        || !HASH_PATTERN.test(input.queueEvidenceSha256)
+        || (input.now !== undefined && !Number.isFinite(input.now.getTime()))
+      ) {
+        return fail("invalid-input", "backend maintenance input is malformed");
+      }
+      const roster = parseMaintenanceRoster(input.roster);
+      const now = (input.now ?? new Date()).toISOString();
+      const entering = withMaintenanceChecksum({
+        version: BACKEND_MAINTENANCE_VERSION,
+        publicationId: input.publicationId,
+        sourceBackend: "sqlite",
+        targetBackend: null,
+        phase: "maintenance-entering",
+        createdAt: now,
+        updatedAt: now,
+        generationId: input.generationId,
+        sourceSelectionSha256: input.sourceSelectionSha256,
+        queueEvidenceSha256: input.queueEvidenceSha256,
+        roster,
+        selectedGenerationId: null,
+        terminalEvidenceSha256: null,
+        abortEvidenceSha256: null,
+      });
+      writeMaintenanceJournal(this.#homeDir, directoryHandle, entering);
+      const held = withMaintenanceChecksum({
+        ...entering,
+        phase: "maintenance-held",
+        updatedAt: new Date().toISOString(),
+      });
+      writeMaintenanceJournal(this.#homeDir, directoryHandle, held, entering.checksumSha256);
+      return held;
+    }, lockToken);
+  }
+
+  inspectMaintenance(): BackendMaintenanceJournal | null {
+    return withBackendPublicationDirectoryRead(
+      this.#homeDir,
+      (directoryHandle) => readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle),
+    );
+  }
+
+  async prepareMaintenanceSelection(
+    input: PrepareBackendMaintenanceSelectionInput,
+  ): Promise<BackendMaintenanceJournal> {
+    return this.#locked(async (directoryHandle) => {
+      const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
+      if (journal === null) return fail("publication-evidence-missing", "backend maintenance journal is missing");
+      if (
+        !HASH_PATTERN.test(input.expectedChecksumSha256)
+        || !HASH_PATTERN.test(input.terminalEvidenceSha256)
+        || !PUBLICATION_ID_PATTERN.test(input.generationId)
+        || (input.targetBackend !== "sqlite" && input.targetBackend !== "postgresql")
+      ) {
+        return fail("invalid-input", "backend maintenance selection input is malformed");
+      }
+      if (
+        journal.phase !== "maintenance-held"
+        || journal.checksumSha256 !== input.expectedChecksumSha256
+        || journal.generationId !== input.generationId
+      ) {
+        return fail("unexpected-state", "backend maintenance selection does not match held state");
+      }
+      const prepared = withMaintenanceChecksum({
+        ...journal,
+        phase: "selection-prepared",
+        targetBackend: input.targetBackend,
+        selectedGenerationId: input.generationId,
+        terminalEvidenceSha256: input.terminalEvidenceSha256,
+        updatedAt: new Date().toISOString(),
+      });
+      writeMaintenanceJournal(this.#homeDir, directoryHandle, prepared, journal.checksumSha256);
+      return prepared;
+    });
+  }
+
+  async completeMaintenanceSelection(
+    input: CompleteBackendMaintenanceSelectionInput,
+  ): Promise<BackendMaintenanceJournal> {
+    return this.#locked(async (directoryHandle) => {
+      const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
+      if (journal === null) return fail("publication-evidence-missing", "backend maintenance journal is missing");
+      if (
+        !HASH_PATTERN.test(input.expectedChecksumSha256)
+        || !HASH_PATTERN.test(input.terminalEvidenceSha256)
+        || !PUBLICATION_ID_PATTERN.test(input.generationId)
+      ) {
+        return fail("invalid-input", "backend maintenance completion input is malformed");
+      }
+      if (
+        journal.phase !== "selection-prepared"
+        || journal.checksumSha256 !== input.expectedChecksumSha256
+        || journal.generationId !== input.generationId
+        || journal.selectedGenerationId !== input.generationId
+        || journal.terminalEvidenceSha256 !== input.terminalEvidenceSha256
+      ) {
+        return fail("unexpected-state", "backend maintenance completion does not match prepared selection");
+      }
+      const completed = withMaintenanceChecksum({
+        ...journal,
+        phase: "selection-completed",
+        updatedAt: new Date().toISOString(),
+      });
+      writeMaintenanceJournal(this.#homeDir, directoryHandle, completed, journal.checksumSha256);
+      return completed;
+    });
+  }
+
+  async abortMaintenance(input: AbortBackendMaintenanceInput): Promise<BackendMaintenanceJournal> {
+    return this.#locked(async (directoryHandle) => {
+      const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
+      if (journal === null) return fail("publication-evidence-missing", "backend maintenance journal is missing");
+      if (
+        !HASH_PATTERN.test(input.expectedChecksumSha256)
+        || !HASH_PATTERN.test(input.sourceSelectionSha256)
+        || !HASH_PATTERN.test(input.abortEvidenceSha256)
+      ) {
+        return fail("invalid-input", "backend maintenance abort input is malformed");
+      }
+      if (
+        journal.phase !== "maintenance-held"
+        || journal.checksumSha256 !== input.expectedChecksumSha256
+        || journal.sourceSelectionSha256 !== input.sourceSelectionSha256
+      ) {
+        return fail("unexpected-state", "backend maintenance abort does not match held state");
+      }
+      const aborted = withMaintenanceChecksum({
+        ...journal,
+        phase: "maintenance-aborted",
+        abortEvidenceSha256: input.abortEvidenceSha256,
+        updatedAt: new Date().toISOString(),
+      });
+      writeMaintenanceJournal(this.#homeDir, directoryHandle, aborted, journal.checksumSha256);
+      return aborted;
+    });
+  }
+
   async prepare(input: PrepareBackendPublicationInput): Promise<BackendPublicationJournal> {
     return this.#locked(async (directoryHandle) => {
       const validated = validateInput(input);
@@ -2544,8 +3075,11 @@ export class BackendPublicationCoordinator {
     });
   }
 
-  async #locked<T>(callback: (directoryHandle: BackendPublicationDirectoryHandle) => Promise<T>): Promise<T> {
-    return withBackendPublicationLockAsync(this.#homeDir, async () => {
+  async #locked<T>(
+    callback: (directoryHandle: BackendPublicationDirectoryHandle) => Promise<T>,
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<T> {
+    const operation = async (): Promise<T> => {
       ensurePublicationDirectory(this.#homeDir);
       let directoryHandle: BackendPublicationDirectoryHandle | undefined;
       try {
@@ -2560,7 +3094,12 @@ export class BackendPublicationCoordinator {
       } finally {
         directoryHandle?.close();
       }
-    });
+    };
+    if (lockToken !== undefined) {
+      assertLockToken(lockToken, this.#homeDir);
+      return operation();
+    }
+    return withBackendPublicationLockAsync(this.#homeDir, operation);
   }
 
   async #materialContext(

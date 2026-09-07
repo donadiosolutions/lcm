@@ -15,6 +15,8 @@ import { normalizeProjectPath, projectMapPathsForHash } from "./project-map.js";
 import { loadDaemonConfig, type LlmApiMode, type LlmInvocationRequestPolicy, type LlmReasoningEffort, type LlmRetryPolicy } from "./daemon/config.js";
 import { MANUAL_COMPACT_FRESH_TAIL_COUNT } from "./compaction.js";
 import { selectStorageBackendForConfig } from "./storage/backend.js";
+import { withBackendPublicationConsumerLock } from "./storage/backend-publication.js";
+import type { BackendPublicationLockToken } from "./storage/backend-publication.js";
 
 export interface UncompactedConversation {
   projectDir: string;
@@ -158,12 +160,17 @@ export function formatLlmDiagnostic(input: {
 }
 
 /** Find conversations eligible for compaction, above the token threshold. */
-function projectMatchesCwdFilter(projectHash: string, cwd: string, cwdFilter?: string): boolean {
+function projectMatchesCwdFilter(
+  projectHash: string,
+  cwd: string,
+  cwdFilter?: string,
+  publicationLockToken?: BackendPublicationLockToken,
+): boolean {
   if (!cwdFilter) return true;
   const lexicalFilter = resolve(cwdFilter);
   if (resolve(cwd) === lexicalFilter) return true;
   try {
-    if (projectMapPathsForHash(projectHash).includes(lexicalFilter)) return true;
+    if (projectMapPathsForHash(projectHash, publicationLockToken).includes(lexicalFilter)) return true;
   } catch {
     // Fall back to the metadata cwd while map.json is being edited.
   }
@@ -172,10 +179,14 @@ function projectMatchesCwdFilter(projectHash: string, cwd: string, cwdFilter?: s
   return false;
 }
 
-function metadataFailureMatchesCwdFilter(projectHash: string, cwdFilter?: string): boolean {
+function metadataFailureMatchesCwdFilter(
+  projectHash: string,
+  cwdFilter?: string,
+  publicationLockToken?: BackendPublicationLockToken,
+): boolean {
   if (!cwdFilter) return true;
   try {
-    return projectMapPathsForHash(projectHash).includes(resolve(cwdFilter));
+    return projectMapPathsForHash(projectHash, publicationLockToken).includes(resolve(cwdFilter));
   } catch {
     return false;
   }
@@ -231,7 +242,13 @@ function hasReplayCondensationCandidate(db: ReturnType<typeof getLcmConnection>,
   return false;
 }
 
-function discoverUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): UncompactedDiscovery {
+function discoverUncompacted(
+  minTokens: number,
+  readOnly = false,
+  cwdFilter?: string,
+  replay = false,
+  publicationLockToken?: BackendPublicationLockToken,
+): UncompactedDiscovery {
   const baseDir = lcmProjectsDir();
   if (!existsSync(baseDir)) return { conversations: [], failures: [] };
 
@@ -246,7 +263,7 @@ function discoverUncompacted(minTokens: number, readOnly = false, cwdFilter?: st
 
     const metaPath = join(projDir, "meta.json");
     if (!existsSync(metaPath)) {
-      if (metadataFailureMatchesCwdFilter(entry.name, cwdFilter)) {
+      if (metadataFailureMatchesCwdFilter(entry.name, cwdFilter, publicationLockToken)) {
         failures.push({ target: entry.name, message: "project metadata is missing" });
       }
       continue;
@@ -255,19 +272,19 @@ function discoverUncompacted(minTokens: number, readOnly = false, cwdFilter?: st
     try {
       metadata = JSON.parse(readFileSync(metaPath, "utf-8")) as unknown;
     } catch {
-      if (metadataFailureMatchesCwdFilter(entry.name, cwdFilter)) {
+      if (metadataFailureMatchesCwdFilter(entry.name, cwdFilter, publicationLockToken)) {
         failures.push({ target: entry.name, message: "project metadata is unreadable or malformed" });
       }
       continue;
     }
     const cwd = Object(metadata).cwd as unknown;
     if (typeof cwd !== "string" || cwd.trim().length === 0) {
-      if (metadataFailureMatchesCwdFilter(entry.name, cwdFilter)) {
+      if (metadataFailureMatchesCwdFilter(entry.name, cwdFilter, publicationLockToken)) {
         failures.push({ target: entry.name, message: "project metadata cwd must be a non-empty string" });
       }
       continue;
     }
-    if (!projectMatchesCwdFilter(entry.name, cwd, cwdFilter)) continue;
+    if (!projectMatchesCwdFilter(entry.name, cwd, cwdFilter, publicationLockToken)) continue;
 
     try {
       const db = getLcmConnection(dbPath);
@@ -329,7 +346,10 @@ function discoverUncompacted(minTokens: number, readOnly = false, cwdFilter?: st
 export function findUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): UncompactedConversation[] {
   const configFile = configPath();
   selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
-  return discoverUncompacted(minTokens, readOnly, cwdFilter, replay).conversations;
+  return withBackendPublicationConsumerLock(
+    undefined,
+    (token) => discoverUncompacted(minTokens, readOnly, cwdFilter, replay, token).conversations,
+  );
 }
 
 /** Compact all uncompacted conversations above threshold via the daemon. */
@@ -359,7 +379,10 @@ export async function batchCompact(opts: {
   const config = loadDaemonConfig(configFile);
   selectStorageBackendForConfig(configFile, config.storage);
   const maxConcurrency = opts.replay ? 1 : opts.maxConcurrency ?? config.llm.maxConcurrency;
-  const discovery = discoverUncompacted(opts.minTokens, opts.dryRun, opts.cwd, opts.replay);
+  const discovery = withBackendPublicationConsumerLock(
+    undefined,
+    (token) => discoverUncompacted(opts.minTokens, opts.dryRun, opts.cwd, opts.replay, token),
+  );
   const conversations = discovery.conversations;
   const onProgress = opts.onProgress;
   const phaseErrors: ProgressPhaseError[] = discovery.failures.map(failure => ({

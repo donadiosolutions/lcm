@@ -907,19 +907,7 @@ async function promoteEventsBatch(
             // Tier 3: pattern-only — require either an existing promoted match or
             // enough repeated passive evidence to bootstrap a new memory.
             confidence = eventConf.pattern ?? 0.2;
-            if (!reinforced) {
-              const existing = await project.lexicalSearch.searchPromoted(
-                scrubbedData,
-                1,
-                undefined,
-                project.projectId,
-              );
-              if (existing.length === 0) {
-                processedIds.push(event.event_id);
-                result.skipped++;
-                continue;
-              }
-            } else {
+            if (reinforced) {
               newEntryConfidence = Math.min(
                 thresholds.maxConfidence ?? 1.0,
                 confidence + (thresholds.reinforcementBoost ?? 0.3),
@@ -933,9 +921,13 @@ async function promoteEventsBatch(
             await edb.setPrevEventId(event.event_id, correlatedErrorId);
           }
 
-          // Promote via existing dedup pipeline
-          await deduplicateAndInsert({
-            transaction: (callback) => project.transaction(callback),
+          const epoch = event.machine_id === null || project.backend !== "sqlite"
+            ? null
+            : await project.transaction(async (repositories) =>
+              repositories.migrationReceipt?.getEpoch(event.machine_id!) ?? null);
+          const receiptEra = epoch !== null
+            && event.machine_sequence >= epoch.firstMachineSequence;
+          const dedupInput = {
             content: scrubbedData,
             tags: [
               tag,
@@ -952,7 +944,83 @@ async function promoteEventsBatch(
               dedupBm25Threshold: thresholds.dedupBm25Threshold ?? 15,
               dedupCandidateLimit: thresholds.dedupCandidateLimit ?? 100,
             },
-          });
+          };
+          if (!receiptEra) {
+            if (event.priority === 3 && !reinforced) {
+              const existing = await project.lexicalSearch.searchPromoted(
+                scrubbedData,
+                1,
+                undefined,
+                project.projectId,
+              );
+              if (existing.length === 0) {
+                processedIds.push(event.event_id);
+                result.skipped++;
+                continue;
+              }
+            }
+            await deduplicateAndInsert({
+              transaction: (callback) => project.transaction(callback),
+              ...dedupInput,
+            });
+          } else {
+            const promotion = await project.transaction(async (repositories) => {
+            const committedAt = (): string => `${new Date().toISOString().slice(0, -1)}000Z`;
+            const envelope = {
+              eventUuid: event.event_uuid,
+              eventVersion: event.event_version,
+              machineId: event.machine_id!,
+              machineSequence: event.machine_sequence,
+              sessionId: event.session_id,
+              sessionSequence: event.seq,
+              type: event.type,
+              category: event.category,
+              data: event.data,
+              priority: event.priority,
+              sourceHook: event.source_hook,
+              createdAt: event.created_at,
+            };
+            if (event.priority === 3 && !reinforced) {
+              const existing = await repositories.lexicalSearch.searchPromoted(
+                scrubbedData,
+                1,
+                undefined,
+                project.projectId,
+              );
+              if (existing.length === 0) {
+                await repositories.migrationReceipt!.record({
+                  epochId: epoch.epochId,
+                  envelope,
+                  effectWitness: {
+                    version: 1,
+                    outcome: "no-effect",
+                    reason: "unreinforced-pattern",
+                  },
+                  committedAt: committedAt(),
+                });
+                return { promoted: false as const };
+              }
+            }
+            const promotedMemoryId = await deduplicateAndInsert({
+              transaction: async (callback) => callback(repositories),
+              repositories,
+              ...dedupInput,
+            });
+            await repositories.migrationReceipt!.record({
+              epochId: epoch.epochId,
+              envelope,
+              effectWitness: { version: 1, outcome: "applied", promotedMemoryId },
+              committedAt: committedAt(),
+            });
+            return { promoted: true as const };
+            });
+
+            if (!promotion.promoted) {
+              processedIds.push(event.event_id);
+              result.skipped++;
+              continue;
+            }
+          }
 
           processedIds.push(event.event_id);
           result.promoted++;

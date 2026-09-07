@@ -7,8 +7,64 @@ each step. A private durable journal makes an interrupted protocol run
 recoverable without guessing from timestamps or partially changed data.
 
 This foundation does **not** copy data, activate PostgreSQL, change the current
-storage backend, or execute rollback by itself. Later migration commands will
-perform those effects and use this protocol to record their boundaries.
+storage backend, or execute rollback by itself. The immutable SQLite snapshot
+capability adds the authenticated source artifact used by those later steps;
+it still does not copy records into PostgreSQL or select a destination.
+
+## Immutable SQLite preparation and capture
+
+Migration preparation is an explicit upgrade action. For an enrolled machine,
+it adopts the two private `migration_receipt_v1_` tables in each SQLite project
+and records the first machine sequence for which passive-event effects must
+commit with an exact receipt. Ordinary SQLite installations without a registered
+machine continue to open and process events as before. They do not fabricate an
+identity or epoch, and snapshot admission refuses their unproven history.
+
+Snapshot capture and dry-run are strictly read-only with respect to the source.
+LCM authenticates read-only, no-follow descriptors for the project database,
+local event outbox, machine-sequence database, and each WAL or shared-memory
+sidecar. Shared-memory bytes are stability evidence and are never published.
+SQLite recovery, `quick_check`, schema inspection, UTF-8 admission, and
+`user_version = 0` validation run only on private copied bytes. Capture never
+opens the source through SQLite, checkpoints it, changes its mode, runs a source
+migration, cleans a sidecar, or writes its directory.
+
+One short local append barrier covers the queue cutoff, exact source-byte
+commitment, durable maintenance entry, and private artifact seal. Hooks may
+append again only after that seal; their later events stay beyond the cutoff.
+Project writers, promotion, delivery claims, correlation repair, processing
+marks, replay, and destructive pruning remain fenced while maintenance is held.
+The maintenance record survives restart and can leave the fence only through an
+authoritative selected-generation readback or an explicit source-preserving
+abort. Reports do not grant replay or prune authority.
+
+The receipt contract deliberately refuses ambiguous legacy input. A receipt-era
+event is represented only when its immutable envelope exactly matches an applied
+or no-effect receipt from the same project transaction. A receipt-era pending
+event with no receipt is retained for later guarded replay. A processed receipt-
+era event without a receipt, an unknown machine, or any pre-epoch event refuses
+cutover. Both processed and unprocessed legacy rows can fall on the historical
+commit-before-`processed_at` crash boundary, so this refusal can be permanent.
+LCM preserves the source and private evidence rather than guessing whether to
+replay or suppress such an effect.
+
+Completed artifacts expose authenticated main and WAL paths, source identities,
+schema and content hashes, maintenance checksum, and bounded queue/receipt root
+digests. The canonical SQLite reader remains owned by the portable storage
+adapter. Migration copy orchestration consumes the artifact alongside that
+adapter; it must not create a second reader, maintenance lock, or admission
+authority.
+
+| Source condition | Snapshot disposition |
+| --- | --- |
+| Enrolled receipt-era applied/no-effect event with exact envelope receipt | Represented |
+| Enrolled receipt-era event at or below cutoff, unprocessed, without receipt | Retained pending replay |
+| Event appended after the sealed cutoff | Retained in the local outbox |
+| Legacy processed or unprocessed event | Refused as effect-ambiguous |
+| Receipt-era processed event without receipt | Refused as integrity failure |
+| Missing, pending, nonlocal, duplicate, or drifting machine authority | Refused |
+| Disconnected participant without durable acknowledged fencing | Refused |
+| Partial, replaced, or tampered generation | Refused; evidence preserved |
 
 ## How to use this today
 

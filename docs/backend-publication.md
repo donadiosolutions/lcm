@@ -117,6 +117,35 @@ root:
   history/
 ```
 
+Migration snapshot maintenance uses a separate exact version-3 journal branch
+in this same coordinator and directory. It does not create a sibling lock or
+coordinator. Version-2 publication journals retain their existing parser,
+phases, recovery material, resume, and abort behavior.
+
+The version-3 phases are `maintenance-entering`, `maintenance-held`,
+`selection-prepared`, `selection-completed`, and `maintenance-aborted`. A held
+record binds the exact snapshot generation, authenticated SQLite selection,
+complete covered machine roster, queue cutoff evidence, and checksum. Generic
+publication `resume` and `recoverPending` never advance a maintenance journal.
+Selection preparation and completion use an exact prior-checksum and generation
+compare-and-swap; completion is reserved for a caller that has authoritative
+terminal readback. A source-preserving abort verifies the original selection
+evidence and never invokes the version-2 target config/map restoration path.
+
+While maintenance is held, ordinary SQLite operations fail publication
+admission even through handles opened earlier. Local hook append has one narrow
+capability: its installation-global sequence allocation and matching outbox
+insert share a short append barrier. Existing outboxes must already have the
+current schema; hook open cannot opportunistically migrate or create an outbox
+during maintenance. Claims, processing marks, retries, acknowledgements,
+correlation updates, replay, missing-cwd updates, and pruning remain blocked.
+After an authenticated abort, SQLite consumer admission resumes. After selected-
+generation completion, only the recorded target backend is admitted.
+
+Do not edit a held journal to release it. Preserve the journal and snapshot
+generation when capture, selection, or abort readback fails. A migration report,
+elapsed time, or apparently quiet outbox is not release evidence.
+
 The exact path is derived from the configured home for isolated installations;
 the default is under `~/.lcm`. Files are bounded, private, checksum-protected,
 and opened through descriptor- and ownership-aware filesystem seams. Consumer
