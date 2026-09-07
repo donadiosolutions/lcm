@@ -229,10 +229,10 @@ describe("spawned timezone fixtures", () => {
         debug: true,
       });
       expect(recency.response.status).toBe(200);
-      const recencyDebug = (recency.body.debug as { candidates: Array<{ id: string; rank: number; baseScore: number }> }).candidates
+      const recencyDebug = (recency.body.debug as { candidates: Array<{ id: string; lexicalScore: number; baseScore: number }> }).candidates
         .find((candidate) => candidate.id === recencyId);
       expect(recencyDebug).toBeDefined();
-      expect(recencyDebug!.baseScore).toBeCloseTo(Math.abs(recencyDebug!.rank) * 0.5, 10);
+      expect(recencyDebug!.baseScore).toBeCloseTo(recencyDebug!.lexicalScore * 0.5, 10);
       expect((recency.body.ids as string[])).toContain(recencyId);
 
       const stale = await routePost(daemon, "/prompt-search", {

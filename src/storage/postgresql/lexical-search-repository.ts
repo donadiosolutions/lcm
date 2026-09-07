@@ -11,13 +11,18 @@ import type {
   SummarySearchInput,
   SummarySearchResult,
 } from "../../store/summary-store.js";
-import type { LexicalSearchRepository } from "../contracts.js";
+import type {
+  LexicalSearchRepository,
+  PromotedRecallCandidate,
+  PromotedRecallSearchResult,
+} from "../contracts.js";
 import { StorageOperationError } from "../errors.js";
 import type {
   PostgreSqlOperationContext,
   PostgreSqlQueryExecutor,
   PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
+import { parseTsqueryEvidence } from "./tsquery-evidence.js";
 
 const MAX_SEARCH_LIMIT = 1_000;
 const DEFAULT_SEARCH_LIMIT = 50;
@@ -42,7 +47,11 @@ const MESSAGE_ROLES = new Set<MessageRole>([
 ]);
 const SUMMARY_KINDS = new Set<SummaryKind>(["leaf", "condensed"]);
 
-type SearchOperation = "searchMessages" | "searchSummaries" | "searchPromoted";
+type PromotedSearchOperation = "searchPromoted" | "searchPromotedForRecall";
+type SearchOperation =
+  | "searchMessages"
+  | "searchSummaries"
+  | PromotedSearchOperation;
 
 type SearchContext = PostgreSqlOperationContext & {
   readonly domain: "lexical-search";
@@ -252,7 +261,7 @@ function finiteNumber(
 function promotedRank(
   value: unknown,
   projectId: string,
-  operation: "searchPromoted",
+  operation: PromotedSearchOperation,
   source: "primary" | "fallback"
 ): number {
   const candidate = finiteNumber(value, projectId, operation, "rank");
@@ -470,7 +479,7 @@ function summaryFromRow(
 function promotedFromRow(
   row: PromotedSearchRow,
   projectId: string,
-  operation: "searchPromoted",
+  operation: PromotedSearchOperation,
   source: "primary" | "fallback"
 ): SearchResult {
   return {
@@ -1192,13 +1201,16 @@ WHERE summary.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
 ORDER BY summary.created_at DESC, summary.summary_id DESC
 LIMIT $6::pg_catalog.int8`;
 
-const PROMOTED_FULL_TEXT_SQL = `WITH input AS MATERIALIZED (
-  SELECT
-    normalized.query,
-    pg_catalog.websearch_to_tsquery(
+const PROMOTED_NATIVE_QUERY = `pg_catalog.websearch_to_tsquery(
       'lcm.search_v1'::pg_catalog.regconfig,
       normalized.query
-    ) AS full_text_query
+    )`;
+
+function promotedSelectionRelation(fullTextQuery: string): string {
+  return `WITH input AS MATERIALIZED (
+  SELECT
+    normalized.query,
+    ${fullTextQuery} AS full_text_query
   FROM (
     SELECT lcm.normalize_search_text($2::pg_catalog.text) AS query
   ) AS normalized
@@ -1452,7 +1464,17 @@ combined AS (
   SELECT * FROM primary_rows
   UNION ALL
   SELECT * FROM fallback_rows
-)
+)`;
+}
+
+const PROMOTED_ORDER_AND_LIMIT = `ORDER BY
+  combined.match_phase,
+  combined.match_order DESC,
+  combined.created_at DESC,
+  combined.memory_id DESC
+LIMIT $5::pg_catalog.int8`;
+
+const PROMOTED_FULL_TEXT_SQL = `${promotedSelectionRelation(PROMOTED_NATIVE_QUERY)}
 SELECT
   combined.memory_id,
   combined.content,
@@ -1464,12 +1486,46 @@ SELECT
   combined.rank,
   combined.match_phase
 FROM combined
-ORDER BY
-  combined.match_phase,
-  combined.match_order DESC,
-  combined.created_at DESC,
-  combined.memory_id DESC
-LIMIT $5::pg_catalog.int8`;
+${PROMOTED_ORDER_AND_LIMIT}`;
+
+const PROMOTED_CANONICAL_QUERY_SQL = `SELECT pg_catalog.websearch_to_tsquery(
+  'lcm.search_v1'::pg_catalog.regconfig,
+  lcm.normalize_search_text($1::pg_catalog.text)
+)::pg_catalog.text AS canonical_query`;
+
+// Selection and evidence read mutable rows in one statement snapshot. The
+// canonical query was obtained separately, but only depends on query text.
+const PROMOTED_RECALL_SQL = `WITH selected AS MATERIALIZED (
+  ${promotedSelectionRelation("$8::pg_catalog.tsquery")}
+  SELECT combined.* FROM combined
+  ${PROMOTED_ORDER_AND_LIMIT}
+), terms AS MATERIALIZED (
+  SELECT atom, group_id
+  FROM ROWS FROM (
+    pg_catalog.unnest($6::pg_catalog.text[]),
+    pg_catalog.unnest($7::pg_catalog.int8[])
+  ) AS evidence(atom, group_id)
+)
+SELECT selected.*,
+  CASE WHEN memory.memory_id IS NULL THEN NULL ELSE (
+    SELECT pg_catalog.count(DISTINCT terms.group_id)
+    FROM terms
+    WHERE memory.search_document OPERATOR(pg_catalog.@@)
+      terms.atom::pg_catalog.tsquery
+      OR EXISTS (
+        SELECT 1 FROM lcm.promoted_memory_tags AS tag
+        WHERE tag.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+          AND tag.memory_id OPERATOR(pg_catalog.=) memory.memory_id
+          AND tag.search_document OPERATOR(pg_catalog.@@)
+            terms.atom::pg_catalog.tsquery
+      )
+  ) END AS matched_terms
+FROM selected
+LEFT JOIN lcm.promoted_memories AS memory
+  ON memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+ AND memory.memory_id OPERATOR(pg_catalog.=) selected.memory_id
+ORDER BY selected.match_phase, selected.match_order DESC,
+  selected.created_at DESC, selected.memory_id DESC`;
 
 export class PostgreSqlLexicalSearchRepository
   implements LexicalSearchRepository
@@ -1610,7 +1666,53 @@ export class PostgreSqlLexicalSearchRepository
     filterTagsInput: string[] = [],
     sourceProjectIdInput?: string
   ): Promise<SearchResult[]> {
-    const operation = "searchPromoted";
+    return this.searchPromotedSelection(
+      "searchPromoted",
+      queryInput,
+      limitInput,
+      filterTagsInput,
+      sourceProjectIdInput
+    );
+  }
+
+  async searchPromotedForRecall(
+    queryInput: string,
+    limitInput: number,
+    filterTagsInput: string[] = [],
+    sourceProjectIdInput?: string
+  ): Promise<PromotedRecallSearchResult> {
+    return {
+      candidates: await this.searchPromotedSelection(
+        "searchPromotedForRecall",
+        queryInput,
+        limitInput,
+        filterTagsInput,
+        sourceProjectIdInput
+      ),
+    };
+  }
+
+  private searchPromotedSelection(
+    operation: "searchPromoted",
+    queryInput: string,
+    limitInput: number,
+    filterTagsInput: string[],
+    sourceProjectIdInput?: string
+  ): Promise<SearchResult[]>;
+  private searchPromotedSelection(
+    operation: "searchPromotedForRecall",
+    queryInput: string,
+    limitInput: number,
+    filterTagsInput: string[],
+    sourceProjectIdInput?: string
+  ): Promise<PromotedRecallCandidate[]>;
+  private async searchPromotedSelection(
+    operation: PromotedSearchOperation,
+    queryInput: string,
+    limitInput: number,
+    filterTagsInput: string[],
+    sourceProjectIdInput?: string
+  ): Promise<SearchResult[] | PromotedRecallCandidate[]> {
     const query = validatedString(
       queryInput,
       this.access.projectId,
@@ -1639,19 +1741,76 @@ export class PostgreSqlLexicalSearchRepository
     return this.access.atomic(operation, async (executor) => {
       const context = this.access.context(operation);
       return withBoundedSearch(executor, context, async () => {
+        const values: unknown[] = [
+          this.access.projectId, query, sourceProjectId, filterTags, limit,
+        ];
+        let queryTermCount = 0;
+        if (operation === "searchPromotedForRecall") {
+          const canonical = await executor.query<{ canonical_query: unknown }>(
+            { text: PROMOTED_CANONICAL_QUERY_SQL, values: [query] },
+            context
+          );
+          if (canonical.rows.length !== 1) {
+            return dataError(this.access.projectId, operation, "canonical_query");
+          }
+          const canonicalQuery = validatedString(
+            canonical.rows[0].canonical_query,
+            this.access.projectId,
+            operation,
+            "canonical_query"
+          );
+          let parsed: ReturnType<typeof parseTsqueryEvidence>;
+          try {
+            parsed = parseTsqueryEvidence(canonicalQuery);
+          } catch {
+            return dataError(this.access.projectId, operation, "canonical_query");
+          }
+          queryTermCount = parsed.queryTermCount;
+          values.push(parsed.atoms, parsed.groupIds, canonicalQuery);
+        }
         const result = await executor.query<CombinedPromotedSearchRow>(
           {
-            text: PROMOTED_FULL_TEXT_SQL,
-            values: [
-              this.access.projectId,
-              query,
-              sourceProjectId,
-              filterTags,
-              limit,
-            ],
+            text: operation === "searchPromoted"
+              ? PROMOTED_FULL_TEXT_SQL
+              : PROMOTED_RECALL_SQL,
+            values,
           },
           context
         );
+        if (operation === "searchPromotedForRecall") {
+          const candidates = decodeCombinedRows(
+            result.rows,
+            this.access.projectId,
+            operation,
+            (row, phase): PromotedRecallCandidate => {
+              const matchedTermCount = resultNonnegativeInteger(
+                row.matched_terms,
+                this.access.projectId,
+                operation,
+                "matched_terms"
+              );
+              if (matchedTermCount > queryTermCount) {
+                return dataError(this.access.projectId, operation, "matched_terms");
+              }
+              return {
+                result: promotedFromRow(
+                  row, this.access.projectId, operation, phase
+                ),
+                evidence: { queryTermCount, matchedTermCount },
+              };
+            },
+            (candidate) => candidate.result.id,
+            limit
+          );
+          if (
+            candidates.length !== result.rows.length ||
+            new Set(candidates.map((candidate) => candidate.result.id)).size !==
+              candidates.length
+          ) {
+            return dataError(this.access.projectId, operation, "recall_candidates");
+          }
+          return candidates;
+        }
         return decodeCombinedRows(
           result.rows,
           this.access.projectId,
