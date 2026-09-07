@@ -54,6 +54,8 @@ const expectedComponents = [
     paths: [
       "^src/config-manager\\.ts$",
       "^src/config-projection\\.ts$",
+      // PR #791 keeps generated Gitleaks hostname-literal normalization in
+      // this existing configuration-security owner.
       "^src/generated-patterns\\.ts$",
       "^src/home-parent-auth\\.ts$",
       "^src/legacy-names\\.ts$",
