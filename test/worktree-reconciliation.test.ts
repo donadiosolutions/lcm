@@ -6,6 +6,7 @@ import {
   cpSync,
   fstatSync,
   linkSync,
+  lstatSync,
   mkdirSync as fsMkdirSync,
   mkdtempSync,
   readFileSync,
@@ -7456,6 +7457,174 @@ describe("worktree reconciliation", () => {
     );
     expect(existsSync(recreatedEvents)).toBe(true);
   }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
+  it.each([
+    "directory",
+    ...(process.platform === "win32" ? [] : ["fifo"]),
+    "symlink",
+  ] as const)("rejects an initial %s source patterns leaf", (type) => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourceDir = join(home, ".lcm", "projects", sourceHash);
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
+    const sourcePatterns = join(sourceDir, "sensitive-patterns.txt");
+    if (type === "directory") makePrivateFixtureDirectory(sourcePatterns);
+    else if (type === "fifo") execFileSync("mkfifo", [sourcePatterns]);
+    else {
+      const outside = join(home, "outside-patterns.txt");
+      writePrivateFixtureFile(outside, "OUTSIDE_PATTERN\n");
+      symlinkSync(outside, sourcePatterns);
+    }
+    const expectedError = type === "symlink"
+      ? "refusing to reconcile symlink"
+      : "invalid legacy source patterns path";
+
+    expect(() => reconcileWorktrees(main)).toThrow(`${expectedError}: ${sourcePatterns}`);
+
+    const refused = lstatSync(sourcePatterns);
+    expect(
+      type === "directory"
+        ? refused.isDirectory()
+        : type === "fifo"
+          ? refused.isFIFO()
+          : refused.isSymbolicLink(),
+    ).toBe(true);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    expect(statSync(sourceDir).isDirectory()).toBe(true);
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      blockedFrom: "planned",
+      reason: expect.stringContaining(expectedError),
+    }]);
+  });
+
+  it.each([
+    { event: "before-source-patterns-merge", blockedFrom: "planned" },
+    { event: "after-merge-before-archive", blockedFrom: "merged" },
+  ])("rejects a non-regular source patterns leaf at $event", ({ event, blockedFrom }) => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourceDir = join(home, ".lcm", "projects", sourceHash);
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
+    const sourcePatterns = join(sourceDir, "sensitive-patterns.txt");
+    let planted = false;
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (observed) => {
+        if (!planted && observed === event) {
+          planted = true;
+          makePrivateFixtureDirectory(sourcePatterns);
+        }
+      },
+    })).toThrow(`invalid legacy source patterns path: ${sourcePatterns}`);
+
+    expect(planted).toBe(true);
+    expect(lstatSync(sourcePatterns).isDirectory()).toBe(true);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      blockedFrom,
+      reason: expect.stringContaining("invalid legacy source patterns path"),
+    }]);
+    expect(listWorktreeReconciliationJournals()[0].reason).not.toMatch(
+      /appeared after the reconciliation snapshot|disappeared/u,
+    );
+  });
+
+  it("keeps an invalid late source patterns leaf archived and refuses retries", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourceDir = join(home, ".lcm", "projects", sourceHash);
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
+    const sourcePatterns = join(sourceDir, "sensitive-patterns.txt");
+    let planted = false;
+
+    expect(() => reconcileWorktrees(main, {
+      now: new Date("2026-09-07T12:00:00Z"),
+      _observer: (event, _source, detailPath) => {
+        if (
+          !planted
+          && event === "before-source-archive-rename"
+          && detailPath?.includes("oldprojects")
+        ) {
+          planted = true;
+          makePrivateFixtureDirectory(sourcePatterns);
+        }
+      },
+    })).toThrow("invalid legacy source patterns path");
+
+    const blocked = listWorktreeReconciliationJournals()[0];
+    const archivedProject = blocked.backupPaths.find((path) => path.includes("oldprojects"))!;
+    const archivedPatterns = join(archivedProject, "sensitive-patterns.txt");
+    expect(blocked).toMatchObject({
+      phase: "blocked",
+      blockedFrom: "merged",
+      backupPaths: [archivedProject],
+      reason: expect.stringContaining(`invalid legacy source patterns path: ${archivedPatterns}`),
+    });
+    expect(blocked.reason).not.toMatch(/appeared after the reconciliation snapshot|disappeared/u);
+    expect(lstatSync(archivedPatterns).isDirectory()).toBe(true);
+    expect(statSync(sourceDir).isFile()).toBe(true);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+    expect(() => reconcileWorktrees(main)).toThrow(
+      `invalid legacy source patterns path: ${archivedPatterns}`,
+    );
+
+    rmSync(archivedPatterns, { recursive: true });
+    expect(reconcileWorktrees(main).status).toBe("completed");
+    expect(listProjectMapEntries()).not.toHaveProperty(sourceHash);
+  });
+
+  it("propagates unexpected source patterns lstat failures", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const sourceDir = join(home, ".lcm", "projects", sourceHash);
+    makePrivateFixtureDirectory(sourceDir, { recursive: true });
+    const sourcePatterns = join(sourceDir, "sensitive-patterns.txt");
+    const failure = Object.assign(new Error("injected source pattern lstat failure"), {
+      code: "EACCES",
+    });
+    const originalLstat = lstatSync;
+
+    expect(() => withPatchedFs("lstatSync", ((
+      path: Parameters<typeof lstatSync>[0],
+      options?: Parameters<typeof lstatSync>[1],
+    ) => {
+      if (String(path) === sourcePatterns) throw failure;
+      return originalLstat(path, options as never);
+    }) as typeof lstatSync, () => reconcileWorktrees(main))).toThrow(failure);
+    expect(listProjectMapEntries()).toHaveProperty(sourceHash);
+  });
 
   it.each([
     { site: "snapshot", fault: "hard-linked" },
