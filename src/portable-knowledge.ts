@@ -80,7 +80,9 @@ async function gatherExport(
     _publicationConvergence: opts._publicationConvergence,
   }, async ({ storage, project, config }) => {
     const rows = await storage.promotedMemory.getAll({
-      sourceProjectId: project.id,
+      // PostgreSQL repositories already enforce owner-project scope. Provenance
+      // can be a local promotion hash, the owner UUID, or an external origin.
+      sourceProjectId: storage.backend === "sqlite" ? project.id : undefined,
       since: opts.since,
       tags: opts.tags,
     });
@@ -226,7 +228,10 @@ export async function importKnowledge(
     },
   }, async ({ storage, project }) => storage.transaction(async (repositories) => {
     // One scan per transaction, indexed before any deduplication changes rows.
-    const rows = await repositories.promotedMemory.getAll({ sourceProjectId: project.id });
+    // SQLite retains its legacy source filter; PostgreSQL owns rows separately
+    // from provenance, so the scan and dedup must include the same owner scope.
+    const sourceProjectId = storage.backend === "sqlite" ? project.id : undefined;
+    const rows = await repositories.promotedMemory.getAll({ sourceProjectId });
     const metadataById = new Map(rows.map((row) => [row.id, row.metadata]));
     const importedDigests = new Set(rows.flatMap((row) => retryDigests(row.metadata)));
     let imported = 0;
@@ -253,7 +258,7 @@ export async function importKnowledge(
         transaction,
         content: scrubber.scrub(entry.content),
         tags: entry.tags.map((tag) => scrubber.scrub(tag)),
-        sourceProjectId: project.id,
+        sourceProjectId,
         sessionId: entry.sessionId ?? undefined,
         depth: 0, confidence, thresholds: DEFAULT_DEDUP_THRESHOLDS,
       });

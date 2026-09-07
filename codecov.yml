@@ -245,6 +245,7 @@ component_management:
     - component_id: "unit-promotion"
       name: "Unit - Promotion"
       paths:
+        # #1153 rank-independent exact deduplication remains promotion-owned.
         - "src/promotion/"
     - component_id: "unit-project-worktrees"
       name: "Unit - Projects and Worktrees"
@@ -259,6 +260,7 @@ component_management:
         - "^src/git-project\\.ts$"
         - "^src/machine-identity\\.ts$"
         # #889 keeps private import metadata publication in this owner.
+        # #618 knowledge provenance scoping remains owned by project/worktree operations.
         - "^src/portable-knowledge\\.ts$"
         # #1049 keeps project metadata owner and single-link admission in this
         # existing component; no taxonomy, status, or policy change.
@@ -315,6 +317,7 @@ component_management:
     - component_id: "integration-postgresql-portable"
       name: "Integration - PostgreSQL Portable Transfer"
       paths:
+        # #618 canonical self-provenance stays in PostgreSQL portable transfer.
         - "^src/storage/postgresql/portable-source\\.ts$"
         - "^src/storage/postgresql/portable-destination\\.ts$"
         - "^src/storage/postgresql/portable-mapping\\.ts$"

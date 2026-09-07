@@ -219,6 +219,7 @@ const expectedComponents = [
   {
     component_id: "unit-promotion",
     name: "Unit - Promotion",
+    // #1153 rank-independent exact deduplication remains promotion-owned.
     paths: ["src/promotion/"],
   },
   {
@@ -232,6 +233,7 @@ const expectedComponents = [
       "^src/codex-project-resolution\\.ts$",
       "^src/git-project\\.ts$",
       "^src/machine-identity\\.ts$",
+      // #618 knowledge provenance scoping remains owned by project/worktree operations.
       "^src/portable-knowledge\\.ts$",
       // #1049 keeps project metadata owner and single-link admission in this
       // existing component; no taxonomy, status, or policy change.
@@ -283,6 +285,7 @@ const expectedComponents = [
     component_id: "integration-postgresql-portable",
     name: "Integration - PostgreSQL Portable Transfer",
     paths: [
+      // #618 canonical self-provenance stays in PostgreSQL portable transfer.
       "^src/storage/postgresql/portable-source\\.ts$",
       "^src/storage/postgresql/portable-destination\\.ts$",
       "^src/storage/postgresql/portable-mapping\\.ts$",

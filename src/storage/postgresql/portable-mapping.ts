@@ -118,6 +118,8 @@ export async function readCanonicalRow(executor:PostgreSqlQueryExecutor,projectI
 }
 export interface CanonicalDecodeContext {
   readonly projectIdentity:PortableProjectIdentity;
+  /** Authenticated path identity used by ordinary runtime promotions. */
+  readonly localProjectId?:string;
   readonly conversation?:{readonly identitySha256:string;readonly order:PortableRawConversationOrder};
   readonly message?:{readonly identitySha256:string;readonly order:PortableRawMessageOrder};
   readonly occurrenceOrdinal?:string;
@@ -154,7 +156,10 @@ export function decodeCanonicalRow(domain:PortableDomain,row:Row,parent:Canonica
     value.conversationFingerprint = parent.conversationFingerprint ?? canonicalSha256(["lcm-portable-conversation-value-v1",value.sessionId,value.title,value.bootstrappedAt,value.createdAt,value.updatedAt]);
   }
   if (domain === "recall-surfacings") value.occurrenceOrdinal = parent.occurrenceOrdinal ?? fail();
-  if (domain === "promoted-memories" && value.sourceProjectId === projectIdentity.projectId) value.sourceProjectId = null;
+  // Runtime promotions use the local path hash; canonical imports use the
+  // shared owner UUID. Both denote self, but unrelated provenance stays exact.
+  if (domain === "promoted-memories" && (value.sourceProjectId === projectIdentity.projectId
+    || value.sourceProjectId === parent.localProjectId)) value.sourceProjectId = null;
   if (domain === "native-transcripts") {
     const {nativePayload,...metadata} = value;
     context = {projectIdentity,canonicalPayloadBytes:Buffer.byteLength(canonicalJson(nativePayload)),canonicalMetadataBytes:Buffer.byteLength(canonicalJson({...metadata,sourceOrdinal:{$integer:metadata.sourceOrdinal}}))};

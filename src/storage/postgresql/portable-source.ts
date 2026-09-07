@@ -287,7 +287,7 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
         ? String(index.allocateOccurrence(domain,canonicalJson([row.memory_id,row.session_id,row.surfaced_at])))
         : String(rawOrder(existing.order).at(-1));
     }
-    return createPortableRecord({...decodeCanonicalRow(domain,row,{projectIdentity,
+    return createPortableRecord({...decodeCanonicalRow(domain,row,{projectIdentity,localProjectId:expectedIdentity.localProjectId,
       conversation:conversation as {identitySha256:string;order:PortableRawConversationOrder}|undefined,
       message:message as {identitySha256:string;order:PortableRawMessageOrder}|undefined,occurrenceOrdinal}),ordinal});
   };

@@ -42,6 +42,12 @@ predicates and self-provenance normalization use the local ID; the canonical
 identity and PostgreSQL destination use the shared UUID. No source rows or
 capture IDs are rewritten to bridge the two identities.
 
+For PostgreSQL promoted memories, both the authenticated local project hash
+used by normal promotion and the shared owner UUID used by canonical imports
+mean self-provenance. The canonical record encodes either as `null`; the
+destination binds it to its own project identity. Other source project IDs
+remain unchanged, including external origins, across PostgreSQL/SQLite transfers.
+
 These checks establish that the supplied files match the chosen evidence. A
 file digest cannot establish that separately captured files describe the same
 historical instant. The snapshot producer owns source quiescence and coherent

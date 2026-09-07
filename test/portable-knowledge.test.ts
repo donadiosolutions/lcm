@@ -40,6 +40,7 @@ import { clearWorktreeReconciliationCache } from "../src/worktree-reconciliation
 import { lcmHomeDir } from "../src/runtime-paths.js";
 import { isLcmConnectionOpen } from "../src/db/connection.js";
 import { ScrubEngine } from "../src/scrub.js";
+import * as cliStorage from "../src/cli-storage.js";
 import * as publicationModule from "../src/storage/backend-publication.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
 import { createPublicationConvergence } from "../src/storage/publication-convergence.js";
@@ -142,6 +143,62 @@ function seedProject(
 
   return { projDir, projId, dbPath };
 }
+
+it.each(["sqlite", "postgresql"] as const)("retains %s provenance scope across export, import and retry", async backend => {
+  const cwd = makeTempDir();
+  const baseDir = makeTempDir();
+  const content = "Provenance compatibility reference";
+  const { dbPath, projId } = seedProject(baseDir, cwd, [{ content, tags: ["own"] }]);
+  const db = new DatabaseSync(dbPath);
+  const store = new PromotedStore(db);
+  const externalId = store.insert({ content: "External origin reference", tags: ["external"],
+    projectId: "external-origin", depth: 0, confidence: 0.6 });
+  const externalBefore = store.getById(externalId);
+  const original = cliStorage.withCliProjectStorage;
+  // Unit bridge uses real repositories; the PG18 integration suite separately
+  // proves authenticated owner scoping and normal HTTP promotion on PostgreSQL.
+  const opened = vi.spyOn(cliStorage, "withCliProjectStorage").mockImplementation((path, options, callback) =>
+    original(path, options, context => callback({ ...context,
+      project: { ...context.project, id: backend === "postgresql" ? "01990000-0000-7000-8000-000000000001" : projId },
+      storage: { ...context.storage, backend, transaction: context.storage.transaction.bind(context.storage) },
+    })));
+  try {
+    const output = join(baseDir, "scope.json");
+    await expect(exportKnowledge(cwd, { output, skipScrub: true, _lcmBaseDir: baseDir }))
+      .resolves.toMatchObject({ exported: backend === "postgresql" ? 2 : 1 });
+    const doc: ExportDocument = { version: 1, exportedAt: "2026-01-01", projectCwd: "/source", entries: [{
+      content, tags: ["imported"], confidence: 0.9, createdAt: "2026-01-01", sessionId: null,
+    }] };
+    await expect(importKnowledge(cwd, doc, { _lcmBaseDir: baseDir })).resolves.toMatchObject({ imported: 1 });
+    expect(store.getAll()).toHaveLength(2);
+    expect(store.getById(externalId)).toEqual(externalBefore);
+    expect(JSON.parse(store.getAll({ projectId: projId })[0].tags)).toEqual(["own", "imported"]);
+    await expect(importKnowledge(cwd, doc, { _lcmBaseDir: baseDir })).resolves.toMatchObject({ imported: 0, skipped: 1 });
+  } finally { opened.mockRestore(); db.close(); }
+});
+
+it("keeps SQLite external-origin matches outside knowledge import deduplication", async () => {
+  const cwd = makeTempDir();
+  const baseDir = makeTempDir();
+  const { dbPath, projId } = seedProject(baseDir, cwd, []);
+  const db = new DatabaseSync(dbPath);
+  try {
+    const store = new PromotedStore(db);
+    const content = "Identical knowledge from an external project";
+    const externalId = store.insert({ content, tags: ["external"], projectId: "external-origin", confidence: 0.6 });
+    const original = store.getById(externalId);
+    const doc: ExportDocument = { version: 1, exportedAt: "2026-01-01", projectCwd: "/source", entries: [{
+      content, tags: ["own"], confidence: 0.9, createdAt: "2026-01-01", sessionId: null,
+    }] };
+    await expect(importKnowledge(cwd, doc, { _lcmBaseDir: baseDir })).resolves.toMatchObject({ imported: 1 });
+    expect(store.getAll()).toHaveLength(2);
+    expect(store.getById(externalId)).toEqual(original);
+    expect(store.getAll({ projectId: projId })).toEqual([expect.objectContaining({ content, tags: '["own"]' })]);
+    const output = join(baseDir, "own.json");
+    await expect(exportKnowledge(cwd, { output, skipScrub: true, _lcmBaseDir: baseDir })).resolves.toMatchObject({ exported: 1 });
+    expect((JSON.parse(readFileSync(output, "utf8")) as ExportDocument).entries[0].tags).toEqual(["own"]);
+  } finally { db.close(); }
+});
 
 function configurePostgreSqlBackend(): void {
   const home = lcmHomeDir();

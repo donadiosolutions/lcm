@@ -199,6 +199,21 @@ it("refuses missing decode evidence instead of inventing parent identities or du
   expect(mapping.decodeCanonicalRow("promoted-memories",memoryRow,context).value).toMatchObject({sourceProjectId:null});
 });
 
+it("normalizes authenticated local and remote self-provenance while preserving external origins", () => {
+  const localProjectId = "a".repeat(64);
+  const externalProjectId = "b".repeat(64);
+  const memory = buildDomainDrafts(postgresGeneration()).find(draft => draft.domain === "promoted-memories")!.values[0];
+  const row = Object.fromEntries(Object.entries(memory).map(([key, value]) => [
+    key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`),
+    typeof value === "object" && value !== null ? JSON.stringify(value) : value,
+  ]));
+  for (const [source, expected] of [[localProjectId, null], [projectId, null], [null, null], [externalProjectId, externalProjectId]] as const) {
+    expect(mapping.decodeCanonicalRow("promoted-memories", { ...row, source_project_id: source }, {
+      projectIdentity: { scope: "shared", projectId }, localProjectId,
+    }).value).toMatchObject({ sourceProjectId: expected });
+  }
+});
+
 it("enforces PostgreSQL-only UUID, identity, content, path and timestamp checks",async()=>{
   const records=buildRecords(postgresGeneration());
   const base=(domain:import("../../src/storage/portable-record.js").PortableDomain,patch:Record<string,unknown>)=>({...records.get(domain)![0],value:{...records.get(domain)![0].value,...patch}} as import("../../src/storage/portable-record.js").PortableRecord);

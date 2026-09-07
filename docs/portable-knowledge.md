@@ -25,6 +25,15 @@ canonical paths. With PostgreSQL, this is the locally bound set, not every
 project stored on the server. Aliases and linked worktrees resolve to their
 canonical project. A missing remote binding is an error.
 
+PostgreSQL exports all active memories owned by the bound project, including
+normal promotions whose recorded origin is a local path hash and knowledge
+imported from elsewhere. Import compares against that same owner scope, so an
+existing normal promotion can be merged and retains its metadata and retry
+history. A memory's origin does not grant access to another remote project.
+SQLite keeps its existing project-origin filter for this version 1 format.
+Exact content matches merge regardless of search rank on either backend.
+Nonidentical content still requires the configured deduplication threshold.
+
 ## Version 1 format and privacy
 
 The JSON document retains the version 1 schema:

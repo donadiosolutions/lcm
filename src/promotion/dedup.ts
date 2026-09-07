@@ -37,10 +37,10 @@ function isDuplicateCandidate(
   content: string,
   bm25Threshold: number,
 ): boolean {
-  // Fallback ranks are non-negative and may represent broad partial matches.
-  // Only exact content identity is strong enough to deduplicate without BM25.
-  if (candidate.rank >= 0) return candidate.content === content;
-  return candidate.rank <= -bm25Threshold;
+  // Exact content identity is conclusive regardless of the backend's rank
+  // scale. Only nonidentical ranked candidates need the fuzzy-match threshold.
+  if (candidate.content === content) return true;
+  return candidate.rank < 0 && candidate.rank <= -bm25Threshold;
 }
 
 export async function deduplicateAndInsert(params: DedupParams): Promise<string> {
