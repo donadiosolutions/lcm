@@ -41,6 +41,7 @@ const expectedComponents = [
   {
     component_id: "unit-cli",
     name: "Unit - CLI",
+    // #1132 keeps foreground PID publication at the CLI boundary.
     paths: ["bin/", "src/cli/", "^src/cli-help\\.ts$", "^src/cli-storage\\.ts$"],
   },
   {
@@ -279,7 +280,8 @@ const expectedComponents = [
     paths: [
       "^src/daemon/health-observation\\.ts$",
       // #865/#966 convergence and birth budgeting remain lifecycle-owned;
-      // #1073 bounds legacy PID/token evidence within that same owner.
+      // #1073 bounds legacy PID/token evidence within that same owner. #1132
+      // keeps unscoped detached PID publication lifecycle-owned.
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",
@@ -703,6 +705,8 @@ describe("Codecov configuration", () => {
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],
+      // #1155 retains SessionStart outbox pruning admission in the hook owner.
+      ["src/hooks/restore.ts", "unit-hooks"],
       // Bounded Claude completion delivery remains within the hook component.
       ["src/hooks/session-end.ts", "unit-hooks"],
       // #793 search-limit schema remains owned by MCP tools.

@@ -28,6 +28,7 @@ import {
   assertHookPublicationFence,
   isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
+  withHookPublicationFenceAsync,
 } from "./publication-fence.js";
 
 function assertStableRoot(
@@ -232,31 +233,34 @@ export async function handleSessionStart(
       const { SQLiteLocalHookOutboxFactory } = await import("../storage/local-hook-outbox.js");
       const { eventsDbPath } = await import("../db/events-path.js");
       const cwd = input.cwd ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
-      const rootPath = lcmHomeDir();
-      const rootHandle = openPrivateDirectory(rootPath);
-      const rootWitness = rootHandle.witness;
-      const outboxFactory = new SQLiteLocalHookOutboxFactory();
-      try {
-        assertStableRoot(rootHandle, rootPath, rootWitness);
-        const eventsDb = await outboxFactory.open(eventsDbPath(cwd));
-        try {
-          await eventsDb.pruneProcessed(7);
-          await eventsDb.pruneUnprocessed(10_000, 30);
-          await eventsDb.pruneErrorLog(30);
-          const unprocessed = await eventsDb.getUnprocessed(1);
-          if (unprocessed.length > 0) {
-            const { firePromoteEventsRequest } = await import("./session-end.js");
-            firePromoteEventsRequest(daemonPort, { cwd });
-          }
-        } finally {
-          await outboxFactory.close();
-        }
-      } finally {
+      const shouldPromote = await withHookPublicationFenceAsync(async () => {
+        const rootPath = lcmHomeDir();
+        const rootHandle = openPrivateDirectory(rootPath);
+        const rootWitness = rootHandle.witness;
+        const outboxFactory = new SQLiteLocalHookOutboxFactory();
         try {
           assertStableRoot(rootHandle, rootPath, rootWitness);
+          const eventsDb = await outboxFactory.open(eventsDbPath(cwd));
+          try {
+            await eventsDb.pruneProcessed(7);
+            await eventsDb.pruneUnprocessed(10_000, 30);
+            await eventsDb.pruneErrorLog(30);
+            const unprocessed = await eventsDb.getUnprocessed(1);
+            return unprocessed.length > 0;
+          } finally {
+            await outboxFactory.close();
+          }
         } finally {
-          rootHandle.close();
+          try {
+            assertStableRoot(rootHandle, rootPath, rootWitness);
+          } finally {
+            rootHandle.close();
+          }
         }
+      });
+      if (shouldPromote) {
+        const { firePromoteEventsRequest } = await import("./session-end.js");
+        firePromoteEventsRequest(daemonPort, { cwd });
       }
     } catch (error) {
       if (isBackendPublicationJournalError(error)) throw error;
