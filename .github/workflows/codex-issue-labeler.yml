@@ -392,7 +392,7 @@ jobs:
     steps:
       - name: Classify issues with Codex
         id: codex
-        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.10
+        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1.10
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt: ${{ needs.collect.outputs.prompt }}
@@ -807,7 +807,7 @@ jobs:
     steps:
       - name: Classify security fields with Codex
         id: codex
-        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.10
+        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1.10
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt: ${{ needs.collect-security.outputs.prompt }}
@@ -1170,7 +1170,7 @@ jobs:
     steps:
       - name: Identify duplicate bugs with Codex
         id: codex
-        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.10
+        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1.10
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt: ${{ needs.collect-duplicates.outputs.prompt }}
