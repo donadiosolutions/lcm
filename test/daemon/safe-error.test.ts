@@ -1003,6 +1003,183 @@ describe("sanitizeError", () => {
 
   it.each([
     [
+      "file://host.invalid?x=[a]\\Users\\canary\\private.db",
+      "file://host.invalid?x=[a]<path>",
+    ],
+    [
+      "file://host.invalid#x=[a]\\Users\\canary\\private.db",
+      "file://host.invalid#x=[a]<path>",
+    ],
+    [
+      "file://host.invalid?x=[a/Users/canary/private.db",
+      "file://host.invalid?x=[a<path>",
+    ],
+    [
+      "file://host.invalid#x=[a/Users/canary/private.db",
+      "file://host.invalid#x=[a<path>",
+    ],
+    [
+      "file://[fe80::1%25eth0]?x=[a/Users/canary/private.db",
+      "file://[fe80::1%25eth0]?x=[a<path>",
+    ],
+    [
+      "file://host.invalid?x=[[a/Users/canary/private.db]]",
+      "file://host.invalid?x=[[a<path>]]",
+    ],
+    [
+      "file://host.invalid#x=[a]C:\\Users\\canary\\private.db",
+      "file://host.invalid#x=[a]<path>",
+    ],
+    [
+      "file://host.invalid?x=[[a]]\\\\server\\share\\private.db",
+      "file://host.invalid?x=[[a]]<path>",
+    ],
+    [
+      "file://host.invalid?x=[a]b\\Users\\canary\\private.db",
+      "file://host.invalid?x=[a]b<path>",
+    ],
+    [
+      "file://host.invalid#x=[a][b]\\Users\\canary\\private.db",
+      "file://host.invalid#x=[a][b]<path>",
+    ],
+    [
+      "file://host.invalid?x=[[a]]\\Users\\canary\\private.db",
+      "file://host.invalid?x=[[a]]<path>",
+    ],
+    [
+      "file://host.invalid?x=[a/b]\\Users\\canary\\private.db",
+      "file://host.invalid?x=[a<path>]<path>",
+    ],
+    [
+      "file://host.invalid#x=[a]\\Users\\canary\\private.db]tail",
+      "file://host.invalid#x=[a]<path>]tail",
+    ],
+  ] as const)("redacts restarted pathless file URL bracket tails: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    [
+      "file://host.invalid?x=[a]b/Users/canary/private.db",
+      "file://host.invalid?x=[a]b/Users/canary/private.db",
+    ],
+    [
+      "file://host.invalid#x=value]\\Users\\canary\\private.db",
+      "file://host.invalid#x=value]\\Users\\canary\\private.db",
+    ],
+    [
+      "file://host.invalid?x=[https://y.test/p]/Users/canary/z",
+      "file://host.invalid?x=[https://y.test/p]<path>",
+    ],
+    [
+      "file://host.invalid#x=[a]https://example.test/p",
+      "file://host.invalid#x=[a]https://example.test/p",
+    ],
+    [
+      "file://host.invalid?q=[a=b]prefix-file://host.invalid/Users/canary/private.db",
+      "file://host.invalid?q=[a=b]prefix-file://host.invalid<path>",
+    ],
+    [
+      "file://host.invalid?x=[next=file://inner.invalid/Users/canary/private.db",
+      "file://host.invalid?x=[next=file://inner.invalid<path>",
+    ],
+    [
+      "file://host.invalid#q=prefix-file://host.invalid/Users/canary/private.db",
+      "file://host.invalid#q=prefix-file://host.invalid<path>",
+    ],
+    [
+      "file://host.invalid?x=[10/20]rate",
+      "file://host.invalid?x=[10<path>]rate",
+    ],
+    [
+      "file://host.invalid#x=[a/b]https://example.test/p",
+      "file://host.invalid#x=[a<path>]https://example.test/p",
+    ],
+  ] as const)("enforces restarted pathless file URL bracket boundaries: %#", (input, expected) => {
+    const result = sanitizeError(input);
+
+    expect(result).toBe(expected);
+    expect(sanitizeError(result)).toBe(result);
+  });
+
+  it.each([
+    ["file://h?x=/a:[/\\]", "file://h?x=<path>:[<path>]"],
+    ["file://h#x=/a:[/\\\\]", "file://h#x=<path>:[<path>]"],
+    ["file://h?x=[word/\\]", "file://h?x=[word<path>]"],
+    ["file://h#x=[-/\\\\]", "file://h#x=[-<path>]"],
+    ["file://h?x=[/]", "file://h?x=[<path>]"],
+    [
+      "file://h#x=[/C:\\Users\\canary\\private.db]",
+      "file://h#x=[<path>]",
+    ],
+    [
+      "file://h?x=[/c:/Users/canary/private.db]",
+      "file://h?x=[<path>]",
+    ],
+    [
+      "file://h?x=[/\\\\server\\share\\private.db]",
+      "file://h?x=[<path>]",
+    ],
+    [
+      "file://h#x=[/Users/canary/private.db]",
+      "file://h#x=[<path>]",
+    ],
+  ] as const)("redacts forced bracket paths in one stable pass: %#", (input, expected) => {
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  it.each([
+    [
+      "file://host.invalid?x=[a/\\C:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[-/\\C:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[-<path>]",
+    ],
+    [
+      "file://host.invalid?x=[/\\C:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a/\\c:/Users/canary/private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a//C:/Users/canary/private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a//\\server\\share\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/\\/server\\share\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/\\C:\\Users\\canary\\private.db",
+      "file://host.invalid?x=[a<path>",
+    ],
+    [
+      "file://host.invalid#x=[a/\\C:\\Users\\canary\\private.db]tail",
+      "file://host.invalid#x=[a<path>]tail",
+    ],
+  ] as const)("redacts forced mixed-separator paths in one stable pass: %#", (input, expected) => {
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  it.each([
+    [
       "'file://host.invalid?x=/Users/canary/My Files/x'",
       "'file://host.invalid?x=<path>'",
     ],

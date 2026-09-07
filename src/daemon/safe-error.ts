@@ -25,6 +25,7 @@ interface UrlPathStarts {
   authority: Uint8Array;
   file: Uint8Array;
   fileQuote: Uint8Array;
+  forcedPath: Uint8Array;
   nestedFileSchemeStarts: Uint8Array;
 }
 
@@ -61,6 +62,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const authority = new Uint8Array(chars.length);
   const file = new Uint8Array(chars.length);
   const fileQuote = new Uint8Array(chars.length);
+  const forcedPath = new Uint8Array(chars.length);
   const nestedFileSchemeStarts = new Uint8Array(chars.length);
   let schemeLength = 0;
   let fileSchemeLength = 0;
@@ -71,6 +73,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let foundFilePath = false;
   let filePathBracketDepth = 0;
   let restartedPathlessFile = false;
+  let restartedPathlessBrackets = 0;
   let queryOrFragment = false;
 
   for (let index = 0; index < chars.length; index += 1) {
@@ -85,6 +88,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      restartedPathlessBrackets = 0;
       queryOrFragment = false;
       continue;
     }
@@ -104,11 +108,26 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      restartedPathlessBrackets = 0;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = quoteCode(chars[nestedFileSchemeStart - 1]);
       authority[nestedFileSchemeStart + 5] = 1;
       authority[nestedFileSchemeStart + 6] = 1;
+      continue;
+    }
+    if (restartedPathlessFile && char === "[") {
+      restartedPathlessBrackets += 1;
+      schemeLength = 0;
+      fileSchemeLength = 0;
+      schemeQuote = 0;
+      continue;
+    }
+    if (restartedPathlessFile && char === "]" && restartedPathlessBrackets > 0) {
+      restartedPathlessBrackets -= 1;
+      schemeLength = 0;
+      fileSchemeLength = 0;
+      schemeQuote = 0;
       continue;
     }
     if (separator >= 0 && char === "[") {
@@ -143,6 +162,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       fileSchemeLength = 0;
       schemeQuote = 0;
       restartedPathlessFile = true;
+      restartedPathlessBrackets = 0;
       continue;
     }
     if (
@@ -151,6 +171,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       !FILE_URL_AUTHORITY_DELIMITERS.has(char)
     ) {
       restartedPathlessFile = false;
+      restartedPathlessBrackets = 0;
       queryOrFragment = false;
     }
     // Conservatively keep supported punctuation and embedded double quotes in
@@ -171,6 +192,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      restartedPathlessBrackets = 0;
       queryOrFragment = false;
       continue;
     }
@@ -192,16 +214,25 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       }
       continue;
     }
+    if (restartedPathlessFile && restartedPathlessBrackets > 0 && char === "/") {
+      forcedPath[index] = 1;
+      schemeLength = 0;
+      fileSchemeLength = 0;
+      schemeQuote = 0;
+      continue;
+    }
     // Preserve the former file-authority handling for the first backslash in
     // this tail without widening backslash detection in unrelated text.
     if (restartedPathlessFile && char === "\\") {
       restartedPathlessFile = false;
+      restartedPathlessBrackets = 0;
       queryOrFragment = false;
       file[index] = 1;
       continue;
     }
     if (char === ":" && schemeLength > 0 && chars[index + 1] === "/" && chars[index + 2] === "/") {
       restartedPathlessFile = false;
+      restartedPathlessBrackets = 0;
       queryOrFragment = false;
       separator = index;
       authority[index + 1] = 1;
@@ -239,7 +270,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
   }
 
-  return { authority, file, fileQuote, nestedFileSchemeStarts };
+  return { authority, file, fileQuote, forcedPath, nestedFileSchemeStarts };
 }
 
 function isPosixPathStart(chars: readonly string[], index: number, urlAuthorityPathStarts: Uint8Array): boolean {
@@ -274,6 +305,16 @@ function fileUrlDriveColonIndex(chars: readonly string[], start: number): number
     return index + 1;
   }
   return -1;
+}
+
+function forcedSeparatorRunHasBackslash(chars: readonly string[], start: number): boolean {
+  let index = start;
+  let hasBackslash = false;
+  while (chars[index] === "/" || chars[index] === "\\") {
+    if (chars[index] === "\\") hasBackslash = true;
+    index += 1;
+  }
+  return hasBackslash;
 }
 
 function scanAbsolutePath(
@@ -392,18 +433,30 @@ function sanitizeAbsolutePaths(message: string): string {
   const sanitized: string[] = [];
   for (let index = 0; index < chars.length;) {
     const fileUrl = urlPathStarts.file[index] === 1;
+    const forcedPath = urlPathStarts.forcedPath[index] === 1;
     const openingQuote = chars[index] === "'" || chars[index] === '"' ? chars[index] : undefined;
     const start = fileUrl || openingQuote === undefined ? index : index + 1;
     const windowsDrive = isWindowsDrivePathStart(chars, start);
-    const windows = fileUrl || windowsDrive || isUncPathStart(chars, start);
-    const posix = !fileUrl && isPosixPathStart(chars, start, urlPathStarts.authority);
+    const forcedDriveColonIndex = forcedPath ? fileUrlDriveColonIndex(chars, start) : -1;
+    const forcedWindowsSeparators = forcedPath && forcedSeparatorRunHasBackslash(chars, start);
+    const windows =
+      fileUrl ||
+      windowsDrive ||
+      forcedDriveColonIndex >= 0 ||
+      forcedWindowsSeparators ||
+      isUncPathStart(chars, start);
+    const posix = forcedPath || (!fileUrl && isPosixPathStart(chars, start, urlPathStarts.authority));
     if (!fileUrl && !windows && !posix) {
       sanitized.push(chars[index]);
       index += 1;
       continue;
     }
     const quote = fileUrl ? quoteFromCode(urlPathStarts.fileQuote[index]) : openingQuote;
-    const driveColonIndex = fileUrl ? fileUrlDriveColonIndex(chars, start) : windowsDrive ? start + 1 : -1;
+    const driveColonIndex = fileUrl
+      ? fileUrlDriveColonIndex(chars, start)
+      : windowsDrive
+        ? start + 1
+        : forcedDriveColonIndex;
     const { end, sawNonSeparator } = scanAbsolutePath(
       chars,
       start,
@@ -413,8 +466,9 @@ function sanitizeAbsolutePaths(message: string): string {
       quote,
     );
     if (
-      ((fileUrl || posix) && !sawNonSeparator) ||
-      (!fileUrl && end <= start + (windowsDrive ? 3 : 1))
+      !forcedPath &&
+      (((fileUrl || posix) && !sawNonSeparator) ||
+        (!fileUrl && end <= start + (windowsDrive ? 3 : 1)))
     ) {
       sanitized.push(chars[index]);
       index += 1;

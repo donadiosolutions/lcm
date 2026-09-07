@@ -1960,12 +1960,11 @@ function writeCanonicalTargetMetadata(
       return;
     }
   }
-  atomicWritePrivateFile(
-    metaPath,
-    `${JSON.stringify({ ...metadata, cwd: canonical }, null, 2)}\n`,
-    {},
-    targetParent,
-  );
+  const serialized = `${JSON.stringify({ ...metadata, cwd: canonical }, null, 2)}\n`;
+  if (Buffer.byteLength(serialized, "utf8") > MAX_PROJECT_METADATA_BYTES) {
+    throw new Error("project metadata exceeds size limit");
+  }
+  atomicWritePrivateFile(metaPath, serialized, {}, targetParent);
   assertTarget();
 }
 
@@ -2362,7 +2361,7 @@ export function reconcileWorktrees(
   }
   const executeLocked = (
     map: Record<string, ProjectMapEntry>,
-    completion: { marked: boolean },
+    completion: { marked: boolean; published: boolean },
     retainedJournalParent: RetainedReconciliationJournalParent | undefined,
     blockedRecording: { attempted: boolean },
   ): WorktreeReconciliationResult => {
@@ -2750,8 +2749,6 @@ export function reconcileWorktrees(
         assertTarget();
       }
       assertTarget();
-      journal.pendingSourceHashes = [];
-      journal.phase = "completed";
       const publishedMapDiscovery = reconciliationDiscovery(
         listProjectMapEntries(opts.homeDir, opts._publicationLockToken),
         targetHash,
@@ -2759,12 +2756,19 @@ export function reconcileWorktrees(
         opts._maxDiscoveryEntries,
         opts._discoveryObserver,
       );
-      journal.discovery = {
-        mapFingerprint: publishedMapDiscovery.mapFingerprint,
-        codexFingerprint: discovery.codexFingerprint,
-        complete: discovery.complete && publishedMapDiscovery.complete,
+      const completed: ReconciliationJournal = {
+        ...journal,
+        pendingSourceHashes: [],
+        phase: "completed",
+        discovery: {
+          mapFingerprint: publishedMapDiscovery.mapFingerprint,
+          codexFingerprint: discovery.codexFingerprint,
+          complete: discovery.complete && publishedMapDiscovery.complete,
+        },
       };
-      writeAttemptJournal(journal);
+      writeAttemptJournal(completed);
+      completion.published = true;
+      Object.assign(journal, completed);
       assertTarget();
       return resultFromJournal(journal, journalFile);
     };
@@ -2778,7 +2782,7 @@ export function reconcileWorktrees(
         },
       );
     } catch (error) {
-      if (!completion.marked) {
+      if (!completion.marked && !completion.published) {
         throwAfterBlockedRecording(error, () => {
           journal.blockedFrom = journal.phase === "merged" || journal.phase === "archived"
             ? journal.phase
@@ -2793,7 +2797,7 @@ export function reconcileWorktrees(
   };
 
   const execute = (map: Record<string, ProjectMapEntry>): WorktreeReconciliationResult => {
-    const completion = { marked: false };
+    const completion = { marked: false, published: false };
     const blockedRecording = { attempted: false };
     const executeWithJournalParent = (
       retainedJournalParent: RetainedReconciliationJournalParent | undefined,
@@ -2803,7 +2807,7 @@ export function reconcileWorktrees(
       } catch (error) {
         if (preservesReconciliationErrorClassification(error)) throw error;
         if (opts.dryRun) throw error;
-        if (completion.marked || blockedRecording.attempted) throw error;
+        if (completion.marked || completion.published || blockedRecording.attempted) throw error;
         blockedRecording.attempted = true;
         let current: ReconciliationJournal | null;
         try {

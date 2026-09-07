@@ -142,12 +142,12 @@ vi.mock("../src/security-files.js", async importOriginal => {
 });
 vi.mock("../src/runtime-paths.js", () => ({ projectsDir: () => "/coverage/projects" }));
 vi.mock("../src/storage/diagnostics.js", () => ({
-  collectBackendDiagnostics: async (options: { collectSqlite: (options: object) => Promise<void> }) => {
+  collectBackendDiagnostics: async (options: { projectId?: string; collectSqlite: (options: object) => Promise<void> }) => {
     const snapshot = {
       backend: "sqlite", classification: "healthy",
       outbox: { status: "ready", captured: 9, unprocessed: 2, errors: 1 },
     };
-    try { await options.collectSqlite({ staleAfterDays: 90, staleSurfacingWithoutUseLimit: 5 }); }
+    try { await options.collectSqlite({ projectId: options.projectId, staleAfterDays: 90, staleSurfacingWithoutUseLimit: 5 }); }
     catch { snapshot.classification = "unavailable"; }
     return snapshot;
   },
@@ -348,6 +348,40 @@ describe("stats service coverage", () => {
 
     await expect(collectStats()).rejects.toBeInstanceOf(StatsUnavailableError);
     expect(mocks.close).not.toHaveBeenCalled();
+    expect(mocks.closeDirectory).toHaveBeenCalledTimes(3);
+  });
+
+  it("revalidates retained directories before skipping an initially absent database", async () => {
+    mocks.entries = [{ name: "metadata-only", directory: true, dbExists: false }];
+    let projectAssertions = 0;
+    mocks.assertDirectory.mockImplementation((path) => {
+      if (!path.endsWith("/metadata-only")) return;
+      projectAssertions++;
+      if (projectAssertions === 3) {
+        throw new PrivateDirectoryTopologyError("private directory topology is not trusted");
+      }
+    });
+
+    await expect(collectStats()).rejects.toBeInstanceOf(StatsUnavailableError);
+    expect(projectAssertions).toBe(3);
+    expect(mocks.constructDatabase).not.toHaveBeenCalled();
+    expect(mocks.closeDirectory).toHaveBeenCalledTimes(3);
+  });
+
+  it("revalidates retained directories before refusing a selected absent database", async () => {
+    mocks.entries = [{ name: "metadata-only", directory: true, dbExists: false }];
+    let projectAssertions = 0;
+    mocks.assertDirectory.mockImplementation((path) => {
+      if (!path.endsWith("/metadata-only")) return;
+      projectAssertions++;
+      if (projectAssertions === 3) {
+        throw new PrivateDirectoryTopologyError("private directory topology is not trusted");
+      }
+    });
+
+    await expect(collectStats({ projectId: "metadata-only" })).rejects.toBeInstanceOf(StatsUnavailableError);
+    expect(projectAssertions).toBe(3);
+    expect(mocks.constructDatabase).not.toHaveBeenCalled();
     expect(mocks.closeDirectory).toHaveBeenCalledTimes(3);
   });
 

@@ -81,7 +81,8 @@ component_management:
       paths:
         # Keep the #691/#700 response fences, #701 terminal factory-close retry,
         # runtime identity, #825 bounded project metadata, #1003 owner/single-link
-        # admission, and #1050 bounded preliminary serialization here.
+        # admission, #1050 bounded preliminary serialization, and #1106 periodic
+        # transcript metadata admission here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
@@ -96,9 +97,9 @@ component_management:
         - "^src/daemon/proxy-manager\\.ts$"
         - "^src/daemon/remediation\\.ts$"
         # Error sanitization, including #893 adjacent-path, #903 prefixed
-        # nested-file, #924 embedded-quote file-authority, #1060 adjacent
-        # nested-file scheme preservation, and #1117 glued file-authority
-        # handling remain daemon-core-owned.
+        # nested-file, #924 embedded-quote authority, #1010 pathless-tail
+        # bracket redaction, #1060 adjacent nested-file scheme preservation,
+        # and #1117 glued file-authority handling, remains daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -148,6 +149,8 @@ component_management:
         # Codex failure classification, #790 endpoint resolver, and #885
         # missing-Codex diagnostic factory remain LLM-owned. #934 keeps
         # caller-cancellation handling during resolver teardown here.
+        # #1154/#1157 keep Spark protocol normalization, bounded upstream
+        # classification, and terminal sentinel handling in this owner.
         - "src/llm/"
         - "src/prompts/"
     - component_id: "unit-local-persistence"
@@ -165,6 +168,7 @@ component_management:
         # opened-identity fencing local-persistence-owned.
         # #1020 keeps UTC message timestamp mapping in conversation-store-owned
         # local persistence paths.
+        # #1084/#1085/#1092 keep SQLite UTC timestamp parsing in this owner.
         - "src/db/"
         - "src/storage/sqlite/"
         - "src/store/"
@@ -212,6 +216,7 @@ component_management:
     - component_id: "unit-transcripts-import"
       name: "Unit - Transcripts and Import"
       paths:
+        # #1106 keeps all-project metadata discovery within this import owner.
         - "^src/codex-transcript\\.ts$"
         - "^src/import-summary\\.ts$"
         - "^src/import\\.ts$"
@@ -227,7 +232,8 @@ component_management:
         # retrieval contracts, plus #971 compact cwd and #972 search cwd client
         # contracts remain memory/retrieval-owned. #866 stats publication retries
         # and fail-closed journal errors, plus #973 project database admission,
-        # stay in this owner.
+        # stay in this owner. #1146 metadata-only aggregate diagnostics also
+        # remain memory/retrieval-owned.
         - "src/memory/"
         - "^src/expansion\\.ts$"
         - "^src/retrieval\\.ts$"
@@ -235,6 +241,7 @@ component_management:
     - component_id: "unit-compaction-summarization"
       name: "Unit - Compaction and Summarization"
       paths:
+        # #1106 keeps batch metadata discovery within this compaction owner.
         - "^src/batch-compact\\.ts$"
         - "^src/compaction\\.ts$"
         - "^src/large-files\\.ts$"
@@ -268,6 +275,8 @@ component_management:
         # #1107 and #1109 keep pattern and journal leaf authentication in this
         # existing component; no taxonomy, status, or policy change.
         # #1059 keeps retained journal-parent publication in this existing owner.
+        # #1087 bounds canonical metadata publication in this existing owner.
+        # #1091 preserves completion evidence across publication failures here.
         - "^src/worktree-reconciliation\\.ts$"
     - component_id: "unit-diagnostics"
       name: "Unit - Diagnostics"

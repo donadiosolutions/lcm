@@ -66,14 +66,20 @@ export type CodexProcessDeps = {
 
 const CODEX_BOOTSTRAP = "LCM compaction bootstrap.\n";
 
-const CODEX_FAILURE_MESSAGES: Readonly<Record<"usage" | "authentication" | "model" | "invalid-request", string>> = {
+const CODEX_FAILURE_MESSAGES = {
   usage: "Codex compaction reached a usage limit. Wait and retry, or choose another available model.",
   authentication: "Codex compaction authentication failed. Sign in again or check your authentication.",
   model: "Codex compaction model is unavailable. Select an accessible supported model.",
   "invalid-request": "Codex compaction request is invalid. Check the model, controls, or CLI compatibility.",
-};
+  "model-protocol": "Codex compaction model protocol was rejected. Retry later or choose another available model.",
+  "upstream-request": "Codex compaction upstream request failed. Retry later or choose another available model.",
+} as const satisfies Readonly<Record<
+  CodexResponsesGatewayFailureCategory | "model" | "invalid-request",
+  string
+>>;
 
-type CodexStderrFailureCategory = keyof typeof CODEX_FAILURE_MESSAGES;
+type CodexStderrFailureCategory = "usage" | "authentication" | "model" | "invalid-request";
+type CodexFailureCategory = keyof typeof CODEX_FAILURE_MESSAGES;
 
 function normalizeCodexStderr(text: string): string {
   return text.toLowerCase().replace(/\s+/gu, " ").trim();
@@ -95,7 +101,7 @@ function classifyCodexStderr(stderr: string): CodexStderrFailureCategory | undef
 }
 
 function createCodexFailureError(
-  category: CodexStderrFailureCategory,
+  category: CodexFailureCategory,
   deps: { model?: string; reasoningEffort?: CodexProcessReasoningEffort; fastMode?: boolean },
 ): Error {
   const model = boundedModelForDisplay(deps.model ?? "default");
