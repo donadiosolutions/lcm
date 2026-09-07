@@ -174,6 +174,10 @@ function safePool(value: ReturnType<BackendDiagnosticRuntime["poolDiagnostics"]>
   if (value === undefined || ![value.configuredMax, value.total, value.idle, value.waiting].every(finiteCount) || typeof value.failed !== "boolean") return { origin, status: "unverified" };
   return { origin, status: "ready", configuredMax: value.configuredMax, total: value.total, idle: value.idle, waiting: value.waiting, failed: value.failed };
 }
+function safeSqlitePool(value: ReturnType<typeof getPoolStats>, origin: BackendDiagnosticPool["origin"]): BackendDiagnosticPool {
+  if (![value.totalConnections, value.idleConnections].every(finiteCount)) return { origin, status: "unverified" };
+  return { origin, status: "ready", total: value.totalConnections, idle: value.idleConnections };
+}
 function safeOutbox(value: EventStats): BackendDiagnosticOutbox {
   const counts = [value.captured, value.unprocessed, value.errors, value.deliveryPending, value.deliveryClaimed, value.deliveryRetry, value.deliveryReplicated, value.deliveryAcknowledged, value.deliveryAwaitingRemotePrune, value.deliveryQuarantined];
   if ((value.scanErrors ?? 0) > 0 || (value.scanSkipped ?? 0) > 0 || !counts.every(finiteCount)) return { status: "unavailable" };
@@ -200,28 +204,32 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
   if (options.storageFactory !== undefined && options.storageFactory.backend !== backend) {
     return scoped(backendDiagnosticFailure(new BackendPublicationJournalError("backend-mismatch", "Diagnostic backend changed."), options.storageFactory.backend));
   }
-  // Borrowed pool counters are local observations, independent of a new remote
-  // probe succeeding or acquiring a connection. Capture them before any await.
-  let borrowedPool: BackendDiagnosticPool | undefined;
+  // Pool counters are local observations, independent of project, outbox, or
+  // remote probe work succeeding. Capture them before any await.
+  let poolObservation: BackendDiagnosticPool | undefined;
   if (backend === "postgresql" && options.storageFactory !== undefined) {
     const factory = options.storageFactory as StorageBackendFactory & {
       getDiagnosticPool?: () => ReturnType<BackendDiagnosticRuntime["poolDiagnostics"]> | undefined;
     };
-    try { borrowedPool = safePool(factory.getDiagnosticPool?.(), "daemon"); }
-    catch { borrowedPool = { origin: "daemon", status: "unverified" }; }
+    try { poolObservation = safePool(factory.getDiagnosticPool?.(), "daemon"); }
+    catch { poolObservation = { origin: "daemon", status: "unverified" }; }
+  } else if (backend === "sqlite") {
+    const origin = options.storageFactory === undefined ? "local" : "daemon";
+    try { poolObservation = safeSqlitePool(getPoolStats(), origin); }
+    catch { poolObservation = { origin, status: "unverified" }; }
   }
   const timeoutSnapshot = (): BackendDiagnosticSnapshot => {
     const snapshot = scoped(emptySnapshot(backend, "timeout"));
-    if (borrowedPool !== undefined) {
-      // A timed-out remote probe cannot authenticate publication for the local
-      // facts. Recheck the bounded synchronous witness before returning them.
+    if (poolObservation !== undefined) {
+      // Timed-out work cannot authenticate publication for these local facts.
+      // Recheck the bounded synchronous witness before returning them.
       try {
         if (dependencies.observePublication(options.homeDir).witness !== before.witness) {
           return scoped(backendDiagnosticFailure(new BackendPublicationJournalError("unexpected-state", "Diagnostic publication changed."), backend));
         }
       } catch (error) { return scoped(backendDiagnosticFailure(error, backend)); }
       snapshot.publication = "ready";
-      snapshot.pool = borrowedPool;
+      snapshot.pool = poolObservation;
     }
     return snapshot;
   };
@@ -238,7 +246,7 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
   const work = withDiagnosticSqliteSession(controller.signal, async (): Promise<BackendDiagnosticSnapshot> => {
     const snapshot = scoped(emptySnapshot(backend, "unavailable"));
     snapshot.publication = "ready";
-    if (borrowedPool !== undefined) snapshot.pool = borrowedPool;
+    if (poolObservation !== undefined) snapshot.pool = poolObservation;
     if (before.machineId !== null && normalizeUuidV7(before.machineId) === before.machineId) snapshot.identity = { status: "ready", machineId: before.machineId };
     else if (backend === "sqlite" && before.machineId === null) snapshot.identity = { status: "not-applicable" };
     try {
@@ -256,7 +264,7 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
         snapshot.tls = health.tls === true ? "ready" : "unavailable";
         snapshot.extensions = health.extensions === undefined ? "unverified" : areRequiredPostgreSqlExtensionsReady(health.extensions) ? "ready" : "unavailable";
         snapshot.search = health.searchConfiguration === undefined ? "unverified" : health.searchConfiguration.ready ? "ready" : "unavailable";
-        snapshot.pool = borrowedPool ?? safePool(runtime.poolDiagnostics(), "diagnostic-probe");
+        snapshot.pool = poolObservation ?? safePool(runtime.poolDiagnostics(), "diagnostic-probe");
         if (health.status !== "healthy" && health.status !== "degraded") throw health.error;
         const metrics = await dependencies.readMetrics(runtime, controller.signal, selectedProjectId);
         if (controller.signal.aborted) return timeoutSnapshot();
@@ -267,11 +275,10 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
         if (snapshot.tls === "ready" && snapshot.extensions === "ready" && snapshot.search === "ready" && snapshot.identity.status === "ready" && snapshot.pool.status === "ready") snapshot.classification = health.status === "degraded" || snapshot.pool.failed === true ? "degraded" : "healthy";
       } else {
         snapshot.tls = "not-applicable"; snapshot.extensions = "not-applicable"; snapshot.search = "not-applicable";
-        const pool = getPoolStats();
-        snapshot.pool = {origin:options.storageFactory === undefined ? "local" : "daemon",status:"ready",total:pool.totalConnections,idle:pool.idleConnections};
         if (options.collectSqlite !== undefined) {
           await options.collectSqlite({homeDir:options.homeDir,signal:controller.signal,projectId:selectedProjectId,staleAfterDays:before.config.restoration.staleAfterDays,staleSurfacingWithoutUseLimit:before.config.restoration.staleSurfacingWithoutUseLimit});
-          snapshot.schema = "ready"; snapshot.classification = "healthy";
+          snapshot.schema = "ready";
+          snapshot.classification = snapshot.pool.status === "ready" ? "healthy" : "unavailable";
         }
       }
       if (controller.signal.aborted) return timeoutSnapshot();

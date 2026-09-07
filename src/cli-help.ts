@@ -365,7 +365,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm connectors doctor github-copilot", "Check GitHub Copilot connector health"],
       ["lcm connectors doctor codex", "Check Codex connector health"],
     ],
-    notes: "Transport choices: CLI runs the agent's command-line workflow and uses the complete CLI bundle; MCP connects the agent to lcm's MCP server. GitHub Copilot uses a repo-local skill under .github/skills/. Codex defaults to a native hook + skill, and the default installation does not mutate MCP configuration.",
+    notes: "Transport choices: CLI runs the agent's command-line workflow and uses the complete CLI bundle; MCP connects the agent to lcm's MCP server. GitHub Copilot uses a repo-local skill under .github/skills/. Codex defaults to a native hook + skill, and the default installation does not mutate MCP configuration. The list format accepts text or json; unsupported --format values are rejected before inventory is read.",
   },
 
   sensitive: {

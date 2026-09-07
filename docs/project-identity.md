@@ -130,8 +130,18 @@ remains safe.
 Each operation has an atomically replaced journal under
 `~/.lcm/reconciliations/`. The journal records discovery evidence, completed
 merge work, backup locations, aliases, and the last durable phase so an
-interrupted operation resumes instead of repeating committed work. LCM
-permanently fences legacy project and event databases against writes before
+interrupted operation resumes instead of repeating committed work. During each
+locked real attempt, LCM retains the authenticated LCM root and reconciliation
+journal directory, including while recording a blocked state. Each journal
+write verifies that retained parent before and after publication and fails
+closed when it detects identity or private-mode drift. Each retry authenticates
+a fresh directory chain; completed fast paths and `--dry-run` do not acquire
+writable journal state. Retryable lock contention is retried only while the
+retained chain remains stable. If contention coincides with journal-parent
+drift, LCM reports unsafe storage instead of retrying into the replacement;
+preserve the displaced entries and run `lcm doctor` before retrying.
+
+LCM permanently fences legacy project and event databases against writes before
 committing their data to the canonical stores. After the merged databases pass
 foreign-key and FTS verification, the legacy project directory and event
 database sidecars move to timestamped private backups under
