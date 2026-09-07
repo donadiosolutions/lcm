@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { runDoctor as runDoctorProduction } from "../../src/doctor/doctor.js";
 import { doctorConfigSeams } from "./config-seams.js";
-import { mergeClaudeSettings, REQUIRED_HOOKS } from "../../installer/install.js";
+import { mergeClaudeSettings } from "../../installer/install.js";
 import { dirname, join } from "node:path";
 import type { DoctorDeps } from "../../src/doctor/types.js";
 
@@ -46,7 +46,7 @@ function baseReadFileSync(p: string, settings: string) {
 }
 
 describe("doctor hook validation", () => {
-  it("repairs hooks when they are absent from settings.json", async () => {
+  it("reports missing hooks without changing settings.json", async () => {
     const settings = JSON.stringify({ mcpServers: { "lcm": {} } });
     const writeFileSync = vi.fn();
     const home = doctorHome();
@@ -61,12 +61,10 @@ describe("doctor hook validation", () => {
       platform: "darwin",
     });
     const hookResult = results.find(r => r.name === "hooks");
-    expect(hookResult).toMatchObject({ status: "warn", fixApplied: true });
-    const settingsWrite = writeFileSync.mock.calls.find(([path]) =>
-      path === `${home}/.claude/settings.json`
-    );
-    const written = JSON.parse(settingsWrite![1]);
-    expect(Object.keys(written.hooks)).toEqual(REQUIRED_HOOKS.map(({ event }) => event));
+    expect(hookResult).toMatchObject({ status: "warn" });
+    expect(hookResult?.message).toContain("lcm install");
+    expect(writeFileSync).not.toHaveBeenCalled();
+
   });
 
   it("reports pass when native hooks and mcpServers.lcm use the installed binary", async () => {
@@ -90,7 +88,7 @@ describe("doctor hook validation", () => {
     expect(mcpResult?.message).toContain("npm-installed runtime");
   });
 
-  it("re-adds mcpServers.lcm when missing from settings.json", async () => {
+  it("reports missing mcpServers.lcm without writing settings.json", async () => {
     const settings = JSON.stringify({ ...mergeClaudeSettings({}, BINARY), theme: "dark", mcpServers: {} });
     const writtenFiles = new Map<string, string>();
     const home = doctorHome();
@@ -107,15 +105,11 @@ describe("doctor hook validation", () => {
     const mcpResult = results.find(r => r.name === "mcp-lcm");
     expect(mcpResult?.status).toBe("warn");
     expect(mcpResult?.message).toContain("missing or stale");
-    // doctor should have written the entry back to settings.json
-    const settingsWritten = writtenFiles.get(`${home}/.claude/settings.json`);
-    expect(settingsWritten).toBeDefined();
-    const written = JSON.parse(settingsWritten!);
-    expect(written.mcpServers?.lcm).toBeDefined();
-    expect(written.theme).toBe("dark");
+    expect(writtenFiles.size).toBe(0);
+
   });
 
-  it("removes only the owned MCP entry for stored Claude CLI transport", async () => {
+  it("reports the owned MCP entry for stored Claude CLI transport without removing it", async () => {
     const home = doctorHome();
     const settings = JSON.stringify({
       ...mergeClaudeSettings({}, BINARY),
@@ -136,11 +130,9 @@ describe("doctor hook validation", () => {
       homedir: home,
       platform: "darwin",
     });
-    expect(results.find(r => r.name === "mcp-lcm")).toMatchObject({ status: "warn", fixApplied: true });
-    const repaired = JSON.parse(writtenFiles.get(`${home}/.claude/settings.json`)!);
-    expect(repaired.mcpServers).toEqual({ unrelated: { command: "other" } });
-    expect(repaired.hooks.UserPromptSubmit.at(-1).hooks[0].command)
-      .toContain("user-prompt --transport cli");
+    expect(results.find(r => r.name === "mcp-lcm")).toMatchObject({ status: "warn" });
+    expect(writtenFiles.size).toBe(0);
+
   });
 
   it("does not adopt unrelated Claude settings as a managed LCM installation", async () => {
@@ -169,7 +161,7 @@ describe("doctor hook validation", () => {
     }
   });
 
-  it("reports a native MCP repair write failure", async () => {
+  it("reports stale native MCP registration without attempting a repair", async () => {
     const settings = JSON.stringify({
       ...mergeClaudeSettings({}, BINARY),
       mcpServers: { lcm: { command: "/old/lcm", args: ["mcp"] } },
@@ -186,10 +178,10 @@ describe("doctor hook validation", () => {
       platform: "darwin",
     });
     expect(results.find(r => r.name === "hooks")?.status).toBe("pass");
-    expect(results.find(r => r.name === "mcp-lcm")?.status).toBe("fail");
+    expect(results.find(r => r.name === "mcp-lcm")?.status).toBe("warn");
   });
 
-  it("stringifies a non-Error Claude settings read failure", async () => {
+  it("sanitizes a non-Error Claude settings read failure", async () => {
     const home = doctorHome();
     const results = await runDoctor({
       existsSync: () => true,
@@ -204,7 +196,8 @@ describe("doctor hook validation", () => {
       homedir: home,
       platform: "darwin",
     });
-    expect(results.find(r => r.name === "hooks")?.message).toContain("plain settings failure");
+    expect(results.find(r => r.name === "hooks")?.status).toBe("fail");
+    expect(JSON.stringify(results)).not.toContain("plain settings failure");
     expect(results.find(r => r.name === "mcp-lcm")?.status).toBe("fail");
   });
 

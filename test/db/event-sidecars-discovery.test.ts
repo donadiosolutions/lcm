@@ -80,7 +80,7 @@ describe("event sidecar discovery", () => {
     const path = join(scanMocks.eventsDir, `${"a".repeat(64)}.db`);
     writeFileSync(path, "");
 
-    const sidecars = await collectEventSidecars({ pruneOrphanSidecars: false });
+    const sidecars = await collectEventSidecars({ pruneOrphanSidecars: true });
 
     expect(sidecars).toHaveLength(1);
     expect(scanMocks.open).toHaveBeenCalledOnce();

@@ -7,6 +7,7 @@ import { createDaemon, type DaemonInstance } from "../../src/daemon/server.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { ensureAuthToken } from "../../src/daemon/auth.js";
+import type { BackendDiagnosticSnapshot } from "../../src/storage/diagnostics.js";
 
 const testIdentity = {
   ownerId: "client-tests",
@@ -21,8 +22,12 @@ describe("DaemonClient", () => {
     daemon = await createDaemon(loadDaemonConfig("/x", { daemon: { port: 0 } }));
     const client = new DaemonClient(`http://127.0.0.1:${daemon.address().port}`);
     expect(await client.health()).toMatchObject({ status: "ok", storageBackend: "sqlite" });
-    await expect(client.get<{ totalConnections: number }>("/stats/pool")).resolves.toMatchObject({
-      totalConnections: expect.any(Number),
+    await expect(client.get<{ backendDiagnostics: BackendDiagnosticSnapshot }>("/stats/pool")).resolves.toMatchObject({
+      backendDiagnostics: {
+        backend: "sqlite",
+        classification: "unavailable",
+        pool: { origin: "daemon", status: "ready", total: 0, idle: 0 },
+      },
     });
   });
 
@@ -130,11 +135,29 @@ describe("DaemonClient", () => {
         storageBackend: "sqlite",
         entrypoint: expect.any(String),
       });
-      const poolStats = await client.get<{ totalConnections: number }>("/stats/pool");
-      expect(poolStats.totalConnections).toBeGreaterThanOrEqual(0);
-      await expect(client.get<{ totalConnections: number }>("/stats/pool")).resolves.toMatchObject({
-        totalConnections: expect.any(Number),
+      const baseUrl = `http://127.0.0.1:${daemon.address().port}`;
+      const missingTokenClient = new DaemonClient(baseUrl, join(dir, "missing.token"));
+      const wrongTokenPath = join(dir, "wrong.token");
+      ensureAuthToken(wrongTokenPath);
+      const wrongTokenClient = new DaemonClient(baseUrl, wrongTokenPath);
+      await expect(missingTokenClient.get("/stats/pool")).rejects.toMatchObject({ statusCode: 401, message: "unauthorized" });
+      await expect(wrongTokenClient.get("/stats/pool")).rejects.toMatchObject({ statusCode: 401, message: "unauthorized" });
+
+      const poolStats = await client.get<{ backendDiagnostics: BackendDiagnosticSnapshot }>("/stats/pool");
+      // An empty fixture has no project schema, but its observed pool is empty.
+      // The successful read also proves credentials reached the protected route.
+      expect(Object.keys(poolStats)).toEqual(["backendDiagnostics"]);
+      expect(poolStats.backendDiagnostics).toMatchObject({
+        backend: "sqlite",
+        classification: "unavailable",
+        publication: "ready",
+        schema: "unverified",
+        project: { scope: "aggregate", status: "unavailable" },
       });
+      expect(poolStats.backendDiagnostics.pool).toEqual({
+        origin: "daemon", status: "ready", total: 0, idle: 0,
+      });
+      expect(JSON.stringify(poolStats)).not.toContain(dir);
       await expect(client.post("/promote-events/notify", { cwd: dir })).resolves.toEqual({ queued: true });
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -148,8 +171,12 @@ describe("DaemonClient", () => {
     try {
       daemon = await createDaemon(loadDaemonConfig("/x", { daemon: { port: 0 } }));
       const client = new DaemonClient(`http://127.0.0.1:${daemon.address().port}`, tokenPath);
-      await expect(client.get<{ totalConnections: number }>("/stats/pool")).resolves.toMatchObject({
-        totalConnections: expect.any(Number),
+      await expect(client.get<{ backendDiagnostics: BackendDiagnosticSnapshot }>("/stats/pool")).resolves.toMatchObject({
+        backendDiagnostics: {
+          backend: "sqlite",
+          classification: "unavailable",
+          pool: { origin: "daemon", status: "ready", total: 0, idle: 0 },
+        },
       });
       await expect(client.post("/promote-events/notify", { cwd: dir })).resolves.toEqual({ queued: true });
     } finally {

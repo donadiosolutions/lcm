@@ -168,9 +168,8 @@ describe("daemon server", () => {
       body: "{}",
     });
     expect(response.status).toBe(503);
-    await expect(response.json()).resolves.toEqual({
-      status: "blocked",
-      error: "backend publication admission blocked",
+    await expect(response.json()).resolves.toMatchObject({
+      backendDiagnostics: { backend: "sqlite", classification: "unavailable", publication: "unavailable" },
     });
 
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -283,9 +282,8 @@ describe("daemon server", () => {
         body: "{}",
       });
       expect(response.status).toBe(503);
-      await expect(response.json()).resolves.toEqual({
-        status: "blocked",
-        error: "backend publication admission blocked",
+      await expect(response.json()).resolves.toMatchObject({
+        backendDiagnostics: { backend: "sqlite", classification: "stale-publication", publication: "unavailable" },
       });
     } finally {
       if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
@@ -570,7 +568,7 @@ describe("daemon server", () => {
     }
   });
 
-  it("starts with selected PostgreSQL storage and preserves staged diagnostic gates", async () => {
+  it("starts with selected PostgreSQL storage and exposes observational diagnostics", async () => {
     const scanForTranscripts = vi.fn(async () => undefined);
     const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
     const caPath = join(tempHome!, "postgres-ca.pem");
@@ -799,13 +797,14 @@ describe("daemon server", () => {
             }
           : {}),
       });
-      expect(response.status).toBe(503);
+      expect(response.status).toBe(200);
       const unavailable = await response.json() as Record<string, unknown>;
-      expect(unavailable).toEqual({
-        code: "STORAGE_BACKEND_STAGED",
-        error: `${request.operation} is unavailable while PostgreSQL storage repositories are staged`,
-        storageBackend: "postgresql",
+      expect(unavailable).toMatchObject({
+        backendDiagnostics: { backend: "postgresql", classification: "stale-publication", publication: "unavailable" },
       });
+      expect(unavailable).not.toHaveProperty("project");
+      expect(unavailable).not.toHaveProperty("messages");
+      expect(unavailable).not.toHaveProperty("backendDiagnostics.metrics");
       expect(JSON.stringify(unavailable)).not.toContain("secret");
     }
   });

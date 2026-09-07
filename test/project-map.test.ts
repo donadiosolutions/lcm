@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -1392,6 +1392,139 @@ describe("project map", () => {
     const map = listProjectMapEntries();
 
     expect(map[hash]?.canonical).toBe(normalizeProjectPath(canonical));
+  });
+
+  it("skips hardlinked metadata while preserving trusted discoveries and existing entries", () => {
+    const existingCanonical = makeDir("existing-map-entry");
+    const existingHash = hashProjectPath(normalizeProjectPath(existingCanonical));
+    const trustedCanonical = makeDir("trusted-meta-sibling");
+    const trustedHash = hashProjectPath(normalizeProjectPath(trustedCanonical));
+    const hardlinkedCanonical = makeDir("hardlinked-meta");
+    const hardlinkedHash = hashProjectPath(normalizeProjectPath(hardlinkedCanonical));
+    writeProjectMap(`${JSON.stringify({
+      [existingHash]: { canonical: existingCanonical, aliases: [] },
+    })}\n`);
+    for (const [hash, canonical] of [
+      [trustedHash, trustedCanonical],
+      [hardlinkedHash, hardlinkedCanonical],
+    ] as const) {
+      const projectDirectory = join(homedir(), ".lcm", "projects", hash);
+      mkdirSync(projectDirectory, { recursive: true });
+      writeFileSync(join(projectDirectory, "meta.json"), JSON.stringify({ cwd: canonical }));
+    }
+    linkSync(
+      join(homedir(), ".lcm", "projects", hardlinkedHash, "meta.json"),
+      join(homedir(), ".lcm", "projects", hardlinkedHash, "meta-copy.json"),
+    );
+    clearProjectMapCache();
+
+    const map = listProjectMapEntries();
+
+    expect(map).toEqual({
+      [existingHash]: { canonical: existingCanonical, aliases: [] },
+      [trustedHash]: { canonical: normalizeProjectPath(trustedCanonical), aliases: [] },
+    });
+  });
+
+  it("skips foreign-owner metadata before reading its bytes", () => {
+    const expectedUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    if (expectedUid === undefined) throw new Error("owner admission test requires process.getuid");
+    const existingCanonical = makeDir("owner-existing-map-entry");
+    const existingHash = hashProjectPath(normalizeProjectPath(existingCanonical));
+    const trustedCanonical = makeDir("owner-trusted-meta-sibling");
+    const trustedHash = hashProjectPath(normalizeProjectPath(trustedCanonical));
+    const foreignCanonical = makeDir("foreign-owner-meta");
+    const foreignHash = hashProjectPath(normalizeProjectPath(foreignCanonical));
+    const foreignMetaPath = join(homedir(), ".lcm", "projects", foreignHash, "meta.json");
+    writeProjectMap(`${JSON.stringify({
+      [existingHash]: { canonical: existingCanonical, aliases: [] },
+    })}\n`);
+    for (const [hash, canonical] of [
+      [trustedHash, trustedCanonical],
+      [foreignHash, foreignCanonical],
+    ] as const) {
+      const projectDirectory = join(homedir(), ".lcm", "projects", hash);
+      mkdirSync(projectDirectory, { recursive: true });
+      writeFileSync(join(projectDirectory, "meta.json"), JSON.stringify({ cwd: canonical }));
+    }
+    clearProjectMapCache();
+
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalClose = nodeFs.closeSync as (...args: unknown[]) => void;
+    const originalFstat = nodeFs.fstatSync as (...args: unknown[]) => unknown;
+    const originalRead = nodeFs.readSync as (...args: unknown[]) => number;
+    const foreignDescriptors = new Set<number>();
+    let foreignReads = 0;
+    try {
+      nodeFs.openSync = ((...args: unknown[]) => {
+        const fd = originalOpen(...args);
+        if (String(args[0]) === foreignMetaPath) foreignDescriptors.add(fd);
+        return fd;
+      });
+      nodeFs.closeSync = ((...args: unknown[]) => {
+        if (typeof args[0] === "number") foreignDescriptors.delete(args[0]);
+        return originalClose(...args);
+      });
+      nodeFs.fstatSync = ((...args: unknown[]) => {
+        const stat = originalFstat(...args);
+        const fd = args[0];
+        const bigint = (args[1] as { bigint?: boolean } | undefined)?.bigint === true;
+        if (typeof fd !== "number" || bigint || !foreignDescriptors.has(fd)) return stat;
+        return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
+          uid: expectedUid + 1,
+        });
+      });
+      nodeFs.readSync = ((...args: unknown[]) => {
+        if (typeof args[0] === "number" && foreignDescriptors.has(args[0])) foreignReads += 1;
+        return originalRead(...args);
+      });
+      syncBuiltinESMExports();
+
+      const map = listProjectMapEntries();
+
+      expect(map).toEqual({
+        [existingHash]: { canonical: existingCanonical, aliases: [] },
+        [trustedHash]: { canonical: normalizeProjectPath(trustedCanonical), aliases: [] },
+      });
+      expect(foreignReads).toBe(0);
+    } finally {
+      nodeFs.openSync = originalOpen;
+      nodeFs.closeSync = originalClose;
+      nodeFs.fstatSync = originalFstat;
+      nodeFs.readSync = originalRead;
+      syncBuiltinESMExports();
+    }
+  });
+
+  it("rejects hardlinked metadata when process.getuid is unavailable", () => {
+    const trustedCanonical = makeDir("portable-trusted-meta");
+    const trustedHash = hashProjectPath(normalizeProjectPath(trustedCanonical));
+    const hardlinkedCanonical = makeDir("portable-hardlinked-meta");
+    const hardlinkedHash = hashProjectPath(normalizeProjectPath(hardlinkedCanonical));
+    for (const [hash, canonical] of [
+      [trustedHash, trustedCanonical],
+      [hardlinkedHash, hardlinkedCanonical],
+    ] as const) {
+      const projectDirectory = join(homedir(), ".lcm", "projects", hash);
+      mkdirSync(projectDirectory, { recursive: true });
+      writeFileSync(join(projectDirectory, "meta.json"), JSON.stringify({ cwd: canonical }));
+    }
+    linkSync(
+      join(homedir(), ".lcm", "projects", hardlinkedHash, "meta.json"),
+      join(homedir(), ".lcm", "projects", hardlinkedHash, "meta-copy.json"),
+    );
+    const getuid = Object.getOwnPropertyDescriptor(process, "getuid");
+    try {
+      Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+
+      expect(listProjectMapEntries()).toEqual({
+        [trustedHash]: { canonical: normalizeProjectPath(trustedCanonical), aliases: [] },
+      });
+    } finally {
+      if (getuid === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", getuid);
+    }
   });
 
   it("rechecks metadata under the mutation lock after a concurrent backfill", () => {

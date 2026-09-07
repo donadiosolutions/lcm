@@ -1,14 +1,19 @@
-import { collectStats } from "../../stats.js";
+import { collectStats, StatsUnavailableError } from "../../stats.js";
+import { backendDiagnosticFailure } from "../../storage/diagnostics.js";
+import type { StorageBackendFactory } from "../../storage/contracts.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 
-export function createStatsHandler(): RouteHandler {
-  return async (_req, res, _body) => {
+export function createStatsHandler(homeDir?: string, storageFactory?: StorageBackendFactory): RouteHandler {
+  return async (_req, res, _body, context) => {
     try {
-      const stats = await collectStats();
+      const stats = await collectStats({ homeDir, storageFactory, signal: context?.signal });
       sendJson(res, 200, stats);
-    } catch {
-      sendJson(res, 500, { error: "Stats collection failed" });
+    } catch (error) {
+      sendJson(res, 200, {
+        backendDiagnostics: error instanceof StatsUnavailableError
+          ? error.diagnostics : backendDiagnosticFailure(error),
+      });
     }
   };
 }

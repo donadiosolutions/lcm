@@ -207,7 +207,7 @@ describe("printStats", () => {
     expect(out).toContain("23.8%");
   });
 
-  it("shows top recalled memories in Recall section", () => {
+  it("does not print content from recalled memories", () => {
     const out = captureLog(() => printStats({
       ...baseStats,
       recallStats: {
@@ -219,9 +219,9 @@ describe("printStats", () => {
         ],
       },
     }, false));
-    expect(out).toContain("Top recalled");
-    expect(out).toContain("PostgreSQL");
-    expect(out).toContain("×3");
+    expect(out).not.toContain("Top recalled");
+    expect(out).not.toContain("PostgreSQL");
+    expect(out).not.toContain("×3");
   });
 
   it("renders recalled memory as a single terminal-safe line", () => {
@@ -234,7 +234,7 @@ describe("printStats", () => {
         topRecalled: [{ id: "unsafe", content: "safe\nspoof\r\x1b]52;c;YQ==\x07\x1b[31mred\x1b[0m\u202eevil", actCount: 1 }],
       },
     }, false));
-    expect(out).toContain("safe spoof red evil");
+    expect(out).not.toContain("safe spoof red evil");
     expect(out).not.toContain("\x1b]52");
     expect(out).not.toContain("\x1b[31m");
     expect(out).not.toContain("\u202e");

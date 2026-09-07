@@ -1,3 +1,5 @@
+import { mkdirSync } from "node:fs";
+import { projectsDir } from "../../../src/runtime-paths.js";
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import { createDaemon, type DaemonInstance } from "../../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
@@ -7,6 +9,7 @@ describe("GET /stats", () => {
   let port: number;
 
   beforeAll(async () => {
+    mkdirSync(projectsDir(), { recursive: true, mode: 0o700 });
     daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
     port = daemon.address().port;
   });

@@ -117,13 +117,13 @@ describe("POST /status", () => {
     expect(data.project.summaryCount).toBe(1);
     expect(data.project.promotedCount).toBe(1);
 
-    // Check timestamps
-    expect(data.project.lastIngest).toBe("2026-03-22T10:00:00.000Z");
-    expect(data.project.lastCompact).toBe("2026-03-22T09:00:00.000Z");
-    expect(data.project.lastPromote).toBe("2026-03-22T08:00:00.000Z");
+    // Arbitrary metadata timestamps are not part of diagnostic output.
+    expect(data.project).not.toHaveProperty("lastIngest");
+    expect(data.project).not.toHaveProperty("lastCompact");
+    expect(data.project).not.toHaveProperty("lastPromote");
   });
 
-  it("returns zeros for empty project", async () => {
+  it("reports unavailable metrics for a project without a database", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-status-empty-"));
     tempDirs.push(tempDir);
 
@@ -141,15 +141,8 @@ describe("POST /status", () => {
     expect(data.daemon).toBeDefined();
     expect(data.daemon.version).toBeDefined();
 
-    // Check project stats are zeros
-    expect(data.project.messageCount).toBe(0);
-    expect(data.project.summaryCount).toBe(0);
-    expect(data.project.promotedCount).toBe(0);
-
-    // Check timestamps are null
-    expect(data.project.lastIngest).toBeNull();
-    expect(data.project.lastCompact).toBeNull();
-    expect(data.project.lastPromote).toBeNull();
+    expect(data).not.toHaveProperty("project");
+    expect(data.backendDiagnostics.classification).toBe("unavailable");
   });
 
   it("includes daemon version and uptime", async () => {

@@ -628,6 +628,8 @@ function populateFromExistingProjectMetadata(map: ProjectMap, homeDir?: string):
       const meta = JSON.parse(readBoundedRegularFile(metaPath, {
         allowedRoot: join(root, entry.name),
         maxBytes: 1024 * 1024,
+        expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+        requireSingleLink: true,
       })) as { cwd?: unknown };
       if (typeof meta.cwd !== "string" || meta.cwd.length === 0) continue;
       const canonical = normalizeProjectPath(meta.cwd);

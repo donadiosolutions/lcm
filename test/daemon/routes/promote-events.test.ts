@@ -18,6 +18,7 @@ import type { DaemonConfig } from "../../../src/daemon/config.js";
 import { PromotedStore } from "../../../src/db/promoted.js";
 import { withBackendPublicationConsumerLockAsync } from "../../../src/storage/backend-publication.js";
 import { createStorageBackendFactory } from "../../../src/storage/index.js";
+import { SQLiteLocalHookOutboxFactory } from "../../../src/storage/local-hook-outbox.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 import { recoverMachineIdentity } from "../../../src/machine-identity.js";
 import {
@@ -1049,14 +1050,22 @@ describe("promote-events route", () => {
     const secondDb = new EventsDb(secondSidecarPath);
     secondDb.close();
 
-    const now = vi.spyOn(Date, "now");
-    now.mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValueOnce(30_001);
+    const now = vi.spyOn(Date, "now").mockReturnValue(0);
+    const originalClose = SQLiteLocalHookOutboxFactory.prototype.close;
+    const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close")
+      .mockImplementationOnce(async function (this: SQLiteLocalHookOutboxFactory) {
+        await originalClose.call(this);
+        // Exhaust the budget after the first real scan finishes, independently
+        // of clock reads used by publication admission and operation deadlines.
+        now.mockReturnValue(30_001);
+      });
 
     const handler = createPromoteAllEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
     try {
       await handler(request, res, "");
     } finally {
+      close.mockRestore();
       now.mockRestore();
     }
 

@@ -47,7 +47,7 @@ afterAll(() => {
   rmSync(NORMALIZATION_FIXTURE_ROOT, { recursive: true, force: true });
 });
 
-it("normalizes a merge result without an MCP servers object", async () => {
+it("compares missing normalized settings without writing during observation", async () => {
   const written: string[] = [];
   const deps: DoctorDeps = {
     existsSync: () => true,
@@ -69,14 +69,10 @@ it("normalizes a merge result without an MCP servers object", async () => {
     ...doctorConfigSeams("{}"),
   };
 
-  mergeClaudeSettingsMock.mockReturnValueOnce({});
   const results = await runDoctor(deps);
-  mergeClaudeSettingsMock.mockReturnValueOnce({ mcpServers: null } as never);
-  await runDoctor(deps);
-  mergeClaudeSettingsMock.mockReturnValueOnce({ mcpServers: {} });
-  await runDoctor(deps);
 
   expect(results.find((result) => result.name === "mcp-lcm")?.status).toBe("warn");
   expect(mergeClaudeSettingsMock).toHaveBeenCalled();
-  expect(written.some((content) => content.includes('"mcpServers"'))).toBe(true);
+  expect(written).toEqual([]);
+  expect(deps.mkdirSync).not.toHaveBeenCalled();
 });

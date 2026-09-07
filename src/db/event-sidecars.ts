@@ -1,15 +1,20 @@
-import { existsSync, lstatSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { lstatSync, readdirSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { MAX_PROJECT_METADATA_BYTES } from "../daemon/project.js";
+import { readDiagnosticSqlite, withDiagnosticSqliteSession } from "./diagnostic-sqlite.js";
+import { sanitizeHookErrorDiagnostic } from "../hooks/hook-error-diagnostic.js";
 import { eventsDir } from "./events-path.js";
 import { projectsDir } from "../runtime-paths.js";
 import {
   assertPrivateDirectory,
   assertPrivateDirectoryEntry,
-  openPrivateDirectory,
+  openPrivateDirectoryIfExists,
+  readBoundedRegularFile,
+  PrivateDirectoryTopologyError,
   type PrivateDirectoryHandle,
   type PrivateDirectoryWitness,
 } from "../security-files.js";
-import { SQLiteLocalHookOutboxFactory } from "../storage/local-hook-outbox.js";
+import { SQLiteLocalHookOutboxFactory, type LocalHookOutboxHealth, type LocalHookErrorRecord } from "../storage/local-hook-outbox.js";
 import { isWorktreeReconciliationFence } from "../worktree-reconciliation-fence.js";
 
 export interface EventSidecarSummary {
@@ -38,6 +43,10 @@ export interface EventSidecarSummary {
 }
 
 export interface EventSidecarScanOptions {
+  homeDir?: string;
+  /** A local project identity hash, never a filesystem path or backend UUID. */
+  projectId?: string;
+  signal?: AbortSignal;
   timeoutMs?: number;
   maxDbs?: number;
   startIndex?: number;
@@ -54,6 +63,100 @@ const PROJECT_HASH_SIDECAR_RE = /^([a-f0-9]{64})\.db$/u;
 type StablePrivateDirectoryWitness = Readonly<Omit<PrivateDirectoryWitness, "nlink">>;
 
 class EventSidecarParentChangedError extends Error {}
+
+class EventSidecarScanStoppedError extends Error {}
+
+function sidecarDirectoryFailure(error: unknown): Error {
+  let source = error;
+  while (source instanceof EventSidecarParentChangedError || source instanceof PrivateDirectoryTopologyError) {
+    source = source.cause;
+  }
+  const code = (source as NodeJS.ErrnoException | null)?.code;
+  return Object.assign(new Error("event sidecar directory unavailable"), {
+    code: code === "EACCES" || code === "EPERM" ? code : undefined,
+  });
+}
+
+async function awaitSidecarScan<T>(operation: Promise<T>, deadline: number, signal?: AbortSignal): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    // Attach a rejection handler even if the deadline already elapsed.
+    const stopped = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(new EventSidecarScanStoppedError("sidecar scan cancelled"));
+      signal?.addEventListener("abort", onAbort, { once: true });
+      timer = setTimeout(() => reject(new EventSidecarScanStoppedError("sidecar scan skipped after timeout")), Math.max(0, deadline - Date.now()));
+      if (signal?.aborted) onAbort();
+      else if (Date.now() >= deadline) reject(new EventSidecarScanStoppedError("sidecar scan skipped after timeout"));
+    });
+    return await Promise.race([stopped, operation]);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort!);
+  }
+}
+
+/** Diagnostic reads never enter the pooled EventsDb migration/creation path. */
+function readOnlySidecarFactory(
+  path: string,
+  expected: NonNullable<ReturnType<typeof lstatSync>>,
+  options: EventSidecarScanOptions,
+  deadline: number,
+  parent: PrivateDirectoryHandle,
+  parentPath: string,
+) {
+  return {
+    async open(_path: string, _options: { busyTimeoutMs: number }) {
+      const statements: { sql: string; mode: "get" | "all" }[] = [{
+        mode: "get",
+        sql: `
+          SELECT COUNT(*) AS totalEvents, MAX(created_at) AS lastCapture,
+            COUNT(*) FILTER (WHERE processed_at IS NULL) AS unprocessed,
+            COUNT(*) FILTER (WHERE delivery_state = 'pending') AS deliveryPending,
+            COUNT(*) FILTER (WHERE delivery_state = 'claimed') AS deliveryClaimed,
+            COUNT(*) FILTER (WHERE delivery_state = 'retry') AS deliveryRetry,
+            COUNT(*) FILTER (WHERE delivery_state = 'replicated') AS deliveryReplicated,
+            COUNT(*) FILTER (WHERE delivery_state = 'acknowledged') AS deliveryAcknowledged,
+            COUNT(*) FILTER (WHERE delivery_state = 'acknowledged' AND remote_inbox_id IS NOT NULL AND remote_pruned_at IS NULL) AS deliveryAwaitingRemotePrune,
+            COUNT(*) FILTER (WHERE delivery_state = 'quarantined') AS deliveryQuarantined,
+            MIN(created_at) FILTER (WHERE delivery_state <> 'acknowledged') AS oldestDeliveryAt
+          FROM events
+        `,
+      }, {
+        mode: "get",
+        sql: `
+          SELECT COUNT(*) AS errors, MAX(created_at) AS lastError FROM error_log
+          WHERE hook NOT LIKE 'maintenance:%' AND created_at >= datetime('now', '-30 days')
+        `,
+      }];
+      if (options.includeRecentErrors) statements.push({
+        mode: "all",
+        sql: `
+          SELECT created_at, hook, error FROM error_log WHERE hook NOT LIKE 'maintenance:%'
+          ORDER BY id DESC LIMIT 5
+        `,
+      });
+      const rows = await readDiagnosticSqlite({
+        path, statements, signal: options.signal,
+        timeoutMs: Math.max(1, deadline - Date.now()),
+        expected: { device: BigInt(expected.dev), inode: BigInt(expected.ino) },
+        parents: [{ path: parentPath, fd: parent.fd, device: BigInt(parent.witness.dev), inode: BigInt(parent.witness.ino) }],
+      });
+      return {
+        async getHealthStats(): Promise<LocalHookOutboxHealth> {
+          const totals = rows[0] as Omit<LocalHookOutboxHealth, "errors" | "lastError">;
+          const errors = rows[1] as { errors: number; lastError: string | null };
+          return { ...totals, ...errors };
+        },
+        async getRecentErrors(_options: { limit: number }): Promise<LocalHookErrorRecord[]> {
+          return (rows[2] as LocalHookErrorRecord[])
+            .map(row => ({ ...row, error: sanitizeHookErrorDiagnostic(row.error) }));
+        },
+      };
+    },
+    async close() { /* The isolated reader owns and closes its connection. */ },
+  };
+}
 
 function stablePrivateDirectoryWitness(
   witness: PrivateDirectoryWitness,
@@ -102,12 +205,15 @@ async function awaitWithEventSidecarParent<T>(
   }
 }
 
-function readCwdForProject(projectId: string): string | undefined {
-  const metaPath = join(projectsDir(), projectId, "meta.json");
-  if (!existsSync(metaPath)) return undefined;
-
+function readCwdForProject(projectId: string, homeDir?: string): string | undefined {
+  const metaPath = join(projectsDir(homeDir), projectId, "meta.json");
   try {
-    const parsed = JSON.parse(readFileSync(metaPath, "utf-8")) as { cwd?: unknown };
+    const parsed = JSON.parse(readBoundedRegularFile(metaPath, {
+      allowedRoot: dirname(metaPath),
+      maxBytes: MAX_PROJECT_METADATA_BYTES,
+      expectedUid: process.getuid?.(),
+      requireSingleLink: true,
+    })) as { cwd?: unknown };
     return typeof parsed.cwd === "string" && parsed.cwd.length > 0 ? parsed.cwd : undefined;
   } catch {
     return undefined;
@@ -118,9 +224,10 @@ function failedSidecarSummary(
   file: string,
   path: string,
   scanError: string,
+  homeDir?: string,
 ): EventSidecarSummary {
   const projectId = file.slice(0, -".db".length);
-  const cwd = readCwdForProject(projectId);
+  const cwd = readCwdForProject(projectId, homeDir);
   return {
     file,
     projectId,
@@ -217,17 +324,29 @@ function pruneSidecarFiles(
 }
 
 export async function collectEventSidecars(options: EventSidecarScanOptions = {}): Promise<EventSidecarSummary[]> {
-  const dir = eventsDir();
+  if (options.pruneOrphanSidecars !== false) return scanEventSidecars(options);
+  const signal = options.signal ?? new AbortController().signal;
+  return withDiagnosticSqliteSession(signal, () => scanEventSidecars({...options, signal}));
+}
+
+async function scanEventSidecars(options: EventSidecarScanOptions): Promise<EventSidecarSummary[]> {
+  if (options.projectId !== undefined && !/^[a-f0-9]{64}$/u.test(options.projectId)) {
+    throw new Error("invalid sidecar project ID");
+  }
+  const dir = eventsDir(options.homeDir);
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const maxDbs = options.maxDbs ?? DEFAULT_MAX_DBS;
+  const maxDbs = options.maxDbs ?? (options.pruneOrphanSidecars === false ? Number.MAX_SAFE_INTEGER : DEFAULT_MAX_DBS);
   const pruneOrphans = options.pruneOrphanSidecars ?? true;
   const pruneOlderThanDays = options.pruneOrphanSidecarsOlderThanDays ?? DEFAULT_PRUNE_ORPHAN_SIDECAR_AGE_DAYS;
   const deadline = Date.now() + timeoutMs;
 
   let parent: PrivateDirectoryHandle;
   try {
-    parent = openPrivateDirectory(dir);
-  } catch {
+    const opened = openPrivateDirectoryIfExists(dir);
+    if (!opened) return [];
+    parent = opened;
+  } catch (error) {
+    if (!pruneOrphans) throw sidecarDirectoryFailure(error);
     return [];
   }
   const parentWitness = stablePrivateDirectoryWitness(parent.witness);
@@ -237,7 +356,8 @@ export async function collectEventSidecars(options: EventSidecarScanOptions = {}
       assertEventSidecarParent(parent, dir, parentWitness);
       try {
         files = readdirSync(dir, { withFileTypes: true })
-          .filter(entry => entry.name.endsWith(".db"))
+          .filter(entry => entry.name.endsWith(".db")
+            && (options.projectId === undefined || entry.name === `${options.projectId}.db`))
           .filter((entry) => {
             const match = PROJECT_HASH_SIDECAR_RE.exec(entry.name);
             if (!match || entry.isFile() || entry.isSymbolicLink()) return true;
@@ -245,7 +365,7 @@ export async function collectEventSidecars(options: EventSidecarScanOptions = {}
               join(dir, entry.name),
               match[1]!,
               "events",
-              { _deadlineReached: () => Date.now() >= deadline },
+              { _deadlineReached: () => options.signal?.aborted === true || Date.now() >= deadline },
             );
           })
           .map(entry => entry.name)
@@ -253,7 +373,8 @@ export async function collectEventSidecars(options: EventSidecarScanOptions = {}
       } finally {
         assertEventSidecarParent(parent, dir, parentWitness);
       }
-    } catch {
+    } catch (error) {
+      if (!pruneOrphans) throw sidecarDirectoryFailure(error);
       return [];
     }
     if (files.length > 0 && options.startIndex !== undefined) {
@@ -266,9 +387,11 @@ export async function collectEventSidecars(options: EventSidecarScanOptions = {}
     for (let index = 0; index < files.length; index++) {
       const file = files[index];
       const path = join(dir, file);
-      if (scanned >= maxDbs || Date.now() >= deadline) {
+      if (options.signal?.aborted || scanned >= maxDbs || Date.now() >= deadline) {
         const skippedCount = files.length - index;
-        const reason = scanned >= maxDbs
+        const reason = options.signal?.aborted
+          ? "sidecar scan cancelled"
+          : scanned >= maxDbs
           ? "sidecar scan skipped after maxDbs limit"
           : "sidecar scan skipped after timeout";
         const skippedFile = files[index];
@@ -293,28 +416,40 @@ export async function collectEventSidecars(options: EventSidecarScanOptions = {}
         if (stat.isSymbolicLink() || !stat.isFile()) {
           throw new Error("sidecar path is not a regular file");
         }
-        const outboxFactory = new SQLiteLocalHookOutboxFactory();
+        const outboxFactory = pruneOrphans
+          ? new SQLiteLocalHookOutboxFactory()
+          : readOnlySidecarFactory(path, stat, options, deadline, parent, dir);
         let opened = false;
         let summary: EventSidecarSummary;
         try {
           assertEventSidecarParent(parent, dir, parentWitness);
           let db: Awaited<ReturnType<typeof outboxFactory.open>>;
           try {
-            db = await outboxFactory.open(path, { busyTimeoutMs: 500 });
+            const opening = outboxFactory.open(path, { busyTimeoutMs: Math.min(500, Math.max(0, deadline - Date.now())) });
+            try {
+              db = await awaitSidecarScan<Awaited<ReturnType<typeof outboxFactory.open>>>(
+                opening, deadline, options.signal,
+              );
+            } catch (error) {
+              // An injected or future asynchronous opener may finish after the
+              // budget. Its factory still owns that late resource.
+              void opening.then(() => outboxFactory.close()).catch(() => {});
+              throw error;
+            }
             opened = true;
           } finally {
             assertEventSidecarParent(parent, dir, parentWitness);
           }
           const stats = await awaitWithEventSidecarParent(
-            () => db.getHealthStats(),
+            () => awaitSidecarScan(db.getHealthStats(), deadline, options.signal),
             parent,
             dir,
             parentWitness,
           );
-          const cwd = readCwdForProject(projectId);
+          const cwd = readCwdForProject(projectId, options.homeDir);
           const recentErrors = options.includeRecentErrors
             ? (await awaitWithEventSidecarParent(
-              () => db.getRecentErrors({ limit: 5 }),
+              () => awaitSidecarScan(db.getRecentErrors({ limit: 5 }), deadline, options.signal),
               parent,
               dir,
               parentWitness,
@@ -356,7 +491,7 @@ export async function collectEventSidecars(options: EventSidecarScanOptions = {}
               beforeCloseError = error;
             }
             try {
-              await outboxFactory.close();
+              await awaitSidecarScan(outboxFactory.close(), deadline, options.signal);
             } catch (error) {
               closeFailed = true;
               closeError = error;
@@ -380,12 +515,20 @@ export async function collectEventSidecars(options: EventSidecarScanOptions = {}
           sidecars.push(summary);
         }
       } catch (error) {
+        const code = (error as NodeJS.ErrnoException | null)?.code;
+        if (error instanceof EventSidecarScanStoppedError || code === "DIAGNOSTIC_SQLITE_TIMEOUT" || code === "DIAGNOSTIC_SQLITE_ABORTED") {
+          const reason = error instanceof EventSidecarScanStoppedError ? error.message
+            : code === "DIAGNOSTIC_SQLITE_ABORTED" ? "sidecar scan cancelled" : "sidecar scan skipped after timeout";
+          sidecars.push(skippedSidecarSummary(file, path, reason));
+          break;
+        }
         sidecars.push(failedSidecarSummary(
           file,
           path,
           error instanceof Error ? error.message : "failed to scan sidecar",
+          options.homeDir,
         ));
-        if (error instanceof EventSidecarParentChangedError) break;
+        if (error instanceof EventSidecarParentChangedError || code === "DIAGNOSTIC_SQLITE_IDENTITY") break;
       }
     }
 

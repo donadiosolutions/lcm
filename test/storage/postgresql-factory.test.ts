@@ -224,6 +224,16 @@ describe("PostgreSQL storage backend factory", () => {
     }]);
   });
 
+  it("reports only optional diagnostic pool telemetry from its borrowed runtime", async () => {
+    const { runtime, dependencies } = harness();
+    const factory = await createPostgreSqlStorageBackendFactoryWithHome(config, "/home/operator", dependencies);
+    expect(factory.getDiagnosticPool()).toBeUndefined();
+    const pool = { configuredMax: 5, total: 2, idle: 1, waiting: 0, failed: false };
+    Object.assign(runtime, { poolDiagnostics: () => pool });
+    expect(factory.getDiagnosticPool()).toEqual(pool);
+    await factory.close();
+  });
+
   it("eagerly proves health and runtime readiness from a cloned config", async () => {
     const { runtime, dependencies, events } = harness();
     let captured: unknown;

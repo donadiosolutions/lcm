@@ -2683,3 +2683,39 @@ describe("PostgreSQL runtime", () => {
     expect(f.release).toHaveBeenCalledWith(true);
   });
 });
+
+describe("PostgreSQL diagnostic runtime telemetry", () => {
+  it("exposes finite public pool counters and recovery latch only", async () => {
+    const fixture = healthFixtures();
+    Object.assign(fixture.pool, { totalCount: 2, idleCount: 1, waitingCount: 3 });
+    expect(fixture.runtime.poolDiagnostics()).toEqual({ configuredMax: 2, total: 2, idle: 1, waiting: 3, failed: false });
+    fixture.failPool();
+    expect(fixture.runtime.poolDiagnostics().failed).toBe(true);
+    expect((await fixture.runtime.health()).status).toBe("degraded");
+    expect(fixture.runtime.poolDiagnostics().failed).toBe(false);
+    expect((await fixture.runtime.health()).status).toBe("healthy");
+    await fixture.runtime.close();
+  });
+
+  it.each([undefined, NaN, Infinity, -1, 1.5, "private"])("rejects invalid public pool counts %j", async (count) => {
+    const fixture = fixtures();
+    Object.assign(fixture.pool, { totalCount: count, idleCount: 0, waitingCount: 0 });
+    expect(() => fixture.runtime.poolDiagnostics()).toThrow(StorageOperationError);
+    await fixture.runtime.close();
+  });
+
+  it("passes the caller signal through every health query", async () => {
+    const fixture = healthFixtures();
+    const query = vi.spyOn(fixture.runtime, "query").mockImplementation(async (config) => {
+      if (isExtensionInspection(config)) return result(CURRENT_EXTENSION_ROWS);
+      if (isSearchConfigurationInspection(config)) return result([{ actual_sha256: POSTGRESQL_SEARCH_CONFIGURATION_SHA256, object_count: "19", ownership_ready: true }]);
+      if (config.text?.includes("pg_stat_statements_info")) return result([{ stats_reset: new Date() }]);
+      return result([HEALTHY_ROW]);
+    });
+    const signal = new AbortController().signal;
+    expect((await fixture.runtime.health(signal)).status).toBe("healthy");
+    expect(query.mock.calls.length).toBeGreaterThan(2);
+    for (const [, options] of query.mock.calls) expect(options.signal).toBe(signal);
+    await fixture.runtime.close();
+  });
+});

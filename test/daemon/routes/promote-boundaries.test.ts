@@ -2,7 +2,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { StorageOperationError } from "../../../src/storage/errors.js";
 import { BackendPublicationJournalError } from "../../../src/storage/backend-publication.js";
-import { PrivateDirectoryTopologyError } from "../../../src/security-files.js";
+import {
+  PrivateDirectoryTopologyError,
+  PrivateFilePublicationTopologyError,
+} from "../../../src/security-files.js";
 import { makeMockStorageFactory } from "./mock-storage-factory.js";
 import {
   createInvocationCoordinator,
@@ -865,6 +868,23 @@ describe("promote persistence boundaries", () => {
       error: "project directory topology changed before metadata publication",
     });
     expect(mocks.writeMetadata).not.toHaveBeenCalled();
+  });
+
+  it("keeps publication-outcome topology failures critical", async () => {
+    const topologyError = new PrivateDirectoryTopologyError("retained parent changed");
+    const publicationError = new PrivateFilePublicationTopologyError(
+      "published",
+      topologyError,
+      topologyError,
+    );
+    mocks.writeMetadata.mockImplementationOnce(() => { throw publicationError; });
+
+    await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/published-topology" }));
+
+    expect(mocks.writeMetadata).toHaveBeenCalledOnce();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, {
+      error: "private file rename completed, but retained parent topology is not trusted",
+    });
   });
 
   it("preserves a topology primary when metadata-parent cleanup also fails", async () => {
