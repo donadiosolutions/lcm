@@ -4,6 +4,7 @@ import {
   closeSync,
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
@@ -1226,6 +1227,88 @@ describe("daemon lifecycle test-scope validation", () => {
         restarted: false,
       });
 
+      for (const [linkKind, childPid] of [
+        ["symlink", 8580],
+        ["hardlink", 8581],
+        ["dangling-symlink", 8582],
+        ["stale", 8583],
+      ] as const) {
+        const linkedRoot = join(fixture.root, `detached-${linkKind}`);
+        mkdirSync(linkedRoot);
+        const linkedPidPath = join(linkedRoot, "daemon.pid");
+        const canaryPath = join(linkedRoot, "canary");
+        if (linkKind === "stale") {
+          writeFileSync(linkedPidPath, "stale", { mode: 0o640 });
+        } else if (linkKind === "dangling-symlink") {
+          symlinkSync(canaryPath, linkedPidPath);
+        } else {
+          writeFileSync(canaryPath, "detached-canary", { mode: 0o600 });
+          if (linkKind === "symlink") symlinkSync(canaryPath, linkedPidPath);
+          else linkSync(canaryPath, linkedPidPath);
+        }
+        const linkedChild = {
+          pid: childPid,
+          once: vi.fn().mockReturnThis(),
+          unref: vi.fn(),
+        };
+
+        await expect(ensureDaemon({
+          port: 37_350,
+          pidFilePath: linkedPidPath,
+          spawnTimeoutMs: 10,
+          spawnArgs: [fixture.scope.entrypoint],
+          _platform: "darwin",
+          _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as never,
+          _spawnOverride: vi.fn(() => linkedChild) as never,
+          _monotonicNowOverride: () => 0,
+          _skipHealthWait: true,
+        })).resolves.toMatchObject({
+          connected: false,
+          spawned: true,
+          startMethod: "detached-spawn",
+        });
+        if (linkKind === "symlink" || linkKind === "hardlink") {
+          expect(readFileSync(canaryPath, "utf8")).toBe("detached-canary");
+        } else if (linkKind === "dangling-symlink") {
+          expect(existsSync(canaryPath)).toBe(false);
+        }
+        expect(readFileSync(linkedPidPath, "utf8")).toBe(String(childPid));
+        const published = lstatSync(linkedPidPath);
+        expect(published.isFile()).toBe(true);
+        expect(published.isSymbolicLink()).toBe(false);
+        expect(published.nlink).toBe(1);
+        expect(published.mode & 0o777).toBe(0o600);
+        expect(statSync(linkedRoot).mode & 0o777).toBe(0o700);
+      }
+
+      const directoryRoot = join(fixture.root, "detached-directory");
+      mkdirSync(directoryRoot);
+      const directoryPidPath = join(directoryRoot, "daemon.pid");
+      mkdirSync(directoryPidPath);
+      const directoryChild = {
+        pid: 8584,
+        once: vi.fn().mockReturnThis(),
+        unref: vi.fn(),
+      };
+      const killAfterPublicationFailure = vi.fn();
+      await expect(ensureDaemon({
+        port: 37_350,
+        pidFilePath: directoryPidPath,
+        spawnTimeoutMs: 10,
+        spawnArgs: [fixture.scope.entrypoint],
+        _platform: "darwin",
+        _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as never,
+        _spawnOverride: vi.fn(() => directoryChild) as never,
+        _killOverride: killAfterPublicationFailure,
+        _monotonicNowOverride: () => 0,
+        _skipHealthWait: true,
+      })).rejects.toBeInstanceOf(Error);
+      expect(directoryChild.unref).toHaveBeenCalledOnce();
+      expect(killAfterPublicationFailure).not.toHaveBeenCalled();
+      expect(readdirSync(directoryRoot).filter(name => (
+        name.startsWith(".daemon.pid.") && name.endsWith(".tmp")
+      ))).toEqual([]);
+
       const child = {
         pid: 8585,
         once: vi.fn().mockReturnThis(),
@@ -1247,6 +1330,10 @@ describe("daemon lifecycle test-scope validation", () => {
         startMethod: "detached-spawn",
       });
       expect(readFileSync(detachedPidPath, "utf8")).toBe("8585");
+      const detachedPublished = lstatSync(detachedPidPath);
+      expect(detachedPublished.isFile()).toBe(true);
+      expect(detachedPublished.nlink).toBe(1);
+      expect(detachedPublished.mode & 0o777).toBe(0o600);
 
       const health = {
         status: "ok",

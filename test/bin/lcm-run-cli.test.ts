@@ -126,6 +126,7 @@ const state = vi.hoisted(() => ({
   createInstallerPublicationConvergence: vi.fn(),
   ensureAuthToken: vi.fn(),
   createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }) })),
+  privateFsRoots: [] as string[],
 }));
 
 vi.mock("../../src/daemon/version.js", async importOriginal => ({
@@ -146,20 +147,84 @@ vi.mock("node:process", async importOriginal => ({
   exit: state.exit,
   stdin: fakeStdin,
 }));
-vi.mock("node:fs", async importOriginal => ({
-  ...(await importOriginal<typeof import("node:fs")>()),
-  readFileSync: vi.fn((path: unknown) => {
+vi.mock("node:fs", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const isPrivateFixturePath = (path: unknown): boolean => {
+    if (typeof path !== "string") return false;
+    return state.privateFsRoots.some(root => path === root || path.startsWith(`${root}/`));
+  };
+  const assertPrivatePidPath = (path: unknown): void => {
+    if (typeof path !== "string") return;
+    const separator = state.runtimePidPath.lastIndexOf("/");
+    const directory = state.runtimePidPath.slice(0, separator);
+    const basename = state.runtimePidPath.slice(separator + 1);
+    const isPidPublicationPath = path === directory
+      || path === state.runtimePidPath
+      || path.startsWith(`${directory}/.${basename}.`);
+    if (isPidPublicationPath && !isPrivateFixturePath(path)) {
+      throw new Error(`PID fixture path escaped its private root: ${path}`);
+    }
+  };
+  return {
+    ...actual,
+    readFileSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      if (isPrivateFixturePath(path)) {
+        return Reflect.apply(actual.readFileSync, actual, [path, ...args]);
+      }
     if (String(path).endsWith("package.json")) {
       state.packageFileReads += 1;
       return JSON.stringify({ version: state.packageVersion });
     }
     if (state.readError) throw state.readError;
     return state.fileText;
-  }),
-  existsSync: vi.fn(() => state.exists),
-  readdirSync: vi.fn(() => state.entries),
-  mkdirSync: vi.fn(), writeFileSync: vi.fn(), unlinkSync: vi.fn(),
-}));
+    }),
+    existsSync: vi.fn((path: unknown) => isPrivateFixturePath(path)
+      ? Reflect.apply(actual.existsSync, actual, [path])
+      : state.exists),
+    readdirSync: vi.fn((path: unknown, ...args: unknown[]) => isPrivateFixturePath(path)
+      ? Reflect.apply(actual.readdirSync, actual, [path, ...args])
+      : state.entries),
+    mkdirSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      if (!isPrivateFixturePath(path)) return undefined;
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.mkdirSync, actual, [path, ...args]);
+    }),
+    writeFileSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      if (typeof path === "number") {
+        return Reflect.apply(actual.writeFileSync, actual, [path, ...args]);
+      }
+      if (!isPrivateFixturePath(path)) return undefined;
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.writeFileSync, actual, [path, ...args]);
+    }),
+    unlinkSync: vi.fn((path: unknown) => {
+      if (!isPrivateFixturePath(path)) return undefined;
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.unlinkSync, actual, [path]);
+    }),
+    chmodSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.chmodSync, actual, [path, ...args]);
+    }),
+    openSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.openSync, actual, [path, ...args]);
+    }),
+    lstatSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.lstatSync, actual, [path, ...args]);
+    }),
+    renameSync: vi.fn((source: unknown, destination: unknown) => {
+      assertPrivatePidPath(source);
+      assertPrivatePidPath(destination);
+      return Reflect.apply(actual.renameSync, actual, [source, destination]);
+    }),
+    rmSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      assertPrivatePidPath(path);
+      return Reflect.apply(actual.rmSync, actual, [path, ...args]);
+    }),
+  };
+});
 vi.mock("../../src/storage/backend-publication.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../../src/storage/backend-publication.js")>();
   return {
@@ -333,6 +398,8 @@ const actualRuntimePaths = await vi.importActual<typeof import("../../src/runtim
 const { batchCompact } = await import("../../src/batch-compact.js");
 const { isDaemonTransportFailure } = await import("../../src/daemon/http-url.js");
 
+let foregroundFixtureRoot: string | undefined;
+
 type RootBootstrapTestSeams = {
   migrate: () => unknown;
   sleep: (delayMs: number) => Promise<void>;
@@ -417,9 +484,12 @@ beforeEach(() => {
   state.sensitiveStdout = "sensitive";
   state.packageVersion = "1.4.0";
   state.packageFileReads = 0;
-  state.runtimeHome = "/lcm";
-  state.runtimePidPath = "/lcm/daemon.pid";
-  state.runtimeTokenPath = "/lcm/daemon.token";
+  foregroundFixtureRoot = actualFs.mkdtempSync(join(tmpdir(), "lcm-run-cli-pid-"));
+  state.privateFsRoots = [foregroundFixtureRoot];
+  state.runtimeHome = join(foregroundFixtureRoot, "state");
+  state.runtimePidPath = join(state.runtimeHome, "daemon.pid");
+  state.runtimeTokenPath = join(state.runtimeHome, "daemon.token");
+  actualFs.mkdirSync(state.runtimeHome, { recursive: true, mode: 0o700 });
   state.storageBackend = "sqlite";
   state.publicationAllowed = false;
   state.cliProjects = [];
@@ -442,6 +512,11 @@ afterEach(() => {
   process.exitCode = undefined;
   vi.useRealTimers();
   vi.restoreAllMocks();
+  if (foregroundFixtureRoot !== undefined) {
+    actualFs.rmSync(foregroundFixtureRoot, { recursive: true, force: true });
+    foregroundFixtureRoot = undefined;
+  }
+  state.privateFsRoots = [];
 });
 
 describe("runCli registration and help dispatch", () => {
@@ -1804,7 +1879,7 @@ describe("runCli orchestration actions", () => {
       expect((await invoke(["compact", "--hook", "--timeout-ms", "2000"]))?.message).toBe("exit:0");
       expect(state.loadConfig).not.toHaveBeenCalled();
       expect(state.loadPolicyConfig).toHaveBeenCalledOnce();
-      expect(state.loadPolicyConfig).toHaveBeenLastCalledWith("/lcm/.lcm/config.json");
+      expect(state.loadPolicyConfig).toHaveBeenLastCalledWith(join(state.runtimeHome, ".lcm", "config.json"));
       expect(JSON.parse(state.dispatchHook.mock.calls.at(-1)![1])).toMatchObject({
         request_timeout_ms: 2000,
       });
@@ -2569,15 +2644,96 @@ describe("runCli failure and alternate presentation branches", () => {
       handlers.set(event, listener);
       return process;
     }) as typeof process.on);
-    state.fileText = String(process.pid);
     expect(await invoke(["daemon", "start", "--foreground"])).toBeUndefined();
+    actualFs.writeFileSync(state.runtimePidPath, "different-pid");
     expect(() => handlers.get("exit")?.()).not.toThrow();
-    state.fileText = "different-pid";
+    expect(actualFs.readFileSync(state.runtimePidPath, "utf-8")).toBe("different-pid");
+    actualFs.writeFileSync(state.runtimePidPath, String(process.pid));
     expect(() => handlers.get("exit")?.()).not.toThrow();
+    expect(actualFs.existsSync(state.runtimePidPath)).toBe(false);
     expect(() => handlers.get("SIGTERM")?.()).toThrow("exit:0");
     expect(() => handlers.get("SIGINT")?.()).toThrow("exit:0");
     on.mockRestore();
   });
+
+  it.each(["absent", "stale", "symlink", "dangling-symlink", "hardlink"] as const)(
+    "publishes a private foreground PID over an %s leaf",
+    async (leafKind) => {
+      const pidDescriptor = Object.getOwnPropertyDescriptor(process, "pid");
+      expect(pidDescriptor).toBeDefined();
+      Object.defineProperty(process, "pid", { ...pidDescriptor, value: 41_321 });
+      vi.spyOn(process, "on").mockImplementation((() => process) as typeof process.on);
+      const canaryPath = join(foregroundFixtureRoot!, `${leafKind}-canary`);
+      if (leafKind === "stale") {
+        actualFs.writeFileSync(state.runtimePidPath, "stale", { mode: 0o640 });
+      } else if (leafKind === "symlink" || leafKind === "hardlink") {
+        actualFs.writeFileSync(canaryPath, "foreground-canary", { mode: 0o600 });
+        if (leafKind === "symlink") actualFs.symlinkSync(canaryPath, state.runtimePidPath);
+        else actualFs.linkSync(canaryPath, state.runtimePidPath);
+      } else if (leafKind === "dangling-symlink") {
+        actualFs.symlinkSync(canaryPath, state.runtimePidPath);
+      }
+
+      try {
+        expect(await invoke(["daemon", "start", "--foreground"])).toBeUndefined();
+
+        if (leafKind === "symlink" || leafKind === "hardlink") {
+          expect(actualFs.readFileSync(canaryPath, "utf-8")).toBe("foreground-canary");
+        } else if (leafKind === "dangling-symlink") {
+          expect(actualFs.existsSync(canaryPath)).toBe(false);
+        }
+        expect(actualFs.readFileSync(state.runtimePidPath, "utf-8")).toBe("41321");
+        const published = actualFs.lstatSync(state.runtimePidPath);
+        expect(published.isFile()).toBe(true);
+        expect(published.isSymbolicLink()).toBe(false);
+        expect(published.nlink).toBe(1);
+        expect(published.mode & 0o777).toBe(0o600);
+        expect(actualFs.statSync(state.runtimeHome).mode & 0o777).toBe(0o700);
+      } finally {
+        Object.defineProperty(process, "pid", pidDescriptor!);
+      }
+    },
+  );
+
+  it("fails foreground startup when the PID leaf is a directory", async () => {
+    actualFs.mkdirSync(state.runtimePidPath);
+    const on = vi.spyOn(process, "on").mockImplementation((() => process) as typeof process.on);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const error = await invoke(["daemon", "start", "--foreground"]);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(log.mock.calls.flat().join("\n")).not.toContain("lcm daemon started");
+    expect(on).not.toHaveBeenCalled();
+    expect(actualFs.readdirSync(state.runtimeHome).filter(name => (
+      name.startsWith(".daemon.pid.") && name.endsWith(".tmp")
+    ))).toEqual([]);
+  });
+
+  it.each(["temporary write", "rename"] as const)(
+    "propagates a foreground PID %s failure without startup success",
+    async (operation) => {
+      const mockedFs = await import("node:fs");
+      const failure = Object.assign(new Error(`forced PID ${operation} failure`), { code: "EIO" });
+      if (operation === "temporary write") {
+        vi.mocked(mockedFs.writeFileSync).mockImplementationOnce(() => { throw failure; });
+      } else {
+        vi.mocked(mockedFs.renameSync).mockImplementationOnce(() => { throw failure; });
+      }
+      const on = vi.spyOn(process, "on").mockImplementation((() => process) as typeof process.on);
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+      const error = await invoke(["daemon", "start", "--foreground"]);
+
+      expect(error).toBe(failure);
+      expect(log.mock.calls.flat().join("\n")).not.toContain("lcm daemon started");
+      expect(on).not.toHaveBeenCalled();
+      expect(actualFs.existsSync(state.runtimePidPath)).toBe(false);
+      expect(actualFs.readdirSync(state.runtimeHome).filter(name => (
+        name.startsWith(".daemon.pid.") && name.endsWith(".tmp")
+      ))).toEqual([]);
+    },
+  );
 
   it("rejects partial and fabricated internal daemon identities before side effects", async () => {
     const ownerOption = "--internal-lcm-test-daemon-owner";
@@ -2794,6 +2950,7 @@ describe("runCli failure and alternate presentation branches", () => {
       owner: process.env.LCM_DAEMON_OWNER_ID,
     };
     const homeDir = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-owned-home-"));
+    state.privateFsRoots.push(homeDir);
     expect(dirname(homeDir)).toBe(tmpdir());
     const runtimeDir = `${homeDir}/runtime`;
     const entrypoint = `${runtimeDir}/owned-lcm.mjs`;
@@ -3042,7 +3199,7 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(state.ensureDaemon).toHaveBeenCalledTimes(2);
     expect(state.ensureDaemon).toHaveBeenNthCalledWith(2, {
       port: 3737,
-      pidFilePath: "/lcm/daemon.pid",
+      pidFilePath: state.runtimePidPath,
       spawnTimeoutMs: 10000,
       expectedStorageBackend: "sqlite",
       enforceUserManagerParent: true,

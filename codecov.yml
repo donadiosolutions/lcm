@@ -13,6 +13,7 @@ component_management:
         # #1088 keeps unsupported connector-list-format admission CLI-owned.
         # #978 keeps compact replacement runtime-digest admission CLI-owned.
         # #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
+        # #1132 keeps foreground PID publication at the CLI boundary.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
@@ -314,6 +315,7 @@ component_management:
         # optional birth-sample budgeting in lifecycle admission. #1073 keeps
         # bounded legacy PID/token evidence in the same lifecycle owner. Their
         # paired managed lifecycle tests remain this component's coverage boundary.
+        # #1132 keeps unscoped detached PID publication lifecycle-owned.
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"
