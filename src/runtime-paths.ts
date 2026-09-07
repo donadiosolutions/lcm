@@ -305,7 +305,15 @@ function openMigrationEntry(path: string, label: string): MigrationEntry {
       close: () => closeSync(fd),
     };
   } catch (error) {
-    closeSync(fd);
+    try {
+      closeSync(fd);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "migration entry validation and cleanup failed",
+        { cause: error },
+      );
+    }
     throw error;
   }
 }
@@ -460,7 +468,15 @@ function openHomeTopology(homeDir: string): HomeTopology {
     const home = openDirectory(absoluteHome, "home directory");
     return { parent, home };
   } catch (error) {
-    parent.close();
+    try {
+      parent.close();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "home topology authentication and parent cleanup failed",
+        { cause: error },
+      );
+    }
     throw error;
   }
 }

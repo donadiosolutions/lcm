@@ -87,6 +87,14 @@ read preparation retry only the lock-acquisition callback. Output, exit status,
 and export file writes happen once after the callback succeeds. Mutation and
 lifecycle commands keep their existing admission and migration behavior.
 
+If home or legacy-entry authentication fails and closing its already-open
+descriptor also fails, LCM preserves both errors in order: the authentication
+or validation failure remains the primary cause, and the close failure remains
+available as cleanup evidence. An entry absent before it is opened is still
+treated as absent. Correct the primary trust failure before retrying; the
+cleanup evidence may also indicate a filesystem or descriptor problem that
+needs attention.
+
 The first authenticated health probe used to identify a retryable daemon can
 take up to two seconds. After the first qualifying contention, retries share a
 single two-second monotonic elapsed deadline and poll at most every 50

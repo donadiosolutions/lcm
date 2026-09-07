@@ -939,6 +939,172 @@ describe("private filesystem primitives", () => {
     }
   });
 
+  it("preserves typed publication and temporary cleanup failures in order", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    writeFileSync(join(replacement, "metadata.json"), "replacement sentinel", { mode: 0o600 });
+    const target = join(active, "metadata.json");
+    const parent = openPrivateDirectory(active);
+    const renameError = new Error("rename reported failure after commit");
+    const cleanupError = Object.assign(new Error("cleanup parent lookup failed"), { code: "EIO" });
+    const originalLstat = lstatSync;
+    let drifted = false;
+    let driftChecks = 0;
+    let thrown: unknown;
+    try {
+      try {
+        withPatchedFs(
+          "lstatSync",
+          ((path: string, options?: unknown) => {
+            if (path === active && drifted && ++driftChecks > 1) throw cleanupError;
+            return originalLstat(path, options as never);
+          }) as typeof lstatSync,
+          () => atomicWritePrivateFile(target, "payload", {
+            rename: (from, to) => {
+              renameSync(from, to);
+              renameSync(active, displaced);
+              renameSync(replacement, active);
+              drifted = true;
+              throw renameError;
+            },
+          }, parent),
+        );
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(PrivateFilePublicationTopologyError);
+      const publication = thrown as PrivateFilePublicationTopologyError;
+      expect(publication.outcome).toBe("unknown");
+      expect(publication.message).toBe(
+        "private file publication outcome is unknown because rename and retained parent topology checks failed",
+      );
+      expect(publication.cause).toBeInstanceOf(AggregateError);
+      const aggregate = publication.cause as AggregateError & { cause?: unknown };
+      const primary = aggregate.errors[0] as PrivateFilePublicationTopologyError;
+      expect(primary).toBeInstanceOf(PrivateFilePublicationTopologyError);
+      expect(primary).not.toBe(publication);
+      expect(primary.outcome).toBe(publication.outcome);
+      expect(primary.topologyError).toBe(publication.topologyError);
+      expect(primary.message).toBe(publication.message);
+      expect(primary.cause).toBe(renameError);
+      expect(aggregate.message).toBe("private file publication and temporary cleanup failed");
+      expect(aggregate.errors).toEqual([primary, cleanupError]);
+      expect(aggregate.cause).toBe(primary);
+      expect(readFileSync(join(displaced, "metadata.json"), "utf8")).toBe("payload");
+      expect(readFileSync(target, "utf8")).toBe("replacement sentinel");
+      expect(readdirSync(active).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toEqual([]);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("preserves topology and temporary cleanup failures in order", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"55".repeat(12)}.tmp`);
+    const topologyCause = Object.assign(new Error("post-write parent lookup failed"), { code: "EIO" });
+    const cleanupError = Object.assign(new Error("cleanup parent lookup failed"), { code: "EIO" });
+    const originalLstat = lstatSync;
+    let afterClose = false;
+    let parentChecks = 0;
+    let renameCalled = false;
+    let thrown: unknown;
+    writeFileSync(target, "original", { mode: 0o600 });
+    try {
+      try {
+        withPatchedFs(
+          "lstatSync",
+          ((path: string, options?: unknown) => {
+            if (path === root && afterClose) {
+              parentChecks += 1;
+              throw parentChecks === 1 ? topologyCause : cleanupError;
+            }
+            return originalLstat(path, options as never);
+          }) as typeof lstatSync,
+          () => atomicWritePrivateFile(target, "payload", {
+            random: () => Buffer.alloc(12, 0x55),
+            close: ((fd: number) => {
+              closeSync(fd);
+              afterClose = true;
+            }) as typeof closeSync,
+            rename: (() => {
+              renameCalled = true;
+            }) as typeof renameSync,
+          }, parent),
+        );
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(thrown).not.toBeInstanceOf(PrivateFilePublicationTopologyError);
+      const topology = thrown as PrivateDirectoryTopologyError;
+      expect(topology.message).toBe("private directory topology is not trusted");
+      expect(topology.cause).toBeInstanceOf(AggregateError);
+      const aggregate = topology.cause as AggregateError & { cause?: unknown };
+      const primary = aggregate.errors[0] as PrivateDirectoryTopologyError;
+      expect(primary).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(primary.message).toBe(topology.message);
+      expect(primary.cause).toBe(topologyCause);
+      expect(aggregate.message).toBe("private file publication and temporary cleanup failed");
+      expect(aggregate.errors).toEqual([primary, cleanupError]);
+      expect(aggregate.cause).toBe(primary);
+      expect(renameCalled).toBe(false);
+      expect(existsSync(tempPath)).toBe(true);
+      expect(readFileSync(target, "utf8")).toBe("original");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it.each([
+    { label: "an Error", primary: new Error("ordinary rename failure") as unknown },
+    { label: "undefined", primary: undefined as unknown },
+  ])("preserves $label and temporary cleanup failure in a plain aggregate", ({ primary }) => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"66".repeat(12)}.tmp`);
+    const cleanupError = Object.assign(new Error("temporary removal failed"), { code: "EIO" });
+    let removeCalls = 0;
+    let didThrow = false;
+    let thrown: unknown;
+    writeFileSync(target, "original", { mode: 0o600 });
+    try {
+      try {
+        atomicWritePrivateFile(target, "payload", {
+          random: () => Buffer.alloc(12, 0x66),
+          rename: () => { throw primary; },
+          remove: () => {
+            removeCalls += 1;
+            throw cleanupError;
+          },
+        }, parent);
+      } catch (error) {
+        didThrow = true;
+        thrown = error;
+      }
+
+      expect(didThrow).toBe(true);
+      expect(thrown).toBeInstanceOf(AggregateError);
+      const aggregate = thrown as AggregateError & { cause?: unknown };
+      expect(aggregate.message).toBe("private file publication and temporary cleanup failed");
+      expect(aggregate.errors).toEqual([primary, cleanupError]);
+      expect(aggregate.cause).toBe(primary);
+      expect(removeCalls).toBe(1);
+      expect(existsSync(tempPath)).toBe(true);
+      expect(readFileSync(target, "utf8")).toBe("original");
+    } finally {
+      parent.close();
+    }
+  });
+
   it("preserves the exact ordinary rename failure and cleans its owned temp", () => {
     const root = makeRoot();
     const parent = openPrivateDirectory(root);
