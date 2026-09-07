@@ -95,6 +95,13 @@ succeeds or no output when lcm defers to Claude Code.
 
 Invoked at the start of a Claude Code session. lcm restores recent summaries and promoted memory, injects them as a user message prefix, and prints a `<context>` block on stdout.
 
+SessionStart serializes its local sidecar maintenance with backend publication:
+it holds the publication consumer lock while it opens, prunes, inspects, and
+closes the local outbox. If another publication already holds that lock, the
+best-effort maintenance and promotion trigger are skipped. Daemon startup and
+the restore request run outside this retained lock and still perform their own
+admission checks. Authenticated publication-journal errors fail closed.
+
 **Stdin fields:**
 
 | Field | Type | Description |
