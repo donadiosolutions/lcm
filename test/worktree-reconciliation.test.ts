@@ -9047,6 +9047,72 @@ describe("worktree reconciliation", () => {
     evidence.close();
   }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
 
+  it("refuses unsupported source content if its completed marker disappears", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "marker-race-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "marker-race-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec(`
+      UPDATE promoted
+      SET content = CAST(X'6D656D6F727900736F75726365' AS TEXT)
+    `);
+    source.close();
+    const target = new DatabaseSync(fixture.targetPath);
+    target.exec(`
+      CREATE TABLE worktree_reconciliation_sources (
+        source_hash TEXT PRIMARY KEY,
+        merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    target.prepare(
+      "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
+    ).run(fixture.sourceHash);
+    target.exec(`
+      UPDATE promoted
+      SET id = 'memory-marker-race-source',
+          content = 'memory',
+          source_summary_id = 'summary-marker-race-source',
+          project_id = '${fixture.targetHash}',
+          session_id = 'marker-race-source'
+    `);
+    target.close();
+
+    const instrumentation = instrumentTargetReconciliationCommit(
+      () => undefined,
+      {
+        onBegin: (openedTarget) => {
+          openedTarget.prepare(
+            "DELETE FROM worktree_reconciliation_sources WHERE source_hash = ?",
+          ).run(fixture.sourceHash);
+        },
+      },
+    );
+    try {
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "stored promoted content is unsupported",
+      );
+    } finally {
+      instrumentation.restore();
+    }
+
+    const preservedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(preservedTarget.prepare("SELECT hex(content) AS content FROM promoted").get())
+      .toEqual({ content: "6D656D6F7279" });
+    expect(preservedTarget.prepare(
+      "SELECT COUNT(*) AS count FROM worktree_reconciliation_sources WHERE source_hash = ?",
+    ).get(fixture.sourceHash)).toEqual({ count: 1 });
+    preservedTarget.close();
+    const preservedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(preservedSource.prepare("SELECT hex(content) AS content FROM promoted").get())
+      .toEqual({ content: "6D656D6F727900736F75726365" });
+    expect(preservedSource.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toMatchObject({ name: "worktree_reconciliation_fence" });
+    preservedSource.close();
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+  }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
+
   it("fails closed when a planned source disappears or its binding changes", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;

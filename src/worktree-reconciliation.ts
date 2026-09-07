@@ -1469,6 +1469,7 @@ function mergeMainDatabase(
               assertTarget();
               return;
             }
+            if (sourceWasMerged) assertSupportedPromotedContent(normalizedSource);
             assertSupportedPromotedContent(target);
             for (const conversation of rows(
               normalizedSource,

@@ -216,8 +216,10 @@ and rerun reconciliation. A source whose canonical completion marker already
 exists is re-fenced and archived without a source-content repair request. Its
 original bytes remain in the private backup, while the completion marker stays
 an idempotent boundary rather than a retrospective audit of canonical content.
-The fixed error is `stored promoted content is unsupported` and does not include
-memory content, IDs, paths, or tags. See the
+If that marker disappears before the target transaction checks it, LCM
+revalidates the normalized source before copying. The fixed error is `stored
+promoted content is unsupported` and does not include memory content, IDs,
+paths, or tags. See the
 [offline promoted-memory repair procedure](privacy.md#embedded-nul-in-promoted-memory).
 
 The canonical target's `meta.json` is a separate leaf-file trust boundary. LCM

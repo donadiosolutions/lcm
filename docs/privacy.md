@@ -214,9 +214,12 @@ rows before retrying.
 A canonical per-source completion marker remains an idempotent recovery
 boundary. LCM does not ask for a source repair that the completed merge would
 skip; it re-fences and archives that source, preserving its original bytes in
-the private backup. This does not audit or repair canonical content written by
-an older LCM version. If that target contains a known truncated legacy value,
-repair the canonical target with the offline procedure above. This refusal
+the private backup. If the completion marker is missing when the target
+transaction checks it, LCM rechecks the normalized source and fails closed
+instead of relying on the earlier marker observation. This does not audit or
+repair canonical content written by an older LCM version. If that target
+contains a known truncated legacy value, repair the canonical target with the
+offline procedure above. This refusal
 behavior is implemented by [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
 
 No data is sent to any Long Context Manager (LCM) server. There is no telemetry.
