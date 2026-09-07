@@ -141,7 +141,7 @@ jobs:
         run: printf 'path=%s\n' "$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
 
       - name: Cache pnpm store
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('pnpm-lock.yaml', 'package.json', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}
@@ -255,7 +255,7 @@ jobs:
 
       - name: Generate Highlights with Codex
         id: highlights
-        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.10
+        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1.10
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt-file: release-highlights-prompt.md
@@ -523,7 +523,7 @@ jobs:
         run: printf 'path=%s\n' "$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
 
       - name: Cache pnpm store
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('release/pnpm-lock.yaml', 'release/package.json', 'release/.npmrc', 'release/pnpm-workspace.yaml', 'release/scripts/bootstrap-pnpm.mjs') }}
@@ -872,7 +872,7 @@ jobs:
 
       - name: Cache pnpm store
         if: ${{ steps.npm.outputs.already_published != 'true' }}
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('release/pnpm-lock.yaml', 'release/package.json', 'release/.npmrc', 'release/pnpm-workspace.yaml', 'release/scripts/bootstrap-pnpm.mjs') }}
