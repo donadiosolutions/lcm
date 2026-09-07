@@ -95,6 +95,14 @@ treated as absent. Correct the primary trust failure before retrying; the
 cleanup evidence may also indicate a filesystem or descriptor problem that
 needs attention.
 
+Private-file writes apply the same diagnostic rule across descriptor close,
+temporary-file removal, and retained-parent close failures. The original
+write or publication failure remains the primary cause, while each cleanup
+failure remains available in cleanup order. A completed exclusive publication
+still reports success if only removal of its extra temporary hard link fails;
+the published private file remains usable, and later maintenance can remove
+the retained temporary link.
+
 The first authenticated health probe used to identify a retryable daemon can
 take up to two seconds. After the first qualifying contention, retries share a
 single two-second monotonic elapsed deadline and poll at most every 50
