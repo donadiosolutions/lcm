@@ -926,6 +926,50 @@ describe("sanitizeError", () => {
 
   it.each([
     [
+      "file://host.invalid?x=[a/\\C:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[-/\\C:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[-<path>]",
+    ],
+    [
+      "file://host.invalid?x=[/\\C:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a/\\c:/Users/canary/private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a//C:/Users/canary/private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a//\\server\\share\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/\\/server\\share\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/\\C:\\Users\\canary\\private.db",
+      "file://host.invalid?x=[a<path>",
+    ],
+    [
+      "file://host.invalid#x=[a/\\C:\\Users\\canary\\private.db]tail",
+      "file://host.invalid#x=[a<path>]tail",
+    ],
+  ] as const)("redacts forced mixed-separator paths in one stable pass: %#", (input, expected) => {
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  it.each([
+    [
       "'file://host.invalid?x=/Users/canary/My Files/x'",
       "'file://host.invalid?x=<path>'",
     ],

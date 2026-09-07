@@ -307,6 +307,16 @@ function fileUrlDriveColonIndex(chars: readonly string[], start: number): number
   return -1;
 }
 
+function forcedSeparatorRunHasBackslash(chars: readonly string[], start: number): boolean {
+  let index = start;
+  let hasBackslash = false;
+  while (chars[index] === "/" || chars[index] === "\\") {
+    if (chars[index] === "\\") hasBackslash = true;
+    index += 1;
+  }
+  return hasBackslash;
+}
+
 function scanAbsolutePath(
   chars: readonly string[],
   start: number,
@@ -386,20 +396,13 @@ function sanitizeAbsolutePaths(message: string): string {
     const openingQuote = chars[index] === "'" || chars[index] === '"' ? chars[index] : undefined;
     const start = fileUrl || openingQuote === undefined ? index : index + 1;
     const windowsDrive = isWindowsDrivePathStart(chars, start);
-    const forcedDriveColonIndex =
-      forcedPath &&
-      chars[start] === "/" &&
-      chars[start + 1]?.match(/^[A-Za-z]$/u) &&
-      chars[start + 2] === ":" &&
-      (chars[start + 3] === "/" || chars[start + 3] === "\\")
-        ? start + 2
-        : -1;
-    const forcedUnc = forcedPath && isUncPathStart(chars, start + 1);
+    const forcedDriveColonIndex = forcedPath ? fileUrlDriveColonIndex(chars, start) : -1;
+    const forcedWindowsSeparators = forcedPath && forcedSeparatorRunHasBackslash(chars, start);
     const windows =
       fileUrl ||
       windowsDrive ||
       forcedDriveColonIndex >= 0 ||
-      forcedUnc ||
+      forcedWindowsSeparators ||
       isUncPathStart(chars, start);
     const posix = forcedPath || (!fileUrl && isPosixPathStart(chars, start, urlPathStarts.authority));
     if (!fileUrl && !windows && !posix) {
