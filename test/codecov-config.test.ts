@@ -70,6 +70,8 @@ const expectedComponents = [
       "^src/secret-key\\.ts$",
       // #1032 keeps retained-parent atomic-write outcome hardening in this owner.
       "^src/security-files\\.ts$",
+      // #1133 keeps project-pattern owner/single-link admission and authenticated
+      // single-snapshot scrubbing in this existing configuration-security owner.
       "^src/sensitive\\.ts$",
       "^src/shell-quote\\.ts$",
       "^src/terminal-sanitize\\.ts$",
