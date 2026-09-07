@@ -58,6 +58,14 @@ commit-before-`processed_at` crash boundary, so this refusal can be permanent.
 LCM preserves the source and private evidence rather than guessing whether to
 replay or suppress such an effect.
 
+An established receipt epoch also proves that preparation created the
+project's canonical local outbox. Capture therefore refuses an enrolled source
+when that outbox is absent, even if the sequence cutoff is null or the outbox
+was empty before it disappeared. Absence cannot prove an empty queue. A present
+empty outbox remains valid, and older sources without enrollment can still be
+inspected for the normal legacy refusal path. Capture never recreates a missing
+outbox.
+
 `captureAuthenticatedSqliteMigrationSource` returns an outer-ready snapshot with
 its physical artifact, exact receipt reference, bounded queue page references,
 and a checksum. It reauthenticates machine identity, project metadata, aliases,
@@ -98,6 +106,7 @@ recovery from a crash before the outbox processing mark.
 | Event appended after the sealed cutoff | Retained in the local outbox |
 | Legacy processed or unprocessed event | Refused as effect-ambiguous |
 | Receipt-era processed event without receipt | Refused as integrity failure |
+| Enrolled source with missing canonical outbox | Refused as integrity failure |
 | Missing, pending, nonlocal, duplicate, or drifting machine authority | Refused |
 | Disconnected participant without durable acknowledged fencing | Refused |
 | Partial, replaced, or tampered generation | Refused; evidence preserved |

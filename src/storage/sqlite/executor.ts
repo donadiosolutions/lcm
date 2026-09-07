@@ -4,12 +4,15 @@ import type { StorageDomain } from "../contracts.js";
 import { normalizeStorageError, StorageOperationError } from "../errors.js";
 import {
   withBackendPublicationConsumerLockAsync,
+  type BackendPublicationAppendBarrierOptions,
   type BackendPublicationLockToken,
 } from "../backend-publication.js";
 
 export type SqliteOperationAdmission = Readonly<{
   homeDir?: string;
   lockToken?: BackendPublicationLockToken;
+  /** @internal Deterministic physical-close admission seams. */
+  _appendBarrierOptions?: BackendPublicationAppendBarrierOptions;
 }>;
 
 type TransactionContext = {

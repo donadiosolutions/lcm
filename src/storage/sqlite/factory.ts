@@ -1,6 +1,5 @@
 import type { ProjectIdentity } from "../../project-map.js";
-import { basename, dirname, resolve } from "node:path";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { projectPaths, ensureProjectDir } from "../../daemon/project.js";
 import {
@@ -29,20 +28,36 @@ import { readMachineIdentity } from "../../machine-identity.js";
 import { LocalHookEventSequenceAllocator } from "../local-hook-event-sequence.js";
 import { adoptMigrationReceiptEpoch } from "../../migration/receipts.js";
 import { SQLiteLocalHookOutboxFactory } from "../local-hook-outbox.js";
-import { withBackendPublicationAppendBarrierAsync, withBackendPublicationConsumerLock, assertBackendPublicationConsumerAccess } from "../backend-publication.js";
+import {
+  assertBackendPublicationConsumerAccess,
+  withBackendPublicationAppendBarrierAsync,
+  withBackendPublicationConsumerLock,
+  type BackendPublicationAppendBarrierOptions,
+} from "../backend-publication.js";
+
+type OwnedProjectConnection = {
+  dbPath: string;
+  db: ReturnType<typeof getLcmConnection>;
+  closePromise?: Promise<void>;
+  releaseCommitted: boolean;
+};
 
 export class SqliteStorageBackendFactory implements StorageBackendFactory {
   readonly backend = "sqlite" as const;
   readonly capabilities: StorageCapabilities = sqliteStorageCapabilities("unknown");
   private readonly projects = new Set<SqliteProjectStorage>();
   private readonly knownProjects = new Map<string, { id: string; dbPath: string }>();
+  private readonly ownedConnections = new Set<OwnedProjectConnection>();
   private readonly pendingOpens = new Set<Promise<void>>();
+  private readonly pendingHealth = new Set<Promise<void>>();
   private closed = false;
   private closePromise: Promise<void> | undefined;
 
   constructor(private readonly options: {
     resolveProject?: (identity: ProjectIdentity) => { id: string; dbPath: string };
     detectFeatures?: (db: ReturnType<typeof getLcmConnection>) => LcmDbFeatures;
+    /** @internal Deterministic physical-close admission seams. */
+    _appendBarrierOptions?: BackendPublicationAppendBarrierOptions;
   } = {}) {}
 
   async projectExists(
@@ -93,6 +108,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
     this.pendingOpens.add(pendingOpen);
     let dbPath: string | undefined;
     let db: ReturnType<typeof getLcmConnection> | undefined;
+    let ownedConnection: OwnedProjectConnection | undefined;
     let storage: SqliteProjectStorage | undefined;
     try {
       throwIfAborted(signal);
@@ -103,6 +119,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
         ensureProjectDir(identity.canonical, publicationLockToken);
       }
       dbPath = paths.dbPath;
+      await this.releaseOwnedConnectionsForPath(dbPath, publicationLockToken);
       throwIfAborted(signal);
       const sourceHome = sqliteProjectHomeDir(paths.dbPath);
       db = sourceHome === undefined
@@ -112,6 +129,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
           return createIfMissing ? getLcmConnection(paths.dbPath) : getExistingLcmConnection(paths.dbPath) ?? undefined;
         }, { lockToken: publicationLockToken });
       if (!db) return null;
+      ownedConnection = { dbPath: paths.dbPath, db, releaseCommitted: false };
       throwIfAborted(signal);
       const executor = sqliteExecutorFor(
         db,
@@ -120,6 +138,9 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       );
       const admission = {
         homeDir: sqliteProjectHomeDir(paths.dbPath),
+        ...(this.options._appendBarrierOptions === undefined
+          ? {}
+          : { _appendBarrierOptions: this.options._appendBarrierOptions }),
         ...(publicationLockToken === undefined ? {} : { lockToken: publicationLockToken }),
       };
       let features: LcmDbFeatures;
@@ -186,20 +207,25 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
         (closed): void => { this.projects.delete(closed); },
         admission,
       );
+      ownedConnection = undefined;
+      this.projects.add(storage);
       throwIfAborted(signal);
       this.assertOpen(identity, operation);
-      this.projects.add(storage);
       this.knownProjects.set(`${paths.id}\0${paths.dbPath}`, { id: paths.id, dbPath: paths.dbPath });
       return storage;
     } catch (error) {
       if (storage) {
         try {
-          await storage.close();
+          await storage.close(publicationLockToken);
         } catch {
           // Preserve the primary open failure.
         }
-      } else if (db && dbPath) {
-        closeLcmConnection(dbPath, db);
+      } else if (ownedConnection) {
+        try {
+          await this.releaseOwnedConnection(ownedConnection, publicationLockToken);
+        } catch {
+          // Preserve the primary open failure; factory close owns the retry.
+        }
       }
       throw normalizeStorageError(
         error,
@@ -213,6 +239,18 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
   }
 
   async health(): Promise<StorageHealth> {
+    let finishHealth!: () => void;
+    const pendingHealth = new Promise<void>(resolve => { finishHealth = resolve; });
+    this.pendingHealth.add(pendingHealth);
+    try {
+      return await this.healthOnce();
+    } finally {
+      this.pendingHealth.delete(pendingHealth);
+      finishHealth();
+    }
+  }
+
+  private async healthOnce(): Promise<StorageHealth> {
     if (this.closed) return { status: "closed", backend: "sqlite" };
     await Promise.all([...this.pendingOpens]);
     if (this.closed) return { status: "closed", backend: "sqlite" };
@@ -236,7 +274,10 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
 
   private async probeKnownProject(project: { id: string; dbPath: string }): Promise<StorageHealth> {
     let db: ReturnType<typeof getLcmConnection> | undefined;
+    let ownedConnection: OwnedProjectConnection | undefined;
+    let candidate: StorageHealth;
     try {
+      await this.releaseOwnedConnectionsForPath(project.dbPath);
       const homeDir = sqliteProjectHomeDir(project.dbPath);
       db = homeDir === undefined
         ? getExistingLcmConnection(project.dbPath) ?? undefined
@@ -253,6 +294,8 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
           "health",
         );
       }
+      ownedConnection = { dbPath: project.dbPath, db, releaseCommitted: false };
+      this.ownedConnections.add(ownedConnection);
       const executor = sqliteExecutorFor(
         db,
         project.id,
@@ -268,9 +311,9 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
           throw error;
         }
       }, { homeDir });
-      return { status: "healthy", backend: "sqlite", projectId: project.id };
+      candidate = { status: "healthy", backend: "sqlite", projectId: project.id };
     } catch (error) {
-      return {
+      candidate = {
         status: "unavailable",
         backend: "sqlite",
         projectId: project.id,
@@ -281,19 +324,54 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
           operation: "health",
         }),
       };
-    } finally {
-      if (db) closeLcmConnection(project.dbPath, db);
     }
+    if (ownedConnection) {
+      try {
+        await this.releaseOwnedConnection(ownedConnection);
+      } catch (error) {
+        if (candidate.status !== "unavailable") {
+          candidate = {
+            status: "unavailable",
+            backend: "sqlite",
+            projectId: project.id,
+            error: normalizeStorageError(error, {
+              backend: "sqlite",
+              projectId: project.id,
+              domain: "factory",
+              operation: "health",
+            }),
+          };
+        }
+      }
+    }
+    return candidate;
   }
 
-  close(): Promise<void> {
+  close(publicationLockToken?: BackendPublicationLockToken): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
-    this.closePromise = Promise.allSettled([...this.pendingOpens])
-      .then(() => Promise.allSettled(
-        [...this.projects].map(async (project) => project.close()),
-      ))
-      .then(() => undefined);
+    const attempt = Promise.allSettled([
+      ...this.pendingOpens,
+      ...this.pendingHealth,
+    ]).then(async () => {
+      const outcomes = await Promise.allSettled([
+        ...[...this.projects].map((project) => project.close(publicationLockToken)),
+        ...[...this.ownedConnections].map((connection) => (
+          this.releaseOwnedConnection(connection, publicationLockToken)
+        )),
+      ]);
+      const failures = outcomes
+        .filter((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected")
+        .map(outcome => outcome.reason as unknown);
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw new AggregateError(failures, "SQLite project factory close failed");
+      }
+    });
+    this.closePromise = attempt.catch((error: unknown): never => {
+      this.closePromise = undefined;
+      throw error;
+    });
     return this.closePromise;
   }
 
@@ -320,6 +398,49 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       operation,
     );
   }
+
+  private async releaseOwnedConnectionsForPath(
+    dbPath: string,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<void> {
+    const retained = [...this.ownedConnections].filter(connection => connection.dbPath === dbPath);
+    const outcomes = await Promise.allSettled(
+      retained.map(connection => this.releaseOwnedConnection(connection, publicationLockToken)),
+    );
+    const failures = outcomes
+      .filter((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected")
+      .map(outcome => outcome.reason as unknown);
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(failures, "SQLite retained connection cleanup failed");
+    }
+  }
+
+  private async releaseOwnedConnection(
+    connection: OwnedProjectConnection,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<void> {
+    if (connection.closePromise) return connection.closePromise;
+    const attempt = closeProjectConnection(
+        connection.dbPath,
+        connection.db,
+        publicationLockToken,
+        this.options._appendBarrierOptions,
+        () => {
+          connection.releaseCommitted = true;
+          this.ownedConnections.delete(connection);
+        },
+      );
+    connection.closePromise = attempt.catch((error: unknown): never => {
+      if (!connection.releaseCommitted) {
+        connection.closePromise = undefined;
+        this.ownedConnections.add(connection);
+        if (this.closed) this.closePromise = undefined;
+      }
+      throw error;
+    });
+    return connection.closePromise;
+  }
 }
 
 function sqliteProjectHomeDir(dbPath: string): string | undefined {
@@ -329,4 +450,28 @@ function sqliteProjectHomeDir(dbPath: string): string | undefined {
   return basename(projectsDirectory) === "projects" && basename(lcmDirectory) === ".lcm"
     ? dirname(lcmDirectory)
     : undefined;
+}
+
+async function closeProjectConnection(
+  dbPath: string,
+  db: ReturnType<typeof getLcmConnection>,
+  publicationLockToken?: BackendPublicationLockToken,
+  appendBarrierOptions?: BackendPublicationAppendBarrierOptions,
+  onCommit?: () => void,
+): Promise<void> {
+  const release = (): void => {
+    closeLcmConnection(dbPath, db);
+    onCommit?.();
+  };
+  const homeDir = sqliteProjectHomeDir(dbPath);
+  if (homeDir === undefined) {
+    release();
+    return;
+  }
+  await withBackendPublicationAppendBarrierAsync(
+    homeDir,
+    release,
+    publicationLockToken,
+    { contentionWaitMs: 5_000, ...appendBarrierOptions },
+  );
 }

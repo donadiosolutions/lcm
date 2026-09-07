@@ -9,6 +9,7 @@ import { eventsDbPath } from "../../src/db/events-path.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
 import * as eventScrubbing from "../../src/hooks/event-scrubbing.js";
 import * as localEnqueue from "../../src/hooks/local-enqueue.js";
+import { LocalHookDurabilityTimeoutError } from "../../src/hooks/local-enqueue.js";
 import * as projectModule from "../../src/daemon/project.js";
 import * as hookErrors from "../../src/hooks/hook-errors.js";
 import * as hookConfig from "../../src/hooks/config.js";
@@ -245,6 +246,33 @@ describe("handlePostToolUse", () => {
       scrub.mockRestore();
       append.mockRestore();
       log.mockRestore();
+    }
+  });
+
+  it("surfaces a retry-required durability timeout before enqueue", async () => {
+    const inputCwd = mkdtempSync(join(tmpdir(), "post-tool-enqueue-timeout-cwd-"));
+    extraDirs.push(inputCwd);
+    const timeout = new LocalHookDurabilityTimeoutError(
+      Object.assign(new PrivateMutationLockContentionError("append busy"), {
+        retryRequired: true,
+      }) as never,
+    );
+    const scrub = vi.spyOn(eventScrubbing, "scrubExtractedEvents").mockResolvedValue([{
+      type: "decision", category: "decision", data: "durable", priority: 1,
+    }]);
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockRejectedValue(timeout);
+    try {
+      await expect(handlePostToolUse(JSON.stringify({
+        session_id: "test-session",
+        tool_name: "AskUserQuestion",
+        cwd: inputCwd,
+        tool_input: { question: "Persist?" },
+        tool_response: "yes",
+      }))).rejects.toBe(timeout);
+      expect(append).toHaveBeenCalledOnce();
+    } finally {
+      scrub.mockRestore();
+      append.mockRestore();
     }
   });
 

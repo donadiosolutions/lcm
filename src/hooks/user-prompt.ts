@@ -19,7 +19,7 @@ import {
 } from "./daemon-notice.js";
 import { isDaemonRefusalReason, type DaemonRefusalReason } from "../daemon/remediation.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
-import { appendLocalHookEvents } from "./local-enqueue.js";
+import { appendLocalHookEvents, LocalHookDurabilityTimeoutError } from "./local-enqueue.js";
 import {
   assertHookPublicationFence,
   assertHookRootEstablished,
@@ -283,6 +283,7 @@ export async function handleUserPromptSubmit(
     const context = buildMemoryContextWithFeedback(hints, ids, selectedTransport);
     return context ? { exitCode: 0, stdout: context } : emptyHookResponse();
   } catch (error) {
+    if (error instanceof LocalHookDurabilityTimeoutError) throw error;
     if (isBackendPublicationJournalError(error)) {
       if (isBackendPublicationEvidenceMissing(error)) return emptyHookResponse();
       throw error;

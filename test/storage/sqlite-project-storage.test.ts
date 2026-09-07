@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   closeLcmConnection,
   getLcmConnection,
+  getPoolStats,
   invalidateLcmConnection,
   isLcmConnectionOpen,
 } from "../../src/db/connection.js";
@@ -13,10 +14,11 @@ import { getLcmDbFeatures } from "../../src/db/features.js";
 import { runLcmMigrations } from "../../src/db/migration.js";
 import { sqliteStorageCapabilities } from "../../src/storage/capabilities.js";
 import { SqliteProjectStorage } from "../../src/storage/sqlite/project-storage.js";
-import { sqliteExecutorFor } from "../../src/storage/sqlite/executor.js";
+import { sqliteExecutorFor, type SqliteOperationAdmission } from "../../src/storage/sqlite/executor.js";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import * as publication from "../../src/storage/backend-publication.js";
 import { recoverMachineIdentity } from "../../src/machine-identity.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 type Deferred<T = void> = {
   promise: Promise<T>;
@@ -139,6 +141,138 @@ describe("SQLite factory maintenance admission", () => {
       expect(readFileSync(context.dbPath)).toEqual(bytes);
       await project.close();
     } finally { await context.factory.close(); rmSync(context.homeDir, { recursive: true, force: true }); }
+  });
+
+  it("uses current operation admission for project close", async () => {
+    const context = fixture();
+    let closePromise: Promise<void> | undefined;
+    try {
+      const project = await context.factory.openProject(context.identity) as SqliteProjectStorage;
+      const outcome = await publication.withBackendPublicationConsumerLockAsync(
+        context.homeDir,
+        token => project.withPublicationAdmission(token, async () => {
+          closePromise = project.close();
+          return Promise.race([
+            closePromise.then(() => "closed" as const, () => "rejected" as const),
+            new Promise<"timed-out">(resolve => setTimeout(() => resolve("timed-out"), 5)),
+          ]);
+        }),
+      );
+      await closePromise;
+      expect(outcome).toBe("closed");
+      expect(isLcmConnectionOpen(context.dbPath)).toBe(false);
+      expect(await project.health()).toMatchObject({ status: "closed" });
+    } finally {
+      await closePromise?.catch(() => undefined);
+      await context.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves an open failure while retaining raw cleanup for factory retry", async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), "lcm-raw-open-cleanup-"));
+    const projectId = "e".repeat(64);
+    const projectDirectory = join(homeDir, ".lcm", "projects", projectId);
+    mkdirSync(projectDirectory, { recursive: true, mode: 0o700 });
+    const dbPath = join(projectDirectory, "db.sqlite");
+    let now = 0;
+    let refuseCleanup = true;
+    const FactoryWithCleanupSeam = SqliteStorageBackendFactory as unknown as new (
+      options: Readonly<{
+        resolveProject: () => { id: string; dbPath: string };
+        detectFeatures: () => never;
+        _appendBarrierOptions: Readonly<{
+          contentionWaitMs: number;
+          retryDelayMs: number;
+          _now: () => number;
+          _wait: (milliseconds: number) => Promise<void>;
+          _appendLockObserver: (event: string) => void;
+        }>;
+      }>,
+    ) => SqliteStorageBackendFactory;
+    const factory = new FactoryWithCleanupSeam({
+      resolveProject: () => ({ id: projectId, dbPath }),
+      detectFeatures: () => { throw new Error("primary feature detection failed"); },
+      _appendBarrierOptions: {
+        contentionWaitMs: 1,
+        retryDelayMs: 1,
+        _now: () => now,
+        _wait: async milliseconds => { now += milliseconds; },
+        _appendLockObserver: (event) => {
+          if (refuseCleanup && event === "before-main-lock-publish") {
+            refuseCleanup = false;
+            throw new PrivateMutationLockContentionError("raw cleanup busy");
+          }
+        },
+      },
+    });
+    try {
+      const error = await factory.openProject({ id: projectId, canonical: homeDir })
+        .catch((caught: unknown) => caught);
+      expect(error).toMatchObject({
+        code: "STORAGE_INITIALIZATION_FAILED",
+        operation: "openProject",
+      });
+      expect(JSON.stringify(error)).not.toContain("raw cleanup busy");
+      expect(getPoolStats().connections.find(connection => connection.path === dbPath)?.refs)
+        .toBe(1);
+
+      await expect(factory.close()).resolves.toBeUndefined();
+      expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    } finally {
+      await factory.close().catch(() => undefined);
+      closeLcmConnection(dbPath);
+      rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports idle health cleanup failure and retries its retained raw release", async () => {
+    const context = fixture();
+    let now = 0;
+    let refuseCleanup = false;
+    const FactoryWithCleanupSeam = SqliteStorageBackendFactory as unknown as new (
+      options: Readonly<{
+        resolveProject: () => { id: string; dbPath: string };
+        _appendBarrierOptions: Readonly<{
+          contentionWaitMs: number;
+          retryDelayMs: number;
+          _now: () => number;
+          _wait: (milliseconds: number) => Promise<void>;
+          _appendLockObserver: (event: string) => void;
+        }>;
+      }>,
+    ) => SqliteStorageBackendFactory;
+    const factory = new FactoryWithCleanupSeam({
+      resolveProject: () => ({ id: context.identity.id, dbPath: context.dbPath }),
+      _appendBarrierOptions: {
+        contentionWaitMs: 1,
+        retryDelayMs: 1,
+        _now: () => now,
+        _wait: async milliseconds => { now += milliseconds; },
+        _appendLockObserver: (event) => {
+          if (refuseCleanup && event === "before-main-lock-publish") {
+            refuseCleanup = false;
+            throw new PrivateMutationLockContentionError("idle cleanup busy");
+          }
+        },
+      },
+    });
+    try {
+      const project = await factory.openProject(context.identity);
+      await project.close();
+      refuseCleanup = true;
+
+      await expect(factory.health()).resolves.toMatchObject({ status: "unavailable" });
+      expect(getPoolStats().connections.find(connection => connection.path === context.dbPath)?.refs)
+        .toBe(1);
+
+      await expect(factory.close()).resolves.toBeUndefined();
+      expect(isLcmConnectionOpen(context.dbPath)).toBe(false);
+    } finally {
+      await factory.close().catch(() => undefined);
+      closeLcmConnection(context.dbPath);
+      rmSync(context.homeDir, { recursive: true, force: true });
+    }
   });
 
   it("keeps current admission local to one handle and rejects detached work after release", async () => {
@@ -438,7 +572,7 @@ describe("SqliteProjectStorage project health lifecycle", () => {
     }
   });
 
-  it("recovers after a failed close and permits a successful retry", async () => {
+  it("does not repeat a committed pool release when close notification fails", async () => {
     const privateSentinel = "sqlite-private-close-sentinel";
     let closeCalls = 0;
     const fixture = createFixture(() => {
@@ -455,21 +589,137 @@ describe("SqliteProjectStorage project health lifecycle", () => {
       );
       expect(firstError).toBeInstanceOf(Error);
       expect((firstError as Error).message).toBe(privateSentinel);
-      const unavailable = await fixture.storage.health();
-      expect(unavailable.status).toBe("unavailable");
-      expect(unavailable.status).not.toBe("closed");
-      expect(JSON.stringify(unavailable)).not.toContain(privateSentinel);
+      expect(await fixture.storage.health()).toEqual({
+        status: "closed",
+        backend: "sqlite",
+        projectId: "sqlite-health-project",
+      });
       expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
 
       const retryClose = fixture.storage.close();
       const duplicateRetry = fixture.storage.close();
-      expect(retryClose).not.toBe(firstClose);
-      expect(duplicateRetry).toBe(retryClose);
-      await expect(retryClose).resolves.toBeUndefined();
-      expect(closeCalls).toBe(2);
+      expect(retryClose).toBe(firstClose);
+      expect(duplicateRetry).toBe(firstClose);
+      await expect(retryClose).rejects.toThrow(privateSentinel);
+      expect(closeCalls).toBe(1);
       expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
     } finally {
       cleanupFixture(fixture);
+    }
+  });
+
+  it("preserves an undefined close notification rejection after commit", async () => {
+    let calls = 0;
+    const fixture = createFixture(() => {
+      calls += 1;
+      throw undefined;
+    });
+    try {
+      const first = fixture.storage.close();
+      let rejected = false;
+      await first.then(
+        () => undefined,
+        (error: unknown) => {
+          rejected = true;
+          expect(error).toBeUndefined();
+        },
+      );
+      expect(rejected).toBe(true);
+      expect(calls).toBe(1);
+      expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
+      expect(fixture.storage.close()).toBe(first);
+    } finally {
+      cleanupFixture(fixture);
+    }
+  });
+
+  it("notifies close once after a committed append-lock cleanup failure", async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), "lcm-project-post-commit-"));
+    const projectId = "f".repeat(64);
+    const projectDirectory = join(homeDir, ".lcm", "projects", projectId);
+    mkdirSync(projectDirectory, { recursive: true, mode: 0o700 });
+    const dbPath = join(projectDirectory, "db.sqlite");
+    const db = getLcmConnection(dbPath);
+    const features = getLcmDbFeatures(db);
+    runLcmMigrations(db, features);
+    const executor = sqliteExecutorFor(db, projectId, () => undefined);
+    const cleanupFailure = new Error("project append cleanup failed");
+    let onCloseCalls = 0;
+    const admission = {
+      homeDir,
+      _appendBarrierOptions: {
+        _appendLockObserver: (event: string) => {
+          if (event === "before-main-lock-release-read") throw cleanupFailure;
+        },
+      },
+    } as unknown as SqliteOperationAdmission;
+    const storage = new SqliteProjectStorage(
+      projectId,
+      dbPath,
+      db,
+      executor,
+      sqliteStorageCapabilities(features.fts5Available),
+      () => { onCloseCalls += 1; },
+      admission,
+    );
+    try {
+      const first = storage.close();
+      await expect(first).rejects.toMatchObject({
+        code: "STORAGE_OPERATION_FAILED",
+        retryable: false,
+      });
+      expect(onCloseCalls).toBe(1);
+      expect(isLcmConnectionOpen(dbPath)).toBe(false);
+      await expect(storage.health()).resolves.toMatchObject({ status: "closed" });
+
+      const repeated = storage.close();
+      expect(repeated).toBe(first);
+      await expect(repeated).rejects.toMatchObject({
+        code: "STORAGE_OPERATION_FAILED",
+        retryable: false,
+      });
+      expect(onCloseCalls).toBe(1);
+    } finally {
+      closeLcmConnection(dbPath, db);
+      rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("retries project close after pre-release admission fails", async () => {
+    const makeCanonical = () => {
+      const homeDir = mkdtempSync(join(tmpdir(), "lcm-project-close-retry-"));
+      const projectId = "d".repeat(64);
+      const projectDirectory = join(homeDir, ".lcm", "projects", projectId);
+      mkdirSync(projectDirectory, { recursive: true, mode: 0o700 });
+      const dbPath = join(projectDirectory, "db.sqlite");
+      const db = new DatabaseSync(dbPath);
+      runLcmMigrations(db);
+      db.close();
+      chmodSync(dbPath, 0o644);
+      const factory = new SqliteStorageBackendFactory({
+        resolveProject: () => ({ id: projectId, dbPath }),
+      });
+      return { homeDir, dbPath, factory, identity: { id: projectId, canonical: homeDir } };
+    };
+    const context = makeCanonical();
+    const other = makeCanonical();
+    try {
+      const project = await context.factory.openProject(context.identity);
+      await expect(publication.withBackendPublicationAppendBarrierAsync(other.homeDir, token =>
+        project.close(token))).rejects.toMatchObject({
+        code: "STORAGE_OPERATION_FAILED",
+        retryable: true,
+      });
+      expect(await project.health()).toMatchObject({ status: "healthy" });
+      expect(isLcmConnectionOpen(context.dbPath)).toBe(true);
+
+      await expect(project.close()).resolves.toBeUndefined();
+      expect(isLcmConnectionOpen(context.dbPath)).toBe(false);
+    } finally {
+      await context.factory.close();
+      await other.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+      rmSync(other.homeDir, { recursive: true, force: true });
     }
   });
 });

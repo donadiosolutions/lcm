@@ -117,10 +117,21 @@ describe("immutable migration queue evidence", () => {
     expect(await inspectAuthenticatedSqliteMigrationSnapshot("generation-1", input.home)).toEqual(result);
     expect(await seal(input)).toEqual(result);
   });
-  it.each([false, true])("seals empty input with optional database absent=%s", async (noEvents) => {
-    const input = await fixture({ count: 0, noEvents }); const result = await seal(input);
+  it("seals empty input when the enrolled database is present", async () => {
+    const input = await fixture({ count: 0 }); const result = await seal(input);
     expect(result.pages).toEqual([]); expect(result.receiptReference.queueCutoff).toBeNull();
     expect(result.receiptReference.queueSetSha256).toBe(hash([]));
+  });
+  it("refuses an absent enrolled database before evidence consumption", async () => {
+    const input = await fixture({ count: 0, noEvents: true });
+    const consume = vi.fn(async () => undefined);
+    await expect(withMigrationQueueEvidence(
+      input.home,
+      input.artifact,
+      input.maintenance,
+      consume,
+    )).rejects.toThrow("enrolled canonical outbox is missing");
+    expect(consume).not.toHaveBeenCalled();
   });
   it("streams at least 129 ordered records into bounded pages", async () => {
     const input = await fixture({ count: 129 }); const evidence = await read(input); const result = await seal(input);

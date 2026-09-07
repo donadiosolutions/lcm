@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   chmodSync,
   mkdirSync,
@@ -12,6 +13,8 @@ import {
   withPrivateMutationLock,
   withPrivateMutationLockAsync,
   withRevocablePrivateMutationPermit,
+  type PrivateMutationLockObserver,
+  type PrivateMutationLockOperations,
 } from "../private-mutation-lock.js";
 import {
   atomicWritePrivateFileDurable,
@@ -373,7 +376,81 @@ const activePublicationLockTokens = new WeakMap<BackendPublicationLockToken, {
   active: boolean;
 }>();
 const activeAppendBarrierTokens = new WeakSet<BackendPublicationLockToken>();
+const activeAppendBarrierContext = new AsyncLocalStorage<Readonly<{
+  rootPath: string;
+  token: BackendPublicationLockToken;
+}>>();
 const appendBarrierTails = new Map<string, Promise<void>>();
+
+export class BackendPublicationAppendBarrierTimeoutError
+  extends PrivateMutationLockContentionError {
+  readonly retryRequired = true;
+
+  constructor(cause: PrivateMutationLockContentionError) {
+    super("local hook append barrier remained busy until its admission deadline", { cause });
+    this.name = "BackendPublicationAppendBarrierTimeoutError";
+  }
+}
+
+export type BackendPublicationAppendBarrierOptions = Readonly<{
+  /** Wait only for a competing live mutation owner before refusing admission. */
+  contentionWaitMs?: number;
+  /** Delay between authenticated contention retries. */
+  retryDelayMs?: number;
+  /** @internal Monotonic test seam. */
+  _now?: () => number;
+  /** @internal Async wait test seam. */
+  _wait?: (milliseconds: number) => Promise<void>;
+  /** @internal Append-lock lifecycle test seam. */
+  _appendLockObserver?: PrivateMutationLockObserver;
+  /** @internal Append-lock cleanup test seam. */
+  _appendLockOperations?: PrivateMutationLockOperations;
+}>;
+
+function appendBarrierTiming(options: BackendPublicationAppendBarrierOptions): Readonly<{
+  bounded: boolean;
+  contentionWaitMs: number;
+  retryDelayMs: number;
+  now: () => number;
+  wait: (milliseconds: number) => Promise<void>;
+  waitForTail: (tail: Promise<void>, milliseconds: number) => Promise<boolean>;
+}> {
+  const bounded = options.contentionWaitMs !== undefined;
+  const contentionWaitMs = options.contentionWaitMs ?? 0;
+  const retryDelayMs = options.retryDelayMs ?? 50;
+  if (!Number.isFinite(contentionWaitMs) || contentionWaitMs < 0) {
+    throw new Error("append barrier contention wait must be a non-negative finite number");
+  }
+  if (!Number.isFinite(retryDelayMs) || retryDelayMs <= 0) {
+    throw new Error("append barrier retry delay must be a positive finite number");
+  }
+  const injectedWait = options._wait;
+  const wait = injectedWait
+    ?? ((milliseconds: number) => new Promise<void>(resolve => setTimeout(resolve, milliseconds)));
+  const waitForTail = injectedWait === undefined
+    ? (tail: Promise<void>, milliseconds: number): Promise<boolean> => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve(false), milliseconds);
+      void tail.then(() => {
+        clearTimeout(timer);
+        resolve(true);
+      }, (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+    })
+    : (tail: Promise<void>, milliseconds: number): Promise<boolean> => Promise.race([
+      tail.then(() => true),
+      injectedWait(milliseconds).then(() => false),
+    ]);
+  return {
+    bounded,
+    contentionWaitMs,
+    retryDelayMs,
+    now: options._now ?? performance.now.bind(performance),
+    wait,
+    waitForTail,
+  };
+}
 
 function fail(reason: BackendPublicationJournalError["reason"], message: string): never {
   throw new BackendPublicationJournalError(reason, message);
@@ -1512,6 +1589,25 @@ function assertLockToken(
   }
 }
 
+function contextualAppendLockToken(
+  homeDir: string | undefined,
+  explicit: BackendPublicationLockToken | undefined,
+): BackendPublicationLockToken | undefined {
+  const inherited = activeAppendBarrierContext.getStore();
+  if (inherited === undefined) return explicit;
+  if (
+    inherited.rootPath !== rootPath(homeDir)
+    || (explicit !== undefined && explicit !== inherited.token)
+  ) {
+    return fail("permit-mismatch", "append barrier context does not match the requested home and token");
+  }
+  assertLockToken(inherited.token, homeDir);
+  if (!activeAppendBarrierTokens.has(inherited.token)) {
+    return fail("permit-mismatch", "inherited append barrier token is no longer active");
+  }
+  return inherited.token;
+}
+
 function newLockToken(homeDir: string | undefined): BackendPublicationLockToken {
   const token = {};
   activePublicationLockTokens.set(token, { rootPath: rootPath(homeDir), active: true });
@@ -1738,11 +1834,12 @@ export function withBackendPublicationConsumerLock<T>(
   callback: (token: BackendPublicationLockToken) => T,
   options: ConsumerLockOptions = {},
 ): T {
-  if (options.lockToken !== undefined) assertLockToken(options.lockToken, homeDir);
-  if (options.lockToken !== undefined && options.permit === undefined) {
-    return requireSynchronousResult(callback(options.lockToken));
+  const lockToken = contextualAppendLockToken(homeDir, options.lockToken);
+  if (lockToken !== undefined) assertLockToken(lockToken, homeDir);
+  if (lockToken !== undefined && options.permit === undefined) {
+    return requireSynchronousResult(callback(lockToken));
   }
-  return consumerLockCallback(homeDir, callback, options);
+  return consumerLockCallback(homeDir, callback, { ...options, lockToken });
 }
 
 /** Async counterpart used by watcher and sensitive-file boundaries. */
@@ -1751,9 +1848,10 @@ export async function withBackendPublicationConsumerLockAsync<T>(
   callback: (token: BackendPublicationLockToken) => Promise<T> | T,
   options: ConsumerLockOptions = {},
 ): Promise<T> {
-  if (options.lockToken !== undefined) assertLockToken(options.lockToken, homeDir);
-  if (options.lockToken !== undefined && options.permit === undefined) {
-    return callback(options.lockToken);
+  const lockToken = contextualAppendLockToken(homeDir, options.lockToken);
+  if (lockToken !== undefined) assertLockToken(lockToken, homeDir);
+  if (lockToken !== undefined && options.permit === undefined) {
+    return callback(lockToken);
   }
   if (options.permit !== undefined) {
     assertBackendPublicationPermit(options.permit, homeDir);
@@ -1806,9 +1904,10 @@ export function withBackendPublicationAppendBarrier<T>(
   callback: (token: BackendPublicationLockToken) => T,
   lockToken?: BackendPublicationLockToken,
 ): T {
-  if (lockToken !== undefined && activeAppendBarrierTokens.has(lockToken)) {
-    assertLockToken(lockToken, homeDir);
-    return requireSynchronousResult(callback(lockToken), lockToken);
+  const contextualToken = contextualAppendLockToken(homeDir, lockToken);
+  if (contextualToken !== undefined && activeAppendBarrierTokens.has(contextualToken)) {
+    assertLockToken(contextualToken, homeDir);
+    return requireSynchronousResult(callback(contextualToken), contextualToken);
   }
   return withBackendPublicationConsumerLock(homeDir, (token) => {
     const maintenance = withBackendPublicationDirectoryRead(
@@ -1829,13 +1928,16 @@ export function withBackendPublicationAppendBarrier<T>(
       () => {
         activeAppendBarrierTokens.add(token);
         try {
-          return requireSynchronousResult(callback(token), token);
+          return activeAppendBarrierContext.run(
+            { rootPath: rootPath(homeDir), token },
+            () => requireSynchronousResult(callback(token), token),
+          );
         } finally {
           activeAppendBarrierTokens.delete(token);
         }
       },
     );
-  }, { allowUnresolved: true, lockToken });
+  }, { allowUnresolved: true, lockToken: contextualToken });
 }
 
 /** Async local-append barrier with the same exact authority as the sync form. */
@@ -1843,48 +1945,99 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
   homeDir: string | undefined,
   callback: (token: BackendPublicationLockToken) => Promise<T> | T,
   lockToken?: BackendPublicationLockToken,
+  options: BackendPublicationAppendBarrierOptions = {},
 ): Promise<T> {
-  if (lockToken !== undefined && activeAppendBarrierTokens.has(lockToken)) {
-    assertLockToken(lockToken, homeDir);
-    return callback(lockToken);
-  }
   const key = rootPath(homeDir);
+  const contextualToken = contextualAppendLockToken(homeDir, lockToken);
+  if (contextualToken !== undefined && activeAppendBarrierTokens.has(contextualToken)) {
+    assertLockToken(contextualToken, homeDir);
+    return callback(contextualToken);
+  }
+  const timing = appendBarrierTiming(options);
+  const deadline = timing.now() + timing.contentionWaitMs;
   const previous = appendBarrierTails.get(key) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve): void => { release = resolve; });
   const tail = previous.then(() => current);
   appendBarrierTails.set(key, tail);
-  await previous;
+  void tail.then(() => {
+    if (appendBarrierTails.get(key) === tail) appendBarrierTails.delete(key);
+  });
   try {
-    return await withBackendPublicationConsumerLockAsync(homeDir, async (token) => {
-    const maintenance = withBackendPublicationDirectoryRead(
-      homeDir,
-      (directoryHandle) => readMaintenanceJournalFromDirectory(homeDir, directoryHandle),
-    );
-    if (maintenance !== null && (
-      maintenance.phase !== "maintenance-held"
-      && maintenance.phase !== "selection-prepared"
-      && maintenance.phase !== "selection-completed"
-      && maintenance.phase !== "maintenance-aborted"
-    )) {
-      return fail("unresolved-publication", "backend maintenance is not ready for local append");
-    }
-    return withPrivateMutationLockAsync(
-      join(rootPath(homeDir), ".local-hook-append.lock"),
-      "local hook append barrier",
-      async () => {
-        activeAppendBarrierTokens.add(token);
-        try {
-          return await callback(token);
-        } finally {
-          activeAppendBarrierTokens.delete(token);
+    let previousSettled = false;
+    void previous.then(() => { previousSettled = true; });
+    await Promise.resolve();
+    if (!previousSettled) {
+      if (!timing.bounded) {
+        await previous;
+      } else {
+        const remaining = deadline - timing.now();
+        const queued = new PrivateMutationLockContentionError(
+          "local append admission is queued in this process",
+        );
+        if (remaining <= 0 || !await timing.waitForTail(previous, remaining)) {
+          throw new BackendPublicationAppendBarrierTimeoutError(queued);
         }
-      },
-    );
-    }, { allowUnresolved: true, lockToken });
+        if (timing.now() >= deadline) {
+          throw new BackendPublicationAppendBarrierTimeoutError(queued);
+        }
+      }
+    }
+    while (true) {
+      let callerEffectsStarted = false;
+      try {
+        return await withBackendPublicationConsumerLockAsync(homeDir, async (token) => {
+          const maintenance = withBackendPublicationDirectoryRead(
+            homeDir,
+            (directoryHandle) => readMaintenanceJournalFromDirectory(homeDir, directoryHandle),
+          );
+          if (maintenance !== null && (
+            maintenance.phase !== "maintenance-held"
+            && maintenance.phase !== "selection-prepared"
+            && maintenance.phase !== "selection-completed"
+            && maintenance.phase !== "maintenance-aborted"
+          )) {
+            return fail("unresolved-publication", "backend maintenance is not ready for local append");
+          }
+          return withPrivateMutationLockAsync(
+            join(rootPath(homeDir), ".local-hook-append.lock"),
+            "local hook append barrier",
+            async () => {
+              activeAppendBarrierTokens.add(token);
+              try {
+                callerEffectsStarted = true;
+                return await activeAppendBarrierContext.run(
+                  { rootPath: key, token },
+                  () => callback(token),
+                );
+              } finally {
+                activeAppendBarrierTokens.delete(token);
+              }
+            },
+            options._appendLockObserver,
+            options._appendLockOperations,
+          );
+        }, { allowUnresolved: true, lockToken: contextualToken });
+      } catch (error) {
+        const remaining = deadline - timing.now();
+        if (
+          callerEffectsStarted
+          || !(error instanceof PrivateMutationLockContentionError)
+        ) {
+          throw error;
+        }
+        if (!timing.bounded) throw error;
+        if (remaining <= 0) {
+          throw new BackendPublicationAppendBarrierTimeoutError(error);
+        }
+        await timing.wait(Math.min(timing.retryDelayMs, remaining));
+        if (timing.now() >= deadline) {
+          throw new BackendPublicationAppendBarrierTimeoutError(error);
+        }
+      }
+    }
   } finally {
     release();
-    if (appendBarrierTails.get(key) === tail) appendBarrierTails.delete(key);
   }
 }
 

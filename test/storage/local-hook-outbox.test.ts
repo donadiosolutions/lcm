@@ -3,15 +3,18 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
-import { isLcmConnectionOpen } from "../../src/db/connection.js";
+import { getPoolStats, isLcmConnectionOpen } from "../../src/db/connection.js";
+import { eventSequenceDbPath } from "../../src/db/events-path.js";
 import {
   type LocalHookOutboxRepository,
   SQLiteLocalHookOutboxFactory,
 } from "../../src/storage/local-hook-outbox.js";
 import {
   BackendPublicationCoordinator,
+  withBackendPublicationAppendBarrierAsync,
   type BackendPublicationDriver,
 } from "../../src/storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 describe("SQLiteLocalHookOutboxFactory", () => {
   const machineId = "0195d250-0000-7000-8000-000000000091";
@@ -413,5 +416,157 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     await factory.close();
 
     await expectRetainedOperationsClosed(repository);
+  });
+
+  it("retries factory close after pre-release admission fails", async () => {
+    const local = localPathFor("retry-close");
+    const other = localPathFor("other-home");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const repository = await factory.open(local.dbPath);
+
+    await expect(withBackendPublicationAppendBarrierAsync(other.homeDir, token =>
+      factory.close(token))).rejects.toMatchObject({ reason: "permit-mismatch" });
+    await expect(repository.getHealthStats()).resolves.toMatchObject({ unprocessed: 0 });
+    expect(isLcmConnectionOpen(local.dbPath)).toBe(true);
+    await expect(factory.open(localPathFor("late-after-failure").dbPath)).rejects.toMatchObject({
+      code: "STORAGE_CLOSED",
+      operation: "open",
+    });
+
+    await expect(factory.close()).resolves.toBeUndefined();
+    expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+    await expectRetainedOperationsClosed(repository);
+  });
+
+  it("shares one in-flight repository close while waiting for append admission", async () => {
+    const local = localPathFor("shared-close");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const repository = await factory.open(local.dbPath);
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(local.homeDir, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+
+    const first = repository.close();
+    const duplicate = repository.close();
+    const samePromise = duplicate === first;
+    releaseOwner();
+    await owner;
+    await first;
+
+    expect(samePromise).toBe(true);
+    await expect(duplicate).resolves.toBeUndefined();
+    await factory.close();
+  });
+
+  it("keeps a committed repository closed after append-lock cleanup fails", async () => {
+    const local = localPathFor("committed-cleanup");
+    const cleanupFailure = new Error("outbox append cleanup failed");
+    let armed = false;
+    const ControlledFactory = SQLiteLocalHookOutboxFactory as unknown as new (
+      dependencies: Readonly<{
+        appendBarrierOptions: Readonly<{
+          _appendLockObserver: (event: string) => void;
+        }>;
+      }>,
+    ) => SQLiteLocalHookOutboxFactory;
+    const factory = new ControlledFactory({
+      appendBarrierOptions: {
+        _appendLockObserver: (event) => {
+          if (armed && event === "before-main-lock-release-read") throw cleanupFailure;
+        },
+      },
+    });
+    const repository = await factory.open(local.dbPath);
+    const sequencePath = eventSequenceDbPath(local.homeDir);
+    armed = true;
+
+    const first = factory.close();
+    await expect(first).rejects.toBe(cleanupFailure);
+    expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+    expect(isLcmConnectionOpen(sequencePath)).toBe(false);
+    await expectRetainedOperationsClosed(repository);
+
+    armed = false;
+    await expect(factory.close()).resolves.toBeUndefined();
+    expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+  });
+
+  it("preserves an undefined post-commit cleanup rejection", async () => {
+    const local = localPathFor("undefined-cleanup");
+    let armed = false;
+    const factory = new SQLiteLocalHookOutboxFactory({
+      appendBarrierOptions: {
+        _appendLockObserver: (event) => {
+          if (armed && event === "before-main-lock-release-read") throw undefined;
+        },
+      },
+    });
+    const repository = await factory.open(local.dbPath);
+    armed = true;
+
+    let rejected = false;
+    await factory.close().then(
+      () => undefined,
+      (error: unknown) => {
+        rejected = true;
+        expect(error).toBeUndefined();
+      },
+    );
+    expect(rejected).toBe(true);
+    expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+    await expectRetainedOperationsClosed(repository);
+  });
+
+  it("reports multiple uncommitted close failures in repository order", async () => {
+    const first = localPathFor("aggregate-first");
+    const second = localPathFor("aggregate-second");
+    let now = 0;
+    let armed = false;
+    const factory = new SQLiteLocalHookOutboxFactory({
+      appendBarrierOptions: {
+        contentionWaitMs: 1,
+        retryDelayMs: 1,
+        _now: () => now,
+        _wait: async milliseconds => { now += milliseconds; },
+        _appendLockObserver: (event, path) => {
+          if (armed && event === "before-main-lock-publish") {
+            throw new PrivateMutationLockContentionError(path.includes(first.homeDir)
+              ? "first close busy"
+              : "second close busy");
+          }
+        },
+      },
+    });
+    await factory.open(first.dbPath);
+    await factory.open(second.dbPath);
+    armed = true;
+
+    const error = await factory.close().catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors.map((failure: Error) => failure.cause?.message))
+      .toEqual(["first close busy", "second close busy"]);
+    expect(isLcmConnectionOpen(first.dbPath)).toBe(true);
+    expect(isLcmConnectionOpen(second.dbPath)).toBe(true);
+  });
+
+  it("orders only the final outbox pool release behind append admission", async () => {
+    const local = localPathFor("pooled-close");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const first = await factory.open(local.dbPath);
+    const second = await factory.open(local.dbPath);
+    expect(getPoolStats().connections.find(connection => connection.path === local.dbPath)?.refs)
+      .toBe(2);
+
+    await first.close();
+    expect(getPoolStats().connections.find(connection => connection.path === local.dbPath)?.refs)
+      .toBe(1);
+    await second.close();
+    expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+    await factory.close();
   });
 });

@@ -133,6 +133,8 @@ export async function withMigrationQueueEvidence<T>(
     }
     const epoch = getMigrationReceiptEpoch(project, authority.physicalProjectId, authority.machineIdentity.machineId);
     if (epoch === null) throw new Error("migration receipt epoch is missing");
+    if (events === null) throw new Error("migration enrolled canonical outbox is missing");
+    const eventDatabase = events;
     const beyond = project.prepare("SELECT 1 FROM migration_receipt_v1_events WHERE ? IS NULL OR machine_sequence > ? LIMIT 1")
       .get(queueCutoff, queueCutoff);
     if (beyond !== undefined) throw new Error("migration receipt lies beyond the sealed cutoff");
@@ -145,16 +147,13 @@ export async function withMigrationQueueEvidence<T>(
       receiptSetSha256: receiptHash.finish(), queueCutoff,
       sourceArtifactSha256: artifact.artifactSha256, maintenanceChecksumSha256: maintenance.checksumSha256,
     };
-    if (events !== null) {
-      const duplicate = events.prepare("SELECT 1 FROM events GROUP BY event_uuid HAVING count(*) > 1 LIMIT 1").get();
-      const oversized = events.prepare("SELECT 1 FROM events WHERE length(CAST(data AS BLOB)) > 1048576 LIMIT 1").get();
-      if (duplicate !== undefined || oversized !== undefined) throw new Error("migration queue row is malformed or oversized");
-    }
+    const duplicate = eventDatabase.prepare("SELECT 1 FROM events GROUP BY event_uuid HAVING count(*) > 1 LIMIT 1").get();
+    const oversized = eventDatabase.prepare("SELECT 1 FROM events WHERE length(CAST(data AS BLOB)) > 1048576 LIMIT 1").get();
+    if (duplicate !== undefined || oversized !== undefined) throw new Error("migration queue row is malformed or oversized");
     project.exec("BEGIN");
     const records = function* (): Generator<MigrationQueueRecord> {
       let previousSequence: string | undefined;
-      if (events === null) return;
-      for (const row of events.prepare(`SELECT event_uuid, event_version, machine_id, machine_sequence, session_id,
+      for (const row of eventDatabase.prepare(`SELECT event_uuid, event_version, machine_id, machine_sequence, session_id,
         seq, type, category, data, priority, source_hook, processed_at, created_at
         FROM events ORDER BY machine_sequence COLLATE BINARY, event_uuid COLLATE BINARY`).iterate()) {
         const envelope: MigrationReceiptEnvelope = {

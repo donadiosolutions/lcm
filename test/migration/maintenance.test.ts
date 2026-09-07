@@ -9,6 +9,7 @@ import {
   assertBackendPublicationConsumerAccess,
   withBackendPublicationAppendBarrier,
   withBackendPublicationAppendBarrierAsync,
+  type BackendPublicationLockToken,
   type BackendPublicationDriver,
 } from "../../src/storage/backend-publication.js";
 import { SQLiteLocalHookOutboxFactory } from "../../src/storage/local-hook-outbox.js";
@@ -162,6 +163,62 @@ describe("backend publication maintenance journal v3", () => {
     expect(page.records).toMatchObject([{ disposition: "retained" }]);
     expect(page.records).toHaveLength(1);
   });
+  it.each(["populated", "empty"] as const)(
+    "refuses %s enrolled capture when its canonical outbox was deleted",
+    async (kind) => {
+      const fixture = enrollmentFixture();
+      vi.stubEnv("HOME", fixture.homeDir);
+      await prepareSqliteMigrationEnrollment(
+        fixture.request,
+        { openIdentitySession: fixture.openIdentitySession },
+      );
+      if (kind === "populated") {
+        await appendLocalHookEvents({
+          cwd: fixture.cwd,
+          sessionId: "deleted-outbox",
+          sourceHook: "PostToolUse",
+          events: [{
+            type: "decision",
+            category: "decision",
+            data: "must not seal after source deletion",
+            priority: 1,
+          }],
+        });
+      }
+      closeLcmConnection();
+      const outboxPath = join(fixture.homeDir, ".lcm", "events", `${fixture.local.id}.db`);
+      rmSync(outboxPath, { force: true });
+      rmSync(`${outboxPath}-wal`, { force: true });
+      rmSync(`${outboxPath}-shm`, { force: true });
+
+      const source = await heldSource(fixture);
+      expect(source.authority.passiveEventsDbPath).toBeNull();
+      await expect(captureAuthenticatedSqliteMigrationSource(source.authority, source.options))
+        .rejects.toThrow("enrolled canonical outbox is missing");
+      expect(existsSync(join(
+        fixture.homeDir,
+        ".lcm",
+        "migration-evidence",
+        source.options.generationId,
+        "witness.json",
+      ))).toBe(false);
+      expect(existsSync(outboxPath)).toBe(false);
+    },
+  );
+
+  it("captures a present empty enrolled outbox", async () => {
+    const fixture = enrollmentFixture();
+    await prepareSqliteMigrationEnrollment(
+      fixture.request,
+      { openIdentitySession: fixture.openIdentitySession },
+    );
+    const source = await heldSource(fixture);
+    expect(source.authority.passiveEventsDbPath).not.toBeNull();
+
+    const snapshot = await captureAuthenticatedSqliteMigrationSource(source.authority, source.options);
+    expect(snapshot.pages).toEqual([]);
+    expect(snapshot.receiptReference.queueCutoff).toBeNull();
+  });
   it.each(["openProject", "openExistingProject"] as const)("prepares first-hook durability in ordinary registered %s", async (operation) => {
     const fixture = enrollmentFixture();
     vi.stubEnv("HOME", fixture.homeDir);
@@ -193,13 +250,24 @@ describe("backend publication maintenance journal v3", () => {
     }
     const before = existsSync(path) ? readFileSync(path) : null;
     const factory = new SQLiteLocalHookOutboxFactory();
-    let queued!: Promise<unknown>;
-    await withBackendPublicationAppendBarrierAsync(fixture.homeDir, async (token) => {
-      queued = factory.open(path);
+    let enterBarrier!: (token: BackendPublicationLockToken) => void;
+    let releaseBarrier!: () => void;
+    const entered = new Promise<BackendPublicationLockToken>(resolve => { enterBarrier = resolve; });
+    const release = new Promise<void>(resolve => { releaseBarrier = resolve; });
+    const holder = withBackendPublicationAppendBarrierAsync(fixture.homeDir, async (token) => {
+      enterBarrier(token);
+      await release;
+    });
+    const token = await entered;
+    const queued = factory.open(path);
+    try {
       // The open is invoked before the journal exists but must decide whether
       // creation or migration is permitted only after acquiring admission.
       await coordinator(fixture.homeDir).enterMaintenance(input(), token);
-    });
+    } finally {
+      releaseBarrier();
+      await holder;
+    }
     try { await expect(queued).rejects.toThrow(); }
     finally { await factory.close(); }
     expect(existsSync(path) ? readFileSync(path) : null).toEqual(before);

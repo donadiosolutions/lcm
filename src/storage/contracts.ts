@@ -413,7 +413,7 @@ export interface ProjectStorage extends ProjectRepositories {
   readonly capabilities: StorageCapabilities;
   transaction<T>(callback: (repositories: TransactionRepositories) => Promise<T>): Promise<T>;
   health(): Promise<StorageHealth>;
-  close(): Promise<void>;
+  close(publicationLockToken?: BackendPublicationLockToken): Promise<void>;
 }
 
 /**
@@ -449,5 +449,5 @@ export interface StorageBackendFactory {
     signal?: AbortSignal,
   ): Promise<ProjectStorage>;
   health(): Promise<StorageHealth>;
-  close(): Promise<void>;
+  close(publicationLockToken?: BackendPublicationLockToken): Promise<void>;
 }

@@ -17,13 +17,15 @@ import {
   readBackendPublicationJournal,
   withBackendPublicationConfigLock,
   withBackendPublicationConsumerLock,
+  withBackendPublicationAppendBarrier,
+  withBackendPublicationAppendBarrierAsync,
   type BackendPublicationDriver,
   type BackendPublicationFenceRecord,
   type BackendPublicationRecoveryFile,
   type BackendPublicationRecoveryMaterial,
   type BackendPublicationStateWitness,
 } from "../src/storage/backend-publication.js";
-import { PrivateMutationPermitRevokedError } from "../src/private-mutation-lock.js";
+import { PrivateMutationLockContentionError, PrivateMutationPermitRevokedError } from "../src/private-mutation-lock.js";
 import { withRevocablePrivateMutationPermit } from "../src/private-mutation-lock.js";
 import {
   assertHomeLockTopology,
@@ -3817,6 +3819,192 @@ describe("revocable mutation permits", () => {
       permit.assertActive();
     });
     expect(() => retained?.assertActive()).toThrow(PrivateMutationPermitRevokedError);
+  });
+
+  it("never retries caller effects that throw a contention-shaped error", async () => {
+    const home = makeHome();
+    const contention = new PrivateMutationLockContentionError("callback contention");
+    let calls = 0;
+    const waitingBarrier = withBackendPublicationAppendBarrierAsync as unknown as <T>(
+      homeDir: string,
+      callback: () => Promise<T>,
+      token: undefined,
+      options: Readonly<{ contentionWaitMs: number; retryDelayMs: number }>,
+    ) => Promise<T>;
+
+    await expect(waitingBarrier(home, async () => {
+      calls += 1;
+      throw contention;
+    }, undefined, { contentionWaitMs: 50, retryDelayMs: 1 })).rejects.toBe(contention);
+    expect(calls).toBe(1);
+  });
+
+  it("reuses only a live same-home append context", async () => {
+    const home = makeHome();
+    const other = makeHome();
+    let releaseRetained!: () => void;
+    let retained!: Promise<void>;
+    await withBackendPublicationAppendBarrierAsync(home, async token => {
+      expect(await withBackendPublicationAppendBarrierAsync(home, nested => nested)).toBe(token);
+      expect(withBackendPublicationConsumerLock(home, nested => nested)).toBe(token);
+      await expect(withBackendPublicationAppendBarrierAsync(other, async () => undefined))
+        .rejects.toMatchObject({ reason: "permit-mismatch" });
+      await expect(withBackendPublicationAppendBarrierAsync(home, async () => undefined, {}))
+        .rejects.toMatchObject({ reason: "permit-mismatch" });
+      const released = new Promise<void>(resolve => { releaseRetained = resolve; });
+      retained = released.then(async () => {
+        await Promise.resolve();
+        await withBackendPublicationAppendBarrierAsync(home, async () => undefined);
+      });
+    });
+    releaseRetained();
+    await expect(retained).rejects.toMatchObject({ reason: "permit-mismatch" });
+  });
+
+  it("retries only pre-callback contention and releases its local tail", async () => {
+    const home = makeHome();
+    let now = 0;
+    let waits = 0;
+    let effects = 0;
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      await new Promise(resolve => setTimeout(resolve, 30));
+    });
+    await Promise.resolve();
+    const timeout = withBackendPublicationAppendBarrierAsync(home, async () => {
+      effects += 1;
+    }, undefined, {
+      contentionWaitMs: 10,
+      retryDelayMs: 1,
+      _now: () => now,
+      _wait: async milliseconds => { waits += 1; now += milliseconds; },
+    });
+    await expect(timeout).rejects.toMatchObject({
+      name: "BackendPublicationAppendBarrierTimeoutError",
+      retryRequired: true,
+    });
+    expect(effects).toBe(0);
+    expect(waits).toBe(1);
+    await owner;
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => "released"))
+      .resolves.toBe("released");
+  });
+
+  it("keeps a timed-out queued entry behind its live predecessor", async () => {
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => {
+      throw new Error("timed-out callback must not run");
+    }, undefined, {
+      contentionWaitMs: 1,
+      _now: () => 0,
+      _wait: async () => undefined,
+    })).rejects.toMatchObject({ name: "BackendPublicationAppendBarrierTimeoutError" });
+
+    let followerEntered = false;
+    const follower = withBackendPublicationAppendBarrierAsync(home, async () => {
+      followerEntered = true;
+      return "followed";
+    });
+    await Promise.resolve();
+    expect(followerEntered).toBe(false);
+    releaseOwner();
+    await owner;
+    await expect(follower).resolves.toBe("followed");
+  });
+
+  it("releases its queued entry when the injected wait rejects", async () => {
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const waitFailure = new Error("injected local-tail wait failure");
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => undefined, undefined, {
+      contentionWaitMs: 1,
+      _wait: async () => { throw waitFailure; },
+    })).rejects.toBe(waitFailure);
+    releaseOwner();
+    await owner;
+
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => "released", undefined, {
+      contentionWaitMs: 50,
+    })).resolves.toBe("released");
+  });
+
+  it("cancels the local-tail deadline timer when admission wins", async () => {
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+
+    vi.useFakeTimers();
+    try {
+      const follower = withBackendPublicationAppendBarrierAsync(
+        home,
+        async () => "admitted",
+        undefined,
+        { contentionWaitMs: 5_000 },
+      );
+      await Promise.resolve();
+      expect(vi.getTimerCount()).toBe(1);
+      releaseOwner();
+      await owner;
+      await expect(follower).resolves.toBe("admitted");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      releaseOwner();
+      await owner;
+    }
+  });
+
+  it("propagates post-callback append-lock cleanup without replaying effects", async () => {
+    const home = makeHome();
+    const cleanupFailure = new Error("append lock cleanup failed");
+    let effects = 0;
+    const barrierWithCleanupSeam = withBackendPublicationAppendBarrierAsync as unknown as <T>(
+      homeDir: string,
+      callback: () => Promise<T>,
+      token: undefined,
+      options: Readonly<{ _appendLockObserver: (event: string) => void }>,
+    ) => Promise<T>;
+
+    await expect(barrierWithCleanupSeam(home, async () => {
+      effects += 1;
+      return "committed";
+    }, undefined, {
+      _appendLockObserver: (event) => {
+        if (event === "before-main-lock-release-read") throw cleanupFailure;
+      },
+    })).rejects.toBe(cleanupFailure);
+    expect(effects).toBe(1);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => "next"))
+      .resolves.toBe("next");
+  });
+
+  it("reuses exact-home append authority in the synchronous wrappers", () => {
+    const home = makeHome();
+    withBackendPublicationAppendBarrier(home, token => {
+      expect(withBackendPublicationAppendBarrier(home, nested => nested)).toBe(token);
+      expect(withBackendPublicationConsumerLock(home, nested => nested)).toBe(token);
+    });
   });
 });
 

@@ -197,7 +197,13 @@ publication admission is attempted. After that durable boundary:
 
 If publication admission fails before the local event can be durably appended,
 the hook does not report a successful observer result; the direct top-level CLI
-path retains its fixed stderr diagnostic and exit code `1`.
+path retains its fixed stderr diagnostic and exit code `1`. Hook append
+admission waits for contention for at most five seconds, including time queued
+behind another hook in the same process. Once admitted, opening the outbox,
+allocating sequences, inserting every event, reading health, and physically
+closing the outbox and sequence handles complete under that single admission.
+The hook never retries its event writes; an admission timeout occurs before
+the first write and requires the host to retry the hook.
 
 The fixed diagnostic is:
 
