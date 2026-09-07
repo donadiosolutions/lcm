@@ -11,7 +11,7 @@ export function createPoolStatsHandler(homeDir?: string, storageFactory?: Storag
       sendJson(res, 200, { backendDiagnostics });
     } catch (error) {
       sendJson(res, 200, { backendDiagnostics: error instanceof StatsUnavailableError
-        ? error.diagnostics : backendDiagnosticFailure(error) });
+        ? error.diagnostics : backendDiagnosticFailure(error, storageFactory?.backend) });
     }
   };
 }
