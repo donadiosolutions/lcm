@@ -62,7 +62,7 @@ jobs:
         run: node --test .github/scripts/*.test.mjs
 
       - name: Test helper regressions
-        run: python3 -m unittest discover -s .agents/skills/tests -v
+        run: python3 -B -m unittest discover -s .agents/skills/tests -v
 
       - name: Upload Vitest reports
         if: ${{ !cancelled() }}
