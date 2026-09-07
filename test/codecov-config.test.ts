@@ -590,6 +590,8 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/status.ts", "unit-daemon-routes"],
       ["src/daemon/routes/session-complete.ts", "unit-daemon-routes"],
       ["src/daemon/routes/review-stale.ts", "unit-daemon-routes"],
+      // #1148 keeps promoted created_at UTC parsing in the existing daemon
+      // routes owner; prompt-search and restore retain their route ownership.
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
       // #833 passive-event identity admission remains route-owned.
