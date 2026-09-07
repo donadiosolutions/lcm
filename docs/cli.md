@@ -156,6 +156,24 @@ treated as absent. Correct the primary trust failure before retrying; the
 cleanup evidence may also indicate a filesystem or descriptor problem that
 needs attention.
 
+Atomic private-file writers preserve an earlier write or setup failure if
+closing the temporary descriptor also fails. The ordinary replacement writer
+also retains temporary-file cleanup errors. Durable writes retain subsequent
+cleanup errors in descriptor, temporary-file, and parent-directory order.
+These diagnostics help distinguish the original failure from cleanup trouble.
+
+Exclusive creation has distinct outcomes. The non-durable
+`atomicWritePrivateFileExclusive` helper preserves pre-publication failures
+alongside temporary-file cleanup errors, and still reports success when a
+completed publication only fails to remove its extra temporary hard link.
+The published file remains usable, although that temporary link may remain.
+The durable exclusive writer instead reports failed post-link cleanup because
+durability has not completed. The retained-parent `atomicWritePrivateFile`
+exclusive branch keeps its existing best-effort temporary cleanup behavior;
+its temporary unlink failures are not added to the primary error. The separate
+`writePrivateFileExclusive` helper also keeps its existing best-effort cleanup
+behavior and is outside this diagnostic change.
+
 The first authenticated health probe used to identify a retryable daemon can
 take up to two seconds. After the first qualifying contention, retries share a
 single two-second monotonic elapsed deadline and poll at most every 50

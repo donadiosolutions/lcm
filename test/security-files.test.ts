@@ -259,6 +259,75 @@ describe("private filesystem primitives", () => {
     }
   });
 
+  it.each([
+    { label: "undefined", primary: undefined as unknown },
+    { label: "null", primary: null as unknown },
+  ])("preserves an exclusive $label write failure when descriptor close also fails", ({ primary }) => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const closeFailure = new Error("exclusive temporary close failed");
+    let closeCalls = 0;
+    let didThrow = false;
+    let thrown: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "content", {
+          write: () => { throw primary; },
+          close: (fd) => {
+            closeCalls += 1;
+            closeSync(fd);
+            throw closeFailure;
+          },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        didThrow = true;
+        thrown = error;
+      }
+
+      expect(didThrow).toBe(true);
+      expect(thrown).toBeInstanceOf(AggregateError);
+      const aggregate = thrown as AggregateError & { cause?: unknown };
+      expect(aggregate.errors).toEqual([primary, closeFailure]);
+      expect(aggregate.cause).toBe(primary);
+      expect(closeCalls).toBe(1);
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it.each([
+    { label: "exclusive", requireAbsent: true },
+    { label: "ordinary", requireAbsent: false },
+  ])("propagates a lone $label temporary close failure once", ({ requireAbsent }) => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const closeFailure = new Error("temporary close failed");
+    let closeCalls = 0;
+    let observed: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "content", {
+          close: (fd) => {
+            closeCalls += 1;
+            closeSync(fd);
+            throw closeFailure;
+          },
+        }, parent, { requireAbsent });
+      } catch (error) {
+        observed = error;
+      }
+
+      expect(observed).toBe(closeFailure);
+      expect(closeCalls).toBe(1);
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
   it("reports exclusive temporary cleanup failure after publication", () => {
     const root = makeRoot();
     const parent = openPrivateDirectory(root);
@@ -1125,6 +1194,55 @@ describe("private filesystem primitives", () => {
       expect(thrown).toBe(renameError);
       expect(existsSync(tempPath)).toBe(false);
       expect(readFileSync(target, "utf8")).toBe("original");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("keeps caller aggregates nested through descriptor and pathname cleanup failures", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const callerPrimary = new AggregateError(
+      [new Error("caller detail")],
+      "caller write failed",
+    );
+    const closeFailure = new Error("temporary close failed");
+    const removeFailure = new Error("temporary remove failed");
+    let closeCalls = 0;
+    let removeCalls = 0;
+    let thrown: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "content", {
+          write: () => { throw callerPrimary; },
+          close: (fd) => {
+            closeCalls += 1;
+            closeSync(fd);
+            throw closeFailure;
+          },
+          remove: () => {
+            removeCalls += 1;
+            throw removeFailure;
+          },
+        }, parent);
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(AggregateError);
+      const outer = thrown as AggregateError & { cause?: unknown };
+      expect(outer.errors).toHaveLength(2);
+      expect(outer.errors[1]).toBe(removeFailure);
+      expect(outer.cause).toBe(outer.errors[0]);
+      const inner = outer.errors[0] as AggregateError & { cause?: unknown };
+      expect(inner).toBeInstanceOf(AggregateError);
+      expect(inner.errors).toEqual([callerPrimary, closeFailure]);
+      expect(inner.cause).toBe(callerPrimary);
+      expect(inner.errors[0]).toBe(callerPrimary);
+      expect(closeCalls).toBe(1);
+      expect(removeCalls).toBe(1);
+      expect(existsSync(target)).toBe(false);
     } finally {
       parent.close();
     }
@@ -2026,33 +2144,48 @@ describe("private filesystem primitives", () => {
     const closeFailure = join(root, "close-failure");
     const originalClose = closeSync;
     let closeCalls = 0;
+    let temporaryFd: number | undefined;
+    const temporaryCloseFailure = new Error("temporary close failed");
     expect(() => withPatchedFs(
       "closeSync",
       ((fd: number) => {
         closeCalls += 1;
-        if (closeCalls === 1) throw new Error("temporary close failed");
-        return originalClose(fd);
+        originalClose(fd);
+        if (temporaryFd === undefined) {
+          temporaryFd = fd;
+          throw temporaryCloseFailure;
+        }
       }) as typeof closeSync,
       () => atomicWritePrivateFileDurable(closeFailure, "content"),
-    )).toThrow("temporary close failed");
+    )).toThrow(temporaryCloseFailure);
+    expect(temporaryFd).toBeDefined();
+    expect(closeCalls).toBe(2);
 
     const cleanupFailure = join(root, "cleanup-failure");
     const writeFailure = new Error("durable write failed");
     const originalUnlink = unlinkSync;
-    expect(() => withPatchedFs(
-      "writeSync",
-      (() => { throw writeFailure; }) as typeof writeSync,
-      () => withPatchedFs(
-        "unlinkSync",
-        ((path: string) => {
-          if (path.includes("cleanup-failure")) {
-            throw Object.assign(new Error("cleanup denied"), { code: "EACCES" });
-          }
-          return originalUnlink(path);
-        }) as typeof unlinkSync,
-        () => atomicWritePrivateFileDurable(cleanupFailure, "content"),
-      ),
-    )).toThrow("cleanup denied");
+    const cleanupDenied = Object.assign(new Error("cleanup denied"), { code: "EACCES" });
+    let observed: unknown;
+    try {
+      withPatchedFs(
+        "writeSync",
+        (() => { throw writeFailure; }) as typeof writeSync,
+        () => withPatchedFs(
+          "unlinkSync",
+          ((path: string) => {
+            if (path.includes("cleanup-failure")) throw cleanupDenied;
+            return originalUnlink(path);
+          }) as typeof unlinkSync,
+          () => atomicWritePrivateFileDurable(cleanupFailure, "content"),
+        ),
+      );
+    } catch (error) {
+      observed = error;
+    }
+    expect(observed).toBeInstanceOf(AggregateError);
+    const cleanupAggregate = observed as AggregateError & { cause?: unknown };
+    expect(cleanupAggregate.errors).toEqual([writeFailure, cleanupDenied]);
+    expect(cleanupAggregate.cause).toBe(writeFailure);
 
     const publishedCleanup = join(root, "published-cleanup");
     expect(() => withPatchedFs(
@@ -2098,6 +2231,154 @@ describe("private filesystem primitives", () => {
     const binary = join(root, "binary");
     atomicWritePrivateFileDurable(binary, new Uint8Array([0x62, 0x69, 0x6e, 0x61, 0x72, 0x79]));
     expect(readFileSync(binary, "utf8")).toBe("binary");
+  });
+
+  it("preserves durable primary and every ordered cleanup failure exactly once", () => {
+    const root = makeRoot();
+    const path = join(root, "durable-triple-cleanup");
+    const writeFailure = new AggregateError(
+      [new Error("durable caller detail")],
+      "durable write failed",
+    );
+    const temporaryCloseFailure = new Error("durable temporary close failed");
+    const unlinkFailure = Object.assign(new Error("durable unlink failed"), { code: "EIO" });
+    const parentCloseFailure = new Error("durable parent close failed");
+    const originalClose = closeSync;
+    let closeCalls = 0;
+    let unlinkCalls = 0;
+    let observed: unknown;
+
+    try {
+      withPatchedFs("writeSync", (() => { throw writeFailure; }) as typeof writeSync, () => (
+        withPatchedFs("unlinkSync", (() => {
+          unlinkCalls += 1;
+          throw unlinkFailure;
+        }) as typeof unlinkSync, () => (
+          withPatchedFs("closeSync", ((fd: number) => {
+            closeCalls += 1;
+            originalClose(fd);
+            throw closeCalls === 1 ? temporaryCloseFailure : parentCloseFailure;
+          }) as typeof closeSync, () => atomicWritePrivateFileDurable(path, "content"))
+        ))
+      ));
+    } catch (error) {
+      observed = error;
+    }
+
+    expect(observed).toBeInstanceOf(AggregateError);
+    const aggregate = observed as AggregateError & { cause?: unknown };
+    expect(aggregate.errors).toEqual([
+      writeFailure,
+      temporaryCloseFailure,
+      unlinkFailure,
+      parentCloseFailure,
+    ]);
+    expect(aggregate.cause).toBe(writeFailure);
+    expect(aggregate.errors[0]).toBe(writeFailure);
+    expect(closeCalls).toBe(2);
+    expect(unlinkCalls).toBe(1);
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it.each([
+    { label: "undefined", primary: undefined as unknown },
+    { label: "null", primary: null as unknown },
+  ])("preserves a durable $label primary before cleanup evidence", ({ label, primary }) => {
+    const root = makeRoot();
+    const path = join(root, `durable-${label}-primary`);
+    const cleanupFailure = Object.assign(new Error("durable cleanup failed"), { code: "EIO" });
+    let cleanupCalls = 0;
+    let didThrow = false;
+    let observed: unknown;
+
+    try {
+      withPatchedFs("writeSync", (() => { throw primary; }) as typeof writeSync, () => (
+        withPatchedFs("unlinkSync", (() => {
+          cleanupCalls += 1;
+          throw cleanupFailure;
+        }) as typeof unlinkSync, () => atomicWritePrivateFileDurable(path, "content"))
+      ));
+    } catch (error) {
+      didThrow = true;
+      observed = error;
+    }
+
+    expect(didThrow).toBe(true);
+    expect(observed).toBeInstanceOf(AggregateError);
+    const aggregate = observed as AggregateError & { cause?: unknown };
+    expect(aggregate.errors).toEqual([primary, cleanupFailure]);
+    expect(aggregate.cause).toBe(primary);
+    expect(cleanupCalls).toBe(1);
+  });
+
+  it("retains the durable parent through preflight, naming, and collision failures", () => {
+    const root = makeRoot();
+    const existing = join(root, "existing");
+    writeFileSync(existing, "existing", { mode: 0o600 });
+    const randomFailure = new Error("durable random failed");
+    const cases: Array<Readonly<{
+      label: string;
+      run: () => void;
+      expected: unknown;
+      expectedCloseCalls: number;
+    }>> = [
+      {
+        label: "preflight",
+        run: () => atomicWritePrivateFileDurable(existing, "new", { maxExistingBytes: 1 }),
+        expected: expect.any(Error),
+        expectedCloseCalls: 2,
+      },
+      {
+        label: "temporary naming",
+        run: () => atomicWritePrivateFileDurable(join(root, "random"), "new", {
+          random: () => { throw randomFailure; },
+        }),
+        expected: randomFailure,
+        expectedCloseCalls: 1,
+      },
+      {
+        label: "already exists",
+        run: () => atomicWritePrivateFileDurable(existing, "new", {
+          maxExistingBytes: 64,
+          requireAbsent: true,
+        }),
+        expected: expect.objectContaining({ message: "private file already exists" }),
+        expectedCloseCalls: 2,
+      },
+    ];
+    const originalClose = closeSync;
+
+    for (const testCase of cases) {
+      let closeCalls = 0;
+      let observed: unknown;
+      try {
+        withPatchedFs("closeSync", ((fd: number) => {
+          closeCalls += 1;
+          originalClose(fd);
+        }) as typeof closeSync, testCase.run);
+      } catch (error) {
+        observed = error;
+      }
+      expect(observed, testCase.label).toEqual(testCase.expected);
+      expect(closeCalls, testCase.label).toBe(testCase.expectedCloseCalls);
+    }
+  });
+
+  it("surfaces a lone durable parent-close failure without changing publication", () => {
+    const root = makeRoot();
+    const path = join(root, "durable-parent-close");
+    const closeFailure = new Error("durable parent close failed");
+    const originalClose = closeSync;
+    let closeCalls = 0;
+
+    expect(() => withPatchedFs("closeSync", ((fd: number) => {
+      closeCalls += 1;
+      originalClose(fd);
+      if (closeCalls === 2) throw closeFailure;
+    }) as typeof closeSync, () => atomicWritePrivateFileDurable(path, "content")))
+      .toThrow(closeFailure);
+    expect(closeCalls).toBe(2);
+    expect(readFileSync(path, "utf8")).toBe("content");
   });
 
   it("atomically replaces files and symlinks with private regular files", () => {
@@ -2846,16 +3127,155 @@ describe("private filesystem primitives", () => {
     const root = makeRoot();
     const path = join(root, "atomic-unpublished-cleanup-denied");
     const denied = Object.assign(new Error("denied"), { code: "EACCES" });
+    const setupFailure = new Error("setup failed");
+    let removeCalls = 0;
+    let observed: unknown;
+
+    try {
+      atomicWritePrivateFileExclusive(path, "content", {
+        chmod: () => { throw setupFailure; },
+        remove: () => {
+          removeCalls += 1;
+          throw denied;
+        },
+      });
+    } catch (error) {
+      observed = error;
+    }
+    expect(observed).toBeInstanceOf(AggregateError);
+    const aggregate = observed as AggregateError & { cause?: unknown };
+    expect(aggregate.errors).toEqual([setupFailure, denied]);
+    expect(aggregate.cause).toBe(setupFailure);
+    expect(removeCalls).toBe(1);
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("preserves exclusive link failure before temporary cleanup evidence", () => {
+    const root = makeRoot();
+    const path = join(root, "atomic-link-cleanup-denied");
+    const linkFailure = Object.assign(new Error("link failed"), { code: "EACCES" });
+    const removeFailure = Object.assign(new Error("remove failed"), { code: "EIO" });
+    let removeCalls = 0;
+    let observed: unknown;
+
+    try {
+      atomicWritePrivateFileExclusive(path, "content", {
+        link: () => { throw linkFailure; },
+        remove: () => {
+          removeCalls += 1;
+          throw removeFailure;
+        },
+      });
+    } catch (error) {
+      observed = error;
+    }
+
+    expect(observed).toBeInstanceOf(AggregateError);
+    const aggregate = observed as AggregateError & { cause?: unknown };
+    expect(aggregate.errors).toEqual([linkFailure, removeFailure]);
+    expect(aggregate.cause).toBe(linkFailure);
+    expect(removeCalls).toBe(1);
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("does not flatten exclusive write, close, and removal failures", () => {
+    const root = makeRoot();
+    const path = join(root, "atomic-write-close-remove");
+    const writeFailure = new Error("exclusive write failed");
+    const closeFailure = new Error("exclusive close failed");
+    const removeFailure = new Error("exclusive remove failed");
+    const originalClose = closeSync;
+    let closeCalls = 0;
+    let removeCalls = 0;
+    let observed: unknown;
+
+    try {
+      withPatchedFs("writeFileSync", (() => { throw writeFailure; }) as typeof writeFileSync, () => (
+        withPatchedFs("closeSync", ((fd: number) => {
+          closeCalls += 1;
+          originalClose(fd);
+          throw closeFailure;
+        }) as typeof closeSync, () => atomicWritePrivateFileExclusive(path, "content", {
+          remove: () => {
+            removeCalls += 1;
+            throw removeFailure;
+          },
+        }))
+      ));
+    } catch (error) {
+      observed = error;
+    }
+
+    expect(observed).toBeInstanceOf(AggregateError);
+    const outer = observed as AggregateError & { cause?: unknown };
+    expect(outer.errors).toHaveLength(2);
+    expect(outer.errors[1]).toBe(removeFailure);
+    expect(outer.cause).toBe(outer.errors[0]);
+    const inner = outer.errors[0] as AggregateError & { cause?: unknown };
+    expect(inner.errors).toEqual([writeFailure, closeFailure]);
+    expect(inner.cause).toBe(writeFailure);
+    expect(closeCalls).toBe(1);
+    expect(removeCalls).toBe(1);
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("propagates a lone exclusive-writer close failure once", () => {
+    const root = makeRoot();
+    const path = join(root, "atomic-close-failure");
+    const closeFailure = new Error("exclusive writer close failed");
+    const originalClose = closeSync;
+    let closeCalls = 0;
+    let observed: unknown;
+
+    try {
+      withPatchedFs("closeSync", ((fd: number) => {
+        closeCalls += 1;
+        originalClose(fd);
+        throw closeFailure;
+      }) as typeof closeSync, () => atomicWritePrivateFileExclusive(path, "content"));
+    } catch (error) {
+      observed = error;
+    }
+
+    expect(observed).toBe(closeFailure);
+    expect(closeCalls).toBe(1);
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("preserves a lone exclusive-writer write failure after closing once", () => {
+    const root = makeRoot();
+    const path = join(root, "atomic-write-failure");
+    const writeFailure = new Error("exclusive writer write failed");
+    const originalClose = closeSync;
+    let closeCalls = 0;
+    let observed: unknown;
+
+    try {
+      withPatchedFs("writeFileSync", (() => { throw writeFailure; }) as typeof writeFileSync, () => (
+        withPatchedFs("closeSync", ((fd: number) => {
+          closeCalls += 1;
+          originalClose(fd);
+        }) as typeof closeSync, () => atomicWritePrivateFileExclusive(path, "content"))
+      ));
+    } catch (error) {
+      observed = error;
+    }
+
+    expect(observed).toBe(writeFailure);
+    expect(closeCalls).toBe(1);
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("keeps EEXIST cleanup-only failure distinct from ordinary contention", () => {
+    const root = makeRoot();
+    const path = join(root, "atomic-existing-cleanup");
+    const cleanupFailure = new Error("existing contender cleanup failed");
+    writeFileSync(path, "winner", { mode: 0o600 });
 
     expect(() => atomicWritePrivateFileExclusive(path, "content", {
-      chmod: () => {
-        throw new Error("setup failed");
-      },
-      remove: () => {
-        throw denied;
-      },
-    })).toThrow(denied);
-    expect(existsSync(path)).toBe(false);
+      remove: () => { throw cleanupFailure; },
+    })).toThrow(cleanupFailure);
+    expect(readFileSync(path, "utf8")).toBe("winner");
   });
 
   it("removes an exclusively created destination when initialization fails", () => {
