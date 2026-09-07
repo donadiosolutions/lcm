@@ -37,6 +37,7 @@ function deferred<T>(): Deferred<T> {
 
 const EXPECTED_BUILT_IN_ROUTE_ADMISSIONS: readonly [string, RouteAdmission, "retained" | "operation-scoped"][] = [
   ["GET /health", "read", "retained"],
+  ["GET /health/observe", "read", "retained"],
   ["POST /compact", "mutating", "operation-scoped"],
   ["POST /promote", "mutating", "operation-scoped"],
   ["POST /restore", "mutating", "operation-scoped"],

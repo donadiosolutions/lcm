@@ -33,6 +33,7 @@ const state = vi.hoisted(() => ({
   }) : ({ ok: true, promoted: 1, processed: 1, skipped: 0, errors: 0, processedProjects: 1 })),
   get: vi.fn(async () => ({ totalConnections: 2, activeConnections: 1, idleConnections: 1, connections: [{ refs: 1, status: "active", path: "/db" }] })),
   health: vi.fn(async (): Promise<unknown> => true),
+  observe: vi.fn(async (): Promise<unknown> => null),
   readAuthToken: vi.fn(() => state.authToken),
   dispatchHook: vi.fn(async () => ({ stdout: "hook-output", exitCode: 0 })),
   loadConfig: vi.fn(() => ({
@@ -188,6 +189,7 @@ vi.mock("../../src/daemon/client.js", () => ({
     post = state.post;
     get = state.get;
     health = state.health;
+    observe = state.observe;
     constructor() {
       state.daemonClientInstances++;
     }
@@ -380,6 +382,7 @@ beforeEach(() => {
   fakeStdin.isTTY = true;
   state.ensureDaemon.mockResolvedValue({ connected: true, spawned: false, restartedForParent: false, pid: 42 });
   state.health.mockReset().mockResolvedValue(true);
+  state.observe.mockReset().mockResolvedValue(null);
   state.post.mockReset().mockImplementation(async (path: string) => path === "/status" ? ({
     daemon: { version: "1.0.0", uptime: 5, port: 3737 },
     backendDiagnostics: state.diagnostics,
@@ -1261,7 +1264,48 @@ describe("runCli registration and help dispatch", () => {
 });
 
 describe("runCli daemon-backed and utility actions", () => {
-  it("routes all six daemon reads through an authenticated healthy daemon without migration", async () => {
+  it.each([["status", "--json"], ["stats", "--pool", "--json"]])("uses process-only daemon identity for diagnostics %#", async (...args) => {
+    state.observe.mockResolvedValue({
+      status: "ok", observation: "identity-only", storage: { status: "unverified" },
+      version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime",
+      daemonInstanceId: "generation", pid: 42, uptime: 7,
+    });
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    expect(await invoke(args)).toBeUndefined();
+    expect(state.observe).toHaveBeenCalledExactlyOnceWith({ timeoutMs: 2000 });
+    expect(state.health).not.toHaveBeenCalled();
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.restartDaemon).not.toHaveBeenCalled();
+    expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    if (args[0] === "status") {
+      expect(state.post).toHaveBeenCalledWith("/status", { cwd: process.cwd() }, { timeoutMs: 2000 });
+      expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toMatchObject({ diagnosticSource: "daemon", daemon: { status: "up" } });
+    } else expect(state.get).toHaveBeenCalledWith("/stats/pool", { timeoutMs: 2000 });
+  });
+
+  it.each([
+    null,
+    { status: "ok", version: "old", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+    { status: "ok", version: "1.4.2", storageBackend: "postgresql", entrypoint: "/daemon", runtimeDigest: "runtime" },
+    { status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/other", runtimeDigest: "runtime" },
+    { status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "other" },
+    { status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon" },
+  ])("refuses unavailable or mismatched diagnostic identity without active repair %#", async observation => {
+    state.observe.mockResolvedValue(observation);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    expect(await invoke(["status", "--json"])).toBeUndefined();
+    expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toMatchObject({ diagnosticSource: "local", daemon: { status: "down" } });
+    expect(await invoke(["stats", "--pool"])).toBeUndefined();
+    expect(state.post).not.toHaveBeenCalled();
+    expect(state.get).not.toHaveBeenCalled();
+    expect(state.health).not.toHaveBeenCalled();
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
+    expect(state.restartDaemon).not.toHaveBeenCalled();
+    expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+  });
+
+  it("preserves active health for retrieval while diagnostics observe identity", async () => {
+    state.observe.mockResolvedValue({ status: "ok", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" });
     state.health.mockResolvedValue({
       status: "healthy",
       version: "1.4.2",
@@ -1297,7 +1341,8 @@ describe("runCli daemon-backed and utility actions", () => {
       expect(results).toEqual(reads.map(() => undefined));
       expect(migrate).not.toHaveBeenCalled();
       expect(state.ensureDaemon).not.toHaveBeenCalled();
-      expect(state.health).toHaveBeenCalled();
+      expect(state.health).toHaveBeenCalledTimes(4);
+      expect(state.observe).toHaveBeenCalledTimes(2);
     } finally {
       state.runtimeHome = previousRuntime.home;
       state.runtimePidPath = previousRuntime.pid;
@@ -1671,9 +1716,10 @@ describe("runCli orchestration actions", () => {
     const root = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-status-refusal-"));
     actualFs.mkdirSync(join(root, ".lcm"), { recursive: true });
     state.runtimeHome = root;
-    state.health.mockResolvedValue({
-      status: "healthy", version: "1.4.2", storageBackend: "sqlite",
-      entrypoint: "/daemon", runtimeDigest: "runtime", uptime: 7,
+    state.observe.mockResolvedValue({
+      status: "ok", observation: "identity-only", storage: { status: "unverified" },
+      version: "1.4.2", storageBackend: "sqlite",
+      entrypoint: "/daemon", runtimeDigest: "runtime", uptime: 7, pid: 42, daemonInstanceId: "generation",
     });
     const statsModule = await import("../../src/stats.js");
     const classification = localHealthy ? "healthy" : "stale-publication";
@@ -2256,7 +2302,7 @@ describe("runCli failure and alternate presentation branches", () => {
   it("does not trust staged or mismatched daemon identity for diagnostics", async () => {
     const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     state.storageBackend = "postgresql";
-    state.health.mockResolvedValue({ status: "unavailable", version: "other", storageBackend: "postgresql" });
+    state.observe.mockResolvedValue({ status: "unavailable", version: "other", storageBackend: "postgresql" });
     expect(await invoke(["status", "--json"])).toBeUndefined();
     expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toMatchObject({ daemon: { status: "down" } });
     expect(state.post).not.toHaveBeenCalled();

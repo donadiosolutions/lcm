@@ -51,9 +51,9 @@ import {
   type ResolvedStorageConfig,
 } from "../daemon/config.js";
 import {
-  isStagedPostgreSqlHealth,
-  type StagedPostgreSqlHealthResponse,
-} from "../daemon/staged-postgresql.js";
+  parseDaemonObservation,
+  type DaemonObservation,
+} from "../daemon/client.js";
 import {
   assertBackendPublicationConfigReadAccess,
   BackendPublicationJournalError,
@@ -110,7 +110,7 @@ interface DoctorConfig {
 }
 
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
-const DAEMON_HEALTH_DEADLINE_MS = 2000;
+const DAEMON_OBSERVATION_DEADLINE_MS = 2000;
 
 function publicationAdmissionMessage(
   reason: BackendPublicationJournalError["reason"],
@@ -148,43 +148,29 @@ function checkBackendPublicationAdmission(
   return false;
 }
 
-type DaemonStorageReadiness = "ready" | "unavailable" | "unverified";
-
-type DoctorDaemonHealth = StagedPostgreSqlHealthResponse & {
-  readonly status?: string;
-  /** Authenticated health only: the daemon's resolved runtime entrypoint. */
-  readonly entrypoint?: string;
-  /** Authenticated health only: the packaged runtime digest. */
-  readonly runtimeDigest?: string;
-};
-
-async function readRecognizedDaemonHealth(
+async function readDaemonObservation(
   fetchFn: typeof globalThis.fetch,
   port: number,
   token: string | null,
-  timeoutMs = DAEMON_HEALTH_DEADLINE_MS,
-): Promise<DoctorDaemonHealth | null> {
+  timeoutMs = DAEMON_OBSERVATION_DEADLINE_MS,
+): Promise<DaemonObservation | null> {
   if (token === null) return null;
   const controller = new AbortController();
   let timeout!: ReturnType<typeof setTimeout>;
   const deadline = new Promise<never>((_, reject) => {
     timeout = setTimeout(() => {
       controller.abort();
-      reject(new Error("Daemon health check timed out"));
+      reject(new Error("Daemon identity observation timed out"));
     }, timeoutMs);
   });
   try {
     return await Promise.race([
       (async () => {
-        const res = await fetchFn(`http://127.0.0.1:${port}/health`, {
+        const res = await fetchFn(`http://127.0.0.1:${port}/health/observe`, {
           headers: { Authorization: `Bearer ${token}` },
           signal: controller.signal,
         });
-        const health = await res.json() as DoctorDaemonHealth;
-        return (res.ok && health.status === "ok")
-          || isStagedPostgreSqlHealth(res.status, health)
-          ? health
-          : null;
+        return parseDaemonObservation(res.status, await res.json());
       })(),
       deadline,
     ]);
@@ -201,11 +187,11 @@ function readDoctorDaemonToken(deps: DoctorDeps): string | null {
   }
 }
 
-async function readDoctorAuthenticatedHealth(
+async function readDoctorAuthenticatedObservation(
   deps: DoctorDeps,
   port: number,
-): Promise<DoctorDaemonHealth | null> {
-  return readRecognizedDaemonHealth(
+): Promise<DaemonObservation | null> {
+  return readDaemonObservation(
     deps.fetch,
     port,
     readDoctorDaemonToken(deps),
@@ -220,52 +206,45 @@ type ExpectedDaemonIdentity = Readonly<{
   runtimeDigest: string;
 }>;
 
-function daemonHealthMatchesIdentity(
-  health: DoctorDaemonHealth | null,
+function daemonObservationMatchesIdentity(
+  observation: DaemonObservation,
   identity: ExpectedDaemonIdentity,
   platform: NodeJS.Platform,
 ): boolean {
-  return health !== null
-    && health.pid === identity.pid
-    && health.version === identity.version
-    && (health.storageBackend ?? "sqlite") === identity.storageBackend
-    && daemonEntrypointMatches(health.entrypoint, identity.entrypoint, platform)
-    && health.runtimeDigest === identity.runtimeDigest;
+  return observation.pid === identity.pid
+    && observation.version === identity.version
+    && observation.storageBackend === identity.storageBackend
+    && daemonEntrypointMatches(observation.entrypoint, identity.entrypoint, platform)
+    && observation.runtimeDigest === identity.runtimeDigest;
 }
 
 /**
- * Build the identity doctor will require from token-authenticated health
- * before trusting storage readiness. The PID comes from authenticated health;
- * every remaining field is the identity this installation expects. Peer
+ * Build the identity doctor requires from token-authenticated observation.
+ * The PID comes from the observation; every remaining field is the identity
+ * this installation expects. Active storage readiness is not probed. Peer
  * metadata cannot supply a missing local version or runtime digest.
  */
 function expectedDaemonIdentity(
-  initialHealthPid: number | undefined,
+  observedPid: number | undefined,
   config: DoctorConfig,
   expectedVersion: string | undefined,
   expectedEntrypoint: string,
   expectedRuntimeDigest: string | undefined,
 ): ExpectedDaemonIdentity | undefined {
   if (
-    initialHealthPid === undefined
+    observedPid === undefined
     || expectedVersion === undefined
     || expectedVersion.trim() === ""
     || expectedRuntimeDigest === undefined
     || (config.storageBackend !== "sqlite" && config.storageBackend !== "postgresql")
   ) return undefined;
   return {
-    pid: initialHealthPid,
+    pid: observedPid,
     version: expectedVersion,
     storageBackend: config.storageBackend,
     entrypoint: expectedEntrypoint,
     runtimeDigest: expectedRuntimeDigest,
   };
-}
-
-function storageReadinessFromHealth(
-  health: DoctorDaemonHealth,
-): DaemonStorageReadiness {
-  return health.status === "ok" ? "ready" : "unavailable";
 }
 
 export interface DoctorRunOptions {
@@ -617,8 +596,7 @@ function packagedRuntimePath(): string {
 async function checkPassiveLearning(
   results: CheckResult[],
   options: Required<DoctorRunOptions>,
-  daemonHealthy: boolean,
-  daemonStorageReadiness: DaemonStorageReadiness,
+  daemonIdentityVerified: boolean,
   repairBlocked: boolean,
   publicationBlocked: boolean,
   homeDir: string,
@@ -642,41 +620,30 @@ async function checkPassiveLearning(
   // Capture check
   if (stats.captured === 0) {
     results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: "No events captured — passive learning may not be active\n     Fix: run 'lcm install' to re-register hooks, then use a Bash or Edit tool to trigger the first event capture; re-run /lcm-doctor to verify" });
-  } else if (
-    stats.unprocessed > 0
-    && daemonHealthy
-    && daemonStorageReadiness === "unavailable"
-  ) {
-    results.push({
-      name: "events-capture",
-      category: "Passive Learning",
-      status: "warn",
-      message: `${stats.captured} events (${stats.unprocessed} unprocessed) — daemon is up but storage is unavailable; the queue cannot drain until storage is healthy`,
-    });
-  } else if (stats.unprocessed > 0 && !daemonHealthy) {
+  } else if (stats.unprocessed > 0 && !daemonIdentityVerified) {
     results.push({ name: "events-capture", category: "Passive Learning", status: "warn",
       message: `${stats.captured} events (${stats.unprocessed} unprocessed) — daemon runtime identity is unverified; restore authenticated daemon health before expecting queue drain. Run: lcm daemon restart` });
   } else if (stats.unprocessed >= PASSIVE_BACKLOG_WARN_THRESHOLD) {
     const sidecarCount = stats.sidecarsWithUnprocessed ?? 0;
     const orphanCount = stats.orphanedSidecarsWithUnprocessed ?? 0;
-      const scope = sidecarCount > 0
-        ? ` across ${sidecarCount} project sidecar${sidecarCount === 1 ? "" : "s"}`
-        : "";
-      const orphanNote = orphanCount > 0
-        ? `; ${orphanCount} sidecar${orphanCount === 1 ? "" : "s"} missing metadata`
-        : "";
-      if (orphanCount > 0 && orphanCount === sidecarCount) {
-        results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — project metadata is missing; lcm events promote --all can only report orphaned sidecars — remove stale orphan sidecars or trigger new activity after lcm install` });
-      } else if (orphanCount > 0) {
-        results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — daemon is up — run: lcm events promote --all for metadata-backed sidecars; orphaned sidecars need metadata repair or pruning` });
-      } else {
-        results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — daemon is up — run: lcm events promote --all` });
-      }
+    const scope = sidecarCount > 0
+      ? ` across ${sidecarCount} project sidecar${sidecarCount === 1 ? "" : "s"}`
+      : "";
+    const orphanNote = orphanCount > 0
+      ? `; ${orphanCount} sidecar${orphanCount === 1 ? "" : "s"} missing metadata`
+      : "";
+    if (orphanCount > 0 && orphanCount === sidecarCount) {
+      results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — project metadata is missing; lcm events promote --all can only report orphaned sidecars — remove stale orphan sidecars or trigger new activity after lcm install. Active storage readiness was not probed; queue draining is unverified` });
+    } else if (orphanCount > 0) {
+      results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — daemon is up — run: lcm events promote --all for metadata-backed sidecars; orphaned sidecars need metadata repair or pruning. Active storage readiness was not probed; queue draining is unverified` });
+    } else {
+      results.push({ name: "events-capture", category: "Passive Learning", status: "warn", message: `${stats.captured} events (${stats.unprocessed} unprocessed${scope}${orphanNote}) — daemon is up — run: lcm events promote --all. Active storage readiness was not probed; queue draining is unverified` });
+    }
   } else {
-    const pending = stats.unprocessed > 0
-      ? `; ${stats.unprocessed} queued for automatic daemon processing`
-      : "; queue empty";
-    results.push({ name: "events-capture", category: "Passive Learning", status: "pass", message: `${stats.captured} events captured${pending}` });
+    results.push({ name: "events-capture", category: "Passive Learning", status: stats.unprocessed > 0 ? "warn" : "pass",
+      message: stats.unprocessed > 0
+        ? `${stats.captured} events (${stats.unprocessed} unprocessed). Active storage readiness was not probed; queue draining is unverified`
+        : `${stats.captured} events captured; queue empty` });
   }
 
   // Error check
@@ -787,8 +754,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
 
     const runtimePath = packagedRuntimePath();
     const expectedRuntimeDigest = deps._expectedRuntimeDigestForTesting ?? RUNTIME_DIGEST;
-    let daemonHealthy = false;
-    let daemonStorageReadiness: DaemonStorageReadiness = "unverified";
+    let daemonIdentityVerified = false;
     let daemonPid: number | undefined;
 
     if (repairBlocked) {
@@ -804,25 +770,23 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       results.push({ name: "daemon", category: "Daemon", status: "skip", message: repairSkipMessage });
     } else {
       try {
-        const health = await readDoctorAuthenticatedHealth(deps, config.port);
+        const observation = await readDoctorAuthenticatedObservation(deps, config.port);
         const identity = expectedDaemonIdentity(
-          health?.pid, config, pkgVersion, runtimePath, expectedRuntimeDigest,
+          observation?.pid, config, pkgVersion, runtimePath, expectedRuntimeDigest,
         );
-        if (health !== null && identity !== undefined && Number.isSafeInteger(identity.pid) && identity.pid > 0
-          && daemonHealthMatchesIdentity(health, identity, deps.platform)) {
-          daemonHealthy = true;
-          daemonPid = health.pid;
-          daemonStorageReadiness = storageReadinessFromHealth(health);
-          results.push({ name: "daemon", category: "Daemon", status: daemonStorageReadiness === "ready" ? "pass" : "warn",
-            message: daemonStorageReadiness === "ready" ? "Authenticated daemon version and runtime identity verified"
-              : "Authenticated daemon identity verified; storage is unavailable" });
+        if (observation !== null && identity !== undefined
+          && daemonObservationMatchesIdentity(observation, identity, deps.platform)) {
+          daemonIdentityVerified = true;
+          daemonPid = observation.pid;
+          results.push({ name: "daemon", category: "Daemon", status: "pass",
+            message: "Authenticated daemon version and runtime identity verified; active storage readiness was not probed" });
         } else {
           results.push({ name: "daemon", category: "Daemon", status: "fail",
-            message: "Daemon health or installed runtime identity could not be authenticated. Run: lcm daemon restart" });
+            message: "Daemon observation or installed runtime identity could not be authenticated. Run: lcm daemon restart" });
         }
       } catch {
         results.push({ name: "daemon", category: "Daemon", status: "fail",
-          message: `Daemon health is unavailable or timed out. ${mapDaemonRefusalToRemediation("ambiguous").message}` });
+          message: `Daemon observation is unavailable or timed out. ${mapDaemonRefusalToRemediation("ambiguous").message}` });
       }
     }
 
@@ -959,8 +923,7 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     await checkPassiveLearning(
       results,
       options,
-      daemonHealthy,
-      daemonStorageReadiness,
+      daemonIdentityVerified,
       repairBlocked,
       publicationBlocked,
       deps.homedir,

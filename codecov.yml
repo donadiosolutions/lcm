@@ -13,6 +13,7 @@ component_management:
         # #1088 keeps unsupported connector-list-format admission CLI-owned.
         # #978 keeps compact replacement runtime-digest admission CLI-owned.
         # #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
+        # #1201 keeps diagnostic-only identity admission CLI-owned.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
@@ -80,6 +81,7 @@ component_management:
         # Includes native adapters and the #726/#737 publication-diagnostic flow.
         # Claude's bounded session-completion acknowledgment remains hook-owned.
         - "src/hooks/"
+    # #1201 keeps process-only observation, its parser/client, and route allowlist here.
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
@@ -294,6 +296,7 @@ component_management:
         # #1087 bounds canonical metadata publication in this existing owner.
         # #1091 preserves completion evidence across publication failures here.
         - "^src/worktree-reconciliation\\.ts$"
+    # #1201 keeps doctor identity observation and unverified queue readiness here.
     - component_id: "unit-diagnostics"
       name: "Unit - Diagnostics"
       paths:
