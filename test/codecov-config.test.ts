@@ -92,6 +92,7 @@ const expectedComponents = [
   {
     component_id: "unit-hooks",
     name: "Unit - Hooks",
+    // #1225 composes SessionStart pruning with append admission in this owner.
     paths: ["src/hooks/"],
   },
   {
