@@ -1,135 +1,117 @@
 # Coordination, recovery and completion
 
-Read [the shared contract](../SKILL.md) and preserve the caller's run identity.
+Apply [the run contract](../SKILL.md); preserve caller identity and budgets.
 
-## Scheduling and readiness
+## Directives
 
-Maintain up to `MAX_ACTIVE_OWNERS` productive item owners. Fill slots promptly
-from actionable inventory; park an item only when external input/dependencies
-prevent any useful work. Parking releases capacity but is not completion. Resume
-parked owners only after the root readmits them to a slot.
+Admit at most `MAX_ACTIVE_OWNERS` productive owners. Parking releases a productive
+slot, not necessarily a runtime thread; account for the root, leaves and retained
+workers against actual runtime capacity. Park only when external input/dependencies
+prevent useful work. Cleared blockers require root readmission before work resumes.
+Neither parking nor an empty worker queue proves completion.
 
-Use descriptions, acceptance criteria and likely components to reduce obvious
-overlap. This is best-effort: do not delay ready work seeking a perfect schedule,
-reserve source files, or wait to merge a ready PR for convenience. Owners handle
-conflicts in their own workspaces. Respect runtime capacity across owners/leaves.
-
-The root also remains the caller's readiness coordinator. At internal merge,
-external prerequisite updates, relevant worker events and recovery, evaluate each
-affected dependency's caller-defined evidence requirement. Record acceptance,
-source revision and rationale before changing a waiting item to ready. The shared
-scheduler consumes those recorded decisions; it never invents domain acceptance.
-Read-only preparation may precede readiness, but implementation must wait for the
-caller-required merged prerequisites and acceptance evidence. Newly ready members
-stay in the same inventory/run. Blocked edges do not block unrelated ready items.
-
-## Events and watchdog
-
-At dispatch establish a supported event path that actually wakes the root, and
-verify the first event is received/handled. A message written only to a leaf
-transcript is insufficient. If delivery requires an active event wait, retain it
-while workers run; do not end the turn and assume an idle task will wake.
-
-Wake promptly for caller phase-barrier completion, readiness changes, publication,
-merge readiness/completion, parking, blockers, escalation, worker failure,
-necessary deconfliction and environment failure. Refill slots immediately rather
-than waiting for the watchdog. Avoid continuous polling of healthy workers.
-
-Separately arrange a supported `WATCHDOG_MINUTES` wake-up or active-wait deadline
-with run identity and record location. Reuse it on recovery and stop it after final
-audit. Do not create a separate autonomous goal. Bounded runtime wait returns do
-not themselves require repeated polling or user reports. Each actual watchdog pass:
-
-1. Run the caller's watchdog environment checks.
-2. Reconcile active owners, completion, failures, stalls and parked blockers.
-3. Reevaluate relevant prerequisite evidence and replenish slots.
-4. Update the permitted tracker checkpoint and provide a concise progress report.
-
-Track fixed inventory total, waiting, active, completed/delivered, parked/blocked,
-open/merged PRs, escalated items, security-routed items, deferred follow-ups and
-remaining items, plus caller-specific counters. Keep follow-ups outside the original
-denominator. A zero-worker queue is not completion.
+Overlap scheduling is best-effort: dispatch ready work and merge ready PRs promptly,
+without perfect conflict avoidance or file reservations. Owners resolve conflicts
+in their own workspaces. Read-only preparation may precede readiness; implementation
+waits for caller-required merged prerequisites and acceptance evidence.
 
 Only the root communicates with the user. Owners send questions with context,
-impact, options and any reversible default to the root. Continue unrelated work
-while waiting; do not invent irreversible decisions. Coordinator events are not
-automatically user notifications. Use any authorized push mechanism only for
-decisions, major blockers, repeated failures or significant milestones, not routine
-worker chatter. Watchdog reports remain concise and separate from push alerts.
+impact, options and a reversible default where available. Do not invent irreversible
+decisions; progress independent work. Authorized push notifications are for decisions,
+major blockers, repeated failures or milestones, not routine worker chatter.
 
-## Environment operations
+## Scheduling and events
 
-Use only the operations and executors supplied by the caller for startup,
-observed target advance/post-merge convergence, watchdog and final audit. No
-environment operations means there is no implicit global refresh or service check.
-Apply the declared flock contract before protected operations; read-only checks
-need no lock unless specified, but repairs need their declared ownership.
+At dispatch establish a supported event path and verify its first delivery. Where
+available, `send_message` delivers to a running recipient without starting a turn;
+`followup_task` starts an existing worker's next task. Use `wait_agent` for active
+waiting. Call collaboration tools directly using their live-schema recipients, not
+inside an execution wrapper. Ending the root turn is not a wake-up mechanism.
 
-Record a fixed batch of observed merges and pending target advances. Before a
-refresh, acquire any declared resource, re-read the target SHA, verify the batch's
-ancestry and run the caller's exact artifact/verification procedure. Record the
-verified revision and evidence before release. If newer events arrive during the
-operation, retain them and converge to the newest observed target afterward.
-Never mark later merges installed using evidence for an earlier artifact.
+Wake promptly on barriers, readiness changes, publication/merge requests or results,
+parking, blockers, escalation, failure, deconfliction and environment failure.
+Reevaluate affected dependency edges after internal merges, external updates and
+recovery; record accepted evidence, source revision and rationale before admission.
+The scheduler consumes caller-defined acceptance, never invents it. Refill slots
+on events rather than waiting for the watchdog; do not busy-poll healthy workers.
 
-Contention defers only the protected operation. Failed verification preserves
-original logs and pending recovery; unrelated work can continue, but final audit
-cannot silently waive the caller's environment gate. A lower-concurrency retry
-may diagnose contention, not prove the original failure fixed. Never weaken
-assertions/timeouts/skips or CI to manufacture success. Shared-service authority
-does not authorize repairs to unrelated user infrastructure.
+Maintain one supported `WATCHDOG_MINUTES` wake-up or active-wait deadline carrying
+run identity and record location. Reuse it on recovery, without creating another
+autonomous goal. Shorter runtime wait returns are neither watchdog passes nor
+reasons for user reports. At each actual watchdog pass:
 
-## Durable evidence and recovery
+1. Run caller-supplied environment checks and reconcile owners, results, failures,
+   stalls and parked blockers.
+2. Reevaluate prerequisite evidence and refill productive slots.
+3. Update the permitted checkpoint and give a concise progress report.
 
-Maintain workflow-local scratch plus the caller's permitted tracker channel. Store
-repository/target, scope freeze, coordinator identity, worker IDs/routes/settings,
-worktrees/branches, readiness/ownership, candidates, completed/incomplete rounds,
+Track fixed total, waiting/active/delivered/parked/blocked/remaining items, open and
+merged PRs, escalations, security routes and deferred follow-ups, plus caller
+counters. Keep follow-ups outside the original denominator.
+
+## Environment procedure
+
+Run only caller-defined startup, target-advance, watchdog and final operations,
+using their authorized executors and declared locks. No supplied operations means
+no implicit refresh. Read-only checks need no lock unless specified; repairs do.
+
+For refresh, record a batch of observed merges/advances, acquire required ownership,
+re-read target SHA and verify the batch's ancestry. Execute the caller's exact
+artifact/verification procedure and record verified revision/evidence before
+release. Retain newer events and converge afterward; never certify later merges
+with an earlier artifact's evidence.
+
+Contention defers only the protected action. Failed verification retains original
+logs and pending recovery; it blocks required final environment gates, not unrelated
+work. Lower-concurrency retries diagnose contention, not proof of a fix. Never
+weaken assertions, timeouts, skips or CI to obtain a pass. Shared-service authority
+does not authorize unrelated infrastructure repairs.
+
+## Checkpoint and recovery procedure
+
+Persist repository/target, frozen scope, root and worker IDs/routes/settings,
+workspaces/branches, ownership/readiness, candidate SHAs, complete/incomplete rounds,
 reports/adjudications, P2 state, PRs, environment evidence and pending events.
-Keep credentials out. Public checkpoints must not disclose private absolute host
-paths; use shareable evidence or host/task identity plus relative scratch location.
+Use scratch plus only the caller's allowed tracker channel; preserve unrelated
+tracker content. Public records use host/task identity and relative scratch paths,
+not private absolute paths or secrets. Update meaningful transitions; successors
+must locate evidence without guessing. Channel changes link prior evidence without
+resetting run identity or budgets.
 
-Update checkpoints at meaningful transitions. A successor must be able to locate
-evidence without guessing paths. Preserve tracker content outside the permitted
-channel. With no tracker use scratch only. On checkpoint-channel change, record
-the new identity and link prior evidence; do not reset the run or budgets.
+Before retrying an uncertain write, read back authoritative issue/ownership, worker,
+PR-head, follow-up and environment state. Avoid duplicate workers, trackers,
+comments, closures and merges. Recover the interrupted gate in the same workspace;
+for unchanged SHA retry only absent/invalid reports, otherwise repeat all reviews.
+A merged PR alone does not prove its required gates passed.
 
-Before retrying interrupted writes, reconcile issue ownership/state, existing
-workers, PR heads, follow-ups and environment state. Read back uncertain outcomes
-to avoid duplicate owners, trackers, comments, follow-ups, closures and merges.
-Recover the interrupted gate with the same workspace and candidate. Retry only
-missing/invalid reports for an unchanged SHA; new SHA means complete re-review.
-Supersede failed workers explicitly so they cannot keep mutating concurrently.
+Silence, wait timeout or a lost watcher is not worker failure or completion.
+Reconcile live state, durable logs and exit status; reattach a supported watcher.
+Do not interrupt healthy work to reclaim capacity. Supersede a failed worker only
+after ensuring it cannot keep mutating; preserve its evidence for replacement.
+Repair missing bookkeeping from authoritative evidence without repeating proven
+gates; rerun only absent/invalid evidence.
 
-Expired watchers/lost handles are not completion. Reconcile process state, durable
-logs and exit status; attach a supported watcher as needed. Missing detector fields
-are evidence gaps: reconcile authoritative PR/CI and review artifacts, repair
-bookkeeping without rerunning established gates, and rerun only absent/invalid
-evidence. A merged PR alone does not prove its required checks/reviews passed.
-
-Report externally closed items to the caller for disposition validation. A bare
-closed state cannot prove acceptance. Recheck follow-up classification and valid
-resolution, preserving real fixes/canonical successors instead of reopening valid
-closures for a counter. New discoveries follow repository issue policy and remain
-outside the inventory unless the user explicitly revises scope.
+Validate external closures against caller dispositions, not bare closed state.
+Preserve verified fixes, duplicates and canonical successors rather than reopening
+resolved work for counters. New discoveries follow repository issue policy and
+remain outside inventory unless explicitly admitted.
 
 ## Final audit
 
-The root combines shared and caller-specific evidence before reporting completion:
+Even empty inventory requires all applicable predicates:
 
-- Every inventory member has exactly one justified outcome; caller-authorized
-  blocked accounting is distinguished from delivered work. Temporary parking alone
-  is never a terminal result.
-- All delivered changes are present on the chosen current target, with exact-head
-  reviews/checks and required source-resolution evidence.
-- Every deferred finding is actionable, properly linked/classified or verifiably
+- Each item has one justified outcome. Distinguish delivered from caller-authorized
+  blocked accounting; temporary parking is not terminal.
+- Verify the **requested endpoint**: draft/PR delivery at its exact head, or merged
+  delivery on the current selected target. Require the corresponding reviews,
+  checks and source-resolution evidence; never turn no-merge scope into a merge.
+- Deferred findings are actionable, correctly linked/classified or verifiably
   resolved, and outside the fixed inventory.
-- Tracker/ownership/readiness/counters and recovery evidence reconcile; no active
-  owner is still working on an item declared terminal.
-- Every supplied environment and final predicate has fresh evidence. Missing
-  or unimplemented caller gates are pending, never implicitly successful.
+- Tracker, ownership, readiness, counters and recovery evidence agree; no worker
+  still productively owns an item declared terminal.
+- Every supplied environment/final gate has fresh evidence; missing gates remain
+  pending, not implicitly successful.
 
-Even an empty inventory receives this audit. Return item outcomes, delivered and
-blocked counts, remaining work, escalations, follow-ups, target SHA and any supplied
-environment results. Let the caller apply its own tracker-closure authorization
-and domain criteria; do not independently close an arbitrary tracker. Stop the
-run's watchdog only when the final audit and permitted terminal accounting finish.
+Report outcomes, delivered/blocked counts, remaining work, escalations, follow-ups,
+target SHA and supplied environment results. Apply only caller-authorized tracker
+closure. Stop the watchdog after final audit and permitted terminal accounting.
