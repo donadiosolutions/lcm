@@ -17,9 +17,17 @@ With the default SQLite backend, all storage is on your machine:
   parsed or rewritten. Missing metadata is created; malformed or non-object
   metadata is rebuilt; valid metadata with the current project path is left
   unchanged; and valid metadata with a different path is replaced atomically
-  with mode `0600`. If metadata restored as another user blocks initialization,
-  correct its ownership or remove `meta.json`; missing metadata is regenerated
-  on the next initialization. Separately, final successful ingest and compact
+  with mode `0600`. The serialized UTF-8 representation, including indentation
+  and its terminating newline, must also fit within 1 MiB. If publication would
+  exceed that limit, LCM reports `project metadata exceeds size limit` before
+  writing and preserves an existing `meta.json` unchanged.
+
+  To recover, inspect `~/.lcm/projects/{hash}/meta.json` and reduce optional
+  metadata until the serialized file fits. You can instead back up and remove
+  only `meta.json` so LCM regenerates it on the next initialization; the project
+  history in `db.sqlite` is preserved. If metadata restored as another user
+  blocks initialization, correct its ownership or use the same metadata-only
+  recovery. Separately, final successful ingest and compact
   timestamp updates use the same size, regular-file, and single-link checks as
   a best-effort write, and require a matching owner when the process user ID is
   available. Malformed, oversized, linked, non-regular, or owner-mismatched
@@ -41,11 +49,20 @@ With the default SQLite backend, all storage is on your machine:
   closed. Promotion database work and a metadata update completed before a
   post-publication failure are not rolled back. The guarantee begins when the
   metadata phase acquires this chain, so an independently valid private
-  hierarchy substituted before that phase can be admitted. Pathname operations
-  inside the atomic writer also leave a bounded race where a replacement can
-  receive a write before the postcondition reports failure. These checks do not
-  claim detection of every transient replacement. A missing-file race has no
-  sampled parent identity and remains outside this guarantee.
+  hierarchy substituted before that phase can be admitted. When promotion
+  retains the metadata parent, the atomic writer reasserts that parent after
+  creating its temporary file, before writing content, and again immediately
+  before rename. It also requires the temporary pathname to still identify the
+  regular file it created. Observed drift at either point refuses publication.
+  These checks are bounded observations rather than an atomic pin on the parent
+  pathname: they do not detect every transient replacement or prevent a change
+  during rename. If rename returns and the following parent check fails, the
+  error outcome is `published`; this means rename completed, not that it reached
+  the retained directory. If rename throws and the parent check also fails, the
+  outcome is `unknown`. Either outcome means bytes may have been published and
+  must not authorize automatic rollback or retry. Calls without a retained
+  parent, including a missing-file race with no sampled parent identity, remain
+  outside this guarantee.
 - **`~/.lcm/projects/{hash}/sensitive-patterns.txt`** — Per-project sensitive patterns (if configured).
 - **`~/.lcm/config.json`** — Global configuration including the optional `security.sensitivePatterns` array.
 - **`~/.lcm/daemon.pid`** — Daemon process ID (transient).

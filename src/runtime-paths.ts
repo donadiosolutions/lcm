@@ -436,9 +436,17 @@ function openDirectory(
         closeSync(fd);
       },
     };
-  } catch (error) {
-    closeSync(fd);
-    throw error;
+  } catch (authenticationError) {
+    try {
+      closeSync(fd);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [authenticationError, cleanupError],
+        "directory authentication and cleanup failed",
+        { cause: authenticationError },
+      );
+    }
+    throw authenticationError;
   }
 }
 
