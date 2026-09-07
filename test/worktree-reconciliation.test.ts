@@ -6490,6 +6490,7 @@ describe("worktree reconciliation", () => {
       `external-${site.replaceAll(" ", "-")}-patterns.txt`,
     );
     let authenticationActive = site === "snapshot" || site === "merge target";
+    let beforeSourcePatternsMergeObserved = false;
     let refusedPath = patternPath;
     const activateAuthenticationFault = (archivePath?: string) => {
       authenticationActive = true;
@@ -6502,6 +6503,9 @@ describe("worktree reconciliation", () => {
     const reconcile = () => reconcileWorktrees(main, {
       now: new Date("2026-09-06T12:00:00Z"),
       _observer: (event, _source, detailPath) => {
+        if (event === "before-source-patterns-merge") {
+          beforeSourcePatternsMergeObserved = true;
+        }
         if (site === "merge source" && event === "before-source-patterns-merge") {
           activateAuthenticationFault();
         }
@@ -6526,6 +6530,9 @@ describe("worktree reconciliation", () => {
       )).toThrow(expectedError);
     } else {
       expect(reconcile).toThrow(expectedError);
+    }
+    if (site === "snapshot") {
+      expect(beforeSourcePatternsMergeObserved).toBe(false);
     }
 
     const after = statSync(refusedPath);
