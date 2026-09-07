@@ -971,6 +971,115 @@ describe("Codex Responses zero-tools gateway", () => {
     expect(responseBody).not.toContain("GPT-5.3-Codex-Spark");
   });
 
+  it.each([
+    ["null body", () => new Response(null, { status: 200 })],
+    ["wrong media type", () => new Response("upstream body", {
+      status: 200,
+      headers: { "content-type": "text/plain" },
+    })],
+  ] as const)("latches upstream-stream for an accepted HTTP 200 %s", async (_label, makeResponse) => {
+    const gateway = await createCodexResponsesGateway({ prompt: PROMPT, _fetch: async () => makeResponse() });
+    gateways.push(gateway);
+
+    const response = await fetchGateway(gateway);
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("codex responses gateway request failed\n");
+    expect(gateway.requestAccepted).toBe(true);
+    expect(gateway.requestCompleted).toBe(false);
+    expect(gateway.upstreamFailureCategory).toBe("upstream-stream");
+  });
+
+  it.each([
+    ["malformed SSE", "event: response.completed\ndata: not-json\n\n"],
+    ["incomplete SSE", "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\"}\n\n"],
+  ] as const)("latches upstream-stream for an accepted HTTP 200 %s", async (_label, body) => {
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+    gateways.push(gateway);
+
+    await fetchGateway(gateway).then(async response => {
+      expect(response.status).toBe(502);
+      expect(await response.text()).toBe("codex responses gateway request failed\n");
+    }).catch(() => undefined);
+    expect(gateway.requestAccepted).toBe(true);
+    expect(gateway.requestCompleted).toBe(false);
+    expect(gateway.upstreamFailureCategory).toBe("upstream-stream");
+  });
+
+  it("latches upstream-stream when an accepted HTTP 200 reader fails", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error("upstream stream failure"));
+      },
+    });
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+    gateways.push(gateway);
+
+    const response = await fetchGateway(gateway);
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("codex responses gateway request failed\n");
+    expect(gateway.requestAccepted).toBe(true);
+    expect(gateway.requestCompleted).toBe(false);
+    expect(gateway.upstreamFailureCategory).toBe("upstream-stream");
+  });
+
+  it("preserves a successful HTTP 200 response with no content type", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(COMPLETED_SSE));
+        controller.close();
+      },
+    });
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response(body, { status: 200 }),
+    });
+    gateways.push(gateway);
+
+    const response = await fetchGateway(gateway);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(COMPLETED_SSE);
+    await expect(gateway.waitForCompletion()).resolves.toBeUndefined();
+    expect(gateway.requestCompleted).toBe(true);
+    expect(gateway.upstreamFailureCategory).toBeUndefined();
+  });
+
+  it("does not classify an accepted stream aborted by gateway close", async () => {
+    let releaseRead!: () => void;
+    const readPending = new Promise<void>(resolve => { releaseRead = resolve; });
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        await readPending;
+        controller.close();
+      },
+    });
+    const gateway = await createCodexResponsesGateway({
+      prompt: PROMPT,
+      _fetch: async () => new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    });
+    gateways.push(gateway);
+    const responsePending = fetchGateway(gateway).catch(() => undefined);
+    await vi.waitFor(() => expect(gateway.requestAccepted).toBe(true));
+    await gateway.close();
+    releaseRead();
+    await responsePending;
+    expect(gateway.upstreamFailureCategory).toBeUndefined();
+  });
+
   it("classifies only the exact structured Spark Lite rejection and keeps the response private", async () => {
     const canary = "Bearer upstream-canary";
     const fetchImpl = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({

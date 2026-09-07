@@ -93,7 +93,8 @@ export type CodexResponsesGatewayFailureCategory =
   | "usage"
   | "authentication"
   | "model-protocol"
-  | "upstream-request";
+  | "upstream-request"
+  | "upstream-stream";
 
 export type CodexResponsesGateway = {
   /** Base URL ending at the private capability path; append `/responses`. */
@@ -104,7 +105,7 @@ export type CodexResponsesGateway = {
   readonly requestAccepted: boolean;
   /** True only after the complete successful upstream SSE stream was relayed. */
   readonly requestCompleted: boolean;
-  /** Optional provider failure category latched from an upstream HTTP status. */
+  /** Optional provider failure category latched from an upstream failure. */
   readonly upstreamFailureCategory?: CodexResponsesGatewayFailureCategory;
   /** Wait for the one accepted request and complete upstream stream. */
   waitForCompletion(): Promise<void>;
@@ -794,6 +795,7 @@ export async function createCodexResponsesGateway(
     request.on("close", onRequestClose);
 
     let bodyReadAttempted = false;
+    let upstreamSucceeded = false;
     let upstreamBody: ReadableStream<Uint8Array> | null | undefined;
     try {
       rejectDuplicateRequestHeaders(request);
@@ -837,6 +839,7 @@ export async function createCodexResponsesGateway(
         }
         throw new GatewayInputError(502);
       }
+      upstreamSucceeded = true;
       if (upstream.body === null) {
         throw new GatewayInputError(502);
       }
@@ -855,6 +858,8 @@ export async function createCodexResponsesGateway(
       requestCompleted = true;
       finishCompletion();
     } catch (error) {
+      const wasAborted = controller.signal.aborted;
+      if (upstreamSucceeded && !wasAborted) upstreamFailureCategory = "upstream-stream";
       if (!bodyReadAttempted) {
         try {
           request.resume();

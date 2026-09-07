@@ -1024,6 +1024,11 @@ prompts, credentials, and provider response details are omitted. Codex usage
 and authentication failures observed as upstream 429 and 401 responses from
 LCM's loopback Responses gateway use the same safe categories without exposing
 provider detail.
+After an accepted upstream HTTP 200 response, missing bodies, invalid media
+types, malformed or incomplete SSE, reader failures, and premature EOF use a
+separate upstream stream category. Retry later or choose another available
+model when this category is reported; client disconnects and gateway shutdown
+remain cancellation outcomes.
 
 The intersection applies only to `llm.reasoningEffort` stored with
 `llm.provider: "auto"`, because that value must work for either process provider.
@@ -1171,8 +1176,11 @@ This behavior has no configuration option.
 Upstream authentication and usage failures retain their safe categories. The
 gateway also distinguishes a confirmed Spark protocol rejection from a generic
 upstream request failure, so neither is mislabeled as advice to upgrade Codex.
-Error bodies and provider diagnostics are never shown. Retry later or select a
-different available model when either safe upstream failure is reported.
+Failures after an accepted HTTP 200 response are reported as an upstream stream
+failure, including a missing body, wrong media type, malformed or incomplete
+SSE, reader failure, or clean EOF before completion. Error bodies and provider
+diagnostics are never shown. Retry later or select a different available model
+when either safe upstream failure is reported.
 
 ```json
 {
