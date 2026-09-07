@@ -1885,41 +1885,80 @@ function withPublicationAdmission<T>(homeDir: string, callback: (admission: Publ
   // recursive directory hardening would chmod the home before validation.
   const topology = openHomeTopology(homeDir);
   let bootstrapLock: BootstrapLock | undefined;
+  let outcome:
+    | Readonly<{ succeeded: true; value: T }>
+    | Readonly<{ succeeded: false; error: unknown }>;
   try {
     bootstrapLock = acquireBootstrapLock(homeDir, topology);
     const rootExists = lstatIfPresent(lcmHomeDir(homeDir)) !== undefined;
     if (rootExists) {
-      return withBackendPublicationConsumerLock(homeDir, (lockToken) => {
-        // Publication admission is deliberately the outermost durable
-        // boundary. The callback keeps the acquired token through every
-        // root/config/source witness in the established-root case.
-        assertBackendPublicationConsumerAccess({ homeDir, lockToken });
-        const parentAuthority = classifyHomeParent(topology, homeDir, true);
-        return callback({
+      outcome = {
+        succeeded: true,
+        value: withBackendPublicationConsumerLock(homeDir, (lockToken) => {
+          // Publication admission is deliberately the outermost durable
+          // boundary. The callback keeps the acquired token through every
+          // root/config/source witness in the established-root case.
+          assertBackendPublicationConsumerAccess({ homeDir, lockToken });
+          const parentAuthority = classifyHomeParent(topology, homeDir, true);
+          return callback({
+            topology,
+            parentAuthority,
+            withFinalLock: (nested) => nested(lockToken),
+          });
+        }),
+      };
+    } else {
+      const parentAuthority = classifyHomeParent(topology, homeDir, false);
+
+      // There is no root-backed publication state to consume while the root is
+      // absent. The authenticated bootstrap lock is the interprocess boundary
+      // for this phase; withFinalLock performs the mandatory handoff as soon as
+      // the active root appears.
+      outcome = {
+        succeeded: true,
+        value: callback({
           topology,
           parentAuthority,
-          withFinalLock: (nested) => nested(lockToken),
-        });
-      });
+          withFinalLock: (nested) => withBackendPublicationConsumerLock(homeDir, (lockToken) => {
+            assertBackendPublicationConsumerAccess({ homeDir, lockToken });
+            return nested(lockToken);
+          }),
+        }),
+      };
     }
-
-    const parentAuthority = classifyHomeParent(topology, homeDir, false);
-
-    // There is no root-backed publication state to consume while the root is
-    // absent. The authenticated bootstrap lock is the interprocess boundary
-    // for this phase; withFinalLock performs the mandatory handoff as soon as
-    // the active root appears.
-    return callback({
-      topology,
-      parentAuthority,
-      withFinalLock: (nested) => withBackendPublicationConsumerLock(homeDir, (lockToken) => {
-        assertBackendPublicationConsumerAccess({ homeDir, lockToken });
-        return nested(lockToken);
-      }),
-    });
-  } finally {
-    try { bootstrapLock?.close(); } finally { topology.home.close(); topology.parent.close(); }
+  } catch (error) {
+    outcome = { succeeded: false, error };
   }
+
+  const cleanupErrors: unknown[] = [];
+  for (const cleanup of [
+    () => bootstrapLock?.close(),
+    () => topology.home.close(),
+    () => topology.parent.close(),
+  ]) {
+    try {
+      cleanup();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+
+  if (cleanupErrors.length === 0) {
+    if (outcome.succeeded) return outcome.value;
+    throw outcome.error;
+  }
+  if (outcome.succeeded) {
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    throw new AggregateError(
+      cleanupErrors,
+      "publication admission descriptor cleanup failed",
+    );
+  }
+  throw new AggregateError(
+    [outcome.error, ...cleanupErrors],
+    "publication admission and descriptor cleanup failed",
+    { cause: outcome.error },
+  );
 }
 
 /**

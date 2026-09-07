@@ -597,6 +597,8 @@ describe("Codecov configuration", () => {
       ["src/home-parent-auth.ts", "unit-configuration-security"],
       // #1041 preserves bootstrap directory authentication errors when
       // descriptor cleanup also fails in this existing owner.
+      // #1144 preserves admission callback failures while retaining ordered
+      // bootstrap-lock, home, and parent descriptor cleanup evidence here.
       ["src/runtime-paths.ts", "unit-configuration-security"],
       // #1195 strict module-relative asset resolution retains this owner.
       ["src/runtime-root.ts", "unit-configuration-security"],

@@ -310,6 +310,54 @@ function legacyHome(base = tmpdir()): { home: string; legacy: string; next: stri
   return { home, legacy, next: lcmHomeDir(home) };
 }
 
+function admissionDescriptorPaths(home: string): { lock: string; home: string; parent: string } {
+  return {
+    lock: join(home, ".lcm-root-bootstrap.lock"),
+    home,
+    parent: dirname(home),
+  };
+}
+
+function trackAdmissionDescriptors(home: string): {
+  paths: { lock: string; home: string; parent: string };
+  fds: Map<string, number>;
+  closeAttempts: Map<string, number>;
+} {
+  const paths = admissionDescriptorPaths(home);
+  const fds = new Map<string, number>();
+  const fdGenerations = new Map<number, number>();
+  const admissionGenerations = new Map<string, number>();
+  const closeAttempts = new Map<string, number>();
+  fsControl.openHook = (path, fd) => {
+    const generation = (fdGenerations.get(fd) ?? 0) + 1;
+    fdGenerations.set(fd, generation);
+    if (Object.values(paths).includes(path) && !fds.has(path)) {
+      fds.set(path, fd);
+      admissionGenerations.set(path, generation);
+    }
+  };
+  fsControl.closeHook = (_path, fd) => {
+    for (const [path, capturedFd] of fds) {
+      if (capturedFd === fd && admissionGenerations.get(path) === fdGenerations.get(fd)) {
+        closeAttempts.set(path, (closeAttempts.get(path) ?? 0) + 1);
+        break;
+      }
+    }
+  };
+  return { paths, fds, closeAttempts };
+}
+
+function expectAdmissionDescriptorsClosed(tracked: ReturnType<typeof trackAdmissionDescriptors>): void {
+  for (const path of Object.values(tracked.paths)) {
+    const fd = tracked.fds.get(path);
+    expect(fd, `missing captured descriptor for ${path}`).toBeTypeOf("number");
+    expect(tracked.closeAttempts.get(path), `unexpected close attempts for ${path}`).toBe(1);
+    expect(() => fstatSync(fd!, { bigint: true })).toThrowError(
+      expect.objectContaining({ code: "EBADF" }),
+    );
+  }
+}
+
 it("accepts an overflow-owned parent only with a direct-root witness", () => {
   const home = mkdtempSync(join(tmpdir(), "lcm-runtime-overflow-witness-"));
   homes.push(home);
@@ -979,7 +1027,14 @@ describe("runtime home rename failures", () => {
     const paths = legacyHome();
     fsControl.fsyncError = Object.assign(new Error("durability failed"), { code: "EIO" });
 
-    expect(() => migrateLegacyHomeIfNeeded(paths.home)).toThrow("durability failed");
+    let failure: unknown;
+    try {
+      migrateLegacyHomeIfNeeded(paths.home);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors[0]).toMatchObject({ message: "durability failed" });
     expect(existsSync(paths.legacy)).toBe(true);
   });
 
@@ -1527,6 +1582,123 @@ describe("runtime home rename failures", () => {
     expect((failure as AggregateError & { cause?: unknown }).cause).toBe(authenticationError);
     expect(genuineParentCloses).toBe(1);
     expect(observedClosedDescriptor).toBe(true);
+  });
+
+  it("preserves an admission callback failure when bootstrap-lock cleanup also fails", () => {
+    const paths = legacyHome();
+    const tracked = trackAdmissionDescriptors(paths.home);
+    const primaryError = new Error("synthetic admission callback failure");
+    const cleanupError = new Error("synthetic bootstrap-lock cleanup failure");
+    fsControl.lstatHook = (path, stat) => {
+      if (path === paths.legacy) throw primaryError;
+      return stat;
+    };
+    fsControl.closeAfterHook = (path, fd) => {
+      if (path !== tracked.paths.lock) return;
+      expect(() => fstatSync(fd, { bigint: true })).toThrowError(
+        expect.objectContaining({ code: "EBADF" }),
+      );
+      throw cleanupError;
+    };
+
+    let failure: unknown;
+    try {
+      migrateLegacyHomeIfNeeded(paths.home);
+    } catch (error) {
+      failure = error;
+    } finally {
+      fsControl.closeAfterHook = undefined;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    const aggregate = failure as AggregateError & { cause?: unknown };
+    expect(aggregate.message).toBe("publication admission and descriptor cleanup failed");
+    expect(aggregate.errors).toEqual([primaryError, cleanupError]);
+    expect(aggregate.cause).toBe(primaryError);
+    expectAdmissionDescriptorsClosed(tracked);
+  });
+
+  it("preserves an undefined admission failure and falsy cleanup evidence in order", () => {
+    const paths = legacyHome();
+    const tracked = trackAdmissionDescriptors(paths.home);
+    const parentCleanupError = new Error("synthetic parent cleanup failure");
+    fsControl.lstatHook = (path, stat) => {
+      if (path === paths.legacy) throw undefined;
+      return stat;
+    };
+    fsControl.closeAfterHook = (path) => {
+      if (path === tracked.paths.home) throw undefined;
+      if (path === tracked.paths.parent) throw parentCleanupError;
+    };
+
+    let failure: unknown;
+    try {
+      migrateLegacyHomeIfNeeded(paths.home);
+    } catch (error) {
+      failure = error;
+    } finally {
+      fsControl.closeAfterHook = undefined;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    const aggregate = failure as AggregateError & { cause?: unknown };
+    expect(aggregate.message).toBe("publication admission and descriptor cleanup failed");
+    expect(aggregate.errors.length).toBe(3);
+    expect(aggregate.errors[0]).toBeUndefined();
+    expect(aggregate.errors[1]).toBeUndefined();
+    expect(aggregate.errors[2]).toBe(parentCleanupError);
+    expect(aggregate.cause).toBeUndefined();
+    expect(Object.hasOwn(aggregate, "cause")).toBe(true);
+    expectAdmissionDescriptorsClosed(tracked);
+  });
+
+  it("throws one exact cleanup failure after a successful no-op admission", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-admission-cleanup-only-"));
+    homes.push(home);
+    const tracked = trackAdmissionDescriptors(home);
+    const cleanupError = new Error("synthetic home cleanup failure");
+    fsControl.closeAfterHook = (path) => {
+      if (path === tracked.paths.home) throw cleanupError;
+    };
+
+    let failure: unknown;
+    try {
+      migrateLegacyHomeIfNeeded(home);
+    } catch (error) {
+      failure = error;
+    } finally {
+      fsControl.closeAfterHook = undefined;
+    }
+
+    expect(failure).toBe(cleanupError);
+    expectAdmissionDescriptorsClosed(tracked);
+  });
+
+  it("aggregates multiple cleanup failures after a successful no-op admission", () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-runtime-admission-cleanup-aggregate-"));
+    homes.push(home);
+    const tracked = trackAdmissionDescriptors(home);
+    const parentCleanupError = new Error("synthetic parent cleanup failure");
+    fsControl.closeAfterHook = (path) => {
+      if (path === tracked.paths.home) throw undefined;
+      if (path === tracked.paths.parent) throw parentCleanupError;
+    };
+
+    let failure: unknown;
+    try {
+      migrateLegacyHomeIfNeeded(home);
+    } catch (error) {
+      failure = error;
+    } finally {
+      fsControl.closeAfterHook = undefined;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    const aggregate = failure as AggregateError & { cause?: unknown };
+    expect(aggregate.message).toBe("publication admission descriptor cleanup failed");
+    expect(aggregate.errors).toEqual([undefined, parentCleanupError]);
+    expect(Object.hasOwn(aggregate, "cause")).toBe(false);
+    expectAdmissionDescriptorsClosed(tracked);
   });
 
   it("propagates a non-exclusive bootstrap-lock open failure", () => {
