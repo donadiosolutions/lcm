@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createDaemon, type DaemonInstance } from "../../../src/daemon/server.js";
 import { loadDaemonConfig } from "../../../src/daemon/config.js";
+import { openLocalTranscriptQuarantine } from "../../../src/storage/local-transcript-quarantine.js";
 import { projectDbPath, projectPaths } from "../../../src/daemon/project.js";
 import { closeLcmConnection, getLcmConnection } from "../../../src/db/connection.js";
 
@@ -24,6 +25,116 @@ describe("POST /ingest", () => {
     for (const dir of projectDirs.splice(0)) {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("archives scrubbed native records and exact links even when parsed messages were already imported", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-native-ingest-"));
+    tempDirs.push(cwd);
+    const transcriptPath = join(cwd, "session.jsonl");
+    writeFileSync(transcriptPath, [
+      { type: "metadata", secret: "NATIVE_SECRET" },
+      { message: { role: "user", content: "hello NATIVE_SECRET" } },
+    ].map(record => JSON.stringify(record)).join("\n") + "\n");
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", {
+      daemon: { port: 0 }, security: { sensitivePatterns: ["NATIVE_SECRET"] },
+    }));
+    const post = (body: object) => fetch(`http://127.0.0.1:${daemon!.address().port}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd, session_id: "native-retry", ...body }),
+    });
+    expect((await post({ messages: [{ role: "user", content: "hello NATIVE_SECRET", tokenCount: 4 }] })).status).toBe(200);
+    const imported = await post({ transcript_path: transcriptPath });
+    expect(imported.status).toBe(200);
+    expect(await imported.json()).toEqual({ ingested: 0, totalTokens: 0 });
+    const dbPath = projectDbPath(cwd);
+    const db = getLcmConnection(dbPath);
+    try {
+      const rows = db.prepare("SELECT native_payload FROM runtime_native_transcripts ORDER BY source_ordinal").all();
+      expect(rows).toHaveLength(2);
+      expect(JSON.stringify(rows)).toContain("[REDACTED]");
+      expect(JSON.stringify(rows)).not.toContain("NATIVE_SECRET");
+      expect(db.prepare("SELECT t.source_ordinal, m.content FROM runtime_native_transcript_messages AS l JOIN runtime_native_transcripts AS t ON t.transcript_id=l.transcript_id JOIN messages AS m ON m.message_id=l.message_id").all())
+        .toEqual([{ source_ordinal: 1, content: "hello [REDACTED]" }]);
+      expect(db.prepare("SELECT last_source_ordinal, imported_count FROM runtime_native_ingest_checkpoints").get())
+        .toEqual({ last_source_ordinal: 1, imported_count: 2 });
+      expect((await post({ transcript_path: transcriptPath })).status).toBe(200);
+      expect(db.prepare("SELECT count(*) AS n FROM runtime_native_transcripts").get()).toEqual({ n: 2 });
+      expect(db.prepare("SELECT count(*) AS n FROM messages").get()).toEqual({ n: 1 });
+    } finally { closeLcmConnection(dbPath); }
+  });
+
+  it("retries native persistence after its transaction fails without acknowledging partial import", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-native-failure-"));
+    tempDirs.push(cwd);
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const post = (body: object) => fetch(`http://127.0.0.1:${daemon!.address().port}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd, session_id: "native-failure", ...body }),
+    });
+    expect((await post({ messages: [{ role: "user", content: "hello", tokenCount: 1 }] })).status).toBe(200);
+    const dbPath = projectDbPath(cwd);
+    const db = getLcmConnection(dbPath);
+    const transcriptPath = join(cwd, "session.jsonl");
+    writeFileSync(transcriptPath, JSON.stringify({ message: { role: "user", content: "hello" } }) + "\n");
+    try {
+      db.exec("CREATE TRIGGER reject_native BEFORE INSERT ON runtime_native_transcripts BEGIN SELECT RAISE(ABORT, 'native failure sentinel'); END");
+      const failed = await post({ transcript_path: transcriptPath });
+      expect(failed.status).toBe(500);
+      expect(await failed.text()).not.toContain("sentinel");
+      expect(db.prepare("SELECT count(*) AS n FROM runtime_native_transcripts").get()).toEqual({ n: 0 });
+      expect(db.prepare("SELECT count(*) AS n FROM runtime_native_ingest_checkpoints").get()).toEqual({ n: 0 });
+      db.exec("DROP TRIGGER reject_native");
+      expect((await post({ transcript_path: transcriptPath })).status).toBe(200);
+      expect(db.prepare("SELECT count(*) AS n FROM runtime_native_transcripts").get()).toEqual({ n: 1 });
+      expect(db.prepare("SELECT count(*) AS n FROM messages").get()).toEqual({ n: 1 });
+    } finally { closeLcmConnection(dbPath); }
+  });
+
+  it("quarantines malformed native records as metadata and links the remaining messages", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-native-quarantine-"));
+    tempDirs.push(cwd);
+    const transcriptPath = join(cwd, "session.jsonl");
+    writeFileSync(transcriptPath, '{"malformed":"SECRET_QUARANTINE"\n' + JSON.stringify({ message: { role: "user", content: "valid" } }) + "\n");
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const response = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd, session_id: "quarantine", transcript_path: transcriptPath }),
+    });
+    expect(response.status).toBe(200);
+    const paths = projectPaths(cwd);
+    const quarantine = openLocalTranscriptQuarantine(paths.id, "claude-code");
+    try {
+      const rejected = await quarantine.list();
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0]).toMatchObject({ reason: "malformed-json", sourceOrdinal: 0 });
+      expect(JSON.stringify(rejected)).not.toContain("SECRET_QUARANTINE");
+    } finally { await quarantine.close(); }
+    const db = getLcmConnection(paths.dbPath);
+    try {
+      expect(db.prepare("SELECT imported_count, quarantined_count FROM runtime_native_ingest_checkpoints").get())
+        .toEqual({ imported_count: 1, quarantined_count: 1 });
+      expect(db.prepare("SELECT count(*) AS n FROM runtime_native_transcript_messages").get()).toEqual({ n: 1 });
+    } finally { closeLcmConnection(paths.dbPath); }
+  });
+
+  it("stores metadata-only native records without creating a parsed conversation", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-native-metadata-"));
+    tempDirs.push(cwd);
+    const transcriptPath = join(cwd, "session.jsonl");
+    writeFileSync(transcriptPath, JSON.stringify({ type: "session_meta", payload: { id: "metadata-only" } }) + "\n");
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const response = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd, session_id: "metadata-only", transcript_path: transcriptPath, client: "codex" }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ingested: 0, totalTokens: 0 });
+    const dbPath = projectDbPath(cwd);
+    const db = getLcmConnection(dbPath);
+    try {
+      expect(db.prepare("SELECT count(*) AS n FROM runtime_native_transcripts").get()).toEqual({ n: 1 });
+      expect(db.prepare("SELECT count(*) AS n FROM conversations").get()).toEqual({ n: 0 });
+    } finally { closeLcmConnection(dbPath); }
   });
 
   it("accepts messages[] as an alternative to transcript_path", async () => {

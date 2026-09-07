@@ -263,7 +263,7 @@ classification.
 
 The daemon's PostgreSQL project routes store scrubbed messages, summaries,
 promoted memories, and related repository data only after local validation and
-redaction. The PostgreSQL native-transcript repository stores only client-native JSON
+redaction. Both SQLite and PostgreSQL native-transcript repositories store only client-native JSON
 records that passed local decoding, scrubbing, residual-secret validation, and
 canonicalization. For the explicit embedded and backfill APIs, an accepted
 sanitized native record must also fit the same inclusive 10 MiB limit in
@@ -274,8 +274,10 @@ produce only bounded metadata in private local quarantine stores separated by
 project and transcript client. The client identity exists only in the opaque
 database namespace, not in quarantine rows, so identical Claude and Codex
 metadata cannot deduplicate across clients.
-Native-transcript daemon and CLI routing is not active; explicit backfill and
-adapter use are documented in
+`lcm import` and transcript-path daemon ingestion run this native backfill
+after storing parsed messages. Native failure fails the import; retry resumes
+native checkpoints even if the parsed messages already exist. Structured
+`messages` requests retain their existing parsed-message behavior. Details are in
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md).
 
 ## Secret redaction
@@ -423,15 +425,47 @@ The `Security` section of the doctor output shows:
   delimiters, including later colons, `?`, and `#`, end the redacted span, so
   text after those delimiters can remain visible. Before the first path
   separator, semicolons, commas, apostrophes, closing parentheses, and closing
-  braces remain part of an exact `file://` authority; after the path begins,
-  those characters retain their existing path and prose delimiter behavior.
-  A quote immediately before the `file` scheme establishes a quote boundary,
-  and its matching quote still terminates the URL. Before the first path
-  separator, an apostrophe inside an unquoted or double-quoted authority, or a
-  double quote inside an unquoted or apostrophe-quoted authority, remains
-  conservatively classified as authority text so a following local path is
-  redacted. Quotes after a file URL path begins, double quotes in non-file URLs
-  or structured text, and ordinary quoted local paths retain their existing
+  braces remain part of an exact `file://` authority. In a single-quoted exact
+  file URL, that includes an apostrophe matching the quote before the scheme;
+  it closes the current URL only when immediately followed by a fresh,
+  case-insensitive `file://` literal. That literal begins a separately quoted
+  nested file URL, preserving redaction of its path when the path contains
+  spaces. Otherwise, the matching apostrophe remains authority text. Before
+  the first path separator, an apostrophe inside an unquoted or double-quoted
+  authority, or a double quote inside an unquoted or apostrophe-quoted
+  authority, also remains conservatively classified as authority text so a
+  following local path is redacted. A matching double quote still closes a
+  double-quoted file URL. The existing outer-quoted query and fragment markers,
+  `?` and `#`, keep exact-file classification before the first path. Pre-path
+  whitespace resets classification. The remaining URL-ending punctuation
+  (`|`, `<`, `>`, and closing square brackets subject to the existing bracket
+  handling) ends it. After a path begins, these characters retain their
+  existing path and prose delimiter behavior, and a matching quote closes the
+  redacted path, even inside unmatched or path-wrapping brackets. The matching
+  quote also stops that file URL from hiding a later standalone local path,
+  which is redacted in the same pass. A backslash path immediately after that
+  quote is also redacted when the surrounding bracket remains unmatched:
+  `'file://host'['/private'\Users\SECRET` becomes
+  `'file://host'['<path>'<path>`. This immediate-backslash handoff also applies
+  when a matching quote closes a root-only file path outside brackets: the root
+  separators remain unchanged and the following Windows path becomes `<path>`.
+  While an exact file URL's context remains
+  active, a backslash path in that URL's own query or fragment is redacted on
+  the first pass. This includes a query or fragment following a closed quoted
+  path, with or without a closing wrapper. Whitespace and URL-ending delimiters
+  can end that context; this does not extend backslash redaction to unrelated
+  text. A public URL glued directly after the closing quote or bracket without
+  whitespace may be conservatively redacted:
+  `'file://host'['/private']https://pub.test/x` becomes
+  `'file://host'['<path>']https:<path>`. If that glued URL is followed by a
+  Windows drive path, the URL and drive path are redacted separately, as in
+  `https:<path>\<path>`. Conservative redaction can also extend through unspaced
+  query-tail continuations. Separating the following public URL with whitespace
+  preserves it byte-for-byte. Unspaced text after an apparent pathless closing
+  apostrophe can be treated as continuing authority text, so an eventual path
+  can cause conservative redaction of that later text. Whitespace-separated
+  following prose or URLs are classified normally. Double quotes in non-file
+  URLs or structured text and ordinary quoted local paths retain their existing
   boundaries. Ordinary HTTP and HTTPS URLs retain their authorities, slashes,
   and paths. In an unquoted exact
   `file://` URL with no path, a `?` or `#` outside still-open brackets ends the

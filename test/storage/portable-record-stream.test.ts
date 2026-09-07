@@ -1,3 +1,4 @@
+import { validatePortableTransferBatch } from "../../src/storage/portable-transfer.js";
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import * as portableRecordStream from "../../src/storage/portable-record-stream.js";
@@ -1847,8 +1848,25 @@ describe("portable record stream public seam", () => {
       maxRecords: 2,
       maxBytes: PORTABLE_LIMITS.maxBatchBytes,
     })), "batch-limit-exceeded");
+    // The destination must stop decoding as soon as the cumulative bound is
+    // exceeded, even when an untrusted caller supplies further records.
+    const terminal = manifest.domains.find((domain) => domain.domain === "messages")!;
+    const checkpoint = withCheckpointChecksum(prior.checkpoint, {
+      nextOrdinal: 3, recordCount: 3, prefixSha256: terminal.prefixSha256,
+      lastRecordIdentitySha256: second.identitySha256, lastRecordSha256: second.recordSha256,
+      previousCheckpointSha256: prior.checkpoint.checkpointSha256, complete: true,
+    });
+    let readBeyondByteLimit = false;
+    const poisonedTail = new Proxy({}, { get() { readBeyondByteLimit = true; throw new Error("must not decode tail"); } });
+    expect(() => validatePortableTransferBatch({
+      version: 1, manifestSha256: manifest.manifestSha256, domain: "messages",
+      records: [first, second, poisonedTail as PortableRecord],
+      framedBytes: PORTABLE_LIMITS.maxBatchBytes + 1, complete: true,
+      priorCheckpointSha256: prior.checkpoint.checkpointSha256, checkpoint,
+    }, manifest, prior.checkpoint)).toThrow("Portable transfer error: invalid-input");
+    expect(readBeyondByteLimit).toBe(false);
     expect(prior.checkpoint.nextOrdinal).toBe(1);
-  }, 120_000);
+  }, 180_000);
 
   it("rejects the first record above a lower caller byte limit without advancing the prior checkpoint", () => {
     const manifest = makeManifest();

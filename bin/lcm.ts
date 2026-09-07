@@ -41,6 +41,9 @@ import {
   projectsDir as lcmProjectsDir,
 } from "../src/runtime-paths.js";
 import type { ProgressState } from "../src/cli/progress-state.js";
+import { CliProjectStorageMissingError } from "../src/cli-storage.js";
+import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../src/storage/identity-context.js";
+import { MachineIdentityFileError } from "../src/machine-identity.js";
 import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 import { PrivateMutationLockContentionError } from "../src/private-mutation-lock.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
@@ -2553,13 +2556,13 @@ export async function runCli(
 
         const { NinjaRenderer } = await import("../src/cli/pipeline-runner.js");
         const { makeProgressState } = await import("../src/cli/progress-state.js");
-        const isTTY = process.stdout.isTTY ?? false;
-        const renderOpts = { isTTY, width: process.stdout.columns ?? 80, color: isTTY, verbose };
+        const isTTY = process.stderr.isTTY ?? false;
+        const renderOpts = { isTTY, width: process.stderr.columns ?? 80, color: isTTY, verbose };
         const compactState = makeProgressState({ phases: [
           { name: "Compact", status: "active" },
           ...(!noPromote ? [{ name: "Promote", status: "pending" } as const] : []),
         ], dryRun });
-        const compactRenderer = new NinjaRenderer({ state: compactState, renderOpts, handleSignals: false });
+        const compactRenderer = new NinjaRenderer({ state: compactState, renderOpts, handleSignals: false, output: process.stderr });
         signalHandlers.bindRenderer(compactState);
         compactRenderer.start();
         try {
@@ -2646,7 +2649,7 @@ export async function runCli(
             for (const promoteCwd of compactedProjects) {
               if (signalHandlers.draining) break;
               compactState.currentProject = sanitizeTerminalText(promoteCwd);
-              if (!isTTY || verbose) console.log(`  promoting: ${sanitizeTerminalText(promoteCwd)}...`);
+              if (!isTTY || verbose) console.error(`  promoting: ${sanitizeTerminalText(promoteCwd)}...`);
               try {
                 const promotionBody = {
                   cwd: promoteCwd,
@@ -3742,20 +3745,20 @@ export async function runCli(
         sessionCount += findAllCodexTranscripts().length;
       }
 
-      const isTTY = process.stdout.isTTY ?? false;
-      const renderOpts = { isTTY, width: process.stdout.columns ?? 80, color: isTTY, verbose };
+      const isTTY = process.stderr.isTTY ?? false;
+      const renderOpts = { isTTY, width: process.stderr.columns ?? 80, color: isTTY, verbose };
       const state = makeProgressState({
         phases: [{ name: "Import", status: "active" }],
         total: sessionCount,
         dryRun,
       });
-      const renderer = new NinjaRenderer({ state, renderOpts });
+      const renderer = new NinjaRenderer({ state, renderOpts, output: process.stderr });
 
       const providerLabel =
         provider === "codex" ? "Codex CLI" :
         provider === "all"   ? "Claude Code + Codex CLI" :
                                "Claude Code";
-      console.log(`\n  Importing ${providerLabel} sessions${all ? " (all projects)" : ""}...\n`);
+      console.error(`\n  Importing ${providerLabel} sessions${all ? " (all projects)" : ""}...\n`);
       renderer.start();
 
       const client = new DaemonClient(`http://127.0.0.1:${port}`);
@@ -3773,13 +3776,14 @@ export async function runCli(
         state.phases[0].status = "done";
         renderer.printSummary();
         const { printCodexResolutionSummary } = await import("../src/import-summary.js");
-        printCodexResolutionSummary(result);
+        printCodexResolutionSummary(result, console.error, provider);
       } else {
         const { printImportSummary } = await import("../src/import-summary.js");
-        if (dryRun) console.log("  [dry-run] No changes written.\n");
-        printImportSummary(result, { replay });
-        console.log();
+        if (dryRun) console.error("  [dry-run] No changes written.\n");
+        printImportSummary(result, { replay, log: console.error, provider });
+        console.error();
       }
+      if (result.failed > 0) exit(1);
     });
 
   // ─── promote ───────────────────────────────────────────────────────────────
@@ -3803,12 +3807,14 @@ export async function runCli(
       const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
       const { selectStorageBackendForConfig } = await import("../src/storage/backend.js");
-      const { join } = await import("node:path");
-      const { homedir } = await import("node:os");
 
       const configFile = defaultConfigPath();
       const config = loadDaemonConfig(configFile);
       selectStorageBackendForConfig(configFile, config.storage);
+      const { listCliProjects } = await import("../src/cli-storage.js");
+      const cwds = all
+        ? (await listCliProjects()).map(project => project.canonical)
+        : [process.cwd()];
       const port = config.daemon?.port ?? 3737;
       const pidFilePath = daemonPidPath();
       const daemonResult = await ensureDaemon({
@@ -3825,39 +3831,19 @@ export async function runCli(
       clearDaemonRemediationMarker();
 
       const client = new DaemonClient(`http://127.0.0.1:${port}`);
-      const { readdirSync, existsSync, readFileSync } = await import("node:fs");
-
-      if (dryRun) console.log("  [dry-run] No changes will be written.\n");
-
-      // Collect project cwds to promote
-      const cwds: string[] = [];
-      if (all) {
-        const projectsDir = lcmProjectsDir();
-        if (existsSync(projectsDir)) {
-          for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
-            if (!entry.isDirectory()) continue;
-            const metaPath = join(projectsDir, entry.name, "meta.json");
-            if (!existsSync(metaPath)) continue;
-            try {
-              const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-              if (meta.cwd) cwds.push(meta.cwd);
-            } catch { /* skip unreadable */ }
-          }
-        }
-      } else {
-        cwds.push(process.cwd());
-      }
+      if (dryRun) console.error("  [dry-run] No changes will be written.\n");
 
       let totalProcessed = 0;
       let totalPromoted = 0;
+      let failures = 0;
       const total = cwds.length;
 
       for (let i = 0; i < cwds.length; i++) {
         const cwd = cwds[i];
         if (total > 1) {
-          process.stdout.write(`\r  scanning project ${i + 1}/${total}...`);
+          process.stderr.write(`\r  scanning project ${i + 1}/${total}...`);
         } else {
-          process.stdout.write(`\r  scanning...`);
+          process.stderr.write(`\r  scanning...`);
         }
 
         try {
@@ -3870,31 +3856,34 @@ export async function runCli(
           totalPromoted += result.promoted;
 
           if (verbose) {
-            process.stdout.write("\r");
+            process.stderr.write("\r");
             const convLabel = result.conversations !== undefined ? `, ${result.conversations} conversation${result.conversations !== 1 ? "s" : ""}` : "";
-            console.log(
+            console.error(
               `  ${sanitizeTerminalText(cwd)}: ${result.processed} scanned${convLabel}, ${result.promoted} promoted`,
             );
           }
         } catch (err) {
-          if (verbose) {
-            const message = err instanceof Error ? err.message : "request failed";
-            console.error(`  promote failed for ${sanitizeTerminalText(cwd)}: ${sanitizeTerminalText(message)}`);
-          }
-          continue;
+          if (err instanceof StorageIdentityConfigurationError
+            || err instanceof BackendPublicationJournalError
+            || err instanceof PrivateMutationLockContentionError) throw err;
+          failures++;
+          console.error(`  promote failed for ${sanitizeTerminalText(cwd)}: ${knownCliErrorDiagnostic(err) ?? "promotion request failed; check the selected project and retry"}`);
         }
       }
       // Clear the progress line
-      process.stdout.write("\r  \r");
+      process.stderr.write("\r  \r");
 
-      if (totalPromoted === 0) {
-        console.log("  Nothing to promote — no new insights found.");
+      if (failures > 0) {
+        console.error(`  ${failures} project${failures === 1 ? "" : "s"} failed; ${totalPromoted} insights promoted before completion.`);
+      } else if (totalPromoted === 0) {
+        console.error("  Nothing to promote — no new insights found.");
       } else {
-        console.log(`  ${totalPromoted} insight${totalPromoted !== 1 ? "s" : ""} promoted to long-term memory`);
+        console.error(`  ${totalPromoted} insight${totalPromoted !== 1 ? "s" : ""} promoted to long-term memory`);
       }
-      if (verbose) console.log(`  (${totalProcessed} summaries scanned across ${cwds.length} project${cwds.length !== 1 ? "s" : ""})`);
-      if (dryRun) console.log("  [dry-run] No changes written.");
-      console.log();
+      if (verbose) console.error(`  (${totalProcessed} summaries scanned across ${cwds.length} project${cwds.length !== 1 ? "s" : ""})`);
+      if (dryRun) console.error("  [dry-run] No changes written.");
+      console.error();
+      if (failures > 0) exit(1);
     });
 
   // ─── export ────────────────────────────────────────────────────────────────
@@ -3927,9 +3916,7 @@ export async function runCli(
         selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
       });
       const { exportKnowledge } = await import("../src/portable-knowledge.js");
-      const { homedir } = await import("node:os");
       const { join } = await import("node:path");
-      const { existsSync, readdirSync, readFileSync } = await import("node:fs");
 
       const tags: string[] | undefined = opts.tags
         ? (opts.tags as string).split(",").map((t: string) => t.trim()).filter(Boolean)
@@ -3940,43 +3927,26 @@ export async function runCli(
 
       let cwds: string[] = [];
       if (all) {
-        const { reconcileWorktrees } = await import("../src/worktree-reconciliation.js");
-        const projectsDir = lcmProjectsDir();
-        const candidates: string[] = [];
-        if (existsSync(projectsDir)) {
-          for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
-            if (!entry.isDirectory()) continue;
-            const metaPath = join(projectsDir, entry.name, "meta.json");
-            if (!existsSync(metaPath)) continue;
-            try {
-              const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-              if (typeof meta.cwd === "string" && meta.cwd) candidates.push(meta.cwd);
-            } catch { /* skip */ }
-          }
+        if (output !== undefined) {
+          console.error("  --all cannot use one --output file; omit --output to write one file per project.");
+          exit(1);
         }
-        const reconciled = new Map<string, string>();
-        for (const candidate of candidates) {
-          try {
-            const result = await runWithPublicationRetry(() => reconcileWorktrees(candidate));
-            reconciled.set(result.targetHash, result.canonical);
-          } catch (err) {
-            if (err instanceof PrivateMutationLockContentionError || err instanceof BackendPublicationJournalError) throw err;
-            const message = err instanceof Error ? err.message : String(err);
-            process.stderr.write(`  Warning: could not reconcile ${candidate}: ${message}\n`);
-          }
-        }
-        cwds = [...reconciled.values()];
+        const { listCliProjects } = await import("../src/cli-storage.js");
+        cwds = (await runWithPublicationRetry(() => listCliProjects())).map(project => project.canonical);
       } else {
         cwds.push(process.cwd());
       }
 
       let total = 0;
+      let failures = 0;
       for (const cwd of cwds) {
         let outFile: string | undefined = output;
         if (all && output === undefined) {
           // When --all and no --output, generate filenames automatically
           const slug = cwd.replace(/[^a-zA-Z0-9]/g, "-").replace(/-+/g, "-").slice(-40);
-          outFile = join(process.cwd(), `lcm-export-${slug}.json`);
+          const { createHash } = await import("node:crypto");
+          const suffix = createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+          outFile = join(process.cwd(), `lcm-export-${slug}-${suffix}.json`);
         }
         try {
           const exportOptions = {
@@ -3988,17 +3958,19 @@ export async function runCli(
           const result = await exportKnowledge(cwd, exportOptions);
           total += result.exported;
           if (all) {
-            console.log(`  ${cwd}: ${result.exported} entries → ${outFile}`);
+            console.error(`  ${cwd}: ${result.exported} entries → ${outFile}`);
           } else if (outFile) {
-            console.log(`  Exported ${result.exported} entries to ${outFile}`);
+            console.error(`  Exported ${result.exported} entries to ${outFile}`);
           }
         } catch (err: any) {
           if (err instanceof PrivateMutationLockContentionError || err instanceof BackendPublicationJournalError) throw err;
-          process.stderr.write(`  Warning: ${err.message}\n`);
+          failures++;
+          process.stderr.write(`  ${knownCliErrorDiagnostic(err) ?? "Export failed for a selected project. Check its storage binding and retry."}\n`);
         }
       }
 
-      if (all) console.log(`\n  Total: ${total} entries exported`);
+      if (all) console.error(`\n  Total: ${total} entries exported`);
+      if (failures > 0) exit(1);
     });
 
   // ─── import-knowledge ──────────────────────────────────────────────────────
@@ -4037,7 +4009,7 @@ export async function runCli(
       try {
         raw = readFileSync(file, "utf-8");
       } catch (err: any) {
-        console.error(`  Cannot read file: ${err.message}`);
+        console.error("  Cannot read the knowledge export file.");
         exit(1);
       }
 
@@ -4056,21 +4028,15 @@ export async function runCli(
 
       const cwd = process.cwd();
 
-      if (dryRun) {
-        console.log(`\n  [dry-run] Would import ${doc.entries.length} entries into ${cwd}`);
-        console.log("  No changes written.\n");
-        exit(0);
-      }
-
       try {
         const result = await importKnowledge(cwd, doc, { merge: true, dryRun, confidence });
         if (result.dryRun) {
-          console.log(`\n  [dry-run] Would import ${result.total} entries. No changes written.\n`);
+          console.error(`\n  [dry-run] ${result.total - result.skipped} valid, ${result.skipped} skipped. No changes written.\n`);
         } else {
-          console.log(`\n  Imported ${result.imported} entries (${result.skipped} skipped) into ${cwd}\n`);
+          console.error(`\n  Imported ${result.imported} entries (${result.skipped} skipped) into ${cwd}\n`);
         }
       } catch (err: any) {
-        console.error(`  Import failed: ${err.message}`);
+        console.error(`  ${knownCliErrorDiagnostic(err) ?? "Knowledge import failed. Check the document and selected storage, then retry."}`);
         exit(1);
       }
     });
@@ -4118,18 +4084,23 @@ export async function runCli(
   await unknownCommandCompletion;
 }
 
+/** Static remedies never include a mutable error message, driver text, or cause. */
+function knownCliErrorDiagnostic(error: unknown): string | undefined {
+  if (error instanceof BackendPublicationJournalError) return BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC;
+  if (error instanceof StorageIdentityConfigurationError) return UNBOUND_POSTGRESQL_PROJECT_MESSAGE;
+  if (error instanceof CliProjectStorageMissingError) return "No LCM storage found for this project. Run `lcm import` or `lcm import-knowledge <file>` in the intended project, then retry.";
+  if (error instanceof MachineIdentityFileError) return "LCM machine identity is unavailable. Run `lcm machine show` and register or recover the machine before retrying.";
+  if (error instanceof ConfigValidationError) return "LCM configuration is invalid. Check config.json and the required environment variables, then retry.";
+  if (error instanceof StorageBackendUnavailableError) return "This operation is not available for the postgresql storage backend.";
+  if (error instanceof BootstrapLockContentionError) return "LCM home migration is busy. Wait for the active operation to finish, then retry.";
+  if (error instanceof PrivateMutationLockContentionError) return "LCM storage publication is busy. Wait for the active operation to finish, then retry; run `lcm doctor` if it remains blocked.";
+  return undefined;
+}
+
 /** @internal Top-level rejection handler kept separate for deterministic tests. */
 export function handleCliError(err: unknown): never {
-  console.error(
-    err instanceof BackendPublicationJournalError
-      ? BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC
-      : err instanceof ConfigValidationError
-      || err instanceof StorageBackendUnavailableError
-      || err instanceof BootstrapLockContentionError
-      || err instanceof PrivateMutationLockContentionError
-      ? err.message
-      : err,
-  );
+  console.error(knownCliErrorDiagnostic(err)
+    ?? "LCM command failed. Check the command inputs and selected storage configuration.");
   return exit(1);
 }
 

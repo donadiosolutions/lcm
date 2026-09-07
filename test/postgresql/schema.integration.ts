@@ -43,6 +43,9 @@ const DOMAIN_TABLES = [
   "summary_messages",
   "summary_parents",
   "transcript_messages",
+  "transfer_batches",
+  "transfer_identities",
+  "transfer_runs",
 ] as const;
 
 const FOREIGN_KEY_DELETE_ACTIONS = [
@@ -71,6 +74,9 @@ const FOREIGN_KEY_DELETE_ACTIONS = [
   "summary_parents|NO ACTION|1",
   "transcript_messages|CASCADE|1",
   "transcript_messages|RESTRICT|1",
+  "transfer_batches|RESTRICT|1",
+  "transfer_identities|RESTRICT|1",
+  "transfer_runs|RESTRICT|1",
 ] as const;
 
 interface SeededScope {
@@ -291,9 +297,9 @@ describe("PostgreSQL schema baseline", () => {
       const normalizedConstraints = constraints.rows
         .map((row) => `${row.table_name}|${row.constraint_type}|${row.definition}`)
         .join("\n");
-      expect(constraints.rowCount).toBe(174);
+      expect(constraints.rowCount).toBe(204);
       expect(createHash("sha256").update(normalizedConstraints).digest("hex"))
-        .toBe("7e33a8c0c63ae33056528c922af1005475e5f92ee8e7b60359188225fc77791c");
+        .toBe("ccabebba36d9d2e1d5187dcdf4daa5d7301e90708f4ed34953f58f5b56c8c5fa");
 
       const deleteActions = await database.migrator.query<{
         table_name: string;

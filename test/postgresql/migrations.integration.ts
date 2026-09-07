@@ -635,17 +635,17 @@ describe("PostgreSQL migrations and database isolation", () => {
             migrationFailure: {
               baselineApplied: true,
               driftedDefinitionGroupCount: 1,
-              existingObjectCount: 782,
-              expectedObjectCount: 782,
+              existingObjectCount: 880,
+              expectedObjectCount: 880,
               missingObjectCount: 0,
               operation: "preflightBaselineDefinitions",
             },
-            readinessExpectedObjectCount: 782,
-            readinessExistingObjectCount: 782,
+            readinessExpectedObjectCount: 880,
+            readinessExistingObjectCount: 880,
             readinessMissingObjectCount: 0,
             readinessDriftedDefinitionGroupCount: 1,
-            readinessColumnAclCount: 225,
-            migrationColumnAclCount: 225,
+            readinessColumnAclCount: 253,
+            migrationColumnAclCount: 253,
             readinessColumnAclSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
             migrationColumnAclSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
           });
@@ -1347,7 +1347,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         }
 
         const pending = migration(
-          "0006_runtime_forbidden",
+          "0007_runtime_forbidden",
           "CREATE TABLE lcm.runtime_migration_forbidden (id integer)",
         );
         await expect(runPostgreSqlMigrations(database.runtime, {
@@ -1366,6 +1366,7 @@ describe("PostgreSQL migrations and database isolation", () => {
     { label: "0003 machine identity", migrationCount: 3, snapshotCount: 2 },
     { label: "0004 machine display name", migrationCount: 4, snapshotCount: 3 },
     { label: "0005 summary context integrity", migrationCount: 5, snapshotCount: 4 },
+    { label: "0006 transfer ledger", migrationCount: 6, snapshotCount: 5 },
   ])("validates the registered $label catalog snapshot", async ({
     label,
     migrationCount,
@@ -1744,7 +1745,7 @@ describe("PostgreSQL migrations and database isolation", () => {
 
       await applySummaryContextRuntimeGrant(database);
       await expect(runPostgreSqlMigrations(database.migrator)).resolves.toEqual({
-        applied: ["0005_summary_context_integrity"],
+        applied: ["0005_summary_context_integrity", "0006_transfer_ledger"],
         current: migrations.map(({ id }) => id),
       });
       await expect(runPostgreSqlMigrations(database.migrator)).resolves.toEqual({
@@ -1782,6 +1783,7 @@ describe("PostgreSQL migrations and database isolation", () => {
             "0003_machine_identity_key",
             "0004_machine_display_name",
             "0005_summary_context_integrity",
+            "0006_transfer_ledger",
           ], []]);
         await expect(database.migrator.query<{ key: string }>({
           text: "SELECT key FROM lcm.operator_owned_metadata",
@@ -2031,7 +2033,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         text: "GRANT CREATE ON SCHEMA lcm TO PUBLIC",
       }, { domain: "factory", operation: "driftPublicSchemaCreate" });
       const later = migration(
-        "0006_public_acl_probe",
+        "0007_public_acl_probe",
         "CREATE TABLE lcm.public_acl_probe (id integer PRIMARY KEY);",
       );
 
@@ -2057,7 +2059,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       }, { domain: "factory", operation: "verifyRecurringPublicAclRollback" }))
         .resolves.toMatchObject({
           rows: [{
-              applied_count: "5",
+              applied_count: "6",
             probe_exists: false,
             public_create: true,
           }],
@@ -2203,7 +2205,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         await expect(database.migrator.query<{ applied_count: string }>({
           text: "SELECT count(*)::text AS applied_count FROM lcm.schema_migrations_backup",
         }, { domain: "factory", operation: "verifyLedgerRowsPreservedAfterRelkindDrift" }))
-          .resolves.toMatchObject({ rows: [{ applied_count: "5" }] });
+          .resolves.toMatchObject({ rows: [{ applied_count: "6" }] });
       } finally {
         if (replacementViewCreated) {
           await database.migrator.query({
@@ -2223,7 +2225,7 @@ describe("PostgreSQL migrations and database isolation", () => {
     await withPostgreSqlTestDatabase("managed-owner-drift", async (database) => {
       const admin = new PostgreSqlRuntime(settings(database.adminUrl));
       const later = migration(
-        "0006_managed_owner_probe",
+        "0007_managed_owner_probe",
         "CREATE TABLE lcm.managed_owner_probe (id integer PRIMARY KEY);",
       );
       try {
@@ -2285,7 +2287,7 @@ describe("PostgreSQL migrations and database isolation", () => {
               migrations: [...loadPostgreSqlMigrations(), later],
             }).catch((error: unknown) => error);
             expect(failure).toMatchObject({
-              existingObjectCount: 37,
+              existingObjectCount: 40,
               operation: "preflightManagedObjectOwnership",
               requiredOwner: "lcm_test_migrator",
               schemaName: "lcm",
@@ -2317,7 +2319,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         }, { domain: "factory", operation: "verifyManagedOwnerRollback" }))
           .resolves.toMatchObject({
             rows: [{
-              applied_count: "5",
+              applied_count: "6",
               operator_preserved: true,
               probe_exists: false,
             }],
@@ -2399,8 +2401,8 @@ describe("PostgreSQL migrations and database isolation", () => {
       await expect(runPostgreSqlMigrations(database.migrator))
         .rejects.toMatchObject({
           baselineApplied: true,
-          expectedObjectCount: 37,
-          existingObjectCount: 36,
+          expectedObjectCount: 40,
+          existingObjectCount: 39,
           missingObjectCount: 1,
           operation: "preflightManagedObjectOwnership",
         });
@@ -2429,8 +2431,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 782,
-          existingObjectCount: 781,
+          expectedObjectCount: 880,
+          existingObjectCount: 879,
           missingObjectCount: 1,
           operation: "preflightBaselineDefinitions",
         });
@@ -2450,8 +2452,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 782,
-          existingObjectCount: 782,
+          expectedObjectCount: 880,
+          existingObjectCount: 880,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -2546,8 +2548,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 782,
-          existingObjectCount: 782,
+          expectedObjectCount: 880,
+          existingObjectCount: 880,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -2565,8 +2567,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 782,
-            existingObjectCount: 782,
+            expectedObjectCount: 880,
+            existingObjectCount: 880,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -2589,8 +2591,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 2,
-          expectedObjectCount: 782,
-          existingObjectCount: 782,
+          expectedObjectCount: 880,
+          existingObjectCount: 880,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -2608,8 +2610,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 782,
-            existingObjectCount: 782,
+            expectedObjectCount: 880,
+            existingObjectCount: 880,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -2661,8 +2663,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 782,
-          existingObjectCount: 782,
+          expectedObjectCount: 880,
+          existingObjectCount: 880,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -2679,8 +2681,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 782,
-          existingObjectCount: 782,
+          expectedObjectCount: 880,
+          existingObjectCount: 880,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -2696,8 +2698,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 782,
-          existingObjectCount: 782,
+          expectedObjectCount: 880,
+          existingObjectCount: 880,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -2744,8 +2746,8 @@ describe("PostgreSQL migrations and database isolation", () => {
             migrationFailure: {
               baselineApplied: true,
               driftedDefinitionGroupCount: 1,
-              expectedObjectCount: 782,
-              existingObjectCount: 782,
+              expectedObjectCount: 880,
+              existingObjectCount: 880,
               missingObjectCount: 0,
               operation: "preflightBaselineDefinitions",
             },
@@ -2783,8 +2785,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 782,
-            existingObjectCount: 782,
+            expectedObjectCount: 880,
+            existingObjectCount: 880,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -2807,8 +2809,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 782,
-            existingObjectCount: 782,
+            expectedObjectCount: 880,
+            existingObjectCount: 880,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -2829,8 +2831,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 782,
-          existingObjectCount: 782,
+          expectedObjectCount: 880,
+          existingObjectCount: 880,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -2867,8 +2869,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 782,
-          existingObjectCount: 782,
+          expectedObjectCount: 880,
+          existingObjectCount: 880,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -2889,8 +2891,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 782,
-          existingObjectCount: 782,
+          expectedObjectCount: 880,
+          existingObjectCount: 880,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -2907,8 +2909,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 782,
-            existingObjectCount: 782,
+            expectedObjectCount: 880,
+            existingObjectCount: 880,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -2930,8 +2932,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 782,
-          existingObjectCount: 782,
+          expectedObjectCount: 880,
+          existingObjectCount: 880,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -2948,8 +2950,8 @@ describe("PostgreSQL migrations and database isolation", () => {
           .rejects.toMatchObject({
             baselineApplied: true,
             driftedDefinitionGroupCount: 1,
-            expectedObjectCount: 782,
-            existingObjectCount: 782,
+            expectedObjectCount: 880,
+            existingObjectCount: 880,
             missingObjectCount: 0,
             operation: "preflightBaselineDefinitions",
           });
@@ -2978,8 +2980,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         .rejects.toMatchObject({
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
-          expectedObjectCount: 782,
-          existingObjectCount: 782,
+          expectedObjectCount: 880,
+          existingObjectCount: 880,
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
@@ -2989,7 +2991,7 @@ describe("PostgreSQL migrations and database isolation", () => {
   it("rolls back a pending migration that violates its target schema snapshot", async () => {
     await withPostgreSqlTestDatabase("target-schema-snapshot", async (database) => {
       const invalidTarget = migration(
-        "0006_invalid_column_snapshot",
+        "0007_invalid_column_snapshot",
         "ALTER TABLE lcm.projects ALTER COLUMN identity_key DROP NOT NULL",
       );
       await expect(runPostgreSqlMigrations(database.migrator, {
@@ -3007,7 +3009,7 @@ describe("PostgreSQL migrations and database isolation", () => {
                  EXISTS (
                    SELECT 1
                    FROM lcm.schema_migrations
-                   WHERE id = '0006_invalid_column_snapshot'
+                   WHERE id = '0007_invalid_column_snapshot'
                  ) AS applied,
                  attribute.attnotnull AS not_null
                FROM pg_catalog.pg_attribute AS attribute
@@ -3031,7 +3033,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       const packagedSnapshots = loadPostgreSqlSchemaSnapshots();
       const baselineSnapshot = packagedSnapshots.at(-1)!;
       const addManagedObject = migration(
-        "0006_add_managed_snapshot_probe",
+        "0007_add_managed_snapshot_probe",
         "CREATE TABLE lcm.managed_snapshot_probe (id integer PRIMARY KEY)",
       );
       const futureSnapshot = {
@@ -3048,7 +3050,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       })).resolves.toMatchObject({ applied: [addManagedObject.id] });
 
       const dropManagedObject = migration(
-        "0007_drop_managed_snapshot_probe",
+        "0008_drop_managed_snapshot_probe",
         "DROP TABLE lcm.managed_snapshot_probe",
       );
       const damagedTargetSnapshot = {
@@ -3064,8 +3066,8 @@ describe("PostgreSQL migrations and database isolation", () => {
         ],
       })).rejects.toMatchObject({
         baselineApplied: true,
-        expectedObjectCount: 38,
-        existingObjectCount: 37,
+        expectedObjectCount: 41,
+        existingObjectCount: 40,
         missingObjectCount: 1,
         operation: "preflightManagedObjectOwnership",
       });
@@ -3077,7 +3079,7 @@ describe("PostgreSQL migrations and database isolation", () => {
                  EXISTS (
                    SELECT 1
                    FROM lcm.schema_migrations
-                   WHERE id = '0007_drop_managed_snapshot_probe'
+                   WHERE id = '0008_drop_managed_snapshot_probe'
                  ) AS applied,
                  pg_catalog.to_regclass('lcm.managed_snapshot_probe')
                    IS NOT NULL AS table_exists`,
@@ -3199,7 +3201,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       expect(new Set(databases.map((database) => database.name)).size).toBe(3);
       await Promise.all(databases.map(async (database) => {
         const forbidden = migration(
-          "0006_runtime_forbidden",
+          "0007_runtime_forbidden",
           "CREATE TABLE lcm.runtime_forbidden (id integer);",
         );
         await expect(runPostgreSqlMigrations(database.runtime, {
