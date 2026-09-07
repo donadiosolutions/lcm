@@ -1,97 +1,65 @@
 ---
 name: triage-fix-all-bugs
-description: Use when asked to coordinate triage and remediation of all currently open native GitHub Bug issues in this repository. Does not apply to fixing one issue or authoring this skill.
+description: Use when asked to coordinate triage and remediation of all currently open native GitHub Bug issues in this repository. Not for a single issue or merely authoring or reviewing skills.
 ---
 
 # Triage and fix all Bugs
 
-## Configuration
+## Directives and configuration
 
-| Parameter | Default |
-| --- | --- |
-| `TRIAGE_MODEL` | Luna |
-| `TRIAGE_REASONING` | high |
-| `TRIAGE_TIER` | priority |
-| Shared role parameters | Inherit [procedural-development defaults](../procedural-development/SKILL.md#configuration) |
-| `MAX_ACTIVE_OWNERS` | Inherit |
-| `WATCHDOG_MINUTES` | Inherit |
+Execution authorizes two sequential phases within user scope: **triage, then
+remediation**. Reading/editing/testing skills never authorizes workers, issue
+mutations or environment replacement.
 
-Add any shared parameter override here or to the invocation, including
-`OWNER_MODEL`, `OWNER_REASONING`, `OWNER_TIER` and the corresponding parameters
-for implementation, security, escalation and all three reviewer roles. Invocation
-overrides win over this block, which wins over inherited defaults. These are agent
-instructions, not CLI flags. The triage role also performs duplicate adjudication.
-Apply shared route resolution and best-effort tiers to every role; unavailable
-or unverifiable priority never blocks this campaign.
+Bind `TRIAGE_MODEL` through invocation or caller/local role configuration;
+`TRIAGE_REASONING=high`, `TRIAGE_TIER=priority`. This role also adjudicates duplicates.
+Inherit [shared role parameters and limits](../procedural-development/SKILL.md#configuration).
+Explicit invocation overrides caller configuration, then shared defaults; pass
+resolved settings unchanged. These are invocation instructions, not CLI flags.
+Shared route preflight and best-effort tier rules apply to every role.
 
-## Scope and read order
+Read repository/local instructions and project memory, [LCM integration](../shared/lcm-development.md),
+[procedural-development](../procedural-development/SKILL.md) and both its references,
+then [inventory/triage](references/triage.md) and [accounting](references/coordination.md)
+in full. Apply shared root, event, recovery and route rules during triage without
+starting remediation. Workers receive self-contained issue, scope and evidence briefs.
 
-Run two sequential phases: triage, then remediation. An execution invocation
-authorizes that campaign under the user's scope and repository rules. Reading,
-editing or testing the skill does not launch a campaign or authorize issue
-mutations, workers or LCM replacement.
+## Phase boundaries
 
-Before work, read repository/local instructions and
-[LCM integration](../shared/lcm-development.md), and use `lcm-memory` for context.
-Read [procedural-development](../procedural-development/SKILL.md) and its
-[coordination contract](../procedural-development/references/coordination.md)
-as well as its [delivery reference](../procedural-development/references/delivery.md)
-for routing preflight, root boundaries, publication/merge duties, events and recovery.
-Apply those to triage
-too, without starting remediation. Read [inventory and triage](references/triage.md)
-and [campaign accounting](references/coordination.md) in full. Give triage workers
-the relevant instructions, issue, frozen inventory and evidence.
+`Bug` and `Epic` are exact **native issue types**; hierarchy uses native sub-issues.
+Labels, title matches and checklists are not substitutes. Freeze S0 only after two
+consecutive complete paginated native-Bug inventories agree; record T0, TF, parents
+and exact default-branch SHA. Later issues/follow-ups never silently enter S0.
 
-- `Bug` and `Epic` are exact native GitHub issue types; native sub-issues establish
-  relationships. Labels, title matches and checklists are not substitutes.
-- Freeze S0 only after two consecutive complete paginated native-Bug inventories
-  agree. Record T0, TF, parents and the exact default-branch SHA. Later issues and
-  follow-ups never silently enter S0.
-- A Bug parented outside the run is `delegated-existing-parent`: no mutation,
-  reparenting, triage or remediation, but retain it in the denominator. An assignee
-  alone does not trigger this disposition.
-- Finish all individual triage assignments and centralized S0 duplicate
-  adjudication before releasing the complete triage barrier. Inconclusive
-  reproduction stays open as `uncertain-needs-remediation`.
+External native parents imply `delegated-existing-parent`: no mutation, reparenting,
+triage or remediation, but retain the member in S0 accounting. An assignee alone
+does not imply delegation. Finish every valid non-delegated triage assignment and
+centralized S0 duplicate adjudication before remediation. Inconclusive reproduction
+remains open as `uncertain-needs-remediation`.
 
-## Only exclusive resource
+## Shared environment contract
 
-The only resource requiring hard mutual exclusion is `lcm-daemon-update`.
-Use the [flock skill](../flock/SKILL.md) to acquire and release it. Pass this
-resource and its protected operations to `procedural-development`; do not
-introduce additional workflow locks.
+Supply LCM integration's startup, target-advance, watchdog and final operations.
+Only the root acting as Environment Coordinator may mutate/replace/recover main
+LCM, holding **`lcm-daemon-update`** through verification under the
+[flock contract](../flock/SKILL.md). Explicit handoff and live-shell ownership apply.
+There are no other workflow reservations; use isolated fixtures and preserve
+application-internal locks.
 
-The root acting as Environment Coordinator is the sole executor for main LCM
-installation/replacement, daemon mutation and recovery, including required
-verification before release. Supply the shared integration's startup, target
-advance, watchdog and final-audit operations. Follow its explicit handoff and
-live-shell ownership rules. No role may reserve files, worktrees, tests, databases,
-reviews, publication or merges. Isolated fixtures and internal correctness locks
-remain in use.
+## Remediation handoff
 
-## Invoke procedural-development after triage
-
-Once the full barrier passes, update final triage counts and invoke
+After the complete triage barrier, update final triage counts and invoke
 `procedural-development` with the **same root, run ID and recovery record**:
 
-- Inventory: only S0 items dispositioned `reproducible` or
-  `uncertain-needs-remediation`, with evidence, ownership and acceptance criteria.
-  Retain the complete S0 denominator in the caller's accounting.
-- Tracker: the existing root campaign Epic and its established checkpoint channel;
-  preserve hierarchy and S0 freeze metadata.
-- Configuration: resolved shared roles and concurrency; do not reset defaults or
-  spent candidate rounds on invocation/resume.
-- Delivery: repository instructions and [LCM integration](../shared/lcm-development.md).
-  P2 follow-ups must be native `Bug` issues linked to source and PR, outside S0,
-  without native parenting under this campaign. Preserve the shared pre-PR pending
-  link procedure.
-- Outcome: a complete merged fix must be present on the default branch and its
-  source Bug closed with evidence/readback before `merged-resolved` is recorded.
-  Never close incomplete fixes merely for accounting.
-- Environment and completion: the declared resource/operations above and the
-  [caller final audit](references/coordination.md#final-audit).
+| Input | Supply |
+| --- | --- |
+| Inventory | Only S0 `reproducible` and `uncertain-needs-remediation` items, with evidence, ownership and acceptance; retain full S0 accounting |
+| Tracker | Existing root campaign Epic, checkpoint channel, native hierarchy and freeze metadata |
+| Configuration | Resolved roles/limits and spent rounds; never reapply defaults or reset budgets |
+| Delivery | Repository/LCM policy; native `Bug` P2 follow-ups linked to source/PR, outside S0 and campaign hierarchy, using pending PR links before publication |
+| Resolution | `merged-resolved` requires a complete fix on default branch and verified source closure; incomplete fixes stay open |
+| Environment/completion | Declared operations/resource and the [caller audit](references/coordination.md#final-audit) |
 
-The shared skill owns all remediation scheduling, planning/review, severity and
-round handling, publication and recovery mechanics. Do not maintain a second
-remediation procedure here. The caller remains responsible for S0 dispositions,
-native hierarchy, triage-specific counters and interpreting terminal outcomes.
+Shared procedures own remediation scheduling, planning/review, severity/budgets,
+publication and recovery. The caller retains S0 dispositions, native hierarchy,
+triage counters and terminal interpretation; do not duplicate the shared procedure.
