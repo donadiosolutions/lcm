@@ -150,6 +150,9 @@ describe("release workflows", () => {
       version: "pnpm run version-packages",
       createGithubReleases: false,
     });
+    expect(changesets?.uses).toBe(
+      "changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d",
+    );
     expect(changesets?.env?.LCM_RELEASE_CHANNEL).toBe("${{ steps.channel.outputs.channel }}");
     expect(versionWorkflow.jobs.version.steps.indexOf(channel!)).toBeLessThan(
       versionWorkflow.jobs.version.steps.indexOf(changesets!),
@@ -185,7 +188,7 @@ describe("release workflows", () => {
       expect(index("Locate pnpm store")).toBeLessThan(index("Cache pnpm store"));
       expect(index("Cache pnpm store")).toBeLessThan(index("Install dependencies"));
       const cache = job.steps[index("Cache pnpm store")];
-      expect(cache.uses).toBe("actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306");
+      expect(cache.uses).toBe("actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9");
       expect(cache.with?.path).toBe("${{ steps.pnpm-store.outputs.path }}");
       const prefix = job.defaults?.run["working-directory"] === "release" ? "release/" : "";
       for (const name of ["package.json", "pnpm-lock.yaml", ".npmrc", "pnpm-workspace.yaml", "scripts/bootstrap-pnpm.mjs"]) {
@@ -337,7 +340,7 @@ describe("release workflows", () => {
       (step) => step.name === "Generate Highlights with Codex",
     );
     expect(codex?.uses).toBe(
-      "openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56",
+      "openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e",
     );
     expect(codex?.with).toMatchObject({
       "openai-api-key": "${{ secrets.OPENAI_API_KEY }}",
