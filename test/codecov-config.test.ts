@@ -115,8 +115,8 @@ const expectedComponents = [
       // quoted/root-only backslash handoff, #1010 pathless-tail brackets,
       // #1060 adjacent nested-file schemes, #1113 doubled-colon drive tails,
       // #1117 glued authorities, #1128 active file-URL own-query backslash
-      // paths, and #1156 forced drive-after-content continuations remain
-      // daemon-core-owned.
+      // paths, #1141 single-slash file tails, and #1156 forced drive-after-content
+      // continuations remain daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -268,6 +268,8 @@ const expectedComponents = [
       // #1059 keeps retained journal-parent publication in this existing owner.
       // #1087 bounds canonical metadata publication in this existing owner.
       // #1091 preserves completion evidence across publication failures here.
+      // #1173 keeps promoted-content reconciliation guards in this existing
+      // project/worktree ownership component; no topology change.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },

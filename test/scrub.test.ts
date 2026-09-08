@@ -185,11 +185,21 @@ describe("hostname-scoped Gitleaks rules", () => {
     }
   });
 
-  it("matches all supported Slack webhook path prefixes", () => {
+  it("matches lower, upper, and mixed-case Slack webhook hosts on each path", () => {
     const rule = compiledGitleaksRule("slack-webhook-url");
     for (const prefix of ["services", "workflows", "triggers"]) {
-      const webhook = ["https://hooks.slack.com", prefix, slackTail].join("/");
-      expect(rule.test(webhook), prefix).toBe(true);
+      for (const host of ["hooks.slack.com", "HOOKS.SLACK.COM", "HoOkS.SlAcK.CoM"]) {
+        const webhook = [`https://${host}`, prefix, slackTail].join("/");
+        expect(rule.test(webhook), `${host}/${prefix}`).toBe(true);
+      }
+    }
+  });
+
+  it("rejects uppercase and mixed-case Slack webhook path prefixes", () => {
+    const rule = compiledGitleaksRule("slack-webhook-url");
+    for (const prefix of ["SERVICES", "WORKFLOWS", "TRIGGERS", "Services"]) {
+      const webhook = ["https://HoOkS.SlAcK.CoM", prefix, slackTail].join("/");
+      expect(rule.test(webhook), prefix).toBe(false);
     }
   });
 

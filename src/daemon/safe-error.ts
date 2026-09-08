@@ -58,6 +58,18 @@ function isFileUrlLiteral(chars: readonly string[], index: number): boolean {
   );
 }
 
+function isSingleSlashFileUrlLiteral(chars: readonly string[], index: number): boolean {
+  return (
+    chars[index]?.toLowerCase() === "f" &&
+    chars[index + 1]?.toLowerCase() === "i" &&
+    chars[index + 2]?.toLowerCase() === "l" &&
+    chars[index + 3]?.toLowerCase() === "e" &&
+    chars[index + 4] === ":" &&
+    chars[index + 5] === "/" &&
+    chars[index + 6] !== "/"
+  );
+}
+
 function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const authority = new Uint8Array(chars.length);
   const file = new Uint8Array(chars.length);
@@ -393,6 +405,7 @@ function scanAbsolutePath(
   let brackets = 0;
   let sawPathCharacter = false;
   let sawNonSeparator = false;
+  let singleSlashFileTail = false;
   while (index < chars.length) {
     const char = chars[index];
     if (quote === undefined && nestedFileSchemeStarts[index] === 1) break;
@@ -416,6 +429,11 @@ function scanAbsolutePath(
       index += 2;
       continue;
     }
+    const singleSlashFileUrl =
+      quote === undefined &&
+      char === ":" &&
+      index >= start + FILE_SCHEME.length &&
+      isSingleSlashFileUrlLiteral(chars, index - FILE_SCHEME.length);
     if (
       quote === undefined &&
       char === ":" &&
@@ -466,6 +484,15 @@ function scanAbsolutePath(
         index += 1;
         continue;
       }
+    }
+    if (singleSlashFileUrl) {
+      singleSlashFileTail = true;
+      index += 1;
+      continue;
+    }
+    if (singleSlashFileTail && char === ":") {
+      index += 1;
+      continue;
     }
     if (char === "/" || (windowsContext && char === "\\")) {
       sawPathCharacter = true;

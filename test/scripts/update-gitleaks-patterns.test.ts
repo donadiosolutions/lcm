@@ -27,22 +27,32 @@ describe("Gitleaks hostname normalization", () => {
     )).toBe("(?:gems\\.contribsys\\.com|enterprise\\.contribsys\\.com)");
   });
 
-  it("escapes only the Slack webhook host literal", () => {
+  it("normalizes a raw Slack webhook host literal to paired case", () => {
     expect(normalizeGitleaksHostnameLiterals(
       "slack-webhook-url",
-      "hooks.slack.com/(?:services|workflows|triggers)",
-    )).toBe("hooks\\.slack\\.com/(?:services|workflows|triggers)");
+      "hooks.slack.com/services",
+    )).toBe("[Hh][Oo][Oo][Kk][Ss]\\.[Ss][Ll][Aa][Cc][Kk]\\.[Cc][Oo][Mm]/services");
   });
 
-  it("is idempotent for already escaped upstream hostnames", () => {
+  it("normalizes an escaped Slack webhook host literal to the same paired output", () => {
+    expect(normalizeGitleaksHostnameLiterals(
+      "slack-webhook-url",
+      "hooks\\.slack\\.com/services",
+    )).toBe("[Hh][Oo][Oo][Kk][Ss]\\.[Ss][Ll][Aa][Cc][Kk]\\.[Cc][Oo][Mm]/services");
+  });
+
+  it("leaves escaped Sidekiq hostnames byte-identical", () => {
     const sidekiq = "(?:gems\\.contribsys\\.com|enterprise\\.contribsys\\.com)";
-    const slack = "hooks\\.slack\\.com/services";
     expect(normalizeGitleaksHostnameLiterals("sidekiq-sensitive-url", sidekiq))
       .toBe(sidekiq);
+  });
+
+  it("leaves already paired Slack hostnames byte-identical", () => {
+    const slack = "[Hh][Oo][Oo][Kk][Ss]\\.[Ss][Ll][Aa][Cc][Kk]\\.[Cc][Oo][Mm]/services";
     expect(normalizeGitleaksHostnameLiterals("slack-webhook-url", slack)).toBe(slack);
   });
 
-  it("leaves unrelated rules and load-bearing dots byte-identical", () => {
+  it("leaves unrelated rules and suffixes byte-identical", () => {
     const rotatingSlack = "xoxe.xox[bp]-\\d-[A-Z0-9]{163,166}";
     const mailchimp = "(?:MailchimpSDK.initialize|mailchimp)";
     const conversions = "[A-Za-z0-9]+$start[\\s\\S](?:token)";
