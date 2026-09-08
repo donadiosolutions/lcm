@@ -511,6 +511,10 @@ The `Security` section of the doctor output shows:
   userinfo, port, or bracketed host, and its following path are removed. This
   can remove a non-secret host or port glued to a private path, preventing the
   private tail from remaining visible after one sanitization pass. Ordinary
+  unquoted paths also absorb a glued single-slash `file:/` suffix and its
+  colon-bearing path segments into the same span. This scan-local rule does not
+  make `file:/` a new top-level path start or change ordinary public URL
+  classification. Existing
   authority delimiters still end the absorbed span; later word-glued text is
   classified independently and can remain visible even when it resembles a
   local path. An opening `(` instead resumes the already active path scan, so
