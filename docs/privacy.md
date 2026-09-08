@@ -523,7 +523,16 @@ The `Security` section of the doctor output shows:
   Whitespace, quoted-path, nested-URL, and delimiter termination remain
   unchanged. An unmatched closing bracket, a freshly recognized URL, or other
   URL-ending punctuation ends the context and clears its bracket state. A
-  recognizable nested exact `file://` path is also redacted. An exact
+  recognizable nested exact `file://` path is also redacted. When an unquoted
+  local-path span starts with
+  `/scheme://`, its URL-shaped portion, including scheme and port colons, is
+  replaced by one `<path>` marker on the first pass. The span ends at whitespace
+  or the first unbalanced `)` or `]`, `#`, `&`, `=`, `|`, `,`, `;`, `!`, `?`,
+  `}`, apostrophe, double quote, `<`, or `>`. The marker therefore stops before
+  a suffix such as `?a=b`. This includes slash-prefixed URLs inside or after
+  brackets, and the result is stable on repeated sanitation. Ordinary
+  word-adjacent nested non-file URLs remain unchanged, and independent local
+  filesystem paths continue to be redacted. An exact
   case-insensitive `file://` literal immediately after `?`, `#`, `&`, or `=`
   inside any URL starts a nested file URL. Once an outer URL has entered its
   query or fragment, the same literal also starts a nested file URL after any
