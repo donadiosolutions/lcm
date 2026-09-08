@@ -53,7 +53,8 @@ type OwnedProjectConnection = {
 export class SqliteStorageBackendFactory implements StorageBackendFactory {
   readonly backend = "sqlite" as const;
   readonly capabilities: StorageCapabilities = sqliteStorageCapabilities("unknown");
-  private readonly projects = new Set<SqliteProjectStorage>();
+  private readonly projects = new Map<SqliteProjectStorage, string | undefined>();
+  private readonly healthQueues = new Map<string, Promise<void>>();
   private readonly knownProjects = new Map<string, { id: string; dbPath: string }>();
   private readonly ownedConnections = new Set<OwnedProjectConnection>();
   private readonly pendingOpens = new Set<Promise<void>>();
@@ -234,7 +235,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
         admission,
       );
       ownedConnection = undefined;
-      this.projects.add(storage);
+      this.projects.set(storage, homeDir);
       throwIfAborted(signal);
       this.assertOpen(identity, operation);
       this.knownProjects.set(`${paths.id}\0${paths.dbPath}`, { id: paths.id, dbPath: paths.dbPath });
@@ -280,13 +281,15 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
     if (this.closed) return { status: "closed", backend: "sqlite" };
     await Promise.all([...this.pendingOpens]);
     if (this.closed) return { status: "closed", backend: "sqlite" };
-    const activeProjectIds = new Set([...this.projects].map((project) => project.projectId));
+    const activeProjectIds = new Set([...this.projects.keys()].map((project) => project.projectId));
     const idleProjects = [...this.knownProjects.values()].filter(
       (project) => !activeProjectIds.has(project.id),
     );
     const projectHealth = await Promise.all([
-      ...[...this.projects].map((project) => project.healthWithFreshAdmission()),
-      ...idleProjects.map((project) => this.probeKnownProject(project)),
+      ...[...this.projects].map(([project, homeDir]) =>
+        this.scheduleHealth(homeDir, () => project.healthWithFreshAdmission())),
+      ...idleProjects.map((project) =>
+        this.scheduleHealth(sqliteProjectHomeDir(project.dbPath), () => this.probeKnownProject(project))),
     ]);
     if (this.closed) return { status: "closed", backend: "sqlite" };
     const unavailable = projectHealth.find((health) => health.status === "unavailable");
@@ -296,6 +299,22 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       backend: "sqlite",
       error: unavailable.error,
     };
+  }
+
+  /** Serialize full probes, including idle cleanup, across same-home sweeps. */
+  private scheduleHealth(
+    homeDir: string | undefined,
+    probe: () => Promise<StorageHealth>,
+  ): Promise<StorageHealth> {
+    if (homeDir === undefined) return probe();
+    const previous = this.healthQueues.get(homeDir) ?? Promise.resolve();
+    const result = previous.then(probe);
+    const tail = result.then(() => undefined, () => undefined);
+    this.healthQueues.set(homeDir, tail);
+    void tail.then(() => {
+      if (this.healthQueues.get(homeDir) === tail) this.healthQueues.delete(homeDir);
+    });
+    return result;
   }
 
   private async probeKnownProject(project: { id: string; dbPath: string }): Promise<StorageHealth> {
@@ -381,7 +400,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
       ...this.pendingHealth,
     ]).then(async () => {
       const outcomes = await Promise.allSettled([
-        ...[...this.projects].map((project) => project.close(publicationLockToken)),
+        ...[...this.projects.keys()].map((project) => project.close(publicationLockToken)),
         ...[...this.ownedConnections].map((connection) => (
           this.releaseOwnedConnection(connection, publicationLockToken)
         )),

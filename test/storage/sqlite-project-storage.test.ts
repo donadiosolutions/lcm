@@ -670,6 +670,284 @@ describe("SQLite factory maintenance admission", () => {
   });
 });
 
+describe("SQLite factory same-home health admission", () => {
+  async function fixture(homeIndexes: number[] = [0, 0]) {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-factory-health-queue-"));
+    const entries = homeIndexes.map((homeIndex, index) => {
+      const homeDir = join(directory, `home-${homeIndex}`);
+      const id = (index + 1).toString(16).padStart(64, "0");
+      const projectDirectory = join(homeDir, ".lcm", "projects", id);
+      mkdirSync(projectDirectory, { recursive: true, mode: 0o700 });
+      const dbPath = join(projectDirectory, "db.sqlite");
+      const db = new DatabaseSync(dbPath);
+      runLcmMigrations(db);
+      db.close();
+      return { homeDir, dbPath, identity: { id, canonical: homeDir } };
+    });
+    const factory = new SqliteStorageBackendFactory({ resolveProject: identity => {
+      const entry = entries.find(entry => entry.identity.id === identity.id)!;
+      return { id: identity.id, dbPath: entry.dbPath };
+    } });
+    const projects: SqliteProjectStorage[] = [];
+    for (const entry of entries) {
+      projects.push(await publication.withBackendPublicationConsumerLockAsync(entry.homeDir,
+        token => factory.openProject(entry.identity, token)) as SqliteProjectStorage);
+    }
+    return { directory, entries, projects, factory };
+  }
+
+  async function cleanup(context: Awaited<ReturnType<typeof fixture>>) {
+    await context.factory.close();
+    rmSync(context.directory, { recursive: true, force: true });
+  }
+
+  function expectNoProbeTables(dbPath: string) {
+    const inspection = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      expect(inspection.prepare(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE name LIKE '__lcm_storage_health_probe_%'",
+      ).get()).toEqual({ count: 0 });
+    } finally { inspection.close(); }
+  }
+
+  it.each(["retained", "idle", "mixed"] as const)(
+    "keeps %s same-home projects healthy across overlapping sweeps", async state => {
+      const context = await fixture(state === "mixed" ? [0, 0, 0, 0] : [0, 0]);
+      try {
+        if (state !== "retained") {
+          for (const project of state === "idle" ? context.projects : context.projects.slice(2)) {
+            await project.close();
+          }
+        }
+        expect(await context.factory.health()).toEqual({ status: "healthy", backend: "sqlite" });
+        expect(await Promise.all([context.factory.health(), context.factory.health()])).toEqual([
+          { status: "healthy", backend: "sqlite" },
+          { status: "healthy", backend: "sqlite" },
+        ]);
+        expect(await context.factory.health()).toEqual({ status: "healthy", backend: "sqlite" });
+        for (const entry of context.entries) expectNoProbeTables(entry.dbPath);
+      } finally { await cleanup(context); }
+    },
+  );
+
+  it("lets another home finish while same-home probes wait", async () => {
+    const context = await fixture([0, 0, 1]);
+    const entered = deferred();
+    const release = deferred();
+    const otherCompleted = deferred();
+    const first = context.projects[0]!;
+    const next = context.projects[1]!;
+    const other = context.projects[2]!;
+    const originalFirst = first.healthWithFreshAdmission.bind(first);
+    const originalOther = other.healthWithFreshAdmission.bind(other);
+    const nextProbe = vi.spyOn(next, "healthWithFreshAdmission");
+    vi.spyOn(first, "healthWithFreshAdmission").mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      return originalFirst();
+    });
+    vi.spyOn(other, "healthWithFreshAdmission").mockImplementationOnce(async () => {
+      const result = await originalOther();
+      expect(result.status).toBe("healthy");
+      otherCompleted.resolve();
+      return result;
+    });
+    const health = context.factory.health();
+    try {
+      await entered.promise;
+      await otherCompleted.promise;
+      expect(nextProbe).not.toHaveBeenCalled();
+      await expectPending(health);
+      release.resolve();
+      expect(await health).toEqual({ status: "healthy", backend: "sqlite" });
+      expect(nextProbe).toHaveBeenCalledOnce();
+    } finally {
+      release.resolve();
+      await Promise.allSettled([health]);
+      await cleanup(context);
+    }
+  });
+
+  it("preserves unexpected rejection and recovers later queued sweeps", async () => {
+    const context = await fixture([0]);
+    const entered = deferred();
+    const release = deferred();
+    const failure = new Error("injected probe rejection");
+    vi.spyOn(context.projects[0]!, "healthWithFreshAdmission").mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      throw failure;
+    });
+    const rejected = expect(context.factory.health()).rejects.toBe(failure);
+    await entered.promise;
+    const recovery = context.factory.health();
+    try {
+      release.resolve();
+      await rejected;
+      expect(await recovery).toEqual({ status: "healthy", backend: "sqlite" });
+      expect(await context.factory.health()).toEqual({ status: "healthy", backend: "sqlite" });
+    } finally {
+      release.resolve();
+      await Promise.allSettled([rejected, recovery]);
+      await cleanup(context);
+    }
+  });
+
+  it.each(["retained", "idle"] as const)(
+    "drains overlapping queued %s home probes before closing", async state => {
+      const context = await fixture();
+      const firstEntry = context.entries[0]!;
+      const retainedDb = getLcmConnection(firstEntry.dbPath);
+      if (state === "idle") for (const project of context.projects) await project.close();
+      const executor = sqliteExecutorFor(retainedDb, firstEntry.identity.id, () => undefined);
+      const entered = deferred();
+      const release = deferred();
+      const events: string[] = [];
+      const transaction = executor.transaction(async () => {
+        entered.resolve();
+        await release.promise;
+      });
+      await entered.promise;
+      const originalPrepare = DatabaseSync.prototype.prepare;
+      const prepareSpy = vi.spyOn(DatabaseSync.prototype, "prepare").mockImplementation(function (
+        this: DatabaseSync, sql: string,
+      ) {
+        if (sql === "PRAGMA quick_check(1)") events.push("probe");
+        return originalPrepare.call(this, sql);
+      });
+      const health = context.factory.health();
+      const overlapping = context.factory.health();
+      // A full event-loop turn lets both snapshots enqueue without releasing the transaction.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(events).toEqual([]);
+      const closing = context.factory.close().then(() => { events.push("closed"); });
+      try {
+        await expectPending(closing);
+        await expectPending(health);
+        await expectPending(overlapping);
+        release.resolve();
+        const [first, second] = await Promise.all([health, overlapping, closing, transaction]);
+        expect(first).toEqual({ status: "closed", backend: "sqlite" });
+        expect(second).toEqual({ status: "closed", backend: "sqlite" });
+        expect(events).toEqual(["probe", "probe", "probe", "probe", "closed"]);
+        expect(getPoolStats().connections.find(entry => entry.path === firstEntry.dbPath))
+          .toMatchObject({ refs: 1 });
+        expect(getPoolStats().connections.some(entry => entry.path === context.entries[1]!.dbPath)).toBe(false);
+        closeLcmConnection(firstEntry.dbPath, retainedDb);
+        expect(getPoolStats().connections.some(entry => entry.path === firstEntry.dbPath)).toBe(false);
+        for (const entry of context.entries) expectNoProbeTables(entry.dbPath);
+      } finally {
+        release.resolve();
+        await Promise.allSettled([health, overlapping, transaction, closing]);
+        prepareSpy.mockRestore();
+        closeLcmConnection(firstEntry.dbPath, retainedDb);
+        await cleanup(context);
+      }
+    },
+  );
+
+  it("keeps a handle opened while its idle probe is queued usable", async () => {
+    const context = await fixture();
+    const firstEntry = context.entries[0]!;
+    const secondEntry = context.entries[1]!;
+    const retainedDb = getLcmConnection(firstEntry.dbPath);
+    for (const project of context.projects) await project.close();
+    const entered = deferred();
+    const release = deferred();
+    const executor = sqliteExecutorFor(retainedDb, firstEntry.identity.id, () => undefined);
+    const transaction = executor.transaction(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    const health = context.factory.health();
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(getPoolStats().connections.find(entry => entry.path === firstEntry.dbPath))
+        .toMatchObject({ refs: 2 });
+      const active = await publication.withBackendPublicationConsumerLockAsync(secondEntry.homeDir,
+        token => context.factory.openProject(secondEntry.identity, token)) as SqliteProjectStorage;
+      release.resolve();
+      await transaction;
+      expect(await health).toEqual({ status: "healthy", backend: "sqlite" });
+      expect(getPoolStats().connections.find(entry => entry.path === secondEntry.dbPath))
+        .toMatchObject({ refs: 1 });
+      await publication.withBackendPublicationConsumerLockAsync(secondEntry.homeDir, token =>
+        active.withPublicationAdmission(token, async () => {
+          const conversation = await active.conversations.getOrCreateConversation("after-idle-probe");
+          expect(await active.conversations.getMessageCount(conversation.conversationId)).toBe(0);
+        }));
+      expectNoProbeTables(secondEntry.dbPath);
+    } finally {
+      release.resolve();
+      await Promise.allSettled([health, transaction]);
+      closeLcmConnection(firstEntry.dbPath, retainedDb);
+      await cleanup(context);
+    }
+  });
+
+  it.each(["retained", "idle"] as const)(
+    "preserves real publication contention and maintenance refusal for %s projects", async state => {
+      const context = await fixture();
+      const homeDir = context.entries[0]!.homeDir;
+      try {
+        if (state === "idle") for (const project of context.projects) await project.close();
+        await publication.withBackendPublicationConsumerLockAsync(homeDir, async () => {
+          const health = await context.factory.health();
+          expect(health).toMatchObject({ status: "unavailable", backend: "sqlite",
+            error: { code: "STORAGE_OPERATION_FAILED", domain: "factory", operation: "health" } });
+          expect(JSON.stringify(health)).not.toContain(homeDir);
+        });
+        expect(await context.factory.health()).toEqual({ status: "healthy", backend: "sqlite" });
+        const unexpected = async (): Promise<never> => { throw new Error("unexpected driver"); };
+        const coordinator = new publication.BackendPublicationCoordinator({ homeDir, driver: {
+          observeLocalState: unexpected, publishProjectMap: unexpected, publishConfig: unexpected,
+          restoreConfig: unexpected, restoreProjectMap: unexpected,
+        } });
+        await coordinator.enterMaintenance({
+          publicationId: "health-queue-maintenance", generationId: "health-queue-generation",
+          sourceSelectionSha256: "a".repeat(64), queueEvidenceSha256: "b".repeat(64),
+          roster: [{ machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
+            queueCutoff: null, evidenceSha256: "c".repeat(64) }],
+        });
+        const before = context.entries.map(entry => readFileSync(entry.dbPath));
+        expect(await context.factory.health()).toMatchObject({ status: "unavailable", backend: "sqlite" });
+        expect(context.entries.map(entry => readFileSync(entry.dbPath))).toEqual(before);
+      } finally { await cleanup(context); }
+    },
+  );
+
+  it("reports an idle failure while probing the next project and releasing every reference", async () => {
+    const context = await fixture();
+    for (const project of context.projects) await project.close();
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    let probes = 0;
+    const prepareSpy = vi.spyOn(DatabaseSync.prototype, "prepare").mockImplementation(function (
+      this: DatabaseSync, sql: string,
+    ) {
+      if (sql === "PRAGMA quick_check(1)" && ++probes === 1) {
+        return { all: () => [{ quick_check: "private-readiness-failure" }] } as never;
+      }
+      return originalPrepare.call(this, sql);
+    });
+    try {
+      const result = await context.factory.health();
+      expect(result).toMatchObject({ status: "unavailable", backend: "sqlite" });
+      expect(JSON.stringify(result)).not.toContain("private-readiness-failure");
+      expect(probes).toBe(2);
+      for (const entry of context.entries) {
+        expect(getPoolStats().connections.some(connection => connection.path === entry.dbPath)).toBe(false);
+        expectNoProbeTables(entry.dbPath);
+      }
+      expect(await context.factory.health()).toEqual({ status: "healthy", backend: "sqlite" });
+    } finally {
+      prepareSpy.mockRestore();
+      await cleanup(context);
+    }
+  });
+
+});
+
 describe("SqliteProjectStorage project health lifecycle", () => {
   it("uses per-operation admission without a canonical home", async () => {
     const fixture = createFixture();
