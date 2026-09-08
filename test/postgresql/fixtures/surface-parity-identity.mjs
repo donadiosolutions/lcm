@@ -17,6 +17,10 @@ export function json(result, code = 0) {
     let error = "";
     let payload;
     try { payload = JSON.parse(result.stdout); error = String(payload.error ?? ""); } catch {}
+    const exactTemplate = /^PostgreSQL created the project but the local binding could not be confirmed\. Run `lcm project link -- .+` to reconcile it\.$/u.test(error) ? "created-unbound"
+      : /^project map mutation is already in progress \((?:owned by live PID [0-9]+|owner state is ambiguous)\); retry after the active operation completes$/u.test(error) ? "map-contention"
+      : /^backend publication mutation is already in progress \((?:owned by live PID [0-9]+|owner state is ambiguous)\); retry after the active operation completes$/u.test(error) ? "publication-contention"
+      : "unmatched-template";
     const classification = /already a project with stored data/iu.test(error) ? "stored-data"
       : /already mapped|multiple hashes/iu.test(error) ? "path-ownership"
       : /unknown project|not found|does not exist/iu.test(error) ? "missing-project"
@@ -30,8 +34,8 @@ export function json(result, code = 0) {
       : "unexpected-status";
     const frames = [...new Error().stack.matchAll(/surface-parity-identity\.mjs:(\d+):\d+/gu)];
     const caller = frames[1]?.[1] ?? "unknown";
-    const failure = new Error(`surface-identity:cli-L${caller}:${classification}`);
-    failure.surfaceEvidence = { stderrDigest: createHash("sha256").update(result.stderr).digest("hex") };
+    const failure = new Error(`surface-identity:cli-L${caller}:${classification}:${exactTemplate}`);
+    failure.surfaceEvidence = { stdoutErrorDigest: createHash("sha256").update(error).digest("hex"), stderrDigest: createHash("sha256").update(result.stderr).digest("hex") };
     throw failure;
   }
   return JSON.parse(result.stdout);
@@ -100,6 +104,14 @@ async function matches(context, cwd, query) {
   return result.body.messages ?? result.body.matches;
 }
 
+async function sameLifetime(context, previous) {
+  assert.deepEqual(context.currentDaemonIdentity(), previous, 'surface-identity:live-owner');
+  const observed = await context.request('GET', '/health/observe');
+  assert.equal(observed.status, 200, 'surface-identity:observe-status');
+  assert.equal(observed.body.pid, previous.pid, 'surface-identity:live-pid');
+  assert.equal(observed.body.daemonInstanceId, previous.generation, 'surface-identity:live-generation');
+}
+
 async function identity(context) {
   const rows = [];
   const pg = context.backend === "postgresql";
@@ -143,41 +155,60 @@ async function identity(context) {
     assert.equal(existsSync(machineFile) ? readFileSync(machineFile, "utf8") : null, priorMachine);
   }
 
-  const root = privateRoot(context, "identity");
-  const other = privateRoot(context, "identity-other");
-  const alias = privateRoot(context, "identity-alias");
-  await invalid(context, ["project", "create", root]);
-  const creation = await context.cli(["project", "create", root, "--name", "Surface parity identity", "--json"]);
-  if (pg) {
-    const created = json(creation);
-    assert.match(created.remote.projectId, UUID);
-    assert.equal(created.local.id, hash(root));
-    assert.notEqual(created.remote.projectId, created.local.id);
-    assert.equal(created.local.remoteProjectId, created.remote.projectId);
-    assert.equal(created.remote.displayName, "Surface parity identity");
-    assert.equal(json(await context.cli(["project", "show", root, "--json"])).remote.projectId, created.remote.projectId);
-    json(await context.cli(["project", "create", other, "--name", "Surface parity unrelated", "--json"]));
-    rows.push(receipt("project create", { code: creation.code, created: true, separateRemoteIdentity: created.local.id !== created.remote.projectId }));
-  } else {
-    assert.match(json(creation, 1).error, REMOTE_REFUSAL);
-    rows.push(receipt("project create", { code: creation.code, refusal: "postgresql-required" }));
-  }
+  let root, other, alias;
+  await context.prepareProjects('identity-roots', async () => {
+    const results = [];
+    root = privateRoot(context, "identity");
+    other = privateRoot(context, "identity-other");
+    alias = privateRoot(context, "identity-alias");
+    await invalid(context, ["project", "create", root]);
+    const creation = await context.cli(["project", "create", root, "--name", "Surface parity identity", "--json"]);
+    if (pg) {
+      const created = json(creation);
+      results.push({ path: root, result: creation, parsed: created });
+      assert.match(created.remote.projectId, UUID);
+      assert.equal(created.local.id, hash(root));
+      assert.notEqual(created.remote.projectId, created.local.id);
+      assert.equal(created.local.remoteProjectId, created.remote.projectId);
+      assert.equal(created.remote.displayName, "Surface parity identity");
+      assert.equal(json(await context.cli(["project", "show", root, "--json"])).remote.projectId, created.remote.projectId);
+      const otherResult = await context.cli(["project", "create", other, "--name", "Surface parity unrelated", "--json"]);
+      results.push({ path: other, result: otherResult, parsed: json(otherResult) });
+      rows.push(receipt("project create", { code: creation.code, created: true, separateRemoteIdentity: created.local.id !== created.remote.projectId }));
+    } else {
+      assert.match(json(creation, 1).error, REMOTE_REFUSAL);
+      rows.push(receipt("project create", { code: creation.code, refusal: "postgresql-required" }));
+    }
+    return { caseId: 'identity-roots', created: results };
+  });
+  Object.assign(context, context.runtimeState());
+  let lifetime = context.currentDaemonIdentity();
   await ingest(context, root, "surface-identity-main", "Identity corpus amber nautical separator");
+  await sameLifetime(context, lifetime);
   await ingest(context, other, "surface-identity-other", "Identity corpus cobalt unrelated separator");
+  assert.equal((await context.request('GET', '/health')).status, 200, 'surface-identity:two-ingest-health');
+  await sameLifetime(context, lifetime);
   await invalid(context, ["project", "show", root]);
   const shown = json(await context.cli(["project", "show", root, "--json"]));
   assert.equal(shown.hash, hash(root));
   assert.equal(shown.entry.canonical, root);
   assert.equal(Boolean(shown.remote), pg);
   rows.push(receipt("project show", { code: 0, localIdentity: shown.hash === hash(root), remote: Boolean(shown.remote) }));
+  await context.isolateAsyncWork();
+  Object.assign(context, context.runtimeState());
+  lifetime = context.currentDaemonIdentity();
+  await sameLifetime(context, lifetime);
   await invalid(context, ["project", "link", shown.hash, alias]);
   const linked = json(await context.cli(["project", "link", shown.hash, alias, "--json"]));
   assert.equal(linked.local.id, shown.hash);
   const aliasShown = json(await context.cli(["project", "show", alias, "--json"]));
+  await sameLifetime(context, lifetime);
   assert.equal(aliasShown.hash, shown.hash);
   assert.ok(aliasShown.entry.aliases.includes(alias));
   assert.equal((await matches(context, alias, "amber nautical")).length, 1);
+  await sameLifetime(context, lifetime);
   assert.equal((await matches(context, other, "amber nautical")).length, 0);
+  await sameLifetime(context, lifetime);
   rows.push(receipt("project link", { code: 0, sameProject: aliasShown.hash === shown.hash, isolated: true, remote: Boolean(linked.local.remoteProjectId) }));
   await invalid(context, ["project", "list"]);
   const listed = json(await context.cli(["project", "list", "--json"]));
@@ -187,6 +218,10 @@ async function identity(context) {
   if (pg) assert.ok(listed.remote.some((entry) => entry.projectId === shown.remote.projectId));
   else assert.equal(listed.remote, undefined);
   rows.push(receipt("project list", { code: 0, projectsPresent: 2, remote: Array.isArray(listed.remote) }));
+  await sameLifetime(context, lifetime);
+  await context.isolateAsyncWork();
+  Object.assign(context, context.runtimeState());
+  lifetime = context.currentDaemonIdentity();
   // Synthetic on-disk Git metadata exercises the production filesystem
   // resolver without requiring a Git executable in the pinned CI image.
   const linkedWorktree = join(dirname(root), "surface-identity-linked-worktree");
@@ -212,6 +247,11 @@ async function identity(context) {
   assert.equal(linkedShown.hash, shown.hash);
   assert.equal((await matches(context, linkedWorktree, "amber nautical")).length, 1);
   rows.push(receipt("project reconcile-worktrees", { code: 0, status: reconciled.status, unchanged: true, linkedWorktree: linkedShown.hash === shown.hash }));
+  await sameLifetime(context, lifetime);
+  await context.isolateAsyncWork();
+  Object.assign(context, context.runtimeState());
+  lifetime = context.currentDaemonIdentity();
+  await sameLifetime(context, lifetime);
   await invalid(context, ["project", "unlink", alias]);
   const unlinked = json(await context.cli(["project", "unlink", alias, "--json"]));
   assert.equal(unlinked.hash, shown.hash);
@@ -222,6 +262,7 @@ async function identity(context) {
     const unbound = await context.request("POST", "/ingest", {
       cwd: alias, session_id: "surface-unbound", messages: [{ role: "user", content: "Must refuse unbound identity", tokenCount: 5 }],
     });
+    await sameLifetime(context, lifetime);
     assert.ok(unbound.status >= 400, "unbound PostgreSQL path must refuse durable writes");
     assert.match(JSON.stringify(unbound.body), /binding|project|postgresql/iu);
     const beforeRejectedLink = readFileSync(mapPath, "utf8");
@@ -231,8 +272,10 @@ async function identity(context) {
     assert.equal(json(await context.cli(["project", "show", alias, "--json"])).entry.remoteProjectId, undefined);
     assert.equal(json(await context.cli(["project", "show", root, "--json"])).remote.projectId, shown.remote.projectId);
     assert.equal((await matches(context, other, "amber nautical")).length, 0);
+    await sameLifetime(context, lifetime);
   }
   noProjectSqlite(context, [root, other, alias, linkedWorktree]);
+  await sameLifetime(context, lifetime);
   rows.push(receipt("project unlink", { code: 0, aliasRemoved: unlinked.aliasRemoved, originalPreserved: true, unboundRefused: pg }));
   if (pg) {
     // The refused ingest establishes an independent unbound identity and its
@@ -240,19 +283,27 @@ async function identity(context) {
     // stored state. Bind this owned negative fixture as a new project through
     // the public API so later all-project sweeps see only bound identities.
     // The completed unlink assertion above still proves the original boundary.
-    const rebound = json(await context.cli(["project", "create", alias, "--json"]));
-    assert.equal(rebound.local.id, hash(alias));
-    assert.equal(rebound.local.remoteProjectId, rebound.remote.projectId);
-    assert.notEqual(rebound.remote.projectId, shown.remote.projectId);
-    const reboundAlias = json(await context.cli(["project", "show", alias, "--json"]));
-    assert.equal(reboundAlias.hash, hash(alias));
-    assert.equal(reboundAlias.remote.projectId, rebound.remote.projectId);
-    const original = json(await context.cli(["project", "show", root, "--json"]));
-    assert.equal(original.entry.aliases.includes(alias), false);
-    assert.equal(original.remote.projectId, shown.remote.projectId);
+    await context.prepareProjects('identity-rebound', async () => {
+      const reboundResult = await context.cli(["project", "create", alias, "--json"]);
+      const rebound = json(reboundResult);
+      assert.equal(rebound.local.id, hash(alias));
+      assert.equal(rebound.local.remoteProjectId, rebound.remote.projectId);
+      assert.notEqual(rebound.remote.projectId, shown.remote.projectId);
+      const reboundAlias = json(await context.cli(["project", "show", alias, "--json"]));
+      assert.equal(reboundAlias.hash, hash(alias));
+      assert.equal(reboundAlias.remote.projectId, rebound.remote.projectId);
+      const original = json(await context.cli(["project", "show", root, "--json"]));
+      assert.equal(original.entry.aliases.includes(alias), false);
+      assert.equal(original.remote.projectId, shown.remote.projectId);
+      return { caseId: 'identity-rebound', created: [{ path: alias, result: reboundResult, parsed: rebound }] };
+    });
+    Object.assign(context, context.runtimeState());
     assert.equal((await matches(context, root, "amber nautical")).length, 1);
     assert.equal((await matches(context, alias, "amber nautical")).length, 0);
     noProjectSqlite(context, [root, other, alias, linkedWorktree]);
+  } else {
+    await context.finishSqliteRebound();
+    Object.assign(context, context.runtimeState());
   }
   return rows;
 }
@@ -289,7 +340,15 @@ async function events(context) {
   const rows = [];
   const root = privateRoot(context, "events-operator");
   const pg = context.backend === "postgresql";
-  if (pg) json(await context.cli(["project", "create", root, "--name", "Surface event operator", "--json"]));
+  await context.prepareProjects('events-operator', async () => {
+    const created = [];
+    if (pg) {
+      const result = await context.cli(["project", "create", root, "--name", "Surface event operator", "--json"]);
+      created.push({ path: root, result, parsed: json(result) });
+    }
+    return { caseId: 'events-operator', created };
+  });
+  Object.assign(context, context.runtimeState());
   await ingest(context, root, "surface-events-bootstrap", "Operator baseline corpus");
   const cli = (args) => context.cli(args, { cwd: root });
   for (const path of ["/promote-events", "/promote-events/all", "/promote-events/notify"]) {
@@ -389,7 +448,15 @@ async function events(context) {
   // Retain notification admission after the CLI/recovery oracles. The
   // following owned-lifetime boundary settles work before the next scenario.
   const notifyRoot = privateRoot(context, "events-notify");
-  if (pg) json(await context.cli(["project", "create", notifyRoot, "--json"]));
+  await context.prepareProjects('events-notify', async () => {
+    const created = [];
+    if (pg) {
+      const result = await context.cli(["project", "create", notifyRoot, "--json"]);
+      created.push({ path: notifyRoot, result, parsed: json(result) });
+    }
+    return { caseId: 'events-notify', created };
+  });
+  Object.assign(context, context.runtimeState());
   await ingest(context, notifyRoot, "surface-events-notify", "Notification baseline corpus");
   const notified = await context.request("POST", "/promote-events/notify", { cwd: notifyRoot, priority: 1, pendingCount: 0, sourceHook: "surface-parity" });
   assert.equal(notified.status, 200);
@@ -487,7 +554,7 @@ async function sensitive(context) {
 export async function runIdentityScenario(scenario, context) {
   const run = { identity, admin, events, sensitive }[scenario];
   assert.ok(run, `unknown identity workflow ${scenario}`);
-  const rows = await run(context);
+  const rows = scenario === "sensitive" ? await context.runStoppedSensitiveCase(() => run(context)) : await run(context);
   const expected = context.matrix.filter((row) => row.scenario === scenario).map((row) => row.id).sort();
   assert.deepEqual(rows.map((row) => row.id).sort(), expected, "identity workflow owns its exact denominator");
   for (const row of rows) {

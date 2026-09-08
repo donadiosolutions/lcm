@@ -12,6 +12,7 @@ import { PostgreSqlIdentityRepository, type RegisteredMachine, type RemoteProjec
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import { createCertificate, encodeBookkeeping, loadMatrix, sourceDigest } from "../../scripts/surface-parity-artifact.mjs";
 import { assertCompleteReport, assertSemanticEqual, compareBackendReports, semanticDigest } from "../surface-parity/assertions.mjs";
+import { createAdmissionLedger, preparedCase, validatePreparedCatalog } from "../surface-parity/prepared-projects.mjs";
 import { createGitFixture } from "../surface-parity/git-fixture.mjs";
 import { FAULT_ASSERTION_OWNERS, type SurfaceRow } from "../surface-parity/inventory.js";
 import { expectedSurfaceObservations } from "./fixtures/surface-parity-workflows.mjs";
@@ -90,6 +91,11 @@ class OwnedAdministrator {
   private witnessed = new Set<number>();
   private denied = false;
   private baselineCorpus?: CorpusCounts;
+  private prepared?: { token: number; caseId: string; paths: string[]; before: { projects: Json[]; aliases: Json[]; snapshot: Json } };
+  private preparedSequence = 0;
+  private preparedPaths?: WorkerPaths;
+
+  setPreparedPaths(paths: WorkerPaths): void { requireThat(!this.preparedPaths, "prepared-paths-once"); this.preparedPaths = paths; }
 
   constructor(private database: PostgreSqlTestDatabase, private unavailable: () => Promise<Json>) {
     this.runtime = new PostgreSqlRuntime(settings(database.adminUrl));
@@ -98,6 +104,30 @@ class OwnedAdministrator {
 
   async execute(action: unknown, payload: unknown, scenario: string): Promise<Json> {
     requireThat(typeof action === "string" && object(payload), "admin-request-schema");
+    if (action === "prepared-projects.begin") {
+      requireThat(exact(payload, ["caseId"]) && typeof payload.caseId === "string" && this.preparedPaths && !this.prepared, "prepared-begin");
+      const paths = preparedCase(payload.caseId, scenario, this.preparedPaths);
+      const before = await this.preparedCatalog();
+      const token = ++this.preparedSequence;
+      this.prepared = { token, caseId: payload.caseId, paths, before };
+      return { token, snapshotDigest: semanticDigest(before.snapshot) };
+    }
+    if (action === "prepared-projects.finish") {
+      requireThat(exact(payload, ["token", "caseId", "created"]) && this.prepared && payload.token === this.prepared.token
+        && payload.caseId === this.prepared.caseId && Array.isArray(payload.created) && this.preparedPaths, "prepared-finish");
+      const paths = preparedCase(this.prepared.caseId, scenario, this.preparedPaths);
+      const expected = this.prepared.caseId === "sensitive-files" ? [] : paths;
+      requireThat(payload.created.length === expected.length, "prepared-result-count");
+      for (const [index, item] of payload.created.entries()) {
+        requireThat(exact(item, ["path", "remote"]) && item.path === expected[index] && object(item.remote)
+          && Array.isArray(item.remote.aliases) && item.remote.aliases.length === 1 && object(item.remote.aliases[0])
+          && item.remote.aliases[0].path === item.path && item.remote.aliases[0].normalizedPath === item.path, "prepared-result-path");
+      }
+      const after = await this.preparedCatalog();
+      const result = validatePreparedCatalog(this.prepared.before, after, payload.created);
+      this.prepared = undefined;
+      return { ...result, snapshotDigest: semanticDigest(after.snapshot) };
+    }
     if (action === "snapshot") {
       requireThat(exact(payload, []), "snapshot-payload");
       const snapshot = await this.snapshot();
@@ -201,6 +231,12 @@ class OwnedAdministrator {
     throw failure("unknown-admin-action");
   }
 
+  private async preparedCatalog(): Promise<{ projects: Json[]; aliases: Json[]; snapshot: Json }> {
+    const projects = await this.runtime.query<{ row: Json }>({ text: 'SELECT to_jsonb(record) AS row FROM lcm.projects record ORDER BY project_id' }, scope);
+    const aliases = await this.runtime.query<{ row: Json }>({ text: 'SELECT to_jsonb(record) AS row FROM lcm.project_aliases record ORDER BY machine_id,normalized_path COLLATE "C"' }, scope);
+    return { projects: projects.rows.map(row => row.row), aliases: aliases.rows.map(row => row.row), snapshot: await this.snapshot() };
+  }
+
   private async snapshot(): Promise<Json> {
     const catalog = await this.runtime.query<{ table_name: string; column_name: string; data_type: string; is_nullable: string; column_default: string | null }>({
       text: `SELECT table_name,column_name,data_type,is_nullable,column_default
@@ -256,6 +292,7 @@ class OwnedAdministrator {
   }
 
   async releaseLock(): Promise<void> {
+    this.prepared = undefined;
     const lock = this.lock;
     if (!lock) return;
     lock.release.resolve();
@@ -443,6 +480,7 @@ class FixedBackendWorker {
   private adminOutstanding = 0;
   private adminQueue = Promise.resolve();
   private fatal?: Error;
+  private admission = createAdmissionLedger({ requireCases: false });
   private readySeen = false;
   private stopping = false;
   private stopSeen = false;
@@ -450,6 +488,7 @@ class FixedBackendWorker {
   private termination?: Promise<void>;
 
   constructor(readonly backend: Backend, env: NodeJS.ProcessEnv, private administrator: OwnedAdministrator) {
+    if (backend === "postgresql") administrator.setPreparedPaths({ homeDir: env.HOME!, projectPath: env.LCM_SURFACE_PROJECT_PATH!, secondaryProjectPath: env.LCM_SURFACE_SECONDARY_PROJECT_PATH! });
     this.child = fork(join(process.cwd(), "test/postgresql/fixtures/surface-parity-worker.mjs"), [], {
       cwd: process.cwd(), env, execArgv: [], detached: true,
       stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -512,6 +551,7 @@ class FixedBackendWorker {
 
   private breakProtocol(id: string, terminate = true): void {
     this.fatal ??= failure(id);
+    this.admission.fail(this.fatal);
     this.ready.reject(this.fatal);
     this.stopped.reject(this.fatal);
     this.pending?.reply.reject(this.fatal);
@@ -563,7 +603,9 @@ class FixedBackendWorker {
     requireThat(this.pending && message.seq === this.pending.seq && message.scenario === this.pending.scenario && message.backend === this.backend && this.adminOutstanding === 0, "response-identity");
     if (message.type === "failed") {
       requireThat(exact(message, ["type", "seq", "backend", "scenario", "error"]), "failure-contract");
-      this.pending.reply.reject(failure(`worker:${this.backend}:${workerError(message.error)}`));
+      this.fatal ??= failure(`worker:${this.backend}:${workerError(message.error)}`);
+      this.admission.fail(this.fatal);
+      this.pending.reply.reject(this.fatal);
       return;
     }
     const fault = this.pending.scenario.startsWith("fault-");
@@ -571,6 +613,7 @@ class FixedBackendWorker {
     encodeBookkeeping(message.bookkeeping, this.backend);
     const expectedPhase = this.pending.scenario === "compaction" ? "compact-preview" : this.pending.scenario === "diagnostics" ? "health-readiness" : this.pending.scenario;
     requireThat(message.bookkeeping.every(tuple => Array.isArray(tuple) && tuple[0] === expectedPhase), "bookkeeping-scenario-owner");
+    this.admission.complete(this.pending.scenario);
     this.pending.reply.resolve(message as unknown as WorkerResult);
   }
 
@@ -589,6 +632,7 @@ class FixedBackendWorker {
 
   async run(scenario: string): Promise<WorkerResult> {
     requireThat(this.readySeen && !this.pending && !this.stopping && !this.fatal, "worker-run-state");
+    this.admission.begin(scenario);
     const reply = deferred<WorkerResult>();
     this.pending = { seq: ++this.sequence, scenario, reply };
     try {

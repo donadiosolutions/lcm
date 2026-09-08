@@ -255,3 +255,24 @@ storage or TLS refusal, correct the configured authority or connection and retry
 the selected backend. Do not delete local metadata or switch backends as an
 implicit repair. Known upstream regressions remain failures when reproduced;
 their historical fixes do not waive an assertion on the tested revision.
+
+Project creation prerequisites run through the actual project-create CLI with
+its fixed configured backend while the fixture's owned daemon and MCP
+publishers are closed for the entire preparation. Before setup, the fixture
+captures existing native data, catalog rows, map entries and publication
+identity. It admits only each named case's result-backed metadata additions,
+then starts a new daemon and independently checks preservation across startup.
+The CLI-only sensitive-pattern case has its own stopped local-file contract.
+These setup checks add no surface or assertion credits.
+
+The certificate therefore does not claim live-daemon project-create success
+or success under arbitrary cross-process publication overlap. The live identity
+proofs retain the same daemon PID and generation through ordinary two-project
+ingestion and active health, alias link/unlink/show/list, worktree reconciliation
+and their HTTP effects. Native hook completion and fault lifetimes remain
+separate exercised contracts. A failed setup or live scenario makes its worker
+terminal; later scenarios and faults cannot fill missing certificate rows.
+
+This fixture boundary is not evidence of a production defect or a remedy
+recommendation. Historical CI handled JSON is unavailable. The earlier
+319-pass diagnostic run was investigative evidence, not candidate admission.

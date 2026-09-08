@@ -14,7 +14,9 @@ import { createDaemon } from '../../../dist/src/daemon/server.js';
 import { loadDaemonConfig, readDaemonConfigSnapshot, daemonConfigSnapshotWitnessEqual } from '../../../dist/src/daemon/config.js';
 import { withBackendPublicationReadRoot, assertBackendPublicationConfigReadAccess, withBackendPublicationConsumerLock, assertBackendPublicationConsumerAccess } from '../../../dist/src/storage/backend-publication.js';
 import { assertSelectedBackend } from '../../surface-parity/backend-observation.mjs';
+import { capturePreparedMetadata, capturePreparedInputs, validatePreparedInputs, createAdmissionLedger, preparedCase, runPreparedCase, validatePreparedBundle, validatePreparedDelta } from '../../surface-parity/prepared-projects.mjs';
 import { isolateAsyncBoundary } from '../../surface-parity/async-isolation.mjs';
+import { semanticDigest } from '../../surface-parity/assertions.mjs';
 import { assertRestartSnapshotUnchanged } from '../../surface-parity/restart-snapshot.mjs';
 import { invokeAfterConsumerAdmission } from '../../surface-parity/mcp-readiness.mjs';
 import { collectEventSidecars } from '../../../dist/src/db/event-sidecars.js';
@@ -60,6 +62,12 @@ let busy = false;
 let stopping = false;
 let lastSequence = 0;
 let activeScenario = 'startup';
+const admission = createAdmissionLedger();
+let preparing = false;
+const admittedBindings = new Map(backend === 'postgresql' ? [
+  [projectPath, process.env.LCM_SURFACE_REMOTE_PROJECT_ID],
+  [secondaryProjectPath, process.env.LCM_SURFACE_SECONDARY_REMOTE_PROJECT_ID],
+] : []);
 let observedBookkeeping = new Map();
 const streamLimit = 32768;
 
@@ -71,7 +79,7 @@ function failure(error) {
   const knownCodes = new Set(['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'EBADF', 'EBUSY', 'EAGAIN', 'ESTALE', 'ERR_INVALID_STATE', 'ERR_INVALID_ARG_TYPE', 'ERR_SQLITE_ERROR']);
   const fallbackId = errorName ? `surface-worker:${errorName}` : knownCodes.has(error?.code) ? `surface-worker:${error.code}` : 'surface-worker:assertion';
   const frame = String(error?.stack ?? '').match(/(surface-parity-[a-z-]+\.mjs):(\d+):\d+/u);
-  return { id: `${symbolic ?? fallbackId}${frame ? `:${frame[1]}:${frame[2]}` : ''}`.slice(0, 80), digest: error?.surfaceEvidence?.stderrDigest ?? createHash('sha256').update(message).digest('hex') };
+  return { id: `${symbolic ?? fallbackId}${frame ? `:${frame[1]}:${frame[2]}` : ''}`.slice(0, 80), digest: error?.surfaceEvidence?.stdoutErrorDigest ?? error?.surfaceEvidence?.stderrDigest ?? createHash('sha256').update(message).digest('hex') };
 }
 function send(message) {
   const json = JSON.stringify(message);
@@ -245,6 +253,8 @@ function bookkeepingResult() {
 }
 const context = {
   backend, homeDir, projectPath, secondaryProjectPath, scenario: activeScenario, recordBookkeeping,
+  prepareProjects, runStoppedSensitiveCase, finishSqliteRebound,
+  runtimeState: () => ({ baseUrl: context.baseUrl, client: context.client, config: context.config, daemonPid: context.daemonPid, daemonInstanceId: context.daemonInstanceId }),
   currentDaemonIdentity: () => ({ pid: baseline?.pid, generation: context.daemonInstanceId }),
   projectId: hashProjectPath(projectPath), secondaryProjectId: hashProjectPath(secondaryProjectPath),
   remoteProjectId: process.env.LCM_SURFACE_REMOTE_PROJECT_ID,
@@ -421,9 +431,9 @@ async function hasPendingPassiveWork() {
   assert.ok(sidecars.every(row => !row.scanError && !row.scanSkipped), 'surface-isolation:sidecar-observation');
   return sidecars.some(row => row.projectId === context.projectId && row.unprocessed > 0);
 }
-async function isolateAsyncWork() {
+function ownedLifecycle() {
   assert.ok(baselineStarted && baseline && !directDaemon, 'surface-isolation:canonical-lifetime');
-  await isolateAsyncBoundary({
+  return {
     drain: cwd => request('POST', '/promote-events', { cwd, drain: true }),
     readSidecars: readPassiveSidecars,
     captureState: async () => {
@@ -448,6 +458,7 @@ async function isolateAsyncWork() {
       assert.throws(() => process.kill(previous.pid, 0), error => error.code === 'ESRCH', 'surface-isolation:old-daemon-retained');
       baseline = undefined;
       resetSnapshotReaders();
+      assert.equal(childProcesses.size, 0, 'surface-isolation:owned-child-retained');
       return previous;
     },
     start: async port => {
@@ -458,14 +469,114 @@ async function isolateAsyncWork() {
       assert.ok(JSON.stringify(after.authority) === JSON.stringify(before.authority), 'surface-isolation:authority-changed');
       assertRestartSnapshotUnchanged(after.logical, before.logical, process.getuid());
     },
+  };
+}
+async function isolateAsyncWork() {
+  admission.assertHealthy();
+  await isolateAsyncBoundary(ownedLifecycle());
+}
+async function settlePrepared() {
+  const sidecars = await readPassiveSidecars();
+  for (const sidecar of sidecars) {
+    assert.ok(!sidecar.metadataMissing, 'surface-prepared:sidecar-metadata');
+    if (backend === 'postgresql') {
+      const entry = readProjectMapSnapshot()[sidecar.projectId];
+      if (!entry?.remoteProjectId) assert.equal(sidecar.unprocessed, 0, 'surface-prepared:unbound-passive-events');
+    }
+    if (sidecar.unprocessed > 0) {
+      const result = await request('POST', '/promote-events', { cwd: sidecar.cwd, drain: true });
+      assert.ok(result.status === 200 && result.body.errors === 0 && result.body.incomplete !== true, 'surface-prepared:drain');
+    }
+  }
+  assert.ok((await readPassiveSidecars()).every(row => row.unprocessed === 0), 'surface-prepared:settled');
+}
+async function prepareProjects(caseId, runExistingSetup) {
+  assert.notEqual(caseId, 'sensitive-files', 'surface-prepared:separate-sensitive-case');
+  return prepared(caseId, runExistingSetup);
+}
+async function runStoppedSensitiveCase(runExistingSensitive) {
+  let rows;
+  await prepared('sensitive-files', async () => {
+    rows = await runExistingSensitive();
+    return { caseId: 'sensitive-files', created: [] };
   });
+  return rows;
+}
+async function finishSqliteRebound() {
+  assert.equal(backend, 'sqlite', 'surface-prepared:rebound-not-applicable');
+  admission.beginCase('identity-rebound');
+  try { await isolateAsyncWork(); admission.completeCase('identity-rebound'); }
+  catch (error) { throw admission.fail(error); }
+}
+async function prepared(caseId, runExistingSetup) {
+  const paths = { homeDir, projectPath };
+  preparedCase(caseId, activeScenario, paths);
+  const lifecycle = ownedLifecycle();
+  const authority = readAdmissionAuthority();
+  let token;
+  let admitted = false;
+  let validatedBundle;
+  const capture = async () => ({ ...await lifecycle.captureState(), metadata: capturePreparedMetadata(homeDir), inputs: capturePreparedInputs(paths) });
+  try {
+    return await runPreparedCase({
+      assertAdmitted() {
+        admission.assertHealthy();
+        assert.ok(!preparing, 'surface-prepared:concurrent-case');
+        admission.beginCase(caseId);
+        preparing = true;
+        admitted = true;
+      },
+      settle: settlePrepared,
+      stop: lifecycle.stop,
+      assertStopped() {
+        assert.ok(!baseline && !directDaemon && !mcpClient && !transport && !readFactory && childProcesses.size === 0,
+          'surface-prepared:owned-publisher-retained');
+      },
+      async captureBefore() {
+        const before = await capture();
+        assert.ok(JSON.stringify(before.authority) === JSON.stringify(authority), 'surface-prepared:prestop-authority');
+        if (backend === 'postgresql') {
+          const witness = await admin('prepared-projects.begin', { caseId });
+          assert.equal(witness.snapshotDigest, semanticDigest(before.logical.postgresql), 'surface-prepared:catalog-before');
+          token = witness.token;
+        }
+        return before;
+      },
+      async captureAfter(bundle) {
+        validatePreparedBundle(caseId, activeScenario, paths, backend, bundle);
+        const after = await capture();
+        if (backend === 'postgresql') {
+          const result = await admin('prepared-projects.finish', { caseId, token,
+            created: bundle.created.map(item => ({ path: item.path, remote: item.parsed.remote })) });
+          assert.equal(result.snapshotDigest, semanticDigest(after.logical.postgresql), 'surface-prepared:catalog-after');
+          after.catalogValidated = result.validated === true;
+        }
+        return after;
+      },
+      validate: (before, after, bundle) => {
+        validatePreparedInputs(caseId, activeScenario, paths, before.inputs, after.inputs, process.getuid());
+        validatePreparedDelta({ caseId, scenario: activeScenario, paths, backend, bundle, before, after, owner: process.getuid() });
+        validatedBundle = bundle;
+      },
+      start: lifecycle.start,
+      captureRestart: lifecycle.captureState,
+      assertRestartUnchanged: lifecycle.assertStateUnchanged,
+      complete: () => {
+        admission.completeCase(caseId);
+        if (backend === 'postgresql') for (const item of validatedBundle.created) admittedBindings.set(item.path, item.parsed.remote.projectId);
+      },
+      fail: error => admission.fail(error),
+    }, runExistingSetup);
+  } finally { if (admitted) preparing = false; }
 }
 async function enterFaults() {
   if (directDaemon) return;
   await closeMcp();
   await readFactory?.close();
   readFactory = undefined;
+  const previousPid = baseline?.pid;
   await stopBaseline();
+  if (previousPid) assert.throws(() => process.kill(previousPid, 0), error => error.code === 'ESRCH', 'surface-worker:fault-old-pid');
   baseline = undefined;
   resetSnapshotReaders();
   // Ordinary public workflows use normal production tuning. Saturation and
@@ -508,6 +619,7 @@ process.on('message', message => {
       return;
     }
     assert.equal(message.type, 'run', 'surface-worker:request-type');
+    admission.begin(message.scenario);
     activeScenario = message.scenario;
     context.scenario = activeScenario;
     observedBookkeeping = new Map();
@@ -515,6 +627,14 @@ process.on('message', message => {
     await assertNoFallback();
     if (baseline) assert.equal(baseline.exitCode, null, 'surface-worker:baseline-exited');
     let result;
+    if (message.scenario === 'diagnostics' && backend === 'postgresql') {
+      const map = readProjectMapSnapshot();
+      assert.equal(admittedBindings.size, 10, 'surface-prepared:bound-fixture-count');
+      for (const [path, remote] of admittedBindings) {
+        const entry = map[hashProjectPath(path)];
+        assert.ok(entry?.canonical === path && entry.remoteProjectId === remote, 'surface-prepared:diagnostic-binding');
+      }
+    }
     if (message.scenario === 'diagnostics' || message.scenario.startsWith('fault-')) await quiesceReadState();
     if (message.scenario.startsWith('fault-')) {
       if (message.scenario === 'fault-pool' || message.scenario === 'fault-cancellation') await enterFaults();
@@ -527,10 +647,11 @@ process.on('message', message => {
       assert.equal(currentHealth?.daemonInstanceId, context.daemonInstanceId, 'surface-worker:baseline-generation-replaced');
     }
     closeSnapshotReaders();
+    admission.complete(message.scenario);
     send({ type: 'result', seq: message.seq, backend, scenario: message.scenario, ...result, bookkeeping: bookkeepingResult() });
   })().catch(error => {
     try { closeSnapshotReaders(); } catch { /* Preserve the primary failure; final cleanup also fails closed. */ }
-    send({ type: 'failed', seq: message?.seq, backend, scenario: activeScenario, error: failure(error) });
+    send({ type: 'failed', seq: message?.seq, backend, scenario: activeScenario, error: failure(admission.fail(error)) });
   })
     .finally(() => { busy = false; });
 });

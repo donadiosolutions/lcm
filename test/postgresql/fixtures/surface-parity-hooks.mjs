@@ -240,22 +240,28 @@ async function promotionContext(original) {
   // separate so earlier mock summaries cannot deduplicate into a memory whose
   // session belongs to another scenario, obscuring ordinary source provenance.
   const projectPath = join(dirname(original.projectPath), 'surface-promotion');
-  assert.equal(existsSync(projectPath), false, 'surface-parity:promotion:fresh-project');
-  createGitFixture(projectPath);
-  const { hashProjectPath } = await import('../../../dist/src/project-map.js');
-  const projectId = hashProjectPath(projectPath);
-  assert.notEqual(projectId, original.projectId, 'surface-parity:promotion:separate-project');
-  let remoteProjectId;
-  if (original.backend === 'postgresql') {
-    const result = await original.cli(['project', 'create', projectPath, '--json'], { cwd: projectPath });
-    assert.equal(result.code, 0, 'surface-parity:promotion:project-create');
-    const created = JSON.parse(result.stdout);
-    remoteProjectId = created.remote.projectId;
-    assert.match(remoteProjectId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu, 'surface-parity:promotion:remote-project');
-    assert.equal(created.local.id, projectId, 'surface-parity:promotion:local-project');
-    assert.equal(created.local.remoteProjectId, remoteProjectId, 'surface-parity:promotion:project-binding');
-    assert.notEqual(remoteProjectId, projectId, 'surface-parity:promotion:distinct-provenance');
-  }
+  let projectId, remoteProjectId;
+  await original.prepareProjects('promotion-root', async () => {
+    assert.equal(existsSync(projectPath), false, 'surface-parity:promotion:fresh-project');
+    createGitFixture(projectPath);
+    const { hashProjectPath } = await import('../../../dist/src/project-map.js');
+    projectId = hashProjectPath(projectPath);
+    assert.notEqual(projectId, original.projectId, 'surface-parity:promotion:separate-project');
+    const results = [];
+    if (original.backend === 'postgresql') {
+      const result = await original.cli(['project', 'create', projectPath, '--json'], { cwd: projectPath });
+      assert.equal(result.code, 0, 'surface-parity:promotion:project-create');
+      const created = JSON.parse(result.stdout);
+      results.push({ path: projectPath, result, parsed: created });
+      remoteProjectId = created.remote.projectId;
+      assert.match(remoteProjectId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu, 'surface-parity:promotion:remote-project');
+      assert.equal(created.local.id, projectId, 'surface-parity:promotion:local-project');
+      assert.equal(created.local.remoteProjectId, remoteProjectId, 'surface-parity:promotion:project-binding');
+      assert.notEqual(remoteProjectId, projectId, 'surface-parity:promotion:distinct-provenance');
+    }
+    return { caseId: 'promotion-root', created: results };
+  });
+  Object.assign(original, original.runtimeState());
   // SQLite creates its persisted identity through the real /ingest below.
   // Backend selection, HOME, daemon and read-only observers remain unchanged.
   return { ...original, projectPath, projectId, remoteProjectId };
@@ -399,6 +405,10 @@ export async function runHookScenario(scenario, context) {
     assert.deepEqual(row.assertions, executedAssertions(row.id), `surface-parity:unexecuted-assertion:${row.id}`);
   }
   if (scenario === 'hooks') return runHooks(context);
-  if (scenario === 'promotion') return runPromotion(context);
+  if (scenario === 'promotion') {
+    const rows = await runPromotion(context);
+    await context.isolateAsyncWork();
+    return rows;
+  }
   throw new Error('surface-parity:unknown-hook-scenario');
 }

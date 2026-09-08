@@ -19,8 +19,9 @@ it.each([
   try { json({ code: 1, stdout, stderr }); }
   catch (error) { failure = error as typeof failure; }
   expect(failure).toBeInstanceOf(Error);
-  expect(failure!.message).toMatch(new RegExp(`^surface-identity:cli-L(?:[0-9]+|unknown):${category}$`, "u"));
+  expect(failure!.message).toMatch(new RegExp(`^surface-identity:cli-L(?:[0-9]+|unknown):${category}:unmatched-template$`, "u"));
   expect(failure!.surfaceEvidence).toEqual({
+    stdoutErrorDigest: createHash("sha256").update((() => { try { return String(JSON.parse(stdout).error ?? ""); } catch { return ""; } })()).digest("hex"),
     stderrDigest: createHash("sha256").update(stderr).digest("hex"),
   });
   expect(JSON.stringify(failure)).not.toContain(privateText);
@@ -35,4 +36,20 @@ it("preserves success payloads and explicitly expected nonzero results", () => {
 
 it("still rejects malformed JSON on an otherwise successful command", () => {
   expect(() => json({ code: 0, stdout: "not-json", stderr: "" })).toThrow(SyntaxError);
+});
+
+
+it.each([
+  ["created-unbound", "PostgreSQL created the project but the local binding could not be confirmed. Run `lcm project link -- private/path` to reconcile it."],
+  ["map-contention", "project map mutation is already in progress (owned by live PID 123); retry after the active operation completes"],
+  ["publication-contention", "backend publication mutation is already in progress (owner state is ambiguous); retry after the active operation completes"],
+  ["unmatched-template", "private unknown refusal"],
+])("keeps only fixed %s template and hashes the handled JSON error", (template, error) => {
+  try { json({ code: 1, stdout: JSON.stringify({ error }), stderr: "" }); expect.fail("expected refusal"); }
+  catch (failure) {
+    expect((failure as Error).message).toMatch(new RegExp(`:${template}$`, "u"));
+    expect(JSON.stringify(failure)).not.toContain(error);
+    expect((failure as { surfaceEvidence: { stdoutErrorDigest: string } }).surfaceEvidence.stdoutErrorDigest)
+      .toBe(createHash("sha256").update(error).digest("hex"));
+  }
 });

@@ -153,15 +153,23 @@ async function nativeImport(context) {
 
   // Two real project identities whose Claude directory encoding collides.
   const collisionPaths = [join(context.homeDir, 'import-collision-a'), join(context.homeDir, 'import-collision', 'a')];
-  for (const path of collisionPaths) {
-    createGitFixture(path, { remote: 'https://example.invalid/parity-import.git' });
-    if (context.backend === 'postgresql') successful(await context.cli(['project', 'create', path, '--json']), 'collision-binding');
-    else resolveProjectIdentity(path);
-    // Native binding ambiguity comes from two real thread-owner metadata records.
-    // The resolver checks these owners before its optional Git remote query.
-    write(join(path, '.git', 'worktrees', 'parity-owner', 'codex-thread.json'),
-      JSON.stringify({ version: 1, ownerThreadId: 'parity-ambiguous' }) + '\n');
-  }
+  await context.prepareProjects('import-collisions', async () => {
+    const created = [];
+    for (const path of collisionPaths) {
+      createGitFixture(path, { remote: 'https://example.invalid/parity-import.git' });
+      if (context.backend === 'postgresql') {
+        const result = await context.cli(['project', 'create', path, '--json']);
+        successful(result, 'collision-binding');
+        created.push({ path, result, parsed: JSON.parse(result.stdout) });
+      } else created.push({ path, identity: resolveProjectIdentity(path) });
+      // Native binding ambiguity comes from two real thread-owner metadata records.
+      // The resolver checks these owners before its optional Git remote query.
+      write(join(path, '.git', 'worktrees', 'parity-owner', 'codex-thread.json'),
+        JSON.stringify({ version: 1, ownerThreadId: 'parity-ambiguous' }) + '\n');
+    }
+    return { caseId: 'import-collisions', created };
+  });
+  Object.assign(context, context.runtimeState());
   equal(cwdToProjectHash(collisionPaths[0]), cwdToProjectHash(collisionPaths[1]), 'collision-fixture');
   write(join(context.homeDir, '.claude', 'projects', cwdToProjectHash(collisionPaths[0]), 'parity-refused.jsonl'),
     transcript('claude', 'parity-refused', collisionPaths[0]));
