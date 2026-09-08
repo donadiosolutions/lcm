@@ -16,6 +16,8 @@ import { withBackendPublicationReadRoot, assertBackendPublicationConfigReadAcces
 import { assertSelectedBackend } from '../../surface-parity/backend-observation.mjs';
 import { capturePreparedMetadata, capturePreparedInputs, validatePreparedInputs, createAdmissionLedger, preparedCase, runPreparedCase, validatePreparedBundle, validatePreparedDelta } from '../../surface-parity/prepared-projects.mjs';
 import { isolateAsyncBoundary } from '../../surface-parity/async-isolation.mjs';
+import { classifyHomeParent, parseHomeParentWitness, witnessPayload } from '../../../dist/src/home-parent-auth.js';
+import { readBoundedRegularFileWithStat } from '../../../dist/src/security-files.js';
 import { semanticDigest } from '../../surface-parity/assertions.mjs';
 import { assertRestartSnapshotUnchanged } from '../../surface-parity/restart-snapshot.mjs';
 import { invokeAfterConsumerAdmission } from '../../surface-parity/mcp-readiness.mjs';
@@ -508,6 +510,32 @@ async function finishSqliteRebound() {
   try { await isolateAsyncWork(); admission.completeCase('identity-rebound'); }
   catch (error) { throw admission.fail(error); }
 }
+function capturePreparedParentWitness(metadata) {
+  const leaf = metadata.otherLeaves['home-parent-witness.json'];
+  if (!leaf) return undefined;
+  return withBackendPublicationReadRoot(homeDir, assertReadRoot => {
+    const observe = () => {
+      assertReadRoot();
+      const home = lstatSync(homeDir, { bigint: true });
+      const parent = lstatSync(dirname(homeDir), { bigint: true });
+      assertReadRoot();
+      return { homePath: homeDir, homeDev: String(home.dev), homeIno: String(home.ino), homeUid: Number(home.uid),
+        parentPath: dirname(homeDir), parentDev: String(parent.dev), parentIno: String(parent.ino),
+        parentMode: Number(parent.mode & 0o7777n), parentUid: Number(parent.uid), parentGid: String(parent.gid), parentCtimeNs: String(parent.ctimeNs) };
+    };
+    const observation = observe();
+    const authority = classifyHomeParent(observation, { rootPresent: true, witnessRoot: homeDir });
+    const file = readBoundedRegularFileWithStat(join(homeDir, '.lcm/home-parent-witness.json'), {
+      allowedRoot: join(homeDir, '.lcm'), maxBytes: 8192, expectedUid: process.getuid(), allowedModes: [0o600], requireSingleLink: true,
+    });
+    assert.equal(file.ino, leaf.inode, 'surface-prepared:witness-capture-inode');
+    assert.equal(file.dev, leaf.dev, 'surface-prepared:witness-capture-device');
+    assert.equal(createHash('sha256').update(file.content).digest('hex'), leaf.sha256, 'surface-prepared:witness-capture-bytes');
+    const { checksumSha256, ...actualPayload } = parseHomeParentWitness(file.content);
+    assert.ok(JSON.stringify(observe()) === JSON.stringify(observation), 'surface-prepared:witness-topology');
+    return { authority, actualPayload, expectedPayload: witnessPayload(observation), checksumSha256 };
+  });
+}
 async function prepared(caseId, runExistingSetup) {
   const paths = { homeDir, projectPath };
   preparedCase(caseId, activeScenario, paths);
@@ -516,7 +544,13 @@ async function prepared(caseId, runExistingSetup) {
   let token;
   let admitted = false;
   let validatedBundle;
-  const capture = async () => ({ ...await lifecycle.captureState(), metadata: capturePreparedMetadata(homeDir), inputs: capturePreparedInputs(paths) });
+  const capture = async () => {
+    const state = await lifecycle.captureState();
+    const metadata = capturePreparedMetadata(homeDir);
+    const parentWitness = capturePreparedParentWitness(metadata);
+    if (parentWitness) metadata.parentWitness = parentWitness;
+    return { ...state, metadata, inputs: capturePreparedInputs(paths) };
+  };
   try {
     return await runPreparedCase({
       assertAdmitted() {

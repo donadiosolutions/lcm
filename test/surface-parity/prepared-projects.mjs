@@ -119,7 +119,25 @@ export function validatePreparedDelta({ caseId, scenario, paths, backend, bundle
   equal(after.authority, before.authority, 'authority');
   const prior = before.metadata;
   const current = after.metadata;
-  equal(current.otherLeaves ?? {}, prior.otherLeaves ?? {}, 'other-metadata');
+  const otherLeaves = { ...(current.otherLeaves ?? {}) };
+  const name = 'home-parent-witness.json';
+  const oldWitness = prior.otherLeaves?.[name];
+  const newWitness = otherLeaves[name];
+  if (oldWitness && newWitness && oldWitness.inode !== newWitness.inode) {
+    for (const [metadata, leaf] of [[prior, oldWitness], [current, newWitness]]) {
+      const witness = metadata.parentWitness;
+      check(witness?.authority === 'direct-system-root', 'witness-authority');
+      check(leaf.mode === 0o100600 && leaf.uid === owner && leaf.nlink === 1
+        && /^[a-f0-9]{64}$/u.test(leaf.sha256) && Number.isSafeInteger(leaf.inode) && leaf.inode > 0, 'witness-file');
+      equal(witness.actualPayload, witness.expectedPayload, 'witness-binding');
+      check(/^[a-f0-9]{64}$/u.test(witness.checksumSha256), 'witness-checksum');
+    }
+    equal(current.parentWitness, prior.parentWitness, 'witness-preservation');
+    // Existing CLI bootstrap republishes exactly this authenticated witness.
+    // No other leaf or field acquires an atomic-publication exception.
+    otherLeaves[name] = { ...newWitness, inode: oldWitness.inode };
+  }
+  equal(otherLeaves, prior.otherLeaves ?? {}, 'other-metadata');
   let map = structuredClone(prior.map);
   const expectedBackups = [];
   const publish = next => { expectedBackups.push(hash(JSON.stringify(map, null, 2) + '\n')); map = next; };

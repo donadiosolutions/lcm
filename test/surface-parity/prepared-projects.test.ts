@@ -286,6 +286,72 @@ describe("independent prepared catalog readback", () => {
   });
 });
 
+function parentWitnessFixture() {
+  const base = deltaFixture();
+  base.owner = 0;
+  for (const snapshot of [base.before, base.after]) {
+    for (const entry of Object.values(snapshot.logical.entries)) entry.uid = 0;
+    snapshot.metadata.mapFile.uid = 0;
+  }
+  const payload = { home: paths.homeDir, parent: "/fixture", homeInode: 70, parentInode: 71 };
+  const parentWitness = { authority: "direct-system-root", actualPayload: { ...payload }, expectedPayload: { ...payload }, checksumSha256: digest(JSON.stringify(payload)) };
+  const witness = { inode: 90, dev: 1, uid: 0, gid: 0, mode: 0o100600, nlink: 1, sha256: digest("authenticated-witness") };
+  const otherLeaves: Record<string, typeof witness> = {
+    "home-parent-witness.json": witness,
+    "other-private.json": { ...witness, inode: 92, sha256: digest("other-private") },
+  };
+  const before = { ...base.before, metadata: { ...base.before.metadata, otherLeaves, parentWitness: parentWitness as typeof parentWitness | undefined } };
+  const after = structuredClone(before);
+  after.metadata.otherLeaves["home-parent-witness.json"].inode = 91;
+  return { ...base, before, after };
+}
+
+describe("authenticated direct-system-root parent witness replacement", () => {
+  it("allows only inode replacement of the same existing private authenticated witness", () => {
+    const f = parentWitnessFixture();
+    expect(() => validatePreparedDelta(f)).not.toThrow();
+    expect(f.before.metadata.otherLeaves["home-parent-witness.json"].inode).toBe(90);
+    expect(f.after.metadata.otherLeaves["home-parent-witness.json"].inode).toBe(91);
+  });
+
+  it.each(["before", "after"] as const)("requires authenticated %s authority and payload binding", side => {
+    for (const mutation of ["authority", "missing", "home", "parent", "checksum"]) {
+      const f = parentWitnessFixture();
+      const metadata = f[side].metadata;
+      if (mutation === "authority") metadata.parentWitness!.authority = "delegated-root";
+      if (mutation === "missing") metadata.parentWitness = undefined;
+      if (mutation === "home") metadata.parentWitness!.actualPayload.home = "/wrong-home";
+      if (mutation === "parent") metadata.parentWitness!.actualPayload.parent = "/wrong-parent";
+      if (mutation === "checksum") metadata.parentWitness!.checksumSha256 = "invalid-checksum";
+      expect(() => validatePreparedDelta(f)).toThrow();
+    }
+  });
+
+  it.each(["dev", "gid", "mode", "uid", "nlink"] as const)("rejects a changed witness %s alongside inode replacement", field => {
+    const f = parentWitnessFixture();
+    f.after.metadata.otherLeaves["home-parent-witness.json"][field]++;
+    expect(() => validatePreparedDelta(f)).toThrow();
+  });
+
+  it("rejects changed content and changed otherwise valid checksum", () => {
+    const content = parentWitnessFixture();
+    content.after.metadata.otherLeaves["home-parent-witness.json"].sha256 = digest("changed-content");
+    expect(() => validatePreparedDelta(content)).toThrow();
+    const checksum = parentWitnessFixture();
+    checksum.after.metadata.parentWitness!.checksumSha256 = digest("changed-checksum");
+    expect(() => validatePreparedDelta(checksum)).toThrow();
+  });
+
+  it.each(["appearance", "deletion", "extra-leaf", "other-inode"])("does not extend replacement permission to %s", mutation => {
+    const f = parentWitnessFixture();
+    if (mutation === "appearance") delete f.before.metadata.otherLeaves["home-parent-witness.json"];
+    if (mutation === "deletion") delete f.after.metadata.otherLeaves["home-parent-witness.json"];
+    if (mutation === "extra-leaf") f.after.metadata.otherLeaves["extra.json"] = { ...f.after.metadata.otherLeaves["other-private.json"] };
+    if (mutation === "other-inode") f.after.metadata.otherLeaves["other-private.json"].inode++;
+    expect(() => validatePreparedDelta(f)).toThrow();
+  });
+});
+
 type Created = { path: string; identity: { id: string; canonical: string; remoteProjectId?: string };
   parsed: { local: { id: string; canonical: string; remoteProjectId?: string }; remote: { projectId: string; aliases: { path: string; normalizedPath: string; machineId: string }[] } };
   result: { code: number; stdout: string } };

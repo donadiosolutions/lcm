@@ -480,6 +480,7 @@ class FixedBackendWorker {
   private adminOutstanding = 0;
   private adminQueue = Promise.resolve();
   private fatal?: Error;
+  private runFailure?: Error;
   private admission = createAdmissionLedger({ requireCases: false });
   private readySeen = false;
   private stopping = false;
@@ -603,9 +604,9 @@ class FixedBackendWorker {
     requireThat(this.pending && message.seq === this.pending.seq && message.scenario === this.pending.scenario && message.backend === this.backend && this.adminOutstanding === 0, "response-identity");
     if (message.type === "failed") {
       requireThat(exact(message, ["type", "seq", "backend", "scenario", "error"]), "failure-contract");
-      this.fatal ??= failure(`worker:${this.backend}:${workerError(message.error)}`);
-      this.admission.fail(this.fatal);
-      this.pending.reply.reject(this.fatal);
+      this.runFailure ??= failure(`worker:${this.backend}:${workerError(message.error)}`);
+      this.admission.fail(this.runFailure);
+      this.pending.reply.reject(this.runFailure);
       return;
     }
     const fault = this.pending.scenario.startsWith("fault-");
@@ -631,6 +632,7 @@ class FixedBackendWorker {
   }
 
   async run(scenario: string): Promise<WorkerResult> {
+    this.admission.assertHealthy();
     requireThat(this.readySeen && !this.pending && !this.stopping && !this.fatal, "worker-run-state");
     this.admission.begin(scenario);
     const reply = deferred<WorkerResult>();
