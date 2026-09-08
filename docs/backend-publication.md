@@ -60,6 +60,31 @@ original typed contention error. Platforms where process birth cannot be
 obtained decline lifecycle convergence and retain the existing fail-closed
 behavior.
 
+## Concurrent daemon operations
+
+The daemon serializes its own publication admission work in arrival order. A
+session-completion request can wait for an in-flight background scan or another
+request's storage operation, including PostgreSQL work, instead of failing
+because the same daemon already owns publication admission. Early project identity
+checks also use this admission. Transcript parsing, scrubber preparation, and
+provider calls remain outside these exclusive storage scopes; later storage
+work rechecks the current identity and publication state.
+
+Each admitted operation still acquires the real publication lock. Another
+process's active lock, invalid evidence, or changed configuration continues to
+fail closed. Cancellation before queue entry prevents the operation from opening
+storage later. Once a storage operation starts, its ownership lasts through its
+actual settlement and cleanup. A nested operation without its caller's explicit
+valid token fails promptly rather than waiting behind itself.
+
+Prolonged publication work can delay session completion beyond the native hook's
+existing one-second best-effort wait. In that case the hook may abandon the
+queued completion; there is no guarantee of completion within that limit under
+arbitrary load. The hook timeout and the five-second conformance observation
+window are unchanged. Read requests stay outside this write queue and retain
+the server's before/after admission witnesses. Their handler-level project
+identity checks can still fail closed while publication ownership is held.
+
 ## What the admission boundary protects
 
 Every project-scoped PostgreSQL query and transaction declares its complete

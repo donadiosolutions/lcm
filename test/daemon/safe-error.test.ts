@@ -1772,6 +1772,151 @@ describe("sanitizeError", () => {
     expect(sanitizeError(firstPass)).toBe(expected);
   });
 
+  // Bug #1156 keeps this promotion inside an already-admitted forced scan.
+  // The canonical and slash forms are clean at the parent as two spans; the
+  // one-span result pins the same bounded transition as the numeric and
+  // non-ASCII forms whose backslash tails leak at the parent.
+  it.each([
+    [
+      "file://host.invalid?x=[a/b/\\C:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\Ç:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a/b/\\C:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a/b/\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a/b/\\Ç:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\c:/Users/canary/private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\1:/Users/canary/private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\Ç:/Users/canary/private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a/\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/\\Ç:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a/\\Ç:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\C:\\Users\\canary\\private.db",
+      "file://host.invalid?x=[a<path>",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\1:\\Users\\canary\\private.db",
+      "file://host.invalid?x=[a<path>",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\Ç:\\Users\\canary\\private.db",
+      "file://host.invalid?x=[a<path>",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\@:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\1:\\Users\\canary\\private.db https://public.test/x",
+      "file://host.invalid?x=[a<path> https://public.test/x",
+    ],
+  ] as const)("redacts forced drive continuations after earlier content: %#", (input, expected) => {
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  it.each([
+    [
+      "file://host.invalid?x=[a/b/\\!:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>!:\\Users\\canary\\private.db]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\AB:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>:\\Users\\canary\\private.db]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\12:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>:\\Users\\canary\\private.db]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\C:note\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>:note\\Users\\canary\\private.db]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\C\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    ["file://host.invalid?x=[a/b/\\C:]", "file://host.invalid?x=[a<path>:]"],
+    ["file://host.invalid?x=[a/b/\\1:", "file://host.invalid?x=[a<path>:"],
+    ["/p\\C:\\E::\\SECRET", "<path>\\<path>"],
+  ] as const)("preserves forced drive continuation boundaries: %#", (input, expected) => {
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  // Bug #1234 owns the deliberately excluded zero-label continuation.
+  it("preserves the empty-label forced continuation boundary for Bug #1234", () => {
+    const input = "file://host.invalid?x=[a/\\:\\Users\\canary\\private.db]";
+    const expected = "file://host.invalid?x=[a<path>:\\Users\\canary\\private.db]";
+
+    expect(sanitizeError(input)).toBe(expected);
+  });
+
+  // Leading file-path starts use a distinct classifier and are not fixed by
+  // Bug #1156's forced-scan-only transition.
+  it.each([
+    [
+      "file://host.invalid?x=[\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[<path>:\\Users\\canary\\private.db]",
+    ],
+    [
+      "file://host.invalid?x=[\\Ç:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[<path>:\\Users\\canary\\private.db]",
+    ],
+  ] as const)("preserves leading drive-like classifier scope: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
+  });
+
+  // Bug #1111 owns the known repeated-pass drift for this nested HTTPS form.
+  it("preserves the nested HTTPS first-pass boundary for Bug #1111", () => {
+    expect(sanitizeError("file://host.invalid?x=[a/b/https://public.test/p]")).toBe(
+      "file://host.invalid?x=[a<path>://public.test/p]",
+    );
+  });
+
   it.each([
     [
       "'file://host.invalid?x=/Users/canary/My Files/x'",

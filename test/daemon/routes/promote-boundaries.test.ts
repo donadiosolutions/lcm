@@ -13,6 +13,7 @@ import {
   type InvocationCoordinator,
 } from "../../../src/daemon/invocation-coordinator.js";
 import type { RouteExecutionContext } from "../../../src/daemon/server.js";
+import { createPublicationQueue } from "../../../src/daemon/publication-queue.js";
 import { createAbortError } from "../../../src/daemon/cancellation.js";
 
 const mocks = vi.hoisted(() => ({
@@ -769,7 +770,7 @@ describe("promote persistence boundaries", () => {
       withPublicationAdmission,
     });
 
-    expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(3);
     expect(mocks.readMetadata).not.toHaveBeenCalled();
     expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
     expect(mocks.writeMetadata).not.toHaveBeenCalled();
@@ -852,12 +853,13 @@ describe("promote persistence boundaries", () => {
     );
     const withPublicationAdmission = vi.fn()
       .mockImplementationOnce(async (operation: (token: object) => Promise<unknown> | unknown) => operation({}))
+      .mockImplementationOnce(async (operation: (token: object) => Promise<unknown> | unknown) => operation({}))
       .mockRejectedValueOnce(admissionError);
 
     await createPromoteHandler(config)({} as never, response, JSON.stringify({ cwd: "/critical-admission" }), {
       withPublicationAdmission,
     });
-    expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(3);
     expect(mocks.openDirectory).not.toHaveBeenCalled();
     expect(mocks.readMetadata).not.toHaveBeenCalled();
     expect(mocks.assertDirectoryEntry).not.toHaveBeenCalled();
@@ -928,7 +930,7 @@ describe("promote persistence boundaries", () => {
     });
 
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "topology primary" });
-    expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(3);
   });
 
   it("keeps metadata cleanup failures best-effort while preserving writer errors", async () => {
@@ -1122,6 +1124,73 @@ describe("promote persistence boundaries", () => {
     });
     expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     await coordinator.shutdown();
+  });
+
+  it("cancels queued storage admission through the composed invocation signal", async () => {
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const invocationId = "78787878-7878-4787-8787-787878787878";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    const requestController = new AbortController();
+    const queue = createPublicationQueue();
+    let releaseBlocker!: () => void;
+    const held = new Promise<void>(resolve => { releaseBlocker = resolve; });
+    let storageQueued!: () => void;
+    const queued = new Promise<void>(resolve => { storageQueued = resolve; });
+    let blocker: Promise<void> | undefined;
+    const signals: Array<AbortSignal | undefined> = [];
+    const entered = vi.fn();
+    const withPublicationAdmission = async <T>(
+      operation: (token: object) => Promise<T> | T,
+      signal?: AbortSignal,
+    ): Promise<T> => {
+      signals.push(signal);
+      if (signals.length === 2) {
+        blocker = queue(() => held, requestController.signal);
+        storageQueued();
+      }
+      return queue(() => {
+        entered();
+        return operation({});
+      }, signal ?? requestController.signal);
+    };
+    const running = createPromoteHandler(config, makeMockStorageFactory({
+      projectExists: mocks.projectExists,
+      openProject: mocks.openProject,
+      close: mocks.factoryClose,
+    }))({} as never, response, JSON.stringify({ cwd: "/queued-cancel", invocation_id: invocationId }), {
+      signal: requestController.signal,
+      invocationCoordinator: coordinator,
+      withPublicationAdmission,
+    });
+
+    try {
+      await queued;
+      expect(signals).toHaveLength(2);
+      expect(signals[0]).toBeInstanceOf(AbortSignal);
+      expect(signals[1]).toBe(signals[0]);
+      expect(signals[1]).not.toBe(requestController.signal);
+      const cancellation = coordinator.cancel({ invocationId, daemonInstanceId, command: "compact" });
+      await running;
+      await cancellation;
+      expect(requestController.signal.aborted).toBe(false);
+      expect(signals[1]?.aborted).toBe(true);
+      expect(entered).toHaveBeenCalledOnce();
+      expect(mocks.openProject).not.toHaveBeenCalled();
+      expect(mocks.writeMetadata).not.toHaveBeenCalled();
+      expect(mocks.send).toHaveBeenLastCalledWith(response, 499, {
+        status: "cancelled", error: "promote cancelled",
+      });
+      releaseBlocker();
+      await blocker;
+      await queue(() => undefined, requestController.signal);
+      expect(entered).toHaveBeenCalledOnce();
+    } finally {
+      releaseBlocker();
+      await running;
+      await blocker;
+      await coordinator.shutdown();
+    }
   });
 
   it("keeps cancellation bounded when targeted cancel control rejects", async () => {
@@ -1433,7 +1502,7 @@ describe("promote persistence boundaries", () => {
       JSON.stringify({ cwd: "/publication" }),
       { withPublicationAdmission } satisfies RouteExecutionContext,
     );
-    expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(3);
     expect(mocks.writeMetadata).toHaveBeenCalledOnce();
   });
 
@@ -1527,7 +1596,7 @@ describe("promote persistence boundaries", () => {
       config.security.sensitivePatterns,
       "/private/project",
     );
-    expect(order).toEqual(["scrubber", "admission"]);
+    expect(order).toEqual(["admission", "scrubber", "admission"]);
     expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
       status: "blocked",
       error: "backend publication admission blocked",

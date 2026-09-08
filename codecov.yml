@@ -108,6 +108,7 @@ component_management:
         - "^src/daemon/cancellation\\.ts$"
         - "^src/daemon/orientation\\.ts$"
         - "^src/daemon/project-queue\\.ts$"
+        - "^src/daemon/publication-queue\\.ts$"
         - "^src/daemon/project\\.ts$"
         # Monotonic proxy startup polling remains daemon-core-owned.
         - "^src/daemon/proxy-manager\\.ts$"
@@ -118,7 +119,8 @@ component_management:
         # #1060 adjacent nested-file schemes, #1113 doubled-colon drive tails,
         # #1117 glued authorities, #1111 bracketed nested-URL idempotence,
         # #1118 quoted query-tail handoff, #1128 active file-URL own-query
-        # backslash paths, and #1141 single-slash file tails remain
+        # backslash paths, #1141 single-slash file tails, and #1156 forced
+        # drive-after-content continuations remain
         # daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"

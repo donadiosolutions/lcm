@@ -520,11 +520,18 @@ The `Security` section of the doctor output shows:
   this restarted tail are tracked independently. A slash inside a still-open
   bracket is conservatively treated as a path marker even when it follows a
   word character, and a matched closing bracket keeps the context active so a
-  later backslash-based path is also redacted. Once the brackets are balanced,
-  ordinary word-adjacent slash text remains unchanged. Whitespace, an unmatched
-  closing bracket, a freshly recognized URL, or other URL-ending punctuation
-  ends the context and clears its bracket state. A recognizable nested exact
-  `file://` path is also redacted. When an unquoted local-path span starts with
+  later backslash-based path is also redacted. Within that already-admitted
+  forced scan, an internal backslash followed by exactly one path-word code
+  point, a colon, and `/` or `\` keeps a drive-shaped continuation in the same
+  redacted span. Path-word characters include Unicode letters, numbers, and
+  marks plus `_.-@+~%$*`; this contextual rule does not make numeric,
+  non-ASCII, or punctuation labels standalone drive-path starts. Once the
+  brackets are balanced, ordinary word-adjacent slash text remains unchanged.
+  Whitespace, quoted-path, nested-URL, and delimiter termination remain
+  unchanged. An unmatched closing bracket, a freshly recognized URL, or other
+  URL-ending punctuation ends the context and clears its bracket state. A
+  recognizable nested exact `file://` path is also redacted. When an unquoted
+  local-path span starts with
   `/scheme://`, its URL-shaped portion, including scheme and port colons, is
   replaced by one `<path>` marker on the first pass. The span ends at whitespace
   or the first unbalanced `)` or `]`, `#`, `&`, `=`, `|`, `,`, `;`, `!`, `?`,
