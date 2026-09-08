@@ -44,7 +44,8 @@ import { backendDiagnosticFailure } from "../storage/diagnostics.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
 import { createReviewStaleHandler } from "./routes/review-stale.js";
 import { createInvocationControlHandler } from "./routes/invocation-control.js";
-import { throwIfAborted } from "./cancellation.js";
+import { composeAbortSignals, throwIfAborted } from "./cancellation.js";
+import { createPublicationQueue } from "./publication-queue.js";
 import {
   createInvocationCoordinator,
   type InvocationCoordinator,
@@ -79,6 +80,7 @@ export { PKG_VERSION };
 
 export type RoutePublicationAdmission = <T>(
   operation: (publicationLockToken: BackendPublicationLockToken) => Promise<T> | T,
+  signal?: AbortSignal,
 ) => Promise<T>;
 
 export type RouteExecutionContext = Readonly<{
@@ -96,7 +98,7 @@ export type RouteHandler = (
 ) => Promise<void>;
 export type RouteAdmission = "read" | "mutating";
 type BuiltInRoutePublicationMode = "retained" | "operation-scoped";
-type RequestLifecycleEvent = "cancelled" | "settled";
+type RequestLifecycleEvent = "received" | "cancelled" | "settled";
 type RegisteredRoute = Readonly<{
   handler: RouteHandler;
   admission: RouteAdmission;
@@ -560,22 +562,33 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }
     assertDaemonRequestStorageAdmission(config, publicationConfigPath, lockToken);
   };
-  const withBackgroundPublicationAdmission: BackgroundPublicationAdmission = async operation => {
-    assertDaemonNotShuttingDown();
-    return withConsumerPublicationLockAsync(publicationHome, async publicationLockToken => {
-      assertDaemonNotShuttingDown();
-      assertRequestAdmission(publicationLockToken);
-      assertDaemonNotShuttingDown();
-      return operation(publicationLockToken);
-    });
+  const enqueuePublication = createPublicationQueue();
+  const publicationAdmission = (signal: AbortSignal): RoutePublicationAdmission => async (operation, operationSignal) => {
+    const cancellation = composeAbortSignals([signal, operationSignal]);
+    try {
+      return await enqueuePublication(() => {
+        throwIfAborted(cancellation.signal);
+        return withConsumerPublicationLockAsync(publicationHome, async publicationLockToken => {
+          throwIfAborted(cancellation.signal);
+          assertRequestAdmission(publicationLockToken);
+          throwIfAborted(cancellation.signal);
+          return operation(publicationLockToken);
+        });
+      }, cancellation.signal);
+    } finally {
+      cancellation.cleanup();
+    }
   };
+  const withBackgroundPublicationAdmission: BackgroundPublicationAdmission = publicationAdmission(shutdownController.signal);
   const withRequestPublicationAdmission = (
     retainedToken: BackendPublicationLockToken,
-  ): RoutePublicationAdmission => async operation => {
+  ): RoutePublicationAdmission => async (operation, signal) => {
+    throwIfAborted(signal);
     assertDaemonNotShuttingDown();
     return withConsumerPublicationLockAsync(
       publicationHome,
       async publicationLockToken => {
+        throwIfAborted(signal);
         assertDaemonNotShuttingDown();
         assertRequestAdmission(publicationLockToken);
         assertDaemonNotShuttingDown();
@@ -948,21 +961,22 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
 
       assertDaemonNotShuttingDown();
       const body = req.method !== "GET" ? await readBody(req) : "";
+      options?._onRequestLifecycle?.("received", requestSignal);
       if (route.admission === "mutating") {
         if (route.publicationMode === "operation-scoped") {
           assertDaemonNotShuttingDown();
-          assertRequestAdmission();
+          const withPublicationAdmission = publicationAdmission(requestSignal);
+          await withPublicationAdmission(() => undefined);
+          throwIfAborted(requestSignal);
           await route.handler(req, res, body, {
-            withPublicationAdmission: withBackgroundPublicationAdmission,
+            withPublicationAdmission,
             signal: requestSignal,
             invocationCoordinator,
           });
           return;
         }
         bufferedResponse = new BufferedServerResponse(res);
-        await withConsumerPublicationLockAsync(publicationHome, async (lockToken) => {
-          assertDaemonNotShuttingDown();
-          assertRequestAdmission(lockToken);
+        await publicationAdmission(requestSignal)(async (lockToken) => {
           await route.handler(req, bufferedResponse as unknown as ServerResponse, body, {
             publicationLockToken: lockToken,
             withPublicationAdmission: withRequestPublicationAdmission(lockToken),

@@ -333,30 +333,36 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.openOutbox).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps local promotion preparation outside admission and the selected batch inside", async () => {
+  it("queues local SQLite preparation separately from scrubber and selected storage", async () => {
     const sequence: string[] = [];
+    let admitted = false;
     const events = [event({ data: "admit only the selected batch" })];
-    mocks.openOutbox.mockImplementation(() => { sequence.push("outbox-open"); });
+    mocks.openOutbox.mockImplementationOnce(() => { expect(admitted).toBe(true); sequence.push("outbox-open"); });
     mocks.events.mockImplementation(() => {
+      expect(admitted).toBe(true);
       sequence.push("outbox-read");
       return events;
     });
     mocks.scrubberFactory.mockImplementation(async () => {
+      expect(admitted).toBe(false);
       sequence.push("scrubber");
       return { scrub: mocks.scrub };
     });
     mocks.openProject.mockImplementation(async () => {
+      expect(admitted).toBe(true);
       sequence.push("project-open");
       return projectStorage();
     });
     mocks.dedup.mockImplementation(async () => {
+      expect(admitted).toBe(true);
       sequence.push("repository-batch");
       return "id";
     });
     const currentToken = {};
     const withPublicationAdmission = vi.fn(async (operation: (token: object) => Promise<unknown>) => {
       sequence.push("admission");
-      return operation(currentToken);
+      admitted = true;
+      try { return await operation(currentToken); } finally { admitted = false; }
     });
 
     await promoteEventsForCwd(
@@ -369,11 +375,11 @@ describe("promote-events unit boundaries", () => {
     );
 
     expect(mocks.mark).toHaveBeenCalledWith([events[0].event_id]);
-    expect(sequence.indexOf("outbox-open")).toBeLessThan(sequence.indexOf("admission"));
-    expect(sequence.indexOf("outbox-read")).toBeLessThan(sequence.indexOf("admission"));
-    expect(sequence.indexOf("scrubber")).toBeLessThan(sequence.indexOf("admission"));
-    expect(sequence.indexOf("admission")).toBeLessThan(sequence.indexOf("project-open"));
-    expect(sequence.indexOf("project-open")).toBeLessThan(sequence.indexOf("repository-batch"));
+    expect(sequence).toEqual([
+      "admission", "outbox-open", "outbox-read", "admission", "scrubber",
+      "admission", "project-open", "repository-batch",
+    ]);
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(3);
   });
 
   it("pairs a PostgreSQL-shaped preflight identity with scrubber paths and admission", async () => {

@@ -1,9 +1,10 @@
+import { admittedProjectIdentity } from "./storage-lifecycle.js";
 import type { EventRow, PatternReinforcementStats } from "../../hooks/events-db.js";
 import { eventsDbPath, existingEventsDbPath } from "../../db/events-path.js";
 import { deduplicateAndInsert, deduplicateAndInsertInRepositories } from "../../promotion/dedup.js";
 import { sendJson, type RouteExecutionContext, type RouteHandler } from "../server.js";
 import { isMissingCwdError, validateCwd } from "../validate-cwd.js";
-import { projectIdentity, projectPathsForIdentity } from "../project.js";
+import { projectPathsForIdentity } from "../project.js";
 import type { DaemonConfig } from "../config.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
 import { collectEventSidecars } from "../../db/event-sidecars.js";
@@ -183,12 +184,19 @@ async function withLockedCwdPromotion<T>(
   onReady: (resolvedCwd: string, sidecarPath: string) => Promise<T>,
   onUnavailable: (result: PromoteResult) => T,
   publicationLockToken?: BackendPublicationLockToken,
+  context?: PromotionExecutionContext,
 ): Promise<T> {
+  const existingPath = (resolvedCwd: string) => {
+    const discover = (token = publicationLockToken) => existingEventsDbPathForPromotion(resolvedCwd, token);
+    return context?.withPublicationAdmission === undefined
+      ? discover()
+      : context.withPublicationAdmission(discover, context.signal);
+  };
   let sidecarPath = sidecarPathOverride;
   if (sidecarPath === undefined) {
     try {
       const resolvedCwd = validateCwd(cwd);
-      sidecarPath = existingEventsDbPathForPromotion(resolvedCwd, publicationLockToken)
+      sidecarPath = await existingPath(resolvedCwd)
         ?? eventsDbPath(resolvedCwd);
     } catch (error) {
       if (!isMissingCwdError(error)) throw error;
@@ -196,7 +204,7 @@ async function withLockedCwdPromotion<T>(
       // cwd without requiring the missing path to become stat-able. Sidecar
       // identity must never depend on unresolved `..` or trailing separators.
       const resolvedCwd = validateCwd(cwd, { allowMissing: true });
-      sidecarPath = existingEventsDbPathForPromotion(resolvedCwd, publicationLockToken);
+      sidecarPath = await existingPath(resolvedCwd);
       if (sidecarPath === undefined) return onUnavailable(noSidecarParkingResult());
     }
   }
@@ -221,6 +229,13 @@ function promotionExecutionContext(
 ): PromotionExecutionContext | undefined {
   if (context !== undefined) return context;
   return publicationLockToken === undefined ? undefined : { publicationLockToken };
+}
+
+function createPromotionStorageFactory(config: DaemonConfig, context?: PromotionExecutionContext) {
+  const createFactory = (token = context?.publicationLockToken) => createStorageBackendFactory(config.storage, undefined, undefined, token);
+  return context?.withPublicationAdmission === undefined
+    ? createFactory()
+    : context.withPublicationAdmission(createFactory, context.signal);
 }
 
 function existingEventsDbPathForPromotion(
@@ -346,12 +361,7 @@ export function createPromoteEventsHandler(
 
     let ownedFactory: StorageBackendFactory | undefined;
     const activeFactory = storageFactory
-      ?? (ownedFactory = await createStorageBackendFactory(
-        config.storage,
-        undefined,
-        undefined,
-        context?.publicationLockToken,
-      ));
+      ?? (ownedFactory = await createPromotionStorageFactory(config, context));
     try {
       const result = input.drain === true
       ? await drainEventsForCwd(
@@ -406,12 +416,7 @@ export function createPromoteAllEventsHandler(
   return async (_req, res, _body, context) => {
     let ownedFactory: StorageBackendFactory | undefined;
     const activeFactory = storageFactory
-      ?? (ownedFactory = await createStorageBackendFactory(
-        config.storage,
-        undefined,
-        undefined,
-        context?.publicationLockToken,
-      ));
+      ?? (ownedFactory = await createPromotionStorageFactory(config, context));
     try {
       const result: PromoteAllResult = {
         promoted: 0,
@@ -584,6 +589,7 @@ export async function drainEventsForCwd(
       return result;
     },
     context?.publicationLockToken ?? publicationLockToken,
+    context,
   );
 }
 
@@ -608,19 +614,18 @@ async function drainEventsForCwdUnlocked(
   const executionContext = promotionExecutionContext(publicationLockToken, context);
   const effectiveToken = executionContext?.publicationLockToken;
   try {
-    const edb = await outboxFactory.open(sidecarPath, {}, effectiveToken);
-    await edb.clearMissingCwd(effectiveToken);
-    const factory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
-      config.storage,
-      undefined,
-      undefined,
-      effectiveToken,
-    ));
+    const edb = await withPromotionLocalAdmission(executionContext, async token => {
+      const outbox = await outboxFactory.open(sidecarPath, {}, token);
+      await outbox.clearMissingCwd(token);
+      return outbox;
+    });
+    const factory = storageFactory ?? (ownedFactory = await createPromotionStorageFactory(config, executionContext));
     for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
-      const prepared = await preparePromotionBatch(config, edb, effectiveToken);
+      const prepared = await withPromotionLocalAdmission(executionContext,
+        token => preparePromotionBatch(config, edb, token));
       const expectedIdentity = prepared.events.length === 0
         ? undefined
-        : projectIdentity(cwd, config.storage, effectiveToken);
+        : await admittedProjectIdentity(cwd, config.storage, executionContext);
       const batchResult = await runSelectedPromotionBatch(
         config,
         cwd,
@@ -681,6 +686,7 @@ export async function promoteEventsForCwd(
       ),
     (result) => result,
     context?.publicationLockToken ?? publicationLockToken,
+    context,
   );
 }
 
@@ -697,18 +703,15 @@ async function promoteEventsForCwdUnlocked(
   const executionContext = promotionExecutionContext(publicationLockToken, context);
   const effectiveToken = executionContext?.publicationLockToken;
   try {
-    const edb = await outboxFactory.open(sidecarPath, {}, effectiveToken);
-    await edb.clearMissingCwd(effectiveToken);
-    const prepared = await preparePromotionBatch(config, edb, effectiveToken);
-    const factory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
-      config.storage,
-      undefined,
-      undefined,
-      effectiveToken,
-    ));
+    const { edb, prepared } = await withPromotionLocalAdmission(executionContext, async token => {
+      const edb = await outboxFactory.open(sidecarPath, {}, token);
+      await edb.clearMissingCwd(token);
+      return { edb, prepared: await preparePromotionBatch(config, edb, token) };
+    });
+    const factory = storageFactory ?? (ownedFactory = await createPromotionStorageFactory(config, executionContext));
     const expectedIdentity = prepared.events.length === 0
       ? undefined
-      : projectIdentity(cwd, config.storage, effectiveToken);
+      : await admittedProjectIdentity(cwd, config.storage, executionContext);
     return await runSelectedPromotionBatch(
       config,
       cwd,
@@ -721,6 +724,16 @@ async function promoteEventsForCwdUnlocked(
   } finally {
     await closePromotionStorage(effectiveToken, outboxFactory, ownedFactory);
   }
+}
+
+/** Queue only local SQLite preparation; scrubber and selected work have separate lifetimes. */
+async function withPromotionLocalAdmission<T>(
+  context: PromotionExecutionContext | undefined,
+  operation: (token?: BackendPublicationLockToken) => Promise<T>,
+): Promise<T> {
+  return context?.withPublicationAdmission === undefined
+    ? operation(context?.publicationLockToken)
+    : context.withPublicationAdmission(operation, context.signal);
 }
 
 /** Keep retained compatibility admission on resources owned by this route. */

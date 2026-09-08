@@ -134,6 +134,16 @@ Compaction and promotion remain independent, best-effort background requests.
 
 Completion is best-effort when the daemon is unavailable, busy, or refuses
 publication admission. Ordinary completion failures still allow session exit.
+
+Concurrent operations in the same daemon queue their publication and storage
+admission, including early project identity checks. This prevents ordinary
+in-flight PostgreSQL work from immediately rejecting completion or promotion
+because that daemon already owns the publication lock. Publication validation
+and refusal of another process's lock remain in force. A queued completion
+canceled before entry does no storage work. Prolonged work can still exceed the
+one-second best-effort wait and the hook may abandon completion; no timeout is
+extended and no arbitrary-load latency guarantee is made. The conformance
+observer retains its separate five-second observation window.
 A timeout leaves persistence uncertain: the daemon may have committed the
 record before the acknowledgment was interrupted. Local publication-journal
 errors continue to fail closed. Codex Stop events remain turn-scoped and do not
@@ -336,9 +346,10 @@ not contend with its own publication lock after committing a memory or migration
 receipt. A completed receipt remains authoritative on a retry; its effect is
 not repeated. If acknowledgement fails, the event remains queued for retry.
 
-Queue preparation and scrubber setup still happen before operation-scoped
-publication admission. Callers supplying a retained publication token reuse it
-for preparation, acknowledgement, and owned storage cleanup. The token is valid
+Physical outbox opening and local queue reads use short queued publication
+scopes, separate from the selected project batch. Scrubber setup remains outside
+retained admission. Callers supplying a retained publication token reuse it
+for local preparation, acknowledgement, and owned storage cleanup. The token is valid
 only while its owning admission scope remains active.
 
 ### Native ingest source changes and cancellation

@@ -355,8 +355,8 @@ export function createCompactHandler(
       return;
     }
 
-    const withPublicationAdmission = context?.withPublicationAdmission;
-    if (withPublicationAdmission === undefined) {
+    const admission = context?.withPublicationAdmission;
+    if (admission === undefined) {
       sendJson(res, 503, {
         status: "blocked",
         error: "backend publication admission blocked",
@@ -459,6 +459,8 @@ export function createCompactHandler(
         if (context.signal.aborted) onRequestCancellation();
       }
     }
+
+    const withPublicationAdmission: RoutePublicationAdmission = operation => admission(operation, signal);
 
     const underlyingAcquireCommit = invocationTarget !== undefined && coordinator !== undefined
       ? (): CompactionCommitPermit => coordinator!.acquireCommit(invocationTarget!)

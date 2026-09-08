@@ -111,6 +111,7 @@ const expectedComponents = [
       "^src/daemon/cancellation\\.ts$",
       "^src/daemon/orientation\\.ts$",
       "^src/daemon/project-queue\\.ts$",
+      "^src/daemon/publication-queue\\.ts$",
       "^src/daemon/project\\.ts$",
       // #1106 keeps periodic transcript metadata admission daemon-core-owned.
       // Monotonic proxy startup polling remains daemon-core-owned.
@@ -134,7 +135,7 @@ const expectedComponents = [
     component_id: "unit-daemon-routes",
     name: "Unit - Daemon Routes",
     // #1230 keeps route project close on the live request token.
-    // #1247 keeps current-token promotion acknowledgement and cleanup route-owned.
+    // #1247 keeps local queue preparation, acknowledgement, and cleanup route-owned.
     paths: ["src/daemon/routes/"],
   },
   {
@@ -546,7 +547,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(239);
+    expect(productionFiles).toHaveLength(240);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -576,7 +577,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(239);
+    expect(ownershipCounts.size).toBe(240);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106 files in their intended components", () => {

@@ -1,5 +1,6 @@
+import { admittedProjectIdentity } from "./storage-lifecycle.js";
 import { statSync } from "node:fs";
-import { projectIdentity, projectPathsForIdentity } from "../project.js";
+import { projectPathsForIdentity } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { DaemonConfig } from "../config.js";
@@ -81,10 +82,10 @@ export function createStoreHandler(
     try {
       // Reject an unbound project before local scrubber discovery. The
       // lifecycle helper repeats this resolution under its live token.
-      const storageIdentity = projectIdentity(
+      const storageIdentity = await admittedProjectIdentity(
         projectPath,
         config.storage,
-        context?.publicationLockToken,
+        context,
       );
       const localIdentity = {
         id: storageIdentity.localProjectId,

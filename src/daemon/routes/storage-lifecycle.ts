@@ -157,12 +157,24 @@ export async function openExistingProject(
   return factory.openExistingProject(identity, publicationLockToken, signal);
 }
 
+/** Resolve early mutator identity under the same admission used by its storage work. */
+export async function admittedProjectIdentity(
+  cwd: string,
+  storage: DaemonConfig["storage"],
+  context?: RouteExecutionContext,
+): Promise<ReturnType<typeof projectIdentity>> {
+  const resolveIdentity = (token = context?.publicationLockToken) => projectIdentity(cwd, storage, token);
+  return context?.withPublicationAdmission === undefined
+    ? resolveIdentity()
+    : context.withPublicationAdmission(resolveIdentity, context.signal);
+}
+
 /**
  * Resolve, open, use, and close one project-storage scope.
  *
  * Mutating routes pass their operation-scoped publication callback. Read routes
  * deliberately omit it so identity/open/operation/close stay on the existing
- * assertion-only path and do not acquire a new interprocess consumer lock.
+ * path; their identity resolution may still acquire a synchronous consumer lock.
  */
 export async function withProjectStorage<T>(
   request: ProjectStorageRequest,
@@ -237,7 +249,7 @@ export async function withProjectStorage<T>(
   };
 
   const privateExecution = request.context?.withPublicationAdmission !== undefined
-    ? request.context.withPublicationAdmission(run)
+    ? request.context.withPublicationAdmission(run, signal)
     : run(request.context?.publicationLockToken);
   // Attach observers immediately so a prompt public cancellation never leaves
   // a late open rejection unobserved.

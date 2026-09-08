@@ -112,6 +112,7 @@ component_management:
         - "^src/daemon/cancellation\\.ts$"
         - "^src/daemon/orientation\\.ts$"
         - "^src/daemon/project-queue\\.ts$"
+        - "^src/daemon/publication-queue\\.ts$"
         - "^src/daemon/project\\.ts$"
         # Monotonic proxy startup polling remains daemon-core-owned.
         - "^src/daemon/proxy-manager\\.ts$"
@@ -159,7 +160,7 @@ component_management:
         # deduplication implementation remains in unit-promotion below.
         # #1203 keeps evidence-based prompt scoring and debug output route-owned.
         # #1230 keeps route project close on the live request token.
-        # #1247 keeps current-token promotion acknowledgement and cleanup route-owned.
+        # #1247 keeps local queue preparation, acknowledgement, and cleanup route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"

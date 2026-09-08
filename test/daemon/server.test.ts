@@ -1034,14 +1034,16 @@ describe("daemon server", () => {
     const scan = scanForTranscripts?.();
     try {
       const firstBatch = await transactionStarted[0].promise;
-      expect(firstBatch.discoveryToken).toBeUndefined();
+      expect(firstBatch.discoveryToken).toEqual(expect.any(Object));
+      expect(firstBatch.discoveryToken).not.toBe(firstBatch.admissionToken);
       expect(firstBatch.admissionToken).toEqual(expect.any(Object));
       await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined))
         .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
       releaseTransaction[0].resolve();
 
       const secondBatch = await transactionStarted[1].promise;
-      expect(secondBatch.discoveryToken).toBeUndefined();
+      expect(secondBatch.discoveryToken).toEqual(expect.any(Object));
+      expect(secondBatch.discoveryToken).not.toBe(secondBatch.admissionToken);
       expect(secondBatch.admissionToken).toEqual(expect.any(Object));
       expect(secondBatch.admissionToken).not.toBe(firstBatch.admissionToken);
       await expect(withBackendPublicationConfigLockAsync(configPath, async () => undefined))
