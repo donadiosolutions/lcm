@@ -1,0 +1,5738 @@
+[
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "grammar",
+    "id": "cli:<root>",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [
+        "help",
+        "daemon",
+        "config",
+        "compact",
+        "restore",
+        "session-end",
+        "user-prompt",
+        "post-tool",
+        "session-snapshot",
+        "mcp",
+        "install",
+        "uninstall",
+        "status",
+        "stats",
+        "doctor",
+        "events",
+        "machine",
+        "project",
+        "postgres",
+        "search",
+        "grep",
+        "describe",
+        "expand",
+        "store",
+        "diagnose",
+        "connectors",
+        "sensitive",
+        "import",
+        "promote",
+        "export",
+        "import-knowledge"
+      ],
+      "customHelp": {
+        "flags": [
+          "--",
+          "--help",
+          "-h"
+        ],
+        "resolverSha256": "a3e2b7a25cc6b49b1f9023cc8a7266a0eae8f172e86c0e736e9d44fdcfccf0c7",
+        "topics": [
+          "install",
+          "uninstall",
+          "daemon",
+          "config",
+          "status",
+          "doctor",
+          "machine",
+          "project",
+          "postgres",
+          "search",
+          "grep",
+          "describe",
+          "expand",
+          "store",
+          "compact",
+          "import",
+          "promote",
+          "stats",
+          "events",
+          "diagnose",
+          "connectors",
+          "sensitive",
+          "export",
+          "import-knowledge",
+          "mcp",
+          "restore",
+          "session-end",
+          "user-prompt",
+          "post-tool",
+          "session-snapshot"
+        ]
+      },
+      "defaultCommand": null,
+      "handler": false,
+      "name": "lcm",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-V, --version",
+          "hidden": false,
+          "long": "--version",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-V",
+          "variadic": false
+        }
+      ],
+      "path": "<root>"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:compact",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "compact",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--all",
+          "hidden": false,
+          "long": "--all",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--dry-run",
+          "hidden": false,
+          "long": "--dry-run",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--replay",
+          "hidden": false,
+          "long": "--replay",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--no-promote",
+          "hidden": false,
+          "long": "--no-promote",
+          "mandatory": false,
+          "negate": true,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": [
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": null,
+          "flags": "--reasoning-effort <value>",
+          "hidden": false,
+          "long": "--reasoning-effort",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--fast-mode",
+          "hidden": false,
+          "long": "--fast-mode",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--no-fast-mode",
+          "hidden": false,
+          "long": "--no-fast-mode",
+          "mandatory": false,
+          "negate": true,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--timeout-ms <ms>",
+          "hidden": false,
+          "long": "--timeout-ms",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--retry-max-attempts <n>",
+          "hidden": false,
+          "long": "--retry-max-attempts",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--retry-initial-delay-ms <ms>",
+          "hidden": false,
+          "long": "--retry-initial-delay-ms",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--retry-max-delay-ms <ms>",
+          "hidden": false,
+          "long": "--retry-max-delay-ms",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--retry-multiplier <n>",
+          "hidden": false,
+          "long": "--retry-multiplier",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--max-concurrency <n>",
+          "hidden": false,
+          "long": "--max-concurrency",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-v, --verbose",
+          "hidden": false,
+          "long": "--verbose",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-v",
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--hook",
+          "hidden": true,
+          "long": "--hook",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--client <client>",
+          "hidden": true,
+          "long": "--client",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "compact"
+    },
+    "scenario": "compaction",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "grammar",
+    "id": "cli:config",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [
+        "get",
+        "set"
+      ],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "config",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "config"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "backend-independent-control",
+    "id": "cli:config get",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "path",
+          "required": true,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "get",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--effective",
+          "hidden": false,
+          "long": "--effective",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "config get"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "backend-independent-control",
+    "id": "cli:config set",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "path",
+          "required": true,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "name": "value",
+          "required": true,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "set",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "config set"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "grammar",
+    "id": "cli:connectors",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [
+        "list",
+        "install",
+        "remove",
+        "doctor"
+      ],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "connectors",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "connectors"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "backend-independent-control",
+    "id": "cli:connectors doctor",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "agent",
+          "required": false,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "doctor",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--global",
+          "hidden": false,
+          "long": "--global",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "connectors doctor"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "backend-independent-control",
+    "id": "cli:connectors install",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "agent",
+          "required": true,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "install",
+      "options": [
+        {
+          "choices": [
+            "cli",
+            "mcp"
+          ],
+          "default": null,
+          "flags": "--transport <transport>",
+          "hidden": false,
+          "long": "--transport",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--global",
+          "hidden": false,
+          "long": "--global",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "connectors install"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "backend-independent-control",
+    "id": "cli:connectors list",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "list",
+      "options": [
+        {
+          "choices": null,
+          "default": "text",
+          "flags": "--format <format>",
+          "hidden": false,
+          "long": "--format",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--global",
+          "hidden": false,
+          "long": "--global",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "connectors list"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "backend-independent-control",
+    "id": "cli:connectors remove",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "agent",
+          "required": true,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "remove",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--global",
+          "hidden": false,
+          "long": "--global",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "connectors remove"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "grammar",
+    "id": "cli:daemon",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [
+        "start",
+        "restart"
+      ],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "daemon",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "daemon"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "backend-independent-control",
+    "id": "cli:daemon restart",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "restart",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "daemon restart"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "backend-independent-control",
+    "id": "cli:daemon start",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "start",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--detach",
+          "hidden": false,
+          "long": "--detach",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--foreground",
+          "hidden": false,
+          "long": "--foreground",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--internal-lcm-test-daemon-owner <owner>",
+          "hidden": true,
+          "long": "--internal-lcm-test-daemon-owner",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--internal-lcm-test-daemon-entrypoint <path>",
+          "hidden": true,
+          "long": "--internal-lcm-test-daemon-entrypoint",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "daemon start"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:describe",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "nodeId",
+          "required": true,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "describe",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "describe"
+    },
+    "scenario": "memory",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/storage/diagnostic-renderer.ts and docs/cli.md: assert shared sanitized diagnostic fields plus the declared backend identity and pool shape; no repair side effects.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:diagnose",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "diagnose",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--all",
+          "hidden": false,
+          "long": "--all",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": "7",
+          "flags": "--days <n>",
+          "hidden": false,
+          "long": "--days",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--verbose",
+          "hidden": false,
+          "long": "--verbose",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "diagnose"
+    },
+    "scenario": "diagnostics",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/storage/diagnostic-renderer.ts and docs/cli.md: assert shared sanitized diagnostic fields plus the declared backend identity and pool shape; no repair side effects. src/storage/backend.ts, src/storage/postgresql/runtime.ts and src/daemon/server.ts: baseline data semantics remain shared; fault variants assert PostgreSQL pool/grant/unavailable outcomes and the explicit SQLite healthy or abort-aware counterpart. Cancellation is bounded and must release resources on both backends.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects",
+      "backend-denial"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:doctor",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "doctor",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--verbose",
+          "hidden": false,
+          "long": "--verbose",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": "50",
+          "flags": "--events-max-dbs <n|all|unlimited>",
+          "hidden": false,
+          "long": "--events-max-dbs",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        }
+      ],
+      "path": "doctor"
+    },
+    "scenario": "diagnostics",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "grammar",
+    "id": "cli:events",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [
+        "promote",
+        "status",
+        "validate",
+        "quarantine",
+        "replay"
+      ],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "events",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "events"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:events promote",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "promote",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--all",
+          "hidden": false,
+          "long": "--all",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "events promote"
+    },
+    "scenario": "events",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:events quarantine",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "quarantine",
+      "options": [
+        {
+          "choices": null,
+          "default": "100",
+          "flags": "--limit <n>",
+          "hidden": false,
+          "long": "--limit",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "events quarantine"
+    },
+    "scenario": "events",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:events replay",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "event-id",
+          "required": true,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "replay",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--machine <machine-id>",
+          "hidden": false,
+          "long": "--machine",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "events replay"
+    },
+    "scenario": "events",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:events status",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "status",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "events status"
+    },
+    "scenario": "events",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:events validate",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "validate",
+      "options": [
+        {
+          "choices": null,
+          "default": "100",
+          "flags": "--limit <n>",
+          "hidden": false,
+          "long": "--limit",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "events validate"
+    },
+    "scenario": "events",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:expand",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "nodeId",
+          "required": true,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "expand",
+      "options": [
+        {
+          "choices": null,
+          "default": "1",
+          "flags": "--depth <n>",
+          "hidden": false,
+          "long": "--depth",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "expand"
+    },
+    "scenario": "memory",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:export",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "export",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--all",
+          "hidden": false,
+          "long": "--all",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--tags <tags>",
+          "hidden": false,
+          "long": "--tags",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--since <date>",
+          "hidden": false,
+          "long": "--since",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--output <file>",
+          "hidden": false,
+          "long": "--output",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": "json",
+          "flags": "--format <format>",
+          "hidden": false,
+          "long": "--format",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "export"
+    },
+    "scenario": "knowledge",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/storage/postgresql/reference/postgresql-search.md: PostgreSQL full-text snippets expose normalized search text while SQLite preserves source spelling. Assert each actual mode-specific counterpart, shared message membership and ordering, and exact canonical Unicode through native readback and regex retrieval.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:grep",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "query",
+          "required": true,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "grep",
+      "options": [
+        {
+          "choices": null,
+          "default": "full_text",
+          "flags": "--mode <mode>",
+          "hidden": false,
+          "long": "--mode",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": "both",
+          "flags": "--scope <scope>",
+          "hidden": false,
+          "long": "--scope",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--since <iso>",
+          "hidden": false,
+          "long": "--since",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "grep"
+    },
+    "scenario": "memory",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "grammar",
+    "id": "cli:help",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "command",
+          "required": false,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "customHelp": {
+        "flags": [
+          "--",
+          "--help",
+          "-h"
+        ],
+        "resolverSha256": "a3e2b7a25cc6b49b1f9023cc8a7266a0eae8f172e86c0e736e9d44fdcfccf0c7",
+        "topics": [
+          "install",
+          "uninstall",
+          "daemon",
+          "config",
+          "status",
+          "doctor",
+          "machine",
+          "project",
+          "postgres",
+          "search",
+          "grep",
+          "describe",
+          "expand",
+          "store",
+          "compact",
+          "import",
+          "promote",
+          "stats",
+          "events",
+          "diagnose",
+          "connectors",
+          "sensitive",
+          "export",
+          "import-knowledge",
+          "mcp",
+          "restore",
+          "session-end",
+          "user-prompt",
+          "post-tool",
+          "session-snapshot"
+        ]
+      },
+      "defaultCommand": null,
+      "handler": true,
+      "name": "help",
+      "options": [],
+      "path": "help"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:import",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "import",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--all",
+          "hidden": false,
+          "long": "--all",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": "claude",
+          "flags": "--provider <provider>",
+          "hidden": false,
+          "long": "--provider",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--codex",
+          "hidden": false,
+          "long": "--codex",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--verbose",
+          "hidden": false,
+          "long": "--verbose",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--dry-run",
+          "hidden": false,
+          "long": "--dry-run",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--replay",
+          "hidden": false,
+          "long": "--replay",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "import"
+    },
+    "scenario": "native-import",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:import-knowledge",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "file",
+          "required": true,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "import-knowledge",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--merge",
+          "hidden": false,
+          "long": "--merge",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--dry-run",
+          "hidden": false,
+          "long": "--dry-run",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--confidence <n>",
+          "hidden": false,
+          "long": "--confidence",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "import-knowledge"
+    },
+    "scenario": "knowledge",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "backend-independent-control",
+    "id": "cli:install",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "install",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--dry-run",
+          "hidden": false,
+          "long": "--dry-run",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "install"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "grammar",
+    "id": "cli:machine",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [
+        "register",
+        "show",
+        "recover"
+      ],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "machine",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "machine"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:machine recover",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "machine-id",
+          "required": false,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "recover",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--force",
+          "hidden": false,
+          "long": "--force",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "machine recover"
+    },
+    "scenario": "identity",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:machine register",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "register",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--name <display-name>",
+          "hidden": false,
+          "long": "--name",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "machine register"
+    },
+    "scenario": "identity",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:machine show",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "show",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "machine show"
+    },
+    "scenario": "identity",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "backend-independent-control",
+    "id": "cli:mcp",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "mcp",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "mcp"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/hooks/ and docs/cli.md: native hook capture uses the local SQLite outbox with either configured backend; durable project writes remain on the selected backend.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:post-tool",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "post-tool",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--client <client>",
+          "hidden": true,
+          "long": "--client",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "post-tool"
+    },
+    "scenario": "hooks",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "grammar",
+    "id": "cli:postgres",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [
+        "migrate"
+      ],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "postgres",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "postgres"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:postgres migrate",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "migrate",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "postgres migrate"
+    },
+    "scenario": "admin",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "grammar",
+    "id": "cli:project",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [
+        "reconcile-worktrees",
+        "list",
+        "show",
+        "link",
+        "unlink",
+        "create"
+      ],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "project",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "project"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:project create",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "path",
+          "required": false,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "create",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--name <display-name>",
+          "hidden": false,
+          "long": "--name",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "project create"
+    },
+    "scenario": "identity",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:project link",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "target",
+          "required": false,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "name": "path",
+          "required": false,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "link",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--allow-existing-data",
+          "hidden": false,
+          "long": "--allow-existing-data",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "project link"
+    },
+    "scenario": "identity",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:project list",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "list",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "project list"
+    },
+    "scenario": "identity",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:project reconcile-worktrees",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "path",
+          "required": false,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "reconcile-worktrees",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--dry-run",
+          "hidden": false,
+          "long": "--dry-run",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "project reconcile-worktrees"
+    },
+    "scenario": "identity",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:project show",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "target",
+          "required": false,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "show",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "project show"
+    },
+    "scenario": "identity",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:project unlink",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "path",
+          "required": false,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "unlink",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "project unlink"
+    },
+    "scenario": "identity",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:promote",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "promote",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--all",
+          "hidden": false,
+          "long": "--all",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--verbose",
+          "hidden": false,
+          "long": "--verbose",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--dry-run",
+          "hidden": false,
+          "long": "--dry-run",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "promote"
+    },
+    "scenario": "promotion",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/hooks/ and docs/cli.md: native hook capture uses the local SQLite outbox with either configured backend; durable project writes remain on the selected backend.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:restore",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "restore",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--client <client>",
+          "hidden": true,
+          "long": "--client",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "restore"
+    },
+    "scenario": "hooks",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/storage/backend.ts, src/storage/postgresql/runtime.ts and src/daemon/server.ts: baseline data semantics remain shared; fault variants assert PostgreSQL pool/grant/unavailable outcomes and the explicit SQLite healthy or abort-aware counterpart. Cancellation is bounded and must release resources on both backends.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects",
+      "backend-denial"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:search",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "query",
+          "required": true,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "search",
+      "options": [
+        {
+          "choices": null,
+          "default": "5",
+          "flags": "--limit <n>",
+          "hidden": false,
+          "long": "--limit",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": [],
+          "flags": "--layer <name>",
+          "hidden": false,
+          "long": "--layer",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": [],
+          "flags": "--tag <tag>",
+          "hidden": false,
+          "long": "--tag",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "search"
+    },
+    "scenario": "memory",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:sensitive",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "args",
+          "required": false,
+          "variadic": true
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "sensitive",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "sensitive"
+    },
+    "scenario": "sensitive",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:sensitive add",
+    "kind": "cli",
+    "registration": {
+      "dispatcher": "sensitive",
+      "operation": "add"
+    },
+    "scenario": "sensitive",
+    "source": "src/sensitive.ts:handleSensitive"
+  },
+  {
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:sensitive list",
+    "kind": "cli",
+    "registration": {
+      "dispatcher": "sensitive",
+      "operation": "list"
+    },
+    "scenario": "sensitive",
+    "source": "src/sensitive.ts:handleSensitive"
+  },
+  {
+    "architectureReason": "src/sensitive.ts:sensitivePurge: SQLite purges the owned local project; PostgreSQL refuses with StorageBackendUnavailableError because a local purge cannot remove durable PostgreSQL data.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:sensitive purge",
+    "kind": "cli",
+    "registration": {
+      "dispatcher": "sensitive",
+      "operation": "purge"
+    },
+    "scenario": "sensitive",
+    "source": "src/sensitive.ts:handleSensitive"
+  },
+  {
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:sensitive remove",
+    "kind": "cli",
+    "registration": {
+      "dispatcher": "sensitive",
+      "operation": "remove"
+    },
+    "scenario": "sensitive",
+    "source": "src/sensitive.ts:handleSensitive"
+  },
+  {
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:sensitive test",
+    "kind": "cli",
+    "registration": {
+      "dispatcher": "sensitive",
+      "operation": "test"
+    },
+    "scenario": "sensitive",
+    "source": "src/sensitive.ts:handleSensitive"
+  },
+  {
+    "architectureReason": "src/hooks/ and docs/cli.md: native hook capture uses the local SQLite outbox with either configured backend; durable project writes remain on the selected backend.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:session-end",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "session-end",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--client <client>",
+          "hidden": true,
+          "long": "--client",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "session-end"
+    },
+    "scenario": "hooks",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/hooks/ and docs/cli.md: native hook capture uses the local SQLite outbox with either configured backend; durable project writes remain on the selected backend.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:session-snapshot",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "session-snapshot",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--client <client>",
+          "hidden": true,
+          "long": "--client",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "session-snapshot"
+    },
+    "scenario": "hooks",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/storage/diagnostic-renderer.ts and docs/cli.md: assert shared sanitized diagnostic fields plus the declared backend identity and pool shape; no repair side effects. src/stats.ts and src/storage/postgresql/diagnostics.ts: PostgreSQL numeric metrics omit per-conversation details; SQLite statistics include native conversation detail. Assert the actual absent field or native detail membership and the corresponding rendered capability, while preserving exact common aggregate counters. src/storage/backend.ts, src/storage/postgresql/runtime.ts and src/daemon/server.ts: baseline data semantics remain shared; fault variants assert PostgreSQL pool/grant/unavailable outcomes and the explicit SQLite healthy or abort-aware counterpart. Cancellation is bounded and must release resources on both backends.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects",
+      "backend-denial"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:stats",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "stats",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-v, --verbose",
+          "hidden": false,
+          "long": "--verbose",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-v",
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--pool",
+          "hidden": false,
+          "long": "--pool",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "stats"
+    },
+    "scenario": "diagnostics",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/storage/diagnostic-renderer.ts and docs/cli.md: assert shared sanitized diagnostic fields plus the declared backend identity and pool shape; no repair side effects.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:status",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "status",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "status"
+    },
+    "scenario": "diagnostics",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "cli:store",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "text",
+          "required": true,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "store",
+      "options": [
+        {
+          "choices": null,
+          "default": [],
+          "flags": "--tag, --tags <tag>",
+          "hidden": false,
+          "long": "--tags",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": "--tag",
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "store"
+    },
+    "scenario": "memory",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "backend-independent-control",
+    "id": "cli:uninstall",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "uninstall",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--dry-run",
+          "hidden": false,
+          "long": "--dry-run",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "uninstall"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/hooks/ and docs/cli.md: native hook capture uses the local SQLite outbox with either configured backend; durable project writes remain on the selected backend.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:user-prompt",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "user-prompt",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--client <client>",
+          "hidden": true,
+          "long": "--client",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": [
+            "cli",
+            "mcp"
+          ],
+          "default": null,
+          "flags": "--transport <transport>",
+          "hidden": true,
+          "long": "--transport",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "user-prompt"
+    },
+    "scenario": "hooks",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/daemon/server.ts and src/storage/sqlite/factory.ts: authenticated health is active storage readiness, distinct from read-only statistical snapshots. Compare logical data, schema, user_version, journal mode and authority while separately reporting authenticated existing-SQLite engine bookkeeping; missing databases remain missing. Public unauthenticated health is liveness only. src/storage/backend.ts, src/storage/postgresql/runtime.ts and src/daemon/server.ts: baseline data semantics remain shared; fault variants assert PostgreSQL pool/grant/unavailable outcomes and the explicit SQLite healthy or abort-aware counterpart. Cancellation is bounded and must release resources on both backends.",
+    "assertions": [
+      "admission",
+      "result",
+      "effects",
+      "startup-unavailable"
+    ],
+    "expectation": "architecture-specific",
+    "id": "daemon:GET /health",
+    "kind": "daemon",
+    "registration": {
+      "admission": "read",
+      "key": "GET /health",
+      "publicationMode": "retained"
+    },
+    "scenario": "diagnostics",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "architectureReason": "src/daemon/server.ts and src/daemon/client.ts: authenticated observation verifies process identity only and reports storage status unverified. Assert admission, stable selected-backend identity and the strict read-only contract; it neither probes nor certifies active storage readiness.",
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "daemon:GET /health/observe",
+    "kind": "daemon",
+    "registration": {
+      "admission": "read",
+      "key": "GET /health/observe",
+      "publicationMode": "retained"
+    },
+    "scenario": "diagnostics",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "architectureReason": "src/daemon/server.ts and src/storage/diagnostic-renderer.ts: diagnostics expose the configured backend and backend-specific pool shape while preserving the shared sanitized result and read-only contract. src/stats.ts and src/storage/postgresql/diagnostics.ts: PostgreSQL numeric metrics omit per-conversation details; SQLite statistics include native conversation detail. Assert the actual absent field or native detail membership and the corresponding rendered capability, while preserving exact common aggregate counters.",
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "daemon:GET /stats",
+    "kind": "daemon",
+    "registration": {
+      "admission": "read",
+      "key": "GET /stats",
+      "publicationMode": "retained"
+    },
+    "scenario": "diagnostics",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "architectureReason": "src/daemon/server.ts and src/storage/diagnostic-renderer.ts: diagnostics expose the configured backend and backend-specific pool shape while preserving the shared sanitized result and read-only contract.",
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "daemon:GET /stats/pool",
+    "kind": "daemon",
+    "registration": {
+      "admission": "read",
+      "key": "GET /stats/pool",
+      "publicationMode": "retained"
+    },
+    "scenario": "diagnostics",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "architectureReason": "src/storage/backend.ts, src/storage/postgresql/runtime.ts and src/daemon/server.ts: baseline data semantics remain shared; fault variants assert PostgreSQL pool/grant/unavailable outcomes and the explicit SQLite healthy or abort-aware counterpart. Cancellation is bounded and must release resources on both backends.",
+    "assertions": [
+      "admission",
+      "result",
+      "effects",
+      "cancellation"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /compact",
+    "kind": "daemon",
+    "registration": {
+      "admission": "mutating",
+      "key": "POST /compact",
+      "publicationMode": "operation-scoped"
+    },
+    "scenario": "compaction",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /describe",
+    "kind": "daemon",
+    "registration": {
+      "admission": "read",
+      "key": "POST /describe",
+      "publicationMode": "retained"
+    },
+    "scenario": "memory",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /expand",
+    "kind": "daemon",
+    "registration": {
+      "admission": "read",
+      "key": "POST /expand",
+      "publicationMode": "retained"
+    },
+    "scenario": "memory",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "architectureReason": "src/storage/postgresql/reference/postgresql-search.md: PostgreSQL full-text snippets expose normalized search text while SQLite preserves source spelling. Assert each actual mode-specific counterpart, shared message membership and ordering, and exact canonical Unicode through native readback and regex retrieval.",
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "daemon:POST /grep",
+    "kind": "daemon",
+    "registration": {
+      "admission": "read",
+      "key": "POST /grep",
+      "publicationMode": "retained"
+    },
+    "scenario": "memory",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /ingest",
+    "kind": "daemon",
+    "registration": {
+      "admission": "mutating",
+      "key": "POST /ingest",
+      "publicationMode": "operation-scoped"
+    },
+    "scenario": "memory",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /invocation-control",
+    "kind": "daemon",
+    "registration": {
+      "admission": "read",
+      "key": "POST /invocation-control",
+      "publicationMode": "retained"
+    },
+    "scenario": "compaction",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /promote",
+    "kind": "daemon",
+    "registration": {
+      "admission": "mutating",
+      "key": "POST /promote",
+      "publicationMode": "operation-scoped"
+    },
+    "scenario": "promotion",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /promote-events",
+    "kind": "daemon",
+    "registration": {
+      "admission": "mutating",
+      "key": "POST /promote-events",
+      "publicationMode": "operation-scoped"
+    },
+    "scenario": "events",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /promote-events/all",
+    "kind": "daemon",
+    "registration": {
+      "admission": "mutating",
+      "key": "POST /promote-events/all",
+      "publicationMode": "operation-scoped"
+    },
+    "scenario": "events",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /promote-events/notify",
+    "kind": "daemon",
+    "registration": {
+      "admission": "read",
+      "key": "POST /promote-events/notify",
+      "publicationMode": "retained"
+    },
+    "scenario": "events",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /prompt-search",
+    "kind": "daemon",
+    "registration": {
+      "admission": "read",
+      "key": "POST /prompt-search",
+      "publicationMode": "retained"
+    },
+    "scenario": "memory",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /recent",
+    "kind": "daemon",
+    "registration": {
+      "admission": "read",
+      "key": "POST /recent",
+      "publicationMode": "retained"
+    },
+    "scenario": "memory",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /restore",
+    "kind": "daemon",
+    "registration": {
+      "admission": "mutating",
+      "key": "POST /restore",
+      "publicationMode": "operation-scoped"
+    },
+    "scenario": "memory",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /review-stale",
+    "kind": "daemon",
+    "registration": {
+      "admission": "mutating",
+      "key": "POST /review-stale",
+      "publicationMode": "operation-scoped"
+    },
+    "scenario": "promotion",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "architectureReason": "src/storage/backend.ts, src/storage/postgresql/runtime.ts and src/daemon/server.ts: baseline data semantics remain shared; fault variants assert PostgreSQL pool/grant/unavailable outcomes and the explicit SQLite healthy or abort-aware counterpart. Cancellation is bounded and must release resources on both backends.",
+    "assertions": [
+      "admission",
+      "result",
+      "effects",
+      "pool-exhaustion",
+      "cancellation",
+      "backend-denial"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /search",
+    "kind": "daemon",
+    "registration": {
+      "admission": "read",
+      "key": "POST /search",
+      "publicationMode": "retained"
+    },
+    "scenario": "memory",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /session-complete",
+    "kind": "daemon",
+    "registration": {
+      "admission": "mutating",
+      "key": "POST /session-complete",
+      "publicationMode": "operation-scoped"
+    },
+    "scenario": "compaction",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "architectureReason": "src/daemon/server.ts and src/storage/diagnostic-renderer.ts: diagnostics expose the configured backend and backend-specific pool shape while preserving the shared sanitized result and read-only contract.",
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "daemon:POST /status",
+    "kind": "daemon",
+    "registration": {
+      "admission": "read",
+      "key": "POST /status",
+      "publicationMode": "retained"
+    },
+    "scenario": "diagnostics",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /store",
+    "kind": "daemon",
+    "registration": {
+      "admission": "mutating",
+      "key": "POST /store",
+      "publicationMode": "operation-scoped"
+    },
+    "scenario": "memory",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "version",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "knowledge:v1",
+    "kind": "knowledge",
+    "registration": {
+      "export": "exportKnowledge",
+      "import": "importKnowledge",
+      "version": 1
+    },
+    "scenario": "knowledge",
+    "source": "src/portable-knowledge.ts"
+  },
+  {
+    "assertions": [
+      "schema",
+      "result"
+    ],
+    "expectation": "shared-data",
+    "id": "mcp:lcm_describe",
+    "kind": "mcp",
+    "registration": {
+      "description": "Inspect metadata and lineage of a memory node without expanding content. Returns depth, token count, parent/child links, and whether it was promoted to long-term memory.",
+      "inputSchema": {
+        "properties": {
+          "nodeId": {
+            "description": "Node ID to describe",
+            "type": "string"
+          }
+        },
+        "required": [
+          "nodeId"
+        ],
+        "type": "object"
+      },
+      "inputSchemaSha256": "dc3c618c476a7910f03cadaba134dd52b26a6d50ee7e86d90281ba5302696959",
+      "name": "lcm_describe"
+    },
+    "scenario": "memory",
+    "source": "src/mcp/server.ts:getMcpToolDefinitions"
+  },
+  {
+    "architectureReason": "src/mcp/server.ts local diagnostic handlers and src/storage/diagnostic-renderer.ts: report the configured backend snapshot and assert backend-specific pool fields without mutation. src/storage/backend.ts, src/storage/postgresql/runtime.ts and src/daemon/server.ts: baseline data semantics remain shared; fault variants assert PostgreSQL pool/grant/unavailable outcomes and the explicit SQLite healthy or abort-aware counterpart. Cancellation is bounded and must release resources on both backends.",
+    "assertions": [
+      "schema",
+      "result",
+      "backend-denial"
+    ],
+    "expectation": "architecture-specific",
+    "id": "mcp:lcm_doctor",
+    "kind": "mcp",
+    "registration": {
+      "description": "Run diagnostics on the Long Context Manager (LCM) installation. Checks daemon, hooks, MCP config, and summarizer health.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "inputSchemaSha256": "efddc7bd8bbcef73a14eb1ace1ffdaec81e518ef1e13c1e9271d0b8acb694a49",
+      "name": "lcm_doctor"
+    },
+    "scenario": "diagnostics",
+    "source": "src/mcp/server.ts:getMcpToolDefinitions"
+  },
+  {
+    "assertions": [
+      "schema",
+      "result"
+    ],
+    "expectation": "shared-data",
+    "id": "mcp:lcm_expand",
+    "kind": "mcp",
+    "registration": {
+      "description": "Decompress a summary node into its full source content by traversing the DAG. Use when a summary references something that needs more detail.",
+      "inputSchema": {
+        "properties": {
+          "depth": {
+            "default": 1,
+            "description": "How many levels of the DAG to traverse (positive integer; default: 1; no maximum)",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "nodeId": {
+            "description": "Summary node ID to expand",
+            "type": "string"
+          }
+        },
+        "required": [
+          "nodeId"
+        ],
+        "type": "object"
+      },
+      "inputSchemaSha256": "07c253cf2877ddb0f34dbca637e68122a274ff29491f6aefb78c09e3ffb92316",
+      "name": "lcm_expand"
+    },
+    "scenario": "memory",
+    "source": "src/mcp/server.ts:getMcpToolDefinitions"
+  },
+  {
+    "architectureReason": "src/storage/postgresql/reference/postgresql-search.md: PostgreSQL full-text snippets expose normalized search text while SQLite preserves source spelling. Assert each actual mode-specific counterpart, shared message membership and ordering, and exact canonical Unicode through native readback and regex retrieval.",
+    "assertions": [
+      "schema",
+      "result"
+    ],
+    "expectation": "architecture-specific",
+    "id": "mcp:lcm_grep",
+    "kind": "mcp",
+    "registration": {
+      "description": "Search conversation history by keyword or regex across raw messages and summaries. Use when recalling what was said, decided, or done in a past session.",
+      "inputSchema": {
+        "properties": {
+          "mode": {
+            "default": "full_text",
+            "description": "Search mode: full_text performs literal/full-text matching; regex interprets the query as a regular expression",
+            "enum": [
+              "full_text",
+              "regex"
+            ],
+            "type": "string"
+          },
+          "query": {
+            "description": "Keyword, phrase, or pattern to search; interpretation follows mode (full_text by default, regex when selected)",
+            "type": "string"
+          },
+          "scope": {
+            "default": "both",
+            "enum": [
+              "messages",
+              "summaries",
+              "both"
+            ],
+            "type": "string"
+          },
+          "sessionId": {
+            "description": "Filter to a specific session",
+            "type": "string"
+          },
+          "since": {
+            "description": "inclusive ISO datetime lower bound: YYYY-MM-DDTHH:mm:ss with optional 1-3 fractional digits and Z or +/-HH:mm timezone; after offset normalization, UTC years must be 0001-9999; malformed or out-of-range values return HTTP 400 with invalid since; omitted to include all history",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "inputSchemaSha256": "c7003de91f8fa0e2a243eb896a7654179b9ddf4641e1785cbef46e70d613b35c",
+      "name": "lcm_grep"
+    },
+    "scenario": "memory",
+    "source": "src/mcp/server.ts:getMcpToolDefinitions"
+  },
+  {
+    "architectureReason": "src/storage/backend.ts, src/storage/postgresql/runtime.ts and src/daemon/server.ts: baseline data semantics remain shared; fault variants assert PostgreSQL pool/grant/unavailable outcomes and the explicit SQLite healthy or abort-aware counterpart. Cancellation is bounded and must release resources on both backends.",
+    "assertions": [
+      "schema",
+      "result",
+      "backend-denial"
+    ],
+    "expectation": "shared-data",
+    "id": "mcp:lcm_search",
+    "kind": "mcp",
+    "registration": {
+      "description": "Hybrid search across episodic and promoted memory. Returns two separate ranked lists — episodic and promoted. Use when looking for project knowledge spanning multiple sessions.",
+      "inputSchema": {
+        "properties": {
+          "layers": {
+            "default": [
+              "episodic",
+              "promoted"
+            ],
+            "description": "Which memory layers to search (default: both)",
+            "items": {
+              "enum": [
+                "episodic",
+                "promoted"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "default": 5,
+            "description": "Maximum results per layer (positive integer from 1 to 1000; default: 5)",
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "query": {
+            "description": "Natural language search query",
+            "type": "string"
+          },
+          "tags": {
+            "description": "Filter promoted results to entries that include all specified tags; episodic results remain unfiltered. Use layers: ['promoted'] for tag-only recall (e.g. ['reasoning'], ['decision', 'architecture'])",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "inputSchemaSha256": "eb3eaf06f098fe17a08014094089063d60ec3590861f550ad97f48130af76d0a",
+      "name": "lcm_search"
+    },
+    "scenario": "memory",
+    "source": "src/mcp/server.ts:getMcpToolDefinitions"
+  },
+  {
+    "architectureReason": "src/mcp/server.ts local diagnostic handlers and src/storage/diagnostic-renderer.ts: report the configured backend snapshot and assert backend-specific pool fields without mutation. src/stats.ts and src/storage/postgresql/diagnostics.ts: PostgreSQL numeric metrics omit per-conversation details; SQLite statistics include native conversation detail. Assert the actual absent field or native detail membership and the corresponding rendered capability, while preserving exact common aggregate counters. src/storage/backend.ts, src/storage/postgresql/runtime.ts and src/daemon/server.ts: baseline data semantics remain shared; fault variants assert PostgreSQL pool/grant/unavailable outcomes and the explicit SQLite healthy or abort-aware counterpart. Cancellation is bounded and must release resources on both backends.",
+    "assertions": [
+      "schema",
+      "result",
+      "backend-denial"
+    ],
+    "expectation": "architecture-specific",
+    "id": "mcp:lcm_stats",
+    "kind": "mcp",
+    "registration": {
+      "description": "Show token savings, compression ratios, and usage statistics across all Long Context Manager (LCM) projects. Use to check how much context is being saved.",
+      "inputSchema": {
+        "properties": {
+          "verbose": {
+            "default": false,
+            "description": "Include per-conversation breakdown",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "inputSchemaSha256": "f6d63bd8554a4c327fb44d3bc6851fd6dafaa622c085adac28c37edee5f841e9",
+      "name": "lcm_stats"
+    },
+    "scenario": "diagnostics",
+    "source": "src/mcp/server.ts:getMcpToolDefinitions"
+  },
+  {
+    "assertions": [
+      "schema",
+      "result"
+    ],
+    "expectation": "shared-data",
+    "id": "mcp:lcm_store",
+    "kind": "mcp",
+    "registration": {
+      "description": "Store a memory in Long Context Manager (LCM)'s semantic layer. Stored memories can be retrieved with lcm_search.",
+      "inputSchema": {
+        "properties": {
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Optional key/value metadata (e.g. projectId, sessionId, source)",
+            "type": "object"
+          },
+          "tags": {
+            "description": "Optional string tags associated with the memory. Each tag uses the <prefix>:<value> format.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "text": {
+            "description": "The content to store",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "inputSchemaSha256": "08c44615bce161c56c7c68b1807a0bdc3dcbd63498306e18e89a4f262c67650b",
+      "name": "lcm_store"
+    },
+    "scenario": "memory",
+    "source": "src/mcp/server.ts:getMcpToolDefinitions"
+  },
+  {
+    "assertions": [
+      "dispatch",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "native-import:all",
+    "kind": "native-import",
+    "registration": {
+      "dispatch": [
+        [
+          "claude",
+          "all"
+        ],
+        [
+          "codex",
+          "all"
+        ]
+      ],
+      "format": "dispatch",
+      "provider": "all"
+    },
+    "scenario": "native-import",
+    "source": "src/import.ts:importSessions"
+  },
+  {
+    "assertions": [
+      "dispatch",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "native-import:claude",
+    "kind": "native-import",
+    "registration": {
+      "dispatch": [
+        [
+          "claude",
+          "all"
+        ]
+      ],
+      "format": "claude",
+      "provider": "claude"
+    },
+    "scenario": "native-import",
+    "source": "src/import.ts:importSessions"
+  },
+  {
+    "assertions": [
+      "dispatch",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "native-import:codex",
+    "kind": "native-import",
+    "registration": {
+      "dispatch": [
+        [
+          "codex",
+          "all"
+        ]
+      ],
+      "format": "codex",
+      "provider": "codex"
+    },
+    "scenario": "native-import",
+    "source": "src/import.ts:importSessions"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:PORTABLE_LIMITS",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "PORTABLE_LIMITS",
+      "module": "./portable-record-stream.js",
+      "name": "PORTABLE_LIMITS"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:PORTABLE_RECORD_DOMAIN_ORDER",
+    "kind": "portable-api",
+    "registration": {
+      "declarations": [
+        {
+          "imported": "PortableBatch",
+          "module": "./portable-record-stream.js",
+          "name": "PortableBatch"
+        },
+        {
+          "imported": "PortableCheckpoint",
+          "module": "./portable-record-stream.js",
+          "name": "PortableCheckpoint"
+        },
+        {
+          "imported": "PortableCoverageEvidence",
+          "module": "./portable-record-stream.js",
+          "name": "PortableCoverageEvidence"
+        },
+        {
+          "imported": "PortableDomain",
+          "module": "./portable-record-stream.js",
+          "name": "PortableDomain"
+        },
+        {
+          "imported": "PortableDomainManifest",
+          "module": "./portable-record-stream.js",
+          "name": "PortableDomainManifest"
+        },
+        {
+          "imported": "PortableIntegerValue",
+          "module": "./portable-record-stream.js",
+          "name": "PortableIntegerValue"
+        },
+        {
+          "imported": "PortableLimits",
+          "module": "./portable-record-stream.js",
+          "name": "PortableLimits"
+        },
+        {
+          "imported": "PortableManifest",
+          "module": "./portable-record-stream.js",
+          "name": "PortableManifest"
+        },
+        {
+          "imported": "PortableProjectIdentity",
+          "module": "./portable-record-stream.js",
+          "name": "PortableProjectIdentity"
+        },
+        {
+          "imported": "PortableRawRecordInput",
+          "module": "./portable-record-stream.js",
+          "name": "PortableRawRecordInput"
+        },
+        {
+          "imported": "PortableRawRecordValueByDomain",
+          "module": "./portable-record-stream.js",
+          "name": "PortableRawRecordValueByDomain"
+        },
+        {
+          "imported": "PortableReadBatchInput",
+          "module": "./portable-record-stream.js",
+          "name": "PortableReadBatchInput"
+        },
+        {
+          "imported": "PortableRecord",
+          "module": "./portable-record-stream.js",
+          "name": "PortableRecord"
+        },
+        {
+          "imported": "PortableRecordInput",
+          "module": "./portable-record-stream.js",
+          "name": "PortableRecordInput"
+        },
+        {
+          "imported": "PortableRecordSource",
+          "module": "./portable-record-stream.js",
+          "name": "PortableRecordSource"
+        },
+        {
+          "imported": "PortableRecordStream",
+          "module": "./portable-record-stream.js",
+          "name": "PortableRecordStream"
+        },
+        {
+          "imported": "PortableRecordValue",
+          "module": "./portable-record-stream.js",
+          "name": "PortableRecordValue"
+        },
+        {
+          "imported": "PortableRecordValueByDomain",
+          "module": "./portable-record-stream.js",
+          "name": "PortableRecordValueByDomain"
+        },
+        {
+          "imported": "PortableSourceDescription",
+          "module": "./portable-record-stream.js",
+          "name": "PortableSourceDescription"
+        },
+        {
+          "imported": "PortableSourcePage",
+          "module": "./portable-record-stream.js",
+          "name": "PortableSourcePage"
+        },
+        {
+          "imported": "PortableSourcePageInput",
+          "module": "./portable-record-stream.js",
+          "name": "PortableSourcePageInput"
+        },
+        {
+          "imported": "PortableSourceVerificationInput",
+          "module": "./portable-record-stream.js",
+          "name": "PortableSourceVerificationInput"
+        },
+        {
+          "imported": "PortableStreamErrorCode",
+          "module": "./portable-record-stream.js",
+          "name": "PortableStreamErrorCode"
+        },
+        {
+          "imported": "PortableVerification",
+          "module": "./portable-record-stream.js",
+          "name": "PortableVerification"
+        },
+        {
+          "imported": "PortableDestinationProgress",
+          "module": "./portable-transfer.js",
+          "name": "PortableDestinationProgress"
+        },
+        {
+          "imported": "PortableDestinationVerification",
+          "module": "./portable-transfer.js",
+          "name": "PortableDestinationVerification"
+        },
+        {
+          "imported": "PortablePreflight",
+          "module": "./portable-transfer.js",
+          "name": "PortablePreflight"
+        },
+        {
+          "imported": "PortableRecordWriter",
+          "module": "./portable-transfer.js",
+          "name": "PortableRecordWriter"
+        },
+        {
+          "imported": "PortableTransferErrorCode",
+          "module": "./portable-transfer.js",
+          "name": "PortableTransferErrorCode"
+        },
+        {
+          "imported": "PortableTransferProgress",
+          "module": "./portable-transfer.js",
+          "name": "PortableTransferProgress"
+        },
+        {
+          "imported": "PortableTransferResult",
+          "module": "./portable-transfer.js",
+          "name": "PortableTransferResult"
+        },
+        {
+          "imported": "RunPortableTransferInput",
+          "module": "./portable-transfer.js",
+          "name": "RunPortableTransferInput"
+        },
+        {
+          "imported": "OpenSqlitePortableSourceInput",
+          "module": "./sqlite/portable-source.js",
+          "name": "OpenSqlitePortableSourceInput"
+        },
+        {
+          "imported": "SqlitePortableIdentityFacts",
+          "module": "./sqlite/portable-source.js",
+          "name": "SqlitePortableIdentityFacts"
+        },
+        {
+          "imported": "SqlitePortableCapturedFile",
+          "module": "./sqlite/portable-source.js",
+          "name": "SqlitePortableCapturedFile"
+        },
+        {
+          "imported": "SqlitePortableAbsentSidecar",
+          "module": "./sqlite/portable-source.js",
+          "name": "SqlitePortableAbsentSidecar"
+        },
+        {
+          "imported": "SqlitePortableCapturedSidecars",
+          "module": "./sqlite/portable-source.js",
+          "name": "SqlitePortableCapturedSidecars"
+        },
+        {
+          "imported": "SqlitePortableRecordSource",
+          "module": "./sqlite/portable-source.js",
+          "name": "SqlitePortableRecordSource"
+        },
+        {
+          "imported": "OpenSqlitePortableDestinationInput",
+          "module": "./sqlite/portable-destination.js",
+          "name": "OpenSqlitePortableDestinationInput"
+        },
+        {
+          "imported": "SqlitePortableArchiveReader",
+          "module": "./sqlite/portable-archive.js",
+          "name": "SqlitePortableArchiveReader"
+        },
+        {
+          "imported": "PostgreSqlPortableDestinationInput",
+          "module": "./postgresql/portable-destination.js",
+          "name": "PostgreSqlPortableDestinationInput"
+        },
+        {
+          "imported": "PostgreSqlPortableSourceOptions",
+          "module": "./postgresql/portable-source.js",
+          "name": "PostgreSqlPortableSourceOptions"
+        },
+        {
+          "imported": "StorageIdentityContext",
+          "module": "./contracts.js",
+          "name": "StorageIdentityContext"
+        },
+        {
+          "imported": "PostgreSqlConnectionSettings",
+          "module": "./postgresql/contracts.js",
+          "name": "PostgreSqlConnectionSettings"
+        }
+      ],
+      "imported": "PORTABLE_RECORD_DOMAIN_ORDER",
+      "module": "./portable-record-stream.js",
+      "name": "PORTABLE_RECORD_DOMAIN_ORDER"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:PORTABLE_RECORD_SCHEMA_SHA256",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "PORTABLE_RECORD_SCHEMA_SHA256",
+      "module": "./portable-record-stream.js",
+      "name": "PORTABLE_RECORD_SCHEMA_SHA256"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:PortableStreamError",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "PortableStreamError",
+      "module": "./portable-record-stream.js",
+      "name": "PortableStreamError"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:PortableTransferError",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "PortableTransferError",
+      "module": "./portable-transfer.js",
+      "name": "PortableTransferError"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:canonicalJson",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "canonicalJson",
+      "module": "./portable-record-stream.js",
+      "name": "canonicalJson"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:canonicalSha256",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "canonicalSha256",
+      "module": "./portable-record-stream.js",
+      "name": "canonicalSha256"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:createPortableRecord",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "createPortableRecord",
+      "module": "./portable-record-stream.js",
+      "name": "createPortableRecord"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:createPortableRecordStream",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "createPortableRecordStream",
+      "module": "./portable-record-stream.js",
+      "name": "createPortableRecordStream"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract",
+      "mismatch-refusal"
+    ],
+    "directions": [
+      "sqlite->postgresql",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:createPostgreSqlPortableDestination",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "createPostgreSqlPortableDestination",
+      "module": "./postgresql/portable-destination.js",
+      "name": "createPostgreSqlPortableDestination"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:createPostgreSqlPortableSource",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "createPostgreSqlPortableSource",
+      "module": null,
+      "name": "createPostgreSqlPortableSource"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract",
+      "mismatch-refusal"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "postgresql->sqlite"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:openSqlitePortableDestination",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "openSqlitePortableDestination",
+      "module": "./sqlite/portable-destination.js",
+      "name": "openSqlitePortableDestination"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:openSqlitePortableSource",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "openSqlitePortableSource",
+      "module": "./sqlite/portable-source.js",
+      "name": "openSqlitePortableSource"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:parsePortableCheckpoint",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "parsePortableCheckpoint",
+      "module": "./portable-record-stream.js",
+      "name": "parsePortableCheckpoint"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:parsePortableManifest",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "parsePortableManifest",
+      "module": "./portable-record-stream.js",
+      "name": "parsePortableManifest"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:parsePortableRecord",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "parsePortableRecord",
+      "module": "./portable-record-stream.js",
+      "name": "parsePortableRecord"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract",
+      "resume",
+      "replay"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:runPortableTransfer",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "runPortableTransfer",
+      "module": "./portable-transfer.js",
+      "name": "runPortableTransfer"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:serializePortableCheckpoint",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "serializePortableCheckpoint",
+      "module": "./portable-record-stream.js",
+      "name": "serializePortableCheckpoint"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:serializePortableManifest",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "serializePortableManifest",
+      "module": "./portable-record-stream.js",
+      "name": "serializePortableManifest"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:serializePortableRecord",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "serializePortableRecord",
+      "module": "./portable-record-stream.js",
+      "name": "serializePortableRecord"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:sqlitePortableFileSha256",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "sqlitePortableFileSha256",
+      "module": "./sqlite/portable-source.js",
+      "name": "sqlitePortableFileSha256"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "contract"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-api:verifyPortableCheckpoint",
+    "kind": "portable-api",
+    "registration": {
+      "imported": "verifyPortableCheckpoint",
+      "module": "./portable-record-stream.js",
+      "name": "verifyPortableCheckpoint"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable.ts"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:context-items",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "context-items",
+      "ordinal": 11,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:conversations",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "conversations",
+      "ordinal": 3,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:large-files",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "large-files",
+      "ordinal": 6,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:machines",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "machines",
+      "ordinal": 0,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:message-parts",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "message-parts",
+      "ordinal": 5,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:messages",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "messages",
+      "ordinal": 4,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:native-transcript-checkpoints",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "native-transcript-checkpoints",
+      "ordinal": 20,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:native-transcript-message-links",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "native-transcript-message-links",
+      "ordinal": 19,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:native-transcripts",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "native-transcripts",
+      "ordinal": 18,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:passive-events",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "passive-events",
+      "ordinal": 21,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:project",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "project",
+      "ordinal": 1,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:project-aliases",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "project-aliases",
+      "ordinal": 2,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:promoted-memories",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "promoted-memories",
+      "ordinal": 12,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:promoted-memory-tags",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "promoted-memory-tags",
+      "ordinal": 13,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:recall-surfacings",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "recall-surfacings",
+      "ordinal": 14,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:redaction-counters",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "redaction-counters",
+      "ordinal": 15,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:session-ingest",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "session-ingest",
+      "ordinal": 16,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:session-instructions",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "session-instructions",
+      "ordinal": 17,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:summaries",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "summaries",
+      "ordinal": 7,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:summary-file-links",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "summary-file-links",
+      "ordinal": 8,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:summary-message-links",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "summary-message-links",
+      "ordinal": 9,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  },
+  {
+    "assertions": [
+      "populated",
+      "roundtrip",
+      "native-readback"
+    ],
+    "directions": [
+      "sqlite->sqlite",
+      "sqlite->postgresql",
+      "postgresql->sqlite",
+      "postgresql->postgresql"
+    ],
+    "expectation": "shared-data",
+    "id": "portable-domain:summary-parent-links",
+    "kind": "portable-domain",
+    "registration": {
+      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "domain": "summary-parent-links",
+      "ordinal": 10,
+      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+    },
+    "scenario": "transfer",
+    "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
+  }
+]
