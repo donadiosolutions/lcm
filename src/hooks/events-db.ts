@@ -1,7 +1,7 @@
 // src/hooks/events-db.ts
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   getExistingLcmConnection,
   getLcmConnection,
@@ -205,9 +205,9 @@ ${ERROR_LOG_SQL}
 ${MISSING_CWD_STATE_SQL}
 `;
 
-function currentRegisteredMachineId(): string | null {
+function currentRegisteredMachineId(homeDir?: string): string | null {
   try {
-    return readMachineIdentity()?.machineId ?? null;
+    return readMachineIdentity(homeDir)?.machineId ?? null;
   } catch {
     // Hooks must remain offline-safe even when machine registration needs repair.
     return null;
@@ -253,6 +253,7 @@ export class EventsDb {
   private closed = false;
   private busyTimeoutOverrideId: symbol | undefined;
   private sequenceAllocator: LocalHookEventSequenceAllocator | undefined;
+  private readonly homeDir: string | undefined;
 
   static openExisting(
     dbPath: string,
@@ -260,6 +261,7 @@ export class EventsDb {
   ): EventsDb | null {
     const connection = getExistingLcmConnection(dbPath, {
       tightenDatabaseParent: true,
+      ...(options._expectedFileIdentity === undefined ? {} : { expectedFileIdentity: options._expectedFileIdentity }),
     });
     if (connection === null) return null;
     return new EventsDb(dbPath, options, connection);
@@ -271,6 +273,11 @@ export class EventsDb {
     existingConnection?: DatabaseSync,
   ) {
     this.dbPath = dbPath;
+    const eventsDirectory = dirname(resolve(dbPath));
+    const lcmDirectory = dirname(eventsDirectory);
+    this.homeDir = basename(eventsDirectory) === "events" && basename(lcmDirectory) === ".lcm"
+      ? dirname(lcmDirectory)
+      : undefined;
     if (existingConnection) {
       this.db = existingConnection;
     } else {
@@ -291,7 +298,15 @@ export class EventsDb {
     }
     if (!_migratedPaths.has(dbPath)) {
       try {
-        this.migrate();
+        if (options._requireCurrentSchema === true) {
+          const row = this.db.prepare("SELECT version FROM schema_version").get() as
+            { version?: unknown } | undefined;
+          if (row?.version !== SCHEMA_VERSION) {
+            throw new Error("events database schema is not current during migration maintenance");
+          }
+        } else {
+          this.migrate();
+        }
       } catch (e) {
         // Migration failed — release the pooled connection so the ref-count
         // doesn't leak. The constructor will re-throw, so callers see the error.
@@ -519,7 +534,7 @@ export class EventsDb {
               ?, ?, ?, ?, ?)
     `);
     const result = stmt.run(
-      randomUUID(), currentRegisteredMachineId(), sequence, sessionId, sessionId,
+      randomUUID(), currentRegisteredMachineId(this.homeDir), sequence, sessionId, sessionId,
       event.type, event.category, event.data, event.priority, sourceHook
     );
     return Number(result.lastInsertRowid);

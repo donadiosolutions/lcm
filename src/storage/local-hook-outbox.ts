@@ -1,5 +1,21 @@
-import { EventsDb } from "../hooks/events-db.js";
+import { EventsDb, EVENTS_SCHEMA_VERSION } from "../hooks/events-db.js";
+import { basename, dirname, resolve } from "node:path";
+import {
+  withBackendPublicationAppendBarrierAsync,
+  withBackendPublicationConsumerLock,
+  readBackendMaintenanceJournal,
+  type BackendPublicationAppendBarrierOptions,
+  type BackendPublicationLockToken,
+} from "./backend-publication.js";
 import { StorageOperationError } from "./errors.js";
+import { readCurrentLocalHookOutboxIdentity } from "./local-hook-outbox-schema.js";
+
+const LOCAL_OUTBOX_CLOSE_CONTENTION_WAIT_MS = 5_000;
+
+export type SQLiteLocalHookOutboxFactoryDependencies = Readonly<{
+  /** @internal Deterministic append-admission seams used by lifecycle tests. */
+  appendBarrierOptions?: BackendPublicationAppendBarrierOptions;
+}>;
 
 export interface LocalHookEvent {
   type: string;
@@ -109,15 +125,20 @@ export interface LocalHookDeliveryDiagnostics {
 }
 
 export interface LocalHookOutboxRepository {
-  insertEvent(sessionId: string, event: LocalHookEvent, sourceHook: string): Promise<number>;
-  getUnprocessed(limit?: number): Promise<LocalHookEventRow[]>;
-  markProcessed(eventIds: number[]): Promise<void>;
+  insertEvent(
+    sessionId: string,
+    event: LocalHookEvent,
+    sourceHook: string,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<number>;
+  getUnprocessed(limit?: number, publicationLockToken?: BackendPublicationLockToken): Promise<LocalHookEventRow[]>;
+  markProcessed(eventIds: number[], publicationLockToken?: BackendPublicationLockToken): Promise<void>;
   observeMissingCwd(
     observedAtMs: number,
     minimumIntervalMs: number,
     requiredObservations: number,
   ): Promise<LocalHookMissingCwdState>;
-  clearMissingCwd(): Promise<void>;
+  clearMissingCwd(publicationLockToken?: BackendPublicationLockToken): Promise<void>;
   pruneProcessed(olderThanDays: number): Promise<number>;
   setPrevEventId(eventId: number, prevEventId: number): Promise<void>;
   getPatternReinforcement(
@@ -125,6 +146,7 @@ export interface LocalHookOutboxRepository {
     category: string,
     data: string,
     maxAgeDays?: number,
+    publicationLockToken?: BackendPublicationLockToken,
   ): Promise<PatternReinforcementStats>;
   logHookError(hook: string, error: unknown, sessionId?: string): Promise<void>;
   getHealthStats(): Promise<LocalHookOutboxHealth>;
@@ -163,11 +185,15 @@ export interface LocalHookOutboxRepository {
   listAcknowledgedForRemotePrune(limit?: number): Promise<LocalHookEventRow[]>;
   markRemotePruned(eventUuid: string): Promise<boolean>;
   getDeliveryDiagnostics(): Promise<LocalHookDeliveryDiagnostics>;
-  close(): Promise<void>;
+  close(publicationLockToken?: BackendPublicationLockToken): Promise<void>;
 }
 
 export interface LocalHookOutboxOpenOptions {
   busyTimeoutMs?: number;
+  /** @internal Refuse schema changes while migration maintenance is held. */
+  _requireCurrentSchema?: boolean;
+  /** @internal Bind the authenticated private-copy schema preflight. */
+  _expectedFileIdentity?: Readonly<{ device: number; inode: number }>;
 }
 
 /**
@@ -180,83 +206,188 @@ export interface LocalHookOutboxOpenOptions {
 export class SQLiteLocalHookOutboxFactory {
   private readonly repositories = new Set<SQLiteLocalHookOutboxRepository>();
   private closed = false;
+  private closePromise: Promise<void> | undefined;
+
+  constructor(
+    private readonly dependencies: SQLiteLocalHookOutboxFactoryDependencies = {},
+  ) {}
 
   async open(
     dbPath: string,
     options: LocalHookOutboxOpenOptions = {},
+    publicationLockToken?: BackendPublicationLockToken,
   ): Promise<LocalHookOutboxRepository> {
-    if (this.closed) {
-      throw new StorageOperationError(
-        "STORAGE_CLOSED",
-        "sqlite",
-        undefined,
-        "passive-events",
-        "open",
-      );
-    }
+    return this.withOpenAdmission(dbPath, () => {
+      if (this.closed) {
+        throw new StorageOperationError(
+          "STORAGE_CLOSED",
+          "sqlite",
+          undefined,
+          "passive-events",
+          "open",
+        );
+      }
 
-    return this.register(new EventsDb(dbPath, options));
+      const homeDir = localOutboxHomeDir(dbPath);
+      const maintenance = homeDir === undefined ? null : readBackendMaintenanceJournal(homeDir);
+      if (maintenance !== null && maintenance.phase !== "maintenance-aborted") {
+        const database = this.openCurrentSchema(dbPath, options);
+        if (database === null) {
+          throw new StorageOperationError(
+            "STORAGE_INITIALIZATION_FAILED",
+            "sqlite",
+            undefined,
+            "passive-events",
+            "open",
+          );
+        }
+        return this.register(database, dbPath);
+      }
+      return this.register(new EventsDb(dbPath, options), dbPath);
+    }, publicationLockToken);
   }
 
   /** Open an existing local outbox without creating its file or parent directory. */
   async openExisting(
     dbPath: string,
     options: LocalHookOutboxOpenOptions = {},
+    publicationLockToken?: BackendPublicationLockToken,
   ): Promise<LocalHookOutboxRepository | null> {
-    if (this.closed) {
-      throw new StorageOperationError(
-        "STORAGE_CLOSED",
-        "sqlite",
-        undefined,
-        "passive-events",
-        "openExisting",
-      );
-    }
+    return this.withOpenAdmission(dbPath, () => {
+      if (this.closed) {
+        throw new StorageOperationError(
+          "STORAGE_CLOSED",
+          "sqlite",
+          undefined,
+          "passive-events",
+          "openExisting",
+        );
+      }
 
-    const database = EventsDb.openExisting(dbPath, options);
-    return database === null ? null : this.register(database);
+      const homeDir = localOutboxHomeDir(dbPath);
+      const maintenance = homeDir === undefined ? null : readBackendMaintenanceJournal(homeDir);
+      const database = maintenance !== null && maintenance.phase !== "maintenance-aborted"
+        ? this.openCurrentSchema(dbPath, options)
+        : EventsDb.openExisting(dbPath, options);
+      return database === null ? null : this.register(database, dbPath);
+    }, publicationLockToken);
   }
 
-  private register(database: EventsDb): LocalHookOutboxRepository {
+  private async withOpenAdmission<T>(
+    dbPath: string,
+    callback: () => T,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<T> {
+    const homeDir = localOutboxHomeDir(dbPath);
+    return homeDir === undefined
+      ? callback()
+      : withBackendPublicationAppendBarrierAsync(
+        homeDir,
+        callback,
+        publicationLockToken,
+        this.dependencies.appendBarrierOptions,
+      );
+  }
+
+  private openCurrentSchema(dbPath: string, options: LocalHookOutboxOpenOptions): EventsDb | null {
+    const identity = readCurrentLocalHookOutboxIdentity(dbPath, EVENTS_SCHEMA_VERSION);
+    return identity === null ? null : EventsDb.openExisting(dbPath, {
+      ...options, _requireCurrentSchema: true, _expectedFileIdentity: identity,
+    });
+  }
+
+  private register(database: EventsDb, dbPath: string): LocalHookOutboxRepository {
     let repository: SQLiteLocalHookOutboxRepository;
     repository = new SQLiteLocalHookOutboxRepository(
       database,
+      localOutboxHomeDir(dbPath),
       () => this.repositories.delete(repository),
+      this.dependencies.appendBarrierOptions,
     );
     this.repositories.add(repository);
     return repository;
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(publicationLockToken?: BackendPublicationLockToken): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
-    const repositories = [...this.repositories];
-    this.repositories.clear();
-    await Promise.all(repositories.map((repository) => repository.close()));
+    const attempt = Promise.allSettled(
+      [...this.repositories].map((repository) => repository.close(publicationLockToken)),
+    ).then((outcomes): void => {
+      const failures = outcomes
+        .filter((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected")
+        .map(outcome => outcome.reason as unknown);
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw new AggregateError(failures, "local hook outbox factory close failed");
+      }
+    });
+    this.closePromise = attempt.catch((error: unknown): never => {
+      this.closePromise = undefined;
+      throw error;
+    });
+    return this.closePromise;
   }
 }
 
 class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
-  private closed = false;
+  private closeState: "open" | "closing" | "closed" = "open";
+  private closePromise: Promise<void> | undefined;
+  private releaseCommitted = false;
 
   constructor(
     private readonly database: EventsDb,
+    private readonly homeDir: string | undefined,
     private readonly onClose: () => void,
+    private readonly appendBarrierOptions: BackendPublicationAppendBarrierOptions | undefined,
   ) {}
 
-  async insertEvent(sessionId: string, event: LocalHookEvent, sourceHook: string): Promise<number> {
+  private admitted<T>(callback: () => T, publicationLockToken?: BackendPublicationLockToken): T {
+    return this.homeDir === undefined
+      ? callback()
+      : withBackendPublicationConsumerLock(this.homeDir, callback, {
+        lockToken: publicationLockToken,
+      });
+  }
+
+  private async append<T>(
+    callback: () => T,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<T> {
+    return this.homeDir === undefined
+      ? callback()
+      : withBackendPublicationAppendBarrierAsync(
+        this.homeDir,
+        callback,
+        publicationLockToken,
+        {
+          contentionWaitMs: LOCAL_OUTBOX_CLOSE_CONTENTION_WAIT_MS,
+          ...this.appendBarrierOptions,
+        },
+      );
+  }
+
+  async insertEvent(
+    sessionId: string,
+    event: LocalHookEvent,
+    sourceHook: string,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<number> {
     this.assertOpen("insertEvent");
-    return this.database.insertEvent(sessionId, event, sourceHook);
+    return this.append(
+      () => this.database.insertEvent(sessionId, event, sourceHook),
+      publicationLockToken,
+    );
   }
 
-  async getUnprocessed(limit?: number): Promise<LocalHookEventRow[]> {
+  async getUnprocessed(limit?: number, publicationLockToken?: BackendPublicationLockToken): Promise<LocalHookEventRow[]> {
     this.assertOpen("getUnprocessed");
-    return this.database.getUnprocessed(limit);
+    return this.admitted(() => this.database.getUnprocessed(limit), publicationLockToken);
   }
 
-  async markProcessed(eventIds: number[]): Promise<void> {
+  async markProcessed(eventIds: number[], publicationLockToken?: BackendPublicationLockToken): Promise<void> {
     this.assertOpen("markProcessed");
-    this.database.markProcessed(eventIds);
+    this.admitted(() => this.database.markProcessed(eventIds), publicationLockToken);
   }
 
   async observeMissingCwd(
@@ -265,26 +396,26 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     requiredObservations: number,
   ): Promise<LocalHookMissingCwdState> {
     this.assertOpen("observeMissingCwd");
-    return this.database.observeMissingCwd(
+    return this.admitted(() => this.database.observeMissingCwd(
       observedAtMs,
       minimumIntervalMs,
       requiredObservations,
-    );
+    ));
   }
 
-  async clearMissingCwd(): Promise<void> {
+  async clearMissingCwd(publicationLockToken?: BackendPublicationLockToken): Promise<void> {
     this.assertOpen("clearMissingCwd");
-    this.database.clearMissingCwd();
+    this.admitted(() => this.database.clearMissingCwd(), publicationLockToken);
   }
 
   async pruneProcessed(olderThanDays: number): Promise<number> {
     this.assertOpen("pruneProcessed");
-    return this.database.pruneProcessed(olderThanDays);
+    return this.admitted(() => this.database.pruneProcessed(olderThanDays));
   }
 
   async setPrevEventId(eventId: number, prevEventId: number): Promise<void> {
     this.assertOpen("setPrevEventId");
-    this.database.setPrevEventId(eventId, prevEventId);
+    this.admitted(() => this.database.setPrevEventId(eventId, prevEventId));
   }
 
   async getPatternReinforcement(
@@ -292,14 +423,15 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     category: string,
     data: string,
     maxAgeDays?: number,
+    publicationLockToken?: BackendPublicationLockToken,
   ): Promise<PatternReinforcementStats> {
     this.assertOpen("getPatternReinforcement");
-    return this.database.getPatternReinforcement(type, category, data, maxAgeDays);
+    return this.admitted(() => this.database.getPatternReinforcement(type, category, data, maxAgeDays), publicationLockToken);
   }
 
   async logHookError(hook: string, error: unknown, sessionId?: string): Promise<void> {
     this.assertOpen("logHookError");
-    this.database.logHookError(hook, error, sessionId);
+    this.admitted(() => this.database.logHookError(hook, error, sessionId));
   }
 
   async getHealthStats(): Promise<LocalHookOutboxHealth> {
@@ -314,17 +446,17 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
 
   async pruneUnprocessed(maxRows?: number, maxAgeDays?: number): Promise<{ pruned: number }> {
     this.assertOpen("pruneUnprocessed");
-    return this.database.pruneUnprocessed(maxRows, maxAgeDays);
+    return this.admitted(() => this.database.pruneUnprocessed(maxRows, maxAgeDays));
   }
 
   async pruneErrorLog(olderThanDays?: number): Promise<number> {
     this.assertOpen("pruneErrorLog");
-    return this.database.pruneErrorLog(olderThanDays);
+    return this.admitted(() => this.database.pruneErrorLog(olderThanDays));
   }
 
   async claimDeliveries(input: LocalHookDeliveryClaimInput): Promise<LocalHookEventRow[]> {
     this.assertOpen("claimDeliveries");
-    return this.database.claimDeliveries(input);
+    return this.admitted(() => this.database.claimDeliveries(input));
   }
 
   async markReplicated(
@@ -333,7 +465,7 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     remoteInboxId: bigint,
   ): Promise<boolean> {
     this.assertOpen("markReplicated");
-    return this.database.markReplicated(eventUuid, claimOwner, remoteInboxId);
+    return this.admitted(() => this.database.markReplicated(eventUuid, claimOwner, remoteInboxId));
   }
 
   async markDeliveryRetry(
@@ -343,7 +475,7 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     nextAttemptAt: string,
   ): Promise<boolean> {
     this.assertOpen("markDeliveryRetry");
-    return this.database.markDeliveryRetry(eventUuid, claimOwner, error, nextAttemptAt);
+    return this.admitted(() => this.database.markDeliveryRetry(eventUuid, claimOwner, error, nextAttemptAt));
   }
 
   async markDeliveryQuarantined(
@@ -352,7 +484,7 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     reason: string,
   ): Promise<boolean> {
     this.assertOpen("markDeliveryQuarantined");
-    return this.database.markDeliveryQuarantined(eventUuid, claimOwner, reason);
+    return this.admitted(() => this.database.markDeliveryQuarantined(eventUuid, claimOwner, reason));
   }
 
   async listAwaitingRemote(
@@ -360,17 +492,17 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     includeQuarantined?: boolean,
   ): Promise<LocalHookEventRow[]> {
     this.assertOpen("listAwaitingRemote");
-    return this.database.listAwaitingRemote(limit, includeQuarantined);
+    return this.admitted(() => this.database.listAwaitingRemote(limit, includeQuarantined));
   }
 
   async listQuarantined(limit?: number): Promise<LocalHookEventRow[]> {
     this.assertOpen("listQuarantined");
-    return this.database.listQuarantined(limit);
+    return this.admitted(() => this.database.listQuarantined(limit));
   }
 
   async markAcknowledged(eventUuid: string, remoteInboxId: bigint): Promise<boolean> {
     this.assertOpen("markAcknowledged");
-    return this.database.markAcknowledged(eventUuid, remoteInboxId);
+    return this.admitted(() => this.database.markAcknowledged(eventUuid, remoteInboxId));
   }
 
   async markQuarantined(
@@ -379,22 +511,22 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     reason: string,
   ): Promise<boolean> {
     this.assertOpen("markQuarantined");
-    return this.database.markQuarantined(eventUuid, remoteInboxId, reason);
+    return this.admitted(() => this.database.markQuarantined(eventUuid, remoteInboxId, reason));
   }
 
   async replayQuarantined(eventUuid: string): Promise<boolean> {
     this.assertOpen("replayQuarantined");
-    return this.database.replayQuarantined(eventUuid);
+    return this.admitted(() => this.database.replayQuarantined(eventUuid));
   }
 
   async listAcknowledgedForRemotePrune(limit?: number): Promise<LocalHookEventRow[]> {
     this.assertOpen("listAcknowledgedForRemotePrune");
-    return this.database.listAcknowledgedForRemotePrune(limit);
+    return this.admitted(() => this.database.listAcknowledgedForRemotePrune(limit));
   }
 
   async markRemotePruned(eventUuid: string): Promise<boolean> {
     this.assertOpen("markRemotePruned");
-    return this.database.markRemotePruned(eventUuid);
+    return this.admitted(() => this.database.markRemotePruned(eventUuid));
   }
 
   async getDeliveryDiagnostics(): Promise<LocalHookDeliveryDiagnostics> {
@@ -402,15 +534,58 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     return this.database.getDeliveryDiagnostics();
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
-    this.database.close();
-    this.onClose();
+  close(publicationLockToken?: BackendPublicationLockToken): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closeState = "closing";
+    const attempt = this.closeOnce(publicationLockToken);
+    this.closePromise = attempt.catch((error: unknown): never => {
+      if (this.releaseCommitted) {
+        this.closeState = "closed";
+      } else {
+        this.closeState = "open";
+        this.closePromise = undefined;
+      }
+      throw error;
+    });
+    return this.closePromise;
+  }
+
+  private async closeOnce(
+    publicationLockToken: BackendPublicationLockToken | undefined,
+  ): Promise<void> {
+    let hasFailure = false;
+    let failure: unknown;
+    try {
+      await this.append(() => {
+        this.database.close();
+        this.releaseCommitted = true;
+      }, publicationLockToken);
+    } catch (error) {
+      hasFailure = true;
+      failure = error;
+    }
+    if (this.releaseCommitted) {
+      this.closeState = "closed";
+      try {
+        this.onClose();
+      } catch (error) {
+        if (!hasFailure) {
+          hasFailure = true;
+          failure = error;
+        } else {
+          failure = new AggregateError(
+            [failure, error],
+            "local hook outbox close committed but cleanup failed",
+            { cause: failure },
+          );
+        }
+      }
+    }
+    if (hasFailure) throw failure;
   }
 
   private assertOpen(operation: string): void {
-    if (!this.closed) return;
+    if (this.closeState === "open") return;
     throw new StorageOperationError(
       "STORAGE_CLOSED",
       "sqlite",
@@ -419,4 +594,12 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
       operation,
     );
   }
+}
+
+function localOutboxHomeDir(dbPath: string): string | undefined {
+  const eventsDirectory = dirname(resolve(dbPath));
+  const lcmDirectory = dirname(eventsDirectory);
+  return basename(eventsDirectory) === "events" && basename(lcmDirectory) === ".lcm"
+    ? dirname(lcmDirectory)
+    : undefined;
 }

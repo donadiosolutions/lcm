@@ -96,11 +96,12 @@ succeeds or no output when lcm defers to Claude Code.
 Invoked at the start of a Claude Code session. lcm restores recent summaries and promoted memory, injects them as a user message prefix, and prints a `<context>` block on stdout.
 
 SessionStart serializes its local sidecar maintenance with backend publication:
-it holds the publication consumer lock while it opens, prunes, inspects, and
-closes the local outbox. If another publication already holds that lock, the
-best-effort maintenance and promotion trigger are skipped. Daemon startup and
-the restore request run outside this retained lock and still perform their own
-admission checks. Authenticated publication-journal errors fail closed.
+it uses one live consumer token to enter the append barrier while it opens,
+prunes, inspects, and physically closes the local outbox. If another publication
+already holds that lock, the best-effort maintenance and promotion trigger are
+skipped. Daemon startup and the restore request run outside these retained
+locks and still perform their own admission checks. Authenticated
+publication-journal errors fail closed.
 
 **Stdin fields:**
 
@@ -214,7 +215,13 @@ publication admission is attempted. After that durable boundary:
 
 If publication admission fails before the local event can be durably appended,
 the hook does not report a successful observer result; the direct top-level CLI
-path retains its fixed stderr diagnostic and exit code `1`.
+path retains its fixed stderr diagnostic and exit code `1`. Hook append
+admission waits for contention for at most five seconds, including time queued
+behind another hook in the same process. Once admitted, opening the outbox,
+allocating sequences, inserting every event, reading health, and physically
+closing the outbox and sequence handles complete under that single admission.
+The hook never retries its event writes; an admission timeout occurs before
+the first write and requires the host to retry the hook.
 
 The fixed diagnostic is:
 
@@ -329,6 +336,21 @@ Snapshot ingestion is skipped when daemon bootstrap cannot verify the configured
 ## Auto-heal
 
 All lcm hooks self-repair on each invocation: before dispatching, `validateAndFixHooks()` checks that all required hook entries remain registered in `~/.claude/settings.json` and re-adds any missing entries. This means lcm hooks survive `claude settings reset` or manual edits to the settings file.
+
+### Passive promotion acknowledgement
+
+Passive promotion and explicit event draining mark a queued event processed
+only after its selected project transaction succeeds. Queue acknowledgement
+uses the same live publication admission as the project operation, so it does
+not contend with its own publication lock after committing a memory or migration
+receipt. A completed receipt remains authoritative on a retry; its effect is
+not repeated. If acknowledgement fails, the event remains queued for retry.
+
+Physical outbox opening and local queue reads use short queued publication
+scopes, separate from the selected project batch. Scrubber setup remains outside
+retained admission. Callers supplying a retained publication token reuse it
+for local preparation, acknowledgement, and owned storage cleanup. The token is valid
+only while its owning admission scope remains active.
 
 ### Native ingest source changes and cancellation
 

@@ -381,6 +381,20 @@ export interface CoordinationRepository {
   deleteSessionInstructions(scope: SessionInstructionsScope): Promise<void>;
 }
 
+export interface MigrationReceiptRepository {
+  getEpoch(machineId: string): Promise<import("../migration/receipts.js").MigrationReceiptEpoch | null>;
+  findMatching(input: Readonly<{
+    epochId: string;
+    envelope: import("../migration/receipts.js").MigrationReceiptEnvelope;
+  }>): Promise<import("../migration/receipts.js").MigrationReceipt | null>;
+  record(input: Readonly<{
+    epochId: string;
+    envelope: import("../migration/receipts.js").MigrationReceiptEnvelope;
+    effectWitness: import("../migration/receipts.js").MigrationReceiptEffectWitness;
+    committedAt: string;
+  }>): Promise<import("../migration/receipts.js").MigrationReceipt>;
+}
+
 export interface ProjectRepositories {
   readonly conversations: ConversationRepository;
   readonly summaries: SummaryRepository;
@@ -393,7 +407,10 @@ export interface ProjectRepositories {
   readonly coordination: CoordinationRepository;
 }
 
-export type TransactionRepositories = ProjectRepositories;
+export type TransactionRepositories = ProjectRepositories & Readonly<{
+  /** SQLite-private exactly-once evidence; never a canonical transfer domain. */
+  migrationReceipt?: MigrationReceiptRepository;
+}>;
 
 export interface ProjectStorage extends ProjectRepositories {
   /** Native imports own their checkpoint transactions outside parsed-message transactions. */
@@ -406,7 +423,7 @@ export interface ProjectStorage extends ProjectRepositories {
   readonly capabilities: StorageCapabilities;
   transaction<T>(callback: (repositories: TransactionRepositories) => Promise<T>): Promise<T>;
   health(): Promise<StorageHealth>;
-  close(): Promise<void>;
+  close(publicationLockToken?: BackendPublicationLockToken): Promise<void>;
 }
 
 /**
@@ -442,5 +459,5 @@ export interface StorageBackendFactory {
     signal?: AbortSignal,
   ): Promise<ProjectStorage>;
   health(): Promise<StorageHealth>;
-  close(): Promise<void>;
+  close(publicationLockToken?: BackendPublicationLockToken): Promise<void>;
 }

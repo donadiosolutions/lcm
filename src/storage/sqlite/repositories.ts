@@ -24,9 +24,15 @@ import type {
   ProjectRepositories,
   PromotedMemoryRecord,
   StorageDomain,
+  TransactionRepositories,
 } from "../contracts.js";
 import { normalizeStorageError } from "../errors.js";
 import { sessionInstructionsScopeHash } from "../session-instructions.js";
+import {
+  getMigrationReceiptEpoch,
+  findMatchingMigrationReceipt,
+  recordMigrationReceipt,
+} from "../../migration/receipts.js";
 
 export type RepositoryInvoker = <T>(
   domain: StorageDomain,
@@ -93,7 +99,7 @@ export function createSqliteRepositories(
   stores: SqliteRepositoryStores,
   projectId: string,
   invoke: RepositoryInvoker,
-): ProjectRepositories {
+): TransactionRepositories {
   const conversations = stores.conversations;
   const conversationAtomic = stores.conversationAtomic;
   const summaries = stores.summaries;
@@ -118,7 +124,24 @@ export function createSqliteRepositories(
     return invokeValidated();
   };
 
-  const repositories: ProjectRepositories = {
+  const repositories: TransactionRepositories = {
+    migrationReceipt: {
+      findMatching: (input) => invoke(
+        "coordination",
+        "findMatchingMigrationReceipt",
+        () => findMatchingMigrationReceipt(db, { projectId, ...input }),
+      ),
+      getEpoch: (machineId) => invoke(
+        "coordination",
+        "getMigrationReceiptEpoch",
+        () => getMigrationReceiptEpoch(db, projectId, machineId),
+      ),
+      record: (input) => invoke(
+        "coordination",
+        "recordMigrationReceipt",
+        () => recordMigrationReceipt(db, { projectId, ...input }),
+      ),
+    },
     conversations: {
       createConversation: (input) => invoke("conversations", "createConversation", () => conversations.createConversation(input)),
       getConversation: (id) => invoke("conversations", "getConversation", () => conversations.getConversation(id)),

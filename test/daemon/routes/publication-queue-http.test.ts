@@ -1,3 +1,6 @@
+import { ScrubEngine } from "../../../src/scrub.js";
+import { SQLiteLocalHookOutboxFactory } from "../../../src/storage/local-hook-outbox.js";
+import { getPoolStats, closeLcmConnection } from "../../../src/db/connection.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -36,6 +39,7 @@ async function withDaemon(operation: (fixture: {
   post: (path: string, body: object, signal?: AbortSignal) => Promise<Response>;
   waitForArrival: () => Promise<void>;
   waitForCancellation: () => Promise<void>;
+  waitForSettlement: () => Promise<void>;
   holdBackground: (releaseOnShutdown?: boolean) => Promise<{ release: () => void; done: Promise<void> }>;
   storageEntries: string[];
 }) => Promise<void>): Promise<void> {
@@ -55,6 +59,7 @@ async function withDaemon(operation: (fixture: {
   let scanOperation: NonNullable<DaemonOptions["_scanForTranscripts"]> = async () => undefined;
   let arrival = deferred();
   let cancellation = deferred();
+  let settlement = deferred();
   let daemon: DaemonInstance | undefined;
   const releases: (() => void)[] = [];
   const scans: Promise<void>[] = [];
@@ -73,6 +78,7 @@ async function withDaemon(operation: (fixture: {
       _onRequestLifecycle: (event) => {
         if (event === "received") arrival.resolve();
         if (event === "cancelled") cancellation.resolve();
+        if (event === "settled") settlement.resolve();
       },
       _createStorageBackendFactory: async (...args) => {
         const factory = await createStorageBackendFactory(...args);
@@ -99,6 +105,10 @@ async function withDaemon(operation: (fixture: {
       waitForCancellation: () => {
         const pending = cancellation.promise;
         return bounded(pending).then(() => { cancellation = deferred(); });
+      },
+      waitForSettlement: () => {
+        const pending = settlement.promise;
+        return bounded(pending).then(() => { settlement = deferred(); });
       },
       holdBackground: async (releaseOnShutdown = false) => {
         const entered = deferred();
@@ -213,6 +223,76 @@ describe("builtin HTTP publication queue", () => {
       expect(storageEntries).toEqual(["openProject"]);
       expect(query(cwd, "SELECT session_id FROM session_ingest_log ORDER BY session_id"))
         .toEqual([{ session_id: "after-cancellation" }]);
+    });
+  });
+
+  it("attempts outbox cleanup after cancellation before the selected batch", async () => {
+    await withDaemon(async ({ home, cwd, post, waitForCancellation, waitForSettlement, holdBackground, storageEntries }) => {
+      const sidecar = eventsDbPath(cwd);
+      const events = new EventsDb(sidecar);
+      events.insertEvent("cancelled-promotion", { type: "decision", category: "decision", data: "cancel after physical outbox opening", priority: 1 }, "PostToolUse");
+      events.close();
+      const enteredScrubber = deferred();
+      const releaseScrubber = deferred();
+      const cleanupStarted = deferred();
+      const cleanupFinished = deferred();
+      const openOwners = new Set<SQLiteLocalHookOutboxFactory>();
+      let promotionOwner: SQLiteLocalHookOutboxFactory | undefined;
+      let closeAttempts = 0;
+      const originalOpen = SQLiteLocalHookOutboxFactory.prototype.open;
+      vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementation(async function (...args) {
+        const repository = await originalOpen.apply(this, args);
+        if (args[0] === sidecar) openOwners.add(this);
+        return repository;
+      });
+      const originalClose = SQLiteLocalHookOutboxFactory.prototype.close;
+      vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close").mockImplementation(function (...args) {
+        openOwners.delete(this);
+        const closing = originalClose.apply(this, args);
+        if (this === promotionOwner) {
+          closeAttempts += 1;
+          cleanupStarted.resolve();
+          void closing.then(cleanupFinished.resolve, cleanupFinished.resolve);
+        }
+        return closing;
+      });
+      const originalScrubber = ScrubEngine.forProject;
+      vi.spyOn(ScrubEngine, "forProject").mockImplementationOnce(async (...args) => {
+        expect(openOwners.size).toBe(1);
+        promotionOwner = [...openOwners][0];
+        enteredScrubber.resolve();
+        await releaseScrubber.promise;
+        return originalScrubber(...args);
+      });
+      const controller = new AbortController();
+      const request = post("/promote-events", { cwd }, controller.signal);
+      const outcome = request.then(() => "responded", () => "aborted");
+      await bounded(enteredScrubber.promise);
+      expect(getPoolStats().connections.some(connection => connection.path === sidecar)).toBe(true);
+      const hold = await holdBackground();
+      try {
+        const cancelled = waitForCancellation();
+        const settled = waitForSettlement();
+        controller.abort();
+        await cancelled;
+        releaseScrubber.resolve();
+        await bounded(cleanupStarted.promise);
+        // Keep the competing owner until this route actually attempts cleanup,
+        // then release it within the existing physical-close admission budget.
+        hold.release();
+        await bounded(hold.done);
+        await bounded(cleanupFinished.promise);
+        await settled;
+        await expect(bounded(outcome)).resolves.toBe("aborted");
+        expect(closeAttempts).toBe(1);
+        expect(storageEntries).toEqual([]);
+        expect(getPoolStats().connections.filter(connection => connection.path.startsWith(home))).toEqual([]);
+      } finally {
+        releaseScrubber.resolve(); hold.release(); await hold.done;
+        for (const connection of getPoolStats().connections) {
+          if (connection.path.startsWith(home)) closeLcmConnection(connection.path);
+        }
+      }
     });
   });
 

@@ -80,6 +80,21 @@ describe("local hook event sequence", () => {
     expect(() => allocator.allocateSequence()).toThrow("allocator is closed");
   });
 
+  it("reads the next cutoff sequence without allocating it", () => {
+    const allocatorPath = sequencePath();
+    const allocator = new LocalHookEventSequenceAllocator(allocatorPath);
+    try {
+      expect(allocator.peekNextSequence()).toBe(0n);
+      expect(allocator.allocateSequence()).toBe(0n);
+      expect(allocator.peekNextSequence()).toBe(1n);
+    } finally {
+      allocator.close();
+    }
+    expect(() => allocator.peekNextSequence()).toThrow("allocator is closed");
+    expect(isLcmConnectionOpen(allocatorPath)).toBe(false);
+    expect(allocateLocalHookEventSequence(allocatorPath)).toBe(1n);
+  });
+
   it("releases its connection when checkpoint initialization fails", () => {
     const path = sequencePath();
     const originalExec = DatabaseSync.prototype.exec;

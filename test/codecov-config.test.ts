@@ -59,6 +59,9 @@ const expectedComponents = [
       // configuration-security owner without changing component topology.
       // #1134/#1135/#1136 preserve private-write failures while retaining
       // ordered descriptor, temporary-file, and parent cleanup evidence here.
+      // #1223 keeps authenticated lock-owner disappearance recovery in this
+      // existing configuration-security owner.
+      // #1231 keeps exact intended enrollment identity construction here.
       // #1151 revalidates the journal temporary inode, single-link topology,
       // and retained parent after destination authorization in this owner.
       // PR #791 keeps generated Gitleaks hostname-literal normalization in
@@ -92,6 +95,7 @@ const expectedComponents = [
   {
     component_id: "unit-hooks",
     name: "Unit - Hooks",
+    // #1225 composes SessionStart pruning with append admission in this owner.
     paths: ["src/hooks/"],
   },
   {
@@ -131,6 +135,8 @@ const expectedComponents = [
   {
     component_id: "unit-daemon-routes",
     name: "Unit - Daemon Routes",
+    // #1230 keeps route project close on the live request token.
+    // #1247 keeps local queue preparation, acknowledgement, and cleanup route-owned.
     paths: ["src/daemon/routes/"],
   },
   {
@@ -157,7 +163,9 @@ const expectedComponents = [
     // #1082 keeps SQLite promoted-content NUL admission and replay guards in
     // local persistence; this change does not alter component ownership.
     // #618 optional receipt schema admission stays local-persistence-owned.
+    // #622 keeps registered-project outbox preparation and admitted sidecar discovery here.
     // #1140 fixed transfer-ledger control bounds stay local-persistence-owned.
+    // #1231 prepares an intended enrollment epoch before identity publication.
     paths: ["src/db/", "src/storage/sqlite/", "src/store/"],
   },
   {
@@ -169,6 +177,7 @@ const expectedComponents = [
       "^src/storage/backend\\.ts$",
       // #844 and #942 keep coordinator evidence, material, and checkpoint
       // directory-witness authentication in this owner.
+      // #1240 keeps authenticated terminal-maintenance configuration admission here.
       "^src/storage/backend-publication\\.ts$",
       // #910 keeps shared publication retry deadlines monotonic in this owner.
       "^src/storage/publication-convergence\\.ts$",
@@ -191,14 +200,20 @@ const expectedComponents = [
   {
     component_id: "unit-migration-cutover",
     name: "Unit - Migration and Cutover",
+    // #622 keeps immutable capture, preparation, and receipt evidence here.
+    // #1231 orders receipt epoch durability before machine identity visibility.
+    // #622 seals private artifact modes before the final file sync.
     paths: ["src/migration/"],
   },
   {
     component_id: "unit-local-event-storage",
     name: "Unit - Local Event Storage",
+    // #622 keeps outbox connection admission and current-schema validation here.
+    // #1247 keeps explicit promotion queue admission in this component.
     paths: [
       "^src/storage/local-hook-event-sequence\\.ts$",
       "^src/storage/local-hook-outbox\\.ts$",
+      "^src/storage/local-hook-outbox-schema\\.ts$",
       "^src/storage/session-instructions\\.ts$",
     ],
   },
@@ -534,7 +549,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(235);
+    expect(productionFiles).toHaveLength(240);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -564,7 +579,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(235);
+    expect(ownershipCounts.size).toBe(240);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106 files in their intended components", () => {
@@ -635,6 +650,7 @@ describe("Codecov configuration", () => {
       ["src/daemon/http-url.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
       ["src/daemon/project.ts", "unit-daemon-core"],
+      // Compact forwards current operation tokens; SQLite validates handle admission.
       ["src/daemon/routes/compact.ts", "unit-daemon-routes"],
       ["src/daemon/routes/describe.ts", "unit-daemon-routes"],
       ["src/daemon/routes/expand.ts", "unit-daemon-routes"],
@@ -695,7 +711,12 @@ describe("Codecov configuration", () => {
       // #837 consumer-admission descriptor cleanup remains storage-owned.
       // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
+      ["src/storage/local-hook-outbox-schema.ts", "unit-local-event-storage"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
+      ["src/migration/maintenance.ts", "unit-migration-cutover"],
+      ["src/migration/receipts.ts", "unit-migration-cutover"],
+      ["src/migration/queue-evidence.ts", "unit-migration-cutover"],
+      ["src/migration/sqlite-snapshot.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
       ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
@@ -717,7 +738,9 @@ describe("Codecov configuration", () => {
       // opened-identity fencing local-persistence-owned.
       ["src/db/connection.ts", "unit-local-persistence"],
       ["src/db/database-parent.ts", "unit-local-persistence"],
+      // Retained-handle token scopes and fresh factory health remain local persistence.
       ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
+      ["src/storage/sqlite/project-storage.ts", "unit-local-persistence"],
       // #1020 keeps message timestamp mapping in the existing local-persistence
       // component; conversation timestamps remain on their existing mapper.
       ["src/store/conversation-store.ts", "unit-local-persistence"],

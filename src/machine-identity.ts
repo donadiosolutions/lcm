@@ -263,6 +263,27 @@ export function ensurePendingMachineIdentity(
   );
 }
 
+/** Build and validate the exact identity intended for final publication. */
+export function createMachineIdentity(
+  pending: StoredMachineIdentity,
+  machineId: string,
+  displayName: string,
+): MachineIdentity {
+  const normalizedMachineId = normalizeUuidV7(machineId);
+  if (!normalizedMachineId) {
+    throw new MachineIdentityFileError(
+      "PostgreSQL returned an invalid machine ID",
+      "Verify the PostgreSQL 18 schema and rerun `lcm machine register`.",
+    );
+  }
+  return {
+    version: MACHINE_IDENTITY_VERSION,
+    identityKey: pending.identityKey,
+    machineId: normalizedMachineId,
+    displayName: normalizeMachineDisplayName(displayName),
+  };
+}
+
 export function finalizeMachineIdentity(
   pending: StoredMachineIdentity,
   machineId: string,
@@ -273,19 +294,7 @@ export function finalizeMachineIdentity(
     readonly _lockObserverForTesting?: PrivateMutationLockObserver;
   } = {},
 ): MachineIdentity {
-  const normalizedMachineId = normalizeUuidV7(machineId);
-  if (!normalizedMachineId) {
-    throw new MachineIdentityFileError(
-      "PostgreSQL returned an invalid machine ID",
-      "Verify the PostgreSQL 18 schema and rerun `lcm machine register`.",
-    );
-  }
-  const intended: MachineIdentity = {
-    version: MACHINE_IDENTITY_VERSION,
-    identityKey: pending.identityKey,
-    machineId: normalizedMachineId,
-    displayName: normalizeMachineDisplayName(displayName),
-  };
+  const intended = createMachineIdentity(pending, machineId, displayName);
   return withPrivateMutationLock(
     machineIdentityMutationLockPath(homeDir),
     "machine identity",
@@ -298,10 +307,10 @@ export function finalizeMachineIdentity(
         );
       }
       if (current.machineId !== null) {
-        if (current.machineId !== normalizedMachineId) {
+        if (current.machineId !== intended.machineId) {
           throw new MachineIdentityFileError(
             "machine.json is stale and disagrees with PostgreSQL",
-            `Run \`lcm machine recover ${normalizedMachineId} --force\` to reconcile it.`,
+            `Run \`lcm machine recover ${intended.machineId} --force\` to reconcile it.`,
           );
         }
         if (

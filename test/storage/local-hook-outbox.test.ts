@@ -1,13 +1,22 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
-import { isLcmConnectionOpen } from "../../src/db/connection.js";
+import { getPoolStats, isLcmConnectionOpen } from "../../src/db/connection.js";
+import { eventSequenceDbPath } from "../../src/db/events-path.js";
 import {
   type LocalHookOutboxRepository,
   SQLiteLocalHookOutboxFactory,
 } from "../../src/storage/local-hook-outbox.js";
+import {
+  BackendPublicationCoordinator,
+  withBackendPublicationAppendBarrierAsync,
+  withBackendPublicationConsumerLockAsync,
+  type BackendPublicationLockToken,
+  type BackendPublicationDriver,
+} from "../../src/storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 describe("SQLiteLocalHookOutboxFactory", () => {
   const machineId = "0195d250-0000-7000-8000-000000000091";
@@ -24,6 +33,14 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-local-outbox-"));
     directories.push(directory);
     return join(directory, `${name}.db`);
+  }
+
+  function localPathFor(name: string): { homeDir: string; dbPath: string } {
+    const homeDir = mkdtempSync(join(tmpdir(), "lcm-local-outbox-home-"));
+    directories.push(homeDir);
+    const eventsDirectory = join(homeDir, ".lcm", "events");
+    mkdirSync(eventsDirectory, { recursive: true, mode: 0o700 });
+    return { homeDir, dbPath: join(eventsDirectory, `${name}.db`) };
   }
 
   function retainedOperations(
@@ -237,6 +254,108 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     await factory.close();
   });
 
+  it("forwards delivery quarantine lifecycle operations through the local repository", async () => {
+    const path = pathFor("delivery-lifecycle");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const repository = await factory.open(path);
+    const first = await repository.insertEvent(
+      "delivery-session",
+      { type: "choice", category: "decision", data: "first", priority: 1 },
+      "PostToolUse",
+    );
+    const second = await repository.insertEvent(
+      "delivery-session",
+      { type: "choice", category: "decision", data: "second", priority: 1 },
+      "PostToolUse",
+    );
+    const [firstClaim] = await repository.claimDeliveries({
+      machineId: (await repository.getUnprocessed())[0].machine_id ?? machineId,
+      claimOwner: "owner-a",
+      limit: 1,
+      staleClaimMs: 1_000,
+    });
+    expect(firstClaim.event_id).toBe(first);
+    expect(await repository.markDeliveryRetry(
+      firstClaim.event_uuid,
+      "owner-a",
+      "temporary failure",
+      "2000-01-01T00:00:00.000Z",
+    )).toBe(true);
+
+    const [reclaimed] = await repository.claimDeliveries({
+      machineId: firstClaim.machine_id ?? machineId,
+      claimOwner: "owner-b",
+      limit: 1,
+      staleClaimMs: 1_000,
+    });
+    expect(reclaimed.event_id).toBe(first);
+    expect(await repository.markDeliveryQuarantined(
+      reclaimed.event_uuid,
+      "owner-b",
+      "poisoned payload",
+    )).toBe(true);
+    expect((await repository.listQuarantined()).map((event) => event.event_id)).toEqual([first]);
+
+    const [secondClaim] = await repository.claimDeliveries({
+      machineId: firstClaim.machine_id ?? machineId,
+      claimOwner: "owner-c",
+      limit: 1,
+      staleClaimMs: 1_000,
+    });
+    expect(secondClaim.event_id).toBe(second);
+    expect(await repository.markReplicated(secondClaim.event_uuid, "owner-c", 41n)).toBe(true);
+    expect((await repository.listAwaitingRemote()).map((event) => event.event_id)).toEqual([second]);
+    expect(await repository.markQuarantined(secondClaim.event_uuid, 41n, "remote poison")).toBe(true);
+    expect(await repository.listAwaitingRemote()).toEqual([]);
+    expect((await repository.listAwaitingRemote(undefined, true)).map((event) => event.event_id)).toEqual([second]);
+    expect((await repository.listQuarantined()).map((event) => event.event_id)).toEqual([first, second]);
+    expect(await repository.replayQuarantined(reclaimed.event_uuid)).toBe(true);
+    expect(await repository.replayQuarantined(secondClaim.event_uuid)).toBe(true);
+    expect(await repository.markAcknowledged(secondClaim.event_uuid, 41n)).toBe(true);
+    expect((await repository.listAcknowledgedForRemotePrune()).map((event) => event.event_id)).toEqual([second]);
+
+    await repository.close();
+    await factory.close();
+  });
+
+  it("opens an existing local outbox while migration maintenance is held", async () => {
+    const { homeDir, dbPath } = localPathFor("maintenance-held");
+    const seedFactory = new SQLiteLocalHookOutboxFactory();
+    const seed = await seedFactory.open(dbPath);
+    await seed.insertEvent(
+      "maintenance-session",
+      { type: "choice", category: "decision", data: "held", priority: 1 },
+      "PostToolUse",
+    );
+    await seedFactory.close();
+
+    const unexpected: BackendPublicationDriver["observeLocalState"] = async () => {
+      throw new Error("publication driver must not run");
+    };
+    const driver: BackendPublicationDriver = {
+      observeLocalState: unexpected,
+      publishProjectMap: async () => { throw new Error("publication driver must not run"); },
+      publishConfig: async () => { throw new Error("publication driver must not run"); },
+      restoreConfig: async () => { throw new Error("publication driver must not run"); },
+      restoreProjectMap: async () => { throw new Error("publication driver must not run"); },
+    };
+    const coordinator = new BackendPublicationCoordinator({ homeDir, driver });
+    await coordinator.enterMaintenance({
+      publicationId: "local-outbox-publication",
+      generationId: "local-outbox-generation",
+      sourceSelectionSha256: "a".repeat(64),
+      queueEvidenceSha256: "b".repeat(64),
+      roster: [{ machineId, queueCutoff: null, evidenceSha256: "a".repeat(64) }],
+    });
+
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const repository = await factory.openExisting(dbPath);
+    expect(repository).not.toBeNull();
+    await repository?.close();
+    await factory.close();
+
+  });
+
   it("opens only an existing local outbox without creating missing path state", async () => {
     const existingPath = pathFor("existing-only");
     const missingParent = join(dirname(existingPath), "missing");
@@ -299,5 +418,241 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     await factory.close();
 
     await expectRetainedOperationsClosed(repository);
+  });
+
+  it("requires the exact live token for promotion queue preparation and acknowledgement", async () => {
+    const local = localPathFor("promotion-token");
+    const other = localPathFor("other-token");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const repository = await factory.open(local.dbPath);
+    const id = await repository.insertEvent("session", { type: "decision", category: "decision", data: "authority-bound event", priority: 1 }, "PostToolUse");
+    await repository.observeMissingCwd(10, 1, 3);
+    const observe = () => {
+      const db = new DatabaseSync(local.dbPath, { readOnly: true });
+      try { return { events: db.prepare("SELECT * FROM events").all(), missing: db.prepare("SELECT * FROM missing_cwd_state").all() }; }
+      finally { db.close(); }
+    };
+    const before = observe();
+    const operations = (token: BackendPublicationLockToken) => [
+      () => repository.getUnprocessed(undefined, token),
+      () => repository.getPatternReinforcement("decision", "decision", "authority-bound event", undefined, token),
+      () => repository.clearMissingCwd(token),
+      () => repository.markProcessed([id], token),
+    ];
+    try {
+      const revoked = await withBackendPublicationConsumerLockAsync(local.homeDir, token => token);
+      for (const run of operations(revoked)) await expect(run()).rejects.toMatchObject({ reason: "permit-mismatch" });
+      await withBackendPublicationConsumerLockAsync(other.homeDir, async token => {
+        for (const run of operations(token)) await expect(run()).rejects.toMatchObject({ reason: "permit-mismatch" });
+      });
+      expect(observe()).toEqual(before);
+      await withBackendPublicationConsumerLockAsync(local.homeDir, async token => {
+        expect(await repository.getUnprocessed(undefined, token)).toHaveLength(1);
+        expect(await repository.getPatternReinforcement("decision", "decision", "authority-bound event", undefined, token))
+          .toMatchObject({ totalCount: 1, distinctSessions: 1 });
+        await repository.clearMissingCwd(token);
+        await repository.markProcessed([id], token);
+        expect(await repository.getUnprocessed(undefined, token)).toEqual([]);
+        await factory.close(token);
+      });
+      expect(observe().missing).toEqual([]);
+      expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+    } finally { await factory.close(); }
+  });
+
+  it("retries factory close after pre-release admission fails", async () => {
+    const local = localPathFor("retry-close");
+    const other = localPathFor("other-home");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const repository = await factory.open(local.dbPath);
+
+    await expect(withBackendPublicationAppendBarrierAsync(other.homeDir, token =>
+      factory.close(token))).rejects.toMatchObject({ reason: "permit-mismatch" });
+    await expect(repository.getHealthStats()).resolves.toMatchObject({ unprocessed: 0 });
+    expect(isLcmConnectionOpen(local.dbPath)).toBe(true);
+    await expect(factory.open(localPathFor("late-after-failure").dbPath)).rejects.toMatchObject({
+      code: "STORAGE_CLOSED",
+      operation: "open",
+    });
+
+    await expect(factory.close()).resolves.toBeUndefined();
+    expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+    await expectRetainedOperationsClosed(repository);
+  });
+
+  it("shares one in-flight repository close while waiting for append admission", async () => {
+    const local = localPathFor("shared-close");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const repository = await factory.open(local.dbPath);
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(local.homeDir, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+
+    const first = repository.close();
+    const duplicate = repository.close();
+    const samePromise = duplicate === first;
+    releaseOwner();
+    await owner;
+    await first;
+
+    expect(samePromise).toBe(true);
+    await expect(duplicate).resolves.toBeUndefined();
+    await factory.close();
+  });
+
+  it("keeps a committed repository closed after append-lock cleanup fails", async () => {
+    const local = localPathFor("committed-cleanup");
+    const cleanupFailure = new Error("outbox append cleanup failed");
+    let armed = false;
+    const ControlledFactory = SQLiteLocalHookOutboxFactory as unknown as new (
+      dependencies: Readonly<{
+        appendBarrierOptions: Readonly<{
+          _appendLockObserver: (event: string) => void;
+        }>;
+      }>,
+    ) => SQLiteLocalHookOutboxFactory;
+    const factory = new ControlledFactory({
+      appendBarrierOptions: {
+        _appendLockObserver: (event) => {
+          if (armed && event === "before-main-lock-release-read") throw cleanupFailure;
+        },
+      },
+    });
+    const repository = await factory.open(local.dbPath);
+    const sequencePath = eventSequenceDbPath(local.homeDir);
+    armed = true;
+
+    const first = factory.close();
+    await expect(first).rejects.toBe(cleanupFailure);
+    expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+    expect(isLcmConnectionOpen(sequencePath)).toBe(false);
+    await expectRetainedOperationsClosed(repository);
+
+    armed = false;
+    await expect(factory.close()).resolves.toBeUndefined();
+    expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+  });
+
+  it.each([false, true])("keeps committed outbox ownership released when notification fails (cleanup=%s)", async cleanupFails => {
+    const local = localPathFor("notification-failure");
+    const cleanupError = new Error("append cleanup failure");
+    const notificationError = new Error("owner notification failure");
+    let armed = false;
+    const factory = new SQLiteLocalHookOutboxFactory({ appendBarrierOptions: {
+      _appendLockObserver: event => {
+        if (armed && cleanupFails && event === "before-main-lock-release-read") throw cleanupError;
+      },
+    } });
+    const repository = await factory.open(local.dbPath);
+    const originalDelete = Set.prototype.delete;
+    let notifications = 0;
+    let reentrantClose: Promise<void> | undefined;
+    const deletion = vi.spyOn(Set.prototype, "delete").mockImplementation(function (value) {
+      const deleted = originalDelete.call(this, value);
+      if (value === repository) {
+        notifications += 1;
+        reentrantClose = repository.close();
+        throw notificationError;
+      }
+      return deleted;
+    });
+    try {
+      armed = true;
+      const close = repository.close();
+      const error = await close.catch((caught: unknown) => caught);
+      if (cleanupFails) {
+        expect(error).toBeInstanceOf(AggregateError);
+        expect((error as AggregateError).errors).toEqual([cleanupError, notificationError]);
+        expect((error as AggregateError).cause).toBe(cleanupError);
+      } else expect(error).toBe(notificationError);
+      expect(repository.close()).toBe(close);
+      expect(reentrantClose).toBe(close);
+      expect(notifications).toBe(1);
+      expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+      await expectRetainedOperationsClosed(repository);
+    } finally {
+      deletion.mockRestore();
+      armed = false;
+      await factory.close();
+    }
+  });
+
+  it("preserves an undefined post-commit cleanup rejection", async () => {
+    const local = localPathFor("undefined-cleanup");
+    let armed = false;
+    const factory = new SQLiteLocalHookOutboxFactory({
+      appendBarrierOptions: {
+        _appendLockObserver: (event) => {
+          if (armed && event === "before-main-lock-release-read") throw undefined;
+        },
+      },
+    });
+    const repository = await factory.open(local.dbPath);
+    armed = true;
+
+    let rejected = false;
+    await factory.close().then(
+      () => undefined,
+      (error: unknown) => {
+        rejected = true;
+        expect(error).toBeUndefined();
+      },
+    );
+    expect(rejected).toBe(true);
+    expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+    await expectRetainedOperationsClosed(repository);
+  });
+
+  it("reports multiple uncommitted close failures in repository order", async () => {
+    const first = localPathFor("aggregate-first");
+    const second = localPathFor("aggregate-second");
+    let now = 0;
+    let armed = false;
+    const factory = new SQLiteLocalHookOutboxFactory({
+      appendBarrierOptions: {
+        contentionWaitMs: 1,
+        retryDelayMs: 1,
+        _now: () => now,
+        _wait: async milliseconds => { now += milliseconds; },
+        _appendLockObserver: (event, path) => {
+          if (armed && event === "before-main-lock-publish") {
+            throw new PrivateMutationLockContentionError(path.includes(first.homeDir)
+              ? "first close busy"
+              : "second close busy");
+          }
+        },
+      },
+    });
+    await factory.open(first.dbPath);
+    await factory.open(second.dbPath);
+    armed = true;
+
+    const error = await factory.close().catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors.map((failure: Error) => failure.cause?.message))
+      .toEqual(["first close busy", "second close busy"]);
+    expect(isLcmConnectionOpen(first.dbPath)).toBe(true);
+    expect(isLcmConnectionOpen(second.dbPath)).toBe(true);
+  });
+
+  it("orders only the final outbox pool release behind append admission", async () => {
+    const local = localPathFor("pooled-close");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const first = await factory.open(local.dbPath);
+    const second = await factory.open(local.dbPath);
+    expect(getPoolStats().connections.find(connection => connection.path === local.dbPath)?.refs)
+      .toBe(2);
+
+    await first.close();
+    expect(getPoolStats().connections.find(connection => connection.path === local.dbPath)?.refs)
+      .toBe(1);
+    await second.close();
+    expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+    await factory.close();
   });
 });

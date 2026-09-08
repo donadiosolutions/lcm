@@ -6,12 +6,17 @@ import { handleUserPromptSubmit } from "../../src/hooks/user-prompt.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import type { EventsDb as EventsDbType } from "../../src/hooks/events-db.js";
 import * as localEnqueue from "../../src/hooks/local-enqueue.js";
+import { LocalHookDurabilityTimeoutError } from "../../src/hooks/local-enqueue.js";
 import * as publicationFence from "../../src/hooks/publication-fence.js";
 import * as hookConfig from "../../src/hooks/config.js";
 import * as autoHeal from "../../src/hooks/auto-heal.js";
 import * as eventScrubbing from "../../src/hooks/event-scrubbing.js";
 import * as daemonNotice from "../../src/hooks/daemon-notice.js";
-import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import {
+  BackendPublicationAppendBarrierTimeoutError,
+  BackendPublicationJournalError,
+} from "../../src/storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn(),
@@ -594,6 +599,32 @@ describe("handleUserPromptSubmit", () => {
     } finally {
       append.mockRestore();
       fence.mockRestore();
+    }
+  });
+
+  it("surfaces a retry-required durability timeout before enqueue", async () => {
+    const timeout = new LocalHookDurabilityTimeoutError(
+      new BackendPublicationAppendBarrierTimeoutError(
+        new PrivateMutationLockContentionError("append busy"),
+      ),
+    );
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockRejectedValueOnce(timeout);
+    mockExtractUserPromptEvents.mockReturnValueOnce([{
+      type: "decision",
+      category: "decision",
+      data: "use SQLite",
+      priority: 1,
+    }]);
+    try {
+      await expect(handleUserPromptSubmit(
+        JSON.stringify({ prompt: "we chose SQLite", cwd: "/proj", session_id: "s1" }),
+        asDaemonClient({ post: vi.fn() }),
+        3737,
+        { backend: "sqlite" },
+      )).rejects.toBe(timeout);
+      expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    } finally {
+      append.mockRestore();
     }
   });
 

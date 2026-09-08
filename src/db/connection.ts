@@ -160,6 +160,8 @@ export type LcmConnectionOptions = Readonly<{
 }>;
 
 export type ExistingLcmConnectionOptions = LcmConnectionOptions & Readonly<{
+  /** Bind a completed read-only preflight before any writable connection setup. */
+  expectedFileIdentity?: Readonly<{ device: number; inode: number }>;
   /** Safely repair the authenticated existing parent to mode 0700. */
   tightenDatabaseParent?: boolean;
 }>;
@@ -222,6 +224,10 @@ function openLcmConnection(
     // usable through SQLite while no longer representing the requested path.
     parent.assertCurrent();
     const expectedIdentity = inspectExistingLcmDatabasePath(dbPath);
+    if (options.expectedFileIdentity !== undefined
+      && (expectedIdentity === null || !sameDatabaseFileIdentity(options.expectedFileIdentity, expectedIdentity))) {
+      throw new Error("database path changed after read-only preflight");
+    }
     if (!createIfMissing && expectedIdentity === null) return null;
     if (
       pooledEntry
