@@ -217,6 +217,7 @@ component_management:
         # Captured UTF-8 decoding and immutable-file authority remain local-persistence-owned.
         # #618 optional receipt schema admission stays local-persistence-owned.
         # Includes current-token scopes and independently admitted factory health.
+        # #1196 serializes same-home factory health probes across overlapping sweeps.
         # #622 keeps registered-project outbox preparation and admitted sidecar
         # discovery in the existing local-persistence component.
         # #1140 fixed transfer-ledger control bounds stay local-persistence-owned.

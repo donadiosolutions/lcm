@@ -171,6 +171,7 @@ const expectedComponents = [
     // #622 keeps registered-project outbox preparation and admitted sidecar discovery here.
     // #1140 fixed transfer-ledger control bounds stay local-persistence-owned.
     // #1231 prepares an intended enrollment epoch before identity publication.
+    // #1196 serializes same-home factory health probes across overlapping sweeps.
     paths: ["src/db/", "src/storage/sqlite/", "src/store/"],
   },
   {
@@ -587,7 +588,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(240);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1196 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
