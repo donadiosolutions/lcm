@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -494,6 +494,50 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     armed = false;
     await expect(factory.close()).resolves.toBeUndefined();
     expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+  });
+
+  it.each([false, true])("keeps committed outbox ownership released when notification fails (cleanup=%s)", async cleanupFails => {
+    const local = localPathFor("notification-failure");
+    const cleanupError = new Error("append cleanup failure");
+    const notificationError = new Error("owner notification failure");
+    let armed = false;
+    const factory = new SQLiteLocalHookOutboxFactory({ appendBarrierOptions: {
+      _appendLockObserver: event => {
+        if (armed && cleanupFails && event === "before-main-lock-release-read") throw cleanupError;
+      },
+    } });
+    const repository = await factory.open(local.dbPath);
+    const originalDelete = Set.prototype.delete;
+    let notifications = 0;
+    let reentrantClose: Promise<void> | undefined;
+    const deletion = vi.spyOn(Set.prototype, "delete").mockImplementation(function (value) {
+      const deleted = originalDelete.call(this, value);
+      if (value === repository) {
+        notifications += 1;
+        reentrantClose = repository.close();
+        throw notificationError;
+      }
+      return deleted;
+    });
+    try {
+      armed = true;
+      const close = repository.close();
+      const error = await close.catch((caught: unknown) => caught);
+      if (cleanupFails) {
+        expect(error).toBeInstanceOf(AggregateError);
+        expect((error as AggregateError).errors).toEqual([cleanupError, notificationError]);
+        expect((error as AggregateError).cause).toBe(cleanupError);
+      } else expect(error).toBe(notificationError);
+      expect(repository.close()).toBe(close);
+      expect(reentrantClose).toBe(close);
+      expect(notifications).toBe(1);
+      expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+      await expectRetainedOperationsClosed(repository);
+    } finally {
+      deletion.mockRestore();
+      armed = false;
+      await factory.close();
+    }
   });
 
   it("preserves an undefined post-commit cleanup rejection", async () => {

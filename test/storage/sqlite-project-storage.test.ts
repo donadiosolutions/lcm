@@ -23,6 +23,9 @@ import {
   readMachineIdentity,
   recoverMachineIdentity,
 } from "../../src/machine-identity.js";
+import { getMigrationReceiptEpoch } from "../../src/migration/receipts.js";
+import * as identityApi from "../../src/machine-identity.js";
+import { LocalHookEventSequenceAllocator } from "../../src/storage/local-hook-event-sequence.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 type Deferred<T = void> = {
@@ -200,6 +203,144 @@ describe("SQLite factory maintenance admission", () => {
     }
   });
 
+  it.each(["preparation", "adoption"])("refuses machine replacement before epoch %s", async phase => {
+    const context = fixture();
+    const machine = {
+      version: 1 as const, identityKey: `machine:${"d".repeat(64)}`,
+      machineId: "018f0b5d-1234-7abc-8def-1234567890ab", displayName: "Factory test",
+    };
+    recoverMachineIdentity(machine, { homeDir: context.homeDir });
+    const replace = () => recoverMachineIdentity({ ...machine,
+      machineId: "118f0b5d-1234-7abc-8def-1234567890ab",
+    }, { homeDir: context.homeDir, force: true });
+    if (phase === "preparation") {
+      const original = identityApi.readMachineIdentity;
+      vi.spyOn(identityApi, "readMachineIdentity").mockImplementationOnce(home => {
+        const observed = original(home);
+        replace();
+        return observed;
+      });
+    } else {
+      const original = LocalHookEventSequenceAllocator.prototype.peekNextSequence;
+      vi.spyOn(LocalHookEventSequenceAllocator.prototype, "peekNextSequence").mockImplementationOnce(function () {
+        const next = original.call(this);
+        replace();
+        return next;
+      });
+    }
+    try {
+      await expect(context.factory.openProject(context.identity)).rejects.toMatchObject({
+        code: "STORAGE_INITIALIZATION_FAILED",
+      });
+      expect(isLcmConnectionOpen(context.dbPath)).toBe(false);
+      const source = new DatabaseSync(context.dbPath);
+      try {
+        expect(getMigrationReceiptEpoch(source, context.identity.id, machine.machineId)).toBeNull();
+      } finally { source.close(); }
+    } finally {
+      await context.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["version", "machineId"])("rejects an enrollment identity whose normalized %s differs", async field => {
+    const context = fixture();
+    const pending = ensurePendingMachineIdentity("Enrollment", context.homeDir).identity;
+    const intended = createMachineIdentity(pending, "018f0b5d-1234-7abc-8def-1234567890ab", "Enrollment");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: () => ({ id: context.identity.id, dbPath: context.dbPath }),
+      _migrationEnrollmentIdentity: field === "version"
+        ? { ...intended, version: 2 as 1 }
+        : { ...intended, machineId: intended.machineId.toUpperCase() },
+    });
+    try {
+      await publication.withBackendPublicationConsumerLockAsync(context.homeDir, async token => {
+        await expect(factory.openProject(context.identity, token)).rejects.toMatchObject({ code: "STORAGE_INITIALIZATION_FAILED" });
+      });
+      expect(readMachineIdentity(context.homeDir)?.machineId).toBeNull();
+      expect(isLcmConnectionOpen(context.dbPath)).toBe(false);
+    } finally {
+      await factory.close();
+      await context.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("aggregates independent project release failures and retries all owners", async () => {
+    const context = fixture();
+    const first = await context.factory.openProject(context.identity);
+    const second = await context.factory.openProject(context.identity);
+    const firstError = new Error("first physical owner failed");
+    const secondError = new Error("second physical owner failed");
+    const firstClose = vi.spyOn(first, "close").mockRejectedValueOnce(firstError);
+    const secondClose = vi.spyOn(second, "close").mockRejectedValueOnce(secondError);
+    try {
+      const error = await context.factory.close().catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(AggregateError);
+      expect((error as AggregateError).errors).toEqual([firstError, secondError]);
+      expect(getPoolStats().connections.find(connection => connection.path === context.dbPath)?.refs).toBe(2);
+      await context.factory.close();
+      expect(firstClose).toHaveBeenCalledTimes(2);
+      expect(secondClose).toHaveBeenCalledTimes(2);
+      expect(isLcmConnectionOpen(context.dbPath)).toBe(false);
+    } finally {
+      firstClose.mockRestore(); secondClose.mockRestore();
+      await context.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["missing", "key", "machine"])("refuses intended enrollment against a %s machine authority", async change => {
+    const context = fixture();
+    const pending = ensurePendingMachineIdentity("Enrollment", context.homeDir).identity;
+    const intended = createMachineIdentity(pending, "018f0b5d-1234-7abc-8def-1234567890ab", "Enrollment");
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: () => ({ id: context.identity.id, dbPath: context.dbPath }),
+      _migrationEnrollmentIdentity: intended,
+    });
+    if (change === "missing") rmSync(join(context.homeDir, ".lcm", "machine.json"));
+    else recoverMachineIdentity({ ...intended,
+      ...(change === "key" ? { identityKey: `machine:${"e".repeat(64)}` }
+        : { machineId: "118f0b5d-1234-7abc-8def-1234567890ab" }),
+    }, { homeDir: context.homeDir, force: true });
+    try {
+      await publication.withBackendPublicationConsumerLockAsync(context.homeDir, async token => {
+        await expect(factory.openProject(context.identity, token)).rejects.toMatchObject({ code: "STORAGE_INITIALIZATION_FAILED" });
+      });
+      expect(isLcmConnectionOpen(context.dbPath)).toBe(false);
+    } finally {
+      await factory.close(); await context.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retain a raw owner after physical release commits but lock cleanup fails", async () => {
+    const context = fixture();
+    let releases = 0;
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: () => ({ id: context.identity.id, dbPath: context.dbPath }),
+      detectFeatures: () => { throw new Error("feature detection failed"); },
+      _appendBarrierOptions: {
+        _appendLockObserver: event => {
+          if (event === "before-main-lock-release-read") {
+            releases += 1;
+            throw new Error("postcommit cleanup failed");
+          }
+        },
+      },
+    });
+    try {
+      await expect(factory.openProject(context.identity)).rejects.toMatchObject({ code: "STORAGE_INITIALIZATION_FAILED" });
+      expect(releases).toBe(1);
+      expect(isLcmConnectionOpen(context.dbPath)).toBe(false);
+      await factory.close();
+      expect(releases).toBe(1);
+    } finally {
+      await factory.close(); await context.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+    }
+  });
+
   it("uses current operation admission for project close", async () => {
     const context = fixture();
     let closePromise: Promise<void> | undefined;
@@ -283,7 +424,51 @@ describe("SQLite factory maintenance admission", () => {
     }
   });
 
-  it("reports idle health cleanup failure and retries its retained raw release", async () => {
+  it.each([1, 2])("retains %s failed raw owners across concurrent reopen cleanup attempts", async count => {
+    const context = fixture();
+    let refuse = true;
+    const factory = new SqliteStorageBackendFactory({
+      resolveProject: () => ({ id: context.identity.id, dbPath: context.dbPath }),
+      detectFeatures: () => { throw new Error("migration setup failure"); },
+      _appendBarrierOptions: {
+        contentionWaitMs: 0,
+        _appendLockObserver: event => {
+          if (refuse && event === "before-main-lock-publish") {
+            throw new PrivateMutationLockContentionError("raw owner still busy");
+          }
+        },
+      },
+    });
+    try {
+      const opens = await Promise.allSettled(Array.from({ length: count }, () => factory.openProject(context.identity)));
+      expect(opens.every(outcome => outcome.status === "rejected")).toBe(true);
+      expect(getPoolStats().connections.find(connection => connection.path === context.dbPath)?.refs).toBe(count);
+      const reopens = await Promise.allSettled([
+        factory.openProject(context.identity), factory.openProject(context.identity),
+      ]);
+      expect(reopens.every(outcome => outcome.status === "rejected")).toBe(true);
+      expect(getPoolStats().connections.find(connection => connection.path === context.dbPath)?.refs).toBe(count);
+      await expect(factory.close()).rejects.toBeDefined();
+      expect(getPoolStats().connections.find(connection => connection.path === context.dbPath)?.refs).toBe(count);
+      refuse = false;
+      // Zero-budget close releases one owner; a queued sibling remains owned
+      // until the next explicit retry.
+      for (let attempt = 0; attempt < count; attempt += 1) {
+        await factory.close().catch(() => undefined);
+      }
+      await factory.close();
+      expect(isLcmConnectionOpen(context.dbPath)).toBe(false);
+    } finally {
+      refuse = false;
+      for (let attempt = 0; attempt <= count; attempt += 1) {
+        await factory.close().catch(() => undefined);
+      }
+      await context.factory.close();
+      rmSync(context.homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])("reports idle health cleanup failure and retains the raw release (probe=%s)", async probeFails => {
     const context = fixture();
     let now = 0;
     let refuseCleanup = false;
@@ -318,11 +503,19 @@ describe("SQLite factory maintenance admission", () => {
       const project = await factory.openProject(context.identity);
       await project.close();
       refuseCleanup = true;
+      const originalExec = DatabaseSync.prototype.exec;
+      const probe = vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (sql) {
+        if (probeFails && sql.startsWith('CREATE TABLE main."__lcm_storage_health_probe_')) {
+          throw new Error("primary health probe failed");
+        }
+        return originalExec.call(this, sql);
+      });
 
       await expect(factory.health()).resolves.toMatchObject({ status: "unavailable" });
       expect(getPoolStats().connections.find(connection => connection.path === context.dbPath)?.refs)
         .toBe(1);
 
+      probe.mockRestore();
       await expect(factory.close()).resolves.toBeUndefined();
       expect(isLcmConnectionOpen(context.dbPath)).toBe(false);
     } finally {
@@ -478,6 +671,16 @@ describe("SQLite factory maintenance admission", () => {
 });
 
 describe("SqliteProjectStorage project health lifecycle", () => {
+  it("uses per-operation admission without a canonical home", async () => {
+    const fixture = createFixture();
+    try {
+      const result = await fixture.storage.withPublicationAdmission({},
+        () => fixture.storage.conversations.getOrCreateConversation("noncanonical"));
+      expect(result.conversationId).toBeDefined();
+      await fixture.storage.close();
+    } finally { cleanupFixture(fixture); }
+  });
+
   it("returns the exact healthy result before close", async () => {
     const fixture = createFixture();
     try {
@@ -690,7 +893,7 @@ describe("SqliteProjectStorage project health lifecycle", () => {
     }
   });
 
-  it("notifies close once after a committed append-lock cleanup failure", async () => {
+  it.each([false, true])("notifies close once after committed cleanup failure (notification=%s)", async notificationFails => {
     const homeDir = mkdtempSync(join(tmpdir(), "lcm-project-post-commit-"));
     const projectId = "f".repeat(64);
     const projectDirectory = join(homeDir, ".lcm", "projects", projectId);
@@ -702,6 +905,8 @@ describe("SqliteProjectStorage project health lifecycle", () => {
     const executor = sqliteExecutorFor(db, projectId, () => undefined);
     const cleanupFailure = new Error("project append cleanup failed");
     let onCloseCalls = 0;
+    let reentrantClose: Promise<void> | undefined;
+    const notificationError = new Error("notification failed");
     const admission = {
       homeDir,
       _appendBarrierOptions: {
@@ -716,26 +921,33 @@ describe("SqliteProjectStorage project health lifecycle", () => {
       db,
       executor,
       sqliteStorageCapabilities(features.fts5Available),
-      () => { onCloseCalls += 1; },
+      () => {
+        onCloseCalls += 1;
+        reentrantClose = storage.close();
+        if (notificationFails) throw notificationError;
+      },
       admission,
     );
     try {
       const first = storage.close();
-      await expect(first).rejects.toMatchObject({
-        code: "STORAGE_OPERATION_FAILED",
-        retryable: false,
-      });
+      const error = await first.catch((caught: unknown) => caught);
+      const primary = notificationFails ? (error as AggregateError).errors[0] : error;
+      expect(primary).toMatchObject({ code: "STORAGE_OPERATION_FAILED", retryable: false });
+      if (notificationFails) {
+        expect(error).toBeInstanceOf(AggregateError);
+        expect((error as AggregateError).errors).toEqual([primary, notificationError]);
+        expect((error as AggregateError).cause).toBe(primary);
+      }
       expect(onCloseCalls).toBe(1);
+      expect(reentrantClose).toBe(first);
       expect(isLcmConnectionOpen(dbPath)).toBe(false);
       await expect(storage.health()).resolves.toMatchObject({ status: "closed" });
 
       const repeated = storage.close();
       expect(repeated).toBe(first);
-      await expect(repeated).rejects.toMatchObject({
-        code: "STORAGE_OPERATION_FAILED",
-        retryable: false,
-      });
+      await expect(repeated).rejects.toBe(error);
       expect(onCloseCalls).toBe(1);
+      expect(reentrantClose).toBe(first);
     } finally {
       closeLcmConnection(dbPath, db);
       rmSync(homeDir, { recursive: true, force: true });

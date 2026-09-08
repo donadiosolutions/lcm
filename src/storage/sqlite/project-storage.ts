@@ -43,7 +43,6 @@ export class SqliteProjectStorage implements ProjectStorage {
   private closeState: "open" | "closing" | "closed" = "open";
   private closePromise: Promise<void> | undefined;
   private releaseCommitted = false;
-  private onCloseInvoked = false;
 
   constructor(
     readonly projectId: string,
@@ -211,10 +210,7 @@ export class SqliteProjectStorage implements ProjectStorage {
     if (this.releaseCommitted) {
       this.closeState = "closed";
       try {
-        if (!this.onCloseInvoked) {
-          this.onCloseInvoked = true;
-          this.onClose(this);
-        }
+        this.onClose(this);
       } catch (error) {
         if (!hasFailure) {
           hasFailure = true;

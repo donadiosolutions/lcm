@@ -1,3 +1,4 @@
+import { AsyncResource } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -3821,6 +3822,43 @@ describe("revocable mutation permits", () => {
     expect(() => retained?.assertActive()).toThrow(PrivateMutationPermitRevokedError);
   });
 
+  it.each([
+    { contentionWaitMs: -1 }, { contentionWaitMs: Infinity },
+    { retryDelayMs: 0 }, { retryDelayMs: NaN },
+  ])("rejects invalid append timing before effects: %j", async options => {
+    const effect = vi.fn();
+    await expect(withBackendPublicationAppendBarrierAsync(makeHome(), effect, undefined, options))
+      .rejects.toThrow("must be");
+    expect(effect).not.toHaveBeenCalled();
+  });
+
+  it("refuses admission when the predecessor completes exactly at the deadline", async () => {
+    const home = makeHome();
+    let release!: () => void;
+    let enter!: () => void;
+    let now = 0;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      enter();
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    await entered;
+    const effect = vi.fn();
+    const follower = withBackendPublicationAppendBarrierAsync(home, effect, undefined, {
+      contentionWaitMs: 10,
+      _now: () => now,
+      _wait: async () => {
+        now = 10;
+        release();
+        await owner;
+        await new Promise<void>(() => undefined);
+      },
+    });
+    await expect(follower).rejects.toMatchObject({ name: "BackendPublicationAppendBarrierTimeoutError" });
+    expect(effect).not.toHaveBeenCalled();
+    await owner;
+  });
+
   it("never retries caller effects that throw a contention-shaped error", async () => {
     const home = makeHome();
     const contention = new PrivateMutationLockContentionError("callback contention");
@@ -3859,6 +3897,70 @@ describe("revocable mutation permits", () => {
     });
     releaseRetained();
     await expect(retained).rejects.toMatchObject({ reason: "permit-mismatch" });
+  });
+
+  it("rejects detached append work after callback completion while the consumer token is still live", async () => {
+    const home = makeHome();
+    let task: AsyncResource | undefined;
+    let observed = false;
+    await withBackendPublicationAppendBarrierAsync(home, async () => {
+      task = new AsyncResource("detached-append-work");
+    }, undefined, {
+      _appendLockObserver: event => {
+        if (event === "before-main-lock-release-read") {
+          task!.runInAsyncScope(() => {
+            expect(() => withBackendPublicationConsumerLock(home, () => undefined))
+              .toThrow("inherited append barrier token is no longer active");
+            observed = true;
+          });
+        }
+      },
+    });
+    task!.emitDestroy();
+    expect(observed).toBe(true);
+  });
+
+  it("retries transient pre-callback contention using the default timer", async () => {
+    let attempts = 0;
+    const effect = vi.fn(() => "committed");
+    await expect(withBackendPublicationAppendBarrierAsync(makeHome(), effect, undefined, {
+      contentionWaitMs: 5_000, retryDelayMs: 1, _now: () => 0,
+      _appendLockObserver: event => {
+        if (event === "before-main-lock-publish" && ++attempts === 1) {
+          throw new PrivateMutationLockContentionError("transient external append owner");
+        }
+      },
+    })).resolves.toBe("committed");
+    expect(attempts).toBe(2);
+    expect(effect).toHaveBeenCalledOnce();
+  });
+
+  it("times out a queued caller through the default deadline timer", async () => {
+    const home = makeHome();
+    let release!: () => void;
+    let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      enter();
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    await entered;
+    const effect = vi.fn();
+    try {
+      await expect(withBackendPublicationAppendBarrierAsync(home, effect, undefined, {
+        contentionWaitMs: 1, _now: () => 0,
+      })).rejects.toMatchObject({ name: "BackendPublicationAppendBarrierTimeoutError" });
+      expect(effect).not.toHaveBeenCalled();
+    } finally { release(); await owner; }
+  });
+
+  it("preserves immediate pre-callback contention for an unbounded caller", async () => {
+    const error = new PrivateMutationLockContentionError("external append owner");
+    const effect = vi.fn();
+    await expect(withBackendPublicationAppendBarrierAsync(makeHome(), effect, undefined, {
+      _appendLockObserver: event => { if (event === "before-main-lock-publish") throw error; },
+    })).rejects.toBe(error);
+    expect(effect).not.toHaveBeenCalled();
   });
 
   it("retries only pre-callback contention and releases its local tail", async () => {

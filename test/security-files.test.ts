@@ -2796,6 +2796,31 @@ describe("private filesystem primitives", () => {
     expect(absence(path)).toBe(false);
   });
 
+  it("refuses absence evidence for a different expected parent", () => {
+    const root = makeRoot();
+    const handle = openPrivateDirectory(root);
+    try {
+      expect(() => securityFiles.privateFileAbsentAtRetainedParent(join(root, "absent"), {
+        expectedParent: { ...handle.witness, ino: `${BigInt(handle.witness.ino) + 1n}` },
+      })).toThrow("topology");
+    } finally { handle.close(); }
+  });
+
+  it("rejects a retained directory group change during an absence lookup", () => {
+    const root = makeRoot();
+    const originalFstat = fstatSync;
+    let changed = false;
+    withPatchedFs("fstatSync", ((...args: Parameters<typeof fstatSync>) => {
+      const stat = originalFstat(...args);
+      if (changed) Object.defineProperty(stat, "gid", { value: BigInt(stat.gid) + 1n });
+      return stat;
+    }) as typeof fstatSync, () => {
+      expect(() => securityFiles.privateFileAbsentAtRetainedParent(join(root, "absent"), {
+        _beforeLookupForTesting: () => { changed = true; },
+      })).toThrow("topology");
+    });
+  });
+
   it("fails closed on absence lookup, retained-parent rebind, and close failures", () => {
     const root = makeRoot();
     const parent = join(root, "parent");

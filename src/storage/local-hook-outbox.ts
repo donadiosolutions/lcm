@@ -333,7 +333,6 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
   private closeState: "open" | "closing" | "closed" = "open";
   private closePromise: Promise<void> | undefined;
   private releaseCommitted = false;
-  private onCloseInvoked = false;
 
   constructor(
     private readonly database: EventsDb,
@@ -566,10 +565,7 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     if (this.releaseCommitted) {
       this.closeState = "closed";
       try {
-        if (!this.onCloseInvoked) {
-          this.onCloseInvoked = true;
-          this.onClose();
-        }
+        this.onClose();
       } catch (error) {
         if (!hasFailure) {
           hasFailure = true;

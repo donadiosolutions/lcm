@@ -24,6 +24,7 @@ import {
   dryRunAuthenticatedSqliteMigrationSource,
   type SqliteMigrationEnrollmentInput,
 } from "../../src/migration/maintenance.js";
+import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { localProjectIdentity } from "../../src/daemon/project.js";
 import { writeFileSync } from "node:fs";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
@@ -473,6 +474,112 @@ describe("backend publication maintenance journal v3", () => {
     });
   });
 
+  it.each(["abort-absent", "abort-present", "complete"] as const)(
+    "admits authenticated terminal configuration after %s", async terminal => {
+      const fixture = enrollmentFixture();
+      vi.stubEnv("HOME", fixture.homeDir);
+      const configPath = join(fixture.homeDir, ".lcm", "config.json");
+      if (terminal === "abort-present") {
+        writeFileSync(configPath, JSON.stringify({ storage: { backend: "sqlite" } }), { mode: 0o600 });
+      }
+      await prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession });
+      const before = existsSync(configPath) ? readFileSync(configPath, "utf8") : null;
+      expect(() => loadDaemonConfig(configPath, undefined, {})).not.toThrow();
+      const source = await heldSource(fixture);
+      const owner = coordinator(fixture.homeDir);
+      const held = owner.inspectMaintenance()!;
+      let terminalJournal;
+      if (terminal === "complete") {
+        const prepared = await owner.prepareMaintenanceSelection({
+          expectedChecksumSha256: held.checksumSha256, generationId: held.generationId,
+          targetBackend: "postgresql", terminalEvidenceSha256: source.options.expectedSourceBytes.checksumSha256,
+        });
+        writeFileSync(configPath, JSON.stringify({ storage: { backend: "postgresql", postgresql: { migrationRole: "unused" } } }), { mode: 0o600 });
+        terminalJournal = await owner.completeMaintenanceSelection({
+          expectedChecksumSha256: prepared.checksumSha256, generationId: held.generationId,
+          terminalEvidenceSha256: source.options.expectedSourceBytes.checksumSha256,
+        });
+      } else {
+        terminalJournal = await owner.abortMaintenance({
+          expectedChecksumSha256: held.checksumSha256,
+          sourceSelectionSha256: source.authority.sourceSelectionSha256,
+          abortEvidenceSha256: source.options.expectedSourceBytes.checksumSha256,
+        });
+      }
+      const backend = terminal === "complete" ? "postgresql" : "sqlite";
+      const wrongBackend = backend === "sqlite" ? "postgresql" : "sqlite";
+      const content = existsSync(configPath) ? readFileSync(configPath, "utf8") : null;
+      if (terminal !== "complete") expect(content).toBe(before);
+      const witness = publicationApi.captureBackendPublicationFileWitness(configPath, join(fixture.homeDir, ".lcm")).witness;
+      expect(() => publicationApi.assertBackendPublicationConfigAccess(configPath, backend, content)).not.toThrow();
+      expect(() => publicationApi.assertBackendPublicationConfigAccess(configPath, backend)).not.toThrow();
+      expect(publicationApi.assertBackendPublicationConfigReadAccess(configPath, backend, witness))
+        .toEqual({ journalChecksumSha256: terminalJournal.checksumSha256 });
+      publicationApi.withBackendPublicationConsumerLock(fixture.homeDir, token => {
+        expect(() => publicationApi.assertBackendPublicationConfigAccess(configPath, wrongBackend, content, undefined, token))
+          .toThrow(expect.objectContaining({ reason: "backend-mismatch" }));
+      });
+      expect(() => publicationApi.assertBackendPublicationConfigReadAccess(configPath, wrongBackend, witness))
+        .toThrow(expect.objectContaining({ reason: "backend-mismatch" }));
+      expect(() => publicationApi.assertBackendPublicationConfigAccess(configPath, backend, "stale config"))
+        .toThrow(expect.objectContaining({ reason: "unexpected-state" }));
+      expect(() => publicationApi.assertBackendPublicationConfigReadAccess(configPath, backend, { ...witness, byteLength: witness.byteLength + 1 }))
+        .toThrow(expect.objectContaining({ reason: "unexpected-state" }));
+      writeFileSync(join(fixture.homeDir, "ca.pem"), "fixture CA", { mode: 0o600 });
+      expect(() => loadDaemonConfig(configPath, undefined, {
+        LCM_POSTGRES_URL: "postgresql://fixture:fixture@unused.invalid/lcm",
+        LCM_POSTGRES_CA_FILE: join(fixture.homeDir, "ca.pem"),
+      })).not.toThrow();
+      // A replaced inode with identical bytes invalidates the earlier snapshot.
+      if (content !== null) {
+        renameSync(configPath, `${configPath}.old`);
+        writeFileSync(configPath, content, { mode: 0o600 });
+        expect(() => publicationApi.assertBackendPublicationConfigReadAccess(configPath, backend, witness))
+          .toThrow(expect.objectContaining({ reason: "unexpected-state" }));
+      }
+      const journalPath = publicationApi.backendPublicationJournalPath(fixture.homeDir);
+      writeFileSync(journalPath, JSON.stringify({ ...terminalJournal, checksumSha256: HASH_A }));
+      expect(() => publicationApi.assertBackendPublicationConfigReadAccess(configPath, backend, witness))
+        .toThrow(expect.objectContaining({ reason: "checksum-mismatch" }));
+      for (const invalid of ["{broken", "null", JSON.stringify({ ...terminalJournal, version: 999 })]) {
+        writeFileSync(journalPath, invalid);
+        expect(() => publicationApi.assertBackendPublicationConfigReadAccess(configPath, backend, witness))
+          .toThrow(expect.objectContaining({ reason: "malformed-journal" }));
+        expect(() => publicationApi.assertBackendPublicationConfigAccess(configPath, backend, content)).toThrow();
+      }
+    },
+  );
+
+  it.each(["maintenance-entering", "maintenance-held", "selection-prepared"] as const)(
+    "refuses configuration admission in active phase %s", async phase => {
+      const fixture = enrollmentFixture();
+      await prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession });
+      const source = await heldSource(fixture);
+      const owner = coordinator(fixture.homeDir);
+      const held = owner.inspectMaintenance()!;
+      if (phase === "selection-prepared") {
+        await owner.prepareMaintenanceSelection({
+          expectedChecksumSha256: held.checksumSha256, generationId: held.generationId,
+          targetBackend: "postgresql", terminalEvidenceSha256: source.options.expectedSourceBytes.checksumSha256,
+        });
+      } else if (phase === "maintenance-entering") {
+        const { checksumSha256: _checksum, ...body } = held;
+        const entering = { ...body, phase };
+        writeFileSync(publicationApi.backendPublicationJournalPath(fixture.homeDir), JSON.stringify({
+          ...entering, checksumSha256: publicationApi.backendPublicationCanonicalSha256(entering),
+        }));
+      }
+      const configPath = join(fixture.homeDir, ".lcm", "config.json");
+      const witness = publicationApi.captureBackendPublicationFileWitness(configPath, join(fixture.homeDir, ".lcm")).witness;
+      publicationApi.withBackendPublicationConsumerLock(fixture.homeDir, token => {
+        expect(() => publicationApi.assertBackendPublicationConfigAccess(configPath, "sqlite", null, undefined, token))
+          .toThrow(expect.objectContaining({ reason: "unresolved-publication" }));
+      }, { allowUnresolved: true });
+      expect(() => publicationApi.assertBackendPublicationConfigReadAccess(configPath, "sqlite", witness))
+        .toThrow(expect.objectContaining({ reason: "unresolved-publication" }));
+    },
+  );
+
   it("refuses authentication and enrollment when PostgreSQL is already configured", async () => {
     const fixture = enrollmentFixture();
     const caFile = join(fixture.homeDir, ".lcm", "ca.crt");
@@ -631,6 +738,32 @@ describe("backend publication maintenance journal v3", () => {
       return original(...args);
     });
     await expect(prepareSqliteMigrationEnrollment(fixture.request, { openIdentitySession: fixture.openIdentitySession })).rejects.toThrow("before finalization");
+    expect(identityApi.readMachineIdentity(fixture.homeDir)?.machineId).toBeNull();
+  });
+
+  it("rechecks source selection immediately before receipt adoption", async () => {
+    const fixture = enrollmentFixture();
+    const originalHash = publicationApi.backendPublicationCanonicalSha256;
+    let changed = false;
+    vi.spyOn(publicationApi, "backendPublicationCanonicalSha256").mockImplementation(value => {
+      const hash = originalHash(value);
+      // The finalization read has just authenticated its selection. Model an
+      // external metadata writer before the adoption step reads it again.
+      if (!changed && typeof value === "object" && value !== null
+        && "projectMetadataSha256" in value && identityApi.readMachineIdentity(fixture.homeDir) !== null) {
+        const selection = value as { projectMetadataSha256: string };
+        if (selection.projectMetadataSha256 && ++selectionReads === 4) {
+          changed = true;
+          writeFileSync(fixture.metadata, `${JSON.stringify({ cwd: fixture.cwd, changed: true })}\n`);
+        }
+      }
+      return hash;
+    });
+    let selectionReads = 0;
+    await expect(prepareSqliteMigrationEnrollment(fixture.request, {
+      openIdentitySession: fixture.openIdentitySession,
+    })).rejects.toThrow("before receipt adoption");
+    expect(changed).toBe(true);
     expect(identityApi.readMachineIdentity(fixture.homeDir)?.machineId).toBeNull();
   });
 

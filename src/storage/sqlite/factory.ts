@@ -471,7 +471,6 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
     );
     if (
       intended.version !== validated.version
-      || intended.identityKey !== validated.identityKey
       || intended.machineId !== validated.machineId
       || intended.displayName !== validated.displayName
     ) {
@@ -519,13 +518,13 @@ function sqliteProjectHomeDir(dbPath: string): string | undefined {
 async function closeProjectConnection(
   dbPath: string,
   db: ReturnType<typeof getLcmConnection>,
-  publicationLockToken?: BackendPublicationLockToken,
-  appendBarrierOptions?: BackendPublicationAppendBarrierOptions,
-  onCommit?: () => void,
+  publicationLockToken: BackendPublicationLockToken | undefined,
+  appendBarrierOptions: BackendPublicationAppendBarrierOptions | undefined,
+  onCommit: () => void,
 ): Promise<void> {
   const release = (): void => {
     closeLcmConnection(dbPath, db);
-    onCommit?.();
+    onCommit();
   };
   const homeDir = sqliteProjectHomeDir(dbPath);
   if (homeDir === undefined) {

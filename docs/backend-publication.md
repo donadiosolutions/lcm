@@ -132,6 +132,17 @@ compare-and-swap; completion is reserved for a caller that has authoritative
 terminal readback. A source-preserving abort verifies the original selection
 evidence and never invokes the version-2 target config/map restoration path.
 
+After `maintenance-aborted`, normal configuration loading resumes for SQLite,
+including installations whose configuration file is absent. After
+`selection-completed`, it resumes for the target backend recorded in the
+journal. Entering, held, and prepared maintenance continue to block normal
+configuration reads. A terminal journal for a different backend is also refused.
+Configuration admission still authenticates the journal and checks the actual
+canonical configuration bytes or the reader's file-identity witness. Lock-free
+readers receive the journal checksum for their existing double-read check.
+Version-3 journals do not record a version-2 target configuration hash; terminal
+admission uses their selected backend and the current authenticated file witness.
+
 If maintenance entry is interrupted after its entering checkpoint, call
 `enterMaintenance` with the exact original publication, generation, selection,
 queue evidence and roster, plus the observed `expectedChecksumSha256` for
