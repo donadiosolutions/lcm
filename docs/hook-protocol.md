@@ -96,11 +96,12 @@ succeeds or no output when lcm defers to Claude Code.
 Invoked at the start of a Claude Code session. lcm restores recent summaries and promoted memory, injects them as a user message prefix, and prints a `<context>` block on stdout.
 
 SessionStart serializes its local sidecar maintenance with backend publication:
-it holds the publication consumer lock while it opens, prunes, inspects, and
-closes the local outbox. If another publication already holds that lock, the
-best-effort maintenance and promotion trigger are skipped. Daemon startup and
-the restore request run outside this retained lock and still perform their own
-admission checks. Authenticated publication-journal errors fail closed.
+it uses one live consumer token to enter the append barrier while it opens,
+prunes, inspects, and physically closes the local outbox. If another publication
+already holds that lock, the best-effort maintenance and promotion trigger are
+skipped. Daemon startup and the restore request run outside these retained
+locks and still perform their own admission checks. Authenticated
+publication-journal errors fail closed.
 
 **Stdin fields:**
 
@@ -130,6 +131,12 @@ to acknowledge its session-completion record. The daemon records the message
 count from stored history; repeating completion updates the same session record
 with the current stored count. This wait covers completion bookkeeping only.
 Compaction and promotion remain independent, best-effort background requests.
+Ordinary scheduling failures, including publication-lock contention, do not
+prevent the remaining background requests or Claude's completion attempt.
+A failed scheduling stage may already have sent its request before a final
+publication check failed; its delivery is uncertain and the hook does not retry
+it. Local typed publication-journal failures stop subsequent stages and retain
+the fail-closed admission behavior.
 
 Completion is best-effort when the daemon is unavailable, busy, or refuses
 publication admission. Ordinary completion failures still allow session exit.
@@ -156,7 +163,9 @@ mark the session complete; their session-snapshot behavior is unchanged.
 | `cwd` | string | Working directory |
 | `hook_event_name` | string | `"SessionEnd"` |
 
-**Response:** Exit code `0`. Runs best-effort; failures do not block session exit.
+**Response:** Ordinary failures return exit code `0` and do not block session
+exit. Local typed publication-journal failures return exit code `1` with the
+publication-admission diagnostic.
 
 ## UserPromptSubmit Hook
 
@@ -214,7 +223,13 @@ publication admission is attempted. After that durable boundary:
 
 If publication admission fails before the local event can be durably appended,
 the hook does not report a successful observer result; the direct top-level CLI
-path retains its fixed stderr diagnostic and exit code `1`.
+path retains its fixed stderr diagnostic and exit code `1`. Hook append
+admission waits for contention for at most five seconds, including time queued
+behind another hook in the same process. Once admitted, opening the outbox,
+allocating sequences, inserting every event, reading health, and physically
+closing the outbox and sequence handles complete under that single admission.
+The hook never retries its event writes; an admission timeout occurs before
+the first write and requires the host to retry the hook.
 
 The fixed diagnostic is:
 
@@ -329,6 +344,49 @@ Snapshot ingestion is skipped when daemon bootstrap cannot verify the configured
 ## Auto-heal
 
 All lcm hooks self-repair on each invocation: before dispatching, `validateAndFixHooks()` checks that all required hook entries remain registered in `~/.claude/settings.json` and re-adds any missing entries. This means lcm hooks survive `claude settings reset` or manual edits to the settings file.
+
+### Passive promotion acknowledgement
+
+Passive promotion and explicit event draining mark a queued event processed
+only after its selected project transaction succeeds. Queue acknowledgement
+uses the same live publication admission as the project operation, so it does
+not contend with its own publication lock after committing a memory or migration
+receipt. A completed receipt remains authoritative on a retry; its effect is
+not repeated. If acknowledgement fails, the event remains queued for retry.
+
+Physical outbox opening and local queue reads use short queued publication
+scopes, separate from the selected project batch. Scrubber setup remains outside
+retained admission. Callers supplying a retained publication token reuse it
+for local preparation, acknowledgement, and owned storage cleanup. The token is valid
+only while its owning admission scope remains active.
+
+### Publication fence finalization
+
+Before a hook's publication fence finishes, LCM validates the retained root
+directory again and attempts to close its descriptor even if validation fails.
+When both steps succeed, an operation failure is preserved unchanged, including
+its original error identity and cause.
+
+If final validation or descriptor closure also fails, an existing publication
+journal error retains its reason and message unless its reason is
+`publication-evidence-missing`. The combined error preserves the original failure
+as the first entry in its aggregate evidence, followed by final-validation and
+descriptor-close failures in that order. The original error is never modified;
+any evidence it already contains remains attached to it.
+
+All other cases with a finalization failure, including missing publication
+evidence, lock contention, ordinary operation failures, and otherwise successful
+operations, are classified as `unsafe-storage`. An otherwise successful operation
+cannot return success from the fence after either finalization step fails. Its
+evidence contains only the cleanup failures: one failure is retained directly as
+the cause, and multiple failures are aggregated in validation-then-close order.
+The public diagnostic remains sanitized; filesystem details stay in error
+evidence. PreCompact records initial `unsafe-storage` admission failures through
+its existing error logger and still returns exit code 0 with empty output.
+Consumers that already throw on journal errors now also fail closed on these
+typed finalization failures; consumers that return exit code 0 continue to do so.
+Thus reclassification can change which existing error-handling branch runs, and
+a typed fence failure does not imply a nonzero exit code from every hook.
 
 ### Native ingest source changes and cancellation
 

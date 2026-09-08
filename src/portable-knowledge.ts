@@ -18,6 +18,8 @@ import { createHash } from "node:crypto";
 import { serializePromotedMetadata } from "./db/promoted.js";
 import { deduplicateAndInsert } from "./promotion/dedup.js";
 import { ScrubEngine } from "./scrub.js";
+import { daemonConfigSnapshotWitnessEqual, readDaemonConfigRawSnapshot } from "./daemon/config.js";
+import { configPath } from "./runtime-paths.js";
 import { withCliProjectStorage } from "./cli-storage.js";
 import type { JsonObject, ProjectStorage } from "./storage/contracts.js";
 import type { PublicationConvergence } from "./storage/publication-convergence.js";
@@ -219,12 +221,17 @@ export async function importKnowledge(
       ...(prepared.errors.length ? { errors: prepared.errors } : {}),
     };
   }
+  const configFile = configPath();
+  const configWitness = readDaemonConfigRawSnapshot(configFile).witness;
   let scrubber: ScrubEngine;
   return withCliProjectStorage(cwd, {
     create: true,
     _lcmBaseDir: opts._lcmBaseDir,
     prepare: async ({ project, config }) => {
       scrubber = await ScrubEngine.forProject(opts._globalPatterns ?? config.security.sensitivePatterns, project.dir);
+      if (!daemonConfigSnapshotWitnessEqual(configWitness, readDaemonConfigRawSnapshot(configFile).witness)) {
+        throw new Error("Storage selection changed during knowledge import preparation");
+      }
     },
   }, async ({ storage, project }) => storage.transaction(async (repositories) => {
     // One scan per transaction, indexed before any deduplication changes rows.

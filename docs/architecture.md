@@ -305,7 +305,19 @@ adapter and logs' existing safety boundaries.
 For PostgreSQL and SQLite, once factory shutdown begins, an in-flight factory
 health probe reports only the closed state and exposes no project or runtime
 detail, even if an underlying probe later settles healthy, unavailable, or
-failed. Factory shutdown does not wait for otherwise unbounded health probes.
+failed. PostgreSQL factory shutdown does not wait for otherwise unbounded
+health probes. SQLite factory shutdown drains its registered health checks,
+including queued project probes, before releasing its connections.
+
+SQLite factory health checks probe projects sharing one home sequentially,
+including when multiple health requests overlap. Projects in different homes
+can be probed independently. This prevents health checks from reporting
+unavailable merely because their own project probes compete for admission.
+Health still reports unavailable during maintenance or real contention with
+other operations; it does not bypass their admission checks. Sequential probes
+can increase the time needed to finish a health check, particularly while a
+project's cleanup waits for another operation.
+
 For PostgreSQL and SQLite, once project shutdown begins, project health reports
 the closed state with the project identity and exposes no query detail, even if
 its probe settles later. A failed SQLite project close clears the in-progress

@@ -502,6 +502,136 @@ describe("sanitizeError", () => {
   });
 
   it.each([
+    ["file://host.invalid?x=[a|\\Users\\canary\\private.db", "file://host.invalid?x=[a|<path>"],
+    ["file://host.invalid?x=[a] \\Users\\canary\\private.db", "file://host.invalid?x=[a] <path>"],
+    [
+      "file://host.invalid?x=[https://y.test/p]\\Users\\canary\\private.db",
+      "file://host.invalid?x=[https://y.test/p]<path>",
+    ],
+    // Bug #1128 reclassifies this inherited P3-shaped row as a positive privacy contract.
+    [
+      "file://host.invalid?x=[https://y.test/p]\\Users\\literal",
+      "file://host.invalid?x=[https://y.test/p]<path>",
+    ],
+    [
+      "file://host.invalid/Users/outer.db?x=[a]\\Users\\canary\\private.db",
+      "file://host.invalid<path>?x=[a]<path>",
+    ],
+    ["file://host.invalid#x=[a|\\Users\\canary\\private.db", "file://host.invalid#x=[a|<path>"],
+    ["file://host.invalid#x=[a]\t\\Users\\canary\\private.db", "file://host.invalid#x=[a]\t<path>"],
+    [
+      "file://host.invalid#x=[http://y.test/p]\\Users\\canary\\private.db",
+      "file://host.invalid#x=[http://y.test/p]<path>",
+    ],
+    ["FiLe://host.invalid?x=[[a],] \\home\\canary\\private.db", "FiLe://host.invalid?x=[[a],] <path>"],
+  ] as const)("redacts bracket-handoff backslash tails from file URL values: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("Users");
+    expect(first).not.toContain("canary");
+    expect(first).not.toContain("private.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "file://h?x=[https://[::1]/p]\\Users\\fictional.db",
+      "file://h?x=[https://[::1]/p]<path>",
+    ],
+    [
+      "file://h?x=[https://[::1]:443/p]\\Users\\fictional.db",
+      "file://h?x=[https://[::1]:443/p]<path>",
+    ],
+    [
+      "file://h?x=[https://[::1]?q=a]\\Users\\fictional.db",
+      "file://h?x=[https://[::1]?q=a]<path>",
+    ],
+  ] as const)("redacts IPv6 URL bracket-handoff backslash tails: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    ["ordinary?x=[a]\\Users\\literal", "ordinary?x=[a]\\Users\\literal"],
+    [
+      "https://host.invalid/outer?x=[a]\\Users\\literal",
+      "https://host.invalid/outer?x=[a]\\Users\\literal",
+    ],
+    [
+      "file://host.invalid?x=value then \\Users\\literal",
+      "file://host.invalid?x=value then \\Users\\literal",
+    ],
+    ["file://host.invalid?x=value|\\Users\\literal", "file://host.invalid?x=value|\\Users\\literal"],
+    ["file://host.invalid?x=value]\\Users\\literal", "file://host.invalid?x=value]\\Users\\literal"],
+    [
+      "file://host.invalid?x=[a] prose \\Users\\literal",
+      "file://host.invalid?x=[a] prose \\Users\\literal",
+    ],
+    ["file://host.invalid?x=[a]\n\\Users\\literal", "file://host.invalid?x=[a]\n\\Users\\literal"],
+    ["file://host.invalid?x=[a]\r\\Users\\literal", "file://host.invalid?x=[a]\r\\Users\\literal"],
+    ["file://host.invalid?x=[a]\u00a0\\Users\\literal", "file://host.invalid?x=[a]\u00a0\\Users\\literal"],
+    [
+      "file://host.invalid?x=https://y.test/p\\Users\\literal",
+      "file://host.invalid?x=https://y.test/p\\Users\\literal",
+    ],
+    [
+      "file://host.invalid/outer?x=a \\Users\\literal",
+      "file://host.invalid<path>?x=a \\Users\\literal",
+    ],
+    [
+      "file://host.invalid/outer?x=a|\\Users\\literal",
+      "file://host.invalid<path>?x=a|\\Users\\literal",
+    ],
+    ["file://host.invalid?x=[a]https://example.test/p", "file://host.invalid?x=[a]https://example.test/p"],
+    ["err at \\Users\\canary\\private.db now", "err at \\Users\\canary\\private.db now"],
+    ["file://host.invalid?x=[a|see\\Users\\literal", "file://host.invalid?x=[a|see\\Users\\literal"],
+    ["file://host.invalid?x=[a| \\Users\\literal", "file://host.invalid?x=[a| \\Users\\literal"],
+    [
+      "file://host.invalid?x=[a|https://y.test/p?q=\\Users\\literal",
+      "file://host.invalid?x=[a|https://y.test/p?q=\\Users\\literal",
+    ],
+    ["file://host.invalid?x=[a]]\\Users\\literal", "file://host.invalid?x=[a]]\\Users\\literal"],
+    [
+      "file://host.invalid?x=[a|see]\\Users\\literal",
+      "file://host.invalid?x=[a|see]\\Users\\literal",
+    ],
+    [
+      "file://h?x=[https://[::1]prose]\\Users\\fictional.db",
+      "file://h?x=[https://[::1]prose]\\Users\\fictional.db",
+    ],
+  ] as const)("preserves bracket-handoff boundaries: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(expected);
+  });
+
+  it("consumes a bracket-handoff only once across sanitizer passes", () => {
+    const input = "file://host.invalid?x=[a|\\Users\\first.db|\\Users\\second.db";
+    const expected = "file://host.invalid?x=[a|<path>|\\Users\\second.db";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(expected);
+    expect(sanitizeError(sanitizeError(first))).toBe(expected);
+  });
+
+  it("expires an IPv6 bracket handoff after its generated marker", () => {
+    const input = "file://h?x=[https://[::1]/p|\\Users\\first.db|\\Users\\second.db";
+    const expected = "file://h?x=[https://[::1]/p|<path>|\\Users\\second.db";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(expected);
+    expect(sanitizeError(sanitizeError(first))).toBe(expected);
+  });
+
+  it.each([
     ["ordinary?x=a\\Users\\literal", "ordinary?x=a\\Users\\literal"],
     ["https://host.invalid/outer?x=[a]\\Users\\literal", "https://host.invalid/outer?x=[a]\\Users\\literal"],
     ["file://host.invalid/outer[x]\\Users\\literal", "file://host.invalid<path>"],
@@ -509,7 +639,6 @@ describe("sanitizeError", () => {
     ["file://host.invalid/outer?x=a \\Users\\literal", "file://host.invalid<path>?x=a \\Users\\literal"],
     ["file://host.invalid/outer?x=a|\\Users\\literal", "file://host.invalid<path>?x=a|\\Users\\literal"],
     ["file://host.invalid/outer?x=a;\\Users\\literal", "file://host.invalid<path>?x=a;\\Users\\literal"],
-    ["file://host.invalid?x=[https://y.test/p]\\Users\\literal", "file://host.invalid?x=[https://y.test/p]\\Users\\literal"],
     ["file://host.invalid/outer?x=[a]/public", "file://host.invalid<path>?x=[a]/public"],
   ] as const)("keeps backslash query handling within its file URL context: %#", (input, expected) => {
     expect(sanitizeError(input)).toBe(expected);
@@ -533,11 +662,88 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(input))).toBe(expected);
   });
 
-  it("preserves the deferred word-bearing query tail boundary", () => {
-    const result = sanitizeError("'file://host'['/private']?next/Users/SECRET");
+  it.each([
+    [
+      "'file://host'['/private']?next/Users/SECRET",
+      "'file://host'['<path>']?next<path>",
+    ],
+    [
+      "'file://host'['/private']#next/Users/SECRET",
+      "'file://host'['<path>']#next<path>",
+    ],
+    [
+      '"file://host["/private"]?next/Users/SECRET',
+      '"file://host["<path>"]?next<path>',
+    ],
+    [
+      '"file://host["/private"]#next/Users/SECRET',
+      '"file://host["<path>"]#next<path>',
+    ],
+  ] as const)("redacts word-bearing quoted query tails in one pass: %#", (input, expected) => {
+    const first = sanitizeError(input);
+    const second = sanitizeError(first);
+    const third = sanitizeError(second);
 
-    expect(result).toBe("'file://host'['<path>']?next/Users/SECRET");
-    expect(sanitizeError(result)).toBe("'file://host'['<path>']?next<path>");
+    expect(first).toBe(expected);
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+  });
+
+  it.each([
+    ["'file://host'['/private']? /Users/SECRET", "'file://host'['<path>']? <path>"],
+    [
+      "'file://host'['/private']|https://example.test/x",
+      "'file://host'['<path>']|https://example.test/x",
+    ],
+    [
+      "'file://host'['/private']?file://two.invalid/Users/b?next2/Users/SECRET",
+      "'file://host'['<path>']?file://two.invalid<path>?next2/Users/SECRET",
+    ],
+    [
+      "'file://host'['/private']|file://two.invalid/Users/b?next2/Users/SECRET",
+      "'file://host'['<path>']|file://two.invalid<path>?next2/Users/SECRET",
+    ],
+    [
+      "file://host.invalid/Users/a?next/Users/SECRET",
+      "file://host.invalid<path>?next/Users/SECRET",
+    ],
+    [
+      "'file://host'['/private']?next/Users/SECRET|https://example.test/x",
+      "'file://host'['<path>']?next<path>|https://example.test/x",
+    ],
+    [
+      "'file://host'['/private']?a&b=c/Users/SECRET",
+      "'file://host'['<path>']?a&b=c<path>",
+    ],
+    ["'file://host'['/private']?next?/Users/SECRET", "'file://host'['<path>']?next?<path>"],
+    ["'file://host'['/private']?next#/Users/SECRET", "'file://host'['<path>']?next#<path>"],
+    [
+      "'file://host'['/private']?next/Users/A?more/Users/B",
+      "'file://host'['<path>']?next<path>?more<path>",
+    ],
+    ["ordinary?next/Users/SECRET", "ordinary?next/Users/SECRET"],
+    ["file://host.invalid/Users/canary/private.db", "file://host.invalid<path>"],
+  ] as const)("keeps quoted query-tail handoff within its file URL context: %#", (input, expected) => {
+    const first = sanitizeError(input);
+    const second = sanitizeError(first);
+    const third = sanitizeError(second);
+
+    expect(first).toBe(expected);
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+  });
+
+  it.each([
+    [
+      "'file://host'['/private']?next/https://public.test/x",
+      "'file://host'['<path>']?next/https:<path>",
+    ],
+    [
+      "'file://host'['/private']?next/ftp://public.test/x",
+      "'file://host'['<path>']?next/ftp:<path>",
+    ],
+  ] as const)("does not consume a recognized scheme as a quoted query tail: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
   });
 
   it.each([
@@ -1693,6 +1899,151 @@ describe("sanitizeError", () => {
 
     expect(firstPass).toBe(expected);
     expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  // Bug #1156 keeps this promotion inside an already-admitted forced scan.
+  // The canonical and slash forms are clean at the parent as two spans; the
+  // one-span result pins the same bounded transition as the numeric and
+  // non-ASCII forms whose backslash tails leak at the parent.
+  it.each([
+    [
+      "file://host.invalid?x=[a/b/\\C:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\Ç:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a/b/\\C:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a/b/\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a/b/\\Ç:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\c:/Users/canary/private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\1:/Users/canary/private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\Ç:/Users/canary/private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a/\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/\\Ç:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid#x=[a/\\Ç:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\C:\\Users\\canary\\private.db",
+      "file://host.invalid?x=[a<path>",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\1:\\Users\\canary\\private.db",
+      "file://host.invalid?x=[a<path>",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\Ç:\\Users\\canary\\private.db",
+      "file://host.invalid?x=[a<path>",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\@:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\1:\\Users\\canary\\private.db https://public.test/x",
+      "file://host.invalid?x=[a<path> https://public.test/x",
+    ],
+  ] as const)("redacts forced drive continuations after earlier content: %#", (input, expected) => {
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  it.each([
+    [
+      "file://host.invalid?x=[a/b/\\!:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>!:\\Users\\canary\\private.db]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\AB:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>:\\Users\\canary\\private.db]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\12:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>:\\Users\\canary\\private.db]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\C:note\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>:note\\Users\\canary\\private.db]",
+    ],
+    [
+      "file://host.invalid?x=[a/b/\\C\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+    ],
+    ["file://host.invalid?x=[a/b/\\C:]", "file://host.invalid?x=[a<path>:]"],
+    ["file://host.invalid?x=[a/b/\\1:", "file://host.invalid?x=[a<path>:"],
+    ["/p\\C:\\E::\\SECRET", "<path>\\<path>"],
+  ] as const)("preserves forced drive continuation boundaries: %#", (input, expected) => {
+    const firstPass = sanitizeError(input);
+
+    expect(firstPass).toBe(expected);
+    expect(sanitizeError(firstPass)).toBe(expected);
+  });
+
+  // Bug #1234 owns the deliberately excluded zero-label continuation.
+  it("preserves the empty-label forced continuation boundary for Bug #1234", () => {
+    const input = "file://host.invalid?x=[a/\\:\\Users\\canary\\private.db]";
+    const expected = "file://host.invalid?x=[a<path>:\\Users\\canary\\private.db]";
+
+    expect(sanitizeError(input)).toBe(expected);
+  });
+
+  // Leading file-path starts use a distinct classifier and are not fixed by
+  // Bug #1156's forced-scan-only transition.
+  it.each([
+    [
+      "file://host.invalid?x=[\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[<path>:\\Users\\canary\\private.db]",
+    ],
+    [
+      "file://host.invalid?x=[\\Ç:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[<path>:\\Users\\canary\\private.db]",
+    ],
+  ] as const)("preserves leading drive-like classifier scope: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
+  });
+
+  // Bug #1111 owns the known repeated-pass drift for this nested HTTPS form.
+  it("preserves the nested HTTPS first-pass boundary for Bug #1111", () => {
+    expect(sanitizeError("file://host.invalid?x=[a/b/https://public.test/p]")).toBe(
+      "file://host.invalid?x=[a<path>://public.test/p]",
+    );
   });
 
   it.each([

@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { request } from "node:http";
 import { join } from "node:path";
-import { handleSessionEnd } from "../../src/hooks/session-end.js";
+import { handleSessionEnd, fireCompactRequest, firePromoteRequest, firePromoteEventsRequest } from "../../src/hooks/session-end.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { loadDaemonConfig, type DaemonConfig } from "../../src/daemon/config.js";
 import { safeLogError } from "../../src/hooks/hook-errors.js";
@@ -492,6 +493,84 @@ describe("handleSessionEnd", () => {
     const error = new BackendPublicationJournalError("malformed-journal", "fixture journal malformed");
     vi.mocked(client.post).mockResolvedValueOnce({ ingested: 2 }).mockRejectedValueOnce(error);
     await expect(handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client)).rejects.toBe(error);
+  });
+
+  describe("independent background scheduling failures", () => {
+    const paths = ["/compact", "/promote", "/promote-events"];
+    const failures = [
+      { kind: "contention", error: new PrivateMutationLockContentionError("fixture owner busy"), journal: false },
+      { kind: "ordinary", error: new Error("fixture scheduling failure"), journal: false },
+      { kind: "journal", error: new BackendPublicationJournalError("unresolved-publication", "fixture unresolved"), journal: true },
+      { kind: "missing-evidence", error: new BackendPublicationJournalError("publication-evidence-missing", "fixture evidence missing"), journal: true },
+    ];
+    const cases = paths.flatMap((path, stage) => failures.flatMap(failure =>
+      [false, true].map(afterCallback => ({ path, stage, ...failure, afterCallback }))));
+
+    function injectSchedulingFailure(stage: number, error: Error, afterCallback: boolean) {
+      const actual = publicationFence.withHookPublicationFence;
+      let call = 0;
+      return vi.spyOn(publicationFence, "withHookPublicationFence").mockImplementation(callback => {
+        if (call++ !== stage) return actual(callback);
+        if (afterCallback) actual(callback);
+        throw error;
+      });
+    }
+
+    it.each(cases)("$path $kind afterCallback=$afterCallback preserves stage policy", async ({ stage, error, journal, afterCallback }) => {
+      vi.mocked(loadDaemonConfig).mockReturnValue({ ...defaultConfig, hooks: { ...defaultConfig.hooks, disableAutoCompact: false } });
+      const client = createMockClient({ ingested: 7 });
+      const fence = injectSchedulingFailure(stage, error, afterCallback);
+      try {
+        const pending = handleSessionEnd('{"session_id":"background-s1","cwd":"/fixture","client":"claude"}', client);
+        if (journal) await expect(pending).rejects.toBe(error);
+        else await expect(pending).resolves.toEqual({ exitCode: 0, stdout: "" });
+        const expectedPaths = paths.filter((_, index) =>
+          (index !== stage || afterCallback) && (!journal || index <= stage));
+        expect(vi.mocked(request).mock.calls.map(httpCallPath)).toEqual(expectedPaths);
+        expect(mockHttpReq.write).toHaveBeenCalledTimes(expectedPaths.length);
+        expect(mockHttpReq.end).toHaveBeenCalledTimes(expectedPaths.length);
+        expect(fence).toHaveBeenCalledTimes(journal ? stage + 1 : 3);
+        const completions = vi.mocked(client.post).mock.calls.filter(([path]) => path === "/session-complete");
+        if (journal) expect(completions).toEqual([]);
+        else expect(completions).toEqual([["/session-complete", {
+          session_id: "background-s1", cwd: "/fixture", message_count: 7,
+        }, { signal: expect.any(AbortSignal) }]]);
+      } finally { fence.mockRestore(); }
+    });
+
+    it.each(failures)("compact disabled preserves promote $kind policy", async ({ error, journal }) => {
+      vi.mocked(loadDaemonConfig).mockReturnValue({ ...defaultConfig, hooks: { ...defaultConfig.hooks, disableAutoCompact: true } });
+      const client = createMockClient({ ingested: 1 });
+      const fence = injectSchedulingFailure(0, error, false);
+      try {
+        const pending = handleSessionEnd('{"session_id":"s1","client":"claude"}', client);
+        if (journal) await expect(pending).rejects.toBe(error);
+        else await expect(pending).resolves.toEqual({ exitCode: 0, stdout: "" });
+        expect(vi.mocked(request).mock.calls.map(httpCallPath)).toEqual(journal ? [] : ["/promote-events"]);
+        expect(fence).toHaveBeenCalledTimes(journal ? 1 : 2);
+        expect(vi.mocked(client.post).mock.calls.filter(([path]) => path === "/session-complete")).toHaveLength(journal ? 0 : 1);
+      } finally { fence.mockRestore(); }
+    });
+
+    it("continues Codex background scheduling without synthesizing completion", async () => {
+      const client = createMockClient({ ingested: 1 });
+      const fence = injectSchedulingFailure(0, failures[0]!.error, false);
+      try {
+        await expect(handleSessionEnd('{"session_id":"s1","client":"codex"}', client))
+          .resolves.toEqual({ exitCode: 0, stdout: "" });
+        expect(vi.mocked(request).mock.calls.map(httpCallPath)).toEqual(["/promote", "/promote-events"]);
+        expect(vi.mocked(client.post).mock.calls.filter(([path]) => path === "/session-complete")).toEqual([]);
+      } finally { fence.mockRestore(); }
+    });
+
+    it.each([fireCompactRequest, firePromoteRequest, firePromoteEventsRequest])("direct helper %s still propagates both failure classes", helper => {
+      for (const { error } of failures) {
+        const fence = injectSchedulingFailure(0, error, false);
+        try { expect(() => helper(3737, {})).toThrow(error); }
+        finally { fence.mockRestore(); }
+      }
+      expect(request).not.toHaveBeenCalled();
+    });
   });
 
   it("calls socket.unref() so the process does not wait for a compact response", async () => {

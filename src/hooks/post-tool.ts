@@ -4,7 +4,7 @@ import { normalizePostToolInput } from "./post-tool-normalization.js";
 import { safeLogError } from "./hook-errors.js";
 import { ensureProjectDir } from "../daemon/project.js";
 import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
-import { appendLocalHookEvents } from "./local-enqueue.js";
+import { appendLocalHookEvents, LocalHookDurabilityTimeoutError } from "./local-enqueue.js";
 import {
   BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC,
   assertHookPublicationFence,
@@ -87,6 +87,7 @@ export async function handlePostToolUse(
     // daemon's bounded background scan process them; never use a payload port
     // for a token-bearing request.
   } catch (error) {
+    if (error instanceof LocalHookDurabilityTimeoutError) throw error;
     if (isBackendPublicationJournalError(error)) {
       try {
         await safeLogError(

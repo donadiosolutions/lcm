@@ -23,7 +23,7 @@ import {
 import { createAbortError } from "../cancellation.js";
 
 interface AsyncClosable {
-  close(): Promise<void> | void;
+  close(publicationLockToken?: BackendPublicationLockToken): Promise<void> | void;
 }
 
 export const STORAGE_IDENTITY_REQUIRED_ERROR_CODE = "STORAGE_IDENTITY_REQUIRED" as const;
@@ -112,6 +112,7 @@ export function createCommitCloseBarrier(): Readonly<{
 export type ProjectStorageOperation<T> = (
   storage: ProjectStorage,
   signal: AbortSignal,
+  publicationLockToken?: BackendPublicationLockToken,
 ) => Promise<T> | T;
 
 export function sameStorageIdentity(
@@ -127,10 +128,13 @@ export function sameStorageIdentity(
     && expected.remoteProjectId === actual.remoteProjectId;
 }
 
-async function settleClose(resource: AsyncClosable | undefined): Promise<void> {
+async function settleClose(
+  resource: AsyncClosable | undefined,
+  publicationLockToken?: BackendPublicationLockToken,
+): Promise<void> {
   if (!resource) return;
   try {
-    await resource.close();
+    await resource.close(publicationLockToken);
   } catch {
     // Route cleanup is best-effort. Operation errors determine the response.
   }
@@ -140,7 +144,7 @@ async function settleClose(resource: AsyncClosable | undefined): Promise<void> {
 export async function closeRouteStorage(
   ...resources: Array<AsyncClosable | undefined>
 ): Promise<void> {
-  await Promise.all(resources.map(settleClose));
+  await Promise.all(resources.map(resource => settleClose(resource)));
 }
 
 /** Open a project only when it already exists in the selected backend. */
@@ -204,7 +208,7 @@ export async function withProjectStorage<T>(
     const closeProject = (): Promise<void> => {
       projectClose ??= (async () => {
         await request.beforeClose?.();
-        await closeRouteStorage(project);
+        await settleClose(project, publicationLockToken);
       })();
       return projectClose;
     };
@@ -236,7 +240,7 @@ export async function withProjectStorage<T>(
         onAbort();
         throw createRouteAbortError();
       }
-      const result = await operation(project, signal);
+      const result = await operation(project, signal, publicationLockToken);
       return result;
     } finally {
       signal.removeEventListener("abort", onAbort);

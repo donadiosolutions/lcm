@@ -5,7 +5,9 @@ import { platform } from "node:os";
 import { dirname, join, win32 } from "node:path";
 import {
   atomicWritePrivateFileExclusive,
+  BoundedFileIdentityChangedError,
   deleteRegularFile,
+  privateFileAbsentAtRetainedParent,
   readBoundedRegularFile,
 } from "./security-files.js";
 
@@ -53,6 +55,8 @@ export type ProcessStartTimeOptions = Readonly<{
 /** @internal Deterministic filesystem seam used by lock recovery tests. */
 export type PrivateMutationLockOperations = {
   readonly deleteRegularFile: typeof deleteRegularFile;
+  /** @internal Deterministic owner-disappearance seam. */
+  readonly _beforeOwnerReadPostStatForTesting?: () => void;
 };
 
 const DEFAULT_PRIVATE_MUTATION_LOCK_OPERATIONS: PrivateMutationLockOperations = {
@@ -189,6 +193,7 @@ function lockOwnerState(
 function readLockOwner(
   lockPath: string,
   label: string,
+  operations: Pick<PrivateMutationLockOperations, "_beforeOwnerReadPostStatForTesting"> = {},
 ): {
   readonly content: string;
   readonly owner: PrivateMutationLockOwner;
@@ -196,6 +201,7 @@ function readLockOwner(
   const content = readBoundedRegularFile(lockPath, {
     maxBytes: MAX_PRIVATE_MUTATION_LOCK_BYTES,
     allowedRoot: dirname(lockPath),
+    _beforePostStatForTesting: operations._beforeOwnerReadPostStatForTesting,
   });
   let value: unknown;
   try {
@@ -356,9 +362,15 @@ function acquireMutationLock(
     let existing: ReturnType<typeof readLockOwner>;
     try {
       observer("before-main-lock-owner-read", lockPath);
-      existing = readLockOwner(lockPath, label);
+      existing = readLockOwner(lockPath, label, operations);
     } catch (error) {
-      if (!isMissingFileError(error)) throw error;
+      if (error instanceof BoundedFileIdentityChangedError) {
+        if (!privateFileAbsentAtRetainedParent(lockPath, {
+          expectedParent: error.parentIdentity,
+        })) throw error;
+      } else if (!isMissingFileError(error)) {
+        throw error;
+      }
       if (disappearedOwnerReadRetries >= MAX_DISAPPEARED_OWNER_READ_RETRIES) {
         throw new Error(
           `${label} mutation lock changed repeatedly during acquisition; retry the operation`,

@@ -86,13 +86,20 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let filePathBracketDepth = 0;
   let restartedPathlessFile = false;
   let quotedPathEnded = false;
+  let quotedQueryTail = false;
+  let quotedPathEndedSeparator = -1;
   let restartedPathlessBrackets = 0;
+  let fileTailBracketDepth = 0;
+  let pendingFileTailBackslash = false;
+  let pendingNestedUrlContinuation = false;
   let queryOrFragment = false;
   let queryOrFragmentStart = -1;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
     if (WHITESPACE_PATTERN.test(char)) {
+      const preservesClosedBracketHandoff =
+        pendingFileTailBackslash && fileTailBracketDepth === 0 && (char === " " || char === "\t");
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;
@@ -103,13 +110,58 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
       quotedPathEnded = false;
+      quotedQueryTail = false;
+      quotedPathEndedSeparator = -1;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
+      if (!preservesClosedBracketHandoff) {
+        fileTailBracketDepth = 0;
+        pendingFileTailBackslash = false;
+        pendingNestedUrlContinuation = false;
+      }
       continue;
     }
+    const fileTailBoundaryEvent =
+      fileTailBracketDepth > 0 && (char === "]" || URL_END_DELIMITERS.has(char));
+    if (pendingFileTailBackslash) {
+      if (char === "\\") {
+        if (!restartedPathlessFile) {
+          file[index] = 1;
+          fileTailBracketDepth = 0;
+          pendingFileTailBackslash = false;
+          pendingNestedUrlContinuation = false;
+          continue;
+        }
+      } else {
+        const continuesNestedUrl =
+          pendingNestedUrlContinuation && (char === "/" || char === ":" || char === "?");
+        pendingFileTailBackslash = false;
+        pendingNestedUrlContinuation = false;
+        if (!fileTailBoundaryEvent && !continuesNestedUrl) fileTailBracketDepth = 0;
+      }
+    }
+    if (fileTailBracketDepth > 0 && char === "[") {
+      fileTailBracketDepth += 1;
+    } else if (fileTailBracketDepth > 0 && char === "]") {
+      fileTailBracketDepth -= 1;
+      pendingFileTailBackslash = true;
+      pendingNestedUrlContinuation = fileTailBracketDepth > 0 && separator >= 0 && brackets > 0;
+    } else if (fileTailBracketDepth > 0 && URL_END_DELIMITERS.has(char)) {
+      pendingFileTailBackslash = true;
+      pendingNestedUrlContinuation = false;
+    } else if (restartedPathlessFile && char === "[") {
+      fileTailBracketDepth = 1;
+    }
     if (separator >= 0 && (char === "?" || char === "#")) {
+      const startsQuotedQueryTail =
+        exactFileScheme &&
+        foundFilePath &&
+        quotedPathEndedSeparator === separator &&
+        brackets === 0;
+
       queryOrFragment = true;
       queryOrFragmentStart = index;
+      if (startsQuotedQueryTail) quotedQueryTail = true;
     }
     const nestedFileSchemeStart = isNestedFileUrlStart(chars, index)
       ? index + 1
@@ -126,6 +178,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      quotedQueryTail = false;
       restartedPathlessBrackets = 0;
       schemeLength = 0;
       fileSchemeLength = 0;
@@ -181,6 +234,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       schemeQuote = 0;
       restartedPathlessFile = true;
       restartedPathlessBrackets = 0;
+      fileTailBracketDepth = 0;
+      pendingFileTailBackslash = false;
+      pendingNestedUrlContinuation = false;
       continue;
     }
     if (
@@ -189,6 +245,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       !FILE_URL_AUTHORITY_DELIMITERS.has(char)
     ) {
       restartedPathlessFile = false;
+      quotedQueryTail = false;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
     }
@@ -213,6 +270,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       // separator after the wrapper still restarts a file path, but stop
       // claiming later slashes as this URL authority.
       quotedPathEnded = true;
+      quotedPathEndedSeparator = separator;
       schemeQuote = 0;
       // An adjacent backslash starts a fresh path even before the wrapper closes.
       if (chars[index + 1] === "\\") foundFilePath = false;
@@ -235,11 +293,23 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      quotedQueryTail = false;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
       continue;
     }
     if (separator >= 0) {
+      if (
+        quotedQueryTail &&
+        brackets === 0 &&
+        char === "/" &&
+        isPathWord(chars[index - 1]) &&
+        !startsUrlSchemeLiteral(chars, index + 1)
+      ) {
+        forcedPath[index] = 1;
+        quotedQueryTail = false;
+        continue;
+      }
       if (char === "/" && !quotedPathEnded) authority[index] = 1;
       if (
         exactFileScheme &&
@@ -272,12 +342,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (restartedPathlessFile && char === "\\") {
       restartedPathlessFile = false;
       restartedPathlessBrackets = 0;
+      fileTailBracketDepth = 0;
+      pendingFileTailBackslash = false;
+      pendingNestedUrlContinuation = false;
       queryOrFragment = false;
       file[index] = 1;
       continue;
     }
     if (char === ":" && schemeLength > 0 && chars[index + 1] === "/" && chars[index + 2] === "/") {
       restartedPathlessFile = false;
+      quotedQueryTail = false;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
       separator = index;
@@ -372,6 +446,13 @@ function fileUrlDriveColonIndex(chars: readonly string[], start: number): number
   return -1;
 }
 
+function forcedDriveContinuationColonIndex(chars: readonly string[], index: number): number {
+  if (!isPathWord(chars[index + 1])) return -1;
+  if (chars[index + 2] !== ":") return -1;
+  if (chars[index + 3] !== "/" && chars[index + 3] !== "\\") return -1;
+  return index + 2;
+}
+
 function forcedSeparatorRunHasBackslash(chars: readonly string[], start: number): boolean {
   let index = start;
   let hasBackslash = false;
@@ -387,11 +468,13 @@ function scanAbsolutePath(
   start: number,
   windows: boolean,
   driveColonIndex: number,
+  allowForcedDriveContinuation: boolean,
   nestedFileSchemeStarts: Uint8Array,
   quote?: string,
 ): { end: number; sawNonSeparator: boolean } {
   let index = start;
   let windowsContext = windows;
+  let activeDriveColonIndex = driveColonIndex;
   let parentheses = 0;
   let brackets = 0;
   let sawPathCharacter = false;
@@ -408,7 +491,7 @@ function scanAbsolutePath(
       index += 1;
       continue;
     }
-    if (index === driveColonIndex && char === ":") {
+    if (index === activeDriveColonIndex && char === ":") {
       index += 1;
       continue;
     }
@@ -467,6 +550,16 @@ function scanAbsolutePath(
       sawNonSeparator = true;
       index = cursor;
       continue;
+    }
+    if (allowForcedDriveContinuation && char === "\\") {
+      const continuationColonIndex = forcedDriveContinuationColonIndex(chars, index);
+      if (continuationColonIndex >= 0) {
+        windowsContext = true;
+        activeDriveColonIndex = continuationColonIndex;
+        sawPathCharacter = true;
+        index += 1;
+        continue;
+      }
     }
     if (singleSlashFileUrl) {
       singleSlashFileTail = true;
@@ -566,6 +659,7 @@ function sanitizeAbsolutePaths(message: string): string {
       start,
       windows,
       driveColonIndex,
+      forcedPath,
       urlPathStarts.nestedFileSchemeStarts,
       quote,
     );

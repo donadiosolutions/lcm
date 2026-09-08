@@ -66,7 +66,12 @@ function database(seed: (db: DatabaseSync) => void): DatabaseSync {
   const root = mkdtempSync(join(tmpdir(), "lcm-sidecar-"));
   const path = join(root, "sidecar.db");
   const writable = new DatabaseSync(path);
-  try { seed(writable); } finally { writable.close(); }
+  try {
+    // Amortize fixture commits; seed callbacks must not start a nested transaction.
+    writable.exec("BEGIN");
+    seed(writable);
+    writable.exec("COMMIT");
+  } finally { writable.close(); }
   const db = new DatabaseSync(path, { readOnly: true });
   resources.push({ root, db });
   return db;

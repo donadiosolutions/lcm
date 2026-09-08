@@ -490,8 +490,15 @@ The `Security` section of the doctor output shows:
   the first pass. This includes a query or fragment following a closed quoted
   path, with or without a closing wrapper. Whitespace and URL-ending delimiters
   can end that context; this does not extend backslash redaction to unrelated
-  text. A public URL glued directly after the closing quote or bracket without
-  whitespace may be conservatively redacted:
+  text. When non-delimiter query or fragment text follows a quoted path in a
+  closed wrapper, a later slash-prefixed local path is redacted in the same
+  pass. For example, `'file://host'['/private']?next/Users/SECRET` becomes
+  `'file://host'['<path>']?next<path>`. The handoff remains within that exact
+  file URL context; whitespace and URL-ending punctuation reset it, and a
+  recognized `scheme://` token is not consumed as the local path.
+  Classification state from an earlier quoted file URL does not carry into a
+  later unquoted file URL's query tail. A public URL glued directly after the
+  closing quote or bracket without whitespace may be conservatively redacted:
   `'file://host'['/private']https://pub.test/x` becomes
   `'file://host'['<path>']https:<path>`. If that glued URL is followed by a
   Windows drive path, the URL and drive path are redacted separately, as in
@@ -513,11 +520,26 @@ The `Security` section of the doctor output shows:
   this restarted tail are tracked independently. A slash inside a still-open
   bracket is conservatively treated as a path marker even when it follows a
   word character, and a matched closing bracket keeps the context active so a
-  later backslash-based path is also redacted. Once the brackets are balanced,
-  ordinary word-adjacent slash text remains unchanged. Whitespace, an unmatched
-  closing bracket, a freshly recognized URL, or other URL-ending punctuation
-  ends the context and clears its bracket state. A recognizable nested exact
-  `file://` path is also redacted. When an unquoted local-path span starts with
+  later backslash-based path is also redacted. Within that already-admitted
+  forced scan, an internal backslash followed by exactly one path-word code
+  point, a colon, and `/` or `\` keeps a drive-shaped continuation in the same
+  redacted span. Path-word characters include Unicode letters, numbers, and
+  marks plus `_.-@+~%$*`; this contextual rule does not make numeric,
+  non-ASCII, or punctuation labels standalone drive-path starts. Once the
+  brackets are balanced, ordinary word-adjacent slash text remains unchanged.
+  Whitespace, quoted-path, nested-URL, and delimiter termination remain
+  unchanged. An unmatched closing bracket, a freshly recognized URL, or other
+  URL-ending punctuation ends the context and clears its bracket state. A
+  recognizable nested exact `file://` path is also redacted. A root-relative
+  Windows backslash path is also redacted when a bracketed file URL query or
+  fragment hands off to it immediately after URL-ending punctuation or a
+  bracketed nested non-file URL. A nested IPv6 URL keeps the enclosing bracket
+  context through a path, port, or query after its IP-literal closing bracket.
+  A balanced outer bracket may have only spaces or tabs before the backslash.
+  This handoff is consumed once. Prose, newlines, carriage returns, and other
+  whitespace end it; ordinary text and non-file URLs do not make a single
+  backslash a global path start.
+  When an unquoted local-path span starts with
   `/scheme://`, its URL-shaped portion, including scheme and port colons, is
   replaced by one `<path>` marker on the first pass. The span ends at whitespace
   or the first unbalanced `)` or `]`, `#`, `&`, `=`, `|`, `,`, `;`, `!`, `?`,

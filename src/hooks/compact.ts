@@ -56,7 +56,9 @@ export async function handlePreCompact(
   try {
     assertHookPublicationFence();
   } catch (error) {
-    if (isBackendPublicationJournalError(error) && !isBackendPublicationEvidenceMissing(error)) {
+    if (isBackendPublicationJournalError(error)
+      && !isBackendPublicationEvidenceMissing(error)
+      && error.reason !== "unsafe-storage") {
       return { exitCode: 0, stdout: "" };
     }
     await safeLogError(

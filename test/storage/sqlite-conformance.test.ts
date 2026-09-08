@@ -1070,30 +1070,26 @@ describe("SQLite storage backend conformance", () => {
         factoryClosed = true;
         timeline.push("factory-close-complete");
       });
-      await closing;
+      let closeSettled = false;
+      void closing.then(() => { closeSettled = true; });
+      await Promise.resolve();
+      expect(closeSettled).toBe(false);
       expect(healthSettled).toBe(false);
       expect(quickCheckCount).toBe(0);
 
       releaseTransaction();
       await transaction;
-      const [result] = await Promise.all([health]);
+      const [result] = await Promise.all([health, closing]);
       expect(result).toEqual({ status: "closed", backend: "sqlite" });
       expect(JSON.stringify(result)).not.toContain("private-idle-health-race-sentinel");
       expect(JSON.stringify(result)).not.toContain("idle-health-race.db");
       expect(quickCheckCount).toBe(1);
-      expect(timeline.indexOf("factory-close-complete"), timeline.join(",")).toBeLessThan(timeline.indexOf("transaction-complete"));
       expect(timeline.indexOf("transaction-complete"), timeline.join(",")).toBeLessThan(timeline.indexOf("probe"));
       expect(timeline.indexOf("probe"), timeline.join(",")).toBeLessThan(timeline.indexOf("health-complete"));
-      if (outcome === "healthy") {
-        // Factory shutdown is non-draining: an already in-flight idle probe may
-        // still run BEGIN IMMEDIATE, temporary DDL, and ROLLBACK afterward.
-        expect(postCloseProbeSql).toContain("BEGIN IMMEDIATE");
-        expect(postCloseProbeSql.some(sql => sql.startsWith("CREATE TABLE main.\"__lcm_storage_health_probe_"))).toBe(true);
-        expect(postCloseProbeSql).toContain("ROLLBACK");
-      }
+      expect(timeline.indexOf("health-complete"), timeline.join(",")).toBeLessThan(timeline.indexOf("factory-close-complete"));
+      expect(postCloseProbeSql).toEqual([]);
       expect(getPoolStats().connections.find(entry => entry.path === dbPath))
         .toMatchObject({ path: dbPath, refs: 1 });
-
       closeLcmConnection(dbPath, retainedDb);
       expect(getPoolStats().connections.some(entry => entry.path === dbPath)).toBe(false);
       const inspection = new DatabaseSync(dbPath, { readOnly: true });
@@ -1686,11 +1682,14 @@ describe("SQLite storage backend conformance", () => {
     const successfulEntered = new Promise<void>((resolve) => { enterSuccessful = resolve; });
     const successfulGate = new Promise<void>((resolve) => { releaseSuccessful = resolve; });
     const originalSuccessfulClose = successful.close.bind(successful);
-    const failingClose = vi.spyOn(failing, "close").mockImplementation(async () => {
-      enterFailing();
-      await failingGate;
-      throw new Error("injected project close failure");
-    });
+    const originalFailingClose = failing.close.bind(failing);
+    const failingClose = vi.spyOn(failing, "close")
+      .mockImplementationOnce(async () => {
+        enterFailing();
+        await failingGate;
+        throw new Error("injected project close failure");
+      })
+      .mockImplementation(() => originalFailingClose());
     const successfulClose = vi.spyOn(successful, "close").mockImplementation(async () => {
       enterSuccessful();
       await successfulGate;
@@ -1703,12 +1702,15 @@ describe("SQLite storage backend conformance", () => {
     await Promise.all([failingEntered, successfulEntered]);
 
     let factorySettled = false;
-    void firstClose.then(() => { factorySettled = true; });
+    void firstClose.then(
+      () => { factorySettled = true; },
+      () => { factorySettled = true; },
+    );
     releaseFailing();
     await Promise.resolve();
     expect(factorySettled).toBe(false);
     releaseSuccessful();
-    await expect(firstClose).resolves.toBeUndefined();
+    await expect(firstClose).rejects.toThrow("injected project close failure");
     expect(factorySettled).toBe(true);
     expect(failingClose).toHaveBeenCalledOnce();
     expect(successfulClose).toHaveBeenCalledOnce();
@@ -1716,12 +1718,11 @@ describe("SQLite storage backend conformance", () => {
     await expect(factory.openProject(projectIdentity(join(root, "after-close"))))
       .rejects.toMatchObject({ code: "STORAGE_CLOSED" });
     await expect(factory.close()).resolves.toBeUndefined();
-    expect(failingClose).toHaveBeenCalledOnce();
+    expect(failingClose).toHaveBeenCalledTimes(2);
     expect(successfulClose).toHaveBeenCalledOnce();
 
     failingClose.mockRestore();
     successfulClose.mockRestore();
-    await failing.close();
   });
 
   it("stays healthy while a normally closing project drains queued work", async () => {
