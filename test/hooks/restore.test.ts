@@ -10,11 +10,25 @@ import {
 import { eventsDbPath } from "../../src/db/events-path.js";
 import type { DaemonClient } from "../../src/daemon/client.js";
 import * as publicationFence from "../../src/hooks/publication-fence.js";
-import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
+import { lcmHomeDir } from "../../src/runtime-paths.js";
+import {
+  backendPublicationDirectory,
+  BackendPublicationJournalError,
+} from "../../src/storage/backend-publication.js";
+import { SQLiteLocalHookOutboxFactory } from "../../src/storage/local-hook-outbox.js";
 
 const securityFilesMock = vi.hoisted(() => ({
   assertPrivateDirectory: vi.fn(),
 }));
+
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return {
+    ...actual,
+    homedir: () => process.env.HOME ?? actual.homedir(),
+  };
+});
 
 vi.mock("../../src/security-files.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/security-files.js")>();
@@ -48,6 +62,21 @@ vi.mock("../../src/hooks/session-end.js", () => ({
 
 import { ensureDaemon } from "../../src/daemon/lifecycle.js";
 const mockEnsureDaemon = vi.mocked(ensureDaemon);
+
+function usePrivatePublicationHome(prefix: string): () => void {
+  const previousHome = process.env.HOME;
+  const home = mkdtempSync(join(tmpdir(), prefix));
+  process.env.HOME = home;
+  const root = join(home, ".lcm");
+  mkdirSync(root, { mode: 0o700 });
+  expect(lcmHomeDir()).toBe(root);
+  expect(backendPublicationDirectory()).toBe(join(root, "backend-publication"));
+  return () => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  };
+}
 
 describe("handleSessionStart", () => {
   beforeEach(() => {
@@ -347,10 +376,14 @@ describe("handleSessionStart", () => {
   });
 
   it("triggers promote-events when unprocessed events exist", async () => {
+    const restoreHome = usePrivatePublicationHome("lcm-restore-promote-release-");
     const { EventsDb } = await import("../../src/hooks/events-db.js");
     const { firePromoteEventsRequest } = await import("../../src/hooks/session-end.js");
     const mockFirePromote = vi.mocked(firePromoteEventsRequest);
     mockFirePromote.mockClear();
+    mockFirePromote.mockImplementationOnce(() => {
+      publicationFence.withHookPublicationFence(() => undefined);
+    });
 
     vi.mocked(EventsDb).mockImplementationOnce(function () {
       return {
@@ -367,18 +400,204 @@ describe("handleSessionStart", () => {
       health: vi.fn(),
       post: vi.fn().mockResolvedValue({ context: "" }),
     };
-    await handleSessionStart(JSON.stringify({ session_id: "s4", cwd: "/proj" }), client);
-    expect(mockFirePromote).toHaveBeenCalledWith(3737, { cwd: "/proj" });
+    try {
+      await handleSessionStart(JSON.stringify({ session_id: "s4", cwd: "/proj" }), client);
+      expect(mockFirePromote).toHaveBeenCalledWith(3737, { cwd: "/proj" });
+    } finally {
+      rmSync(sessionLockPathForTesting("s4"), { force: true });
+      restoreHome();
+    }
+  });
+
+  it("skips SessionStart scavenge on publication contention and still restores after release", async () => {
+    const restoreHome = usePrivatePublicationHome("lcm-restore-scavenge-contention-");
+    const contention = new PrivateMutationLockContentionError("publication is active");
+    const fencedScavenge = vi.spyOn(publicationFence, "withHookPublicationFenceAsync")
+      .mockRejectedValueOnce(contention);
+    const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open");
+    const { firePromoteEventsRequest } = await import("../../src/hooks/session-end.js");
+    const mockFirePromote = vi.mocked(firePromoteEventsRequest);
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const client = { post: vi.fn().mockResolvedValue({ context: "restored after contention" }) };
+
+    try {
+      await expect(handleSessionStart(
+        JSON.stringify({ session_id: "released-scavenge-contention", cwd: "/proj" }),
+        client,
+      )).resolves.toEqual({ exitCode: 0, stdout: "restored after contention" });
+      expect(open).not.toHaveBeenCalled();
+      expect(mockFirePromote).not.toHaveBeenCalled();
+      expect(client.post).toHaveBeenCalledWith("/restore", expect.objectContaining({
+        session_id: "released-scavenge-contention",
+      }));
+    } finally {
+      fencedScavenge.mockRestore();
+      open.mockRestore();
+      rmSync(sessionLockPathForTesting("released-scavenge-contention"), { force: true });
+      restoreHome();
+    }
+  });
+
+  it("does not restore while publication contention remains active after skipped scavenge", async () => {
+    const restoreHome = usePrivatePublicationHome("lcm-restore-held-contention-");
+    let markEnsureStarted!: () => void;
+    let releaseEnsure!: () => void;
+    let markPublicationHeld!: () => void;
+    let releasePublication!: () => void;
+    const ensureStarted = new Promise<void>((resolve) => { markEnsureStarted = resolve; });
+    const ensureRelease = new Promise<void>((resolve) => { releaseEnsure = resolve; });
+    const publicationHeld = new Promise<void>((resolve) => { markPublicationHeld = resolve; });
+    const publicationRelease = new Promise<void>((resolve) => { releasePublication = resolve; });
+    mockEnsureDaemon.mockImplementationOnce(async () => {
+      markEnsureStarted();
+      await ensureRelease;
+      return { connected: true, port: 3737, spawned: false };
+    });
+    const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open");
+    const client = { post: vi.fn().mockResolvedValue({ context: "must not restore" }) };
+    let publisher: Promise<void> | undefined;
+
+    try {
+      const restore = handleSessionStart(
+        JSON.stringify({ session_id: "held-scavenge-contention", cwd: "/proj" }),
+        client,
+      );
+      await ensureStarted;
+      publisher = publicationFence.withHookPublicationFenceAsync(async () => {
+        markPublicationHeld();
+        await publicationRelease;
+      });
+      await publicationHeld;
+      releaseEnsure();
+
+      await expect(restore).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(open).not.toHaveBeenCalled();
+      expect(client.post).not.toHaveBeenCalled();
+    } finally {
+      releaseEnsure();
+      releasePublication();
+      await publisher;
+      open.mockRestore();
+      rmSync(sessionLockPathForTesting("held-scavenge-contention"), { force: true });
+      restoreHome();
+    }
+  });
+
+  it("retains publication admission while resolving the SessionStart outbox path", async () => {
+    const restoreHome = usePrivatePublicationHome("lcm-restore-scavenge-path-");
+    let pathFenceError: unknown;
+    const path = vi.mocked(eventsDbPath).mockImplementationOnce(() => {
+      try {
+        publicationFence.withHookPublicationFence(() => undefined);
+      } catch (error) {
+        pathFenceError = error;
+      }
+      return "/tmp/test-events.db";
+    });
+    const outbox = {
+      pruneProcessed: vi.fn().mockResolvedValue(0),
+      pruneUnprocessed: vi.fn().mockResolvedValue({ pruned: 0 }),
+      pruneErrorLog: vi.fn().mockResolvedValue(0),
+      getUnprocessed: vi.fn().mockResolvedValue([]),
+    };
+    const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open")
+      .mockResolvedValue(outbox as never);
+    const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close")
+      .mockResolvedValue(undefined);
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+
+    try {
+      await expect(handleSessionStart(
+        JSON.stringify({ session_id: "retained-scavenge-path", cwd: "/proj" }),
+        { post: vi.fn().mockResolvedValue({ context: "restored" }) },
+      )).resolves.toEqual({ exitCode: 0, stdout: "restored" });
+      expect(path).toHaveBeenCalledWith("/proj");
+      expect(pathFenceError).toBeInstanceOf(PrivateMutationLockContentionError);
+    } finally {
+      open.mockRestore();
+      close.mockRestore();
+      rmSync(sessionLockPathForTesting("retained-scavenge-path"), { force: true });
+      restoreHome();
+    }
+  });
+
+  it.each([
+    "open",
+    "pruneProcessed",
+    "pruneUnprocessed",
+    "pruneErrorLog",
+    "getUnprocessed",
+    "close",
+  ] as const)("retains publication admission through SessionStart outbox %s", async (heldStage) => {
+    const restoreHome = usePrivatePublicationHome("lcm-restore-scavenge-fence-");
+    let releasePrune!: () => void;
+    let markPruneStarted!: () => void;
+    const pruneStarted = new Promise<void>((resolve) => { markPruneStarted = resolve; });
+    const pruneRelease = new Promise<void>((resolve) => { releasePrune = resolve; });
+    const holdSelectedStage = async (stage: typeof heldStage): Promise<void> => {
+      if (stage !== heldStage) return;
+      markPruneStarted();
+      await pruneRelease;
+    };
+    const outbox = {
+      pruneProcessed: vi.fn(async () => {
+        await holdSelectedStage("pruneProcessed");
+        return 0;
+      }),
+      pruneUnprocessed: vi.fn(async () => {
+        await holdSelectedStage("pruneUnprocessed");
+        return { pruned: 0 };
+      }),
+      pruneErrorLog: vi.fn(async () => {
+        await holdSelectedStage("pruneErrorLog");
+        return 0;
+      }),
+      getUnprocessed: vi.fn(async () => {
+        await holdSelectedStage("getUnprocessed");
+        return [];
+      }),
+    };
+    const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open")
+      .mockImplementation(async () => {
+        await holdSelectedStage("open");
+        return outbox as never;
+      });
+    const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close")
+      .mockImplementation(async () => { await holdSelectedStage("close"); });
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const client = { post: vi.fn().mockResolvedValue({ context: "restored" }) };
+
+    try {
+      const restore = handleSessionStart(
+        JSON.stringify({ session_id: `retained-scavenge-fence-${heldStage}`, cwd: "/proj" }),
+        client,
+      );
+      await pruneStarted;
+
+      expect(() => publicationFence.withHookPublicationFence(() => undefined))
+        .toThrow(PrivateMutationLockContentionError);
+
+      releasePrune();
+      await expect(restore).resolves.toEqual({ exitCode: 0, stdout: "restored" });
+      expect(() => publicationFence.withHookPublicationFence(() => undefined)).not.toThrow();
+    } finally {
+      releasePrune();
+      open.mockRestore();
+      close.mockRestore();
+      rmSync(sessionLockPathForTesting(`retained-scavenge-fence-${heldStage}`), { force: true });
+      restoreHome();
+    }
   });
 
   it("continues after an ordinary scavenge witness change", async () => {
+    const restoreHome = usePrivatePublicationHome("lcm-restore-scavenge-witness-");
     let admissionComplete = false;
-    let scavengeProbeUsed = false;
+    let postAdmissionProbes = 0;
     const originalAssert = securityFilesMock.assertPrivateDirectory.getMockImplementation()!;
     const assert = securityFilesMock.assertPrivateDirectory.mockImplementation((handle, path, expected) => {
       const actual = originalAssert(handle, path, expected);
-      if (admissionComplete && !scavengeProbeUsed) {
-        scavengeProbeUsed = true;
+      if (admissionComplete) postAdmissionProbes += 1;
+      if (postAdmissionProbes === 3) {
         return { ...actual, mode: actual.mode === 0o700 ? 0o755 : 0o700 };
       }
       return actual;
@@ -391,13 +610,79 @@ describe("handleSessionStart", () => {
     try {
       await expect(handleSessionStart(JSON.stringify({ session_id: "witness-restore", cwd: "/proj" }), client))
         .resolves.toEqual({ exitCode: 0, stdout: "context after scavenge" });
+      expect(postAdmissionProbes).toBeGreaterThanOrEqual(3);
     } finally {
       assert.mockImplementation(originalAssert);
       rmSync(sessionLockPathForTesting("witness-restore"), { force: true });
+      restoreHome();
+    }
+  });
+
+  it("continues after a publication-fence witness change skips scavenge", async () => {
+    const restoreHome = usePrivatePublicationHome("lcm-restore-fence-witness-");
+    let admissionComplete = false;
+    let postAdmissionProbes = 0;
+    const originalAssert = securityFilesMock.assertPrivateDirectory.getMockImplementation()!;
+    const assert = securityFilesMock.assertPrivateDirectory.mockImplementation((handle, path, expected) => {
+      const actual = originalAssert(handle, path, expected);
+      if (admissionComplete) postAdmissionProbes += 1;
+      if (postAdmissionProbes === 2) {
+        return { ...actual, mode: actual.mode === 0o700 ? 0o755 : 0o700 };
+      }
+      return actual;
+    });
+    const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open");
+    mockEnsureDaemon.mockImplementationOnce(async () => {
+      admissionComplete = true;
+      return { connected: true, port: 3737, spawned: false };
+    });
+    const client = { post: vi.fn().mockResolvedValue({ context: "context after fence skip" }) };
+    try {
+      await expect(handleSessionStart(JSON.stringify({ session_id: "fence-witness-restore", cwd: "/proj" }), client))
+        .resolves.toEqual({ exitCode: 0, stdout: "context after fence skip" });
+      expect(open).not.toHaveBeenCalled();
+    } finally {
+      open.mockRestore();
+      assert.mockImplementation(originalAssert);
+      rmSync(sessionLockPathForTesting("fence-witness-restore"), { force: true });
+      restoreHome();
+    }
+  });
+
+  it("does not promote when outbox close fails after finding pending events", async () => {
+    const restoreHome = usePrivatePublicationHome("lcm-restore-close-failure-");
+    const outbox = {
+      pruneProcessed: vi.fn().mockResolvedValue(0),
+      pruneUnprocessed: vi.fn().mockResolvedValue({ pruned: 0 }),
+      pruneErrorLog: vi.fn().mockResolvedValue(0),
+      getUnprocessed: vi.fn().mockResolvedValue([{ event_id: 1 }]),
+    };
+    const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open")
+      .mockResolvedValue(outbox as never);
+    const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close")
+      .mockRejectedValueOnce(new Error("close failed"));
+    const { firePromoteEventsRequest } = await import("../../src/hooks/session-end.js");
+    const mockFirePromote = vi.mocked(firePromoteEventsRequest);
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const client = { post: vi.fn().mockResolvedValue({ context: "restored after close failure" }) };
+
+    try {
+      await expect(handleSessionStart(
+        JSON.stringify({ session_id: "close-failure", cwd: "/proj" }),
+        client,
+      )).resolves.toEqual({ exitCode: 0, stdout: "restored after close failure" });
+      expect(mockFirePromote).not.toHaveBeenCalled();
+      expect(() => publicationFence.withHookPublicationFence(() => undefined)).not.toThrow();
+    } finally {
+      open.mockRestore();
+      close.mockRestore();
+      rmSync(sessionLockPathForTesting("close-failure"), { force: true });
+      restoreHome();
     }
   });
 
   it("swallows an ordinary scavenge error before restoring", async () => {
+    const restoreHome = usePrivatePublicationHome("lcm-restore-ordinary-scavenge-");
     vi.mocked(eventsDbPath).mockImplementationOnce(function () { throw new Error("scavenge failed"); });
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
     const client = { post: vi.fn().mockResolvedValue({ context: "context after failed scavenge" }) };
@@ -406,10 +691,12 @@ describe("handleSessionStart", () => {
         .resolves.toEqual({ exitCode: 0, stdout: "context after failed scavenge" });
     } finally {
       rmSync(sessionLockPathForTesting("ordinary-scavenge"), { force: true });
+      restoreHome();
     }
   });
 
   it("rethrows a publication journal error from scavenge", async () => {
+    const restoreHome = usePrivatePublicationHome("lcm-restore-journal-scavenge-");
     const publicationError = new BackendPublicationJournalError(
       "malformed-journal",
       "publication journal is malformed",
@@ -422,6 +709,7 @@ describe("handleSessionStart", () => {
       })).rejects.toBe(publicationError);
     } finally {
       rmSync(sessionLockPathForTesting("journal-scavenge"), { force: true });
+      restoreHome();
     }
   });
 

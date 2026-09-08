@@ -103,6 +103,11 @@ export function parseCodexTranscript(transcriptPath: string): ParsedMessage[] {
     return [];
   }
 
+  return parseCodexTranscriptText(raw);
+}
+
+/** Parse already-bound transcript bytes without reopening a pathname. */
+export function parseCodexTranscriptText(raw: string): ParsedMessage[] {
   const messages: ParsedMessage[] = [];
 
   for (const line of raw.split("\n")) {

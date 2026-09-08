@@ -534,6 +534,15 @@ and then includes every cleanup failure. Typed publication admission and lock
 contention failures retain their classification so callers remain fail-closed.
 Releasing those resources does not repair or change the publication state.
 
+Publication admission callbacks follow the same contract for their bootstrap
+lock, home, and parent descriptors. When the callback succeeds, one cleanup
+failure is returned directly and two or more cleanup failures are aggregated
+in release order. When the callback fails concurrently with cleanup, its exact
+failure remains the first aggregate entry and the aggregate `cause`, followed
+by every cleanup failure. Bootstrap contention, publication-journal, and
+private-mutation contention failures retain their typed classification, with
+the aggregate preserved as their `cause`.
+
 - **Daemon and health:** an unresolved or inconsistent publication returns a
   sanitized HTTP `503` with `status: "blocked"` and no filesystem, SQL, URL,
   credential, or raw driver detail. A valid terminal PostgreSQL witness still

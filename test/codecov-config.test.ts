@@ -115,8 +115,9 @@ const expectedComponents = [
       // Error sanitization, including #893 adjacent-path, #903 prefixed
       // nested-file, #924 embedded-quote, #925/#1076 quoted-authority,
       // quoted/root-only backslash handoff, #1010 pathless-tail brackets,
-      // #1060 adjacent nested-file schemes, #1117 glued authorities, and
-      // #1128 active file-URL own-query backslash paths remain daemon-core-owned.
+      // #1060 adjacent nested-file schemes, #1113 doubled-colon drive tails,
+      // #1117 glued authorities, and #1128 active file-URL own-query
+      // backslash paths remain daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -364,6 +365,7 @@ const expectedComponents = [
     name: "Integration - PostgreSQL Search",
     paths: [
       "^src/storage/postgresql/lexical-search-repository\\.ts$",
+      "^src/storage/postgresql/tsquery-evidence\\.ts$",
       "^src/storage/postgresql/search-configuration\\.ts$",
     ],
   },
@@ -527,7 +529,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(232);
+    expect(productionFiles).toHaveLength(234);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -557,7 +559,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(232);
+    expect(ownershipCounts.size).toBe(234);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106 files in their intended components", () => {
@@ -574,6 +576,7 @@ describe("Codecov configuration", () => {
     // #930 keeps expand body-shape validation in that component as well.
     // #969 keeps the route-family and passive notification body-shape
     // validation in their existing route and daemon-events components.
+    // #1217 keeps native snapshot retries, preparation/admission and attempt lifetime route-owned.
     // #888 keeps private final ingest and compact metadata writes route-owned.
     // #890 keeps bounded best-effort status metadata reads route-owned.
     // #1003 keeps preliminary metadata admission daemon-core-owned.
@@ -603,6 +606,8 @@ describe("Codecov configuration", () => {
       ["src/home-parent-auth.ts", "unit-configuration-security"],
       // #1041 preserves bootstrap directory authentication errors when
       // descriptor cleanup also fails in this existing owner.
+      // #1144 preserves admission callback failures while retaining ordered
+      // bootstrap-lock, home, and parent descriptor cleanup evidence here.
       ["src/runtime-paths.ts", "unit-configuration-security"],
       // #1195 strict module-relative asset resolution retains this owner.
       ["src/runtime-root.ts", "unit-configuration-security"],
@@ -635,6 +640,12 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/review-stale.ts", "unit-daemon-routes"],
       // #1148 keeps promoted created_at UTC parsing in the existing daemon
       // routes owner; prompt-search and restore retain their route ownership.
+      // #1203 adds native recall evidence without changing component topology.
+      ["src/db/promoted-recall-evidence.ts", "unit-local-persistence"],
+      ["src/storage/postgresql/tsquery-evidence.ts", "integration-postgresql-search"],
+      ["src/storage/contracts.ts", "unit-storage-abstractions"],
+      ["src/storage/sqlite/repositories.ts", "unit-local-persistence"],
+      ["src/storage/postgresql/lexical-search-repository.ts", "integration-postgresql-search"],
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
       // #833 passive-event identity admission remains route-owned.
@@ -709,6 +720,8 @@ describe("Codecov configuration", () => {
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],
+      // #1155 retains SessionStart outbox pruning admission in the hook owner.
+      ["src/hooks/restore.ts", "unit-hooks"],
       // Bounded Claude completion delivery remains within the hook component.
       ["src/hooks/session-end.ts", "unit-hooks"],
       // #793 search-limit schema remains owned by MCP tools.

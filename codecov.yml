@@ -51,6 +51,8 @@ component_management:
         # configuration-security owner without changing component topology.
         # #1134/#1135/#1136 preserve private-write failures while retaining
         # ordered descriptor, temporary-file, and parent cleanup evidence here.
+        # #1144 preserves admission callback failures while retaining ordered
+        # bootstrap-lock, home, and parent descriptor cleanup evidence here.
         # #1151 revalidates the journal temporary inode after destination
         # authorization while retaining this configuration-security owner.
         # PR #791 keeps generated Gitleaks hostname-literal normalization in
@@ -87,6 +89,7 @@ component_management:
       paths:
         # Includes native adapters and the #726/#737 publication-diagnostic flow.
         # Claude's bounded session-completion acknowledgment remains hook-owned.
+        # #1155 keeps SessionStart local-outbox publication admission hook-owned.
         - "src/hooks/"
     # #1201 keeps process-only observation, its parser/client, and route allowlist here.
     - component_id: "unit-daemon-core"
@@ -112,8 +115,9 @@ component_management:
         # Error sanitization, including #893 adjacent-path, #903 prefixed
         # nested-file, #924 embedded-quote, #925/#1076 quoted-authority,
         # quoted/root-only backslash handoff, #1010 pathless-tail brackets,
-        # #1060 adjacent nested-file schemes, #1117 glued authorities, and
-        # #1128 active file-URL own-query backslash paths remain daemon-core-owned.
+        # #1060 adjacent nested-file schemes, #1113 doubled-colon drive tails,
+        # #1117 glued authorities, and #1128 active file-URL own-query
+        # backslash paths remain daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -127,6 +131,7 @@ component_management:
         # #705 prompt-search surfacing-log failures, #709 search and grep routes,
         # #710 grep mode, #792 session filtering, #793 search-limit validation,
         # #794 grep-since validation, #825 bounded atomic promotion metadata,
+        # #1217 native snapshot retries, preparation/admission and attempt lifetime remain route-owned.
         # #888 bounded atomic ingest and compact metadata timestamps,
         # #862 recent limit validation, #863 expand depth validation, #930
         # expand body-shape validation, #969 route body-shape validation, and #864
@@ -146,6 +151,7 @@ component_management:
         # #1062 keeps missing promote metadata no-clobber handling route-owned.
         # #1158 keeps PostgreSQL passive promotion route behavior route-owned;
         # deduplication implementation remains in unit-promotion below.
+        # #1203 keeps evidence-based prompt scoring and debug output route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -191,6 +197,7 @@ component_management:
         # #1082 keeps SQLite promoted-content NUL admission and replay guards
         # in local persistence; this change does not alter component ownership.
         # #1084/#1085/#1092 keep SQLite UTC timestamp parsing in this owner.
+        # #1203 keeps selected SQLite recall evidence and its owned query tokenizer here.
         - "src/db/"
         # Captured UTF-8 decoding and immutable-file authority remain local-persistence-owned.
         # #618 optional receipt schema admission stays local-persistence-owned.
@@ -217,6 +224,7 @@ component_management:
         # #910 keeps shared publication retry deadlines monotonic in this owner.
         - "^src/storage/publication-convergence\\.ts$"
         - "^src/storage/capabilities\\.ts$"
+        # #1203 retains the required recall evidence envelope in shared contracts.
         - "^src/storage/contracts\\.ts$"
         - "^src/storage/errors\\.ts$"
         - "^src/storage/factory\\.ts$"
@@ -396,7 +404,9 @@ component_management:
     - component_id: "integration-postgresql-search"
       name: "Integration - PostgreSQL Search"
       paths:
+        # #1203 owns native canonical recall parsing and selected evidence here.
         - "^src/storage/postgresql/lexical-search-repository\\.ts$"
+        - "^src/storage/postgresql/tsquery-evidence\\.ts$"
         - "^src/storage/postgresql/search-configuration\\.ts$"
     - component_id: "integration-postgresql-transcripts"
       name: "Integration - PostgreSQL Transcripts"

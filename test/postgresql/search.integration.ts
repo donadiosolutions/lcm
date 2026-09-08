@@ -13,6 +13,7 @@ import {
   type PostgreSqlLexicalSearchScopedExecutor,
 } from "../../src/storage/postgresql/lexical-search-repository.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import { parseTsqueryEvidence } from "../../src/storage/postgresql/tsquery-evidence.js";
 import {
   exerciseLexicalSearchRepositoryConformance,
   type LexicalSearchConformanceFixtures,
@@ -611,8 +612,10 @@ async function waitForSearchSnapshotWaiter(
                      'lcm_test_runtime'
                    AND activity.state OPERATOR(pg_catalog.=) 'active'
                    AND activity.wait_event_type OPERATOR(pg_catalog.=) 'Lock'
-                   AND activity.query OPERATOR(pg_catalog.~~)
-                     'WITH input AS MATERIALIZED (%'
+                   AND (
+                     activity.query OPERATOR(pg_catalog.~~) 'WITH input AS MATERIALIZED (%'
+                     OR activity.query OPERATOR(pg_catalog.~~) 'WITH selected AS MATERIALIZED (%'
+                   )
                  ORDER BY activity.pid`,
         },
         {
@@ -775,6 +778,99 @@ async function searchSnapshotDomain(
 }
 
 describe("PostgreSQL 18 lexical search", () => {
+  it("roundtrips native canonical recall atoms from the actual LCM search configuration", async () => {
+    await withPostgreSqlTestDatabase("search-canonical-evidence", async (database) => {
+      const corpus = [
+        { input: "state-of-the-art", count: 5 },
+        { input: "state of the art", count: 4 },
+        { input: "state-of-the-art OR art", count: 5 },
+        { input: "https://example.com/a", count: 2 },
+        { input: "3,000", count: 2 },
+        { input: '"quince orchard"', count: 2 },
+        { input: "CAFÉ cafe café", count: 1 },
+        { input: "running RUNNING running", count: 1 },
+        { input: "foo_bar", count: 2 },
+        { input: "can't", count: undefined },
+        { input: String.raw`c:\work\file`, count: undefined },
+        { input: "-excluded", count: 0 },
+        { input: "", count: 0 },
+      ];
+      for (const { input, count } of corpus) {
+        const serialized = await database.migrator.query<{ canonical: string }>(
+          {
+            text: `SELECT pg_catalog.websearch_to_tsquery(
+              'lcm.search_v1'::pg_catalog.regconfig,
+              lcm.normalize_search_text($1::pg_catalog.text)
+            )::pg_catalog.text AS canonical`,
+            values: [input],
+          },
+          { domain: "lexical-search", operation: "serializeCanonicalEvidence" },
+        );
+        const parsed = parseTsqueryEvidence(serialized.rows[0].canonical);
+        if (count !== undefined) expect(parsed.queryTermCount).toBe(count);
+        else expect(parsed.queryTermCount).toBeGreaterThan(0);
+        expect(new Set(parsed.groupIds).size).toBe(parsed.queryTermCount);
+        const rebound = await database.migrator.query<{ atom: string; nodes: number }>(
+          {
+            text: `SELECT atom::pg_catalog.tsquery::pg_catalog.text AS atom,
+              pg_catalog.numnode(atom::pg_catalog.tsquery) AS nodes
+              FROM pg_catalog.unnest($1::pg_catalog.text[]) WITH ORDINALITY AS terms(atom, ordinal)
+              ORDER BY ordinal`,
+            values: [parsed.atoms],
+          },
+          { domain: "lexical-search", operation: "roundtripCanonicalEvidence" },
+        );
+        expect(rebound.rows.map((row) => row.atom)).toEqual(parsed.atoms);
+        expect(rebound.rows.every((row) => row.nodes === 1)).toBe(true);
+      }
+    });
+  });
+
+  it("preserves native canonical escapes, suffix alternatives, and nested polarity", async () => {
+    await withPostgreSqlTestDatabase("search-qualified-evidence", async (database) => {
+      const input = String.raw`'can''t':ABCD* | 'a\\b':BD | 'can''t':B | !('omit' | !'keep') & !!'last'`;
+      const serialized = await database.migrator.query<{ canonical: string }>(
+        {
+          text: "SELECT $1::pg_catalog.tsquery::pg_catalog.text AS canonical",
+          values: [input],
+        },
+        { domain: "lexical-search", operation: "serializeQualifiedEvidence" },
+      );
+      const parsed = parseTsqueryEvidence(serialized.rows[0].canonical);
+      expect(parsed).toEqual({
+        atoms: ["'can''t':*ABCD", String.raw`'a\\b':BD`, "'can''t':B", "'keep'", "'last'"],
+        groupIds: [0, 1, 0, 2, 3],
+        queryTermCount: 4,
+      });
+      const rebound = await database.migrator.query<{ atom: string; nodes: number }>(
+        {
+          text: `SELECT atom::pg_catalog.tsquery::pg_catalog.text AS atom,
+            pg_catalog.numnode(atom::pg_catalog.tsquery) AS nodes
+            FROM pg_catalog.unnest($1::pg_catalog.text[]) WITH ORDINALITY AS terms(atom, ordinal)
+            ORDER BY ordinal`,
+          values: [parsed.atoms],
+        },
+        { domain: "lexical-search", operation: "roundtripQualifiedEvidence" },
+      );
+      expect(rebound.rows).toEqual(parsed.atoms.map((atom) => ({ atom, nodes: 1 })));
+
+      const alternatives = parseTsqueryEvidence("'run':A | 'run':B | 'run':*");
+      const matches = await database.migrator.query<{ matched: number }>(
+        {
+          text: `SELECT count(DISTINCT group_id)::pg_catalog.int4 AS matched
+            FROM ROWS FROM (
+              pg_catalog.unnest($1::pg_catalog.text[]),
+              pg_catalog.unnest($2::pg_catalog.int8[])
+            ) AS terms(atom, group_id)
+            WHERE $3::pg_catalog.tsvector OPERATOR(pg_catalog.@@) atom::pg_catalog.tsquery`,
+          values: [alternatives.atoms, alternatives.groupIds, "'runner':1D"],
+        },
+        { domain: "lexical-search", operation: "matchQualifiedEvidence" },
+      );
+      expect(matches.rows).toEqual([{ matched: 1 }]);
+    });
+  });
+
   it("requires and admits only the reviewed read-only search grants", async () => {
     await withPostgreSqlTestDatabase("search-grants", async (database) => {
       const projectId = await createProject(database, "Search grants");
@@ -2370,6 +2466,157 @@ describe("PostgreSQL 18 lexical search", () => {
           plans: evidence,
         })}\n`
       );
+    });
+  });
+});
+
+describe("PostgreSQL native promoted recall evidence", () => {
+  it("preserves owner, source, tags, archive, native order and limits for every envelope", async () => {
+    await withPostgreSqlTestDatabase("recall-evidence-selection", async (database) => {
+      await grantSearchRuntimePrivileges(database);
+      const projectId = await createProject(database, "Recall selected owner");
+      const foreignProjectId = await createProject(database, "Recall foreign owner");
+      const insert = (content: string, tags = ["scope"], sourceProjectId = "source-a", owner = projectId) =>
+        seedMemory(database, owner, { content, tags, sourceProjectId, confidence: 0.8 });
+      const fullContent = "quince espalier pollination orchard";
+      const full = await insert(fullContent, ["scope", "quince", "orchard"]);
+      const tied = await insert(fullContent);
+      const partial = await insert("quince unrelated");
+      const tagOnly = await insert("different vocabulary", ["scope", "quince"]);
+      const typo = await insert("quincezz");
+      const sourceMismatch = await insert(fullContent, ["scope"], "source-b");
+      const tagMismatch = await insert(fullContent, []);
+      const archived = await insert(fullContent);
+      const foreign = await insert(fullContent, ["scope"], "source-a", foreignProjectId);
+      await database.migrator.query({
+        text: `UPDATE lcm.promoted_memories SET created_at = '2026-01-01T00:00:00Z'
+          WHERE project_id = $1::pg_catalog.uuid`,
+        values: [projectId],
+      }, { domain: "lexical-search", operation: "prepareRecallSelection" });
+      await database.migrator.query({
+        text: `UPDATE lcm.promoted_memories SET archived_at = pg_catalog.now()
+          WHERE memory_id = $1::pg_catalog.uuid`,
+        values: [archived],
+      }, { domain: "lexical-search", operation: "archiveRecallFixture" });
+      const repository = new PostgreSqlLexicalSearchRepository(database.runtime, projectId);
+      const query = "quince OR espalier OR pollination OR orchard";
+      const recall = await repository.searchPromotedForRecall(query, 20, ["scope"], "source-a");
+      const byId = new Map(recall.candidates.map((candidate) => [candidate.result.id, candidate]));
+      expect(byId.get(full)?.evidence).toEqual({ queryTermCount: 4, matchedTermCount: 4 });
+      expect(byId.get(tied)?.evidence).toEqual({ queryTermCount: 4, matchedTermCount: 4 });
+      expect(byId.get(partial)?.evidence).toEqual({ queryTermCount: 4, matchedTermCount: 1 });
+      expect(byId.get(tagOnly)?.evidence).toEqual({ queryTermCount: 4, matchedTermCount: 1 });
+      for (const excluded of [sourceMismatch, tagMismatch, archived, foreign]) {
+        expect(byId.has(excluded)).toBe(false);
+      }
+      const single = await repository.searchPromotedForRecall("quince", 20, ["scope"], "source-a");
+      expect(single.candidates.find((candidate) => candidate.result.id === typo)).toMatchObject({
+        result: { rank: expect.any(Number) },
+        evidence: { queryTermCount: 1, matchedTermCount: 0 },
+      });
+      expect(single.candidates.find((candidate) => candidate.result.id === typo)!.result.rank)
+        .toBeGreaterThanOrEqual(0);
+      expect(single.candidates.some((candidate) => candidate.result.rank < 0)).toBe(true);
+      for (const search of [query, "quince"]) {
+        for (const limit of [1, 2, 5, 20]) {
+          for (const filter of [undefined, ["scope"], ["missing"]]) {
+            const ordinary = await repository.searchPromoted(search, limit, filter, "source-a");
+            const evidence = await repository.searchPromotedForRecall(search, limit, filter, "source-a");
+            expect(evidence.candidates.map((candidate) => candidate.result)).toEqual(ordinary);
+          }
+        }
+      }
+      const allSources = await repository.searchPromotedForRecall(query, 20, ["scope"]);
+      expect(allSources.candidates.some((candidate) => candidate.result.id === sourceMismatch)).toBe(true);
+      expect(allSources.candidates.some((candidate) => candidate.result.id === foreign)).toBe(false);
+    });
+  });
+
+  it("counts native compounds, duplicate aliases and complete long OR prompts without a term cutoff", async () => {
+    await withPostgreSqlTestDatabase("recall-evidence-native-units", async (database) => {
+      await grantSearchRuntimePrivileges(database);
+      const projectId = await createProject(database, "Recall native units");
+      const repository = new PostgreSqlLexicalSearchRepository(database.runtime, projectId);
+      const insert = (content: string) => seedMemory(database, projectId, {
+        content, tags: [], sourceProjectId: null, confidence: 0.8,
+      });
+      const compound = await insert("state-of-the-art");
+      const separated = await insert("state of the art");
+      const native = await repository.searchPromotedForRecall("state-of-the-art OR art", 20);
+      expect(native.candidates.find((candidate) => candidate.result.id === compound)?.evidence)
+        .toEqual({ queryTermCount: 5, matchedTermCount: 5 });
+      expect(native.candidates.find((candidate) => candidate.result.id === separated)?.evidence)
+        .toEqual({ queryTermCount: 5, matchedTermCount: 4 });
+      const accented = await insert("café");
+      const aliases = await repository.searchPromotedForRecall("CAFÉ cafe café", 20);
+      expect(aliases.candidates.find((candidate) => candidate.result.id === accented)?.evidence)
+        .toEqual({ queryTermCount: 1, matchedTermCount: 1 });
+      const full = await insert("quince espalier pollination orchard");
+      const partial = await insert("quince unrelated");
+      const words = ["quince", "espalier", "pollination", "orchard"];
+      for (const length of [40, 80, 300]) {
+        const query = [...words, ...Array.from({ length: length - words.length }, (_, index) => `unmatched${index}`)].join(" OR ");
+        const found = await repository.searchPromotedForRecall(query, 20);
+        expect(found.candidates.find((candidate) => candidate.result.id === full)?.evidence)
+          .toEqual({ queryTermCount: length, matchedTermCount: 4 });
+        expect(found.candidates.find((candidate) => candidate.result.id === partial)?.evidence)
+          .toEqual({ queryTermCount: length, matchedTermCount: 1 });
+      }
+      for (const content of ["-needle", "!!!"]) {
+        const id = await insert(content);
+        const ordinary = await repository.searchPromoted(content, 20);
+        expect(ordinary.some((row) => row.id === id)).toBe(true);
+        const found = await repository.searchPromotedForRecall(content, 20);
+        expect(found.candidates.map((candidate) => candidate.result)).toEqual(ordinary);
+        expect(found.candidates.find((candidate) => candidate.result.id === id)?.evidence)
+          .toEqual({ queryTermCount: 0, matchedTermCount: 0 });
+      }
+    });
+  });
+
+  it("reads selected content and native counts from one snapshot across a concurrent update", async () => {
+    await withPostgreSqlTestDatabase("recall-evidence-snapshot", async (database) => {
+      await grantSearchRuntimePrivileges(database);
+      await installSearchSnapshotBarriers(database);
+      const projectId = await createProject(database, "Recall evidence snapshot");
+      const id = await seedMemory(database, projectId, {
+        content: "snapshotalpha snapshotbeta", tags: [], sourceProjectId: null, confidence: 0.8,
+      });
+      const repository = new PostgreSqlLexicalSearchRepository(database.runtime, projectId);
+      const barrier = await holdSearchSnapshotBarrier(database, SNAPSHOT_BARRIER_KEYS.promoted);
+      const pending = repository.searchPromotedForRecall("snapshotalpha OR snapshotbeta", 10);
+      const completion = pending.then(
+        (rows) => ({ state: "completed" as const, rows }),
+        (error: unknown) => ({ state: "failed" as const, error })
+      );
+      const abort = new AbortController();
+      const waiting = waitForSearchSnapshotWaiter(database, abort.signal);
+      try {
+        const observation = await Promise.race([
+          waiting.then(() => ({ state: "blocked" as const })), completion,
+        ]);
+        if (observation.state === "failed") throw observation.error;
+        expect(observation.state).toBe("blocked");
+        await database.migrator.query({
+          text: "UPDATE lcm.promoted_memories SET content = $2 WHERE memory_id = $1::pg_catalog.uuid",
+          values: [id, "snapshotalpha"],
+        }, { domain: "lexical-search", operation: "updateRecallSnapshotContent" });
+        await barrier.release();
+        expect((await pending).candidates).toMatchObject([{
+          result: { id, content: "snapshotalpha snapshotbeta" },
+          evidence: { queryTermCount: 2, matchedTermCount: 2 },
+        }]);
+        expect((await repository.searchPromotedForRecall("snapshotalpha OR snapshotbeta", 10)).candidates)
+          .toMatchObject([{
+            result: { id, content: "snapshotalpha" },
+            evidence: { queryTermCount: 2, matchedTermCount: 1 },
+          }]);
+      } finally {
+        abort.abort();
+        await barrier.release();
+        await completion;
+        await waiting;
+      }
     });
   });
 });

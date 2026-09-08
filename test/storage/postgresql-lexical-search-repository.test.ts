@@ -1338,3 +1338,174 @@ describe("PostgreSQL lexical-search repository", () => {
     );
   });
 });
+
+describe("PostgreSQL promoted recall evidence", () => {
+  it("keeps ordinary selection and public rows while adding complete native evidence", async () => {
+    const database = executor((config) => {
+      const sql = text(config);
+      if (sql.includes("previous_timeout")) return timeoutRow();
+      if (sql.includes("set_config")) return result([]);
+      if (sql.includes("AS canonical_query")) {
+        return result([{ canonical_query: "'needle' | 'needle':*A | !'hidden' | 'memory'" }]);
+      }
+      return result([
+        { ...promotedRow, matched_terms: "2" },
+        { ...promotedFallbackRow, memory_id: secondMemoryId, matched_terms: 0n },
+      ]);
+    });
+    const repository = new PostgreSqlLexicalSearchRepository(database, projectId);
+    const ordinary = await repository.searchPromoted("needle OR memory", 2, ["one"], "source-a");
+    const recall = await repository.searchPromotedForRecall("needle OR memory", 2, ["one"], "source-a");
+    expect(recall).toEqual({ candidates: [
+      { result: ordinary[0], evidence: { queryTermCount: 2, matchedTermCount: 2 } },
+      { result: ordinary[1], evidence: { queryTermCount: 2, matchedTermCount: 0 } },
+    ] });
+    expect(ordinary[0]).not.toHaveProperty("matched_terms");
+    expect(ordinary[0]).not.toHaveProperty("match_order");
+    const calls = database.query.mock.calls.map(([config]) => config as QueryConfig<unknown[]>);
+    const canonical = calls.filter((config) => text(config).includes("AS canonical_query"));
+    expect(canonical).toHaveLength(1);
+    expect(canonical[0].values).toEqual(["needle OR memory"]);
+    const evidence = calls.find((config) => text(config).includes("AS matched_terms"))!;
+    expect(evidence.values?.slice(0, 5)).toEqual([projectId, "needle OR memory", "source-a", ["one"], 2]);
+    expect(evidence.values?.slice(5, 7)).toEqual([["'needle'", "'needle':*A", "'memory'"], [0, 0, 1]]);
+    expect(evidence.text).toContain("selected AS MATERIALIZED");
+    expect(evidence.text).toContain("combined.match_order");
+    expect(evidence.text).toContain("count(DISTINCT terms.group_id)");
+    // PostgreSQL only rewrites unqualified multi-argument UNNEST. Keep each
+    // built-in pinned while zipping both arrays through native ROWS FROM.
+    expect(evidence.text).toContain(`FROM ROWS FROM (
+    pg_catalog.unnest($6::pg_catalog.text[]),
+    pg_catalog.unnest($7::pg_catalog.int8[])
+  ) AS evidence(atom, group_id)`);
+    expect(evidence.text).toContain("tag.search_document OPERATOR(pg_catalog.@@)");
+    expect(evidence.text).toContain("memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid");
+    expect(evidence.text).not.toContain("needle");
+    expect(database.transaction).toHaveBeenCalledTimes(2);
+    expect(database.transaction.mock.calls[1][1]).toMatchObject({ operation: "searchPromotedForRecall" });
+  });
+});
+
+describe("PostgreSQL recall evidence validation", () => {
+  function recallExecutor(canonicalRows: QueryResultRow[], rows: QueryResultRow[] = []) {
+    return executor((config) => {
+      const sql = text(config);
+      if (sql.includes("previous_timeout")) return timeoutRow();
+      if (sql.includes("set_config")) return result([]);
+      if (sql.includes("AS canonical_query")) return result(canonicalRows);
+      return result(rows);
+    });
+  }
+
+  it("keeps complete zero-evidence envelopes for empty and negative canonical queries", async () => {
+    for (const canonical_query of ["", "!'needle'"]) {
+      const database = recallExecutor([{ canonical_query }], [
+        { ...promotedFallbackRow, matched_terms: "0" },
+        { ...promotedFallbackRow, memory_id: secondMemoryId, matched_terms: 0 },
+      ]);
+      const repository = new PostgreSqlLexicalSearchRepository(database, projectId);
+      const recall = await repository.searchPromotedForRecall("-needle", 5);
+      expect(recall.candidates.map(({ result: row, evidence }) => ({ id: row.id, ...evidence })))
+        .toEqual([
+          { id: memoryId, queryTermCount: 0, matchedTermCount: 0 },
+          { id: secondMemoryId, queryTermCount: 0, matchedTermCount: 0 },
+        ]);
+      const data = database.query.mock.calls.find(([config]) => text(config).includes("AS matched_terms"))![0];
+      expect(data.values.slice(5, 7)).toEqual([[], []]);
+    }
+  });
+
+  it("does not silently truncate more than 256 native groups", async () => {
+    const atoms = Array.from({ length: 600 }, (_, index) => `'term${index}'`);
+    const database = recallExecutor([{ canonical_query: atoms.join(" | ") }], [
+      { ...promotedRow, matched_terms: "600" },
+    ]);
+    const repository = new PostgreSqlLexicalSearchRepository(database, projectId);
+    expect((await repository.searchPromotedForRecall("large query", 1)).candidates[0].evidence)
+      .toEqual({ queryTermCount: 600, matchedTermCount: 600 });
+    const data = database.query.mock.calls.find(([config]) => text(config).includes("AS matched_terms"))![0];
+    expect(data.values[5]).toEqual(atoms);
+    expect(data.values[6]).toEqual(Array.from({ length: 600 }, (_, index) => index));
+  });
+
+  it("validates admitted input and returns empty before opening a transaction", async () => {
+    const database = recallExecutor([]);
+    const repository = new PostgreSqlLexicalSearchRepository(database, projectId);
+    for (const query of ["", "\r\n ", "\u0362 \u20e0"]) {
+      expect(await repository.searchPromotedForRecall(query, 10)).toEqual({ candidates: [] });
+    }
+    expect(await repository.searchPromotedForRecall("needle", 0)).toEqual({ candidates: [] });
+    for (const invoke of [
+      () => repository.searchPromotedForRecall(null as never, 1),
+      () => repository.searchPromotedForRecall("bad\0query", 1),
+      () => repository.searchPromotedForRecall("needle", 1001),
+      () => repository.searchPromotedForRecall("needle", 1, [null as never]),
+      () => repository.searchPromotedForRecall("needle", 1, [], "bad\ud800"),
+    ]) {
+      await expect(invoke()).rejects.toMatchObject({ operation: "searchPromotedForRecall" });
+    }
+    expect(database.transaction).not.toHaveBeenCalled();
+  });
+
+  it("rejects missing, duplicate, malformed and incompletely consumed canonical query results", async () => {
+    for (const rows of [
+      [], [{ canonical_query: "'needle'" }, { canonical_query: "'needle'" }],
+      [{ canonical_query: null }], [{ canonical_query: "'needle' |" }],
+      [{ canonical_query: "'needle' ignored" }], [{ canonical_query: "'bad\0query'" }],
+    ]) {
+      const database = recallExecutor(rows);
+      const repository = new PostgreSqlLexicalSearchRepository(database, projectId);
+      const error = await repository.searchPromotedForRecall("private query", 1).catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(PostgreSqlLexicalSearchDataError);
+      expect(error).toMatchObject({ field: "canonical_query", operation: "searchPromotedForRecall" });
+      expect(JSON.stringify(error)).not.toContain("private query");
+      expect(database.query.mock.calls.some(([config]) => text(config).includes("AS matched_terms"))).toBe(false);
+    }
+  });
+
+  it("rejects every invalid count and never returns a valid prefix of a damaged result", async () => {
+    for (const matched_terms of [null, undefined, -1, "-1", 2, "2", 0.5, "0.5", Number.NaN,
+      Infinity, "9007199254740992", 9007199254740992n, {}, true]) {
+      const database = recallExecutor([{ canonical_query: "'needle'" }], [
+        { ...promotedRow, matched_terms: "1" },
+        { ...promotedRow, memory_id: secondMemoryId, matched_terms },
+      ]);
+      const repository = new PostgreSqlLexicalSearchRepository(database, projectId);
+      await expect(repository.searchPromotedForRecall("needle", 2)).rejects.toMatchObject({
+        field: "matched_terms", operation: "searchPromotedForRecall",
+      });
+    }
+  });
+
+  it("rejects duplicate selected IDs and result overflow instead of silently dropping evidence", async () => {
+    for (const rows of [
+      [{ ...promotedRow, matched_terms: 1 }, { ...promotedRow, matched_terms: 1 }],
+      [{ ...promotedRow, matched_terms: 1 }, { ...promotedFallbackRow, matched_terms: 1 }],
+      [{ ...promotedRow, matched_terms: 1 }, { ...promotedRow, memory_id: secondMemoryId, matched_terms: 1 },
+        { ...promotedRow, memory_id: thirdMemoryId, matched_terms: 1 }],
+    ]) {
+      const repository = new PostgreSqlLexicalSearchRepository(
+        recallExecutor([{ canonical_query: "'needle'" }], rows), projectId
+      );
+      await expect(repository.searchPromotedForRecall("needle", 2)).rejects.toMatchObject({
+        field: "recall_candidates", operation: "searchPromotedForRecall",
+      });
+    }
+  });
+
+  it("preserves typed executor failures and uses the scoped savepoint without nesting", async () => {
+    const failure = new PostgreSqlStorageOperationError(
+      "STORAGE_OPERATION_FAILED", { projectId, domain: "lexical-search", operation: "searchPromotedForRecall" }, "57014", false
+    );
+    const database = scopedExecutor((config) => {
+      const sql = text(config);
+      if (sql.includes("previous_timeout")) return timeoutRow("2s");
+      if (sql.includes("set_config")) return result([]);
+      if (sql.includes("AS canonical_query")) return result([{ canonical_query: "'needle'" }]);
+      throw failure;
+    });
+    const repository = new PostgreSqlLexicalSearchRepository(database, projectId);
+    await expect(repository.searchPromotedForRecall("needle", 1)).rejects.toBe(failure);
+    expect(database.savepoint).toHaveBeenCalledTimes(1);
+  });
+});

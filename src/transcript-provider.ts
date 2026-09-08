@@ -1,5 +1,5 @@
-import { parseCodexTranscript } from "./codex-transcript.js";
-import { parseTranscript, type ParsedMessage } from "./transcript.js";
+import { parseCodexTranscript, parseCodexTranscriptText } from "./codex-transcript.js";
+import { parseTranscript, parseTranscriptText, type ParsedMessage } from "./transcript.js";
 
 export type TranscriptClient = "claude" | "codex";
 
@@ -14,4 +14,8 @@ export function parseTranscriptForClient(
   return client === "codex"
     ? parseCodexTranscript(transcriptPath)
     : parseTranscript(transcriptPath);
+}
+
+export function parseTranscriptTextForClient(raw: string, client: TranscriptClient): ParsedMessage[] {
+  return client === "codex" ? parseCodexTranscriptText(raw) : parseTranscriptText(raw);
 }
