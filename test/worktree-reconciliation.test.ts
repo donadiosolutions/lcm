@@ -1599,6 +1599,213 @@ describe("worktree reconciliation", () => {
     expect(reconcileWorktrees(linked).status).toBe("completed");
   }, 15_000);
 
+  it("refuses a source promoted TEXT value containing an embedded NUL before fencing", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "nul-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "nul-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec(
+      "UPDATE promoted SET content = CAST(X'6D656D6F727900636F6E74656E74' AS TEXT)",
+    );
+    source.close();
+
+    const targetBefore = readFileSync(fixture.targetPath);
+    let caught: unknown;
+    try {
+      reconcileWorktrees(fixture.main);
+    } catch (error) {
+      caught = error;
+    }
+    expect(String(caught)).toBe("Error: stored promoted content is unsupported");
+    expect(String(caught)).not.toContain(fixture.sourcePath);
+    expect(String(caught)).not.toContain("memory-nul-source");
+    expect(readFileSync(fixture.targetPath)).toEqual(targetBefore);
+    const preserved = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(preserved.prepare("SELECT hex(content) AS content FROM promoted").get())
+      .toEqual({ content: "6D656D6F727900636F6E74656E74" });
+    expect(preserved.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toBeUndefined();
+    preserved.close();
+    expect(existsSync(fixture.sourcePath)).toBe(true);
+  });
+
+  it.each([
+    { label: "leading NUL", hex: "006D656D6F7279" },
+    { label: "interior NUL", hex: "6D656D00726F7279" },
+    { label: "trailing NUL", hex: "6D656D6F727900" },
+    { label: "non-TEXT BLOB", hex: "6D656D6F7279", blob: true },
+  ])("refuses source promoted $label content and retries after in-place repair", ({ hex, blob }) => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "source-unsupported-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "source-unsupported-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    const contentExpression = blob ? `X'${hex}'` : `CAST(X'${hex}' AS TEXT)`;
+    source.exec(`UPDATE promoted SET content = ${contentExpression}`);
+    source.close();
+
+    expect(() => reconcileWorktrees(fixture.main, { _fts5Available: false })).toThrow(
+      "stored promoted content is unsupported",
+    );
+    expect(existsSync(fixture.sourcePath)).toBe(true);
+    const blockedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(blockedSource.prepare("SELECT hex(content) AS content FROM promoted").get())
+      .toEqual({ content: hex });
+    expect(blockedSource.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toBeUndefined();
+    blockedSource.close();
+
+    const repairedSource = new DatabaseSync(fixture.sourcePath);
+    repairedSource.prepare("UPDATE promoted SET content = ?").run("repaired source");
+    repairedSource.close();
+    expect(reconcileWorktrees(fixture.main, { _fts5Available: false })).toMatchObject({
+      status: "completed",
+    });
+    const mergedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(mergedTarget.prepare(
+      "SELECT content FROM promoted WHERE id = 'memory-source-unsupported-source'",
+    ).get()).toEqual({ content: "repaired source" });
+    mergedTarget.close();
+  });
+
+  it.each([true, false])(
+    "refuses unsupported target promoted content in the target transaction and retries in place (FTS %s)",
+    (fts5Available) => {
+      const fixture = makeProjectReconciliation(home);
+      makeDatabase(fixture.targetPath, "target-unsupported-target", "target", fixture.targetHash);
+      makeDatabase(fixture.sourcePath, "target-unsupported-source", "source", fixture.sourceHash);
+      const target = new DatabaseSync(fixture.targetPath);
+      target.exec(
+        `UPDATE promoted
+         SET id = 'memory-target-unsupported-source',
+             content = CAST(X'6D656D6F727920736F7572636500737566666978' AS TEXT),
+             source_summary_id = 'summary-target-unsupported-source',
+             project_id = '${fixture.targetHash}',
+             session_id = 'target-unsupported-source'`,
+      );
+      target.close();
+
+      expect(() => reconcileWorktrees(fixture.main, { _fts5Available: fts5Available })).toThrow(
+        "stored promoted content is unsupported",
+      );
+      const blockedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+      expect(blockedTarget.prepare("SELECT hex(content) AS content FROM promoted").get())
+        .toEqual({ content: "6D656D6F727920736F7572636500737566666978" });
+      blockedTarget.close();
+      const fencedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+      expect(fencedSource.prepare(
+        "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+      ).get()).toMatchObject({ name: "worktree_reconciliation_fence" });
+      fencedSource.close();
+
+      const repairedTarget = new DatabaseSync(fixture.targetPath);
+      repairedTarget.prepare("UPDATE promoted SET content = ?").run("memory source");
+      repairedTarget.close();
+      expect(reconcileWorktrees(fixture.main, { _fts5Available: fts5Available })).toMatchObject({
+        status: "completed",
+      });
+  });
+
+  it("accepts a legacy source database without a promoted table", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "legacy-promoted-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "legacy-promoted-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec("DROP TABLE promoted");
+    source.close();
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+  });
+
+  it("preserves JSON-escaped NUL tags while reconciling ordinary promoted content", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "nul-tags-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "nul-tags-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.prepare("UPDATE promoted SET tags = ?").run('["tag\\u0000"]');
+    source.close();
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(target.prepare(
+      "SELECT tags FROM promoted WHERE id = 'memory-nul-tags-source'",
+    ).get()).toEqual({ tags: '["tag\\u0000"]' });
+    target.close();
+  });
+
+  it("accepts empty promoted content", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "empty-content-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "empty-content-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.prepare("UPDATE promoted SET content = ''").run();
+    source.close();
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(target.prepare(
+      "SELECT content FROM promoted WHERE id = 'memory-empty-content-source'",
+    ).get()).toEqual({ content: "" });
+    target.close();
+  });
+
+  it("keeps a clean source commit when a later source is refused, then retries both", () => {
+    const { main, linked: linkedA } = makeRepository(home);
+    const linkedB = join(home, "linked-b");
+    git(main, "worktree", "add", "-qb", "linked-b", linkedB);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceAHash = hashProjectPath(linkedA);
+    const sourceBHash = hashProjectPath(linkedB);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceAHash]: { canonical: linkedA, aliases: [] },
+      [sourceBHash]: { canonical: linkedB, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const targetPath = join(home, ".lcm", "projects", targetHash, "db.sqlite");
+    const sourceAPath = join(home, ".lcm", "projects", sourceAHash, "db.sqlite");
+    const sourceBPath = join(home, ".lcm", "projects", sourceBHash, "db.sqlite");
+    makeDatabase(targetPath, "multi-target", "target", targetHash);
+    makeDatabase(sourceAPath, "multi-source-a", "source a", sourceAHash);
+    makeDatabase(sourceBPath, "multi-source-b", "source b", sourceBHash);
+    const sourceB = new DatabaseSync(sourceBPath);
+    sourceB.exec(
+      "UPDATE promoted SET content = CAST(X'6D656D6F727900736F757263652062' AS TEXT)",
+    );
+    sourceB.close();
+
+    expect(() => reconcileWorktrees(main)).toThrow(
+      "stored promoted content is unsupported",
+    );
+    const partial = new DatabaseSync(targetPath, { readOnly: true });
+    expect(partial.prepare("SELECT COUNT(*) AS count FROM conversations").get())
+      .toEqual({ count: 2 });
+    expect(partial.prepare(
+      "SELECT COUNT(*) AS count FROM conversations WHERE session_id = 'multi-source-b'",
+    ).get()).toEqual({ count: 0 });
+    partial.close();
+    for (const [path, fenced] of [[sourceAPath, true], [sourceBPath, false]] as const) {
+      const source = new DatabaseSync(path, { readOnly: true });
+      expect(source.prepare(
+        "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+      ).get() !== undefined).toBe(fenced);
+      source.close();
+    }
+    expect(statSync(sourceAPath).isFile()).toBe(true);
+    expect(statSync(sourceBPath).isFile()).toBe(true);
+
+    const repairedSourceB = new DatabaseSync(sourceBPath);
+    repairedSourceB.prepare("UPDATE promoted SET content = ?").run("repaired source b");
+    repairedSourceB.close();
+    expect(reconcileWorktrees(main)).toMatchObject({ status: "completed" });
+    const completed = new DatabaseSync(targetPath, { readOnly: true });
+    expect(completed.prepare("SELECT COUNT(*) AS count FROM conversations").get())
+      .toEqual({ count: 3 });
+    completed.close();
+  });
+
   it("reconciles a late source generation exactly once after a completed generation", () => {
     const { main, linked: linkedA } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
@@ -9261,7 +9468,7 @@ describe("worktree reconciliation", () => {
     expect(ensureWorktreeProjectReconciled(main, identity).status).toBe("not-needed");
   }, 15_000);
 
-  it("re-fences source stores when target merge markers already exist", () => {
+  it("re-fences unsupported source content after a completed target merge", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
@@ -9275,6 +9482,11 @@ describe("worktree reconciliation", () => {
     const sourcePath = join(home, ".lcm", "projects", sourceHash, "db.sqlite");
     makeDatabase(targetPath, "marker-target", "target", targetHash);
     makeDatabase(sourcePath, "marker-source", "source", sourceHash);
+    const source = new DatabaseSync(sourcePath);
+    source.exec(
+      "UPDATE promoted SET content = CAST(X'6D656D6F727900736F75726365' AS TEXT)",
+    );
+    source.close();
     const target = new DatabaseSync(targetPath);
     target.exec(`
       CREATE TABLE worktree_reconciliation_sources (
@@ -9285,6 +9497,14 @@ describe("worktree reconciliation", () => {
     target.prepare(
       "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
     ).run(sourceHash);
+    target.exec(`
+      UPDATE promoted
+      SET id = 'memory-marker-source',
+          content = 'memory',
+          source_summary_id = 'summary-marker-source',
+          project_id = '${targetHash}',
+          session_id = 'marker-source'
+    `);
     target.close();
     const targetEvents = join(home, ".lcm", "events", `${targetHash}.db`);
     const sourceEvents = join(home, ".lcm", "events", `${sourceHash}.db`);
@@ -9302,11 +9522,85 @@ describe("worktree reconciliation", () => {
     ).run(sourceHash);
     events.close();
 
-    expect(reconcileWorktrees(main).status).toBe("completed");
+    const result = reconcileWorktrees(main);
+    expect(result.status).toBe("completed");
     const merged = new DatabaseSync(targetPath, { readOnly: true });
     expect(merged.prepare("SELECT COUNT(*) AS count FROM conversations").get())
       .toEqual({ count: 1 });
+    expect(merged.prepare("SELECT hex(content) AS content FROM promoted").get())
+      .toEqual({ content: "6D656D6F7279" });
     merged.close();
+    const backup = result.backupPaths.find((path) => path.includes("oldprojects"))!;
+    const evidence = new DatabaseSync(join(backup, "db.sqlite"), { readOnly: true });
+    expect(evidence.prepare("SELECT hex(content) AS content FROM promoted").get())
+      .toEqual({ content: "6D656D6F727900736F75726365" });
+    evidence.close();
+  }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
+
+  it("refuses unsupported source content if its completed marker disappears", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "marker-race-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "marker-race-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec(`
+      UPDATE promoted
+      SET content = CAST(X'6D656D6F727900736F75726365' AS TEXT)
+    `);
+    source.close();
+    const target = new DatabaseSync(fixture.targetPath);
+    target.exec(`
+      CREATE TABLE worktree_reconciliation_sources (
+        source_hash TEXT PRIMARY KEY,
+        merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    target.prepare(
+      "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
+    ).run(fixture.sourceHash);
+    target.exec(`
+      UPDATE promoted
+      SET id = 'memory-marker-race-source',
+          content = 'memory',
+          source_summary_id = 'summary-marker-race-source',
+          project_id = '${fixture.targetHash}',
+          session_id = 'marker-race-source'
+    `);
+    target.close();
+
+    const instrumentation = instrumentTargetReconciliationCommit(
+      () => undefined,
+      {
+        onBegin: (openedTarget) => {
+          openedTarget.prepare(
+            "DELETE FROM worktree_reconciliation_sources WHERE source_hash = ?",
+          ).run(fixture.sourceHash);
+        },
+      },
+    );
+    try {
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "stored promoted content is unsupported",
+      );
+    } finally {
+      instrumentation.restore();
+    }
+
+    const preservedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(preservedTarget.prepare("SELECT hex(content) AS content FROM promoted").get())
+      .toEqual({ content: "6D656D6F7279" });
+    expect(preservedTarget.prepare(
+      "SELECT COUNT(*) AS count FROM worktree_reconciliation_sources WHERE source_hash = ?",
+    ).get(fixture.sourceHash)).toEqual({ count: 1 });
+    preservedTarget.close();
+    const preservedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(preservedSource.prepare("SELECT hex(content) AS content FROM promoted").get())
+      .toEqual({ content: "6D656D6F727900736F75726365" });
+    expect(preservedSource.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toMatchObject({ name: "worktree_reconciliation_fence" });
+    preservedSource.close();
+
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
   }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
 
   it("fails closed when a planned source disappears or its binding changes", () => {
