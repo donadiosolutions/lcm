@@ -131,6 +131,12 @@ to acknowledge its session-completion record. The daemon records the message
 count from stored history; repeating completion updates the same session record
 with the current stored count. This wait covers completion bookkeeping only.
 Compaction and promotion remain independent, best-effort background requests.
+Ordinary scheduling failures, including publication-lock contention, do not
+prevent the remaining background requests or Claude's completion attempt.
+A failed scheduling stage may already have sent its request before a final
+publication check failed; its delivery is uncertain and the hook does not retry
+it. Local typed publication-journal failures stop subsequent stages and retain
+the fail-closed admission behavior.
 
 Completion is best-effort when the daemon is unavailable, busy, or refuses
 publication admission. Ordinary completion failures still allow session exit.
@@ -157,7 +163,9 @@ mark the session complete; their session-snapshot behavior is unchanged.
 | `cwd` | string | Working directory |
 | `hook_event_name` | string | `"SessionEnd"` |
 
-**Response:** Exit code `0`. Runs best-effort; failures do not block session exit.
+**Response:** Ordinary failures return exit code `0` and do not block session
+exit. Local typed publication-journal failures return exit code `1` with the
+publication-admission diagnostic.
 
 ## UserPromptSubmit Hook
 
