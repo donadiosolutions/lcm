@@ -360,6 +360,13 @@ function fileUrlDriveColonIndex(chars: readonly string[], start: number): number
   return -1;
 }
 
+function forcedDriveContinuationColonIndex(chars: readonly string[], index: number): number {
+  if (!isPathWord(chars[index + 1])) return -1;
+  if (chars[index + 2] !== ":") return -1;
+  if (chars[index + 3] !== "/" && chars[index + 3] !== "\\") return -1;
+  return index + 2;
+}
+
 function forcedSeparatorRunHasBackslash(chars: readonly string[], start: number): boolean {
   let index = start;
   let hasBackslash = false;
@@ -375,11 +382,13 @@ function scanAbsolutePath(
   start: number,
   windows: boolean,
   driveColonIndex: number,
+  allowForcedDriveContinuation: boolean,
   nestedFileSchemeStarts: Uint8Array,
   quote?: string,
 ): { end: number; sawNonSeparator: boolean } {
   let index = start;
   let windowsContext = windows;
+  let activeDriveColonIndex = driveColonIndex;
   let parentheses = 0;
   let brackets = 0;
   let sawPathCharacter = false;
@@ -393,7 +402,7 @@ function scanAbsolutePath(
       index += 1;
       continue;
     }
-    if (index === driveColonIndex && char === ":") {
+    if (index === activeDriveColonIndex && char === ":") {
       index += 1;
       continue;
     }
@@ -447,6 +456,16 @@ function scanAbsolutePath(
       sawNonSeparator = true;
       index = cursor;
       continue;
+    }
+    if (allowForcedDriveContinuation && char === "\\") {
+      const continuationColonIndex = forcedDriveContinuationColonIndex(chars, index);
+      if (continuationColonIndex >= 0) {
+        windowsContext = true;
+        activeDriveColonIndex = continuationColonIndex;
+        sawPathCharacter = true;
+        index += 1;
+        continue;
+      }
     }
     if (char === "/" || (windowsContext && char === "\\")) {
       sawPathCharacter = true;
@@ -532,6 +551,7 @@ function sanitizeAbsolutePaths(message: string): string {
       start,
       windows,
       driveColonIndex,
+      forcedPath,
       urlPathStarts.nestedFileSchemeStarts,
       quote,
     );
