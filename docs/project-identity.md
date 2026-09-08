@@ -149,19 +149,30 @@ pristine null-versus-numeric copies may coalesce before delivery. LCM neither
 guesses a replacement nor discards either copy, so repeated reconciliation
 remains safe.
 
-Each operation has an atomically replaced journal under
+Each operation has a journal under
 `~/.lcm/reconciliations/`. The journal records discovery evidence, completed
 merge work, backup locations, aliases, and the last durable phase so an
-interrupted operation resumes instead of repeating committed work. During each
-locked real attempt, LCM retains the authenticated LCM root and reconciliation
-journal directory, including while recording a blocked state. Each journal
-write verifies that retained parent before and after publication and fails
-closed when it detects identity or private-mode drift. Each retry authenticates
-a fresh directory chain; completed fast paths and `--dry-run` do not acquire
-writable journal state. Retryable lock contention is retried only while the
-retained chain remains stable. If contention coincides with journal-parent
-drift, LCM reports unsafe storage instead of retrying into the replacement;
-preserve the displaced entries and run `lcm doctor` before retrying.
+interrupted operation resumes instead of repeating committed work. Before each
+real attempt acquires its reconciliation lock, LCM retains the authenticated
+LCM root and reconciliation journal directory. The lock callback and every
+journal transition, including blocked-state recording, must remain bound to
+that directory identity. A rebound between lock publication and the callback
+therefore fails before journal state is written into the replacement. Each
+journal write verifies that retained parent and the current journal leaf. An
+absent journal is created exclusively; a collision preserves the occupant.
+Replacing an existing journal requires the same authenticated device and inode admitted
+by the operation's last read or produced by its last successful publication.
+LCM checks this identity again after preparing the private temporary file and
+verifies that the published pathname still names that temporary inode. It fails
+closed when it detects identity, ownership, link-count, or private-mode drift.
+Portable rename does not provide a kernel compare-and-swap, so a final
+check-to-rename race remains; preserve any conflicting evidence and inspect it
+before retrying. Each retry authenticates a fresh directory chain; completed
+fast paths and `--dry-run` do not acquire writable journal state. Retryable lock
+contention is retried only while the retained chain remains stable. If
+contention coincides with journal-parent drift, LCM reports unsafe storage
+instead of retrying into the replacement; preserve the displaced entries and
+run `lcm doctor` before retrying.
 
 After source archival and project-map publication, a failure before the
 completed journal is durably published records a blocked journal from the
@@ -206,6 +217,22 @@ operator-visible result, and LCM does not publish a partially reconciled map.
 After the conflict is corrected, rerun reconciliation; the durable journal and
 merge markers continue from the verified state.
 
+Promoted-memory content is checked at the SQLite boundary during project
+reconciliation. An unmerged source row with a non-`TEXT` value or an embedded
+NUL is refused before its source fence commits, preserving the source bytes for
+an in-place repair. The same check runs on the target inside its transaction
+before conversation or promoted rows are copied and before FTS is rebuilt. A
+target refusal can leave the source fence committed; repair the target in place
+and rerun reconciliation. A source whose canonical completion marker already
+exists is re-fenced and archived without a source-content repair request. Its
+original bytes remain in the private backup, while the completion marker stays
+an idempotent boundary rather than a retrospective audit of canonical content.
+If that marker disappears before the target transaction checks it, LCM
+revalidates the normalized source before copying. The fixed error is `stored
+promoted content is unsupported` and does not include memory content, IDs,
+paths, or tags. See the
+[offline promoted-memory repair procedure](privacy.md#embedded-nul-in-promoted-memory).
+
 The canonical target's `meta.json` is a separate leaf-file trust boundary. LCM
 refuses to parse or reuse it when its owner differs from the admitted project
 directory owner (`file owner is not trusted`) or when it has more than one hard
@@ -227,20 +254,22 @@ durable merge markers make the explicit retry resumable.
 Reconciliation journals and project-sensitive pattern files are also
 authenticated before LCM reads their contents. A journal must be a regular
 file, have exactly one hard link, and use an
-owner-only mode (`0400`, `0500`, `0600`, or `0700`). Listing reconciliation
-state checks only regular files with journal-shaped names and stops if one
-fails authentication. Non-regular entries, including symlinks, directories,
-and FIFOs, are currently skipped by listing. Pattern files that LCM reads must
-be regular files with exactly one hard link. Reconciliation refuses a present
-non-regular source `sensitive-patterns.txt` path before snapshot, merge, or
-archive verification; it never opens a directory, FIFO, socket, device, or
-other non-regular leaf to decide whether it is admissible. On platforms where
-Node.js exposes `process.getuid()`, both readers also require the file to be
-owned by the current user; the ownership check is skipped when that API is
-unavailable. Historical pattern permissions, including `0644`, are accepted
-for reads. When reconciliation creates or rewrites a pattern file, the new file
-uses owner-only mode `0600`; a no-op merge leaves an existing pattern file and
-its permissions unchanged.
+owner-only mode (`0400`, `0500`, `0600`, or `0700`). Listing selects every
+journal-shaped name and authenticates each leaf that remains present, so a
+directory, symlink, FIFO, hard link, or otherwise unsafe present journal stops
+the listing. An entry that disappears after directory enumeration is omitted.
+The listing-root absence prefilter remains a separate
+limitation tracked by [#1178](https://github.com/donadiosolutions/lcm/issues/1178).
+Pattern files that LCM reads must be regular files with exactly one hard link.
+Reconciliation refuses a present non-regular source `sensitive-patterns.txt`
+path before snapshot, merge, or archive verification; it never opens a
+directory, FIFO, socket, device, or other non-regular leaf to decide whether it
+is admissible. On platforms where Node.js exposes `process.getuid()`, both
+readers also require the file to be owned by the current user; the ownership
+check is skipped when that API is unavailable. Historical pattern permissions,
+including `0644`, are accepted for reads. When reconciliation creates or
+rewrites a pattern file, the new file uses owner-only mode `0600`; a no-op
+merge leaves an existing pattern file and its permissions unchanged.
 
 When a pattern read fails authentication, it blocks that use and publication of
 the folded project map. A later archive check can fail after the same verified

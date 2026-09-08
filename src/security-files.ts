@@ -541,7 +541,7 @@ type PrivatePathIdentity = Readonly<{
   ino: bigint;
 }>;
 
-type PrivateFileIdentity = PrivatePathIdentity & Readonly<{
+export type PrivateFileIdentity = PrivatePathIdentity & Readonly<{
   parentDev: bigint;
   parentIno: bigint;
 }>;
@@ -637,6 +637,7 @@ function privateFilePublicationCleanupFailure(
 function assertPrivateTemporaryFileIdentity(
   path: string,
   expected: PrivateFileIdentity,
+  expectedNlink?: bigint,
 ): void {
   try {
     const current = lstatSync(path, { bigint: true }) as unknown as BigIntFileStat;
@@ -644,6 +645,7 @@ function assertPrivateTemporaryFileIdentity(
       !current.isFile()
       || current.dev !== expected.dev
       || current.ino !== expected.ino
+      || (expectedNlink !== undefined && current.nlink !== expectedNlink)
     ) {
       throw new Error("private temporary file changed during validation");
     }
@@ -1045,8 +1047,12 @@ export function atomicWritePrivateFile(
     readonly write?: typeof writeFileSync;
   } = {},
   parent?: PrivateDirectoryHandle,
-  options: Readonly<{ requireAbsent?: boolean }> = {},
-): void {
+  options: Readonly<{
+    requireAbsent?: boolean;
+    /** Revalidate an existing destination after temp preparation and before replacement. */
+    beforeReplace?: () => void;
+  }> = {},
+): PrivateFileIdentity {
   const directory = dirname(path);
   if (options.requireAbsent) {
     if (parent === undefined) {
@@ -1188,7 +1194,7 @@ export function atomicWritePrivateFile(
       }
     }
     if (primaryErrorPresent) throw primaryError;
-    return;
+    return tempIdentity as PrivateFileIdentity;
   }
   if (parent === undefined) {
     ensurePrivateDirectory(directory);
@@ -1253,6 +1259,16 @@ export function atomicWritePrivateFile(
       assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
       assertPrivateTemporaryFileIdentity(tempPath, preparedIdentity);
     }
+    // Portable rename cannot provide descriptor-relative compare-and-swap.
+    // Callers with a destination policy can revalidate at the last boundary
+    // after temp preparation without changing the generic writer's default.
+    if (options.beforeReplace !== undefined) {
+      options.beforeReplace();
+      if (parent !== undefined) {
+        assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+      }
+      assertPrivateTemporaryFileIdentity(tempPath, preparedIdentity, 1n);
+    }
     try {
       (operations.rename ?? renameSync)(tempPath, path);
     } catch (error) {
@@ -1295,6 +1311,7 @@ export function atomicWritePrivateFile(
     }
     throw primaryError;
   }
+  return tempIdentity as PrivateFileIdentity;
 }
 
 /**

@@ -733,6 +733,82 @@ describe("sanitizeError", () => {
   });
 
   it.each([
+    ["?", "https", "file://host.invalid?x=[label]/https://e.test/p", "file://host.invalid?x=[label]<path>"],
+    ["?", "http", "file://host.invalid?x=[label]/http://e.test/p", "file://host.invalid?x=[label]<path>"],
+    ["?", "ftp", "file://host.invalid?x=[label]/ftp://e.test/p", "file://host.invalid?x=[label]<path>"],
+    ["#", "https", "file://host.invalid#x=[label]/https://e.test/p", "file://host.invalid#x=[label]<path>"],
+    ["#", "http", "file://host.invalid#x=[label]/http://e.test/p", "file://host.invalid#x=[label]<path>"],
+    ["#", "ftp", "file://host.invalid#x=[label]/ftp://e.test/p", "file://host.invalid#x=[label]<path>"],
+  ] as const)(
+    "converges slash-prefixed nested URLs after a balanced pathless %s bracket with %s: %#",
+    (_marker, _scheme, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(first).not.toContain("://e.test/p");
+      expect(sanitizeError(first)).toBe(expected);
+      expect(sanitizeError(sanitizeError(first))).toBe(expected);
+    },
+  );
+
+  it.each([
+    ["?", "https", "file://host.invalid?x=[a/https://e.test/p]", "file://host.invalid?x=[a<path>]"],
+    ["?", "http", "file://host.invalid?x=[a/http://e.test/p]", "file://host.invalid?x=[a<path>]"],
+    ["?", "ftp", "file://host.invalid?x=[a/ftp://e.test/p]", "file://host.invalid?x=[a<path>]"],
+    ["#", "https", "file://host.invalid#x=[a/https://e.test/p]", "file://host.invalid#x=[a<path>]"],
+    ["#", "http", "file://host.invalid#x=[a/http://e.test/p]", "file://host.invalid#x=[a<path>]"],
+    ["#", "ftp", "file://host.invalid#x=[a/ftp://e.test/p]", "file://host.invalid#x=[a<path>]"],
+  ] as const)(
+    "converges slash-prefixed nested URLs inside an open pathless %s bracket with %s: %#",
+    (_marker, _scheme, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(first).not.toContain("://e.test/p");
+      expect(sanitizeError(first)).toBe(expected);
+      expect(sanitizeError(sanitizeError(first))).toBe(expected);
+    },
+  );
+
+  it.each([
+    [
+      "file://host.invalid?x=label/https://e.test/p",
+      "file://host.invalid?x=label/https://e.test/p",
+    ],
+    [
+      "file://host.invalid#x=label/ftp://e.test/p",
+      "file://host.invalid#x=label/ftp://e.test/p",
+    ],
+    [
+      "file://host.invalid?x=[label]/Users/canary/private.db",
+      "file://host.invalid?x=[label]<path>",
+    ],
+    [
+      "file://host.invalid#x=[a/Users/canary/private.db]",
+      "file://host.invalid#x=[a<path>]",
+    ],
+    [
+      "file://host.invalid?x=[label]/file://other.invalid/Users/canary/private.db",
+      "file://host.invalid?x=[label]/file://other.invalid<path>",
+    ],
+    ["see /https://example.test/p", "see <path>"],
+    [
+      "file://host.invalid?x=[label]/https://e.test/p?a=b",
+      "file://host.invalid?x=[label]<path>?a=b",
+    ],
+    [
+      "file://host.invalid?x=[label]/HTTPS://EXAMPLE.TEST:8443/p",
+      "file://host.invalid?x=[label]<path>",
+    ],
+  ] as const)("keeps #1111 URL and path boundaries: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(expected);
+    expect(sanitizeError(sanitizeError(first))).toBe(expected);
+  });
+
+  it.each([
     [
       "file://remote.invalid[/Users/canary/one.db]?next=/Users/canary/two.db",
       "file://remote.invalid[<path>]?next=/Users/canary/two.db",
@@ -1301,19 +1377,60 @@ describe("sanitizeError", () => {
     expect(sanitizeError(firstPass)).toBe(expected);
   });
 
-  // Bug #1141 separately owns single-slash file-shaped tails and their drive
-  // interaction. Pin the existing first-pass output without widening #1117.
   it.each([
+    ["file://one.invalid/Users/afile:/two.invalid/Users/b", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/afile:/C:/Users/b", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/afile:/c:\\Users\\b", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/aFiLe:/two.invalid/Users/b", "file://one.invalid<path>"],
+    ["C:\\Users\\afile:/two.invalid/Users/b", "<path>"],
+    ["/Users/afile:/two.invalid/Users/b", "<path>"],
+    ["file://one.invalid/Users/afile:/two.invalid/Users/b trailing prose", "file://one.invalid<path> trailing prose"],
     [
-      "file://one.invalid/Users/afile:/two.invalid/Users/b",
-      "file://one.invalid<path>:/two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid/Users/afile:/two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>",
     ],
-    [
-      "file://one.invalid/Users/afile:/C:/Users/b",
-      "file://one.invalid<path>:/C:/Users/b",
-    ],
-  ] as const)("preserves known single-slash residual for Bug #1141: %#", (input, expected) => {
-    expect(sanitizeError(input)).toBe(expected);
+    ["file://host.invalid?x=a\\Users\\a-file:/h2.invalid/Users/b", "file://host.invalid?x=a<path>"],
+    ["file://one.invalid/Users/afile:/https://public.test/x", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/afile:/two/bfile:/three/Users/c", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/afile:/C:/Users/bfile:/D:/Users/c", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/afile:/1:/Users/b", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/afile:/Ç:/Users/b", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/aprofile:/two.invalid/Users/b", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/a-profile:/two.invalid/Users/b", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/afile:/two.invalid:8080/Users/b", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/afile:/two.invalid/Users/b?x=1", "file://one.invalid<path>?x=1"],
+    ["file://one.invalid/Users/afile:/two.invalid/Users/b#frag", "file://one.invalid<path>#frag"],
+    ["file://one.invalid/Users/afile:/two.invalid/Users/b&x=1", "file://one.invalid<path>&x=1"],
+    ["file://one.invalid/Users/afile:/file://two.invalid/Users/b", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/afile:/E::\\SECRET", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/afile:/", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/afile:/ two.invalid/Users/b", "file://one.invalid<path> two.invalid/Users/b"],
+    ["file://one.invalid/Users/afile:/D|/Users/b", "file://one.invalid<path>|<path>"],
+  ] as const)("redacts single-slash file continuations in one pass: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    ["https://one.invalid/Users/afile:/two.invalid/Users/b", "https://one.invalid/Users/afile:/two.invalid/Users/b"],
+    ["https://one.invalid/x?q=file:/Users/private.db", "https://one.invalid/x?q=file:/Users/private.db"],
+    ["profile://one.invalid/Users/afile:/two.invalid/Users/b", "profile://one.invalid/Users/afile:/two.invalid/Users/b"],
+    ["afile:/two.invalid/Users/b", "afile:<path>"],
+    ["file:/Users/b", "file:<path>"],
+    ["file://one.invalid/Users/afile://two.invalid/Users/b", "file://one.invalid<path>"],
+    ["file://one.invalid/Users/afile:two.invalid/Users/b", "file://one.invalid<path>:two.invalid/Users/b"],
+    ["'file://one.invalid/Users/afile:/two.invalid/Users/b'", "'file://one.invalid<path>'"],
+    ["'C:\\Users\\afile:/My Files/private.db'", "'<path>'"],
+    ["file://one.invalid/Users/afile:", "file://one.invalid<path>:"],
+    ["/C:/public", "<path>:<path>"],
+  ] as const)("preserves single-slash file continuation boundaries: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
   });
 
   it.each([
