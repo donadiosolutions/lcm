@@ -493,7 +493,13 @@ The `Security` section of the doctor output shows:
   ordinary word-adjacent slash text remains unchanged. Whitespace, an unmatched
   closing bracket, a freshly recognized URL, or other URL-ending punctuation
   ends the context and clears its bracket state. A recognizable nested exact
-  `file://` path is also redacted. An exact
+  `file://` path is also redacted. A root-relative Windows backslash path is
+  also redacted when a bracketed file URL query or fragment hands off to it
+  immediately after URL-ending punctuation or a bracketed nested non-file URL.
+  A balanced outer bracket may have only spaces or tabs before the backslash.
+  This handoff is consumed once. Prose, newlines, carriage returns, and other
+  whitespace end it; ordinary text and non-file URLs do not make a single
+  backslash a global path start. An exact
   case-insensitive `file://` literal immediately after `?`, `#`, `&`, or `=`
   inside any URL starts a nested file URL. Once an outer URL has entered its
   query or fragment, the same literal also starts a nested file URL after any

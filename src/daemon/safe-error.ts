@@ -75,12 +75,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let restartedPathlessFile = false;
   let quotedPathEnded = false;
   let restartedPathlessBrackets = 0;
+  let fileTailBracketDepth = 0;
+  let pendingFileTailBackslash = false;
   let queryOrFragment = false;
   let queryOrFragmentStart = -1;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
     if (WHITESPACE_PATTERN.test(char)) {
+      const preservesClosedBracketHandoff =
+        pendingFileTailBackslash && fileTailBracketDepth === 0 && (char === " " || char === "\t");
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;
@@ -93,7 +97,36 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedPathEnded = false;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
+      if (!preservesClosedBracketHandoff) {
+        fileTailBracketDepth = 0;
+        pendingFileTailBackslash = false;
+      }
       continue;
+    }
+    const fileTailBoundaryEvent =
+      fileTailBracketDepth > 0 && (char === "]" || URL_END_DELIMITERS.has(char));
+    if (pendingFileTailBackslash) {
+      if (char === "\\") {
+        if (!restartedPathlessFile) {
+          file[index] = 1;
+          fileTailBracketDepth = 0;
+          pendingFileTailBackslash = false;
+          continue;
+        }
+      } else {
+        pendingFileTailBackslash = false;
+        if (!fileTailBoundaryEvent) fileTailBracketDepth = 0;
+      }
+    }
+    if (fileTailBracketDepth > 0 && char === "[") {
+      fileTailBracketDepth += 1;
+    } else if (fileTailBracketDepth > 0 && char === "]") {
+      fileTailBracketDepth -= 1;
+      pendingFileTailBackslash = true;
+    } else if (fileTailBracketDepth > 0 && URL_END_DELIMITERS.has(char)) {
+      pendingFileTailBackslash = true;
+    } else if (restartedPathlessFile && char === "[") {
+      fileTailBracketDepth = 1;
     }
     if (separator >= 0 && (char === "?" || char === "#")) {
       queryOrFragment = true;
@@ -169,6 +202,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       schemeQuote = 0;
       restartedPathlessFile = true;
       restartedPathlessBrackets = 0;
+      fileTailBracketDepth = 0;
+      pendingFileTailBackslash = false;
       continue;
     }
     if (
@@ -260,6 +295,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (restartedPathlessFile && char === "\\") {
       restartedPathlessFile = false;
       restartedPathlessBrackets = 0;
+      fileTailBracketDepth = 0;
+      pendingFileTailBackslash = false;
       queryOrFragment = false;
       file[index] = 1;
       continue;
