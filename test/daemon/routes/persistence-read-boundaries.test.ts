@@ -314,6 +314,26 @@ describe("persistence read route boundaries", () => {
     });
   });
 
+  it("converges a bracketed nested URL in describe wire errors", async () => {
+    const message = "read failed for file://host.invalid?x=[label]/https://e.test/p";
+    const expected = "read failed for file://host.invalid?x=[label]<path>";
+    mocks.describe.mockRejectedValueOnce(new Error(message));
+
+    expect(sanitizeError(message)).toBe(expected);
+    await invoke(createDescribeHandler(config), { nodeId: "n", cwd: "/ok" });
+    expectLast(200, { node: null, error: expected });
+  });
+
+  it("converges an open-bracket nested URL in expand wire errors", async () => {
+    const message = "expand failed for file://host.invalid#x=[a/ftp://e.test/p]";
+    const expected = "expand failed for file://host.invalid#x=[a<path>]";
+    mocks.expand.mockRejectedValueOnce(new Error(message));
+
+    expect(sanitizeError(message)).toBe(expected);
+    await invoke(createExpandHandler(config), { nodeId: "n", cwd: "/ok" });
+    expectLast(200, { expanded: null, error: expected });
+  });
+
   it("uses the injected backend without consulting a local SQLite path", async () => {
     mocks.exists.mockReturnValue(false);
     mocks.projectExists.mockResolvedValue(true);
