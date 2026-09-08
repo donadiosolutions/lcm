@@ -11,7 +11,9 @@ import { PrivateMutationLockContentionError } from '../../../dist/src/private-mu
 import { setTimeout as delay } from 'node:timers/promises';
 import { findUserSystemdPid } from '../../../dist/src/daemon/lifecycle.js';
 import { createDaemon } from '../../../dist/src/daemon/server.js';
-import { loadDaemonConfig } from '../../../dist/src/daemon/config.js';
+import { loadDaemonConfig, readDaemonConfigSnapshot, daemonConfigSnapshotWitnessEqual } from '../../../dist/src/daemon/config.js';
+import { withBackendPublicationReadRoot, assertBackendPublicationConfigReadAccess } from '../../../dist/src/storage/backend-publication.js';
+import { assertSelectedBackend } from '../../surface-parity/backend-observation.mjs';
 import { DaemonClient } from '../../../dist/src/daemon/client.js';
 import { ensureAuthToken } from '../../../dist/src/daemon/auth.js';
 import { setConfigValue } from '../../../dist/src/config-manager.js';
@@ -144,9 +146,14 @@ function projectDatabasePaths(root = join(homeDir, '.lcm/projects')) {
   });
 }
 async function assertNoFallback() {
-  await withReadAdmission(() => {
-    assert.equal(loadDaemonConfig(configPath).storage.backend, backend, 'surface-worker:selection-changed');
-    if (backend === 'postgresql') assert.equal(projectDatabasePaths().length, 0, 'surface-worker:sqlite-fallback-file');
+  assertSelectedBackend({
+    homeDir, configPath, backend,
+    assertNoSqliteFiles: () => assert.equal(projectDatabasePaths().length, 0, 'surface-worker:sqlite-fallback-file'),
+  }, {
+    withReadRoot: withBackendPublicationReadRoot,
+    readSnapshot: readDaemonConfigSnapshot,
+    assertReadAccess: assertBackendPublicationConfigReadAccess,
+    witnessEqual: daemonConfigSnapshotWitnessEqual,
   });
 }
 
