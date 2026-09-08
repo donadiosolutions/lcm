@@ -103,7 +103,7 @@ function projectMapValue(content: string | null): unknown {
   }
 }
 
-function hookPublicationHome(): string {
+export function hookPublicationHome(): string {
   const homeDir = backendPublicationHomeForConfigPath(defaultConfigPath());
   if (homeDir === undefined) {
     throw new BackendPublicationJournalError(

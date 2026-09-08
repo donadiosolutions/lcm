@@ -483,7 +483,7 @@ describe("handleSessionStart", () => {
     }
   });
 
-  it("retains publication admission while resolving the SessionStart outbox path", async () => {
+  it("retains append admission while resolving the SessionStart outbox path", async () => {
     const restoreHome = usePrivatePublicationHome("lcm-restore-scavenge-path-");
     let pathFenceError: unknown;
     const path = vi.mocked(eventsDbPath).mockImplementationOnce(() => {
@@ -512,7 +512,7 @@ describe("handleSessionStart", () => {
         { post: vi.fn().mockResolvedValue({ context: "restored" }) },
       )).resolves.toEqual({ exitCode: 0, stdout: "restored" });
       expect(path).toHaveBeenCalledWith("/proj");
-      expect(pathFenceError).toBeInstanceOf(PrivateMutationLockContentionError);
+      expect(pathFenceError).toBeUndefined();
     } finally {
       open.mockRestore();
       close.mockRestore();

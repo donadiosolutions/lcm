@@ -91,7 +91,7 @@ export async function withCliProjectStorage<T>(
             throw new Error("The bound PostgreSQL project is unavailable.");
           }
         } catch (error) {
-          try { await factory.close(); } catch { /* Preserve the primary admission error. */ }
+          try { await factory.close(token); } catch { /* Preserve the primary admission error. */ }
           throw error;
         }
         let failed = false;
@@ -102,8 +102,8 @@ export async function withCliProjectStorage<T>(
           throw error;
         } finally {
           let closeFailed = false;
-          try { await storage.close(); } catch { closeFailed = true; }
-          try { await factory.close(); } catch { closeFailed = true; }
+          try { await storage.close(token); } catch { closeFailed = true; }
+          try { await factory.close(token); } catch { closeFailed = true; }
           if (!failed && closeFailed) throw new Error("LCM storage could not be closed.");
         }
       });

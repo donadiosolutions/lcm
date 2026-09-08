@@ -45,6 +45,7 @@ export interface EventSidecarSummary {
 }
 
 export interface EventSidecarScanOptions {
+  publicationLockToken?: import("../storage/backend-publication.js").BackendPublicationLockToken;
   homeDir?: string;
   /** A local project identity hash, never a filesystem path or backend UUID. */
   projectId?: string;
@@ -434,7 +435,7 @@ async function scanEventSidecars(options: EventSidecarScanOptions): Promise<Even
           assertEventSidecarParent(parent, dir, parentWitness);
           let db: Awaited<ReturnType<typeof outboxFactory.open>>;
           try {
-            const opening = outboxFactory.open(path, { busyTimeoutMs: Math.min(500, Math.max(0, deadline - Date.now())) });
+            const opening = outboxFactory.open(path, { busyTimeoutMs: Math.min(500, Math.max(0, deadline - Date.now())) }, options.publicationLockToken);
             try {
               db = await awaitSidecarScan<Awaited<ReturnType<typeof outboxFactory.open>>>(
                 opening, deadline, options.signal,

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -19,11 +20,14 @@ import type { ProjectStorage, StorageBackendFactory } from "../../../src/storage
 import {
   BackendPublicationJournalError,
   withBackendPublicationConsumerLockAsync,
+  type BackendPublicationLockToken,
 } from "../../../src/storage/backend-publication.js";
 import { clearProjectMapCache } from "../../../src/project-map.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 import { isAbortError } from "../../../src/daemon/cancellation.js";
 import { projectIdentity } from "../../../src/daemon/project.js";
+import { closeLcmConnection, getPoolStats } from "../../../src/db/connection.js";
+import { SqliteStorageBackendFactory } from "../../../src/storage/sqlite/factory.js";
 
 const storageFactorySeam = vi.hoisted(() => ({ create: vi.fn() }));
 
@@ -70,7 +74,7 @@ async function withTemporaryProject<T>(operation: (project: TemporaryProject) =>
   }
 }
 
-function fakeProject(close: () => Promise<void>): ProjectStorage {
+function fakeProject(close: ProjectStorage["close"]): ProjectStorage {
   return {
     backend: "sqlite",
     projectId: "project-id",
@@ -263,7 +267,11 @@ describe("route storage cleanup", () => {
   it("opens an existing project with the live admission token and closes it before admission release", async () => {
     await withTemporaryProject(async ({ home, cwd, config }) => {
       const events: string[] = [];
-      const project = fakeProject(async () => { events.push("project-close"); });
+      let admissionToken: object | undefined;
+      const project = fakeProject(async token => {
+        expect(token).toBe(admissionToken);
+        events.push("project-close");
+      });
       const openExistingProject = vi.fn(async (_identity, token) => {
         expect(token).toBeDefined();
         events.push("open-existing");
@@ -273,6 +281,7 @@ describe("route storage cleanup", () => {
       const controller = new AbortController();
       const withPublicationAdmission = async <T>(operation: (token: object) => Promise<T>): Promise<T> =>
         withBackendPublicationConsumerLockAsync(home, async token => {
+          admissionToken = token;
           events.push("admission-enter");
           const result = await operation(token);
           events.push("admission-release");
@@ -285,9 +294,10 @@ describe("route storage cleanup", () => {
         factory,
         context: { withPublicationAdmission, signal: controller.signal },
         mode: "existing",
-      }, async (storage, signal) => {
+      }, async (storage, signal, currentToken) => {
         expect(storage).toBe(project);
         expect(signal).toBe(controller.signal);
+        expect(currentToken).toBe(admissionToken);
         events.push("operation");
         return storage.projectId;
       })).resolves.toBe("project-id");
@@ -300,6 +310,142 @@ describe("route storage cleanup", () => {
         "admission-release",
       ]);
       expect(factory.close).not.toHaveBeenCalled();
+    });
+  });
+
+  it("closes a real canonical shared-factory project with the exact request token", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+      execFileSync("git", ["init", "-q", cwd]);
+      const factory = new SqliteStorageBackendFactory();
+      let admissionToken: object | undefined;
+      let closeToken: object | undefined;
+      const timeline: string[] = [];
+      const openProject = factory.openProject.bind(factory);
+      vi.spyOn(factory, "openProject").mockImplementation(async (...args) => {
+        const project = await openProject(...args);
+        const close = project.close.bind(project);
+        vi.spyOn(project, "close").mockImplementation(async token => {
+          closeToken = token;
+          timeline.push("project-close");
+          return close(token);
+        });
+        return project;
+      });
+      const startedAt = performance.now();
+      try {
+        await expect(withProjectStorage({
+          config,
+          cwd,
+          factory,
+          mode: "create",
+          beforeClose: async () => { timeline.push("before-close"); },
+          context: {
+            signal: new AbortController().signal,
+            withPublicationAdmission: operation => withBackendPublicationConsumerLockAsync(
+              home,
+              async token => {
+                admissionToken = token;
+                try {
+                  return await operation(token);
+                } finally {
+                  timeline.push("admission-release");
+                }
+              },
+            ),
+          },
+        }, async storage => {
+          timeline.push("operation");
+          await storage.conversations.getOrCreateConversation("route-operation");
+          return storage.projectId;
+        })).resolves.toBeTypeOf("string");
+        expect(performance.now() - startedAt).toBeLessThan(1_000);
+        expect(closeToken).toBe(admissionToken);
+        expect(timeline).toEqual([
+          "operation",
+          "before-close",
+          "project-close",
+          "admission-release",
+        ]);
+        expect(getPoolStats().connections).toEqual([]);
+      } finally {
+        await factory.close();
+        closeLcmConnection();
+      }
+    });
+  });
+
+  it("shares one token-bearing close across abort and finally", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+      let token: BackendPublicationLockToken | undefined;
+      const controller = new AbortController();
+      let releaseClose!: () => void;
+      const closeGate = new Promise<void>(resolve => { releaseClose = resolve; });
+      const close = vi.fn(async (received?: object) => {
+        expect(received).toBe(token);
+        await closeGate;
+      });
+      const project = fakeProject(close);
+      const factory = fakeFactory({ openProject: async () => project });
+      let operationEntered!: () => void;
+      const entered = new Promise<void>(resolve => { operationEntered = resolve; });
+      const result = withProjectStorage({
+        config,
+        cwd,
+        factory,
+        mode: "create",
+        context: {
+          signal: controller.signal,
+          withPublicationAdmission: operation => withBackendPublicationConsumerLockAsync(
+            home,
+            liveToken => {
+              token = liveToken;
+              return operation(liveToken);
+            },
+          ),
+        },
+      }, async (_storage, signal) => {
+        operationEntered();
+        await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+        return "aborted-result";
+      });
+      await entered;
+      controller.abort();
+      await Promise.resolve();
+      expect(close).toHaveBeenCalledOnce();
+      releaseClose();
+      await expect(result).resolves.toBe("aborted-result");
+      expect(close).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("keeps a successful route result when token-bearing close rejects", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+      let token: BackendPublicationLockToken | undefined;
+      const close = vi.fn(async (received?: object) => {
+        expect(received).toBe(token);
+        throw new Error("close failed");
+      });
+      const project = fakeProject(close);
+      await expect(withProjectStorage({
+        config,
+        cwd,
+        factory: fakeFactory({ openProject: async () => project }),
+        mode: "create",
+        context: {
+          signal: new AbortController().signal,
+          withPublicationAdmission: operation => withBackendPublicationConsumerLockAsync(
+            home,
+            liveToken => {
+              token = liveToken;
+              return operation(liveToken);
+            },
+          ),
+        },
+      }, async () => "route-result")).resolves.toBe("route-result");
+      expect(close).toHaveBeenCalledOnce();
     });
   });
 

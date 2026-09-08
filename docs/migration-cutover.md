@@ -7,18 +7,178 @@ each step. A private durable journal makes an interrupted protocol run
 recoverable without guessing from timestamps or partially changed data.
 
 This foundation does **not** copy data, activate PostgreSQL, change the current
-storage backend, or execute rollback by itself. Later migration commands will
-perform those effects and use this protocol to record their boundaries.
+storage backend, or execute rollback by itself. The immutable SQLite snapshot
+capability adds the authenticated source artifact used by those later steps;
+it still does not copy records into PostgreSQL or select a destination.
+
+Compaction releases publication admission while waiting for a model and revalidates
+it for each subsequent storage operation. A project handle uses that operation's
+current token; it cannot reuse the expired token from opening the project. Daemon
+health probes acquire their own fresh admission, so an idle model request does not
+make storage unhealthy. Both paths still refuse access during a migration hold.
+
+## Immutable SQLite preparation and capture
+
+Migration preparation is an explicit upgrade action. For an enrolled machine,
+it adopts the two private `migration_receipt_v1_` tables in each SQLite project
+and records the first machine sequence for which passive-event effects must
+commit with an exact receipt. Ordinary SQLite installations without a registered
+machine continue to open and process events as before. They do not fabricate an
+identity or epoch, and snapshot admission refuses their unproven history.
+
+Snapshot capture and dry-run are strictly read-only with respect to the source.
+LCM authenticates read-only, no-follow descriptors for the project database,
+local event outbox, machine-sequence database, and each WAL or shared-memory
+sidecar. Shared-memory bytes are stability evidence and are never published.
+SQLite recovery, `quick_check`, schema inspection, UTF-8 admission, and
+`user_version = 0` validation run only on private copied bytes. Capture never
+opens the source through SQLite, checkpoints it, changes its mode, runs a source
+migration, cleans a sidecar, or writes its directory.
+
+Private raw database/WAL copies and normalized database artifacts are sealed to
+read-only mode before their final file sync. A mode-change or final-sync failure
+prevents publication of the committed snapshot marker.
+
+Maintenance enters durably before capture. Hooks may keep appending to their
+local outboxes throughout the hold, including after restart. Capture takes a
+short local append barrier, authenticates fresh source bytes and a private copy
+of the sequence checkpoint, and durably refreshes the held journal's cutoff and
+byte commitment by exact-checksum compare-and-swap. The barrier remains held
+through private artifact and queue-evidence sealing. Later hook events stay
+beyond the sealed cutoff.
+Project writers, promotion, delivery claims, correlation repair, processing
+marks, replay, and destructive pruning remain fenced while maintenance is held.
+The maintenance record survives restart and can leave the fence only through an
+authoritative selected-generation readback or an explicit source-preserving
+abort. Reports do not grant replay or prune authority.
+
+The receipt contract deliberately refuses ambiguous legacy input. A receipt-era
+event is represented only when its immutable envelope exactly matches an applied
+or no-effect receipt from the same project transaction. A receipt-era pending
+event with no receipt is retained for later guarded replay. A processed receipt-
+era event without a receipt, an unknown machine, or any pre-epoch event refuses
+cutover. Both processed and unprocessed legacy rows can fall on the historical
+commit-before-`processed_at` crash boundary, so this refusal can be permanent.
+LCM preserves the source and private evidence rather than guessing whether to
+replay or suppress such an effect.
+
+An established receipt epoch also proves that preparation created the
+project's canonical local outbox. Capture therefore refuses an enrolled source
+when that outbox is absent, even if the sequence cutoff is null or the outbox
+was empty before it disappeared. Absence cannot prove an empty queue. A present
+empty outbox remains valid, and older sources without enrollment can still be
+inspected for the normal legacy refusal path. Capture never recreates a missing
+outbox.
+
+`captureAuthenticatedSqliteMigrationSource` returns an outer-ready snapshot with
+its physical artifact, exact receipt reference, bounded queue page references,
+and a checksum. It reauthenticates machine identity, project metadata, aliases,
+configuration, and the held maintenance journal before sealing and returning.
+The actual copied machine-sequence counter must equal the journal cutoff. The
+currently supported participant set is the authenticated local machine; a shared
+project or another participant without acknowledged fencing is refused.
+
+Queue evidence is stored separately under
+`~/.lcm/migration-evidence/<generationId>/`. Each immutable page contains at most
+128 records and 128 KiB. The bounded index is at most 1 MiB; a generation admits
+at most 100,000 queue or receipt rows. Receipt checksums and queue records are
+hashed incrementally in canonical order. Capture never loads the entire queue
+or receipt set to construct pages. Inputs beyond these limits are refused with
+the source and partial generation preserved.
+
+Use `inspectAuthenticatedSqliteMigrationSnapshot` to verify a previously sealed
+outer-ready snapshot. Readback authenticates page identities and content and
+recomputes the receipt and queue commitments from the immutable SQLite
+artifacts. A copied replacement, malformed record, forged disposition, partial
+page set, or changed request refuses reuse. A physical artifact reported as
+complete by the lower-level artifact inspector has not, by itself, passed this
+queue and receipt admission. Preserve both directories on failure and start a
+new generation after the cause is resolved; do not repair a partial generation
+by editing its files.
+
+The canonical SQLite reader remains owned by the portable storage adapter.
+Migration copy orchestration consumes the physical artifact alongside the
+outer-ready receipt/page evidence; it must not create a second reader,
+maintenance lock, or admission authority. Exact duplicate promotion attempts
+reuse the committed receipt before repeating any decision or effect, including
+recovery from a crash before the outbox processing mark.
+
+| Source condition | Snapshot disposition |
+| --- | --- |
+| Enrolled receipt-era applied/no-effect event with exact envelope receipt | Represented |
+| Enrolled receipt-era event at or below cutoff, unprocessed, without receipt | Retained pending replay |
+| Event appended after the sealed cutoff | Retained in the local outbox |
+| Legacy processed or unprocessed event | Refused as effect-ambiguous |
+| Receipt-era processed event without receipt | Refused as integrity failure |
+| Enrolled source with missing canonical outbox | Refused as integrity failure |
+| Missing, pending, nonlocal, duplicate, or drifting machine authority | Refused |
+| Disconnected participant without durable acknowledged fencing | Refused |
+| Partial, replaced, or tampered generation | Refused; evidence preserved |
 
 ## How to use this today
 
-Issue #621 is an internal foundation for the later migration work. It exposes
-only the programmatic `src/migration` module; there is no CLI or operator
-command for this protocol yet. Normal installations continue to use their
-existing storage selection. Do not manually create, edit, delete, or otherwise
-mutate the journal or its lock file. If the protocol refuses a journal state,
-preserve the generation directory for the later diagnostic and recovery
-tooling.
+These capabilities are programmatic preparation APIs; no migration CLI is
+available yet. `prepareSqliteMigrationEnrollment` accepts the current project
+and home directory plus a separately resolved PostgreSQL target configuration.
+It uses the existing verified PostgreSQL identity service to register and read
+back the machine, while SQLite remains selected. Remote work occurs outside the
+publication lock. Finalization rechecks the original configuration and project
+identity, then adopts the forward receipt epoch under writer admission and the
+local append barrier. It never backfills ambiguous historical receipts.
+
+Preparation also initializes or validates that project's local event outbox
+before establishing its receipt epoch. An empty project needs no preliminary
+hook or configuration file: its first hook can append durably after maintenance
+is held. Ordinary SQLite project opens for a registered machine perform this
+same preparation. Outbox connection opening and schema initialization share the
+append barrier with capture, so they wait until a capture finishes. During the
+hold, an absent or outdated outbox is refused; capture and dry-run never repair
+it. Prepare the project successfully before authenticating its source and
+entering maintenance.
+
+Successful enrollment publishes the registered machine identity only after the
+canonical project store, local outbox, sequence allocator, and receipt epoch are
+durable for that exact PostgreSQL identity. If local SQLite preparation fails,
+`machine.json` remains pending. A retry reuses an already committed exact epoch
+before it exposes the machine identity, including when identity publication was
+the interrupted step. Hooks captured while the identity is still pending remain
+unregistered legacy evidence and can still make migration refuse ambiguity;
+enrollment does not backdate an epoch or reclassify those events.
+
+A caller authenticates the SQLite source and source bytes, then enters held
+maintenance through the existing backend publication coordinator. The initial
+roster contains the verified machine, its last allocated sequence (or null
+before allocation), and the authenticated source-byte evidence. A later call to
+`captureAuthenticatedSqliteMigrationSource` acquires its own append barrier;
+callers need not retain a process-local token across maintenance or restart.
+The supplied checksum must match the durable held journal; fresh evidence is
+bound at capture only while the physical generation remains absent.
+Configuration, source selection, machine identity, or participant drift refuses
+capture. The APIs are exported by the `src/migration` module for the later
+migration orchestrator.
+
+Capture returns the refreshed maintenance checksum in
+`artifact.maintenanceChecksumSha256` and the exact source-byte commitment in
+`artifact.sourceByteWitnessSha256`; its source role witnesses are
+`artifact.roles[].source`. Retain these with the generation for exact retries.
+An existing complete artifact is reused only with its original authority,
+maintenance checksum and source-byte witness. A retry never refreshes a partial,
+complete, replaced or tampered generation to fit later source bytes.
+
+If capture fails after refreshing the journal but before creating any generation
+intent, read the durable held journal again, reauthenticate source bytes under
+the append barrier, and retry with that journal's checksum and commitment. Fresh bytes may include later legal appends: an absent generation has not yet
+frozen its capture-time commitment. The exact generation and source-selection
+authority must still match the durable hold. Once any generation intent exists, preserve its files
+and use explicit abort followed by a new generation. An interrupted
+`maintenance-entering` can be resumed with the exact original request and the
+observed `expectedChecksumSha256`, or explicitly aborted with matching source
+selection and abort evidence. Completed selection and authenticated abort
+journals are archived byte-for-byte before a subsequent generation begins.
+
+Normal installations retain their existing storage selection. Do not manually
+create, edit, delete, or otherwise mutate the journal or its lock file. Preserve
+the physical and queue evidence directories when preparation refuses a state.
 
 ## Configuration
 

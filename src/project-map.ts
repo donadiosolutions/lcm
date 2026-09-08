@@ -916,13 +916,16 @@ function resolveCliTarget(
   return { hash: identity.id, entry: refreshed[identity.id], map: refreshed };
 }
 
-export function projectMapPathsForHash(hash: string): string[] {
+export function projectMapPathsForHash(
+  hash: string,
+  publicationLockToken?: BackendPublicationLockToken,
+): string[] {
   return withBackendPublicationConsumerLock(undefined, (token) => {
     const map = loadProjectMapWithMetadata({ _publicationLockToken: token });
     const entry = map[hash];
     if (!entry) return [];
     return [...new Set([entry.canonical, ...entry.aliases].map((path) => resolve(path)))];
-  });
+  }, { lockToken: publicationLockToken });
 }
 
 export function isProjectHash(value: string): boolean {

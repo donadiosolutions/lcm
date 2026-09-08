@@ -1,7 +1,7 @@
 import { admittedProjectIdentity } from "./storage-lifecycle.js";
 import type { EventRow, PatternReinforcementStats } from "../../hooks/events-db.js";
 import { eventsDbPath, existingEventsDbPath } from "../../db/events-path.js";
-import { deduplicateAndInsert } from "../../promotion/dedup.js";
+import { deduplicateAndInsert, deduplicateAndInsertInRepositories } from "../../promotion/dedup.js";
 import { sendJson, type RouteExecutionContext, type RouteHandler } from "../server.js";
 import { isMissingCwdError, validateCwd } from "../validate-cwd.js";
 import { projectPathsForIdentity } from "../project.js";
@@ -218,7 +218,7 @@ async function withLockedCwdPromotion<T>(
       return await onReady(resolvedCwd, sidecarPath);
     } catch (error) {
       if (!isMissingCwdError(error)) throw error;
-      return onUnavailable(await parkUnavailableCwdEventsUnlocked(sidecarPath));
+      return onUnavailable(await parkUnavailableCwdEventsUnlocked(sidecarPath, publicationLockToken));
     }
   });
 }
@@ -289,10 +289,11 @@ async function clearRecoveredMissingCwdState(
 
 async function parkUnavailableCwdEventsUnlocked(
   sidecarPath: string,
+  publicationLockToken?: BackendPublicationLockToken,
 ): Promise<PromoteResult> {
   const outboxFactory = new SQLiteLocalHookOutboxFactory();
   try {
-    const edb = await outboxFactory.openExisting(sidecarPath);
+    const edb = await outboxFactory.openExisting(sidecarPath, {}, publicationLockToken);
     if (!edb) return noSidecarParkingResult();
     const state = await edb.observeMissingCwd(
       Date.now(),
@@ -430,7 +431,8 @@ export function createPromoteAllEventsHandler(
         projects: [],
       };
 
-      const sidecars = await collectEventSidecars({ timeoutMs: 30_000, maxDbs: Number.MAX_SAFE_INTEGER });
+      const sidecars = await collectEventSidecars({ timeoutMs: 30_000, maxDbs: Number.MAX_SAFE_INTEGER,
+        publicationLockToken: context?.publicationLockToken });
       result.scanned = sidecars.length;
       result.sidecarsWithUnprocessed = sidecars.filter(sidecar => sidecar.unprocessed > 0).length;
 
@@ -609,13 +611,18 @@ async function drainEventsForCwdUnlocked(
 
   const outboxFactory = new SQLiteLocalHookOutboxFactory();
   let ownedFactory: StorageBackendFactory | undefined;
+  const executionContext = promotionExecutionContext(publicationLockToken, context);
+  const effectiveToken = executionContext?.publicationLockToken;
   try {
-    const edb = await outboxFactory.open(sidecarPath);
-    await edb.clearMissingCwd();
-    const executionContext = promotionExecutionContext(publicationLockToken, context);
+    const edb = await withPromotionLocalAdmission(executionContext, async token => {
+      const outbox = await outboxFactory.open(sidecarPath, {}, token);
+      await outbox.clearMissingCwd(token);
+      return outbox;
+    });
     const factory = storageFactory ?? (ownedFactory = await createPromotionStorageFactory(config, executionContext));
     for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
-      const prepared = await preparePromotionBatch(config, edb);
+      const prepared = await withPromotionLocalAdmission(executionContext,
+        token => preparePromotionBatch(config, edb, token));
       const expectedIdentity = prepared.events.length === 0
         ? undefined
         : await admittedProjectIdentity(cwd, config.storage, executionContext);
@@ -649,7 +656,7 @@ async function drainEventsForCwdUnlocked(
       }
     }
   } finally {
-    await closeRouteStorage(outboxFactory, ownedFactory);
+    await closePromotionStorage(effectiveToken, outboxFactory, ownedFactory);
   }
 
   result.incomplete = true;
@@ -693,11 +700,14 @@ async function promoteEventsForCwdUnlocked(
 ): Promise<PromoteResult> {
   const outboxFactory = new SQLiteLocalHookOutboxFactory();
   let ownedFactory: StorageBackendFactory | undefined;
+  const executionContext = promotionExecutionContext(publicationLockToken, context);
+  const effectiveToken = executionContext?.publicationLockToken;
   try {
-    const edb = await outboxFactory.open(sidecarPath);
-    await edb.clearMissingCwd();
-    const prepared = await preparePromotionBatch(config, edb);
-    const executionContext = promotionExecutionContext(publicationLockToken, context);
+    const { edb, prepared } = await withPromotionLocalAdmission(executionContext, async token => {
+      const edb = await outboxFactory.open(sidecarPath, {}, token);
+      await edb.clearMissingCwd(token);
+      return { edb, prepared: await preparePromotionBatch(config, edb, token) };
+    });
     const factory = storageFactory ?? (ownedFactory = await createPromotionStorageFactory(config, executionContext));
     const expectedIdentity = prepared.events.length === 0
       ? undefined
@@ -712,8 +722,30 @@ async function promoteEventsForCwdUnlocked(
       expectedIdentity,
     );
   } finally {
-    await closeRouteStorage(outboxFactory, ownedFactory);
+    await closePromotionStorage(effectiveToken, outboxFactory, ownedFactory);
   }
+}
+
+/** Queue only local SQLite preparation; scrubber and selected work have separate lifetimes. */
+async function withPromotionLocalAdmission<T>(
+  context: PromotionExecutionContext | undefined,
+  operation: (token?: BackendPublicationLockToken) => Promise<T>,
+): Promise<T> {
+  return context?.withPublicationAdmission === undefined
+    ? operation(context?.publicationLockToken)
+    : context.withPublicationAdmission(operation, context.signal);
+}
+
+/** Keep retained compatibility admission on resources owned by this route. */
+async function closePromotionStorage(
+  publicationLockToken: BackendPublicationLockToken | undefined,
+  outboxFactory: SQLiteLocalHookOutboxFactory,
+  ownedFactory: StorageBackendFactory | undefined,
+): Promise<void> {
+  await closeRouteStorage(
+    { close: () => outboxFactory.close(publicationLockToken) },
+    ownedFactory === undefined ? undefined : { close: () => ownedFactory.close(publicationLockToken) },
+  );
 }
 
 type PreparedPromotionBatch = Readonly<{
@@ -725,8 +757,9 @@ type PreparedPromotionBatch = Readonly<{
 async function preparePromotionBatch(
   config: DaemonConfig,
   edb: LocalHookOutboxRepository,
+  publicationLockToken?: BackendPublicationLockToken,
 ): Promise<PreparedPromotionBatch> {
-  const events = await edb.getUnprocessed();
+  const events = await edb.getUnprocessed(undefined, publicationLockToken);
   if (events.length === 0) {
     return {
       events,
@@ -749,6 +782,7 @@ async function preparePromotionBatch(
         event.category,
         event.data,
         thresholds.insightsMaxAgeDays ?? 90,
+        publicationLockToken,
       ));
     } catch (error) {
       // Keep the local sidecar read outside selected storage admission while
@@ -802,7 +836,7 @@ async function runSelectedPromotionBatch(
   try {
     result = await withProjectStorage(
       storageRequest,
-      async project => {
+      async (project, _signal, currentPublicationLockToken) => {
         if (prepared.events.length === 0) {
           return {
             promoted: 0,
@@ -822,6 +856,7 @@ async function runSelectedPromotionBatch(
           prepared.events,
           prepared.reinforcementCache,
           prepared.reinforcementErrors,
+          currentPublicationLockToken,
         );
       },
     );
@@ -844,6 +879,7 @@ async function promoteEventsBatch(
   events: EventRow[],
   reinforcementCache: Map<string, PatternReinforcementStats>,
   reinforcementErrors: Map<EventRow["event_id"], unknown>,
+  publicationLockToken?: BackendPublicationLockToken,
 ): Promise<PromoteResult> {
   const result: PromoteResult = { promoted: 0, skipped: 0, correlated: 0, errors: 0 };
 
@@ -902,7 +938,48 @@ async function promoteEventsBatch(
             // Tier 3: pattern-only — require either an existing promoted match or
             // enough repeated passive evidence to bootstrap a new memory.
             confidence = eventConf.pattern ?? 0.2;
-            if (!reinforced) {
+            if (reinforced) {
+              newEntryConfidence = Math.min(
+                thresholds.maxConfidence ?? 1.0,
+                confidence + (thresholds.reinforcementBoost ?? 0.3),
+              );
+            }
+          }
+
+          // Set correlation chain
+          const correlatedErrorId = (event as EventRow & { _correlatedErrorId?: number })._correlatedErrorId;
+          if (correlatedErrorId) {
+            await edb.setPrevEventId(event.event_id, correlatedErrorId);
+          }
+
+          const epoch = event.machine_id === null || project.backend !== "sqlite"
+            ? null
+            : await project.transaction(async (repositories) =>
+              repositories.migrationReceipt?.getEpoch(event.machine_id!) ?? null);
+          const receiptEra = epoch !== null
+            && event.machine_sequence >= epoch.firstMachineSequence;
+          const dedupInput = {
+            content: scrubbedData,
+            tags: [
+              tag,
+              "source:passive-capture",
+              `hook:${event.source_hook}`,
+              ...(reinforced ? ["signal:reinforced"] : []),
+            ],
+            sourceProjectId: project.projectId,
+            candidateScope: "owner" as const,
+            backend: project.backend,
+            sessionId: event.session_id,
+            depth: 0,
+            confidence,
+            newEntryConfidence,
+            thresholds: {
+              dedupBm25Threshold: thresholds.dedupBm25Threshold ?? 15,
+              dedupCandidateLimit: thresholds.dedupCandidateLimit ?? 100,
+            },
+          };
+          if (!receiptEra) {
+            if (event.priority === 3 && !reinforced) {
               const candidateSourceProjectId = project.backend === "postgresql"
                 ? undefined
                 : project.projectId;
@@ -917,42 +994,75 @@ async function promoteEventsBatch(
                 result.skipped++;
                 continue;
               }
-            } else {
-              newEntryConfidence = Math.min(
-                thresholds.maxConfidence ?? 1.0,
-                confidence + (thresholds.reinforcementBoost ?? 0.3),
+            }
+            await deduplicateAndInsert({
+              transaction: (callback) => project.transaction(callback),
+              ...dedupInput,
+            });
+          } else {
+            const promotion = await project.transaction(async (repositories) => {
+            const committedAt = (): string => `${new Date().toISOString().slice(0, -1)}000Z`;
+            const envelope = {
+              eventUuid: event.event_uuid,
+              eventVersion: event.event_version,
+              machineId: event.machine_id!,
+              machineSequence: event.machine_sequence,
+              sessionId: event.session_id,
+              sessionSequence: event.seq,
+              type: event.type,
+              category: event.category,
+              data: event.data,
+              priority: event.priority,
+              sourceHook: event.source_hook,
+              createdAt: event.created_at,
+            };
+            const priorReceipt = await repositories.migrationReceipt!.findMatching({
+              epochId: epoch.epochId,
+              envelope,
+            });
+            if (priorReceipt !== null) {
+              return { promoted: priorReceipt.outcome === "applied" };
+            }
+            if (event.priority === 3 && !reinforced) {
+              const existing = await repositories.lexicalSearch.searchPromoted(
+                scrubbedData,
+                1,
+                undefined,
+                project.projectId,
               );
+              if (existing.length === 0) {
+                await repositories.migrationReceipt!.record({
+                  epochId: epoch.epochId,
+                  envelope,
+                  effectWitness: {
+                    version: 1,
+                    outcome: "no-effect",
+                    reason: "unreinforced-pattern",
+                  },
+                  committedAt: committedAt(),
+                });
+                return { promoted: false as const };
+              }
+            }
+            const promotedMemoryId = await deduplicateAndInsertInRepositories(
+              repositories,
+              dedupInput,
+            );
+            await repositories.migrationReceipt!.record({
+              epochId: epoch.epochId,
+              envelope,
+              effectWitness: { version: 1, outcome: "applied", promotedMemoryId },
+              committedAt: committedAt(),
+            });
+            return { promoted: true as const };
+            });
+
+            if (!promotion.promoted) {
+              processedIds.push(event.event_id);
+              result.skipped++;
+              continue;
             }
           }
-
-          // Set correlation chain
-          const correlatedErrorId = (event as EventRow & { _correlatedErrorId?: number })._correlatedErrorId;
-          if (correlatedErrorId) {
-            await edb.setPrevEventId(event.event_id, correlatedErrorId);
-          }
-
-          // Promote via existing dedup pipeline
-          await deduplicateAndInsert({
-            transaction: (callback) => project.transaction(callback),
-            content: scrubbedData,
-            tags: [
-              tag,
-              "source:passive-capture",
-              `hook:${event.source_hook}`,
-              ...(reinforced ? ["signal:reinforced"] : []),
-            ],
-            sourceProjectId: project.projectId,
-            candidateScope: "owner",
-            backend: project.backend,
-            sessionId: event.session_id,
-            depth: 0,
-            confidence,
-            newEntryConfidence,
-            thresholds: {
-              dedupBm25Threshold: thresholds.dedupBm25Threshold ?? 15,
-              dedupCandidateLimit: thresholds.dedupCandidateLimit ?? 100,
-            },
-          });
 
           processedIds.push(event.event_id);
           result.promoted++;
@@ -967,7 +1077,7 @@ async function promoteEventsBatch(
         }
       }
 
-      await edb.markProcessed(processedIds);
+      await edb.markProcessed(processedIds, publicationLockToken);
 
   return result;
 }

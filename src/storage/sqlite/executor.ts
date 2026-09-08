@@ -2,6 +2,18 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { DatabaseSync } from "node:sqlite";
 import type { StorageDomain } from "../contracts.js";
 import { normalizeStorageError, StorageOperationError } from "../errors.js";
+import {
+  withBackendPublicationConsumerLockAsync,
+  type BackendPublicationAppendBarrierOptions,
+  type BackendPublicationLockToken,
+} from "../backend-publication.js";
+
+export type SqliteOperationAdmission = Readonly<{
+  homeDir?: string;
+  lockToken?: BackendPublicationLockToken;
+  /** @internal Deterministic physical-close admission seams. */
+  _appendBarrierOptions?: BackendPublicationAppendBarrierOptions;
+}>;
 
 type TransactionContext = {
   executor: SqliteExecutor;
@@ -44,7 +56,7 @@ export class SqliteExecutor {
     this.onPoison?.();
   }
 
-  async run<T>(domain: StorageDomain, operation: string, callback: () => T | Promise<T>): Promise<T> {
+  async run<T>(domain: StorageDomain, operation: string, callback: () => T | Promise<T>, admission?: SqliteOperationAdmission): Promise<T> {
     const active = transactionContext.getStore();
     if (active) {
       throw new StorageOperationError(
@@ -56,7 +68,7 @@ export class SqliteExecutor {
       );
     }
     this.assertUsable(domain, operation);
-    return this.enqueue(domain, operation, callback);
+    return this.enqueue(domain, operation, () => this.admitted(callback, admission));
   }
 
   async runScoped<T>(
@@ -92,6 +104,7 @@ export class SqliteExecutor {
     domain: StorageDomain,
     operation: string,
     callback: () => T | Promise<T>,
+    admission?: SqliteOperationAdmission,
   ): Promise<T> {
     const active = transactionContext.getStore();
     if (active) {
@@ -104,7 +117,7 @@ export class SqliteExecutor {
       );
     }
     this.assertUsable(domain, operation);
-    return this.enqueue(domain, operation, () => this.atomicRoot(callback));
+    return this.enqueue(domain, operation, () => this.admitted(() => this.atomicRoot(callback), admission));
   }
 
   async runAtomicScoped<T>(
@@ -244,7 +257,10 @@ export class SqliteExecutor {
     }
   }
 
-  async transaction<T>(callback: (token: symbol) => Promise<T>): Promise<T> {
+  async transaction<T>(
+    callback: (token: symbol) => Promise<T>,
+    admission?: SqliteOperationAdmission,
+  ): Promise<T> {
     const active = transactionContext.getStore();
     if (active) {
       throw new StorageOperationError(
@@ -257,7 +273,7 @@ export class SqliteExecutor {
     }
     this.assertUsable("transaction", "transaction");
 
-    return this.enqueue("transaction", "transaction", async () => {
+    return this.enqueue("transaction", "transaction", () => this.admitted(async () => {
       const token = Symbol("sqlite-transaction");
       this.db.exec("BEGIN IMMEDIATE");
       this.activeTokens.add(token);
@@ -290,7 +306,19 @@ export class SqliteExecutor {
         this.activeTokens.delete(token);
         this.failedTokens.delete(token);
       }
-    });
+    }, admission));
+  }
+
+  private async admitted<T>(
+    callback: () => T | Promise<T>,
+    admission?: SqliteOperationAdmission,
+  ): Promise<T> {
+    if (admission?.homeDir === undefined) return callback();
+    return withBackendPublicationConsumerLockAsync(
+      admission.homeDir,
+      callback,
+      { lockToken: admission.lockToken },
+    );
   }
 
   async runCleanup<T>(

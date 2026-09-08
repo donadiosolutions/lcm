@@ -51,6 +51,9 @@ component_management:
         # configuration-security owner without changing component topology.
         # #1134/#1135/#1136 preserve private-write failures while retaining
         # ordered descriptor, temporary-file, and parent cleanup evidence here.
+        # #1223 keeps authenticated lock-owner disappearance recovery in this
+        # existing configuration-security owner.
+        # #1231 keeps exact intended enrollment identity construction here.
         # #1144 preserves admission callback failures while retaining ordered
         # bootstrap-lock, home, and parent descriptor cleanup evidence here.
         # #1151 revalidates the journal temporary inode, single-link topology,
@@ -90,6 +93,7 @@ component_management:
         # Includes native adapters and the #726/#737 publication-diagnostic flow.
         # Claude's bounded session-completion acknowledgment remains hook-owned.
         # #1155 keeps SessionStart local-outbox publication admission hook-owned.
+        # #1225 composes SessionStart pruning with append admission in this owner.
         - "src/hooks/"
     # #1201 keeps process-only observation, its parser/client, and route allowlist here.
     - component_id: "unit-daemon-core"
@@ -118,14 +122,16 @@ component_management:
         # quoted/root-only backslash handoff, #1010 pathless-tail brackets,
         # #1060 adjacent nested-file schemes, #1113 doubled-colon drive tails,
         # #1117 glued authorities, #1111 bracketed nested-URL idempotence,
-        # #1128 active own-query and IPv6 bracket-boundary backslash paths,
-        # #1141 single-slash file tails, and #1156 forced drive-after-content
-        # continuations remain daemon-core-owned.
+        # #1118 quoted query-tail handoff, #1128 active own-query and IPv6
+        # # bracket-boundary backslash paths, #1141 single-slash file tails,
+        # # and #1156 forced drive-after-content continuations remain
+        # # daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
         - "^src/daemon/validate-cwd\\.ts$"
         - "^src/daemon/version\\.ts$"
+    # Compact forwards each live operation token; SQLite owns handle-scoped admission.
     - component_id: "unit-daemon-routes"
       name: "Unit - Daemon Routes"
       paths:
@@ -155,6 +161,8 @@ component_management:
         # #1158 keeps PostgreSQL passive promotion route behavior route-owned;
         # deduplication implementation remains in unit-promotion below.
         # #1203 keeps evidence-based prompt scoring and debug output route-owned.
+        # #1230 keeps route project close on the live request token.
+        # #1247 keeps local queue preparation, acknowledgement, and cleanup route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -204,7 +212,11 @@ component_management:
         - "src/db/"
         # Captured UTF-8 decoding and immutable-file authority remain local-persistence-owned.
         # #618 optional receipt schema admission stays local-persistence-owned.
+        # Includes current-token scopes and independently admitted factory health.
+        # #622 keeps registered-project outbox preparation and admitted sidecar
+        # discovery in the existing local-persistence component.
         # #1140 fixed transfer-ledger control bounds stay local-persistence-owned.
+        # #1231 prepares an intended enrollment epoch before identity publication.
         - "src/storage/sqlite/"
         - "src/store/"
     - component_id: "unit-storage-abstractions"
@@ -219,6 +231,7 @@ component_management:
         # #942 binds every coordinator checkpoint read and write boundary to
         # that retained operation-scoped directory witness.
         # #837 retains consumer-admission descriptor cleanup in this owner.
+        # #1240 keeps authenticated terminal-maintenance configuration admission here.
         # #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
         # #906 keeps bounded publication-convergence probe expiry and error
         # selection in this storage-abstractions owner.
@@ -247,12 +260,20 @@ component_management:
       name: "Unit - Migration and Cutover"
       paths:
         # #681 leaves protocol-specific manifest replacement in this component.
+        # #622 keeps immutable SQLite capture, maintenance preparation, and
+        # private receipt evidence in this migration owner.
+        # Includes immutable receipt and queue evidence publication.
+        # #1231 orders receipt epoch durability before machine identity visibility.
+        # #622 seals private artifact modes before the final file sync.
         - "src/migration/"
     - component_id: "unit-local-event-storage"
       name: "Unit - Local Event Storage"
       paths:
+        # #622 keeps outbox connection admission and current-schema validation here.
+        # #1247 keeps explicit promotion queue admission in this component.
         - "^src/storage/local-hook-event-sequence\\.ts$"
         - "^src/storage/local-hook-outbox\\.ts$"
+        - "^src/storage/local-hook-outbox-schema\\.ts$"
         - "^src/storage/session-instructions\\.ts$"
     - component_id: "unit-transcripts-import"
       name: "Unit - Transcripts and Import"

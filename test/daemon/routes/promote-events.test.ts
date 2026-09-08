@@ -26,6 +26,10 @@ import {
   resolveProjectIdentity,
   setRemoteProjectBinding,
 } from "../../../src/project-map.js";
+import {
+  adoptMigrationReceiptEpoch,
+  readMigrationReceiptEvidence,
+} from "../../../src/migration/receipts.js";
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const PROJECT_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
@@ -45,13 +49,18 @@ vi.mock("../../../src/db/events-path.js", () => ({
 }));
 
 // Mock deduplicateAndInsert to track calls without needing real FTS5
-vi.mock("../../../src/promotion/dedup.js", () => ({
-  deduplicateAndInsert: vi.fn().mockResolvedValue("mock-id"),
-}));
+vi.mock("../../../src/promotion/dedup.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../src/promotion/dedup.js")>();
+  return {
+    ...actual,
+    deduplicateAndInsert: vi.fn().mockResolvedValue("mock-id"),
+    deduplicateAndInsertInRepositories: vi.fn(actual.deduplicateAndInsertInRepositories),
+  };
+});
 
 // Import the mocked modules
 import { eventsDbPath } from "../../../src/db/events-path.js";
-import { deduplicateAndInsert } from "../../../src/promotion/dedup.js";
+import { deduplicateAndInsert, deduplicateAndInsertInRepositories } from "../../../src/promotion/dedup.js";
 
 function makeConfig(): DaemonConfig {
   return {
@@ -147,6 +156,7 @@ describe("promote-events route", () => {
     eventPathMocks.existingEventsDbPath.mockReturnValue(sidecarPath);
     vi.mocked(eventsDbPath).mockReturnValue(sidecarPath);
     vi.mocked(deduplicateAndInsert).mockClear();
+    vi.mocked(deduplicateAndInsertInRepositories).mockClear();
     clearProjectMapCache();
   });
 
@@ -218,6 +228,168 @@ describe("promote-events route", () => {
     expect(call.backend).toBe("sqlite");
     expect(call.tags).toContain("type:preference");
     expect(call.tags).toContain("source:passive-capture");
+  });
+
+  it("commits an applied receipt with a receipt-era SQLite promotion", async () => {
+    recoverMachineIdentity({
+      version: 1,
+      identityKey: `machine:${"b".repeat(64)}`,
+      machineId: MACHINE_ID,
+      displayName: "Machine A",
+    }, { homeDir });
+    const projectDb = setupProjectDb(dir);
+    adoptMigrationReceiptEpoch(projectDb, {
+      projectId: projectId(dir),
+      machineId: MACHINE_ID,
+      epochId: "118f22c4-6d2a-4f10-8a4c-6b8d3e5f9012",
+      firstMachineSequence: "0000000000000000000",
+      establishedAt: "2026-09-07T03:04:05.123456Z",
+    });
+    projectDb.close();
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", {
+      type: "decision",
+      category: "decision",
+      data: "receipt covered",
+      priority: 1,
+    }, "PostToolUse");
+    edb.close();
+
+    await createPromoteEventsHandler(makeConfig())(
+      request,
+      mockRes().res,
+      JSON.stringify({ cwd: dir }),
+    );
+
+    const verify = new DatabaseSync(projectDbPath(dir), { readOnly: true });
+    const evidence = readMigrationReceiptEvidence(verify, projectId(dir), MACHINE_ID);
+    const effects = new PromotedStore(verify).getAll();
+    expect(effects).toHaveLength(1);
+    expect(effects[0].content).toBe("receipt covered");
+    expect(evidence.receipts).toMatchObject([{
+      outcome: "applied",
+      effectWitness: { promotedMemoryId: effects[0].id },
+    }]);
+    verify.close();
+  });
+
+  it.each([false, true])("commits the unreinforced lexical decision with existing match=%s", async (hasMatch) => {
+    recoverMachineIdentity({
+      version: 1,
+      identityKey: `machine:${"c".repeat(64)}`,
+      machineId: MACHINE_ID,
+      displayName: "Machine A",
+    }, { homeDir });
+    const projectDb = setupProjectDb(dir);
+    adoptMigrationReceiptEpoch(projectDb, {
+      projectId: projectId(dir),
+      machineId: MACHINE_ID,
+      epochId: "318f22c4-6d2a-4f10-8a4c-6b8d3e5f9012",
+      firstMachineSequence: "0000000000000000000",
+      establishedAt: "2026-09-07T03:04:05.123456Z",
+    });
+    const existingId = hasMatch ? new PromotedStore(projectDb).insert({
+      content: "only once", tags: [], projectId: projectId(dir), depth: 0, confidence: 0.5,
+    }) : undefined;
+    projectDb.close();
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", {
+      type: "file_read",
+      category: "file",
+      data: "only once",
+      priority: 3,
+    }, "PostToolUse");
+    edb.close();
+
+    const output = mockRes();
+    await createPromoteEventsHandler(makeConfig())(
+      request,
+      output.res,
+      JSON.stringify({ cwd: dir }),
+    );
+
+    expect(output.getBody()).toMatchObject({
+      promoted: hasMatch ? 1 : 0, skipped: hasMatch ? 0 : 1, errors: 0,
+    });
+    const verify = new DatabaseSync(projectDbPath(dir), { readOnly: true });
+    expect(readMigrationReceiptEvidence(verify, projectId(dir), MACHINE_ID).receipts)
+      .toMatchObject([hasMatch ? {
+        outcome: "applied",
+        effectWitness: { promotedMemoryId: existingId },
+      } : {
+        outcome: "no-effect",
+        effectWitness: { reason: "unreinforced-pattern" },
+      }]);
+    expect(new PromotedStore(verify).getAll()).toHaveLength(hasMatch ? 1 : 0);
+    verify.close();
+  });
+
+  it.each(["applied", "no-effect"] as const)("retries a committed %s receipt without repeating its decision or effect", async (outcome) => {
+    recoverMachineIdentity({
+      version: 1,
+      identityKey: `machine:${"d".repeat(64)}`,
+      machineId: MACHINE_ID,
+      displayName: "Machine A",
+    }, { homeDir });
+    const projectDb = setupProjectDb(dir);
+    adoptMigrationReceiptEpoch(projectDb, {
+      projectId: projectId(dir),
+      machineId: MACHINE_ID,
+      epochId: "418f22c4-6d2a-4f10-8a4c-6b8d3e5f9012",
+      firstMachineSequence: "0000000000000000000",
+      establishedAt: "2026-09-07T03:04:05.123456Z",
+    });
+    projectDb.close();
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", {
+      type: outcome === "applied" ? "decision" : "file_read",
+      category: outcome === "applied" ? "decision" : "file",
+      data: "exact durable receipt retry",
+      priority: outcome === "applied" ? 1 : 3,
+    }, "PostToolUse");
+    edb.close();
+    const dedup = vi.mocked(deduplicateAndInsertInRepositories);
+    // Leave the real original SQLite envelope pending after the effect transaction
+    // commits, as when the process dies before its separate outbox acknowledgement.
+    const mark = vi.spyOn(EventsDb.prototype, "markProcessed").mockImplementationOnce(() => undefined);
+    try {
+      const handler = createPromoteEventsHandler(makeConfig());
+      const firstOutput = mockRes();
+      await handler(request, firstOutput.res, JSON.stringify({ cwd: dir }));
+      expect(firstOutput.getBody()).toMatchObject({ errors: 0 });
+      const source = new DatabaseSync(projectDbPath(dir));
+      const before = readMigrationReceiptEvidence(source, projectId(dir), MACHINE_ID);
+      expect(before.receipts).toHaveLength(1);
+      expect(before.receipts[0].outcome).toBe(outcome);
+      // An unrelated later promotion changes the lexical no-effect decision.
+      if (outcome === "no-effect") new PromotedStore(source).insert({
+        content: "exact durable receipt retry", tags: [], projectId: projectId(dir),
+        depth: 0, confidence: 0.9,
+      });
+      const effectsBefore = new PromotedStore(source).getAll();
+      source.close();
+      const pending = new EventsDb(sidecarPath);
+      expect(pending.getUnprocessed()).toHaveLength(1);
+      pending.close();
+      dedup.mockClear();
+      const retryOutput = mockRes();
+      await handler(request, retryOutput.res, JSON.stringify({ cwd: dir }));
+      expect(retryOutput.getBody()).toMatchObject({
+        promoted: outcome === "applied" ? 1 : 0,
+        skipped: outcome === "no-effect" ? 1 : 0,
+        errors: 0,
+      });
+      expect(dedup).not.toHaveBeenCalled();
+      const verify = new DatabaseSync(projectDbPath(dir), { readOnly: true });
+      expect(readMigrationReceiptEvidence(verify, projectId(dir), MACHINE_ID)).toEqual(before);
+      expect(new PromotedStore(verify).getAll()).toEqual(effectsBefore);
+      verify.close();
+      const remaining = new EventsDb(sidecarPath);
+      expect(remaining.getUnprocessed()).toHaveLength(0);
+      remaining.close();
+    } finally {
+      mark.mockRestore();
+    }
   });
 
   it("reuses the retained publication token through the single-project route", async () => {

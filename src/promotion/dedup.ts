@@ -2,6 +2,7 @@ import type {
   LexicalSearchRepository,
   ProjectStorage,
   PromotedMemoryRepository,
+  TransactionRepositories,
 } from "../storage/contracts.js";
 
 type DedupThresholds = {
@@ -12,6 +13,20 @@ type DedupThresholds = {
 export interface DedupRepositories {
   transaction: ProjectStorage["transaction"];
 }
+
+export type DedupInsertInput = Readonly<{
+  content: string;
+  tags: string[];
+  sourceProjectId?: string;
+  /** Search across the bound owner's provenance on PostgreSQL only. */
+  candidateScope?: "source" | "owner";
+  backend?: ProjectStorage["backend"];
+  sessionId?: string;
+  depth: number;
+  confidence: number;
+  newEntryConfidence?: number;
+  thresholds: DedupThresholds;
+}>;
 
 /** Structural bridge for bespoke SQLite callers deferred to #224. */
 export interface LegacyDedupStore {
@@ -32,6 +47,7 @@ type DedupParams = {
   thresholds: DedupThresholds;
 } & ((DedupRepositories & {
   sourceProjectId?: string;
+  repositories?: TransactionRepositories;
   /** Search across the bound owner's provenance on PostgreSQL only. */
   candidateScope?: "source" | "owner";
   backend?: ProjectStorage["backend"];
@@ -63,46 +79,21 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
   if (!("store" in params)) {
     // Search and mutation share one backend transaction so two concurrent
     // promotions cannot both observe an empty candidate set and insert.
-    const candidateSourceProjectId = params.candidateScope === "owner"
-      && params.backend === "postgresql"
-      ? undefined
-      : params.sourceProjectId;
-    return params.transaction(async (repositories) => {
-      const candidates = await repositories.lexicalSearch.searchPromoted(
-        content,
-        thresholds.dedupCandidateLimit,
-        undefined,
-        candidateSourceProjectId,
-      );
-      const duplicates = candidates.filter(
-        (candidate) => isDuplicateCandidate(candidate, content, thresholds.dedupBm25Threshold),
-      );
-
-      if (duplicates.length === 0) {
-        return repositories.promotedMemory.insert({
-          content,
-          tags,
-          sourceProjectId: params.sourceProjectId,
-          sessionId,
-          depth,
-          confidence: insertConfidence,
-        });
-      }
-
-      const canonical = duplicates[0];
-      const refreshedConfidence = Math.max(confidence, ...duplicates.map((duplicate) => duplicate.confidence));
-      const mergedTags = Array.from(
-        new Set([...canonical.tags, ...duplicates.slice(1).flatMap((duplicate) => duplicate.tags), ...tags]),
-      );
-      await repositories.promotedMemory.update(canonical.id, {
-        confidence: refreshedConfidence,
-        tags: mergedTags,
-      });
-      for (let index = 1; index < duplicates.length; index++) {
-        await repositories.promotedMemory.archive(duplicates[index].id);
-      }
-      return canonical.id;
+    const run = (repositories: TransactionRepositories) => deduplicateAndInsertInRepositories(repositories, {
+      content,
+      tags,
+      sourceProjectId: params.sourceProjectId,
+      candidateScope: params.candidateScope,
+      backend: params.backend,
+      sessionId,
+      depth,
+      confidence,
+      newEntryConfidence,
+      thresholds,
     });
+    return params.repositories === undefined
+      ? params.transaction(run)
+      : run(params.repositories);
   }
 
   // The legacy SQLite bridge remains synchronous until bespoke callers move in #224.
@@ -139,5 +130,56 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
     }
   });
 
+  return canonical.id;
+}
+
+/**
+ * Run dedup inside a caller-owned transaction. The caller records any receipt
+ * in that same transaction alongside these promoted-memory changes.
+ */
+export async function deduplicateAndInsertInRepositories(
+  repositories: TransactionRepositories,
+  input: DedupInsertInput,
+): Promise<string> {
+  const candidateSourceProjectId = input.candidateScope === "owner"
+    && input.backend === "postgresql"
+    ? undefined
+    : input.sourceProjectId;
+  const candidates = await repositories.lexicalSearch.searchPromoted(
+    input.content,
+    input.thresholds.dedupCandidateLimit,
+    undefined,
+    candidateSourceProjectId,
+  );
+  const duplicates = candidates.filter(
+    (candidate) => isDuplicateCandidate(candidate, input.content, input.thresholds.dedupBm25Threshold),
+  );
+  if (duplicates.length === 0) {
+    return repositories.promotedMemory.insert({
+      content: input.content,
+      tags: input.tags,
+      sourceProjectId: input.sourceProjectId,
+      sessionId: input.sessionId,
+      depth: input.depth,
+      confidence: input.newEntryConfidence ?? input.confidence,
+    });
+  }
+  const canonical = duplicates[0];
+  const refreshedConfidence = Math.max(
+    input.confidence,
+    ...duplicates.map((duplicate) => duplicate.confidence),
+  );
+  const mergedTags = Array.from(new Set([
+    ...canonical.tags,
+    ...duplicates.slice(1).flatMap((duplicate) => duplicate.tags),
+    ...input.tags,
+  ]));
+  await repositories.promotedMemory.update(canonical.id, {
+    confidence: refreshedConfidence,
+    tags: mergedTags,
+  });
+  for (let index = 1; index < duplicates.length; index++) {
+    await repositories.promotedMemory.archive(duplicates[index].id);
+  }
   return canonical.id;
 }

@@ -662,11 +662,88 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(input))).toBe(expected);
   });
 
-  it("preserves the deferred word-bearing query tail boundary", () => {
-    const result = sanitizeError("'file://host'['/private']?next/Users/SECRET");
+  it.each([
+    [
+      "'file://host'['/private']?next/Users/SECRET",
+      "'file://host'['<path>']?next<path>",
+    ],
+    [
+      "'file://host'['/private']#next/Users/SECRET",
+      "'file://host'['<path>']#next<path>",
+    ],
+    [
+      '"file://host["/private"]?next/Users/SECRET',
+      '"file://host["<path>"]?next<path>',
+    ],
+    [
+      '"file://host["/private"]#next/Users/SECRET',
+      '"file://host["<path>"]#next<path>',
+    ],
+  ] as const)("redacts word-bearing quoted query tails in one pass: %#", (input, expected) => {
+    const first = sanitizeError(input);
+    const second = sanitizeError(first);
+    const third = sanitizeError(second);
 
-    expect(result).toBe("'file://host'['<path>']?next/Users/SECRET");
-    expect(sanitizeError(result)).toBe("'file://host'['<path>']?next<path>");
+    expect(first).toBe(expected);
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+  });
+
+  it.each([
+    ["'file://host'['/private']? /Users/SECRET", "'file://host'['<path>']? <path>"],
+    [
+      "'file://host'['/private']|https://example.test/x",
+      "'file://host'['<path>']|https://example.test/x",
+    ],
+    [
+      "'file://host'['/private']?file://two.invalid/Users/b?next2/Users/SECRET",
+      "'file://host'['<path>']?file://two.invalid<path>?next2/Users/SECRET",
+    ],
+    [
+      "'file://host'['/private']|file://two.invalid/Users/b?next2/Users/SECRET",
+      "'file://host'['<path>']|file://two.invalid<path>?next2/Users/SECRET",
+    ],
+    [
+      "file://host.invalid/Users/a?next/Users/SECRET",
+      "file://host.invalid<path>?next/Users/SECRET",
+    ],
+    [
+      "'file://host'['/private']?next/Users/SECRET|https://example.test/x",
+      "'file://host'['<path>']?next<path>|https://example.test/x",
+    ],
+    [
+      "'file://host'['/private']?a&b=c/Users/SECRET",
+      "'file://host'['<path>']?a&b=c<path>",
+    ],
+    ["'file://host'['/private']?next?/Users/SECRET", "'file://host'['<path>']?next?<path>"],
+    ["'file://host'['/private']?next#/Users/SECRET", "'file://host'['<path>']?next#<path>"],
+    [
+      "'file://host'['/private']?next/Users/A?more/Users/B",
+      "'file://host'['<path>']?next<path>?more<path>",
+    ],
+    ["ordinary?next/Users/SECRET", "ordinary?next/Users/SECRET"],
+    ["file://host.invalid/Users/canary/private.db", "file://host.invalid<path>"],
+  ] as const)("keeps quoted query-tail handoff within its file URL context: %#", (input, expected) => {
+    const first = sanitizeError(input);
+    const second = sanitizeError(first);
+    const third = sanitizeError(second);
+
+    expect(first).toBe(expected);
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+  });
+
+  it.each([
+    [
+      "'file://host'['/private']?next/https://public.test/x",
+      "'file://host'['<path>']?next/https:<path>",
+    ],
+    [
+      "'file://host'['/private']?next/ftp://public.test/x",
+      "'file://host'['<path>']?next/ftp:<path>",
+    ],
+  ] as const)("does not consume a recognized scheme as a quoted query tail: %#", (input, expected) => {
+    expect(sanitizeError(input)).toBe(expected);
   });
 
   it.each([

@@ -68,6 +68,25 @@ export class PrivateFileCollisionError extends PrivateDirectoryTopologyError {
   }
 }
 
+/** A retained bounded-file descriptor no longer matches its pathname witness. */
+export type BoundedFileParentIdentity = Readonly<{
+  mode: number;
+  uid: number;
+  gid: number;
+  dev: string;
+  ino: string;
+}>;
+
+export class BoundedFileIdentityChangedError extends Error {
+  readonly parentIdentity: BoundedFileParentIdentity;
+
+  constructor(parentIdentity: BoundedFileParentIdentity) {
+    super("file changed during validation");
+    this.name = "BoundedFileIdentityChangedError";
+    this.parentIdentity = parentIdentity;
+  }
+}
+
 export type PrivateFilePublicationOutcome = "published" | "unknown";
 
 /** A publication attempt and retained-parent topology check could not agree. */
@@ -382,6 +401,84 @@ export type BoundedFileResult = {
   exactDev: string;
   exactIno: string;
 };
+
+export type PrivateFileAbsenceOptions = Readonly<{
+  expectedUid?: number;
+  expectedParent?: BoundedFileParentIdentity;
+  /** @internal Deterministic retained-parent race seam. */
+  _beforeLookupForTesting?: () => void;
+  /** @internal Deterministic leaf lookup seam. */
+  _lstatForTesting?: typeof lstatSync;
+  /** @internal Deterministic descriptor-close seam. */
+  _closeParentForTesting?: (handle: PrivateDirectoryHandle) => void;
+}>;
+
+function samePrivateDirectoryIdentity(
+  left: BoundedFileParentIdentity,
+  right: BoundedFileParentIdentity,
+): boolean {
+  return left.mode === right.mode
+    && left.uid === right.uid
+    && left.gid === right.gid
+    && left.dev === right.dev
+    && left.ino === right.ino;
+}
+
+/**
+ * Prove that one private leaf is absent through an authenticated retained
+ * parent. Present entries of every type return false; uncertain topology and
+ * lookup failures remain errors.
+ */
+export function privateFileAbsentAtRetainedParent(
+  path: string,
+  options: PrivateFileAbsenceOptions = {},
+): boolean {
+  const directory = dirname(path);
+  const expectedUid = options.expectedUid ?? currentUid();
+  const parent = openPrivateDirectory(directory, { expectedUid });
+  let hasPrimaryError = false;
+  let primaryError: unknown;
+  let absent = false;
+  try {
+    const before = assertPrivateDirectoryEntry(parent, directory, expectedUid);
+    if (!samePrivateDirectoryIdentity(options.expectedParent ?? parent.witness, before)) {
+      throw new PrivateDirectoryTopologyError(
+        "private directory topology is not trusted",
+      );
+    }
+    options._beforeLookupForTesting?.();
+    try {
+      (options._lstatForTesting ?? lstatSync)(
+        join(`/dev/fd/${parent.fd}`, basename(path)),
+      );
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+      absent = true;
+    }
+    const after = assertPrivateDirectoryEntry(parent, directory, expectedUid);
+    if (!samePrivateDirectoryIdentity(parent.witness, after)) {
+      throw new PrivateDirectoryTopologyError(
+        "private directory topology is not trusted",
+      );
+    }
+  } catch (error) {
+    hasPrimaryError = true;
+    primaryError = error;
+  }
+
+  try {
+    (options._closeParentForTesting ?? ((handle) => handle.close()))(parent);
+  } catch (closeError) {
+    if (!hasPrimaryError) throw closeError;
+    throw new AggregateError(
+      [primaryError, closeError],
+      "private file absence validation and parent cleanup failed",
+      { cause: primaryError },
+    );
+  }
+  if (hasPrimaryError) throw primaryError;
+  return absent;
+}
 
 function readDescriptorBoundedBytes(
   fd: number,
@@ -806,6 +903,14 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
   if (!isContainedPath(allowedRoot, realParent)) {
     throw new Error("file is outside the permitted root");
   }
+  const initialParent = statSync(realParent);
+  const parentIdentity: BoundedFileParentIdentity = {
+    mode: initialParent.mode & 0o7777,
+    uid: initialParent.uid,
+    gid: initialParent.gid,
+    dev: String(initialParent.dev),
+    ino: String(initialParent.ino),
+  };
 
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
@@ -826,7 +931,7 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
     }
     const current = statSync(openedPath);
     if (current.dev !== stat.dev || current.ino !== stat.ino) {
-      throw new Error("file changed during validation");
+      throw new BoundedFileIdentityChangedError(parentIdentity);
     }
     if (stat.size > options.maxBytes) throw new Error("file exceeds the configured size limit");
     options._beforeReadForTesting?.();
@@ -846,10 +951,10 @@ export function readBoundedRegularFileWithStat(path: string, options: BoundedFil
     const afterRead = fstatSync(fd);
     validateBoundedFileMetadata(afterRead, options);
     if (boundedFileMetadataChanged(stat, final)) {
-      throw new Error("file changed during validation");
+      throw new BoundedFileIdentityChangedError(parentIdentity);
     }
     if (boundedFileMetadataChanged(stat, afterRead)) {
-      throw new Error("file changed during validation");
+      throw new BoundedFileIdentityChangedError(parentIdentity);
     }
     const exactStat = directoryStat(fd) as unknown as Readonly<{
       mode: bigint;

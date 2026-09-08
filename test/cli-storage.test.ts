@@ -77,12 +77,12 @@ describe("CLI selected project storage", () => {
     vi.spyOn(factoryModule,"createStorageBackendFactory").mockImplementation(async (...args) => {
       const factory = await realCreate(...args);
       const close = factory.close.bind(factory);
-      vi.spyOn(factory,"close").mockImplementation(async () => { await close(); factoryCloses++; throw new Error("CANARY cleanup"); });
+      vi.spyOn(factory,"close").mockImplementation(async (token) => { await close(token); factoryCloses++; throw new Error("CANARY cleanup"); });
       return factory;
     });
     await expect(withCliProjectStorage(cwd,{create:true},async ({storage}) => {
       const close=storage.close.bind(storage);
-      vi.spyOn(storage,"close").mockImplementation(async () => { await close(); throw new Error("CANARY close"); });
+      vi.spyOn(storage,"close").mockImplementation(async (token) => { await close(token); throw new Error("CANARY close"); });
       throw primary;
     })).rejects.toBe(primary);
     expect(factoryCloses).toBe(1);
@@ -105,17 +105,19 @@ describe("CLI selected project storage", () => {
     vi.spyOn(factoryModule, "createStorageBackendFactory").mockImplementation(async (...args) => {
       const factory = await realCreate(...args);
       const close = factory.close.bind(factory);
-      vi.spyOn(factory, "close").mockImplementation(async () => {
+      vi.spyOn(factory, "close").mockImplementation(async (token) => {
+        expect(token).toBeDefined();
         await assertPublisherBlocked("factory close");
-        await close();
+        await close(token);
       });
       return factory;
     });
     const operation = withCliProjectStorage(cwd, { create: true }, async ({ storage }) => {
       const close = storage.close.bind(storage);
-      vi.spyOn(storage, "close").mockImplementation(async () => {
+      vi.spyOn(storage, "close").mockImplementation(async (token) => {
+        expect(token).toBeDefined();
         await assertPublisherBlocked("storage close");
-        await close();
+        await close(token);
       });
       await assertPublisherBlocked("callback");
       await storage.conversations.getOrCreateConversation("committed");
@@ -138,9 +140,9 @@ describe("CLI selected project storage", () => {
     vi.spyOn(factoryModule, "createStorageBackendFactory").mockImplementation(async (...args) => {
       const factory = await realCreate(...args);
       const close = factory.close.bind(factory);
-      vi.spyOn(factory, "close").mockImplementation(async () => {
+      vi.spyOn(factory, "close").mockImplementation(async (token) => {
         factoryCloses++;
-        await close();
+        await close(token);
         if (phase === "factory close") invalidatePublication();
       });
       return factory;
@@ -149,9 +151,9 @@ describe("CLI selected project storage", () => {
     await expect(withCliProjectStorage(cwd, { create: true }, async ({ storage, project }) => {
       path = project.dbPath;
       const close = storage.close.bind(storage);
-      vi.spyOn(storage, "close").mockImplementation(async () => {
+      vi.spyOn(storage, "close").mockImplementation(async (token) => {
         storageCloses++;
-        await close();
+        await close(token);
         if (phase === "storage close") invalidatePublication();
       });
       if (phase === "callback") invalidatePublication();
@@ -229,7 +231,7 @@ describe("CLI selected project storage", () => {
     const realLock = publicationModule.withBackendPublicationConsumerLockAsync;
     vi.spyOn(publicationModule, "withBackendPublicationConsumerLockAsync").mockImplementation(async (...args) => {
       const result = await realLock(...args);
-      if (phase === "post-check") throw contention;
+      if (phase === "post-check" && args[2]?.lockToken === undefined) throw contention;
       return result;
     });
     const realCreate = factoryModule.createStorageBackendFactory;
@@ -241,11 +243,11 @@ describe("CLI selected project storage", () => {
         if (phase === "open") throw contention;
         const storage = await open(...openArgs);
         const close = storage.close.bind(storage);
-        vi.spyOn(storage, "close").mockImplementation(async () => { storageCloses++; await close(); });
+        vi.spyOn(storage, "close").mockImplementation(async (token) => { storageCloses++; await close(token); });
         return storage;
       });
       const close = factory.close.bind(factory);
-      vi.spyOn(factory, "close").mockImplementation(async () => { factoryCloses++; await close(); });
+      vi.spyOn(factory, "close").mockImplementation(async (token) => { factoryCloses++; await close(token); });
       return factory;
     });
     await expect(withCliProjectStorage(cwd, {

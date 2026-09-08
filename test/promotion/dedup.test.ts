@@ -6,6 +6,7 @@ import { getLcmConnection, closeLcmConnection } from "../../src/db/connection.js
 import { runLcmMigrations } from "../../src/db/migration.js";
 import { PromotedStore } from "../../src/db/promoted.js";
 import { deduplicateAndInsert } from "../../src/promotion/dedup.js";
+import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 
 const tempDirs: string[] = [];
 afterEach(() => {
@@ -90,6 +91,30 @@ function repositoryDeps(
 }
 
 describe("deduplicateAndInsert", () => {
+  it("keeps caller-owned repository insertion inside its real rollback transaction", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-dedup-transaction-"));
+    tempDirs.push(directory);
+    const factory = new SqliteStorageBackendFactory({ resolveProject: () => ({
+      id: "p1", dbPath: join(directory, "project.db"),
+    }) });
+    try {
+      const storage = await factory.openProject({ id: "p1", canonical: directory });
+      let insertedId!: string;
+      await expect(storage.transaction(async (repositories) => {
+        insertedId = await deduplicateAndInsert({
+          transaction: storage.transaction.bind(storage), repositories,
+          content: "Caller-owned transaction must atomically roll back this decision",
+          tags: ["decision"], depth: 0, confidence: 0.9,
+          thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+        });
+        expect(await repositories.promotedMemory.getById(insertedId)).toMatchObject({ id: insertedId });
+        throw new Error("rollback caller transaction");
+      })).rejects.toMatchObject({ operation: "transaction" });
+      expect(insertedId).toEqual(expect.any(String));
+      expect(await storage.promotedMemory.getById(insertedId)).toBeNull();
+    } finally { await factory.close(); }
+  });
+
   it("deduplicates exact content even when the native rank is negative", async () => {
     const searchPromoted = vi.fn().mockResolvedValue([{
       id: "exact-id",
@@ -313,44 +338,51 @@ describe("deduplicateAndInsert", () => {
     expect(store.getById(inserted)?.project_id).toBe("p2");
   });
 
-  it("uses owner scope only for PostgreSQL while preserving source scope elsewhere", async () => {
-    const searchPromoted = vi.fn().mockResolvedValue([]);
-    const insert = vi.fn().mockResolvedValue("inserted");
-    const repositories = {
-      lexicalSearch: { searchPromoted },
-      promotedMemory: {
-        insert,
-        update: vi.fn().mockResolvedValue(undefined),
-        archive: vi.fn().mockResolvedValue(undefined),
-      },
-    };
-    const transaction = async <T>(callback: (value: typeof repositories) => Promise<T>) => callback(repositories);
-    const base = {
-      transaction,
-      content: "owner scoped content",
-      tags: [],
-      sourceProjectId: "remote-project",
-      candidateScope: "owner" as const,
-      depth: 0,
-      confidence: 0.5,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
-    };
+  it.each([false, true])(
+    "uses owner scope only for PostgreSQL while preserving source scope elsewhere (repositories=%s)",
+    async repositoriesOwned => {
+      const searchPromoted = vi.fn().mockResolvedValue([]);
+      const insert = vi.fn().mockResolvedValue("inserted");
+      const repositories = {
+        lexicalSearch: { searchPromoted },
+        promotedMemory: {
+          insert,
+          update: vi.fn().mockResolvedValue(undefined),
+          archive: vi.fn().mockResolvedValue(undefined),
+        },
+      };
+      const transaction = async <T>(callback: (value: typeof repositories) => Promise<T>) => callback(repositories);
+      const base = {
+        transaction,
+        content: "owner scoped content",
+        tags: [],
+        sourceProjectId: "remote-project",
+        candidateScope: "owner" as const,
+        depth: 0,
+        confidence: 0.5,
+        thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+      };
 
-    await deduplicateAndInsert({ ...base, backend: "postgresql" });
-    await deduplicateAndInsert({ ...base, backend: "sqlite" });
-    await deduplicateAndInsert(base);
+      await deduplicateAndInsert({
+        ...base,
+        backend: "postgresql",
+        ...(repositoriesOwned ? { repositories } : {}),
+      });
+      await deduplicateAndInsert({ ...base, backend: "sqlite" });
+      await deduplicateAndInsert(base);
 
-    expect(searchPromoted.mock.calls.map((call) => call[3])).toEqual([
-      undefined,
-      "remote-project",
-      "remote-project",
-    ]);
-    expect(insert.mock.calls.map((call) => call[0].sourceProjectId)).toEqual([
-      "remote-project",
-      "remote-project",
-      "remote-project",
-    ]);
-  });
+      expect(searchPromoted.mock.calls.map((call) => call[3])).toEqual([
+        undefined,
+        "remote-project",
+        "remote-project",
+      ]);
+      expect(insert.mock.calls.map((call) => call[0].sourceProjectId)).toEqual([
+        "remote-project",
+        "remote-project",
+        "remote-project",
+      ]);
+    },
+  );
 
   it.each(["repositories", "legacy"] as const)("merges exact ranked content through %s without lowering the fuzzy threshold", async mode => {
     const db = makeDb();

@@ -6,6 +6,8 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -89,6 +91,100 @@ function strandOwnedLock(
 }
 
 describe("private mutation lock release recovery", () => {
+  it("reacquires once when an authenticated owner disappears during its retained read", () => {
+    const { lockPath } = makeLock();
+    writeFileSync(lockPath, ownerContent("a".repeat(32), {
+      processStartTime: currentProcessStartTime(),
+    }), { mode: 0o600 });
+    let callbacks = 0;
+    const operations = {
+      deleteRegularFile,
+      _beforeOwnerReadPostStatForTesting: () => unlinkSync(lockPath),
+    } as unknown as Parameters<typeof withPrivateMutationLock>[4];
+
+    expect(withPrivateMutationLock(lockPath, "test", () => {
+      callbacks += 1;
+      return "recovered";
+    }, undefined, operations)).toBe("recovered");
+    expect(callbacks).toBe(1);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it.each(["regular", "symlink", "directory"] as const)(
+    "does not retry an owner identity change when a %s replacement is present",
+    (kind) => {
+      const { lockPath, strandedPath } = makeLock();
+      writeFileSync(lockPath, ownerContent("b".repeat(32), {
+        processStartTime: currentProcessStartTime(),
+      }), { mode: 0o600 });
+      let callbacks = 0;
+      const operations = {
+        deleteRegularFile,
+        _beforeOwnerReadPostStatForTesting: () => {
+          renameSync(lockPath, strandedPath);
+          chmodSync(strandedPath, 0o400);
+          if (kind === "regular") writeFileSync(lockPath, "replacement", { mode: 0o600 });
+          else if (kind === "symlink") symlinkSync(strandedPath, lockPath);
+          else mkdirSync(lockPath, { mode: 0o700 });
+        },
+      } as unknown as Parameters<typeof withPrivateMutationLock>[4];
+
+      expect(() => withPrivateMutationLock(lockPath, "test", () => {
+        callbacks += 1;
+      }, undefined, operations)).toThrow("file changed during validation");
+      expect(callbacks).toBe(0);
+    },
+  );
+
+  it("keeps the existing one-retry budget for repeated owner disappearance", () => {
+    const { lockPath } = makeLock();
+    const content = ownerContent("c".repeat(32), {
+      processStartTime: currentProcessStartTime(),
+    });
+    writeFileSync(lockPath, content, { mode: 0o600 });
+    let publishes = 0;
+    let callbacks = 0;
+    const operations = {
+      deleteRegularFile,
+      _beforeOwnerReadPostStatForTesting: () => unlinkSync(lockPath),
+    } as unknown as Parameters<typeof withPrivateMutationLock>[4];
+
+    expect(() => withPrivateMutationLock(lockPath, "test", () => {
+      callbacks += 1;
+    }, (event) => {
+      if (event !== "before-main-lock-publish") return;
+      publishes += 1;
+      if (publishes === 2) writeFileSync(lockPath, content, { mode: 0o600 });
+    }, operations)).toThrow("changed repeatedly during acquisition");
+    expect(publishes).toBe(2);
+    expect(callbacks).toBe(0);
+  });
+
+  it("does not reacquire through a rebound owner-file parent", () => {
+    const { lockPath } = makeLock();
+    const root = join(lockPath, "..");
+    const moved = `${root}-original`;
+    roots.push(moved);
+    writeFileSync(lockPath, ownerContent("d".repeat(32), {
+      processStartTime: currentProcessStartTime(),
+    }), { mode: 0o600 });
+    let callbacks = 0;
+    const operations = {
+      deleteRegularFile,
+      _beforeOwnerReadPostStatForTesting: () => {
+        renameSync(root, moved);
+        unlinkSync(join(moved, "mutation.lock"));
+        mkdirSync(root, { mode: 0o700 });
+        writeFileSync(lockPath, "replacement", { mode: 0o600 });
+      },
+    } as unknown as Parameters<typeof withPrivateMutationLock>[4];
+
+    expect(() => withPrivateMutationLock(lockPath, "test", () => {
+      callbacks += 1;
+    }, undefined, operations)).toThrow("topology");
+    expect(callbacks).toBe(0);
+  });
+
   it("reads only an authenticated owner record and treats absence as no owner", () => {
     const { lockPath } = makeLock();
     expect(readPrivateMutationLockOwner(lockPath)).toBeNull();

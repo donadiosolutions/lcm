@@ -4,6 +4,13 @@ import {
   type LocalHookEvent,
 } from "../storage/local-hook-outbox.js";
 import { lcmHomeDir } from "../runtime-paths.js";
+import { dirname } from "node:path";
+import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
+import {
+  BackendPublicationAppendBarrierTimeoutError,
+  withBackendPublicationAppendBarrierAsync,
+  type BackendPublicationAppendBarrierOptions,
+} from "../storage/backend-publication.js";
 import {
   assertPrivateDirectory,
   openPrivateDirectory,
@@ -34,6 +41,22 @@ export type LocalHookEnqueueResult = Readonly<{
   pendingCount: number;
 }>;
 
+const LOCAL_HOOK_APPEND_CONTENTION_WAIT_MS = 5_000;
+
+export class LocalHookDurabilityTimeoutError extends PrivateMutationLockContentionError {
+  readonly retryRequired = true;
+
+  constructor(cause: BackendPublicationAppendBarrierTimeoutError) {
+    super("local hook durability is busy; retry the hook after capture completes", { cause });
+    this.name = "LocalHookDurabilityTimeoutError";
+  }
+}
+
+export type LocalHookEnqueueDependencies = Readonly<{
+  /** @internal Bounded contention controls for deterministic process tests. */
+  appendBarrierOptions?: BackendPublicationAppendBarrierOptions;
+}>;
+
 /**
  * Append hook events to the durable local SQLite outbox without consulting
  * backend selection, the daemon, or project-map reconciliation. Callers may
@@ -44,7 +67,7 @@ export async function appendLocalHookEvents(input: Readonly<{
   sessionId: string;
   events: readonly LocalHookEvent[];
   sourceHook: string;
-}>): Promise<LocalHookEnqueueResult> {
+}>, dependencies: LocalHookEnqueueDependencies = {}): Promise<LocalHookEnqueueResult> {
   // EventsDb creates dirname(dbPath) recursively. Authenticate the operator-
   // established root first so a missing ~/.lcm cannot be created as a side
   // effect of hook durability. Keep the descriptor open through the database
@@ -55,17 +78,28 @@ export async function appendLocalHookEvents(input: Readonly<{
   const factory = new SQLiteLocalHookOutboxFactory();
   try {
     assertStableRoot(rootHandle, rootPath, rootWitness);
-    const db = await factory.open(eventsDbPath(input.cwd));
     try {
-      for (const event of input.events) {
-        await db.insertEvent(input.sessionId, event, input.sourceHook);
+      return await withBackendPublicationAppendBarrierAsync(dirname(rootPath), async (token) => {
+        const db = await factory.open(eventsDbPath(input.cwd), {}, token);
+        try {
+          for (const event of input.events) {
+            await db.insertEvent(input.sessionId, event, input.sourceHook, token);
+          }
+          return {
+            inserted: input.events.length,
+            pendingCount: (await db.getHealthStats()).unprocessed,
+          };
+        } finally {
+          await factory.close(token);
+        }
+      }, undefined, dependencies.appendBarrierOptions ?? {
+        contentionWaitMs: LOCAL_HOOK_APPEND_CONTENTION_WAIT_MS,
+      });
+    } catch (error) {
+      if (error instanceof BackendPublicationAppendBarrierTimeoutError) {
+        throw new LocalHookDurabilityTimeoutError(error);
       }
-      return {
-        inserted: input.events.length,
-        pendingCount: (await db.getHealthStats()).unprocessed,
-      };
-    } finally {
-      await factory.close();
+      throw error;
     }
   } finally {
     try {

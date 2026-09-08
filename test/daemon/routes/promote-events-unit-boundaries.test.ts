@@ -172,6 +172,20 @@ describe("promote-events unit boundaries", () => {
     mocks.transaction.mockImplementation(async (callback: (repositories: unknown) => Promise<unknown>) => callback({}));
   });
 
+  it("uses ordinary promotion when a SQLite transaction has no receipt repository", async () => {
+    const transaction = vi.fn(async (callback: (repositories: unknown) => Promise<unknown>) =>
+      callback({}));
+    mocks.openProject.mockResolvedValueOnce({ ...projectStorage(), backend: "sqlite", transaction });
+    mocks.events.mockReturnValueOnce([event({ machine_id: "machine" })]);
+
+    const result = await promoteEventsForCwd(config, "/cwd", "/events.db");
+
+    expect(result).toMatchObject({ promoted: 1, skipped: 0, errors: 0 });
+    expect(transaction).toHaveBeenCalledOnce();
+    expect(mocks.dedup).toHaveBeenCalledOnce();
+    expect(mocks.mark).toHaveBeenCalledWith([1]);
+  });
+
   it("returns a generic global error when sidecar collection throws", async () => {
     mocks.collect.mockImplementationOnce(() => { throw new Error("scan failed"); });
     const response = {} as never;
@@ -319,12 +333,13 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.openOutbox).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps local promotion preparation outside admission and the selected batch inside", async () => {
+  it("queues local SQLite preparation separately from scrubber and selected storage", async () => {
     const sequence: string[] = [];
     let admitted = false;
     const events = [event({ data: "admit only the selected batch" })];
-    mocks.openOutbox.mockImplementation(() => { sequence.push("outbox-open"); });
+    mocks.openOutbox.mockImplementationOnce(() => { expect(admitted).toBe(true); sequence.push("outbox-open"); });
     mocks.events.mockImplementation(() => {
+      expect(admitted).toBe(true);
       sequence.push("outbox-read");
       return events;
     });
@@ -343,10 +358,11 @@ describe("promote-events unit boundaries", () => {
       sequence.push("repository-batch");
       return "id";
     });
+    const currentToken = {};
     const withPublicationAdmission = vi.fn(async (operation: (token: object) => Promise<unknown>) => {
       sequence.push("admission");
       admitted = true;
-      try { return await operation({}); } finally { admitted = false; }
+      try { return await operation(currentToken); } finally { admitted = false; }
     });
 
     await promoteEventsForCwd(
@@ -358,11 +374,12 @@ describe("promote-events unit boundaries", () => {
       { withPublicationAdmission },
     );
 
+    expect(mocks.mark).toHaveBeenCalledWith([events[0].event_id]);
     expect(sequence).toEqual([
-      "outbox-open", "outbox-read", "admission", "scrubber",
+      "admission", "outbox-open", "outbox-read", "admission", "scrubber",
       "admission", "project-open", "repository-batch",
     ]);
-    expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(3);
   });
 
   it("pairs a PostgreSQL-shaped preflight identity with scrubber paths and admission", async () => {

@@ -1,3 +1,9 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  assertBackendPublicationConsumerAccess,
+  withBackendPublicationAppendBarrierAsync,
+  type BackendPublicationLockToken,
+} from "../backend-publication.js";
 import { SqliteNativeTranscriptRepository } from "./native-transcript-repository.js";
 import type { DatabaseSync } from "node:sqlite";
 import { closeLcmConnection } from "../../db/connection.js";
@@ -10,6 +16,7 @@ import type {
 } from "../contracts.js";
 import { normalizeStorageError, StorageOperationError } from "../errors.js";
 import { SqliteExecutor } from "./executor.js";
+import type { SqliteOperationAdmission } from "./executor.js";
 import { assertSqliteReady, SqliteReadinessRollbackError } from "./health.js";
 import {
   createSqliteRepositories,
@@ -31,9 +38,11 @@ export class SqliteProjectStorage implements ProjectStorage {
   readonly lexicalSearch: ProjectRepositories["lexicalSearch"];
   readonly coordination: ProjectRepositories["coordination"];
 
+  private readonly operationAdmission = new AsyncLocalStorage<SqliteOperationAdmission>();
   private readonly stores: SqliteRepositoryStores;
-  private closed = false;
+  private closeState: "open" | "closing" | "closed" = "open";
   private closePromise: Promise<void> | undefined;
+  private releaseCommitted = false;
 
   constructor(
     readonly projectId: string,
@@ -42,6 +51,7 @@ export class SqliteProjectStorage implements ProjectStorage {
     private readonly executor: SqliteExecutor,
     readonly capabilities: StorageCapabilities,
     private readonly onClose: (storage: SqliteProjectStorage) => void,
+    private readonly admission?: SqliteOperationAdmission,
   ) {
     this.stores = createSqliteRepositoryStores(db, {
       fts5Available: capabilities.nativeFullTextSearch === "available",
@@ -49,8 +59,8 @@ export class SqliteProjectStorage implements ProjectStorage {
     const invoke: RepositoryInvoker = async (domain, operation, callback, atomic) => {
       this.assertOpen(domain, operation);
       return atomic
-        ? this.executor.runAtomic(domain, operation, callback)
-        : this.executor.run(domain, operation, callback);
+        ? this.executor.runAtomic(domain, operation, callback, this.operationAdmission.getStore() ?? this.admission)
+        : this.executor.run(domain, operation, callback, this.operationAdmission.getStore() ?? this.admission);
     };
     this.nativeTranscripts = Object.freeze({
       machineId: "local",
@@ -68,6 +78,19 @@ export class SqliteProjectStorage implements ProjectStorage {
     this.coordination = repositories.coordination;
   }
 
+  /** Use the caller's live token only for this handle's current operation. */
+  withPublicationAdmission<T>(
+    lockToken: BackendPublicationLockToken,
+    callback: () => T,
+  ): T {
+    if (this.admission?.homeDir !== undefined) {
+      assertBackendPublicationConsumerAccess({
+        homeDir: this.admission.homeDir, backend: "sqlite", lockToken,
+      });
+    }
+    return this.operationAdmission.run({ ...this.admission, lockToken }, callback);
+  }
+
   async transaction<T>(
     callback: (repositories: TransactionRepositories) => Promise<T>,
   ): Promise<T> {
@@ -82,11 +105,16 @@ export class SqliteProjectStorage implements ProjectStorage {
             : this.executor.runScoped(token, domain, operation, operationCallback),
       );
       return callback(repositories);
-    });
+    }, this.operationAdmission.getStore() ?? this.admission);
+  }
+
+  /** Factory probes may outlive the publication scope that opened this handle. */
+  healthWithFreshAdmission(): Promise<StorageHealth> {
+    return this.operationAdmission.run({ homeDir: this.admission?.homeDir }, () => this.health());
   }
 
   async health(): Promise<StorageHealth> {
-    if (this.closed) {
+    if (this.closeState !== "open") {
       return { status: "closed", backend: "sqlite", projectId: this.projectId };
     }
     let candidate: StorageHealth;
@@ -100,7 +128,7 @@ export class SqliteProjectStorage implements ProjectStorage {
           }
           throw error;
         }
-      });
+      }, this.operationAdmission.getStore() ?? this.admission);
       candidate = { status: "healthy", backend: "sqlite", projectId: this.projectId };
     } catch (error) {
       const normalized = normalizeStorageError(error, {
@@ -116,28 +144,91 @@ export class SqliteProjectStorage implements ProjectStorage {
         error: normalized,
       };
     }
-    if (this.closed) {
+    if (this.closeState !== "open") {
       return { status: "closed", backend: "sqlite", projectId: this.projectId };
     }
     return candidate;
   }
 
-  close(): Promise<void> {
+  close(publicationLockToken?: BackendPublicationLockToken): Promise<void> {
     if (this.closePromise) return this.closePromise;
-    this.closed = true;
-    const attempt = this.executor
-      .runCleanup("factory", "close", () => closeLcmConnection(this.dbPath, this.stores.db))
-      .then((): void => this.onClose(this));
+    this.closeState = "closing";
+    const currentAdmission = this.operationAdmission.getStore();
+    const currentLockToken = publicationLockToken ?? currentAdmission?.lockToken;
+    const appendBarrierOptions = currentAdmission?._appendBarrierOptions
+      ?? this.admission?._appendBarrierOptions;
+    const release = (): void => {
+      closeLcmConnection(this.dbPath, this.stores.db);
+      this.releaseCommitted = true;
+    };
+    const admittedRelease = async (): Promise<void> => {
+      try {
+        if (this.admission?.homeDir === undefined) {
+          release();
+          return;
+        }
+        await withBackendPublicationAppendBarrierAsync(
+          this.admission.homeDir,
+          release,
+          currentLockToken,
+          { contentionWaitMs: 5_000, ...appendBarrierOptions },
+        );
+      } catch (error) {
+        if (this.releaseCommitted) throw error;
+        throw new StorageOperationError(
+          "STORAGE_OPERATION_FAILED",
+          "sqlite",
+          this.projectId,
+          "factory",
+          "close",
+          { retryable: true },
+        );
+      }
+    };
+    const attempt = this.closeOnce(admittedRelease);
     this.closePromise = attempt.catch((error: unknown): never => {
-      this.closed = false;
-      this.closePromise = undefined;
+      if (this.releaseCommitted) {
+        this.closeState = "closed";
+      } else {
+        this.closeState = "open";
+        this.closePromise = undefined;
+      }
       throw error;
     });
     return this.closePromise;
   }
 
+  private async closeOnce(admittedRelease: () => Promise<void>): Promise<void> {
+    let hasFailure = false;
+    let failure: unknown;
+    try {
+      await this.executor.runCleanup("factory", "close", admittedRelease);
+    } catch (error) {
+      hasFailure = true;
+      failure = error;
+    }
+    if (this.releaseCommitted) {
+      this.closeState = "closed";
+      try {
+        this.onClose(this);
+      } catch (error) {
+        if (!hasFailure) {
+          hasFailure = true;
+          failure = error;
+        } else {
+          failure = new AggregateError(
+            [failure, error],
+            "SQLite project close committed but cleanup failed",
+            { cause: failure },
+          );
+        }
+      }
+    }
+    if (hasFailure) throw failure;
+  }
+
   private assertOpen(domain: Parameters<SqliteExecutor["run"]>[0], operation: string): void {
-    if (!this.closed) return;
+    if (this.closeState === "open") return;
     throw new StorageOperationError("STORAGE_CLOSED", "sqlite", this.projectId, domain, operation);
   }
 }
