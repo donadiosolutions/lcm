@@ -25,6 +25,10 @@ be registered. Missing bindings or database failures stop the operation;
 commands never fall back to a local SQLite database. Backend selection applies
 to the configured home and daemon, rather than individual projects.
 
+See [SQLite and PostgreSQL surface parity](backend-parity.md) for the supported
+matrix, deliberate capability differences, transfer scope, and instructions for
+reproducing and interpreting a revision's parity evidence.
+
 `lcm export --all`, `lcm promote --all`, and `lcm compact --all` enumerate authenticated locally known
 project paths and bindings, including bindings that have no SQLite database or
 `meta.json`. Aliases of the same selected project are processed once. This does

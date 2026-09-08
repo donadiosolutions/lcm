@@ -116,7 +116,29 @@ jobs:
           stage-postgresql: "true"
 
       - name: Run isolated PostgreSQL 18 conformance harness
-        run: pnpm run test:postgresql
+        shell: bash
+        run: |
+          set -o pipefail
+          pnpm run test:postgresql 2>&1 | tee "$RUNNER_TEMP/surface-parity-${{ matrix.run }}.log"
+
+      - name: Validate surface parity evidence
+        if: always()
+        env:
+          LCM_PARITY_LEG: ${{ matrix.run }}
+          LCM_PARITY_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          node scripts/surface-parity-artifact.mjs \
+            "$RUNNER_TEMP/surface-parity-${{ matrix.run }}.log" \
+            "$RUNNER_TEMP/surface-parity-${{ matrix.run }}"
+
+      - name: Upload surface parity evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: surface-parity-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}
+          path: ${{ runner.temp }}/surface-parity-${{ matrix.run }}/
+          if-no-files-found: error
+          retention-days: 14
 
   linux-systemd:
     name: Linux Ubuntu 24.04 user-systemd integration
