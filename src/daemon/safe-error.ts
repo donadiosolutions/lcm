@@ -89,12 +89,17 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let quotedQueryTail = false;
   let quotedPathEndedSeparator = -1;
   let restartedPathlessBrackets = 0;
+  let fileTailBracketDepth = 0;
+  let pendingFileTailBackslash = false;
+  let pendingNestedUrlContinuation = false;
   let queryOrFragment = false;
   let queryOrFragmentStart = -1;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
     if (WHITESPACE_PATTERN.test(char)) {
+      const preservesClosedBracketHandoff =
+        pendingFileTailBackslash && fileTailBracketDepth === 0 && (char === " " || char === "\t");
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;
@@ -109,7 +114,43 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedPathEndedSeparator = -1;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
+      if (!preservesClosedBracketHandoff) {
+        fileTailBracketDepth = 0;
+        pendingFileTailBackslash = false;
+        pendingNestedUrlContinuation = false;
+      }
       continue;
+    }
+    const fileTailBoundaryEvent =
+      fileTailBracketDepth > 0 && (char === "]" || URL_END_DELIMITERS.has(char));
+    if (pendingFileTailBackslash) {
+      if (char === "\\") {
+        if (!restartedPathlessFile) {
+          file[index] = 1;
+          fileTailBracketDepth = 0;
+          pendingFileTailBackslash = false;
+          pendingNestedUrlContinuation = false;
+          continue;
+        }
+      } else {
+        const continuesNestedUrl =
+          pendingNestedUrlContinuation && (char === "/" || char === ":" || char === "?");
+        pendingFileTailBackslash = false;
+        pendingNestedUrlContinuation = false;
+        if (!fileTailBoundaryEvent && !continuesNestedUrl) fileTailBracketDepth = 0;
+      }
+    }
+    if (fileTailBracketDepth > 0 && char === "[") {
+      fileTailBracketDepth += 1;
+    } else if (fileTailBracketDepth > 0 && char === "]") {
+      fileTailBracketDepth -= 1;
+      pendingFileTailBackslash = true;
+      pendingNestedUrlContinuation = fileTailBracketDepth > 0 && separator >= 0 && brackets > 0;
+    } else if (fileTailBracketDepth > 0 && URL_END_DELIMITERS.has(char)) {
+      pendingFileTailBackslash = true;
+      pendingNestedUrlContinuation = false;
+    } else if (restartedPathlessFile && char === "[") {
+      fileTailBracketDepth = 1;
     }
     if (separator >= 0 && (char === "?" || char === "#")) {
       const startsQuotedQueryTail =
@@ -193,6 +234,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       schemeQuote = 0;
       restartedPathlessFile = true;
       restartedPathlessBrackets = 0;
+      fileTailBracketDepth = 0;
+      pendingFileTailBackslash = false;
+      pendingNestedUrlContinuation = false;
       continue;
     }
     if (
@@ -298,6 +342,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (restartedPathlessFile && char === "\\") {
       restartedPathlessFile = false;
       restartedPathlessBrackets = 0;
+      fileTailBracketDepth = 0;
+      pendingFileTailBackslash = false;
+      pendingNestedUrlContinuation = false;
       queryOrFragment = false;
       file[index] = 1;
       continue;

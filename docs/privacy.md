@@ -530,8 +530,16 @@ The `Security` section of the doctor output shows:
   Whitespace, quoted-path, nested-URL, and delimiter termination remain
   unchanged. An unmatched closing bracket, a freshly recognized URL, or other
   URL-ending punctuation ends the context and clears its bracket state. A
-  recognizable nested exact `file://` path is also redacted. When an unquoted
-  local-path span starts with
+  recognizable nested exact `file://` path is also redacted. A root-relative
+  Windows backslash path is also redacted when a bracketed file URL query or
+  fragment hands off to it immediately after URL-ending punctuation or a
+  bracketed nested non-file URL. A nested IPv6 URL keeps the enclosing bracket
+  context through a path, port, or query after its IP-literal closing bracket.
+  A balanced outer bracket may have only spaces or tabs before the backslash.
+  This handoff is consumed once. Prose, newlines, carriage returns, and other
+  whitespace end it; ordinary text and non-file URLs do not make a single
+  backslash a global path start.
+  When an unquoted local-path span starts with
   `/scheme://`, its URL-shaped portion, including scheme and port colons, is
   replaced by one `<path>` marker on the first pass. The span ends at whitespace
   or the first unbalanced `)` or `]`, `#`, `&`, `=`, `|`, `,`, `;`, `!`, `?`,
