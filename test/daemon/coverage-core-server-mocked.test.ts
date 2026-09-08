@@ -111,6 +111,23 @@ afterEach(() => {
 });
 
 describe("mocked server states unavailable from Node HTTP", () => {
+  it("rejects a request already dispatched when shutdown has started", async () => {
+    const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }));
+    const handler = vi.fn();
+    daemon.registerRoute("POST", "/after-shutdown", handler, "mutating");
+    await daemon.stop();
+    let status = 0;
+    let body = "";
+    await state.listener?.({ method: "POST", url: "/after-shutdown", headers: {} }, {
+      writeHead: (code: number) => { status = code; },
+      end: (value: string) => { body = value; },
+    });
+    expect(status).toBe(500);
+    expect(JSON.parse(body)).toEqual({ error: "daemon is shutting down" });
+    expect(handler).not.toHaveBeenCalled();
+    expect(state.createFactory).toHaveBeenCalledOnce();
+  });
+
   it("waits for an active periodic ingest scan before closing storage", async () => {
     let intervalHandler: (() => Promise<void>) | undefined;
     const realSetInterval = globalThis.setInterval;

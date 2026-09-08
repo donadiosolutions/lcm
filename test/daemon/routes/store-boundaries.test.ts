@@ -292,16 +292,19 @@ describe("store persistence boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { stored: true, id: "stored-id" });
   });
 
-  it("does scrubber work before admission and keeps the repository write inside it", async () => {
+  it("keeps scrubber work between identity and storage admissions", async () => {
     const order: string[] = [];
+    let admitted = false;
     mocks.forProject.mockImplementationOnce(async () => {
+      expect(admitted).toBe(false);
       order.push("scrubber");
       return { scrub: (text: string) => { order.push("scrub"); return `scrubbed:${text}`; } };
     });
-    mocks.insert.mockImplementationOnce(() => { order.push("insert"); return "stored-id"; });
+    mocks.insert.mockImplementationOnce(() => { expect(admitted).toBe(true); order.push("insert"); return "stored-id"; });
     const admission = vi.fn(async (operation: (token: object) => Promise<unknown>) => {
       order.push("admission");
-      return operation({});
+      admitted = true;
+      try { return await operation({}); } finally { admitted = false; }
     });
 
     await createStoreHandler(config)({} as never, response, JSON.stringify({ text: "value", cwd: "/ordered" }), {
@@ -309,8 +312,8 @@ describe("store persistence boundaries", () => {
       signal: new AbortController().signal,
     });
 
-    expect(order).toEqual(["scrubber", "scrub", "admission", "insert"]);
-    expect(admission).toHaveBeenCalledOnce();
+    expect(order).toEqual(["admission", "scrubber", "scrub", "admission", "insert"]);
+    expect(admission).toHaveBeenCalledTimes(2);
   });
 
   it("blocks live identity drift after selecting scrubber patterns from the preflight identity", async () => {
@@ -354,7 +357,7 @@ describe("store persistence boundaries", () => {
       config.security.sensitivePatterns,
       `/lcm/projects/${preflight.localProjectId}`,
     );
-    expect(order).toEqual(["scrubber", "admission"]);
+    expect(order).toEqual(["admission", "scrubber", "admission"]);
     expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
       status: "blocked",
       error: "backend publication admission blocked",

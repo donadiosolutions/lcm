@@ -1,8 +1,8 @@
+import { admittedProjectIdentity } from "./storage-lifecycle.js";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { DaemonConfig } from "../config.js";
-import { projectIdentity } from "../project.js";
 import { buildOrientationPrompt } from "../orientation.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
@@ -123,7 +123,7 @@ export function createRestoreHandler(
       if (cwd) {
         try {
           const before = resolveGitProjectAnchor(cwd);
-          projectIdentity(cwd, config.storage, routeContext?.publicationLockToken);
+          await admittedProjectIdentity(cwd, config.storage, routeContext);
           const after = resolveGitProjectAnchor(cwd);
           if (!anchorsMatch(before, after)) {
             throw new Error("Git worktree topology changed during storage admission");
