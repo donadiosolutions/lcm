@@ -10,20 +10,29 @@ const ABSENT_ID = "01900000-0000-7000-8000-000000000099";
 const REMOTE_REFUSAL = /require.*storage\.backend.*postgresql/iu;
 const PATTERN = "parity_private_[0-9]{4}";
 
-function json(result, code = 0) {
+export function json(result, code = 0) {
   if (result.code !== code) {
     // Emit only a fixed refusal category and this fixture's caller line. CLI
     // payloads can contain private paths or connection details and stay local.
     let error = "";
-    try { error = String(JSON.parse(result.stdout).error ?? ""); } catch {}
+    let payload;
+    try { payload = JSON.parse(result.stdout); error = String(payload.error ?? ""); } catch {}
     const classification = /already a project with stored data/iu.test(error) ? "stored-data"
       : /already mapped|multiple hashes/iu.test(error) ? "path-ownership"
       : /unknown project|not found|does not exist/iu.test(error) ? "missing-project"
       : /binding|reconcil/iu.test(error) ? "binding"
+      : /LCM storage publication is busy/u.test(result.stderr) ? "publication-busy"
+      : /LCM home migration is busy/u.test(result.stderr) ? "migration-busy"
+      : /lcm daemon unavailable \(/u.test(result.stderr) ? "daemon-unavailable"
+      : /LCM command failed\./u.test(result.stderr) ? "command-failed"
+      : payload?.incomplete === true ? "incomplete"
+      : Number.isFinite(payload?.errors) && payload.errors > 0 ? "result-errors"
       : "unexpected-status";
     const frames = [...new Error().stack.matchAll(/surface-parity-identity\.mjs:(\d+):\d+/gu)];
     const caller = frames[1]?.[1] ?? "unknown";
-    assert.fail(`surface-identity:cli-L${caller}:${classification}`);
+    const failure = new Error(`surface-identity:cli-L${caller}:${classification}`);
+    failure.surfaceEvidence = { stderrDigest: createHash("sha256").update(result.stderr).digest("hex") };
+    throw failure;
   }
   return JSON.parse(result.stdout);
 }

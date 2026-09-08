@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
-import { PrivateMutationLockContentionError } from "../../dist/src/private-mutation-lock.js";
-import { withImportCatalogAdmission } from "../postgresql/fixtures/surface-parity-imports.mjs";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
+import { withImportCatalogAdmission } from "./import-admission.mjs";
 
 it("retries the actual private admission class despite its default Error name", async () => {
   const contention = new PrivateMutationLockContentionError("private fixture admission");
@@ -9,7 +9,7 @@ it("retries the actual private admission class despite its default Error name", 
   const result = await withImportCatalogAdmission(async () => {
     if (++calls === 1) throw contention;
     return "admitted";
-  }, "claude");
+  }, "claude", PrivateMutationLockContentionError);
   expect(result).toBe("admitted");
   expect(calls).toBe(2);
 });
@@ -21,6 +21,6 @@ it("does not retry an unrelated error impersonating the class name", async () =>
   await expect(withImportCatalogAdmission(async () => {
     calls++;
     throw unrelated;
-  }, "codex")).rejects.toBe(unrelated);
+  }, "codex", PrivateMutationLockContentionError)).rejects.toBe(unrelated);
   expect(calls).toBe(1);
 });

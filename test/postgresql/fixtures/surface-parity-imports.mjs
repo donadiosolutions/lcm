@@ -1,3 +1,4 @@
+import { withImportCatalogAdmission } from '../../surface-parity/import-admission.mjs';
 import { createGitFixture } from '../../surface-parity/git-fixture.mjs';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -87,28 +88,6 @@ async function ensureProjectStorage(context, cwd) {
   check(result.status === 200 && [0, 1].includes(result.body.ingested), 'prerequisite-storage');
 }
 
-// The public import still executes once admitted; this fixture-only helper
-// retries only the real private catalog-admission contention class.
-export async function withImportCatalogAdmission(operation, provider) {
-  check(provider === 'claude' || provider === 'codex', 'admission-provider');
-  // Preserve the bounded contention failure while identifying its source.
-  // Only fixed module names and line numbers may enter public evidence.
-  const deadline = Date.now() + 5000;
-  for (;;) {
-    try { return await operation(); }
-    catch (error) {
-      if (!(error instanceof PrivateMutationLockContentionError)) throw error;
-      if (Date.now() >= deadline) {
-        const stack = String(error.stack ?? '');
-        const frame = stack.match(/\/(?:dist\/)?src\/(import|cli-storage|project-map|worktree-reconciliation|codex-project-resolution|git-project|identity-service|storage\/(?:backend-publication|publication-convergence))\.(?:js|ts):(\d+):\d+/u)
-          ?? stack.match(/\/(?:dist\/)?src\/(private-mutation-lock)\.(?:js|ts):(\d+):\d+/u);
-        const source = frame ? `${frame[1]}.${frame[2]}` : 'unknown-source';
-        throw new Error(`surface-parity-imports:${provider}-contention:${source}`, { cause: error });
-      }
-      await new Promise(resolve => setTimeout(resolve, 50));
-    }
-  }
-}
 
 async function nativeImport(context) {
   await ensureProjectStorage(context, context.projectPath);
@@ -198,7 +177,7 @@ async function nativeImport(context) {
   const refusals = {};
   for (const provider of providers) {
     const result = await withImportCatalogAdmission(
-      () => importSessions(client, { cwd: context.projectPath, provider, all: true }), provider,
+      () => importSessions(client, { cwd: context.projectPath, provider, all: true }), provider, PrivateMutationLockContentionError,
     );
     const normalized = { unresolved: result.unresolved, ambiguous: result.ambiguous, failed: result.failed, skipped: result.skippedEmpty };
     equal(normalized, { unresolved: 1, ambiguous: 1, failed: provider === 'claude' ? 2 : 0, skipped: 1 }, `${provider}-refusals`);
