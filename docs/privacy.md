@@ -198,10 +198,29 @@ try {
    database file or discard its WAL/SHM sidecars to restore a backup; stop all
    writers again before any restoration.
 
-Legacy worktree reconciliation uses a separate import path. Inspect and
-deliberately repair affected source rows before reconciling worktrees; this
-store guard does not protect that import path. The reconciliation limitation
-is tracked in [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
+Legacy worktree reconciliation uses a separate import path. During a real
+reconciliation, LCM checks the live source database while its existing
+exclusive write lock is held and checks the canonical target inside its target
+transaction. For a source that has not been merged, a promoted row whose
+`content` is not SQLite `TEXT` or contains an embedded NUL fails closed with
+`stored promoted content is unsupported` before the row can be copied or used
+to rebuild FTS. The source check rolls back the uncommitted fence, so the source
+bytes remain intact and can be repaired in place. A target check rolls back the
+target transaction; its source fence may already be committed, so repair the
+target database in place and rerun reconciliation. Use the offline diagnostic
+and replacement procedure above to inspect and deliberately repair affected
+rows before retrying.
+
+A canonical per-source completion marker remains an idempotent recovery
+boundary. LCM does not ask for a source repair that the completed merge would
+skip; it re-fences and archives that source, preserving its original bytes in
+the private backup. If the completion marker is missing when the target
+transaction checks it, LCM rechecks the normalized source and fails closed
+instead of relying on the earlier marker observation. This does not audit or
+repair canonical content written by an older LCM version. If that target
+contains a known truncated legacy value, repair the canonical target with the
+offline procedure above. This refusal
+behavior is implemented by [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
 
 No data is sent to any Long Context Manager (LCM) server. There is no telemetry.
 An explicitly configured PostgreSQL backend is a user-operated remote-primary
@@ -293,9 +312,14 @@ bundled Gitleaks rules, built-in patterns, global `security.sensitivePatterns`,
 and the project's `sensitive-patterns.txt`. Previously captured passive events
 are scrubbed again before promotion.
 
-Bundled rules scoped to a service hostname match that literal hostname,
-including its dots. A lookalike hostname is not treated or redacted as that
-service; add a custom pattern when your environment intentionally uses one.
+The bundled Slack webhook (`hooks.slack.com`) and Sidekiq
+(`gems.contribsys.com` and `enterprise.contribsys.com`) service-hostname rules
+match their hostnames case-insensitively while treating dots literally. The
+Slack webhook rule still accepts only the lowercase `/services`, `/workflows`,
+and `/triggers` path prefixes and preserves its token-suffix boundaries. A
+lookalike hostname is not treated or redacted as that service; add a custom
+pattern when your environment intentionally uses one. Other bundled hostname
+rules retain their own matching behavior.
 
 For PostgreSQL native transcripts, the embedded caller must explicitly
 load and pass both effective custom-pattern arrays: global
@@ -514,6 +538,10 @@ The `Security` section of the doctor output shows:
   userinfo, port, or bracketed host, and its following path are removed. This
   can remove a non-secret host or port glued to a private path, preventing the
   private tail from remaining visible after one sanitization pass. Ordinary
+  unquoted paths also absorb a glued single-slash `file:/` suffix and its
+  colon-bearing path segments into the same span. This scan-local rule does not
+  make `file:/` a new top-level path start or change ordinary public URL
+  classification. Existing
   authority delimiters still end the absorbed span; later word-glued text is
   classified independently and can remain visible even when it resembles a
   local path. An opening `(` instead resumes the already active path scan, so

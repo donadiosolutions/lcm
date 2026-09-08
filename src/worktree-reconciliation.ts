@@ -731,6 +731,34 @@ function tableExists(db: DatabaseSync, table: string): boolean {
   ).get(table) !== undefined;
 }
 
+function assertSupportedPromotedContent(db: DatabaseSync): void {
+  if (!tableExists(db, "promoted")) return;
+  const unsupported = db.prepare(
+    `SELECT 1
+     FROM promoted
+     WHERE typeof(content) <> 'text' OR instr(content, char(0)) > 0
+     LIMIT 1`,
+  ).get();
+  if (unsupported !== undefined) {
+    throw new Error("stored promoted content is unsupported");
+  }
+}
+
+function hasCompletedMainSource(targetPath: string, sourceHash: string): boolean {
+  if (!isRegularFile(targetPath)) return false;
+  const target = new DatabaseSync(targetPath, { readOnly: true });
+  try {
+    return tableExists(target, "worktree_reconciliation_sources")
+      && row(
+        target,
+        "SELECT source_hash FROM worktree_reconciliation_sources WHERE source_hash = ?",
+        sourceHash,
+      ) !== undefined;
+  } finally {
+    target.close();
+  }
+}
+
 function assertNoRuntimeNativeTranscriptState(db: DatabaseSync): void {
   const nativeTables = db.prepare(
     "SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') AND lower(name) GLOB 'runtime_native_*'",
@@ -1395,10 +1423,13 @@ function mergeMainDatabase(
   afterSourceFenceCommit?: () => void,
 ): void {
   assertTarget();
+  const sourceWasMerged = hasCompletedMainSource(targetPath, sourceHash);
+  assertTarget();
   withSourceWriteFence(sourcePath, sourceHash, "project", busyTimeoutMs, (
     source,
     commitFence,
   ) => {
+    if (!sourceWasMerged) assertSupportedPromotedContent(source);
     commitFence();
     assertTarget();
     return withNormalizedMainSnapshot(
@@ -1438,6 +1469,8 @@ function mergeMainDatabase(
               assertTarget();
               return;
             }
+            if (sourceWasMerged) assertSupportedPromotedContent(normalizedSource);
+            assertSupportedPromotedContent(target);
             for (const conversation of rows(
               normalizedSource,
               "SELECT * FROM conversations ORDER BY conversation_id",

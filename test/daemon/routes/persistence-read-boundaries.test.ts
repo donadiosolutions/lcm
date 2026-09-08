@@ -291,6 +291,16 @@ describe("persistence read route boundaries", () => {
     expectLast(200, { expanded: null, error: expected });
   });
 
+  it("absorbs a single-slash file tail in describe wire errors", async () => {
+    const message = "read failed for file://one.invalid/Users/afile:/C:/Users/b";
+    const expected = "read failed for file://one.invalid<path>";
+    mocks.describe.mockRejectedValueOnce(new Error(message));
+
+    expect(sanitizeError(message)).toBe(expected);
+    await invoke(createDescribeHandler(config), { nodeId: "n", cwd: "/ok" });
+    expectLast(200, { node: null, error: expected });
+  });
+
   it("sanitizes adjacent post-bracket paths in describe read errors", async () => {
     mocks.describe.mockRejectedValueOnce(
       new Error("read failed for file://host.invalid[/Users/canary/one.db]/Users/canary/two.db"),
