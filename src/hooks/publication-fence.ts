@@ -163,6 +163,51 @@ export function assertHookRootEstablished(): void {
   assertEstablishedLcmRoot();
 }
 
+type HookOperationOutcome<T> =
+  | Readonly<{ succeeded: true; value: T }>
+  | Readonly<{ succeeded: false; error: unknown }>;
+
+const FENCE_FINALIZATION_DIAGNOSTIC = "hook publication fence finalization failed";
+
+function completeHookOperation<T>(
+  rootHandle: PrivateDirectoryHandle,
+  rootPath: string,
+  rootWitness: PrivateDirectoryWitness,
+  outcome: HookOperationOutcome<T>,
+): T {
+  const cleanupErrors: unknown[] = [];
+  try {
+    assertStableRoot(rootHandle, rootPath, rootWitness);
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    rootHandle.close();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (cleanupErrors.length === 0) {
+    if (outcome.succeeded) return outcome.value;
+    throw outcome.error;
+  }
+  const cause = outcome.succeeded
+    ? cleanupErrors.length === 1
+      ? cleanupErrors[0]
+      : new AggregateError(cleanupErrors, FENCE_FINALIZATION_DIAGNOSTIC)
+    : new AggregateError(
+      [outcome.error, ...cleanupErrors],
+      FENCE_FINALIZATION_DIAGNOSTIC,
+      { cause: outcome.error },
+    );
+  // Benign missing evidence must not hide a failed retained-root fence.
+  if (!outcome.succeeded
+    && outcome.error instanceof BackendPublicationJournalError
+    && outcome.error.reason !== "publication-evidence-missing") {
+    throw new BackendPublicationJournalError(outcome.error.reason, outcome.error.message, { cause });
+  }
+  throw new BackendPublicationJournalError("unsafe-storage", FENCE_FINALIZATION_DIAGNOSTIC, { cause });
+}
+
 /**
  * Fence one direct synchronous hook action with the coordinator's consumer
  * lock. The callback must stay short and consume the live coordinator token
@@ -174,8 +219,9 @@ export function withHookPublicationFence<T>(
   const rootPath = lcmHomeDir();
   const rootHandle = openPrivateDirectory(rootPath);
   const rootWitness = rootHandle.witness;
+  let outcome: HookOperationOutcome<T>;
   try {
-    return withBackendPublicationConsumerLock(hookPublicationHome(), (lockToken) => {
+    const value = withBackendPublicationConsumerLock(hookPublicationHome(), (lockToken) => {
       assertStableRoot(rootHandle, rootPath, rootWitness);
       assertHookPublicationEvidence(lockToken);
       const result = callback(lockToken);
@@ -189,13 +235,11 @@ export function withHookPublicationFence<T>(
       assertHookPublicationEvidence(lockToken);
       return result;
     });
-  } finally {
-    try {
-      assertStableRoot(rootHandle, rootPath, rootWitness);
-    } finally {
-      rootHandle.close();
-    }
+    outcome = { succeeded: true, value };
+  } catch (error) {
+    outcome = { succeeded: false, error };
   }
+  return completeHookOperation(rootHandle, rootPath, rootWitness, outcome);
 }
 
 /** Async counterpart for short local hook actions that need a live token. */
@@ -205,8 +249,9 @@ export async function withHookPublicationFenceAsync<T>(
   const rootPath = lcmHomeDir();
   const rootHandle = openPrivateDirectory(rootPath);
   const rootWitness = rootHandle.witness;
+  let outcome: HookOperationOutcome<T>;
   try {
-    return await withBackendPublicationConsumerLockAsync(
+    const value = await withBackendPublicationConsumerLockAsync(
       hookPublicationHome(),
       async (lockToken) => {
         assertStableRoot(rootHandle, rootPath, rootWitness);
@@ -217,13 +262,11 @@ export async function withHookPublicationFenceAsync<T>(
         return result;
       },
     );
-  } finally {
-    try {
-      assertStableRoot(rootHandle, rootPath, rootWitness);
-    } finally {
-      rootHandle.close();
-    }
+    outcome = { succeeded: true, value };
+  } catch (error) {
+    outcome = { succeeded: false, error };
   }
+  return completeHookOperation(rootHandle, rootPath, rootWitness, outcome);
 }
 
 /** Consume a short admission check without retaining the lock over I/O. */

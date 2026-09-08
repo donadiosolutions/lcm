@@ -96,6 +96,8 @@ const expectedComponents = [
     component_id: "unit-hooks",
     name: "Unit - Hooks",
     // #1225 composes SessionStart pruning with append admission in this owner.
+    // #1259 keeps publication-fence error classification and ordered final
+    // root-validation/descriptor-close evidence in the existing hooks owner.
     paths: ["src/hooks/"],
   },
   {

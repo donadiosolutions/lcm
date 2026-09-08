@@ -352,6 +352,30 @@ retained admission. Callers supplying a retained publication token reuse it
 for local preparation, acknowledgement, and owned storage cleanup. The token is valid
 only while its owning admission scope remains active.
 
+### Publication fence finalization
+
+Before a hook's publication fence finishes, LCM validates the retained root
+directory again and attempts to close its descriptor even if validation fails.
+When both steps succeed, an operation failure is preserved unchanged, including
+its original error identity and cause.
+
+If final validation or descriptor closure also fails, an existing publication
+journal error retains its reason and message unless its reason is
+`publication-evidence-missing`. The combined error preserves the original failure
+as the first entry in its aggregate evidence, followed by final-validation and
+descriptor-close failures in that order. The original error is never modified;
+any evidence it already contains remains attached to it.
+
+All other cases with a finalization failure, including missing publication
+evidence, lock contention, ordinary operation failures, and otherwise successful
+operations, are classified as `unsafe-storage`. An otherwise successful operation
+cannot return success from the fence after either finalization step fails. Its
+evidence contains only the cleanup failures: one failure is retained directly as
+the cause, and multiple failures are aggregated in validation-then-close order.
+The public diagnostic remains sanitized; filesystem details stay in error
+evidence. Each hook keeps its existing diagnostic and exit-code handling, so a
+typed fence failure does not imply a nonzero exit code from every hook.
+
 ### Native ingest source changes and cancellation
 
 When `/ingest` receives a native transcript path, parsed messages and native
