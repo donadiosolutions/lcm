@@ -940,8 +940,8 @@ async function captureRole(
         const stat = context.ops.fstat(fd);
         validateSourceStat(stat, SOURCE_LIMIT);
         if (!sameInode(stat, context.ownedFiles.get(path)!)) throw new InternalSnapshotError("changed");
-        context.ops.fsync(fd);
         context.ops.fchmod(fd, ARTIFACT_MODE);
+        context.ops.fsync(fd);
       } finally { context.ops.close(fd); }
       await observe(context, "after-private-fsync", path, role);
     }

@@ -35,6 +35,10 @@ SQLite recovery, `quick_check`, schema inspection, UTF-8 admission, and
 opens the source through SQLite, checkpoints it, changes its mode, runs a source
 migration, cleans a sidecar, or writes its directory.
 
+Private raw database/WAL copies and normalized database artifacts are sealed to
+read-only mode before their final file sync. A mode-change or final-sync failure
+prevents publication of the committed snapshot marker.
+
 Maintenance enters durably before capture. Hooks may keep appending to their
 local outboxes throughout the hold, including after restart. Capture takes a
 short local append barrier, authenticates fresh source bytes and a private copy

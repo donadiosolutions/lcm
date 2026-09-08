@@ -262,6 +262,7 @@ component_management:
         # private receipt evidence in this migration owner.
         # Includes immutable receipt and queue evidence publication.
         # #1231 orders receipt epoch durability before machine identity visibility.
+        # #622 seals private artifact modes before the final file sync.
         - "src/migration/"
     - component_id: "unit-local-event-storage"
       name: "Unit - Local Event Storage"

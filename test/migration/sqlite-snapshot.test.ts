@@ -4,6 +4,8 @@ import {
   chmodSync,
   closeSync,
   fstatSync,
+  fchmodSync,
+  fsyncSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -1788,6 +1790,56 @@ describe("authenticated SQLite snapshot artifacts", () => {
     const oversized = await prepareFixture({ ...base, authority });
     await expect(captureFixture(oversized)).rejects.toMatchObject({ reason: "invalid-input" });
     expect(() => statSync(join(generationDirectory(base.homeDir), "witness.committed"))).toThrow();
+  });
+
+  it("syncs each final artifact only after sealing its read-only mode", async () => {
+    const fixture = await heldFixture();
+    let sealingPath: string | undefined;
+    const order = new Map<string, string[]>();
+    await captureFixture(fixture, {
+      observe: (boundary, path) => {
+        if (boundary === "before-private-fsync") {
+          sealingPath = path;
+          order.set(path, []);
+        } else if (boundary === "after-private-fsync") sealingPath = undefined;
+      },
+      fchmod: (fd, mode) => {
+        fchmodSync(fd, mode);
+        if (sealingPath !== undefined) order.get(sealingPath)!.push(`chmod:${mode.toString(8)}`);
+      },
+      fsync: fd => {
+        if (sealingPath !== undefined) {
+          order.get(sealingPath)!.push(`fsync:${(fstatSync(fd).mode & 0o777).toString(8)}`);
+        }
+        fsyncSync(fd);
+      },
+    });
+    expect(order.size).toBeGreaterThanOrEqual(6);
+    for (const [path, calls] of order) {
+      expect(calls, path).toEqual(["chmod:400", "fsync:400"]);
+      expect(statSync(path).mode & 0o777).toBe(0o400);
+    }
+    expect(await classifySqliteSnapshotArtifact("generation-1", { homeDir: fixture.homeDir }))
+      .toMatchObject({ state: "complete" });
+  });
+
+  it("does not commit an artifact when final read-only sealing fails", async () => {
+    const fixture = await heldFixture();
+    let sealing = false;
+    let syncedAfterSealingFailure = false;
+    await expect(captureFixture(fixture, {
+      observe: boundary => { if (boundary === "before-private-fsync") sealing = true; },
+      fchmod: (fd, mode) => {
+        if (sealing) throw new Error("final artifact mode failed");
+        fchmodSync(fd, mode);
+      },
+      fsync: fd => {
+        if (sealing) syncedAfterSealingFailure = true;
+        fsyncSync(fd);
+      },
+    })).rejects.toMatchObject({ reason: "snapshot-io" });
+    expect(syncedAfterSealingFailure).toBe(false);
+    expect(() => statSync(join(generationDirectory(fixture.homeDir), "witness.committed"))).toThrow();
   });
 
   it("does not publish a marker after injected read, close, or fsync failure", async () => {

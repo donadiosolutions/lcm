@@ -201,6 +201,7 @@ const expectedComponents = [
     name: "Unit - Migration and Cutover",
     // #622 keeps immutable capture, preparation, and receipt evidence here.
     // #1231 orders receipt epoch durability before machine identity visibility.
+    // #622 seals private artifact modes before the final file sync.
     paths: ["src/migration/"],
   },
   {
