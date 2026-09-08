@@ -54,6 +54,8 @@ component_management:
         # #1223 keeps authenticated lock-owner disappearance recovery in this
         # existing configuration-security owner.
         # #1231 keeps exact intended enrollment identity construction here.
+        # #1144 preserves admission callback failures while retaining ordered
+        # bootstrap-lock, home, and parent descriptor cleanup evidence here.
         # PR #791 keeps generated Gitleaks hostname-literal normalization in
         # this existing configuration-security owner.
         - "^src/config-manager\\.ts$"
@@ -115,8 +117,9 @@ component_management:
         # Error sanitization, including #893 adjacent-path, #903 prefixed
         # nested-file, #924 embedded-quote, #925/#1076 quoted-authority,
         # quoted/root-only backslash handoff, #1010 pathless-tail brackets,
-        # #1060 adjacent nested-file schemes, #1117 glued authorities, and
-        # #1128 active file-URL own-query backslash paths remain daemon-core-owned.
+        # #1060 adjacent nested-file schemes, #1113 doubled-colon drive tails,
+        # #1117 glued authorities, and #1128 active file-URL own-query
+        # backslash paths remain daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -131,6 +134,7 @@ component_management:
         # #705 prompt-search surfacing-log failures, #709 search and grep routes,
         # #710 grep mode, #792 session filtering, #793 search-limit validation,
         # #794 grep-since validation, #825 bounded atomic promotion metadata,
+        # #1217 native snapshot retries, preparation/admission and attempt lifetime remain route-owned.
         # #888 bounded atomic ingest and compact metadata timestamps,
         # #862 recent limit validation, #863 expand depth validation, #930
         # expand body-shape validation, #969 route body-shape validation, and #864

@@ -13,6 +13,10 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import * as sqliteConnection from "../../src/db/connection.js";
 import { eventsDbPath } from "../../src/db/events-path.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
+import { createIngestHandler } from "../../src/daemon/routes/ingest.js";
+import { createStorageBackendFactory } from "../../src/storage/factory.js";
+import type { ProjectStorage } from "../../src/storage/contracts.js";
+import * as hookErrors from "../../src/hooks/hook-errors.js";
 import { DaemonClient } from "../../src/daemon/client.js";
 import { createDaemon } from "../../src/daemon/server.js";
 import { appendLocalHookEvents } from "../../src/hooks/local-enqueue.js";
@@ -197,6 +201,122 @@ function restoreEnvironment(name: string, value: string | undefined): void {
 }
 
 describe("PostgreSQL 18 daemon runtime", { timeout: 120_000 }, () => {
+  it("drains an aborted native ingest checkpoint before closing PostgreSQL storage", async () => {
+    await withPostgreSqlTestDatabase("daemon-ingest-abort", async (database) => {
+      await applyAllRuntimeGrants(database);
+      const homeDir = mkdtempSync(join(tmpdir(), "lcm-pg-ingest-abort-home-"));
+      const projectPath = mkdtempSync(join(tmpdir(), "lcm-pg-ingest-abort-project-"));
+      const transcriptPath = join(projectPath, "session.jsonl");
+      writeFileSync(transcriptPath, JSON.stringify({
+        message: { role: "user", content: "private PostgreSQL abort regression" },
+      }) + "\n", { mode: 0o600 });
+      const repository = new PostgreSqlIdentityRepository(database.migrator);
+      const machine = await repository.registerMachine(
+        `machine:${createHash("sha256").update(projectPath).digest("hex")}`,
+        "PostgreSQL ingest cancellation",
+      );
+      const project = await repository.createProject({
+        machineId: machine.machineId,
+        displayName: "PostgreSQL ingest cancellation",
+        path: projectPath,
+        normalizedPath: resolve(projectPath),
+      });
+      const environmentNames = ["HOME", "USERPROFILE", "LCM_POSTGRES_URL",
+        "LCM_POSTGRES_CA_FILE", "LCM_POSTGRES_MIGRATION_ROLE"] as const;
+      const originalEnvironment = environmentNames.map(name => [name, process.env[name]] as const);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let checkpointCompleted = false;
+      let factory: Awaited<ReturnType<typeof createStorageBackendFactory>> | undefined;
+      let handling: Promise<void> | undefined;
+      let storage: ProjectStorage | undefined;
+      let closeCount = 0;
+      const loggedError = vi.spyOn(hookErrors, "safeLogError").mockImplementation(() => undefined);
+      try {
+        process.env.HOME = homeDir;
+        process.env.USERPROFILE = homeDir;
+        process.env.LCM_POSTGRES_URL = database.runtimeUrl;
+        process.env.LCM_POSTGRES_CA_FILE = process.env.LCM_TEST_POSTGRES_CA_FILE;
+        process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
+        mkdirSync(join(homeDir, ".lcm"), { recursive: true, mode: 0o700 });
+        writeFileSync(join(homeDir, ".lcm", "machine.json"), JSON.stringify({
+          version: 1, identityKey: machine.identityKey, machineId: machine.machineId,
+          displayName: machine.displayName,
+        }) + "\n", { mode: 0o600 });
+        await publishPostgreSqlSelection(homeDir, machine, project, projectPath);
+        const config = loadDaemonConfig(join(homeDir, ".lcm", "config.json"));
+        factory = await createStorageBackendFactory(config.storage, homeDir);
+        const openProject = factory.openProject.bind(factory);
+        vi.spyOn(factory, "openProject").mockImplementation(async (...args) => {
+          storage = await openProject(...args);
+          expect(storage.backend).toBe("postgresql");
+          const native = storage.nativeTranscripts!.repository;
+          const getCheckpoint = native.getCheckpoint.bind(native);
+          vi.spyOn(native, "getCheckpoint").mockImplementation(async (...checkpointArgs) => {
+            entered.resolve();
+            await release.promise;
+            const result = await getCheckpoint(...checkpointArgs);
+            checkpointCompleted = true;
+            return result;
+          });
+          const close = storage.close.bind(storage);
+          vi.spyOn(storage, "close").mockImplementation(async () => {
+            closeCount += 1;
+            await close();
+          });
+          return storage;
+        });
+        const controller = new AbortController();
+        let status = 0;
+        let body = "";
+        const response = {
+          writeHead: (code: number) => { status = code; },
+          end: (text: string) => { body = text; },
+        };
+        handling = Promise.resolve(createIngestHandler(config, factory)(
+          {} as never, response as never,
+          JSON.stringify({ cwd: projectPath, session_id: "abort-native-session",
+            client: "claude", transcript_path: transcriptPath }),
+          { signal: controller.signal },
+        ));
+        await Promise.race([
+          entered.promise,
+          handling.then(() => { throw new Error(`ingest ended before checkpoint: ${status} ${body}`); }),
+        ]);
+        controller.abort();
+        controller.abort();
+        // Let abort cleanup run while the real checkpoint read remains gated.
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(closeCount).toBe(0);
+        expect(await storage!.health()).toMatchObject({ status: "healthy", backend: "postgresql" });
+        release.resolve();
+        await handling;
+        expect(checkpointCompleted).toBe(true);
+        expect(status).toBe(499);
+        expect(JSON.parse(body)).toEqual({ status: "cancelled", error: "ingest cancelled" });
+        expect(loggedError).not.toHaveBeenCalled();
+        expect(closeCount).toBe(1);
+        expect(await storage!.health()).toMatchObject({ status: "closed", backend: "postgresql" });
+        await factory.close();
+        expect(closeCount).toBe(1);
+      } finally {
+        release.resolve();
+        try {
+          await handling;
+        } finally {
+          try {
+            await factory?.close();
+          } finally {
+            loggedError.mockRestore();
+            for (const [name, value] of originalEnvironment) restoreEnvironment(name, value);
+            rmSync(homeDir, { recursive: true, force: true });
+            rmSync(projectPath, { recursive: true, force: true });
+          }
+        }
+      }
+    });
+  });
+
   it("routes real daemon writes and reads without project SQLite fallback", async () => {
     await withPostgreSqlTestDatabase("daemon-runtime", async (database) => {
       await applyAllRuntimeGrants(database);

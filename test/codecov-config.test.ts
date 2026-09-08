@@ -117,8 +117,9 @@ const expectedComponents = [
       // Error sanitization, including #893 adjacent-path, #903 prefixed
       // nested-file, #924 embedded-quote, #925/#1076 quoted-authority,
       // quoted/root-only backslash handoff, #1010 pathless-tail brackets,
-      // #1060 adjacent nested-file schemes, #1117 glued authorities, and
-      // #1128 active file-URL own-query backslash paths remain daemon-core-owned.
+      // #1060 adjacent nested-file schemes, #1113 doubled-colon drive tails,
+      // #1117 glued authorities, and #1128 active file-URL own-query
+      // backslash paths remain daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -582,6 +583,7 @@ describe("Codecov configuration", () => {
     // #930 keeps expand body-shape validation in that component as well.
     // #969 keeps the route-family and passive notification body-shape
     // validation in their existing route and daemon-events components.
+    // #1217 keeps native snapshot retries, preparation/admission and attempt lifetime route-owned.
     // #888 keeps private final ingest and compact metadata writes route-owned.
     // #890 keeps bounded best-effort status metadata reads route-owned.
     // #1003 keeps preliminary metadata admission daemon-core-owned.
@@ -611,6 +613,8 @@ describe("Codecov configuration", () => {
       ["src/home-parent-auth.ts", "unit-configuration-security"],
       // #1041 preserves bootstrap directory authentication errors when
       // descriptor cleanup also fails in this existing owner.
+      // #1144 preserves admission callback failures while retaining ordered
+      // bootstrap-lock, home, and parent descriptor cleanup evidence here.
       ["src/runtime-paths.ts", "unit-configuration-security"],
       // #1195 strict module-relative asset resolution retains this owner.
       ["src/runtime-root.ts", "unit-configuration-security"],

@@ -418,9 +418,15 @@ The `Security` section of the doctor output shows:
   HTTP `200` status and null-result response shape. SQLite details become a
   `database constraint error`. Host-local POSIX, Windows, and UNC paths become
   `<path>`; quoted paths may contain spaces, while unquoted paths stop at
-  whitespace so arbitrary trailing prose remains intact. File URLs preserve
-  their scheme and authority spelling while replacing a non-root path after
-  the authority with `<path>`, including an initial Windows drive. A quote
+  whitespace so arbitrary trailing prose remains intact. Inside an already
+  recognized path, a drive-shaped doubled-colon segment ending in a backslash
+  is also redacted, including in slash-prefixed Windows drives. A URL-shaped
+  scheme token immediately after that backslash retains the existing URL
+  boundary behavior. This does not
+  make doubled-colon text a new path start: standalone `E::\` tails, longer
+  colon runs, and non-drive-shaped segments remain unchanged. File URLs
+  preserve their scheme and authority spelling while replacing a non-root path
+  after the authority with `<path>`, including an initial Windows drive. A quote
   immediately before the `file` scheme lets the redacted path contain spaces
   until the matching quote or a newline. Empty and root-only file URLs remain
   unchanged. Unmatched or path-wrapping brackets in file URLs do not stop path
