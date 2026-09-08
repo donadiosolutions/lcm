@@ -94,6 +94,9 @@ component_management:
         # Claude's bounded session-completion acknowledgment remains hook-owned.
         # #1155 keeps SessionStart local-outbox publication admission hook-owned.
         # #1225 composes SessionStart pruning with append admission in this owner.
+        # #1259 keeps publication-fence error classification and ordered final
+        # root-validation/descriptor-close evidence in the existing hooks owner.
+        # PreCompact initial unsafe-storage diagnostics remain in that same owner.
         - "src/hooks/"
     # #1201 keeps process-only observation, its parser/client, and route allowlist here.
     - component_id: "unit-daemon-core"
