@@ -133,6 +133,16 @@ Compaction and promotion remain independent, best-effort background requests.
 
 Completion is best-effort when the daemon is unavailable, busy, or refuses
 publication admission. Ordinary completion failures still allow session exit.
+
+Concurrent operations in the same daemon queue their publication and storage
+admission, including early project identity checks. This prevents ordinary
+in-flight PostgreSQL work from immediately rejecting completion or promotion
+because that daemon already owns the publication lock. Publication validation
+and refusal of another process's lock remain in force. A queued completion
+canceled before entry does no storage work. Prolonged work can still exceed the
+one-second best-effort wait and the hook may abandon completion; no timeout is
+extended and no arbitrary-load latency guarantee is made. The conformance
+observer retains its separate five-second observation window.
 A timeout leaves persistence uncertain: the daemon may have committed the
 record before the acknowledgment was interrupted. Local publication-journal
 errors continue to fail closed. Codex Stop events remain turn-scoped and do not

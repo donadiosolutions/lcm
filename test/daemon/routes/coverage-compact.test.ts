@@ -206,7 +206,7 @@ vi.mock("../../../src/storage/index.js", () => ({
     if (state.identityError !== undefined) throw state.identityError;
     return state.identity(local.canonical, storageConfig, local);
   },
-  createStorageBackendFactory: async () => ({
+  createStorageBackendFactory: vi.fn(async () => ({
     openProject: async (...args: unknown[]) => {
       state.openProject(...args);
       if (state.openProjectError !== undefined) throw state.openProjectError;
@@ -249,7 +249,7 @@ vi.mock("../../../src/storage/index.js", () => ({
       };
     },
     close: state.factoryClose,
-  }),
+  })),
 }));
 vi.mock("../../../src/compaction.js", () => ({
   MANUAL_COMPACT_FRESH_TAIL_COUNT: 8,
@@ -313,7 +313,8 @@ import type {
   RouteHandler,
   RoutePublicationAdmission,
 } from "../../../src/daemon/server.js";
-import type { StorageBackendFactory } from "../../../src/storage/index.js";
+import { createStorageBackendFactory, type StorageBackendFactory } from "../../../src/storage/index.js";
+import { createPublicationQueue } from "../../../src/daemon/publication-queue.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 import { BackendPublicationJournalError } from "../../../src/storage/backend-publication.js";
@@ -370,6 +371,7 @@ async function call(body: string, value = config()) {
 
 describe("compact route coverage", () => {
   beforeEach(() => {
+    vi.mocked(createStorageBackendFactory).mockClear();
     state.cwdError = undefined;
     state.policyError = undefined;
     state.provider = undefined;
@@ -838,6 +840,68 @@ describe("compact route coverage", () => {
     expect(state.openProject).not.toHaveBeenCalled();
     expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
     await coordinator.shutdown();
+  });
+
+  it("cancels invocation admission while queued without creating a factory or opening a project", async () => {
+    const invocationId = "12345678-1234-4234-8234-123456789abc";
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const coordinator = createInvocationCoordinator({ daemonInstanceId });
+    coordinator.start({ invocationId, command: "compact", daemonInstanceId });
+    const enqueue = createPublicationQueue();
+    const requestController = new AbortController();
+    let releaseBlocker!: () => void;
+    let markEntered!: () => void;
+    let markQueued!: () => void;
+    const blockerGate = new Promise<void>(resolve => { releaseBlocker = resolve; });
+    const entered = new Promise<void>(resolve => { markEntered = resolve; });
+    const queued = new Promise<void>(resolve => { markQueued = resolve; });
+    const blocker = enqueue(async () => { markEntered(); await blockerGate; }, requestController.signal);
+    await entered;
+    let admissionSignal: AbortSignal | undefined;
+    const admission: RoutePublicationAdmission = (operation, signal) => {
+      admissionSignal = signal;
+      const pending = enqueue(() => operation({}), signal ?? requestController.signal);
+      markQueued();
+      return pending;
+    };
+    const output = response();
+    const pending = createCompactHandlerProduction(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ session_id: "queued-invocation-cancel", cwd: "/tmp", invocation_id: invocationId }),
+      { withPublicationAdmission: admission, signal: requestController.signal, invocationCoordinator: coordinator },
+    );
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await queued;
+      expect(admissionSignal).toBeDefined();
+      expect(admissionSignal).not.toBe(requestController.signal);
+      const cancellation = coordinator.cancel({ invocationId, command: "compact", daemonInstanceId });
+      await Promise.race([
+        Promise.all([pending, cancellation]),
+        new Promise<never>((_, reject) => {
+          watchdog = setTimeout(() => reject(new Error("queued invocation cancellation did not settle")), 1_000);
+        }),
+      ]);
+      expect(admissionSignal?.aborted).toBe(true);
+      expect(requestController.signal.aborted).toBe(false);
+      expect(output.status()).toBe(499);
+      expect(output.json()).toMatchObject({ status: "cancelled" });
+      expect(createStorageBackendFactory).not.toHaveBeenCalled();
+      expect(state.identity).not.toHaveBeenCalled();
+      expect(state.openProject).not.toHaveBeenCalled();
+      expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "cancelled", activeCount: 0 });
+    } finally {
+      clearTimeout(watchdog);
+      releaseBlocker();
+      await blocker;
+      await pending;
+      await coordinator.shutdown();
+    }
+    await enqueue(() => undefined, requestController.signal);
+    expect(createStorageBackendFactory).not.toHaveBeenCalled();
+    expect(state.identity).not.toHaveBeenCalled();
+    expect(state.openProject).not.toHaveBeenCalled();
   });
 
   it("returns coordinator cancellation errors from initial admission", async () => {

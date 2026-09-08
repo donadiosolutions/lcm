@@ -252,8 +252,8 @@ describe("ingest persistence boundaries", () => {
             .mockReturnValueOnce({ ...identity, canonical: "/changed" });
         }
         const admission = async (operation: (token: object) => Promise<unknown>) => {
-          expect(preparations).toBe(++attempts);
-          if (attempts === 2 && outcome === "admission") {
+          expect(preparations).toBe(attempts++);
+          if (attempts === 3 && outcome === "admission") {
             throw new BackendPublicationJournalError("unexpected-state", "synthetic blocked publication");
           }
           admitted = true;
@@ -290,7 +290,7 @@ describe("ingest persistence boundaries", () => {
     let attempts = 0;
     mocks.forProject.mockImplementationOnce(async () => {
       expect(admitted).toBe(false);
-      expect(attempts).toBe(1);
+      expect(attempts).toBe(2);
       expect(mocks.closeConnection).toHaveBeenCalledOnce();
       return { scrubWithCounts: mocks.scrubCounts };
     });
@@ -302,17 +302,47 @@ describe("ingest persistence boundaries", () => {
     await createIngestHandler(config)({} as never, response, JSON.stringify({
       session_id: "metadata-append", cwd: "/ok", transcript_path: "/safe",
     }), { withPublicationAdmission: admission });
-    expect(attempts).toBe(2);
+    expect(attempts).toBe(3);
     expect(mocks.forProject).toHaveBeenCalledOnce();
     expect(mocks.createBulk).toHaveBeenCalledOnce();
     expect(mocks.snapshotClose).toHaveBeenCalledTimes(2);
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
   });
 
-  it("closes its prepared source without writes when first publication admission blocks", async () => {
+  it.each(["blocked", "cancelled"] as const)("stops before preparation when identity admission is %s", async (outcome) => {
+    const { BackendPublicationJournalError } = await import("../../../src/storage/backend-publication.js");
+    const controller = new AbortController();
+    const admission = vi.fn(async (operation: (token: object) => Promise<unknown>) => {
+      if (outcome === "blocked") {
+        throw new BackendPublicationJournalError("unexpected-state", "synthetic blocked identity admission");
+      }
+      controller.abort();
+      return operation({});
+    });
+
+    await createIngestHandler(config)({} as never, response, JSON.stringify({
+      session_id: "identity-admission", cwd: "/ok", transcript_path: "/safe",
+    }), { signal: controller.signal, withPublicationAdmission: admission });
+
+    expect(admission).toHaveBeenCalledOnce();
+    expect(mocks.identity).toHaveBeenCalledTimes(outcome === "blocked" ? 0 : 1);
+    expect(mocks.snapshotOpen).not.toHaveBeenCalled();
+    expect(mocks.forProject).not.toHaveBeenCalled();
+    expect(mocks.getConnection).not.toHaveBeenCalled();
+    expect(mocks.createBulk).not.toHaveBeenCalled();
+    expect(mocks.logError).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, outcome === "blocked" ? 503 : 499, {
+      status: outcome,
+      error: outcome === "blocked" ? "backend publication admission blocked" : "ingest cancelled",
+    });
+  });
+
+  it("closes its prepared source without writes when storage publication admission blocks", async () => {
     const { BackendPublicationJournalError } = await import("../../../src/storage/backend-publication.js");
     mocks.parse.mockReturnValue([validMessage]);
-    const admission = async () => {
+    let admissions = 0;
+    const admission = async (operation: (token: object) => Promise<unknown>) => {
+      if (++admissions === 1) return operation({});
       expect(mocks.forProject).toHaveBeenCalledOnce();
       throw new BackendPublicationJournalError("unexpected-state", "synthetic malformed publication journal");
     };
@@ -340,8 +370,9 @@ describe("ingest persistence boundaries", () => {
         controller.abort();
         return db;
       });
+      let admissions = 0;
       const admission = async (operation: (token: object) => Promise<unknown>) => {
-        if (boundary === "admission") controller.abort();
+        if (++admissions === 2 && boundary === "admission") controller.abort();
         return operation({});
       };
       await createIngestHandler(config)({} as never, response, JSON.stringify({
@@ -936,7 +967,7 @@ describe("ingest persistence boundaries", () => {
       transcript_path: "/missing",
     }), { withPublicationAdmission: admission, signal });
 
-    expect(admission).toHaveBeenCalledOnce();
+    expect(admission).toHaveBeenCalledTimes(2);
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 0, totalTokens: 0 });
     expect(mocks.getConnection).toHaveBeenCalledOnce();
   });
@@ -983,7 +1014,7 @@ describe("ingest persistence boundaries", () => {
       config.security.sensitivePatterns,
       `/lcm/projects/${preflight.localProjectId}`,
     );
-    expect(order).toEqual(["scrubber", "admission"]);
+    expect(order).toEqual(["admission", "scrubber", "admission"]);
     expect(mocks.send).toHaveBeenLastCalledWith(response, 503, {
       status: "blocked",
       error: "backend publication admission blocked",
