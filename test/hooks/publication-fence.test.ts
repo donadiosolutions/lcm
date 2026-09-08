@@ -166,7 +166,9 @@ describe("hook publication fence", () => {
             cleanup !== "close" ? validationError : undefined,
             succeeds,
           );
-          const result = await capture(() => {
+          let retainedToken: Parameters<typeof assertHookPublicationFenceToken>[0];
+          const result = await capture((token) => {
+            retainedToken = token;
             if (!succeeds) throw primary;
             return "must not escape";
           });
@@ -177,10 +179,14 @@ describe("hook publication fence", () => {
             const error = result.error as BackendPublicationJournalError;
             expect(error.reason).toBe(primary instanceof BackendPublicationJournalError
               && primary.reason !== "publication-evidence-missing" ? primary.reason : "unsafe-storage");
+            expect(error.message).toBe(primary instanceof BackendPublicationJournalError
+              && primary.reason !== "publication-evidence-missing"
+              ? primary.message : "hook publication fence finalization failed");
             if (succeeds && errors.length === 1) expect(error.cause).toBe(errors[0]);
             else {
               expect(error.cause).toBeInstanceOf(AggregateError);
               const aggregate = error.cause as AggregateError;
+              expect(aggregate.message).toBe("hook publication fence finalization failed");
               expect(aggregate.errors).toEqual(succeeds ? errors : [primary, ...errors]);
               if (succeeds) expect(Object.hasOwn(aggregate, "cause")).toBe(false);
               else {
@@ -190,6 +196,7 @@ describe("hook publication fence", () => {
             }
           }
           closed();
+          expect(() => assertHookPublicationFenceToken(retainedToken!)).toThrow("not active");
         });
       }
     });

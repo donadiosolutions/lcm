@@ -373,8 +373,12 @@ cannot return success from the fence after either finalization step fails. Its
 evidence contains only the cleanup failures: one failure is retained directly as
 the cause, and multiple failures are aggregated in validation-then-close order.
 The public diagnostic remains sanitized; filesystem details stay in error
-evidence. Each hook keeps its existing diagnostic and exit-code handling, so a
-typed fence failure does not imply a nonzero exit code from every hook.
+evidence. PreCompact records initial `unsafe-storage` admission failures through
+its existing error logger and still returns exit code 0 with empty output.
+Consumers that already throw on journal errors now also fail closed on these
+typed finalization failures; consumers that return exit code 0 continue to do so.
+Thus reclassification can change which existing error-handling branch runs, and
+a typed fence failure does not imply a nonzero exit code from every hook.
 
 ### Native ingest source changes and cancellation
 

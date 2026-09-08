@@ -59,6 +59,23 @@ describe("handlePreCompact", () => {
     expect(mockSafeLogError).not.toHaveBeenCalled();
   });
 
+  it("logs unsafe-storage from initial fence finalization without starting daemon work", async () => {
+    const publicationError = new BackendPublicationJournalError(
+      "unsafe-storage", "hook publication fence finalization failed",
+      { cause: new Error("retained root validation failed") },
+    );
+    vi.mocked(publicationFence.assertHookPublicationFence).mockImplementationOnce(() => {
+      throw publicationError;
+    });
+    const post = vi.fn();
+
+    await expect(handlePreCompact("{}", mockDaemonClient(post)))
+      .resolves.toEqual({ exitCode: 0, stdout: "" });
+    expect(mockSafeLogError).toHaveBeenCalledExactlyOnceWith("PreCompact", publicationError, {});
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+  });
+
   it("logs missing publication evidence without converting it to PostgreSQL staged support", async () => {
     const publicationError = new BackendPublicationJournalError("publication-evidence-missing", "publication evidence is missing");
     vi.mocked(publicationFence.assertHookPublicationFence).mockImplementationOnce(() => {
