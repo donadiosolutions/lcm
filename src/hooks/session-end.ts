@@ -22,6 +22,7 @@ import {
   assertHookPublicationFenceToken,
   isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
+  rethrowBackendPublicationJournalError,
   type HookPublicationLockToken,
   withHookPublicationFence,
 } from "./publication-fence.js";
@@ -126,6 +127,14 @@ export function firePromoteEventsNotifyRequest(port: number, body: Record<string
   withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/promote-events/notify", body, lockToken));
 }
 
+function scheduleBackgroundRequest(schedule: () => void): void {
+  try {
+    schedule();
+  } catch (error) {
+    rethrowBackendPublicationJournalError(error);
+  }
+}
+
 export async function handleSessionEnd(
   stdin: string,
   client: DaemonClient,
@@ -220,15 +229,15 @@ export async function handleSessionEnd(
 
   const { input, clientName, ingestResult, disableCompact } = admitted;
   if (!disableCompact) {
-    fireCompactRequest(daemonPort, {
+    scheduleBackgroundRequest(() => fireCompactRequest(daemonPort, {
       session_id: input.session_id,
       cwd: input.cwd,
       skip_ingest: true,
       client: clientName,
-    });
+    }));
   }
-  firePromoteRequest(daemonPort, { cwd: input.cwd });
-  firePromoteEventsRequest(daemonPort, { cwd: input.cwd });
+  scheduleBackgroundRequest(() => firePromoteRequest(daemonPort, { cwd: input.cwd }));
+  scheduleBackgroundRequest(() => firePromoteEventsRequest(daemonPort, { cwd: input.cwd }));
   if (clientName === "claude") {
     try {
       // The CLI explicitly exits after dispatch. Wait for the completion
