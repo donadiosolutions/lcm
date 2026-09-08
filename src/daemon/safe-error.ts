@@ -89,6 +89,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let restartedPathlessBrackets = 0;
   let fileTailBracketDepth = 0;
   let pendingFileTailBackslash = false;
+  let pendingNestedUrlContinuation = false;
   let queryOrFragment = false;
   let queryOrFragmentStart = -1;
 
@@ -112,6 +113,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (!preservesClosedBracketHandoff) {
         fileTailBracketDepth = 0;
         pendingFileTailBackslash = false;
+        pendingNestedUrlContinuation = false;
       }
       continue;
     }
@@ -123,11 +125,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           file[index] = 1;
           fileTailBracketDepth = 0;
           pendingFileTailBackslash = false;
+          pendingNestedUrlContinuation = false;
           continue;
         }
       } else {
+        const continuesNestedUrl =
+          pendingNestedUrlContinuation && (char === "/" || char === ":" || char === "?");
         pendingFileTailBackslash = false;
-        if (!fileTailBoundaryEvent) fileTailBracketDepth = 0;
+        pendingNestedUrlContinuation = false;
+        if (!fileTailBoundaryEvent && !continuesNestedUrl) fileTailBracketDepth = 0;
       }
     }
     if (fileTailBracketDepth > 0 && char === "[") {
@@ -135,8 +141,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     } else if (fileTailBracketDepth > 0 && char === "]") {
       fileTailBracketDepth -= 1;
       pendingFileTailBackslash = true;
+      pendingNestedUrlContinuation = fileTailBracketDepth > 0 && separator >= 0 && brackets > 0;
     } else if (fileTailBracketDepth > 0 && URL_END_DELIMITERS.has(char)) {
       pendingFileTailBackslash = true;
+      pendingNestedUrlContinuation = false;
     } else if (restartedPathlessFile && char === "[") {
       fileTailBracketDepth = 1;
     }
@@ -216,6 +224,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       restartedPathlessBrackets = 0;
       fileTailBracketDepth = 0;
       pendingFileTailBackslash = false;
+      pendingNestedUrlContinuation = false;
       continue;
     }
     if (
@@ -309,6 +318,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       restartedPathlessBrackets = 0;
       fileTailBracketDepth = 0;
       pendingFileTailBackslash = false;
+      pendingNestedUrlContinuation = false;
       queryOrFragment = false;
       file[index] = 1;
       continue;

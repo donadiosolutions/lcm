@@ -536,6 +536,27 @@ describe("sanitizeError", () => {
   });
 
   it.each([
+    [
+      "file://h?x=[https://[::1]/p]\\Users\\fictional.db",
+      "file://h?x=[https://[::1]/p]<path>",
+    ],
+    [
+      "file://h?x=[https://[::1]:443/p]\\Users\\fictional.db",
+      "file://h?x=[https://[::1]:443/p]<path>",
+    ],
+    [
+      "file://h?x=[https://[::1]?q=a]\\Users\\fictional.db",
+      "file://h?x=[https://[::1]?q=a]<path>",
+    ],
+  ] as const)("redacts IPv6 URL bracket-handoff backslash tails: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
     ["ordinary?x=[a]\\Users\\literal", "ordinary?x=[a]\\Users\\literal"],
     [
       "https://host.invalid/outer?x=[a]\\Users\\literal",
@@ -579,6 +600,10 @@ describe("sanitizeError", () => {
       "file://host.invalid?x=[a|see]\\Users\\literal",
       "file://host.invalid?x=[a|see]\\Users\\literal",
     ],
+    [
+      "file://h?x=[https://[::1]prose]\\Users\\fictional.db",
+      "file://h?x=[https://[::1]prose]\\Users\\fictional.db",
+    ],
   ] as const)("preserves bracket-handoff boundaries: %#", (input, expected) => {
     const first = sanitizeError(input);
 
@@ -589,6 +614,16 @@ describe("sanitizeError", () => {
   it("consumes a bracket-handoff only once across sanitizer passes", () => {
     const input = "file://host.invalid?x=[a|\\Users\\first.db|\\Users\\second.db";
     const expected = "file://host.invalid?x=[a|<path>|\\Users\\second.db";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(expected);
+    expect(sanitizeError(sanitizeError(first))).toBe(expected);
+  });
+
+  it("expires an IPv6 bracket handoff after its generated marker", () => {
+    const input = "file://h?x=[https://[::1]/p|\\Users\\first.db|\\Users\\second.db";
+    const expected = "file://h?x=[https://[::1]/p|<path>|\\Users\\second.db";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);

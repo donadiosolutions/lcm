@@ -118,7 +118,7 @@ const expectedComponents = [
       // quoted/root-only backslash handoff, #1010 pathless-tail brackets,
       // #1060 adjacent nested-file schemes, #1113 doubled-colon drive tails,
       // #1117 glued authorities, #1111 bracketed nested-URL idempotence,
-      // #1128 active own-query and bracket-boundary file-URL backslash paths,
+      // #1128 active own-query and IPv6 bracket-boundary backslash paths,
       // #1141 single-slash file tails, and #1156 forced drive-after-content
       // continuations remain daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
