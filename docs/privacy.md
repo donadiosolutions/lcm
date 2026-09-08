@@ -490,8 +490,15 @@ The `Security` section of the doctor output shows:
   the first pass. This includes a query or fragment following a closed quoted
   path, with or without a closing wrapper. Whitespace and URL-ending delimiters
   can end that context; this does not extend backslash redaction to unrelated
-  text. A public URL glued directly after the closing quote or bracket without
-  whitespace may be conservatively redacted:
+  text. When non-delimiter query or fragment text follows a quoted path in a
+  closed wrapper, a later slash-prefixed local path is redacted in the same
+  pass. For example, `'file://host'['/private']?next/Users/SECRET` becomes
+  `'file://host'['<path>']?next<path>`. The handoff remains within that exact
+  file URL context; whitespace and URL-ending punctuation reset it, and a
+  recognized `scheme://` token is not consumed as the local path.
+  Classification state from an earlier quoted file URL does not carry into a
+  later unquoted file URL's query tail. A public URL glued directly after the
+  closing quote or bracket without whitespace may be conservatively redacted:
   `'file://host'['/private']https://pub.test/x` becomes
   `'file://host'['<path>']https:<path>`. If that glued URL is followed by a
   Windows drive path, the URL and drive path are redacted separately, as in

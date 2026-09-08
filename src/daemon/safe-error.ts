@@ -86,6 +86,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let filePathBracketDepth = 0;
   let restartedPathlessFile = false;
   let quotedPathEnded = false;
+  let quotedQueryTail = false;
+  let quotedPathEndedSeparator = -1;
   let restartedPathlessBrackets = 0;
   let queryOrFragment = false;
   let queryOrFragmentStart = -1;
@@ -103,13 +105,22 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
       quotedPathEnded = false;
+      quotedQueryTail = false;
+      quotedPathEndedSeparator = -1;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
       continue;
     }
     if (separator >= 0 && (char === "?" || char === "#")) {
+      const startsQuotedQueryTail =
+        exactFileScheme &&
+        foundFilePath &&
+        quotedPathEndedSeparator === separator &&
+        brackets === 0;
+
       queryOrFragment = true;
       queryOrFragmentStart = index;
+      if (startsQuotedQueryTail) quotedQueryTail = true;
     }
     const nestedFileSchemeStart = isNestedFileUrlStart(chars, index)
       ? index + 1
@@ -126,6 +137,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      quotedQueryTail = false;
       restartedPathlessBrackets = 0;
       schemeLength = 0;
       fileSchemeLength = 0;
@@ -189,6 +201,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       !FILE_URL_AUTHORITY_DELIMITERS.has(char)
     ) {
       restartedPathlessFile = false;
+      quotedQueryTail = false;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
     }
@@ -213,6 +226,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       // separator after the wrapper still restarts a file path, but stop
       // claiming later slashes as this URL authority.
       quotedPathEnded = true;
+      quotedPathEndedSeparator = separator;
       schemeQuote = 0;
       // An adjacent backslash starts a fresh path even before the wrapper closes.
       if (chars[index + 1] === "\\") foundFilePath = false;
@@ -235,11 +249,23 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      quotedQueryTail = false;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
       continue;
     }
     if (separator >= 0) {
+      if (
+        quotedQueryTail &&
+        brackets === 0 &&
+        char === "/" &&
+        isPathWord(chars[index - 1]) &&
+        !startsUrlSchemeLiteral(chars, index + 1)
+      ) {
+        forcedPath[index] = 1;
+        quotedQueryTail = false;
+        continue;
+      }
       if (char === "/" && !quotedPathEnded) authority[index] = 1;
       if (
         exactFileScheme &&
@@ -278,6 +304,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     if (char === ":" && schemeLength > 0 && chars[index + 1] === "/" && chars[index + 2] === "/") {
       restartedPathlessFile = false;
+      quotedQueryTail = false;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
       separator = index;
