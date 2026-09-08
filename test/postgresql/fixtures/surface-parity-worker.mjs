@@ -547,16 +547,39 @@ try {
     ['compaction.leafTokens', 64], ['compaction.autoCompactMinTokens', 1],
     ['security.sensitivePatterns', ['SURFACEPRIVATE']],
   ]) setConfigValue({ configPath, path, value: JSON.stringify(value), json: true });
+  // Identity setup uses the configured storage directly. Complete it before
+  // either daemon can publish background state for this owned home.
+  if (backend === 'postgresql') {
+    assert.ok(!directDaemon && !baseline && !mcpClient, 'surface-worker:binding-before-daemons');
+    await assertNoFallback();
+    const linked = await cli(['project', 'link', context.secondaryRemoteProjectId, secondaryProjectPath, '--json']);
+    if (linked.code !== 0) {
+      const error = new Error('surface-worker:secondary-project-binding');
+      error.surfaceEvidence = { stderrDigest: createHash('sha256').update(linked.stderr).digest('hex') };
+      throw error;
+    }
+    const binding = JSON.parse(linked.stdout);
+    assert.equal(binding.local.id, context.secondaryProjectId, 'surface-worker:secondary-local-id');
+    assert.equal(binding.local.canonical, secondaryProjectPath, 'surface-worker:secondary-local-path');
+    assert.equal(binding.local.remoteProjectId, context.secondaryRemoteProjectId, 'surface-worker:secondary-remote-id');
+    assert.equal(binding.remoteAlias.path, secondaryProjectPath, 'surface-worker:secondary-alias-path');
+    const shown = await cli(['project', 'show', secondaryProjectPath, '--json']);
+    assert.equal(shown.code, 0, 'surface-worker:secondary-project-readback');
+    const persisted = JSON.parse(shown.stdout);
+    assert.equal(persisted.hash, context.secondaryProjectId, 'surface-worker:secondary-map-id');
+    assert.equal(persisted.entry.canonical, secondaryProjectPath, 'surface-worker:secondary-map-path');
+    assert.equal(persisted.entry.remoteProjectId, context.secondaryRemoteProjectId, 'surface-worker:secondary-map-binding');
+    assert.equal(persisted.remote.projectId, context.secondaryRemoteProjectId, 'surface-worker:secondary-catalog-id');
+    assert.ok(persisted.remote.aliases.some(alias => alias.path === secondaryProjectPath
+      && alias.machineId === binding.remoteAlias.machineId), 'surface-worker:secondary-catalog-alias');
+    await assertNoFallback();
+  }
   // Observe the real built registry, then fully stop this direct listener before
   // starting the canonical CLI daemon needed by CLI/MCP identity verification.
   const routes = await startDirect();
   await directDaemon.stop();
   directDaemon = undefined;
   const tools = await startBaseline();
-  if (backend === 'postgresql') {
-    const linked = await cli(['project', 'link', context.secondaryRemoteProjectId, secondaryProjectPath, '--json']);
-    assert.equal(linked.code, 0, 'surface-worker:secondary-project-binding');
-  }
   await assertNoFallback();
   send({ type: 'ready', backend, routes, tools });
 } catch (error) {
