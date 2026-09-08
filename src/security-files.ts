@@ -540,6 +540,7 @@ function privateFilePublicationCleanupFailure(
 function assertPrivateTemporaryFileIdentity(
   path: string,
   expected: PrivateFileIdentity,
+  expectedNlink?: bigint,
 ): void {
   try {
     const current = lstatSync(path, { bigint: true }) as unknown as BigIntFileStat;
@@ -547,6 +548,7 @@ function assertPrivateTemporaryFileIdentity(
       !current.isFile()
       || current.dev !== expected.dev
       || current.ino !== expected.ino
+      || (expectedNlink !== undefined && current.nlink !== expectedNlink)
     ) {
       throw new Error("private temporary file changed during validation");
     }
@@ -1157,7 +1159,10 @@ export function atomicWritePrivateFile(
     // after temp preparation without changing the generic writer's default.
     if (options.beforeReplace !== undefined) {
       options.beforeReplace();
-      assertPrivateTemporaryFileIdentity(tempPath, preparedIdentity);
+      if (parent !== undefined) {
+        assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+      }
+      assertPrivateTemporaryFileIdentity(tempPath, preparedIdentity, 1n);
     }
     try {
       (operations.rename ?? renameSync)(tempPath, path);

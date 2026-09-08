@@ -182,6 +182,64 @@ describe("private filesystem primitives", () => {
     }
   });
 
+  it("refuses a retained parent rebound during opt-in replacement validation", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    const parent = openPrivateDirectory(active);
+    const target = join(active, "metadata.json");
+    const nonce = Buffer.alloc(12, 0xac);
+    const tempName = `.metadata.json.${nonce.toString("hex")}.tmp`;
+    writeFileSync(target, "preserve admitted journal", { mode: 0o600 });
+    writeFileSync(join(replacement, "metadata.json"), "preserve replacement journal", { mode: 0o600 });
+    try {
+      expect(() => atomicWritePrivateFile(target, "prepared evidence", {
+        random: () => nonce,
+      }, parent, {
+        beforeReplace: () => {
+          renameSync(active, displaced);
+          renameSync(replacement, active);
+          linkSync(join(displaced, tempName), join(active, tempName));
+        },
+      })).toThrow(PrivateDirectoryTopologyError);
+      expect(readFileSync(join(active, "metadata.json"), "utf8"))
+        .toBe("preserve replacement journal");
+      expect(readFileSync(join(displaced, "metadata.json"), "utf8"))
+        .toBe("preserve admitted journal");
+      expect(readFileSync(join(displaced, tempName), "utf8")).toBe("prepared evidence");
+      expect(readFileSync(join(active, tempName), "utf8")).toBe("prepared evidence");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("refuses an extra temporary hard link created during opt-in replacement validation", () => {
+    const root = makeRoot();
+    chmodSync(root, 0o700);
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const nonce = Buffer.alloc(12, 0xad);
+    const tempPath = join(root, `.metadata.json.${nonce.toString("hex")}.tmp`);
+    const evidencePath = `${tempPath}.evidence`;
+    writeFileSync(target, "preserve admitted journal", { mode: 0o600 });
+    try {
+      expect(() => atomicWritePrivateFile(target, "prepared evidence", {
+        random: () => nonce,
+      }, parent, {
+        beforeReplace: () => linkSync(tempPath, evidencePath),
+      })).toThrow(PrivateDirectoryTopologyError);
+      expect(readFileSync(target, "utf8")).toBe("preserve admitted journal");
+      expect(existsSync(tempPath)).toBe(false);
+      expect(readFileSync(evidencePath, "utf8")).toBe("prepared evidence");
+      expect(statSync(evidencePath).nlink).toBe(1);
+    } finally {
+      parent.close();
+    }
+  });
+
   it("publishes an absent destination exclusively through a retained parent", () => {
     const root = makeRoot();
     const parent = openPrivateDirectory(root);

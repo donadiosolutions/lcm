@@ -59,8 +59,8 @@ const expectedComponents = [
       // configuration-security owner without changing component topology.
       // #1134/#1135/#1136 preserve private-write failures while retaining
       // ordered descriptor, temporary-file, and parent cleanup evidence here.
-      // #1151 revalidates the journal temporary inode after destination
-      // authorization while retaining this configuration-security owner.
+      // #1151 revalidates the journal temporary inode, single-link topology,
+      // and retained parent after destination authorization in this owner.
       // PR #791 keeps generated Gitleaks hostname-literal normalization in
       // this existing configuration-security owner.
       "^src/generated-patterns\\.ts$",
