@@ -1,9 +1,9 @@
+import { admittedProjectIdentity } from "./storage-lifecycle.js";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import type { DaemonConfig } from "../config.js";
 import {
   MAX_PROJECT_METADATA_BYTES,
   ensureProjectDirForIdentity,
-  projectIdentity,
   projectPathsForIdentity,
 } from "../project.js";
 import {
@@ -301,10 +301,10 @@ export function createPromoteHandler(
       }
 
       throwIfAborted(signal);
-      const storageIdentity = projectIdentity(
+      const storageIdentity = await admittedProjectIdentity(
         cwd,
         config.storage,
-        context?.publicationLockToken,
+        { ...context, signal },
       );
       const localIdentity = {
         id: storageIdentity.localProjectId,
@@ -516,7 +516,7 @@ export function createPromoteHandler(
               }
             };
             if (context?.withPublicationAdmission !== undefined) {
-              await context.withPublicationAdmission(() => writeMetadata());
+              await context.withPublicationAdmission(() => writeMetadata(), signal);
             } else {
               writeMetadata();
             }

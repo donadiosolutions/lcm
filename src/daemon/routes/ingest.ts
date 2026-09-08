@@ -1,3 +1,4 @@
+import { admittedProjectIdentity } from "./storage-lifecycle.js";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { basename, dirname, join } from "node:path";
@@ -17,7 +18,6 @@ import {
   projectPathsForIdentity,
   ensureProjectDirForIdentity,
   isSafeTranscriptPath,
-  projectIdentity,
 } from "../project.js";
 import {
   atomicWritePrivateFile,
@@ -98,10 +98,10 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       throwIfAborted(context?.signal);
       // Preserve the route's early identity/configuration rejection while the
       // lifecycle helper re-resolves the identity with its live admission token.
-      const storageIdentity = projectIdentity(
+      const storageIdentity = await admittedProjectIdentity(
         cwd,
         config.storage,
-        context?.publicationLockToken,
+        context,
       );
       const localIdentity = {
         id: storageIdentity.localProjectId,
