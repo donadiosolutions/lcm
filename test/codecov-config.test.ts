@@ -131,6 +131,7 @@ const expectedComponents = [
     component_id: "unit-daemon-routes",
     name: "Unit - Daemon Routes",
     // #1230 keeps route project close on the live request token.
+    // #1247 keeps current-token promotion acknowledgement and cleanup route-owned.
     paths: ["src/daemon/routes/"],
   },
   {
@@ -202,6 +203,7 @@ const expectedComponents = [
     component_id: "unit-local-event-storage",
     name: "Unit - Local Event Storage",
     // #622 keeps outbox connection admission and current-schema validation here.
+    // #1247 keeps explicit promotion queue admission in this component.
     paths: [
       "^src/storage/local-hook-event-sequence\\.ts$",
       "^src/storage/local-hook-outbox\\.ts$",

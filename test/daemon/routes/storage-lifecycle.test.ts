@@ -294,9 +294,10 @@ describe("route storage cleanup", () => {
         factory,
         context: { withPublicationAdmission, signal: controller.signal },
         mode: "existing",
-      }, async (storage, signal) => {
+      }, async (storage, signal, currentToken) => {
         expect(storage).toBe(project);
         expect(signal).toBe(controller.signal);
+        expect(currentToken).toBe(admissionToken);
         events.push("operation");
         return storage.projectId;
       })).resolves.toBe("project-id");

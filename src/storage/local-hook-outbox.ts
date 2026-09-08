@@ -131,14 +131,14 @@ export interface LocalHookOutboxRepository {
     sourceHook: string,
     publicationLockToken?: BackendPublicationLockToken,
   ): Promise<number>;
-  getUnprocessed(limit?: number): Promise<LocalHookEventRow[]>;
-  markProcessed(eventIds: number[]): Promise<void>;
+  getUnprocessed(limit?: number, publicationLockToken?: BackendPublicationLockToken): Promise<LocalHookEventRow[]>;
+  markProcessed(eventIds: number[], publicationLockToken?: BackendPublicationLockToken): Promise<void>;
   observeMissingCwd(
     observedAtMs: number,
     minimumIntervalMs: number,
     requiredObservations: number,
   ): Promise<LocalHookMissingCwdState>;
-  clearMissingCwd(): Promise<void>;
+  clearMissingCwd(publicationLockToken?: BackendPublicationLockToken): Promise<void>;
   pruneProcessed(olderThanDays: number): Promise<number>;
   setPrevEventId(eventId: number, prevEventId: number): Promise<void>;
   getPatternReinforcement(
@@ -146,6 +146,7 @@ export interface LocalHookOutboxRepository {
     category: string,
     data: string,
     maxAgeDays?: number,
+    publicationLockToken?: BackendPublicationLockToken,
   ): Promise<PatternReinforcementStats>;
   logHookError(hook: string, error: unknown, sessionId?: string): Promise<void>;
   getHealthStats(): Promise<LocalHookOutboxHealth>;
@@ -379,14 +380,14 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     );
   }
 
-  async getUnprocessed(limit?: number): Promise<LocalHookEventRow[]> {
+  async getUnprocessed(limit?: number, publicationLockToken?: BackendPublicationLockToken): Promise<LocalHookEventRow[]> {
     this.assertOpen("getUnprocessed");
-    return this.admitted(() => this.database.getUnprocessed(limit));
+    return this.admitted(() => this.database.getUnprocessed(limit), publicationLockToken);
   }
 
-  async markProcessed(eventIds: number[]): Promise<void> {
+  async markProcessed(eventIds: number[], publicationLockToken?: BackendPublicationLockToken): Promise<void> {
     this.assertOpen("markProcessed");
-    this.admitted(() => this.database.markProcessed(eventIds));
+    this.admitted(() => this.database.markProcessed(eventIds), publicationLockToken);
   }
 
   async observeMissingCwd(
@@ -402,9 +403,9 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     ));
   }
 
-  async clearMissingCwd(): Promise<void> {
+  async clearMissingCwd(publicationLockToken?: BackendPublicationLockToken): Promise<void> {
     this.assertOpen("clearMissingCwd");
-    this.admitted(() => this.database.clearMissingCwd());
+    this.admitted(() => this.database.clearMissingCwd(), publicationLockToken);
   }
 
   async pruneProcessed(olderThanDays: number): Promise<number> {
@@ -422,9 +423,10 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     category: string,
     data: string,
     maxAgeDays?: number,
+    publicationLockToken?: BackendPublicationLockToken,
   ): Promise<PatternReinforcementStats> {
     this.assertOpen("getPatternReinforcement");
-    return this.admitted(() => this.database.getPatternReinforcement(type, category, data, maxAgeDays));
+    return this.admitted(() => this.database.getPatternReinforcement(type, category, data, maxAgeDays), publicationLockToken);
   }
 
   async logHookError(hook: string, error: unknown, sessionId?: string): Promise<void> {

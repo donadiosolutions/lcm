@@ -605,11 +605,11 @@ async function drainEventsForCwdUnlocked(
 
   const outboxFactory = new SQLiteLocalHookOutboxFactory();
   let ownedFactory: StorageBackendFactory | undefined;
+  const executionContext = promotionExecutionContext(publicationLockToken, context);
+  const effectiveToken = executionContext?.publicationLockToken;
   try {
-    const executionContext = promotionExecutionContext(publicationLockToken, context);
-    const effectiveToken = executionContext?.publicationLockToken;
     const edb = await outboxFactory.open(sidecarPath, {}, effectiveToken);
-    await edb.clearMissingCwd();
+    await edb.clearMissingCwd(effectiveToken);
     const factory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
       config.storage,
       undefined,
@@ -617,7 +617,7 @@ async function drainEventsForCwdUnlocked(
       effectiveToken,
     ));
     for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
-      const prepared = await preparePromotionBatch(config, edb);
+      const prepared = await preparePromotionBatch(config, edb, effectiveToken);
       const expectedIdentity = prepared.events.length === 0
         ? undefined
         : projectIdentity(cwd, config.storage, effectiveToken);
@@ -651,7 +651,7 @@ async function drainEventsForCwdUnlocked(
       }
     }
   } finally {
-    await closeRouteStorage(outboxFactory, ownedFactory);
+    await closePromotionStorage(effectiveToken, outboxFactory, ownedFactory);
   }
 
   result.incomplete = true;
@@ -694,12 +694,12 @@ async function promoteEventsForCwdUnlocked(
 ): Promise<PromoteResult> {
   const outboxFactory = new SQLiteLocalHookOutboxFactory();
   let ownedFactory: StorageBackendFactory | undefined;
+  const executionContext = promotionExecutionContext(publicationLockToken, context);
+  const effectiveToken = executionContext?.publicationLockToken;
   try {
-    const executionContext = promotionExecutionContext(publicationLockToken, context);
-    const effectiveToken = executionContext?.publicationLockToken;
     const edb = await outboxFactory.open(sidecarPath, {}, effectiveToken);
-    await edb.clearMissingCwd();
-    const prepared = await preparePromotionBatch(config, edb);
+    await edb.clearMissingCwd(effectiveToken);
+    const prepared = await preparePromotionBatch(config, edb, effectiveToken);
     const factory = storageFactory ?? (ownedFactory = await createStorageBackendFactory(
       config.storage,
       undefined,
@@ -719,8 +719,20 @@ async function promoteEventsForCwdUnlocked(
       expectedIdentity,
     );
   } finally {
-    await closeRouteStorage(outboxFactory, ownedFactory);
+    await closePromotionStorage(effectiveToken, outboxFactory, ownedFactory);
   }
+}
+
+/** Keep retained compatibility admission on resources owned by this route. */
+async function closePromotionStorage(
+  publicationLockToken: BackendPublicationLockToken | undefined,
+  outboxFactory: SQLiteLocalHookOutboxFactory,
+  ownedFactory: StorageBackendFactory | undefined,
+): Promise<void> {
+  await closeRouteStorage(
+    { close: () => outboxFactory.close(publicationLockToken) },
+    ownedFactory === undefined ? undefined : { close: () => ownedFactory.close(publicationLockToken) },
+  );
 }
 
 type PreparedPromotionBatch = Readonly<{
@@ -732,8 +744,9 @@ type PreparedPromotionBatch = Readonly<{
 async function preparePromotionBatch(
   config: DaemonConfig,
   edb: LocalHookOutboxRepository,
+  publicationLockToken?: BackendPublicationLockToken,
 ): Promise<PreparedPromotionBatch> {
-  const events = await edb.getUnprocessed();
+  const events = await edb.getUnprocessed(undefined, publicationLockToken);
   if (events.length === 0) {
     return {
       events,
@@ -756,6 +769,7 @@ async function preparePromotionBatch(
         event.category,
         event.data,
         thresholds.insightsMaxAgeDays ?? 90,
+        publicationLockToken,
       ));
     } catch (error) {
       // Keep the local sidecar read outside selected storage admission while
@@ -809,7 +823,7 @@ async function runSelectedPromotionBatch(
   try {
     result = await withProjectStorage(
       storageRequest,
-      async project => {
+      async (project, _signal, currentPublicationLockToken) => {
         if (prepared.events.length === 0) {
           return {
             promoted: 0,
@@ -829,6 +843,7 @@ async function runSelectedPromotionBatch(
           prepared.events,
           prepared.reinforcementCache,
           prepared.reinforcementErrors,
+          currentPublicationLockToken,
         );
       },
     );
@@ -851,6 +866,7 @@ async function promoteEventsBatch(
   events: EventRow[],
   reinforcementCache: Map<string, PatternReinforcementStats>,
   reinforcementErrors: Map<EventRow["event_id"], unknown>,
+  publicationLockToken?: BackendPublicationLockToken,
 ): Promise<PromoteResult> {
   const result: PromoteResult = { promoted: 0, skipped: 0, correlated: 0, errors: 0 };
 
@@ -1048,7 +1064,7 @@ async function promoteEventsBatch(
         }
       }
 
-      await edb.markProcessed(processedIds);
+      await edb.markProcessed(processedIds, publicationLockToken);
 
   return result;
 }

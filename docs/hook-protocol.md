@@ -327,6 +327,20 @@ Snapshot ingestion is skipped when daemon bootstrap cannot verify the configured
 
 All lcm hooks self-repair on each invocation: before dispatching, `validateAndFixHooks()` checks that all required hook entries remain registered in `~/.claude/settings.json` and re-adds any missing entries. This means lcm hooks survive `claude settings reset` or manual edits to the settings file.
 
+### Passive promotion acknowledgement
+
+Passive promotion and explicit event draining mark a queued event processed
+only after its selected project transaction succeeds. Queue acknowledgement
+uses the same live publication admission as the project operation, so it does
+not contend with its own publication lock after committing a memory or migration
+receipt. A completed receipt remains authoritative on a retry; its effect is
+not repeated. If acknowledgement fails, the event remains queued for retry.
+
+Queue preparation and scrubber setup still happen before operation-scoped
+publication admission. Callers supplying a retained publication token reuse it
+for preparation, acknowledgement, and owned storage cleanup. The token is valid
+only while its owning admission scope remains active.
+
 ### Native ingest source changes and cancellation
 
 When `/ingest` receives a native transcript path, parsed messages and native

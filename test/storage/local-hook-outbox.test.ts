@@ -12,6 +12,8 @@ import {
 import {
   BackendPublicationCoordinator,
   withBackendPublicationAppendBarrierAsync,
+  withBackendPublicationConsumerLockAsync,
+  type BackendPublicationLockToken,
   type BackendPublicationDriver,
 } from "../../src/storage/backend-publication.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
@@ -416,6 +418,46 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     await factory.close();
 
     await expectRetainedOperationsClosed(repository);
+  });
+
+  it("requires the exact live token for promotion queue preparation and acknowledgement", async () => {
+    const local = localPathFor("promotion-token");
+    const other = localPathFor("other-token");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const repository = await factory.open(local.dbPath);
+    const id = await repository.insertEvent("session", { type: "decision", category: "decision", data: "authority-bound event", priority: 1 }, "PostToolUse");
+    await repository.observeMissingCwd(10, 1, 3);
+    const observe = () => {
+      const db = new DatabaseSync(local.dbPath, { readOnly: true });
+      try { return { events: db.prepare("SELECT * FROM events").all(), missing: db.prepare("SELECT * FROM missing_cwd_state").all() }; }
+      finally { db.close(); }
+    };
+    const before = observe();
+    const operations = (token: BackendPublicationLockToken) => [
+      () => repository.getUnprocessed(undefined, token),
+      () => repository.getPatternReinforcement("decision", "decision", "authority-bound event", undefined, token),
+      () => repository.clearMissingCwd(token),
+      () => repository.markProcessed([id], token),
+    ];
+    try {
+      const revoked = await withBackendPublicationConsumerLockAsync(local.homeDir, token => token);
+      for (const run of operations(revoked)) await expect(run()).rejects.toMatchObject({ reason: "permit-mismatch" });
+      await withBackendPublicationConsumerLockAsync(other.homeDir, async token => {
+        for (const run of operations(token)) await expect(run()).rejects.toMatchObject({ reason: "permit-mismatch" });
+      });
+      expect(observe()).toEqual(before);
+      await withBackendPublicationConsumerLockAsync(local.homeDir, async token => {
+        expect(await repository.getUnprocessed(undefined, token)).toHaveLength(1);
+        expect(await repository.getPatternReinforcement("decision", "decision", "authority-bound event", undefined, token))
+          .toMatchObject({ totalCount: 1, distinctSessions: 1 });
+        await repository.clearMissingCwd(token);
+        await repository.markProcessed([id], token);
+        expect(await repository.getUnprocessed(undefined, token)).toEqual([]);
+        await factory.close(token);
+      });
+      expect(observe().missing).toEqual([]);
+      expect(isLcmConnectionOpen(local.dbPath)).toBe(false);
+    } finally { await factory.close(); }
   });
 
   it("retries factory close after pre-release admission fails", async () => {

@@ -112,6 +112,7 @@ export function createCommitCloseBarrier(): Readonly<{
 export type ProjectStorageOperation<T> = (
   storage: ProjectStorage,
   signal: AbortSignal,
+  publicationLockToken?: BackendPublicationLockToken,
 ) => Promise<T> | T;
 
 export function sameStorageIdentity(
@@ -227,7 +228,7 @@ export async function withProjectStorage<T>(
         onAbort();
         throw createRouteAbortError();
       }
-      const result = await operation(project, signal);
+      const result = await operation(project, signal, publicationLockToken);
       return result;
     } finally {
       signal.removeEventListener("abort", onAbort);

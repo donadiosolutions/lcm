@@ -353,9 +353,10 @@ describe("promote-events unit boundaries", () => {
       sequence.push("repository-batch");
       return "id";
     });
+    const currentToken = {};
     const withPublicationAdmission = vi.fn(async (operation: (token: object) => Promise<unknown>) => {
       sequence.push("admission");
-      return operation({});
+      return operation(currentToken);
     });
 
     await promoteEventsForCwd(
@@ -367,6 +368,7 @@ describe("promote-events unit boundaries", () => {
       { withPublicationAdmission },
     );
 
+    expect(mocks.mark).toHaveBeenCalledWith([events[0].event_id]);
     expect(sequence.indexOf("outbox-open")).toBeLessThan(sequence.indexOf("admission"));
     expect(sequence.indexOf("outbox-read")).toBeLessThan(sequence.indexOf("admission"));
     expect(sequence.indexOf("scrubber")).toBeLessThan(sequence.indexOf("admission"));
