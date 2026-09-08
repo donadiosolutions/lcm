@@ -59,6 +59,8 @@ const expectedComponents = [
       // configuration-security owner without changing component topology.
       // #1134/#1135/#1136 preserve private-write failures while retaining
       // ordered descriptor, temporary-file, and parent cleanup evidence here.
+      // #1151 revalidates the journal temporary inode, single-link topology,
+      // and retained parent after destination authorization in this owner.
       // PR #791 keeps generated Gitleaks hostname-literal normalization in
       // this existing configuration-security owner.
       "^src/generated-patterns\\.ts$",
@@ -114,9 +116,10 @@ const expectedComponents = [
       // nested-file, #924 embedded-quote, #925/#1076 quoted-authority,
       // quoted/root-only backslash handoff, #1010 pathless-tail brackets,
       // #1060 adjacent nested-file schemes, #1113 doubled-colon drive tails,
-      // #1117 glued authorities, #1118 quoted query-tail handoff, #1128
-      // active file-URL own-query backslash paths, and #1141 single-slash
-      // file tails remain daemon-core-owned.
+      // #1117 glued authorities, #1111 bracketed nested-URL idempotence,
+      // #1118 quoted query-tail handoff, #1128 active file-URL own-query
+      // backslash paths, and #1141 single-slash file tails remain
+      // daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -268,6 +271,8 @@ const expectedComponents = [
       // #1059 keeps retained journal-parent publication in this existing owner.
       // #1087 bounds canonical metadata publication in this existing owner.
       // #1091 preserves completion evidence across publication failures here.
+      // #1138/#1151/#1165/#1166 keep reconciliation lock, journal admission,
+      // recovery, and listing hardening in this existing worktree owner.
       // #1173 keeps promoted-content reconciliation guards in this existing
       // project/worktree ownership component; no topology change.
       "^src/worktree-reconciliation\\.ts$",

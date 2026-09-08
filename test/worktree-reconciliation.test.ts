@@ -20,7 +20,7 @@ import {
 import { execFileSync } from "node:child_process";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { sessionInstructionsScopeHash } from "../src/storage/session-instructions.js";
@@ -361,6 +361,26 @@ function makeRepository(root: string): { main: string; linked: string } {
   git(main, "commit", "-qm", "initial");
   git(main, "worktree", "add", "-qb", "linked", linked);
   return { main, linked };
+}
+
+function reconciliationJournalBytes(
+  targetHash: string,
+  canonical: string,
+  overrides: Partial<Record<string, unknown>> = {},
+): string {
+  return JSON.stringify({
+    version: 1,
+    targetHash,
+    canonical,
+    sourceHashes: [],
+    pendingSourceHashes: [],
+    aliases: [canonical],
+    createdAt: "2026-09-07T00:00:00.000Z",
+    updatedAt: "2026-09-07T00:00:00.000Z",
+    phase: "planned",
+    backupPaths: [],
+    ...overrides,
+  });
 }
 
 function makeDatabase(path: string, sessionId: string, content: string, projectId: string): void {
@@ -2962,6 +2982,40 @@ describe("worktree reconciliation", () => {
       .toEqual([]);
   }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
+  it("refuses a journal-directory rebound after publishing the reconciliation lock", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const journalDir = join(home, ".lcm", "reconciliations");
+    const displacedJournalDir = `${journalDir}.lock-displaced`;
+    const replacementSentinel = join(journalDir, "must-remain");
+    const lockPath = join(journalDir, `${targetHash}.lock`);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const actualLink = nodeFs.linkSync as typeof linkSync;
+    let rebound = false;
+    expect(existsSync(projectMapPath(home))).toBe(false);
+
+    expect(() => withPatchedFs("linkSync", ((source: string, destination: string) => {
+      actualLink(source, destination);
+      if (!rebound && destination === lockPath) {
+        rebound = true;
+        renameSync(journalDir, displacedJournalDir);
+        makePrivateFixtureDirectory(journalDir);
+        writePrivateFixtureFile(replacementSentinel, "replacement must remain unchanged\n");
+      }
+    }) as typeof linkSync, () => reconcileWorktrees(main))).toThrow(
+      "private directory topology is not trusted",
+    );
+
+    expect(rebound).toBe(true);
+    expect(readFileSync(replacementSentinel, "utf8"))
+      .toBe("replacement must remain unchanged\n");
+    expect(readdirSync(journalDir).filter((entry) => /\.json$|\.tmp$/u.test(entry)))
+      .toEqual([]);
+    expect(readdirSync(displacedJournalDir)).toContain(`${targetHash}.lock`);
+    expect(existsSync(projectMapPath(home))).toBe(false);
+  }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+
   it("refuses an early rebound parent before no-source completion", () => {
     const { main } = makeRepository(home);
     const journalDir = join(home, ".lcm", "reconciliations");
@@ -4124,7 +4178,7 @@ describe("worktree reconciliation", () => {
     }
   }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
 
-  it("blocks new work when a stale completed journal is observed before discovery", async () => {
+  it("preserves a stale completed journal when failure precedes locked admission", async () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const targetHash = hashProjectPath(canonical);
@@ -4153,6 +4207,7 @@ describe("worktree reconciliation", () => {
         sourceBHash,
       );
       const journalPath = join(home, ".lcm", "reconciliations", `${targetHash}.json`);
+      const completedBytes = readFileSync(journalPath, "utf8");
       expect(() => isolated.module.reconcileWorktrees(main, {
         _observer: (event) => {
           if (event !== "after-map-preflight") return;
@@ -4174,11 +4229,12 @@ describe("worktree reconciliation", () => {
         sourceHashes: string[];
         pendingSourceHashes: string[];
       };
-      expect(journal.phase).toBe("blocked");
-      expect(journal.blockedFrom).toBe("planned");
-      expect(journal.reason).toContain("injected stale-completed precompletion failure");
+      expect(journal.phase).toBe("completed");
+      expect(journal).not.toHaveProperty("blockedFrom");
+      expect(journal).not.toHaveProperty("reason");
       expect(journal.sourceHashes).toEqual([sourceHash]);
       expect(journal.pendingSourceHashes).toEqual([]);
+      expect(readFileSync(journalPath, "utf8")).toBe(completedBytes);
       expect(listProjectMapEntries()).toHaveProperty(sourceBHash);
       expect(existsSync(join(home, ".lcm", "projects", sourceBHash, "db.sqlite"))).toBe(true);
     } finally {
@@ -6480,12 +6536,446 @@ describe("worktree reconciliation", () => {
       "journal does not match the requested project",
     );
     writePrivateFixtureFile(join(home, ".lcm", "reconciliations", "ignored.txt"), "{}");
-    makePrivateFixtureDirectory(join(home, ".lcm", "reconciliations", `${"f".repeat(64)}.json`));
     writePrivateFixtureFile(
       join(home, ".lcm", "reconciliations", `${"e".repeat(64)}.json`),
       "{}",
     );
     expect(() => listWorktreeReconciliationJournals()).toThrow("journal is malformed");
+  });
+
+  it.each([
+    { label: "normal", dryRun: false },
+    { label: "dry-run", dryRun: true },
+  ])("preserves a dangling journal during $label admission", ({ dryRun }) => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root, { recursive: true });
+    const journalPath = join(root, `${targetHash}.json`);
+    const missingTarget = join(home, "missing-journal-target");
+    symlinkSync(missingTarget, journalPath);
+
+    expect(() => reconcileWorktrees(main, { dryRun })).toThrow();
+    expect(lstatSync(journalPath).isSymbolicLink()).toBe(true);
+    expect(existsSync(missingTarget)).toBe(false);
+    expect(readdirSync(root).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it.each([
+    {
+      label: "directory",
+      arrange: (path: string) => makePrivateFixtureDirectory(path),
+      expected: "regular file",
+    },
+    {
+      label: "dangling symlink",
+      arrange: (path: string) => symlinkSync(`${path}.missing`, path),
+      expected: "ELOOP",
+    },
+    {
+      label: "hard-linked file",
+      arrange: (path: string) => {
+        writePrivateFixtureFile(path, reconciliationJournalBytes("b".repeat(64), "/unsafe"));
+        linkSync(path, `${path}.external`);
+      },
+      expected: "multiple hard links",
+    },
+  ])("refuses a journal-shaped $label while preserving valid evidence", ({ arrange, expected }) => {
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root, { recursive: true });
+    const validHash = "a".repeat(64);
+    const validPath = join(root, `${validHash}.json`);
+    const validBytes = reconciliationJournalBytes(validHash, "/valid", { phase: "completed" });
+    writePrivateFixtureFile(validPath, validBytes);
+    const validBefore = statSync(validPath);
+    const unsafePath = join(root, `${"b".repeat(64)}.json`);
+    arrange(unsafePath);
+    writePrivateFixtureFile(join(root, "ignored.txt"), "ignored");
+
+    expect(() => listWorktreeReconciliationJournals()).toThrow(expected);
+    const validAfter = statSync(validPath);
+    expect(validAfter.ino).toBe(validBefore.ino);
+    expect(readFileSync(validPath, "utf8")).toBe(validBytes);
+  });
+
+  it.runIf(process.platform === "linux")(
+    "refuses a journal-shaped FIFO without blocking or altering valid evidence",
+    () => {
+      const root = join(home, ".lcm", "reconciliations");
+      makePrivateFixtureDirectory(root, { recursive: true });
+      const validHash = "a".repeat(64);
+      const validPath = join(root, `${validHash}.json`);
+      const validBytes = reconciliationJournalBytes(validHash, "/valid", { phase: "completed" });
+      writePrivateFixtureFile(validPath, validBytes);
+      const validBefore = statSync(validPath);
+      execFileSync("mkfifo", [join(root, `${"b".repeat(64)}.json`)]);
+
+      expect(() => listWorktreeReconciliationJournals()).toThrow("regular file");
+      expect(statSync(validPath).ino).toBe(validBefore.ino);
+      expect(readFileSync(validPath, "utf8")).toBe(validBytes);
+    },
+  );
+
+  it.each([
+    {
+      label: "hard-linked",
+      mutate: (path: string) => linkSync(path, `${path}.external`),
+      expected: "multiple hard links",
+    },
+    {
+      label: "world-readable",
+      mutate: (path: string) => fsChmodSync(path, 0o644),
+      expected: "mode is not trusted",
+    },
+    {
+      label: "safely replaced",
+      mutate: (path: string) => {
+        renameSync(path, `${path}.displaced`);
+        writePrivateFixtureFile(path, reconciliationJournalBytes(
+          basename(path, ".json"),
+          "/replacement",
+        ));
+      },
+      expected: "identity changed",
+    },
+  ])("preserves a $label journal when blocked-state recording loses authorization", ({
+    mutate,
+    expected,
+  }) => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makePrivateFixtureDirectory(join(home, ".lcm", "projects", sourceHash), { recursive: true });
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root, { recursive: true });
+    const journalPath = join(root, `${targetHash}.json`);
+    writePrivateFixtureFile(journalPath, reconciliationJournalBytes(targetHash, canonical, {
+      sourceHashes: [sourceHash],
+      pendingSourceHashes: [sourceHash],
+      aliases: [canonical, linked],
+      sourceComponents: {
+        [sourceHash]: { projectDb: false, eventsDb: false, patterns: false },
+      },
+    }));
+    let primary: Error | undefined;
+    let refusedInode: number | undefined;
+    let refusedBytes: string | undefined;
+
+    let caught: unknown;
+    try {
+      reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event !== "before-source-patterns-merge") return;
+          mutate(journalPath);
+          refusedInode = statSync(journalPath).ino;
+          refusedBytes = readFileSync(journalPath, "utf8");
+          primary = new Error("injected post-admission reconciliation failure");
+          throw primary;
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).cause).toBe(primary);
+    expect((caught as AggregateError).errors[0]).toBe(primary);
+    expect(String((caught as AggregateError).errors[1])).toContain(expected);
+    expect(statSync(journalPath).ino).toBe(refusedInode);
+    expect(readFileSync(journalPath, "utf8")).toBe(refusedBytes);
+  });
+
+  it.each([
+    { label: "inner", failureEvent: "before-source-patterns-merge" },
+    { label: "outer", failureEvent: "after-journal-admission" },
+  ])("preserves a journal whose owner becomes untrusted during $label recovery", ({
+    failureEvent,
+  }) => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makePrivateFixtureDirectory(join(home, ".lcm", "projects", sourceHash), { recursive: true });
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root, { recursive: true });
+    const journalPath = join(root, `${targetHash}.json`);
+    writePrivateFixtureFile(journalPath, reconciliationJournalBytes(targetHash, canonical, {
+      sourceHashes: [sourceHash],
+      pendingSourceHashes: [sourceHash],
+      aliases: [canonical, linked],
+      sourceComponents: {
+        [sourceHash]: { projectDb: false, eventsDb: false, patterns: false },
+      },
+    }));
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const actualFstat = nodeFs.fstatSync as typeof fstatSync;
+    const primary = new Error("injected owner-drift reconciliation failure");
+    let ownerDrifted = false;
+    let refusedInode: number | undefined;
+    let refusedBytes: string | undefined;
+    let caught: unknown;
+
+    try {
+      withPatchedFs("fstatSync", ((fd: number, options?: unknown) => {
+        const observed = actualFstat(fd, options as never);
+        if (!ownerDrifted) return observed;
+        const current = statSync(journalPath);
+        if (observed.dev !== current.dev || observed.ino !== current.ino) return observed;
+        const foreign = Object.create(observed) as typeof observed;
+        Object.defineProperty(foreign, "uid", { value: current.uid + 1 });
+        return foreign;
+      }) as typeof fstatSync, () => reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event !== failureEvent) return;
+          ownerDrifted = true;
+          refusedInode = statSync(journalPath).ino;
+          refusedBytes = readFileSync(journalPath, "utf8");
+          throw primary;
+        },
+      }));
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).cause).toBe(primary);
+    expect(String((caught as AggregateError).errors[1])).toContain("owner is not trusted");
+    expect(statSync(journalPath).ino).toBe(refusedInode);
+    expect(readFileSync(journalPath, "utf8")).toBe(refusedBytes);
+  });
+
+  it("recreates a journal exclusively when it is removed after admission", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const sourceHash = hashProjectPath(linked);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+      [sourceHash]: { canonical: linked, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    makePrivateFixtureDirectory(join(home, ".lcm", "projects", sourceHash), { recursive: true });
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root, { recursive: true });
+    const journalPath = join(root, `${targetHash}.json`);
+    writePrivateFixtureFile(journalPath, reconciliationJournalBytes(targetHash, canonical, {
+      sourceHashes: [sourceHash],
+      pendingSourceHashes: [sourceHash],
+      aliases: [canonical, linked],
+      sourceComponents: {
+        [sourceHash]: { projectDb: false, eventsDb: false, patterns: false },
+      },
+    }));
+    const primary = new Error("injected failure after journal removal");
+
+    expect(() => reconcileWorktrees(main, {
+      _observer: (event) => {
+        if (event !== "before-source-patterns-merge") return;
+        rmSync(journalPath);
+        throw primary;
+      },
+    })).toThrow(primary);
+    expect(JSON.parse(readFileSync(journalPath, "utf8"))).toMatchObject({
+      phase: "blocked",
+      reason: expect.stringContaining(primary.message),
+    });
+    expect(readdirSync(root).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("does not adopt a safe journal substituted after the locked admission read", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root, { recursive: true });
+    const journalPath = join(root, `${targetHash}.json`);
+    writePrivateFixtureFile(journalPath, reconciliationJournalBytes(targetHash, canonical));
+    const replacementBytes = reconciliationJournalBytes(targetHash, canonical, {
+      phase: "completed",
+      reason: "replacement evidence",
+    });
+    const primary = new Error("injected failure after journal admission");
+    let replaced = false;
+    let replacementInode: number | undefined;
+    let caught: unknown;
+
+    try {
+      reconcileWorktrees(main, {
+        _observer: (event) => {
+          if (event !== "after-journal-admission" || replaced) return;
+          replaced = true;
+          renameSync(journalPath, `${journalPath}.displaced`);
+          writePrivateFixtureFile(journalPath, replacementBytes);
+          replacementInode = statSync(journalPath).ino;
+          throw primary;
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).cause).toBe(primary);
+    expect(String((caught as AggregateError).errors[1])).toContain("identity changed");
+    expect(statSync(journalPath).ino).toBe(replacementInode);
+    expect(readFileSync(journalPath, "utf8")).toBe(replacementBytes);
+  });
+
+  it("keeps an exclusive first-write collision instead of replacing it", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const journalPath = join(home, ".lcm", "reconciliations", `${targetHash}.json`);
+    const collisionBytes = "concurrent evidence";
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const actualLink = nodeFs.linkSync as typeof linkSync;
+    let injected = false;
+
+    expect(() => withPatchedFs("linkSync", ((source: string, destination: string) => {
+      if (!injected && destination === journalPath) {
+        injected = true;
+        writePrivateFixtureFile(journalPath, collisionBytes);
+      }
+      return actualLink(source, destination);
+    }) as typeof linkSync, () => reconcileWorktrees(main))).toThrow();
+    expect(readFileSync(journalPath, "utf8")).toBe(collisionBytes);
+    expect(readdirSync(join(home, ".lcm", "reconciliations"))
+      .filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("revalidates an admitted journal after temp preparation and cleans the temp", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root, { recursive: true });
+    const journalPath = join(root, `${targetHash}.json`);
+    writePrivateFixtureFile(journalPath, reconciliationJournalBytes(targetHash, canonical));
+    const replacementBytes = reconciliationJournalBytes(targetHash, canonical, {
+      phase: "completed",
+      reason: "boundary replacement",
+    });
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const actualOpen = nodeFs.openSync as typeof import("node:fs").openSync;
+    let injected = false;
+
+    expect(() => withPatchedFs("openSync", ((path: string, flags: unknown, mode?: unknown) => {
+      const fd = actualOpen(path, flags as never, mode as never);
+      if (
+        !injected
+        && path.startsWith(`${root}/.${targetHash}.json.`)
+        && path.endsWith(".tmp")
+      ) {
+        injected = true;
+        renameSync(journalPath, `${journalPath}.displaced`);
+        writePrivateFixtureFile(journalPath, replacementBytes);
+      }
+      return fd;
+    }) as typeof import("node:fs").openSync, () => reconcileWorktrees(main))).toThrow(
+      "identity changed",
+    );
+    expect(readFileSync(journalPath, "utf8")).toBe(replacementBytes);
+    expect(readdirSync(root).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("fails closed when an admitted journal disappears after temp preparation", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root, { recursive: true });
+    const journalPath = join(root, `${targetHash}.json`);
+    writePrivateFixtureFile(journalPath, reconciliationJournalBytes(targetHash, canonical));
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const actualOpen = nodeFs.openSync as typeof import("node:fs").openSync;
+    let removed = false;
+
+    expect(() => withPatchedFs("openSync", ((path: string, flags: unknown, mode?: unknown) => {
+      const fd = actualOpen(path, flags as never, mode as never);
+      if (
+        !removed
+        && path.startsWith(`${root}/.${targetHash}.json.`)
+        && path.endsWith(".tmp")
+      ) {
+        removed = true;
+        rmSync(journalPath);
+      }
+      return fd;
+    }) as typeof import("node:fs").openSync, () => reconcileWorktrees(main))).toThrow(
+      "identity changed during publication",
+    );
+    expect(JSON.parse(readFileSync(journalPath, "utf8"))).toMatchObject({
+      phase: "blocked",
+      reason: expect.stringContaining("identity changed during publication"),
+    });
+    expect(readdirSync(root).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("rejects a postpublication safe substitute against the published temp inode", () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [targetHash]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root, { recursive: true });
+    const journalPath = join(root, `${targetHash}.json`);
+    writePrivateFixtureFile(journalPath, reconciliationJournalBytes(targetHash, canonical));
+    const substituteBytes = reconciliationJournalBytes(targetHash, canonical, {
+      phase: "completed",
+      reason: "postpublication substitute",
+    });
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const actualRename = nodeFs.renameSync as typeof renameSync;
+    let injected = false;
+
+    expect(() => withPatchedFs("renameSync", ((source: string, destination: string) => {
+      actualRename(source, destination);
+      if (!injected && destination === journalPath) {
+        injected = true;
+        actualRename(journalPath, `${journalPath}.published`);
+        writePrivateFixtureFile(journalPath, substituteBytes);
+      }
+    }) as typeof renameSync, () => reconcileWorktrees(main))).toThrow("identity changed");
+    expect(readFileSync(journalPath, "utf8")).toBe(substituteBytes);
+    expect(JSON.parse(readFileSync(journalPath, "utf8"))).toMatchObject({
+      phase: "completed",
+      reason: "postpublication substitute",
+    });
   });
 
   it("rejects a hard-linked completed journal before fast-path reuse", () => {

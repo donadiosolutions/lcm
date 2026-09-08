@@ -423,6 +423,8 @@ function scanAbsolutePath(
   let brackets = 0;
   let sawPathCharacter = false;
   let sawNonSeparator = false;
+  const slashPrefixedUrlPath =
+    quote === undefined && chars[start] === "/" && startsUrlSchemeLiteral(chars, start + 1);
   let singleSlashFileTail = false;
   while (index < chars.length) {
     const char = chars[index];
@@ -499,6 +501,11 @@ function scanAbsolutePath(
       continue;
     }
     if (singleSlashFileTail && char === ":") {
+      index += 1;
+      continue;
+    }
+    if (slashPrefixedUrlPath && char === ":") {
+      sawNonSeparator = true;
       index += 1;
       continue;
     }
