@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createGitFixture } from '../../surface-parity/git-fixture.mjs';
@@ -102,6 +102,7 @@ async function runHooks(context) {
   }));
   assert.ok(restoredScope?.content.includes(INSTRUCTION), 'surface-parity:restore:instruction-cache');
 
+  const restoreHadPending = await context.hasPendingPassiveWork();
   const restoreCli = await hook(context, 'restore', { cwd: context.projectPath, session_id: 'parity-restore-cli' });
   assert.ok(restoreCli.stdout.includes(INSTRUCTION), 'surface-parity:restore:native-output');
   const cliScope = await context.readProject(context.projectId, storage => storage.coordination.getSessionInstructions({
@@ -109,6 +110,7 @@ async function runHooks(context) {
   }));
   assert.ok(cliScope?.content.includes(INSTRUCTION), 'surface-parity:restore:native-cache');
   observations.push(record(context, 'cli:restore', { exit: restoreCli.code, instructionReturned: true, instructionPersisted: true, outbox: 'sqlite-local' }));
+  if (restoreHadPending) await context.isolateAsyncWork();
 
   const ingestInput = transcript(context, 'parity-ingest-route', ['Durable pear cultivation context.', 'Keep root pruning records.']);
   await post(context, '/ingest', {}, 400);
@@ -123,10 +125,32 @@ async function runHooks(context) {
   const snapshotResult = await hook(context, 'session-snapshot', snapshot);
   assert.equal(snapshotResult.stdout, '', 'surface-parity:snapshot:stdout');
   assert.equal((await messages(context, snapshot.session_id)).length, 2);
+  const cursorPath = join(context.homeDir, '.lcm/tmp', `snap-${snapshot.session_id}.json`);
+  const cursorWitness = () => {
+    const stat = lstatSync(cursorPath);
+    assert.ok(stat.isFile(), 'surface-parity:snapshot:cursor-file');
+    return { inode: stat.ino, dev: stat.dev, mtime: stat.mtimeMs, content: readFileSync(cursorPath, 'utf8') };
+  };
+  const originalCursor = cursorWitness();
+  await context.isolateAsyncWork();
+  // Preserve both contracts: the durable throttle survives restart, and two
+  // successful repeats in that fresh daemon lifetime remain duplicate-free.
   await hook(context, 'session-snapshot', snapshot);
   const snapshotMessages = await messages(context, snapshot.session_id);
   assert.equal(snapshotMessages.length, 2, 'surface-parity:snapshot:idempotent');
+  assert.ok(JSON.stringify(cursorWitness()) === JSON.stringify(originalCursor), 'surface-parity:snapshot:restart-cursor');
+  const expectedLifetime = context.currentDaemonIdentity();
+  const duplicateLifetime = await context.client.observe();
+  assert.equal(duplicateLifetime?.pid, expectedLifetime.pid, 'surface-parity:snapshot:duplicate-pid');
+  assert.equal(duplicateLifetime?.daemonInstanceId, expectedLifetime.generation, 'surface-parity:snapshot:duplicate-generation');
+  await hook(context, 'session-snapshot', snapshot);
+  assert.equal((await messages(context, snapshot.session_id)).length, 2, 'surface-parity:snapshot:same-lifetime-idempotent');
+  assert.ok(JSON.stringify(cursorWitness()) === JSON.stringify(originalCursor), 'surface-parity:snapshot:same-lifetime-cursor');
+  const repeatedLifetime = await context.client.observe();
+  assert.equal(repeatedLifetime?.pid, duplicateLifetime.pid, 'surface-parity:snapshot:repeat-pid');
+  assert.equal(repeatedLifetime?.daemonInstanceId, duplicateLifetime.daemonInstanceId, 'surface-parity:snapshot:repeat-generation');
   observations.push(record(context, 'cli:session-snapshot', { exit: snapshotResult.code, persisted: snapshotMessages.length, duplicateFree: true, outbox: 'sqlite-local' }));
+  await context.isolateAsyncWork();
 
 
   await post(context, '/session-complete', {}, 400);
@@ -134,6 +158,21 @@ async function runHooks(context) {
   assert.equal(completion.recorded, true);
   const completed = await context.readProject(context.projectId, storage => storage.coordination.getSessionIngest(ingestInput.session_id));
   assert.equal(completed.messageCount, 2, 'surface-parity:session-complete:authoritative-count');
+
+  const ending = transcript(context, 'parity-session-end-cli', ['Session end retains grafting records.', 'Protect the nursery from frost.']);
+  const endResult = await hook(context, 'session-end', ending);
+  assert.equal(endResult.stdout, '', 'surface-parity:session-end:stdout');
+  assert.equal((await messages(context, ending.session_id)).length, 2);
+  let completionCount = 'missing';
+  try {
+    await waitFor(async () => {
+      const row = await context.readProject(context.projectId, storage => storage.coordination.getSessionIngest(ending.session_id));
+      completionCount = row === null ? 'missing' : String(row.messageCount);
+      return row?.messageCount === 2;
+    }, 'session-end:completion-persisted');
+  } catch { assert.fail(`surface-parity:session-end:completion-${completionCount}`); }
+  observations.push(record(context, 'cli:session-end', { exit: endResult.code, persisted: 2, completionRecorded: true, outbox: 'sqlite-local' }));
+  await context.isolateAsyncWork();
 
   const capture = await hook(context, 'post-tool', {
     cwd: context.projectPath, session_id: 'parity-post-tool-cli', tool_name: 'Read',
@@ -174,19 +213,7 @@ async function runHooks(context) {
   const feedback = await context.readProject(context.projectId, storage => storage.recall.getFeedback([stored.id]));
   assert.ok(feedback.get(stored.id)?.surfacingCount > 0, 'surface-parity:user-prompt:surfacing-recorded');
   observations.push(record(context, 'cli:user-prompt', { exit: prompted.code, recalledContext: true, decisionCaptured: true, surfacingRecorded: true, outbox: 'sqlite-local' }));
-  const ending = transcript(context, 'parity-session-end-cli', ['Session end retains grafting records.', 'Protect the nursery from frost.']);
-  const endResult = await hook(context, 'session-end', ending);
-  assert.equal(endResult.stdout, '', 'surface-parity:session-end:stdout');
-  assert.equal((await messages(context, ending.session_id)).length, 2);
-  let completionCount = 'missing';
-  try {
-    await waitFor(async () => {
-      const row = await context.readProject(context.projectId, storage => storage.coordination.getSessionIngest(ending.session_id));
-      completionCount = row === null ? 'missing' : String(row.messageCount);
-      return row?.messageCount === 2;
-    }, 'session-end:completion-persisted');
-  } catch { assert.fail(`surface-parity:session-end:completion-${completionCount}`); }
-  observations.push(record(context, 'cli:session-end', { exit: endResult.code, persisted: 2, completionRecorded: true, outbox: 'sqlite-local' }));
+  await context.isolateAsyncWork();
 
   return observations;
 }
@@ -204,6 +231,7 @@ export async function runCompactHook(context) {
   });
   assert.ok(summaries.length > 0, 'surface-parity:compact-hook:summaries');
   assert.ok(result.stdout.includes('compaction-summary'), 'surface-parity:compact-hook:stdout');
+  await context.isolateAsyncWork();
   return { exit: result.code, summariesPersisted: true, summaryReturned: true };
 }
 

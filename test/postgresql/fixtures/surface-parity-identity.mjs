@@ -318,21 +318,6 @@ async function events(context) {
   const badNotification = await context.request("POST", "/promote-events/notify", {});
   assert.equal(badNotification.status, 400);
   assert.deepEqual(badNotification.body, { error: "cwd is required" });
-  // Queue a separate empty project; its background drain cannot race the
-  // quarantined recovery event below.
-  const notifyRoot = privateRoot(context, "events-notify");
-  if (pg) json(await context.cli(["project", "create", notifyRoot, "--json"]));
-  await ingest(context, notifyRoot, "surface-events-notify", "Notification baseline corpus");
-  const notified = await context.request("POST", "/promote-events/notify", { cwd: notifyRoot, priority: 1, pendingCount: 0, sourceHook: "surface-parity" });
-  assert.equal(notified.status, 200);
-  assert.deepEqual(notified.body, { queued: true });
-  const notificationDrain = await context.request("POST", "/promote-events", { cwd: notifyRoot, drain: true });
-  assert.equal(notificationDrain.status, 200);
-  assert.equal(notificationDrain.body.promoted, 0);
-  assert.equal(notificationDrain.body.errors, 0);
-  assert.equal((await matches(context, notifyRoot, "Notification baseline corpus")).length, 1);
-  rows.push({ id: "daemon:POST /promote-events/notify", assertions: ["admission", "result", "effects"], verdict: "passed",
-    observation: { status: notified.status, queued: notified.body.queued, promoted: notificationDrain.body.promoted, existingMessagePreserved: true } });
   await invalid(context, ["events", "promote"], { cwd: root });
   const promoted = json(await cli(["events", "promote", "--json"]));
   assert.equal(promoted.promoted, 0);
@@ -401,7 +386,23 @@ async function events(context) {
     assert.match(json(replay, 1).error, REMOTE_REFUSAL);
     rows.push(receipt("events replay", { code: replay.code, refusal: "postgresql-required" }));
   }
+  // Retain notification admission after the CLI/recovery oracles. The
+  // following owned-lifetime boundary settles work before the next scenario.
+  const notifyRoot = privateRoot(context, "events-notify");
+  if (pg) json(await context.cli(["project", "create", notifyRoot, "--json"]));
+  await ingest(context, notifyRoot, "surface-events-notify", "Notification baseline corpus");
+  const notified = await context.request("POST", "/promote-events/notify", { cwd: notifyRoot, priority: 1, pendingCount: 0, sourceHook: "surface-parity" });
+  assert.equal(notified.status, 200);
+  assert.deepEqual(notified.body, { queued: true });
+  const notificationDrain = await context.request("POST", "/promote-events", { cwd: notifyRoot, drain: true });
+  assert.equal(notificationDrain.status, 200);
+  assert.equal(notificationDrain.body.promoted, 0);
+  assert.equal(notificationDrain.body.errors, 0);
+  assert.equal((await matches(context, notifyRoot, "Notification baseline corpus")).length, 1);
+  rows.push({ id: "daemon:POST /promote-events/notify", assertions: ["admission", "result", "effects"], verdict: "passed",
+    observation: { status: notified.status, queued: notified.body.queued, promoted: notificationDrain.body.promoted, existingMessagePreserved: true } });
   noProjectSqlite(context, [root, notifyRoot]);
+  await context.isolateAsyncWork();
   return rows;
 }
 

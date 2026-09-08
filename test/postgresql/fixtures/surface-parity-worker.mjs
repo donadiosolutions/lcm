@@ -1,19 +1,23 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { PrivateMutationLockContentionError } from '../../../dist/src/private-mutation-lock.js';
+import { PrivateMutationLockContentionError, readPrivateMutationLockOwner, processStartTime } from '../../../dist/src/private-mutation-lock.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { findUserSystemdPid } from '../../../dist/src/daemon/lifecycle.js';
 import { createDaemon } from '../../../dist/src/daemon/server.js';
 import { loadDaemonConfig, readDaemonConfigSnapshot, daemonConfigSnapshotWitnessEqual } from '../../../dist/src/daemon/config.js';
-import { withBackendPublicationReadRoot, assertBackendPublicationConfigReadAccess } from '../../../dist/src/storage/backend-publication.js';
+import { withBackendPublicationReadRoot, assertBackendPublicationConfigReadAccess, withBackendPublicationConsumerLock, assertBackendPublicationConsumerAccess } from '../../../dist/src/storage/backend-publication.js';
 import { assertSelectedBackend } from '../../surface-parity/backend-observation.mjs';
+import { isolateAsyncBoundary } from '../../surface-parity/async-isolation.mjs';
+import { assertRestartSnapshotUnchanged } from '../../surface-parity/restart-snapshot.mjs';
+import { invokeAfterConsumerAdmission } from '../../surface-parity/mcp-readiness.mjs';
+import { collectEventSidecars } from '../../../dist/src/db/event-sidecars.js';
 import { DaemonClient } from '../../../dist/src/daemon/client.js';
 import { ensureAuthToken } from '../../../dist/src/daemon/auth.js';
 import { setConfigValue } from '../../../dist/src/config-manager.js';
@@ -48,6 +52,8 @@ let baselineStarted = false;
 let directDaemon;
 let transport;
 let mcpClient;
+let mcpNeedsReadiness = false;
+let mcpReadinessAuthority;
 let mcpErrorBytes = 0;
 let readFactory;
 let busy = false;
@@ -145,8 +151,8 @@ function projectDatabasePaths(root = join(homeDir, '.lcm/projects')) {
       : /^db\.sqlite(?:-wal|-shm)?$/u.test(entry.name) ? [path] : [];
   });
 }
-async function assertNoFallback() {
-  assertSelectedBackend({
+function assertNoFallback() {
+  return assertSelectedBackend({
     homeDir, configPath, backend,
     assertNoSqliteFiles: () => assert.equal(projectDatabasePaths().length, 0, 'surface-worker:sqlite-fallback-file'),
   }, {
@@ -239,18 +245,30 @@ function bookkeepingResult() {
 }
 const context = {
   backend, homeDir, projectPath, secondaryProjectPath, scenario: activeScenario, recordBookkeeping,
+  currentDaemonIdentity: () => ({ pid: baseline?.pid, generation: context.daemonInstanceId }),
   projectId: hashProjectPath(projectPath), secondaryProjectId: hashProjectPath(secondaryProjectPath),
   remoteProjectId: process.env.LCM_SURFACE_REMOTE_PROJECT_ID,
   secondaryRemoteProjectId: process.env.LCM_SURFACE_SECONDARY_REMOTE_PROJECT_ID,
-  matrix, cli, request, readProject, admin, assertNoFallback, snapshotReaders, assertSnapshotUnchanged, assertLogicalSnapshotUnchanged, resetSnapshotReaders,
+  matrix, cli, request, readProject, admin, assertNoFallback, isolateAsyncWork, hasPendingPassiveWork, observePublisher, snapshotReaders, assertSnapshotUnchanged, assertLogicalSnapshotUnchanged, resetSnapshotReaders,
   canaries: ['SURFACEPRIVATE', 'surface_password_canary', 'surface_query_canary', 'SQLSTATE_PRIVATE_42501', homeDir, projectPath, ...(backend === 'postgresql' ? (() => { const url = new URL(process.env.LCM_POSTGRES_URL); return [process.env.LCM_POSTGRES_URL, decodeURIComponent(url.username), decodeURIComponent(url.password), decodeURIComponent(url.pathname.slice(1))]; })() : [])],
   snapshot: () => snapshotSurfaceState(context),
   snapshotPostgreSql: () => admin('snapshot'),
   unavailableStartup: () => admin('unavailable.start'),
-  mcp: (name, args) => {
+  mcp: async (name, args) => {
     assert.ok(mcpClient, 'surface-worker:mcp-initialized');
     assert.ok(mcpErrorBytes <= streamLimit, 'surface-worker:mcp-output-bound');
-    return mcpClient.callTool({ name, arguments: args });
+    const invoke = () => mcpClient.callTool({ name, arguments: args });
+    if (!mcpNeedsReadiness) return invoke();
+    return invokeAfterConsumerAdmission({
+      admit: observe => withBackendPublicationConsumerLock(homeDir, token => {
+        assertBackendPublicationConsumerAccess({ homeDir, lockToken: token });
+        observe();
+      }),
+      observeAuthority: readAdmissionAuthority,
+      expectedAuthority: mcpReadinessAuthority,
+      ContentionError: PrivateMutationLockContentionError,
+      invoke: () => { mcpNeedsReadiness = false; return invoke(); },
+    });
   },
 };
 async function quiesceReadState() {
@@ -296,9 +314,10 @@ async function startDirect() {
   context.daemonInstanceId = directDaemon.daemonInstanceId;
   return routes;
 }
-async function startBaseline() {
-  const port = await availablePort();
-  selectPort(port);
+async function startBaseline(reusePort) {
+  const port = reusePort ?? await availablePort();
+  if (reusePort === undefined) selectPort(port);
+  else assert.equal(loadDaemonConfig(configPath).daemon.port, reusePort, 'surface-isolation:configured-port');
   context.config = loadDaemonConfig(configPath);
   baselineStarted = false;
   baseline = launch(['daemon', 'start', '--foreground']);
@@ -347,6 +366,8 @@ async function startBaseline() {
   assert.equal(afterMcp?.pid, baseline.pid, 'surface-worker:baseline-process-replaced');
   assert.equal(afterMcp?.daemonInstanceId, context.daemonInstanceId, 'surface-worker:baseline-generation-replaced');
   assert.ok(mcpErrorBytes <= streamLimit, 'surface-worker:mcp-output-bound');
+  mcpReadinessAuthority = readAdmissionAuthority();
+  mcpNeedsReadiness = true;
   return tools;
 }
 async function stopBaseline() {
@@ -355,6 +376,89 @@ async function stopBaseline() {
   // An already-reaped startup refusal is the primary error, not a shutdown
   // failure. A daemon that reached listening must still shut down cleanly.
   if (baselineStarted) assert.equal(baseline.exitCode, 0, 'surface-worker:baseline-cleanup-exit');
+}
+function observePublisher() {
+  try {
+    const path = join(homeDir, '.lcm.backend-publication.lock');
+    const owner = readPrivateMutationLockOwner(path);
+    if (owner === null) return 'absent';
+    try { process.kill(owner.pid, 0); } catch (error) { return error.code === 'ESRCH' ? 'stale' : 'ambiguous'; }
+    const birth = processStartTime(owner.pid);
+    const current = readPrivateMutationLockOwner(path);
+    if (!current || current.nonce !== owner.nonce) return 'changed';
+    if (birth === null || owner.processStartTime === null) return 'ambiguous';
+    if (birth !== owner.processStartTime) return 'stale';
+    return owner.pid === process.pid ? 'live-worker' : owner.pid === baseline?.pid ? 'live-daemon'
+      : owner.pid === transport?.pid ? 'live-mcp' : 'live-other';
+  } catch { return 'unavailable'; }
+}
+function readRootIdentity() {
+  return withBackendPublicationReadRoot(homeDir, assertReadRoot => {
+    assertReadRoot();
+    const home = lstatSync(homeDir);
+    const root = lstatSync(join(homeDir, '.lcm'));
+    assertReadRoot();
+    const identity = stat => ({ inode: stat.ino, dev: stat.dev, mode: stat.mode, uid: stat.uid, gid: stat.gid });
+    return { home: identity(home), root: identity(root) };
+  });
+}
+function readAdmissionAuthority() {
+  const root = readRootIdentity();
+  const backendAuthority = assertNoFallback();
+  assert.ok(JSON.stringify(root) === JSON.stringify(readRootIdentity()), 'surface-mcp:readiness-root-changed');
+  return { root, backend: backendAuthority };
+}
+async function readPassiveSidecars() {
+  const sidecars = await collectEventSidecars({ homeDir, pruneOrphanSidecars: false, includeRecentErrors: false, maxDbs: 128 });
+  assert.ok(sidecars.every(row => !row.scanError && !row.scanSkipped), 'surface-isolation:sidecar-observation');
+  assert.ok(sidecars.every(row => row.unprocessed === 0 || (typeof row.cwd === 'string'
+    && [homeDir, dirname(projectPath)].some(root => resolve(row.cwd) === root || resolve(row.cwd).startsWith(`${root}/`)))),
+  'surface-isolation:pending-owner-outside-fixture');
+  return sidecars;
+}
+async function hasPendingPassiveWork() {
+  const sidecars = await readPassiveSidecars();
+  assert.ok(sidecars.every(row => !row.scanError && !row.scanSkipped), 'surface-isolation:sidecar-observation');
+  return sidecars.some(row => row.projectId === context.projectId && row.unprocessed > 0);
+}
+async function isolateAsyncWork() {
+  assert.ok(baselineStarted && baseline && !directDaemon, 'surface-isolation:canonical-lifetime');
+  await isolateAsyncBoundary({
+    drain: cwd => request('POST', '/promote-events', { cwd, drain: true }),
+    readSidecars: readPassiveSidecars,
+    captureState: async () => {
+      resetSnapshotReaders();
+      try {
+        const root = readRootIdentity();
+        const state = { authority: { root, backend: await assertNoFallback() }, logical: await context.snapshot() };
+        assert.ok(JSON.stringify(root) === JSON.stringify(readRootIdentity()), 'surface-isolation:snapshot-root-changed');
+        return state;
+      }
+      finally { resetSnapshotReaders(); }
+    },
+    stop: async () => {
+      const previous = { pid: baseline.pid, generation: context.daemonInstanceId, port: context.config.daemon.port };
+      const previousMcpPid = transport.pid;
+      assert.ok(Number.isSafeInteger(previousMcpPid) && previousMcpPid > 0, 'surface-isolation:mcp-owner');
+      await closeMcp();
+      assert.throws(() => process.kill(previousMcpPid, 0), error => error.code === 'ESRCH', 'surface-isolation:old-mcp-retained');
+      await readFactory?.close();
+      readFactory = undefined;
+      await stopBaseline();
+      assert.throws(() => process.kill(previous.pid, 0), error => error.code === 'ESRCH', 'surface-isolation:old-daemon-retained');
+      baseline = undefined;
+      resetSnapshotReaders();
+      return previous;
+    },
+    start: async port => {
+      await startBaseline(port);
+      return { pid: baseline.pid, generation: context.daemonInstanceId, port: context.config.daemon.port };
+    },
+    assertStateUnchanged: (after, before) => {
+      assert.ok(JSON.stringify(after.authority) === JSON.stringify(before.authority), 'surface-isolation:authority-changed');
+      assertRestartSnapshotUnchanged(after.logical, before.logical, process.getuid());
+    },
+  });
 }
 async function enterFaults() {
   if (directDaemon) return;

@@ -32,5 +32,6 @@ export function assertSelectedBackend(options, operations) {
     const secondAdmission = admit(second);
     assert.equal(firstAdmission.journalChecksumSha256, secondAdmission.journalChecksumSha256,
       'surface-observer:publication-changed');
+    return { backend, witness: second.witness, journalChecksumSha256: secondAdmission.journalChecksumSha256 };
   });
 }

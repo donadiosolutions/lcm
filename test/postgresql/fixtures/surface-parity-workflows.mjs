@@ -74,7 +74,17 @@ async function request(context, path, body, status = 200, method = "POST") {
 
 async function mcpJson(context, name, args) {
   const result = await context.mcp(name, args);
-  check(result.isError !== true, `mcp:${name}:error`);
+  if (result.isError === true) {
+    const text = result.content.filter(block => block.type === "text").map(block => block.text).join("\n");
+    const category = /file changed during validation/u.test(text) ? "file-changed"
+      : /mutation is already in progress/u.test(text) ? "busy"
+      : /backend publication admission blocked/u.test(text) ? "publication"
+      : "error";
+    const publisher = context.observePublisher();
+    const failure = new Error(`surface-parity:mcp:${name}:${category}:${publisher}`);
+    failure.surfaceEvidence = { stderrDigest: createHash("sha256").update(text).digest("hex") };
+    throw failure;
+  }
   const content = result.content.filter(block => block.type === "text").map(block => block.text).join("\n");
   try { return JSON.parse(content); }
   catch { throw new Error(`surface-parity:mcp:${name}:json`); }
