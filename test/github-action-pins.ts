@@ -12,6 +12,7 @@ export interface ActionReference {
 
 const externalAction = /^(?<repository>[^/@\s]+\/[^/@\s]+)(?:\/[^@\s]+)?@(?<sha>\S+)$/u;
 const usesLine = /^\s*(?:-\s+)?uses:\s*(?<target>[^\s#]+)(?:\s+#\s*(?<comment>.*?))?\s*$/u;
+const blockScalarHeader = /:\s*[>|](?:[+-]?\d?|\d?[+-]?)\s*(?:#.*)?$/u;
 
 interface EffectiveUse {
   target: string;
@@ -39,32 +40,48 @@ function sourceLine(source: string, target: string): number {
   return index + 1;
 }
 
+function indentation(line: string): number {
+  return line.length - line.trimStart().length;
+}
+
 function rawActionReferences(source: string, sourceName: string): ActionReference[] {
-  return source.split(/\r?\n/u).flatMap((line, index) => {
+  const references: ActionReference[] = [];
+  let blockScalarIndent: number | undefined;
+
+  for (const [index, line] of source.split(/\r?\n/u).entries()) {
+    if (blockScalarIndent !== undefined) {
+      if (line.trim().length === 0) continue;
+      if (indentation(line) > blockScalarIndent) continue;
+      blockScalarIndent = undefined;
+    }
+
     const match = usesLine.exec(line);
-    if (!match?.groups) return [];
-
-    const { target, comment } = match.groups;
-    const lineNumber = index + 1;
-    if (target.startsWith("./")) {
-      return [{ comment, kind: "local" as const, line: lineNumber, source: sourceName, target }];
+    if (match?.groups) {
+      const { target, comment } = match.groups;
+      const lineNumber = index + 1;
+      if (target.startsWith("./")) {
+        references.push({ comment, kind: "local", line: lineNumber, source: sourceName, target });
+      } else {
+        const external = externalAction.exec(target);
+        if (!external?.groups) {
+          references.push({ comment, kind: "invalid-local", line: lineNumber, source: sourceName, target });
+        } else {
+          references.push({
+            comment,
+            kind: "external",
+            line: lineNumber,
+            repository: external.groups.repository,
+            sha: external.groups.sha,
+            source: sourceName,
+            target,
+          });
+        }
+      }
     }
 
-    const external = externalAction.exec(target);
-    if (!external?.groups) {
-      return [{ comment, kind: "invalid-local" as const, line: lineNumber, source: sourceName, target }];
-    }
-
-    return [{
-      comment,
-      kind: "external" as const,
-      line: lineNumber,
-      repository: external.groups.repository,
-      sha: external.groups.sha,
-      source: sourceName,
-      target,
-    }];
-  });
+    if (blockScalarHeader.test(line)) blockScalarIndent = indentation(line);
+  }
+  return references;
 }
 
 export function parseActionReferences(source: string, sourceName: string): ActionReference[] {

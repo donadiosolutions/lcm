@@ -39,6 +39,7 @@ function referencesFor(file: URL) {
 
 const validSha = "a".repeat(40);
 const alternateSha = "b".repeat(40);
+const collisionSha = "0123456789abcdef0123456789abcdef01234567";
 
 describe("GitHub Action pin policy", () => {
   it("allows only approved external actions with immutable pins and version comments", () => {
@@ -82,6 +83,32 @@ describe("GitHub Action pin policy", () => {
         parseActionReferences(source, "fixture.yml"),
         approvedRepositories,
       )).toThrow();
+    }
+  });
+
+  it("rejects quoted and flow uses fields despite same-target block-scalar decoys", () => {
+    const action = `actions/checkout@${collisionSha}`;
+    const unsupportedForms = [
+      `  - "uses": ${action}`,
+      `  - { uses: ${action} }`,
+    ];
+    const scalarIndicators = ["|", "|-", "|+", "|2-", ">", ">-", ">+", ">2+"];
+
+    for (const indicator of scalarIndicators) {
+      for (const unsupported of unsupportedForms) {
+        const source = [
+          `decoy: ${indicator}`,
+          `  uses: ${action} # v4.2.2`,
+          "steps:",
+          `  - uses: ${action} # v4.2.2`,
+          unsupported,
+        ].join("\n");
+
+        expect(() => assertApprovedActionReferences(
+          parseActionReferences(source, "fixture.yml"),
+          approvedRepositories,
+        )).toThrow();
+      }
     }
   });
 
