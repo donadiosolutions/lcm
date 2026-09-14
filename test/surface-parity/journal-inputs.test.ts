@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,6 +34,33 @@ describe("independent journal discovery inputs", () => {
         codexFingerprint: fingerprint({ catalogue: [], complete: true }), complete: true } });
     expect(Object.isFrozen(input.observations[target])).toBe(true);
     expect(() => discoveryForJournal(input, {}, target)).toThrow("unvalidated-map-prefix");
+  });
+
+  it.each(["missing", "permission", "signal", "timeout"])("handles actual Git executable %s under isolated PATH", kind => {
+    const { home, target } = fixture();
+    const emptyPath = join(home, "empty-path"); mkdirSync(emptyPath, { mode: 0o700 });
+    if (kind !== "missing") writeFileSync(join(emptyPath, "git"), kind === "timeout" ? "#!/bin/sh\n/bin/sleep 5\n"
+      : kind === "signal" ? "#!/bin/sh\nkill -TERM $$\n" : "#!/bin/sh\nexit 2\n", { mode: kind === "permission" ? 0o600 : 0o700 });
+    // Resolve the actual fixture anchor independently before giving the child
+    // an empty PATH. The child's real execFileSync must report spawn absence.
+    const anchor = resolveGitProjectAnchor(target);
+    const input = { home, target, anchor };
+    const moduleUrl = new URL("./journal-inputs.mjs", import.meta.url).href;
+    const script = `import {captureJournalInputs,discoveryForJournal} from ${JSON.stringify(moduleUrl)};
+      import {execFileSync} from 'node:child_process';
+      const input=JSON.parse(process.argv[1]);
+      let spawnCode;
+      try{execFileSync('git',['--version'],{timeout:2000,stdio:'pipe'});}catch(error){spawnCode=error.code;}
+      try{const captured=captureJournalInputs(input.home,{}, {paths:[input.target],resolveGitProjectAnchor:()=>input.anchor});
+        const discovered=discoveryForJournal(captured,{},input.target);
+        console.log(JSON.stringify({remote:captured.repositories[input.anchor.commonDir].remote,sourceHashes:discovered.sourceHashes,spawnCode}));
+      }catch(error){console.log(JSON.stringify({error:error.message,code:error.cause?.code,spawnCode}));}`;
+    const result = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(input)],
+      { encoding: "utf8", env: { ...process.env, PATH: emptyPath }, timeout: 8000, maxBuffer: 8192 }));
+    if (kind === "missing") expect(result).toEqual({ remote: null, sourceHashes: [], spawnCode: "ENOENT" });
+    else expect(result.error).toBe("surface-prepared:inputs-unsupported-remote-observation");
+    if (kind === "permission") expect(result.code).toBe("EACCES");
+    if (kind === "timeout") expect(result.code).toBe("ETIMEDOUT");
   });
 
   it("admits separate same-remote clones but refuses a same-commonDir source", () => {

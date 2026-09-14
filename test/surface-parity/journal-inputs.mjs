@@ -97,6 +97,9 @@ function remoteOrigin(canonical) {
     return execFileSync('git', ['-C', canonical, 'config', '--get', 'remote.origin.url'],
       { encoding: 'utf8', maxBuffer: 64 * 1024, timeout: 2_000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }).trim() || null;
   } catch (error) {
+    // The pinned slim runtime has no Git executable. Production repositoryUrl
+    // catches this exact spawn failure and has no remote for tombstone discovery.
+    if (error.code === 'ENOENT' && error.path === 'git' && error.status === null && error.signal === null) return null;
     // git --get exits 1 for an absent key. The fixed synthetic repository has
     // no refs directory; Git exits 128 although the read-only LCM anchor is valid.
     // Retain only this exact known fixture failure, never timeout/signal/other IO.
