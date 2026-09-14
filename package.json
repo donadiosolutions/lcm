@@ -78,7 +78,7 @@
     "@types/node": "26.1.2",
     "@types/pg": "8.20.3",
     "@types/safe-regex": "1.1.6",
-    "@vitest/coverage-v8": "4.1.10",
+    "@vitest/coverage-v8": "4.1.11",
     "body-parser": "2.3.0",
     "esbuild": "0.28.1",
     "eslint": "10.8.0",
@@ -86,7 +86,7 @@
     "openai": "7.3.0",
     "typescript": "6.0.3",
     "typescript-eslint": "8.65.0",
-    "vitest": "4.1.10"
+    "vitest": "4.1.11"
   },
   "peerDependencies": {
     "@anthropic-ai/sdk": "0.115.0",
