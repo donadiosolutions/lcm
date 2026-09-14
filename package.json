@@ -66,7 +66,7 @@
     "@hono/node-server": "2.0.12",
     "@sinclair/typebox": "0.34.52",
     "commander": "15.0.0",
-    "js-yaml": "5.2.3",
+    "js-yaml": "5.3.0",
     "pg": "8.22.0",
     "safe-regex": "2.1.1"
   },
