@@ -49,15 +49,18 @@ function expectMinorPatchOnly(group: DependabotGroup): void {
   expect(group["update-types"]).toEqual(["minor", "patch"]);
 }
 
-function expectVersionHold(
-  update: DependabotUpdate,
-  dependencyName: string,
-  versionRange: string,
-): void {
-  expect(update.ignore).toContainEqual({
-    "dependency-name": dependencyName,
-    versions: [versionRange],
-  });
+function normalizedVersionHolds(update: DependabotUpdate): Array<{
+  dependencyName: unknown;
+  versions: unknown;
+}> {
+  return (update.ignore ?? [])
+    .map((ignore) => ({
+      dependencyName: ignore["dependency-name"],
+      versions: ignore.versions,
+    }))
+    .sort(({ dependencyName: left }, { dependencyName: right }) =>
+      String(left).localeCompare(String(right)),
+    );
 }
 
 function configurationKeys(value: unknown): string[] {
@@ -72,6 +75,7 @@ describe("dependency automation configuration", () => {
     const routine = groupFor(npm, "npm-routine");
     const vitest = groupFor(npm, "vitest-routine");
 
+    expect(Object.keys(npm.groups ?? {}).sort()).toEqual(["npm-routine", "vitest-routine"]);
     expect(routine.patterns).toEqual(["*"]);
     expect(routine["exclude-patterns"]).toEqual(["vitest", "@vitest/coverage-v8"]);
     expectMinorPatchOnly(routine);
@@ -83,9 +87,11 @@ describe("dependency automation configuration", () => {
   it("holds only explicitly incompatible npm major ranges until their stated conditions are met", () => {
     const npm = updateFor("npm");
 
-    expectVersionHold(npm, "typescript", ">=7.0.0");
-    expectVersionHold(npm, "vitest", ">=5.0.0");
-    expectVersionHold(npm, "@vitest/coverage-v8", ">=5.0.0");
+    expect(normalizedVersionHolds(npm)).toEqual([
+      { dependencyName: "@vitest/coverage-v8", versions: [">=5.0.0"] },
+      { dependencyName: "typescript", versions: [">=7.0.0"] },
+      { dependencyName: "vitest", versions: [">=5.0.0"] },
+    ]);
     expect(dependabotSource).toMatch(
       /# Remove when typescript-eslint's supported TypeScript peer range includes 7\./u,
     );
@@ -101,9 +107,12 @@ describe("dependency automation configuration", () => {
     const actions = updateFor("github-actions");
     const routine = groupFor(actions, "github-actions-routine");
 
+    expect(Object.keys(actions.groups ?? {}).sort()).toEqual(["github-actions-routine"]);
     expect(routine.patterns).toEqual(["*"]);
     expectMinorPatchOnly(routine);
-    expectVersionHold(actions, "changesets/action", ">=2.0.0");
+    expect(normalizedVersionHolds(actions)).toEqual([
+      { dependencyName: "changesets/action", versions: [">=2.0.0"] },
+    ]);
     expect(dependabotSource).toMatch(
       /# Remove when changesets\/action 2 passes this repository's protected version-PR workflow validation\./u,
     );
