@@ -1,0 +1,33 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "enabledManagers": ["github-actions", "custom.regex"],
+  "includePaths": [".github/actions/**", "scripts/postgresql-images.mjs"],
+  "automerge": false,
+  "minimumReleaseAge": "7 days",
+  "labels": ["dependencies"],
+  "semanticCommits": "enabled",
+  "semanticCommitType": "build",
+  "semanticCommitScope": "deps",
+  "separateMajorMinor": true,
+  "pinDigests": true,
+  "github-actions": {
+    "managerFilePatterns": ["/^\\.github\\/actions\\/.+\\/action\\.ya?ml$/"]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "datasourceTemplate": "docker",
+      "managerFilePatterns": ["/^scripts\\/postgresql-images\\.mjs$/"],
+      "matchStrings": [
+        "export const (?:POSTGRES_IMAGE|NODE_IMAGE) = \"(?<depName>[a-z0-9][a-z0-9._/-]*):(?<currentValue>[^@\"\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})\";"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["actions/cache", "actions/cache/restore", "actions/cache/save"],
+      "groupName": "actions/cache"
+    }
+  ]
+}

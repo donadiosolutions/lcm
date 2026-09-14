@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { load as loadYaml } from "js-yaml";
 import { describe, expect, it } from "vitest";
 
@@ -25,11 +25,48 @@ type DependabotConfig = {
   updates?: DependabotUpdate[];
 };
 
+type RenovateCustomManager = {
+  customType?: unknown;
+  datasourceTemplate?: unknown;
+  managerFilePatterns?: unknown;
+  matchStrings?: unknown;
+};
+
+type RenovatePackageRule = {
+  groupName?: unknown;
+  matchManagers?: unknown;
+  matchPackageNames?: unknown;
+};
+
+type RenovateConfig = {
+  "github-actions"?: {
+    managerFilePatterns?: unknown;
+  };
+  automerge?: unknown;
+  customManagers?: RenovateCustomManager[];
+  enabledManagers?: unknown;
+  includePaths?: unknown;
+  labels?: unknown;
+  minimumReleaseAge?: unknown;
+  packageRules?: RenovatePackageRule[];
+  pinDigests?: unknown;
+  semanticCommitScope?: unknown;
+  semanticCommitType?: unknown;
+  semanticCommits?: unknown;
+  separateMajorMinor?: unknown;
+  [key: string]: unknown;
+};
+
 const dependabotSource = readFileSync(
   new URL("../.github/dependabot.yml", import.meta.url),
   "utf8",
 );
 const dependabot = loadYaml(dependabotSource) as DependabotConfig;
+
+const renovatePath = new URL("../renovate.json", import.meta.url);
+const renovateExists = existsSync(renovatePath);
+const renovateSource = renovateExists ? readFileSync(renovatePath, "utf8") : "{}";
+const renovate = JSON.parse(renovateSource) as RenovateConfig;
 
 function updateFor(ecosystem: string): DependabotUpdate {
   const update = dependabot.updates?.find(
@@ -67,6 +104,52 @@ function configurationKeys(value: unknown): string[] {
   if (Array.isArray(value)) return value.flatMap(configurationKeys);
   if (!value || typeof value !== "object") return [];
   return Object.entries(value).flatMap(([key, nested]) => [key, ...configurationKeys(nested)]);
+}
+
+function regexPatterns(value: unknown): RegExp[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((pattern) => {
+    if (typeof pattern !== "string" || !pattern.startsWith("/") || !pattern.endsWith("/")) {
+      throw new Error(`Expected Renovate regex pattern, received ${String(pattern)}`);
+    }
+    return new RegExp(pattern.slice(1, -1), "u");
+  });
+}
+
+function matchingManagers(fileName: string): string[] {
+  const githubActionsPatterns = regexPatterns(
+    renovate["github-actions"]?.managerFilePatterns,
+  );
+  const githubActionsMatches = githubActionsPatterns.some((pattern) => pattern.test(fileName));
+  const customRegexMatches = (renovate.customManagers ?? []).some((manager) =>
+    regexPatterns(manager.managerFilePatterns).some((pattern) => pattern.test(fileName)),
+  );
+
+  return [
+    ...(githubActionsMatches ? ["github-actions"] : []),
+    ...(customRegexMatches ? ["custom.regex"] : []),
+  ];
+}
+
+function postgresqlImageMatches(source: string): Array<Record<string, string | undefined>> {
+  const manager = (renovate.customManagers ?? []).find(
+    (candidate) => candidate.customType === "regex",
+  );
+  const matchString = manager?.matchStrings;
+  if (!Array.isArray(matchString) || typeof matchString[0] !== "string") return [];
+
+  return [...source.matchAll(new RegExp(matchString[0], "gmu"))].map((match) => match.groups ?? {});
+}
+
+function expectCompletePostgresqlImageMatches(
+  matches: Array<Record<string, string | undefined>>,
+): void {
+  expect(matches).toHaveLength(2);
+  expect(matches.map(({ depName }) => depName).sort()).toEqual(["node", "postgres"]);
+  for (const { currentDigest, currentValue } of matches) {
+    expect(currentValue).toMatch(/^[^\s@"]+$/u);
+    expect(currentDigest).toMatch(/^sha256:[a-f0-9]{64}$/u);
+  }
 }
 
 describe("dependency automation configuration", () => {
@@ -121,5 +204,87 @@ describe("dependency automation configuration", () => {
   it("keeps Dependabot pull requests human-reviewed by omitting auto-merge configuration", () => {
     expect(configurationKeys(dependabot)).not.toContain("automerge");
     expect(configurationKeys(dependabot)).not.toContain("auto-merge");
+  });
+
+  it("enables Renovate only after its reviewed configuration exists", () => {
+    expect(renovateExists).toBe(true);
+  });
+
+  it("gives hosted Renovate exactly one owner for each approved file family", () => {
+    expect(renovate.enabledManagers).toEqual(["github-actions", "custom.regex"]);
+    expect(renovate.includePaths).toEqual([
+      ".github/actions/**",
+      "scripts/postgresql-images.mjs",
+    ]);
+    expect(matchingManagers(".github/actions/setup-ci/action.yml")).toEqual([
+      "github-actions",
+    ]);
+    expect(matchingManagers(".github/actions/nested/setup/action.yaml")).toEqual([
+      "github-actions",
+    ]);
+    expect(matchingManagers("scripts/postgresql-images.mjs")).toEqual(["custom.regex"]);
+    expect(matchingManagers("package.json")).toEqual([]);
+    expect(matchingManagers("pnpm-lock.yaml")).toEqual([]);
+    expect(matchingManagers(".github/workflows/ci.yml")).toEqual([]);
+  });
+
+  it("recognizes both fully pinned PostgreSQL harness images and rejects partial tuples", () => {
+    const currentImageSource = readFileSync(
+      new URL("../scripts/postgresql-images.mjs", import.meta.url),
+      "utf8",
+    );
+    const alternateImageSource = [
+      'export const POSTGRES_IMAGE = "postgres:18.5-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";',
+      'export const NODE_IMAGE = "node:22.21.0-bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";',
+    ].join("\n");
+
+    expect(renovate.customManagers).toHaveLength(1);
+    expect(renovate.customManagers?.[0]?.customType).toBe("regex");
+    expect(renovate.customManagers?.[0]?.datasourceTemplate).toBe("docker");
+    expectCompletePostgresqlImageMatches(postgresqlImageMatches(currentImageSource));
+    expectCompletePostgresqlImageMatches(postgresqlImageMatches(alternateImageSource));
+    expect(
+      postgresqlImageMatches('export const POSTGRES_IMAGE = "postgres:18.4-bookworm";'),
+    ).toEqual([]);
+    expect(
+      postgresqlImageMatches(
+        'export const POSTGRES_IMAGE = "postgres@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296";',
+      ),
+    ).toEqual([]);
+    expect(
+      postgresqlImageMatches(
+        'export const POSTGRES_IMAGE = "postgres:18.4-bookworm@sha256:not-a-digest";',
+      ),
+    ).toEqual([]);
+    expect(
+      postgresqlImageMatches(
+        'export const OTHER_IMAGE = "postgres:18.4-bookworm@sha256:1961f96e6029a02c3812d7cb329a3b03a3ac2bb067058dec17b0f5596aca9296";',
+      ),
+    ).toEqual([]);
+  });
+
+  it("preserves pins, separates majors, and requires human review for Renovate updates", () => {
+    expect(renovate.automerge).toBe(false);
+    expect(configurationKeys(renovate).filter((key) => key === "automerge")).toEqual([
+      "automerge",
+    ]);
+    expect(configurationKeys(renovate)).not.toContain("auto-merge");
+    expect(renovate.minimumReleaseAge).toBe("7 days");
+    expect(renovate.labels).toEqual(["dependencies"]);
+    expect(renovate.semanticCommits).toBe("enabled");
+    expect(renovate.semanticCommitType).toBe("build");
+    expect(renovate.semanticCommitScope).toBe("deps");
+    expect(renovate.separateMajorMinor).toBe(true);
+    expect(renovate.pinDigests).toBe(true);
+  });
+
+  it("keeps cache, restore, and save action updates in one dependency family", () => {
+    expect(renovate.packageRules).toEqual([
+      {
+        groupName: "actions/cache",
+        matchManagers: ["github-actions"],
+        matchPackageNames: ["actions/cache", "actions/cache/restore", "actions/cache/save"],
+      },
+    ]);
   });
 });
