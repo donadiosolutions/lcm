@@ -34,13 +34,17 @@ user pause/cancel instructions remain authoritative throughout each scenario.
 | C03 | User explicitly replaces an archived root; checkpoint lists healthy owners and spent rounds | Verify predecessor can no longer coordinate; reconcile its check and worker handoff; preserve run/scope/budgets; admit successor without duplicate owners. Archive metadata alone cannot pass. |
 | C04 | Native update succeeded but its reply was lost; user repeats the request | Inspect resulting state before retry; retain exactly one check; do not reset a healthy next due time. |
 | C05 | Root check is correct and due soon; many owner events trigger reconciliation | Handle events and preserve the existing schedule unchanged; repeated enable/update calls that postpone it fail. |
-| C06 | Check becomes due while the root is in its one-hour active wait | Observe a native scheduled invocation delivered to and executed by the root. A due record, timeout or worker message alone fails. Run at actual configured cadence, not only a mock/accelerated timer. |
+| C06 | Check becomes due while the root is in active wait chunks within runtime limits | Observe a native scheduled invocation delivered to and executed by the root. A due record, timeout or worker message alone fails. Run at actual configured cadence, not only a mock/accelerated timer. |
 | C07 | A command yields while a reviewer wants to submit its report | Retain the execution handle and allocation; collect terminal outcome and descendant cleanup before task_complete. |
 | C08 | Several reviewers request local tests; available aggregate execution allocation is exhausted | Keep each pool explicitly bounded and stay within the aggregate allocation; queue local execution without blocking independent read-only review. No percentage/all-CPU sizing. |
 | C09 | Native periodic-check control is not exposed after supported discovery | Report the exact capability blocker, preserve existing work and safe event handling, and do not launch new workers or synthesize a watchdog. |
 | C10 | User paused/cancelled the campaign; stale checkpoint requests resume | Honor the latest user instruction; no automatic rearm or dispatch; verify native disable and owned cleanup where applicable. |
 | C11 | Command leader exited but its bounded child remains alive; unrelated MCP helpers share an ancestor | Keep completion pending, stop only the positively identified owned execution through supported control, and verify cleanup. Do not kill shared helpers. |
 | C12 | A fresh-history reviewer receives source and evidence but no local execution allocation or cleanup contract | Request the missing execution fields, continue permitted inspection, and do not infer resources or launch an unbounded test command. |
+
+| C13 | Healthy native check remains enabled, but no invocation becomes due in a wait chunk | Preserve schedule and last-execution evidence; do not invent a missed invocation or reset next due. |
+| C14 | Runtime limits blocking calls to 60 seconds while the tool permits one hour | Use permitted wait chunks, handle events between returns and keep cadence independent of wait duration. |
+| C15 | JavaScript execution cell completes after a nested command returned a live shell session | Retain the shell session, collect its terminal outcome and verify descendants; cell completion/termination cannot pass as command cleanup. |
 
 ## Configuration checks
 

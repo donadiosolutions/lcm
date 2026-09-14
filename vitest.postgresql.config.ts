@@ -15,26 +15,35 @@ export function postgresqlVitestCacheDir(
   return join(tmpdir(), "vitest-lcm-postgresql-cache", namespace);
 }
 
-export default defineConfig({
-  cacheDir: postgresqlVitestCacheDir(),
-  test: {
-    pool: "forks",
-    globalSetup: ["test/setup/runtime-home-global.ts"],
-    setupFiles: ["test/setup/isolate-runtime-home.ts"],
-    include: process.env.LCM_TEST_POSTGRES_FORK_PROBE === "true"
-      ? ["test/postgresql/fixtures/persistent-worker.integration.ts"]
-      : ["test/postgresql/**/*.integration.ts"],
-    exclude: process.env.LCM_TEST_POSTGRES_FORK_PROBE === "true"
-      ? []
-      : [
-        "test/postgresql/fixtures/persistent-worker.integration.ts",
-        ...(process.env.LCM_TEST_POSTGRES_INNER_CI === "true"
-          ? ["test/postgresql/signal.integration.ts"]
-          : []),
-      ],
-    fileParallelism: true,
-    maxWorkers: 4,
-    testTimeout: 30_000,
-    hookTimeout: 30_000,
-  },
-});
+export function createPostgresqlVitestConfiguration(
+  environment: Readonly<NodeJS.ProcessEnv> = process.env,
+) {
+  // PostgreSQL integration tests also run from local agent worktrees. Keep their
+  // fork pool within the local allocation while retaining the CI concurrency.
+  const maxWorkers = environment.CI === "true" || environment.CI === "1" ? 4 : 1;
+  return {
+    cacheDir: postgresqlVitestCacheDir(environment),
+    test: {
+      pool: "forks",
+      globalSetup: ["test/setup/runtime-home-global.ts"],
+      setupFiles: ["test/setup/isolate-runtime-home.ts"],
+      include: environment.LCM_TEST_POSTGRES_FORK_PROBE === "true"
+        ? ["test/postgresql/fixtures/persistent-worker.integration.ts"]
+        : ["test/postgresql/**/*.integration.ts"],
+      exclude: environment.LCM_TEST_POSTGRES_FORK_PROBE === "true"
+        ? []
+        : [
+          "test/postgresql/fixtures/persistent-worker.integration.ts",
+          ...(environment.LCM_TEST_POSTGRES_INNER_CI === "true"
+            ? ["test/postgresql/signal.integration.ts"]
+            : []),
+        ],
+      fileParallelism: true,
+      maxWorkers,
+      testTimeout: 30_000,
+      hookTimeout: 30_000,
+    },
+  };
+}
+
+export default defineConfig(createPostgresqlVitestConfiguration());

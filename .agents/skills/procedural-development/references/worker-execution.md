@@ -39,7 +39,8 @@ assigns a larger allocation within known host headroom. For focused tests use
 finite deadline and uses the runtime's existing execution envelope when available.
 A yielding command does not release its execution allocation.
 
-The local Vitest configuration caps both the root and ordinary parallel project;
+The local Vitest configuration caps the root, ordinary parallel project and
+separate PostgreSQL configuration;
 `CI=true` or `CI=1` preserves existing CI sizing. Do not set CI or override the cap
 in local agent work to evade an allocation. Existing serial projects and full CI
 coverage/admission remain unchanged. Verify effective limits when using an approved
@@ -78,6 +79,32 @@ Preserve logs and exit/cancellation evidence. Escalate unresolved containment to
 the parent promptly. Target only positively identified owned executions; never
 kill a shared app-server, MCP helper or unrelated worker merely because it shares
 an ancestor, process name or cgroup. Do not reclaim another task's resources.
+
+### Codex execution handles
+
+Bind to the live schema; these handles represent different lifecycles:
+
+- `functions.exec` can yield an execution-cell `cell_id`. Only after it reports
+  `Script running with cell ID ...`, use `functions.wait` with that ID until the
+  cell completes. Await every nested tool call before the JavaScript cell ends.
+- `exec_command` can return a shell `session_id`. Retain it and use `write_stdin`
+  with that session ID to collect the command's terminal exit, even if the outer
+  JavaScript cell has already completed. Never pass a cell ID as a shell session ID.
+- `yield_time_ms` limits time spent waiting for output; it is not a command
+  deadline. Establish a finite execution deadline separately using an available
+  task-owned harness or approved bounded command wrapper, and verify its cleanup.
+- `functions.wait(terminate: true)` stops its execution cell. Its schema does not
+  promise termination of a shell session or that session's descendants.
+  `collaboration.interrupt_agent` similarly interrupts an agent turn without a
+  documented process-cleanup guarantee. Neither is descendant-exit evidence.
+
+Select cancellation from the command's actual transport. `write_stdin` sends bytes;
+it is not a general process-tree kill API. A terminal interrupt requires a suitable
+PTY and does not prove descendant cleanup. If the exposed tools cannot establish
+owned-process containment and cleanup for a proposed command, keep that execution
+pending, report the missing boundary, and continue safe inspection. Do not invent
+`task_complete`, process-group cancellation, or CPU/memory-limit tool arguments;
+a terminal assignment report uses the runtime's supported final-response path.
 
 ## Completion
 

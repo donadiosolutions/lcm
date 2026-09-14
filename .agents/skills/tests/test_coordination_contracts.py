@@ -48,8 +48,26 @@ class CoordinationContractTests(unittest.TestCase):
         self.assertIn("root-lifecycle.md", text)
         self.assertNotIn("Maintain one supported scheduled watchdog task", text)
         self.assertNotIn("This allows one scheduled run to be", text)
-        self.assertIn('collaboration.wait_agent({"timeout_ms":3600000})', text)
+        self.assertIn('collaboration.wait_agent({"timeout_ms":60000})', text)
+        self.assertIn("higher-priority runtime instructions", text)
+        self.assertIn("becomes due", text)
         self.assertIn("worker-execution.md#completion", text)
+
+    def test_runtime_binding_distinguishes_handles_and_missing_capabilities(self):
+        root = self.read("procedural-development/references/root-lifecycle.md")
+        worker = self.read("procedural-development/references/worker-execution.md")
+        for term in ("ALL_TOOLS", "collaboration.list_agents", "automation_update"):
+            self.assertIn(term, root)
+        for term in ("functions.wait", "cell_id", "write_stdin", "session_id",
+                     "yield_time_ms", "interrupt_agent"):
+            self.assertIn(term, worker)
+
+    def test_triage_handoff_preserves_run_not_predecessor_identity(self):
+        entry = self.read("triage-fix-all-bugs/SKILL.md")
+        accounting = self.read("triage-fix-all-bugs/references/coordination.md")
+        self.assertNotIn("same root, run ID", entry)
+        self.assertIn("current verified runtime root", entry)
+        self.assertIn("predecessor/successor", accounting)
 
     def test_root_record_requires_native_evidence(self):
         text = self.read("procedural-development/references/root-lifecycle.md")
@@ -94,7 +112,7 @@ class CoordinationContractTests(unittest.TestCase):
 
     def test_behavioral_scenarios_cover_reported_failures_and_recovery(self):
         text = self.read("tests/coordination-scenarios.md")
-        for number in range(1, 13):
+        for number in range(1, 16):
             self.assertIn(f"| C{number:02d} |", text)
         self.assertIn("not executed", text)
         self.assertIn("tool calls", text)

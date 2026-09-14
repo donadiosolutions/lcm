@@ -29,13 +29,18 @@ At dispatch establish a supported event path and verify its first delivery. Wher
 available, `send_message` delivers to a running recipient without starting a turn;
 `followup_task` starts an existing worker's next task. When the root has no ready
 action and is waiting for Bug owners or task owners during triage or implementation,
-call `collaboration.wait_agent({"timeout_ms":3600000})` directly to stay running and
-reachable. The default timeout is 3600000 milliseconds (one hour), the tool's
-maximum. Keep this wait independent of the 30-minute scheduled watchdog; do not
-shorten it to the next watchdog deadline. Verify from the runtime binding and an
-observed scheduled invocation that delivery works during this wait; a due timestamp
-or wait timeout does not prove it. A missed invocation requires native-path diagnosis,
-not a claim that the longer wait repaired it.
+call `collaboration.wait_agent({"timeout_ms":60000})` directly when the live schema
+supports it. Choose each wait within both the schema limit and higher-priority runtime instructions;
+a schema maximum is not a required or default duration. This binding defaults to
+30 seconds and allows at most one hour, but a runtime limiting blocking calls to
+60 seconds takes precedence. Keep active wait chunks independent of the 30-minute
+scheduled watchdog and preserve a healthy check's next due time.
+When a scheduled invocation becomes due during active waiting, verify its delivery
+from an observed native invocation. If none becomes due, absence of an invocation
+is not a failure; retain the existing registration and last-execution evidence.
+A due timestamp or wait timeout alone proves neither delivery nor a missed
+invocation. Diagnose a missed invocation only against the native delivery evidence
+and documented scheduling semantics, not by resetting its due time.
 After each return, handle owner messages and user input, reconcile actionable
 events, and call it again while owner work remains pending and no ready action
 exists. A timeout alone does not justify ending the root turn. Call collaboration
@@ -50,7 +55,7 @@ The scheduler consumes caller-defined acceptance, never invents it. Refill slots
 on events rather than waiting for the watchdog; do not busy-poll healthy workers.
 
 Maintain the admitted root-native periodic check every `WATCHDOG_MINUTES` (30 minutes
-by default) alongside the one-hour active wait. Reconcile it on recovery using
+by default) alongside active wait chunks. Reconcile it on recovery using
 [root lifecycle](root-lifecycle.md), retaining an already-correct check without
 resetting its due time. Shorter runtime wait returns are neither watchdog passes
 nor reasons for user reports. At each observed native watchdog invocation:

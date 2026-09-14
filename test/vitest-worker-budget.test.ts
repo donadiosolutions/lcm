@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createVitestConfiguration } from "../vitest.config";
+import { createPostgresqlVitestConfiguration } from "../vitest.postgresql.config";
 
 describe("local Vitest worker budget", () => {
   it.each([undefined, "", "false", "0", "TRUE", " true "])(
@@ -46,5 +47,21 @@ describe("local Vitest worker budget", () => {
       functions: 100,
       perFile: true,
     });
+  });
+
+  it.each([undefined, "", "false", "0", "TRUE", " true "])(
+    "bounds PostgreSQL integration runs when CI is %s",
+    (CI) => {
+      const environment = CI === undefined ? {} : { CI };
+      const configuration = createPostgresqlVitestConfiguration(environment);
+
+      expect(configuration.test.maxWorkers).toBe(1);
+    },
+  );
+
+  it.each(["true", "1"])("preserves PostgreSQL CI sizing when CI is %s", (CI) => {
+    const configuration = createPostgresqlVitestConfiguration({ CI });
+
+    expect(configuration.test.maxWorkers).toBe(4);
   });
 });

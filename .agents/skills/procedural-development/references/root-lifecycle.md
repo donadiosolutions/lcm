@@ -19,6 +19,28 @@ never fabricate a missing check ID or next-run timestamp. A documented operation
 result that returns current state is usable evidence; a mere acknowledgement of
 an update request is not a state readback.
 
+### Codex capability boundaries
+
+Inspect the tools actually exposed in this session, including deferred tool metadata
+through `ALL_TOOLS` when provided. Use a discovery tool only if its schema is
+available. Product instructions mentioning a feature do not establish a callable
+binding; do not invent a recipient when discovery returns none.
+
+| Exposed surface | Establishes | Does not establish |
+| --- | --- | --- |
+| `collaboration.list_agents`, `send_message`, `followup_task`, `wait_agent` | Current thread-tree agent state and communication under their documented semantics | Native periodic-check registration or cross-root ownership transfer |
+| `clock.sleep`, `clock__curr_time` | Waiting and time observation | A scheduled invocation attached to the root |
+| `functions.exec` and command tools | Tool orchestration and command execution | Scheduler liveness or an enabled root check |
+| `automation_update`, if discovered | Only the automation scope, targeting and state its schema actually documents | Equivalence of an app-wide automation to a root-native periodic check |
+
+When discovery exposes only agent messaging, waits and command execution, native
+check admission is unavailable. Follow **Unavailable control** below; this contract
+does not make that runtime capable of unattended campaigns. Record a session-local
+capability snapshot, not a permanent claim about every Codex installation.
+An absent task-inspection or ownership-transfer API likewise leaves cross-root
+handoff unverified. `list_agents` is scoped to the current root tree; an absent
+predecessor there does not prove that another root has stopped.
+
 ## Admission
 
 For an active campaign with work to dispatch or await, before the first worker

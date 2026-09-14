@@ -54,7 +54,9 @@ application-internal locks.
 ## Remediation handoff
 
 After the complete triage barrier, update final triage counts and invoke
-`procedural-development` with the **same root, run ID and recovery record**:
+`procedural-development` with the **current verified runtime root**, preserving the
+**same logical run ID and recovery record**. An explicitly authorized successor
+uses the shared verified handoff; it retains S0, scope, spent rounds and budgets:
 
 | Input | Supply |
 | --- | --- |
