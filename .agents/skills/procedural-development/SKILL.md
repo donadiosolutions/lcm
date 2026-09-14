@@ -87,10 +87,10 @@ tools only when supported and without withholding necessary review evidence.
    and read the execution contract.
 2. Record the run contract below in workflow-local scratch. These are evidence
    fields, not a new serialized API or executable framework.
-3. Preflight routes, dispatch mechanisms and declared resources. Verify native
-   root periodic-check admission before launching workers or waiting unattended;
+3. Preflight routes, dispatch mechanisms and declared resources. Verify root
+   heartbeat admission before launching workers or waiting unattended;
    only then execute scheduling and delivery against the caller's readiness decisions.
-   Unavailable native control is a coordination blocker, not permission to substitute.
+   Unavailable heartbeat control is a coordination blocker, not permission to substitute.
 4. Reconcile recovery evidence and audit the requested endpoint before completion.
 
 | Contract | Record |
@@ -99,7 +99,7 @@ tools only when supported and without withholding necessary review evidence.
 | Scope | Fixed IDs, sources, acceptance, existing ownership and completed evidence |
 | Readiness | Dependencies, acceptance evidence per edge, decisions and dispositions |
 | Roles | Exact model IDs, effective reasoning, requested/confirmed tiers, owner limit |
-| Coordination | Native root-check binding, confirmed target/enabled/cadence, observation/result reference, next due and last execution when exposed |
+| Coordination | Heartbeat automation binding, confirmed target/status/cadence, observation/result reference, next due and last execution when exposed |
 | Execution | Host/run allocation, per-command concurrency/deadline, worker-owned handles, exit and descendant-cleanup evidence |
 | Delivery | Checks, commit/PR/merge rules, docs/release metadata, follow-up classification, source-resolution rules |
 | Tracker | Identity and allowed checkpoint channel: comment, managed body block, or none |

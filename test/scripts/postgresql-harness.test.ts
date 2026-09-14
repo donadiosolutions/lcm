@@ -51,6 +51,7 @@ import {
   removeLabeled,
   removeOwnedResource,
   resolveSignalProbeReadinessTimeout,
+  runTests,
   resolveConfiguredTemplateArchive,
   runProcess,
   runSanitizedProcess,
@@ -60,7 +61,10 @@ import {
   writeHarnessDiagnostic,
 } from "../../scripts/postgresql-harness.mjs";
 import { createTestTempDirectory } from "../../scripts/test-temp-root.mjs";
-import { postgresqlVitestCacheDir } from "../../vitest.postgresql.config.js";
+import {
+  createPostgresqlVitestConfiguration,
+  postgresqlVitestCacheDir,
+} from "../../vitest.postgresql.config.js";
 
 const testBootId = "12345678-1234-1234-1234-123456789abc";
 const testOwnerScope = `linux:${"a".repeat(64)}:${testBootId}:pid:[4026531836]`;
@@ -1048,6 +1052,42 @@ describe("PostgreSQL harness utilities", () => {
     expect(second).toMatch(new RegExp(`${secondRunId}$`, "u"));
     expect(fallback).toMatch(/vitest-lcm-postgresql-cache\/process-73$/u);
     expect(fallback).not.toContain("shared");
+  });
+
+  it("writes CI into the Docker conformance runner environment", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-runner-env-"));
+    const setupDocker = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
+    const testProcess = vi.fn().mockResolvedValue({
+      stdout: "",
+      stderr: "",
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    });
+    try {
+      await runTests({
+        runId: "a".repeat(32),
+        directory,
+        parent: directory,
+        names: { runner: "lcm-pg-runner-test", network: "lcm-pg-network-test" },
+        owner: { pid: 1, birth: "1", scope: "test-scope" },
+        environment: { LCM_TEST_POSTGRES_RUN_ID: "a".repeat(32) },
+      }, true, setupDocker, testProcess);
+
+      const runnerEnvironment = Object.fromEntries(readFileSync(join(directory, "runner.env"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => line.split("=", 2)));
+      expect(runnerEnvironment).toMatchObject({
+        CI: "true",
+        LCM_TEST_POSTGRES_INNER_CI: "true",
+      });
+      expect(createPostgresqlVitestConfiguration(runnerEnvironment).test.maxWorkers).toBe(4);
+      expect(setupDocker).toHaveBeenCalledWith(expect.arrayContaining([
+        "create", "--env-file", join(directory, "runner.env"),
+      ]));
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("redacts credentials, URLs, private paths, and PEM material", () => {

@@ -62,6 +62,18 @@ class CoordinationContractTests(unittest.TestCase):
                      "yield_time_ms", "interrupt_agent"):
             self.assertIn(term, worker)
 
+    def test_codex_heartbeat_uses_actual_app_binding(self):
+        root = self.read("procedural-development/references/root-lifecycle.md")
+        for term in ("tools.mcp__codex_app__automation_update", 'kind="heartbeat"',
+                     'destination="thread"', 'mode="create"', 'mode="update"',
+                     'mode="view"', 'status="PAUSED"', 'status="ACTIVE"',
+                     "automationId", "target_thread_id", "snapshot.rrule", "snapshot.status",
+                     "targetThreadId"):
+            self.assertIn(term, root)
+        self.assertIn("readback verifies registration", root.lower())
+        self.assertIn("does not expose", root)
+        self.assertNotIn("App-wide automations and worker messaging", root)
+
     def test_triage_handoff_preserves_run_not_predecessor_identity(self):
         entry = self.read("triage-fix-all-bugs/SKILL.md")
         accounting = self.read("triage-fix-all-bugs/references/coordination.md")
@@ -72,7 +84,7 @@ class CoordinationContractTests(unittest.TestCase):
     def test_root_record_requires_native_evidence(self):
         text = self.read("procedural-development/references/root-lifecycle.md")
         fields = self.table_fields(text, "## Evidence record")
-        required = {"Run", "Root", "Binding", "Check", "Enabled", "Cadence",
+        required = {"Run", "Root", "Binding", "Automation", "Status", "Cadence",
                     "Observed", "Next due", "Last execution"}
         self.assertTrue(required.issubset(fields), required - fields)
         for heading in ("## Admission", "## Unavailable control",

@@ -1,8 +1,8 @@
 # Coordination, recovery and completion
 
 Apply [the run contract](../SKILL.md) and the required [root lifecycle](root-lifecycle.md).
-Preserve logical run identity and budgets; verify the current coordinator and native
-periodic check rather than treating recovery metadata as live state.
+Preserve logical run identity and budgets; verify the current coordinator and heartbeat
+automation rather than treating recovery metadata as live state.
 
 ## Directives
 
@@ -24,7 +24,7 @@ major blockers, repeated failures or milestones, not routine worker chatter.
 
 ## Scheduling and events
 
-Before dispatch or unattended waiting, complete [native check admission](root-lifecycle.md#admission).
+Before dispatch or unattended waiting, complete [heartbeat admission](root-lifecycle.md#admission).
 At dispatch establish a supported event path and verify its first delivery. Where
 available, `send_message` delivers to a running recipient without starting a turn;
 `followup_task` starts an existing worker's next task. When the root has no ready
@@ -34,18 +34,18 @@ supports it. Choose each wait within both the schema limit and higher-priority r
 a schema maximum is not a required or default duration. This binding defaults to
 30 seconds and allows at most one hour, but a runtime limiting blocking calls to
 60 seconds takes precedence. Keep active wait chunks independent of the 30-minute
-scheduled watchdog and preserve a healthy check's next due time.
+scheduled watchdog and preserve a healthy heartbeat's schedule.
 When a scheduled invocation becomes due during active waiting, verify its delivery
-from an observed native invocation. If none becomes due, absence of an invocation
+from an observed heartbeat follow-up. If none becomes due, absence of an invocation
 is not a failure; retain the existing registration and last-execution evidence.
 A due timestamp or wait timeout alone proves neither delivery nor a missed
-invocation. Diagnose a missed invocation only against the native delivery evidence
+invocation. Diagnose a missed invocation only against the heartbeat delivery evidence
 and documented scheduling semantics, not by resetting its due time.
 After each return, handle owner messages and user input, reconcile actionable
 events, and call it again while owner work remains pending and no ready action
 exists. A timeout alone does not justify ending the root turn. Call collaboration
 tools using their live-schema recipients and arguments, not inside an execution
-wrapper. Ending the root turn is not a wake-up mechanism.
+wrapper. Ending the root turn alone does not register a future follow-up.
 
 Wake promptly on barriers, readiness changes, publication/merge requests or results,
 parking, blockers, escalation, failure, deconfliction and environment failure.
@@ -54,11 +54,11 @@ recovery; record accepted evidence, source revision and rationale before admissi
 The scheduler consumes caller-defined acceptance, never invents it. Refill slots
 on events rather than waiting for the watchdog; do not busy-poll healthy workers.
 
-Maintain the admitted root-native periodic check every `WATCHDOG_MINUTES` (30 minutes
+Maintain the admitted root heartbeat automation every `WATCHDOG_MINUTES` (30 minutes
 by default) alongside active wait chunks. Reconcile it on recovery using
-[root lifecycle](root-lifecycle.md), retaining an already-correct check without
+[root lifecycle](root-lifecycle.md), retaining an already-correct heartbeat without
 resetting its due time. Shorter runtime wait returns are neither watchdog passes
-nor reasons for user reports. At each observed native watchdog invocation:
+nor reasons for user reports. At each observed heartbeat invocation:
 
 1. Run caller-supplied environment checks and reconcile owners, results, failures,
    stalls and parked blockers.
@@ -141,5 +141,5 @@ Even empty inventory requires all applicable predicates:
 
 Report outcomes, delivered/blocked counts, remaining work, escalations, follow-ups,
 target SHA and supplied environment results. Apply only caller-authorized tracker
-closure. Complete [native watchdog shutdown](root-lifecycle.md#terminal-cleanup)
-after final audit and permitted terminal accounting; verify the disabled state.
+closure. Complete [heartbeat shutdown](root-lifecycle.md#terminal-cleanup)
+after final audit and permitted terminal accounting; verify status PAUSED.
