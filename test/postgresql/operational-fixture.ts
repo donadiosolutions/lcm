@@ -104,7 +104,7 @@ function publicationDriver(homeDir: string): BackendPublicationDriver {
   };
 }
 
-async function publishPostgreSqlSelection(
+export async function publishPostgreSqlSelection(
   homeDir: string,
   machine: RegisteredMachine,
   project: RemoteProject,

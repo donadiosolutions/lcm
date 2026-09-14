@@ -4,10 +4,10 @@ import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { Client, Query } from 'pg';
-import { createPortableRecordStream, PORTABLE_RECORD_DOMAIN_ORDER, type PortableRecordStream } from '../../src/storage/portable-record-stream.js';
-import { runPortableTransfer } from '../../src/storage/portable-transfer.js';
-import { createPostgreSqlPortableSource } from '../../src/storage/postgresql/portable-source.js';
-import { createPostgreSqlPortableDestination } from '../../src/storage/postgresql/portable-destination.js';
+import { createPortableRecordStream, PORTABLE_RECORD_DOMAIN_ORDER, type PortableRecordStream } from '../../src/storage/portable.js';
+import { runPortableTransfer } from '../../src/storage/portable.js';
+import { createPostgreSqlPortableSource } from '../../src/storage/portable.js';
+import { createPostgreSqlPortableDestination } from '../../src/storage/portable.js';
 import { assertHarnessReady, settings, withPostgreSqlTestDatabase, type PostgreSqlTestDatabase } from './harness.js';
 import { seedPortablePostgreSql, grantPortablePostgreSql, PORTABLE_POSTGRESQL_FIXTURE } from './portable-fixture.js';
 
@@ -20,6 +20,11 @@ import { canonicalSha256 } from '../../src/storage/portable-record.js';
 import { exportKnowledge, type ExportDocument } from '../../src/portable-knowledge.js';
 import { hashProjectPath } from '../../src/project-map.js';
 import { withSelectedPostgreSqlProject, restoreRuntimeGrants } from './operational-fixture.js';
+
+import { assertPostgreSqlNativeCounts, assertRuntimeMemory, capture, expectEquivalent, pgSource } from './portable-corpus.js';
+
+import { assertInterruptedPortableTransfer } from "./portable-resume.js";
+import { emitCanonicalEvidence } from "./portable-evidence.js";
 
 beforeAll(assertHarnessReady);
 const context={domain:'factory',operation:'portableIntegration'} as const;
@@ -43,20 +48,49 @@ async function applyEveryDomain(source:PortableRecordStream,destination:Awaited<
 
 describe('PostgreSQL canonical destination native persistence',()=>{
   it('copies independently seeded22 domains and verifies actual SQL content',async()=>{
-    await withPostgreSqlTestDatabase('portable-source',async sourceDb=>withPostgreSqlTestDatabase('portable-target',async targetDb=>{
-      const {source,destination}=await setup(sourceDb,targetDb);
-      const manifest=source.describe();
-      expect(manifest.domains.every(domain=>domain.recordCount>0)).toBe(true);
-      const result=await runPortableTransfer({source,destination,maxRecords:2});
-      expect(result.contentSha256).toBe(manifest.contentSha256);
-      const rows=await targetDb.migrator.query({text:'SELECT state FROM lcm.transfer_runs'},context);
-      expect(rows.rows).toEqual([{state:'completed'}]);
-      const native=await targetDb.migrator.query({text:"SELECT memory_id::text,metadata->>'source' AS source FROM lcm.promoted_memories"},context);
-      expect(native.rows).toHaveLength(3);
-      expect(native.rows[0]!.memory_id).toMatch(/^[0-9a-f-]{14}4/);
-      const statuses=await targetDb.migrator.query({text:'SELECT status FROM lcm.passive_event_inbox ORDER BY status'},context);
-      expect(statuses.rows.map(row=>row.status)).toEqual(['applied','pending','quarantined']);
+    const manifest=await withPostgreSqlTestDatabase('portable-source',async sourceDb=>withPostgreSqlTestDatabase('portable-target',async targetDb=>{
+      const {source,input,destination}=await setup(sourceDb,targetDb);
+      let readback:PortableRecordStream|undefined;
+      try {
+        const manifest=source.describe();
+        const corpus=await capture(source);
+        expect(manifest.domains.every(domain=>domain.recordCount>0)).toBe(true);
+        const result=await assertInterruptedPortableTransfer({source,destination,
+          reopenDestination:()=>createPostgreSqlPortableDestination(input),
+          openWrongDestination:()=>createPostgreSqlPortableDestination({...input,generationId:'wrong-direct-generation'}),
+          openDifferentSource:async()=>createPortableRecordStream(await createPostgreSqlPortableSource({
+            settings:settings(sourceDb.runtimeUrl),expectedOwner:'lcm_test_migrator',expectedIdentity:PORTABLE_POSTGRESQL_FIXTURE.expectedIdentity,
+          })),
+          async readNativeProgress(){
+            const result=await targetDb.migrator.query<{receipts:number;transferredMachines:number;nativeMachines:number}>({
+              text:`SELECT (SELECT count(*)::int FROM lcm.transfer_batches WHERE run_id=$1) AS receipts,
+                (SELECT count(*)::int FROM lcm.transfer_identities WHERE run_id=$1 AND domain='machines') AS "transferredMachines",
+                (SELECT count(*)::int FROM lcm.machines) AS "nativeMachines"`,values:[input.runId],
+            },context);
+            return result.rows[0];
+          },
+        });
+        expect(result.contentSha256).toBe(manifest.contentSha256);
+        const rows=await targetDb.migrator.query({text:'SELECT state FROM lcm.transfer_runs'},context);
+        expect(rows.rows).toEqual([{state:'completed'}]);
+        const native=await targetDb.migrator.query({text:"SELECT memory_id::text,metadata->>'source' AS source FROM lcm.promoted_memories"},context);
+        expect(native.rows).toHaveLength(3);
+        expect(native.rows[0]!.memory_id).toMatch(/^[0-9a-f-]{14}4/);
+        const statuses=await targetDb.migrator.query({text:'SELECT status FROM lcm.passive_event_inbox ORDER BY status'},context);
+        expect(statuses.rows.map(row=>row.status)).toEqual(['applied','pending','quarantined']);
+        readback=await pgSource(targetDb,PORTABLE_POSTGRESQL_FIXTURE.expectedIdentity);
+        expectEquivalent(readback.describe(),manifest);
+        expect(await capture(readback)).toEqual(corpus);
+        await assertPostgreSqlNativeCounts(targetDb,PORTABLE_POSTGRESQL_FIXTURE.projectId,corpus);
+        await assertRuntimeMemory(new PostgreSqlPromotedMemoryRepository(targetDb.runtime,PORTABLE_POSTGRESQL_FIXTURE.projectId),corpus,PORTABLE_POSTGRESQL_FIXTURE.projectId);
+        return manifest;
+      } finally {
+        const closed=await Promise.allSettled([readback?.close(),destination.close(),source.close()]);
+        const failure=closed.find(result=>result.status==='rejected');
+        if(failure?.status==='rejected') throw failure.reason;
+      }
     }));
+    emitCanonicalEvidence("postgresql->postgresql", manifest);
   },120000);
 
   it('retains durable exact receipts across destination reopen and rejects altered replay',async()=>{

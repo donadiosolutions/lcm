@@ -30,6 +30,7 @@ import {
   cleanupHarnessResources,
   completeSignalExit,
   createHarnessAllocationMarkerParser,
+  createCiRunnerContainerArgs,
   createHarnessCleanupOperations,
   createOwnerIdentity,
   createProcessLifecycle,
@@ -829,6 +830,44 @@ describe("PostgreSQL harness utilities", () => {
     expect((failure as AggregateError).errors).toHaveLength(2);
     expect(String(failure)).not.toContain(secret);
     expect((failure as AggregateError).errors.map(String).join("\n")).not.toContain(secret);
+  });
+
+  it("reaps CI runner orphans without changing admitted mounts, networking or cleanup", async () => {
+    const runId = "e".repeat(32);
+    const names = createRunNames(runId);
+    const directory = "/private/owned-harness";
+    const owner = { pid: 42, birth: `linux:${testBootId}:123`, scope: testOwnerScope };
+    const args = createCiRunnerContainerArgs({ names, runId, directory, owner }, `${directory}/runner.env`);
+    const optionValues = (option: string) => args.flatMap((value: string, index: number) => value === option ? [args[index + 1]] : []);
+
+    expect(args.slice(0, 3)).toEqual(["create", "--name", names.runner]);
+    expect(args.filter((value: string) => value === "--init")).toHaveLength(1);
+    expect(optionValues("--network")).toEqual([names.network]);
+    expect(optionValues("--env-file")).toEqual([`${directory}/runner.env`]);
+    expect(optionValues("--volume")).toEqual([`${process.cwd()}:/workspace:ro`, `${directory}:${directory}:ro`]);
+    expect(optionValues("--workdir")).toEqual(["/workspace"]);
+    expect(optionValues("--label")).toEqual(Object.entries({
+      [RUN_LABEL]: runId, [OWNER_SCHEMA_LABEL]: OWNER_SCHEMA_VERSION,
+      [OWNER_PID_LABEL]: "42", [OWNER_BIRTH_LABEL]: owner.birth,
+      [OWNER_SCOPE_LABEL]: owner.scope, [RESOURCE_KIND_LABEL]: "runner",
+    }).map(([key, value]) => `${key}=${value}`));
+    expect(args.slice(args.indexOf(NODE_IMAGE))).toEqual([
+      NODE_IMAGE, "node", "/workspace/node_modules/vitest/vitest.mjs", "run",
+      "--configLoader", "runner", "--config", "/workspace/vitest.postgresql.config.ts",
+    ]);
+    expect(args).not.toContain("--privileged");
+    expect(args).not.toContain("--pid");
+    expect(MAX_CAPTURED_OUTPUT_BYTES).toBe(65_536);
+
+    const removed: string[] = [];
+    await cleanupHarnessResources({ names, runId, directory, sentinelReady: false }, {
+      removeResource: (type: string, name: string) => { removed.push(`${type}:${name}`); },
+      verifySentinel: vi.fn(), removeDirectory: vi.fn(),
+    });
+    expect(removed).toEqual([
+      `container:${names.restore}`, `container:${names.runner}`, `container:${names.container}`,
+      `volume:${names.volume}`, `network:${names.network}`,
+    ]);
   });
 
   it("uses exact digest-pinned images and a namespaced label", () => {

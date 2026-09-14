@@ -49,6 +49,7 @@ interface CiWorkflow {
       needs: string;
       "runs-on": string;
       strategy: { matrix: { run: number[] } };
+      steps: WorkflowStep[];
     };
     "linux-systemd": IntegrationJob;
     "macos-launchd": IntegrationJob;
@@ -350,6 +351,34 @@ describe("CI workflow", () => {
     expect(workflow.jobs.ci.needs).toContain("macos-launchd");
     expect(workflow.jobs.codecov.needs).toBe("ci");
     expect(workflow.jobs["codecov-fork"].needs).toBe("ci");
+  });
+
+  it("requires independent complete parity artifacts from both PostgreSQL legs", () => {
+    const steps = workflow.jobs.postgresql.steps;
+    const harness = steps.find((step) => step.name === "Run isolated PostgreSQL 18 conformance harness")!;
+    const extraction = steps.find((step) => step.name === "Validate surface parity evidence")!;
+    const upload = steps.find((step) => step.name === "Upload surface parity evidence")!;
+    expect(harness.run).toContain("set -o pipefail");
+    expect(harness.run).toContain('pnpm run test:postgresql 2>&1 | tee "$RUNNER_TEMP/surface-parity-${{ matrix.run }}.log"');
+    expect(extraction.if).toBe("always()");
+    expect(extraction.run).toContain("node scripts/surface-parity-artifact.mjs");
+    expect(extraction.run).toContain('"$RUNNER_TEMP/surface-parity-${{ matrix.run }}.log"');
+    expect(extraction.env).toEqual({
+      LCM_PARITY_LEG: "${{ matrix.run }}",
+      LCM_PARITY_CANDIDATE_SHA: "${{ github.event.pull_request.head.sha || github.sha }}",
+    });
+    expect(upload).toMatchObject({
+      if: "always()",
+      uses: "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+      with: {
+        name: "surface-parity-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}",
+        path: "${{ runner.temp }}/surface-parity-${{ matrix.run }}/",
+        "if-no-files-found": "error",
+        "retention-days": 14,
+      },
+    });
+    expect(steps.indexOf(harness)).toBeLessThan(steps.indexOf(extraction));
+    expect(steps.indexOf(extraction)).toBeLessThan(steps.indexOf(upload));
   });
 
   it("publishes the single test report artifact after the core test run", () => {
