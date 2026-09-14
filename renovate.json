@@ -11,12 +11,13 @@
   "separateMajorMinor": true,
   "pinDigests": true,
   "github-actions": {
-    "managerFilePatterns": ["/^\\.github\\/actions\\/.+\\/action\\.ya?ml$/"]
+    "managerFilePatterns": ["/^\\.github\\/actions\\/.+\\/action\\.yml$/"]
   },
   "customManagers": [
     {
       "customType": "regex",
       "datasourceTemplate": "docker",
+      "versioningTemplate": "docker",
       "managerFilePatterns": ["/^scripts\\/postgresql-images\\.mjs$/"],
       "matchStrings": [
         "export const (?:POSTGRES_IMAGE|NODE_IMAGE) = \"(?<depName>[a-z0-9][a-z0-9._/-]*):(?<currentValue>[^@\"\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})\";"
@@ -28,6 +29,13 @@
       "matchManagers": ["github-actions"],
       "matchPackageNames": ["actions/cache", "actions/cache/restore", "actions/cache/save"],
       "groupName": "actions/cache"
+    },
+    {
+      "description": "Refresh image digests only; tag bumps remain coupled to harness runtime policy",
+      "matchDatasources": ["docker"],
+      "matchManagers": ["custom.regex"],
+      "matchUpdateTypes": ["major", "minor", "patch", "pin", "rollback", "bump", "replacement"],
+      "enabled": false
     }
   ]
 }

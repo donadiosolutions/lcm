@@ -33,9 +33,13 @@ type RenovateCustomManager = {
 };
 
 type RenovatePackageRule = {
+  description?: unknown;
+  enabled?: unknown;
   groupName?: unknown;
+  matchDatasources?: unknown;
   matchManagers?: unknown;
   matchPackageNames?: unknown;
+  matchUpdateTypes?: unknown;
 };
 
 type RenovateConfig = {
@@ -219,9 +223,7 @@ describe("dependency automation configuration", () => {
     expect(matchingManagers(".github/actions/setup-ci/action.yml")).toEqual([
       "github-actions",
     ]);
-    expect(matchingManagers(".github/actions/nested/setup/action.yaml")).toEqual([
-      "github-actions",
-    ]);
+    expect(matchingManagers(".github/actions/nested/setup/action.yaml")).toEqual([]);
     expect(matchingManagers("scripts/postgresql-images.mjs")).toEqual(["custom.regex"]);
     expect(matchingManagers("package.json")).toEqual([]);
     expect(matchingManagers("pnpm-lock.yaml")).toEqual([]);
@@ -278,12 +280,27 @@ describe("dependency automation configuration", () => {
     expect(renovate.pinDigests).toBe(true);
   });
 
-  it("keeps cache, restore, and save action updates in one dependency family", () => {
+  it("keeps cache actions coupled and limits harness images to digest updates", () => {
     expect(renovate.packageRules).toEqual([
       {
         groupName: "actions/cache",
         matchManagers: ["github-actions"],
         matchPackageNames: ["actions/cache", "actions/cache/restore", "actions/cache/save"],
+      },
+      {
+        description: "Refresh image digests only; tag bumps remain coupled to harness runtime policy",
+        enabled: false,
+        matchDatasources: ["docker"],
+        matchManagers: ["custom.regex"],
+        matchUpdateTypes: [
+          "major",
+          "minor",
+          "patch",
+          "pin",
+          "rollback",
+          "bump",
+          "replacement",
+        ],
       },
     ]);
   });
