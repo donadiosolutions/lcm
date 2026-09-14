@@ -12,8 +12,10 @@ never authorizes workers, issue mutations or environment replacement. Read
 repository/local instructions, including the primary worktree's local rules when
 working elsewhere, and required project memory. Repository delivery policy applies.
 
-Retain one root, run identity, recovery record and item budgets across callers and
-resumes. The root owns orchestration, user communication, pushes, PRs and merges;
+Retain one logical run, recovery record and item budgets across callers and
+resumes, with exactly one current root coordinator. A user-authorized replacement
+changes the runtime root, not campaign history; follow the shared recovery procedure.
+The root owns orchestration, user communication, pushes, PRs and merges;
 it must not implement, edit owner worktrees, adjudicate their findings or replace
 reviewers. Each owner retains its item's planning, adjudication and resolution;
 implementers use assigned workspaces; reviewers are read-only. If nested dispatch
@@ -55,9 +57,8 @@ from a working proxy, or infer unavailability from an unfamiliar model. Unresolv
 bindings or unavailable required model/reasoning routes need a concrete blocker
 and explicit substitution; never silently lower reasoning or omit a reviewer.
 
-Use self-contained briefs with the assigned role, scope, workspace, evidence and
-report contract. Follow the live schema's fork rules: where full-history forks
-inherit model/reasoning and forbid overrides, use `fork_turns="none"` for an
+Use the dispatch brief below for every role. Follow the live schema's fork rules:
+where full-history forks inherit model/reasoning and forbid overrides, use `fork_turns="none"` for an
 overridden route. Dispatch by the actual tool recipient, not an execution wrapper.
 A worker missing its brief requests it from its parent through `send_message`
 when supported and performs no guessed assignment.
@@ -72,6 +73,43 @@ not a tier failure or a clean review. Retry only the failed gate on its selected
 route, preserving evidence; require success before broad reuse. Reduce optional
 tools only when supported and without withholding necessary review evidence.
 
+### Dispatch brief
+
+Every owner, implementer, reviewer, synthesis reviewer, triager and adjudicator
+receives these fields, including on an empty-history fork. A parent must not assume
+that conversation-only or local instructions were inherited. Include applicable
+invariants inline; references supplement, rather than replace, critical constraints.
+
+| Field | Required content |
+| --- | --- |
+| Assignment | Role, scope/acceptance, parent contact and reporting responsibility |
+| Workspace | Exact candidate/plan revision, allowed writes and private fixture/artifact locations |
+| Evidence | Source material, prior evidence and required report/adjudication contract |
+| Execution | Explicit local-command/worker allocation, applicable host envelope, execution-handle ownership and status/cancel/cleanup controls; include isolation and no-host-stress invariants |
+| Completion evidence | Revision, launched-command outcomes, owned-descendant cleanup or authorized acknowledged handoff; a yielded command is still owned and cannot support task_complete |
+
+Apply [execution lifecycle](references/execution-lifecycle.md) to all roles and to
+the root's own commands. Forward the same requirements through nested dispatch.
+Do not give independent reviewers each other's reports before their own completion.
+Mark execution fields not applicable for inspection-only assignments; request an
+allocation before introducing resource-heavy execution. Missing critical brief
+fields require parent clarification before affected work.
+
+## Coordination admission
+
+Before campaign worker dispatch or an unattended wait, bind the actual exposed
+controls and satisfy [native root admission](references/runtime-controls.md).
+The periodic check belongs to the current root task, not a child or another task.
+Read back native state before claiming it enabled; recording intent is not admission.
+An already-correct check is reused without resetting its next execution.
+
+Apply this gate on recovery and after an explicit report of a disabled check.
+A missing native capability blocks new unattended work, not evidence preservation,
+safe cleanup or handling events from existing workers. Report the concrete blocker;
+do not manufacture a substitute. An empty/final audit with no dispatch or unattended
+wait does not require creating a new check; reconcile an existing check at closure.
+An explicit request to restore the root check still requires native reconciliation.
+
 ## Procedure
 
 1. Read [coordination](references/coordination.md) and
@@ -79,19 +117,22 @@ tools only when supported and without withholding necessary review evidence.
    instructions; the root reads both references in full.
 2. Record the run contract below in workflow-local scratch. These are evidence
    fields, not a new serialized API or executable framework.
-3. Preflight routes, dispatch mechanisms and declared resources; execute the shared
-   scheduling and delivery procedures against the caller's readiness decisions.
+3. Preflight routes, native coordination controls, dispatch mechanisms and declared
+   resources. Satisfy coordination admission and execution allocations before
+   dispatch; execute shared procedures against the caller's readiness decisions.
 4. Reconcile recovery evidence and audit the requested endpoint before completion.
 
 | Contract | Record |
 | --- | --- |
-| Identity | Repository, actual target branch/SHA, stable run/root identity, recovery location |
+| Identity | Repository, actual target branch/SHA, stable logical run ID, current root task ID and predecessor/handoff evidence, recovery location |
 | Scope | Fixed IDs, sources, acceptance, existing ownership and completed evidence |
 | Readiness | Dependencies, acceptance evidence per edge, decisions and dispositions |
 | Roles | Exact model IDs, effective reasoning, requested/confirmed tiers, owner limit |
 | Delivery | Checks, commit/PR/merge rules, docs/release metadata, follow-up classification, source-resolution rules |
 | Tracker | Identity and allowed checkpoint channel: comment, managed body block, or none |
 | Environment | Startup, target-advance, watchdog and final operations, executors and evidence |
+| Coordination | Live-schema control bindings, native root check identity/target/cadence, enabled evidence and separately observed deliveries |
+| Execution | Local-command allocations, aggregate host envelope, live handles and pending cleanup/handoffs |
 | Exclusive resources | Exact resource names, flock skill, protected operations and authorized executors |
 | Completion | Final predicates, allowed blocked accounting and tracker closure authority |
 

@@ -1,6 +1,8 @@
 # Inventory and triage
 
-Apply [the entrypoint](../SKILL.md) and shared coordination/recovery rules.
+Apply [the entrypoint](../SKILL.md), shared coordination/recovery rules and
+[execution lifecycle](../../procedural-development/references/execution-lifecycle.md)
+for every triager and duplicate adjudicator.
 
 ## Directives
 
@@ -67,8 +69,11 @@ A missing/broken reproduction environment never justifies closure. If authentic
 reproduction cannot safely be isolated, report that boundary instead of using
 shared state. Preserve delegated canonical targets without mutating them.
 
-At a terminal triage result, immediately notify the root with Bug, disposition,
-actual closure state, pending S0 duplicate adjudication and exceptional blockers.
+Before a terminal triage result, collect command outcomes and owned-descendant
+cleanup evidence under execution lifecycle. Do not close an issue on evidence from
+a still-running command. Notify the root immediately with Bug, disposition, actual
+closure state, execution evidence, pending S0 duplicate adjudication and blockers.
+An incomplete execution is a pending/failed assignment, not terminal triage evidence.
 This wakes coordination, not the user; workers communicate only through the root.
 
 ## Central duplicate adjudication
@@ -80,7 +85,7 @@ selects canonical problems, documents rationale and closes only proven duplicate
 Avoid cycles; prefer the clearest complete canonical report where ownership permits.
 Preserve each canonical's correct disposition. A delegated member may be canonical
 but remains untouched and `delegated-existing-parent`, even if less complete.
-Report completed adjudication immediately to the root.
+Report completed adjudication and execution cleanup evidence immediately to the root.
 
 ## Recovery and barrier
 
