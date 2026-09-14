@@ -73,6 +73,19 @@ pnpm run update:patterns
 checkout using the existing Node TypeScript invocation; it needs a Node
 version that supports that invocation. It is not an installed-package command.
 
+Local Vitest runs default to one worker in the main configuration and the separate
+PostgreSQL configuration. Only the exact values `CI=true` and `CI=1` retain the
+existing CI sizing. For an agent's focused run, use an explicit allocation:
+
+```bash
+pnpm exec vitest run test/vitest-worker-budget.test.ts --maxWorkers=1
+```
+
+The coordinator may assign a larger allocation within known host capacity; verify
+the effective project limits before using it. Do not set `CI` locally to bypass
+worker limits. A worker cap does not bound subprocesses created inside a test, so
+commands also need finite deadlines and ownership through descendant cleanup.
+
 Run focused tests for changed code and its direct integration boundaries
 locally. Fresh exact-head CI must pass `pnpm run test:ci` with 100% lines,
 branches, functions, and statements for every collected production TypeScript
