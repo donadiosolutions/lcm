@@ -12,10 +12,174 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
+import { load as loadYaml } from "js-yaml";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const exactSemver = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
+const buildDependencyNames = [
+  "@modelcontextprotocol/sdk",
+  "body-parser",
+  "fast-uri",
+  "esbuild",
+];
+const nestedBuildDependencyNames = ["ajv>fast-uri", "qs"];
+
+function exactVersion(section, name, version) {
+  if (typeof version !== "string" || !exactSemver.test(version)) {
+    throw new Error(`${section}.${name} must be an exact semver pin`);
+  }
+  return version;
+}
+
+function versionMap(source, section) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    throw new Error(`${section} must be a dependency map`);
+  }
+  return Object.fromEntries(Object.entries(source).map(([name, version]) => [
+    name,
+    exactVersion(section, name, version),
+  ]));
+}
+
+function requiredVersion(source, section, name) {
+  const version = source[name];
+  if (version === undefined) throw new Error(`${section}.${name} is required`);
+  return exactVersion(section, name, version);
+}
+
+/** Load the expected install topology solely from canonical source manifests. */
+export function loadCanonicalDependencyTopology({
+  packagePath = join(root, "package.json"),
+  workspacePath = join(root, "pnpm-workspace.yaml"),
+} = {}) {
+  const pkg = JSON.parse(readFileSync(packagePath, "utf8"));
+  const runtimeDependencies = versionMap(pkg.dependencies, "dependencies");
+  const developmentDependencies = versionMap(pkg.devDependencies, "devDependencies");
+  const peerDependencies = versionMap(pkg.peerDependencies, "peerDependencies");
+  const peerMetadata = pkg.peerDependenciesMeta;
+  if (!peerMetadata || typeof peerMetadata !== "object" || Array.isArray(peerMetadata)) {
+    throw new Error("peerDependenciesMeta must be a dependency map");
+  }
+  for (const [name, metadata] of Object.entries(peerMetadata)) {
+    if (metadata?.optional === true && developmentDependencies[name] !== peerDependencies[name]) {
+      throw new Error(`optional peer ${name} must equal its development dependency`);
+    }
+  }
+  for (const name of buildDependencyNames) {
+    if (runtimeDependencies[name] !== undefined) {
+      throw new Error(`${name} is build-only and must not be a runtime dependency`);
+    }
+    requiredVersion(developmentDependencies, "devDependencies", name);
+  }
+
+  const workspace = loadYaml(readFileSync(workspacePath, "utf8"));
+  if (!workspace || typeof workspace !== "object" || Array.isArray(workspace)) {
+    throw new Error("pnpm workspace configuration must be an object");
+  }
+  const overrides = versionMap(workspace.overrides, "overrides");
+  const onlyBuiltDependencies = workspace.onlyBuiltDependencies;
+  if (!Array.isArray(onlyBuiltDependencies) || !onlyBuiltDependencies.includes("esbuild")) {
+    throw new Error("pnpm workspace must allow esbuild build scripts");
+  }
+  const buildDependencies = Object.fromEntries(buildDependencyNames.map((name) => [
+    name,
+    requiredVersion(developmentDependencies, "devDependencies", name),
+  ]));
+  const nestedBuildDependencies = Object.fromEntries(nestedBuildDependencyNames.map((name) => [
+    name,
+    requiredVersion(overrides, "overrides", name),
+  ]));
+  return { runtimeDependencies, buildDependencies, nestedBuildDependencies };
+}
+
+function dependencyManifest(parentRequire, dependency, expectedVersion, entry = dependency) {
+  let manifestPath;
+  try {
+    const candidate = parentRequire.resolve(`${dependency}/package.json`);
+    if (JSON.parse(readFileSync(candidate, "utf8")).name === dependency) manifestPath = candidate;
+  } catch {
+    // Packages may export a nested package.json; resolve an executable entry below.
+  }
+  if (manifestPath) {
+    const version = JSON.parse(readFileSync(manifestPath, "utf8")).version;
+    if (version !== expectedVersion) {
+      throw new Error(
+        `${dependency} resolved to ${version} through ${parentRequire.resolve("./package.json")}; expected ${expectedVersion}`,
+      );
+    }
+    return manifestPath;
+  }
+  const entryPath = parentRequire.resolve(entry);
+  let directory = dirname(entryPath);
+  while (directory !== dirname(directory)) {
+    const candidate = join(directory, "package.json");
+    if (existsSync(candidate) && JSON.parse(readFileSync(candidate, "utf8")).name === dependency) {
+      manifestPath = candidate;
+      break;
+    }
+    directory = dirname(directory);
+  }
+  if (!manifestPath) throw new Error(`${dependency} package manifest is not resolvable`);
+  const version = JSON.parse(readFileSync(manifestPath, "utf8")).version;
+  if (version !== expectedVersion) {
+    throw new Error(
+      `${dependency} resolved to ${version} through ${parentRequire.resolve("./package.json")}; expected ${expectedVersion}`,
+    );
+  }
+  return manifestPath;
+}
+
+/** Verify installed nested build paths against the independently loaded manifests. */
+export function verifyNestedBuildDependencies(
+  rootRequire,
+  buildDependencies,
+  nestedBuildDependencies,
+) {
+  const sdkManifest = dependencyManifest(
+    rootRequire,
+    "@modelcontextprotocol/sdk",
+    buildDependencies["@modelcontextprotocol/sdk"],
+    "@modelcontextprotocol/sdk/server/index.js",
+  );
+  dependencyManifest(rootRequire, "body-parser", buildDependencies["body-parser"]);
+  dependencyManifest(rootRequire, "fast-uri", buildDependencies["fast-uri"]);
+  dependencyManifest(rootRequire, "esbuild", buildDependencies.esbuild);
+  const sdkRequire = createRequire(sdkManifest);
+  const expressManifest = sdkRequire.resolve("express/package.json");
+  const ajvManifest = sdkRequire.resolve("ajv/package.json");
+  const bodyParserManifest = dependencyManifest(
+    createRequire(expressManifest),
+    "body-parser",
+    buildDependencies["body-parser"],
+  );
+  const expressQsManifest = dependencyManifest(
+    createRequire(expressManifest),
+    "qs",
+    nestedBuildDependencies.qs,
+  );
+  const bodyParserQsManifest = dependencyManifest(
+    createRequire(bodyParserManifest),
+    "qs",
+    nestedBuildDependencies.qs,
+  );
+  const fastUriManifest = dependencyManifest(
+    createRequire(ajvManifest),
+    "fast-uri",
+    nestedBuildDependencies["ajv>fast-uri"],
+  );
+  return { bodyParserManifest, expressQsManifest, bodyParserQsManifest, fastUriManifest };
+}
+
+/** Compare a packaged manifest with the canonical source runtime dependency map. */
+export function verifyPackedRuntimeDependencies(packedDependencies, runtimeDependencies) {
+  const packed = versionMap(packedDependencies, "packed dependencies");
+  if (Object.keys(packed).length !== Object.keys(runtimeDependencies).length
+      || Object.entries(runtimeDependencies).some(([name, version]) => packed[name] !== version)) {
+    throw new Error("packed runtime dependencies differ from the canonical manifest");
+  }
+}
 
 function runPackageManager(manager, args, cwd, spawn, ignoreScripts = true) {
   const command = process.platform === "win32" ? `${manager}.cmd` : manager;
@@ -58,18 +222,6 @@ function installedVersion(directory, packageName) {
     join(directory, "node_modules", packageName, "package.json"),
     "utf8",
   )).version;
-}
-
-function verifyBuildDependencyPath(parentModule, dependency, expectedVersion) {
-  const parentRequire = createRequire(parentModule);
-  const dependencyManifest = parentRequire.resolve(`${dependency}/package.json`);
-  const version = JSON.parse(readFileSync(dependencyManifest, "utf8")).version;
-  if (version !== expectedVersion) {
-    throw new Error(
-      `${dependency} resolved to ${version} through ${parentModule}; expected ${expectedVersion}`,
-    );
-  }
-  return dependencyManifest;
 }
 
 function verifyNoPublishedBuildDependencies(directory, label) {
@@ -149,27 +301,23 @@ function verifyPostgreSqlApi(directory, spawn) {
 
 export function executeConsumerTopology(scratch, { spawn = spawnSync } = {}) {
   const runNpm = (args, cwd) => runPackageManager("npm", args, cwd, spawn);
+  const topology = loadCanonicalDependencyTopology();
   const rootRequire = createRequire(join(root, "package.json"));
-  const sdkServer = rootRequire.resolve("@modelcontextprotocol/sdk/server/index.js");
-  const expressManifest = createRequire(sdkServer).resolve("express/package.json");
-  const ajvManifest = createRequire(sdkServer).resolve("ajv/package.json");
-  const bodyParserManifest = verifyBuildDependencyPath(
-    expressManifest,
-    "body-parser",
-    "2.3.0",
-  );
-  const expressQsManifest = verifyBuildDependencyPath(expressManifest, "qs", "6.16.0");
-  const bodyParserQsManifest = verifyBuildDependencyPath(
+  const {
     bodyParserManifest,
-    "qs",
-    "6.16.0",
+    expressQsManifest,
+    bodyParserQsManifest,
+    fastUriManifest,
+  } = verifyNestedBuildDependencies(
+    rootRequire,
+    topology.buildDependencies,
+    topology.nestedBuildDependencies,
   );
-  const fastUriManifest = verifyBuildDependencyPath(ajvManifest, "fast-uri", "3.1.7");
   console.log(
-    `build: sdk-express-body-parser=2.3.0 @ ${bodyParserManifest} `
-    + `sdk-express-qs=6.16.0 @ ${expressQsManifest} `
-    + `sdk-body-parser-qs=6.16.0 @ ${bodyParserQsManifest} `
-    + `sdk-ajv-fast-uri=3.1.7 @ ${fastUriManifest}`,
+    `build: sdk-express-body-parser=${topology.buildDependencies["body-parser"]} @ ${bodyParserManifest} `
+    + `sdk-express-qs=${topology.nestedBuildDependencies.qs} @ ${expressQsManifest} `
+    + `sdk-body-parser-qs=${topology.nestedBuildDependencies.qs} @ ${bodyParserQsManifest} `
+    + `sdk-ajv-fast-uri=${topology.nestedBuildDependencies["ajv>fast-uri"]} @ ${fastUriManifest}`,
   );
 
   runPackageManager("pnpm", ["run", "build"], root, spawn, false);
@@ -203,9 +351,7 @@ export function executeConsumerTopology(scratch, { spawn = spawnSync } = {}) {
         || pkg.dependencies?.["fast-uri"]) {
       throw new Error(`${label} packed package exposes build-only SDK dependencies`);
     }
-    if (pkg.dependencies?.["@hono/node-server"] !== "2.0.12") {
-      throw new Error(`${label} packed package changed the independently pinned Hono dependency`);
-    }
+    verifyPackedRuntimeDependencies(pkg.dependencies, topology.runtimeDependencies);
     verifyNoPublishedBuildDependencies(directory, label);
     verifyPostgreSqlApi(directory, spawn);
     verifyPortablePackage(directory, { spawn });

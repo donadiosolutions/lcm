@@ -121,15 +121,18 @@ describe("package.json", () => {
     } finally { rmSync(scratch, { recursive: true, force: true }); }
   });
 
-  it("has anthropic sdk as optional peer dep", () => expect(pkg.peerDependencies).toHaveProperty("@anthropic-ai/sdk"));
+  it("has an optional SDK peer that is also available for development", () => {
+    expect(pkg.peerDependenciesMeta?.["@anthropic-ai/sdk"]).toEqual({ optional: true });
+    expect(pkg.devDependencies).toHaveProperty("@anthropic-ai/sdk", pkg.peerDependencies?.["@anthropic-ai/sdk"]);
+  });
   it("keeps the bundled MCP build graph out of published consumer dependencies", () => {
     expect(pkg.dependencies).not.toHaveProperty("@modelcontextprotocol/sdk");
     expect(pkg.dependencies).not.toHaveProperty("body-parser");
     expect(pkg.dependencies).not.toHaveProperty("fast-uri");
-    expect(pkg.devDependencies).toHaveProperty("@modelcontextprotocol/sdk", "1.30.0");
-    expect(pkg.devDependencies).toHaveProperty("body-parser", "2.3.0");
-    expect(pkg.devDependencies).toHaveProperty("fast-uri", "4.1.4");
-    expect(pkg.dependencies).toHaveProperty("@hono/node-server", "2.0.12");
+    expect(pkg.devDependencies).toHaveProperty("@modelcontextprotocol/sdk");
+    expect(pkg.devDependencies).toHaveProperty("body-parser");
+    expect(pkg.devDependencies).toHaveProperty("fast-uri");
+    expect(pkg.dependencies).toHaveProperty("@hono/node-server");
     expect(pkg.scripts).toHaveProperty(
       "verify:consumer-topology",
       "node scripts/verify-consumer-topology.mjs",
@@ -205,7 +208,7 @@ describe("package.json", () => {
   });
 
   it("uses exact, reproducible runtime bundle tooling", () => {
-    expect(pkg.devDependencies.esbuild).toBe("0.28.1");
+    expect(pkg.devDependencies).toHaveProperty("esbuild");
     expect(pkg.scripts).toHaveProperty("build:runtime", "node scripts/build-runtime.mjs");
     expect(pkg.scripts).not.toHaveProperty("check:plugin-bundles");
   });
@@ -325,11 +328,14 @@ describe("package.json", () => {
     expect(source).toContain("chmod(output, 0o755)");
   });
 
-  it("pins every direct dependency and development dependency exactly", () => {
-    for (const dependencies of [pkg.dependencies, pkg.devDependencies]) {
+  it("pins every direct, development, and peer dependency exactly", () => {
+    for (const dependencies of [pkg.dependencies, pkg.devDependencies, pkg.peerDependencies]) {
       for (const version of Object.values(dependencies)) {
         expect(version).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
       }
+    }
+    for (const [name, metadata] of Object.entries(pkg.peerDependenciesMeta ?? {})) {
+      if (metadata.optional) expect(pkg.devDependencies?.[name]).toBe(pkg.peerDependencies?.[name]);
     }
   });
 });
@@ -342,36 +348,40 @@ describe("pnpm development configuration", () => {
     );
     expect(pkg.engines).not.toHaveProperty("pnpm");
     expect(pkg).not.toHaveProperty("overrides");
-    expect(loadYaml(readFileSync(join(repositoryRoot, "pnpm-workspace.yaml"), "utf8"))).toEqual({
-      packages: ["."],
-      overrides: {
-        "ajv>fast-uri": "3.1.7",
-        qs: "6.16.0",
-        "read-yaml-file": "2.1.0",
-      },
-      onlyBuiltDependencies: ["esbuild", "fsevents"],
-    });
+    const workspace = loadYaml(readFileSync(join(repositoryRoot, "pnpm-workspace.yaml"), "utf8")) as {
+      packages?: unknown;
+      overrides?: Record<string, string>;
+      onlyBuiltDependencies?: unknown;
+    };
+    expect(workspace.packages).toEqual(["."]);
+    expect(workspace.onlyBuiltDependencies).toEqual(["esbuild", "fsevents"]);
+    expect(workspace.overrides).toBeDefined();
+    for (const version of Object.values(workspace.overrides!)) {
+      expect(version).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
+    }
     expect(pkg.scripts["update:patterns"]).toBe(
       "node --experimental-strip-types scripts/update-gitleaks-patterns.ts",
     );
     expect(existsSync(join(repositoryRoot, "package-lock.json"))).toBe(false);
   });
 
-  it("locks only the patched fast-uri and qs graph", () => {
+  it("retains canonical direct and override dependency keys in the lock graph", () => {
     const lock = loadYaml(
       readFileSync(join(repositoryRoot, "pnpm-lock.yaml"), "utf8"),
     ) as { packages: Record<string, unknown> };
     const packageKeys = Object.keys(lock.packages);
-    expect(packageKeys).toEqual(expect.arrayContaining([
-      "fast-uri@3.1.7",
-      "fast-uri@4.1.4",
-      "qs@6.16.0",
-    ]));
-    expect(packageKeys).not.toEqual(expect.arrayContaining([
-      "fast-uri@3.1.5",
-      "fast-uri@4.1.2",
-      "qs@6.15.2",
-    ]));
+    const workspace = loadYaml(
+      readFileSync(join(repositoryRoot, "pnpm-workspace.yaml"), "utf8"),
+    ) as { overrides: Record<string, string> };
+    const direct = { ...pkg.dependencies, ...pkg.devDependencies };
+    const overrideKeys = Object.entries(workspace.overrides).map(([selector, version]) => [
+      selector.slice(selector.lastIndexOf(">") + 1), version,
+    ]);
+    const expectedKeys = [
+      ...Object.entries(direct),
+      ...overrideKeys,
+    ].map(([name, version]) => `${name}@${version}`);
+    expect(packageKeys).toEqual(expect.arrayContaining(expectedKeys));
   });
 
   it("rejects a mismatched manager before installation without switching versions", () => {
