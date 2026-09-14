@@ -12,8 +12,11 @@ never authorizes workers, issue mutations or environment replacement. Read
 repository/local instructions, including the primary worktree's local rules when
 working elsewhere, and required project memory. Repository delivery policy applies.
 
-Retain one root, run identity, recovery record and item budgets across callers and
-resumes. The root owns orchestration, user communication, pushes, PRs and merges;
+Retain one logical run, recovery record and item budgets across callers and resumes.
+Keep the current runtime root identity separate; only explicit user-authorized
+replacement uses the [root lifecycle handoff](references/root-lifecycle.md#coordinator-replacement).
+There must be one verified coordinator, not competing roots. The root owns
+orchestration, user communication, pushes, PRs and merges;
 it must not implement, edit owner worktrees, adjudicate their findings or replace
 reviewers. Each owner retains its item's planning, adjudication and resolution;
 implementers use assigned workspaces; reviewers are read-only. If nested dispatch
@@ -56,7 +59,10 @@ bindings or unavailable required model/reasoning routes need a concrete blocker
 and explicit substitution; never silently lower reasoning or omit a reviewer.
 
 Use self-contained briefs with the assigned role, scope, workspace, evidence and
-report contract. Follow the live schema's fork rules: where full-history forks
+report contract, including every [worker execution brief field](references/worker-execution.md#required-dispatch-brief).
+Supply applicable instructions, resource allocation and command-cleanup obligations
+to every role; empty-history forks do not inherit them by assumption.
+Follow the live schema's fork rules: where full-history forks
 inherit model/reasoning and forbid overrides, use `fork_turns="none"` for an
 overridden route. Dispatch by the actual tool recipient, not an execution wrapper.
 A worker missing its brief requests it from its parent through `send_message`
@@ -76,19 +82,25 @@ tools only when supported and without withholding necessary review evidence.
 
 1. Read [coordination](references/coordination.md) and
    [delivery](references/delivery.md). Owners/leaves receive the applicable delivery
-   instructions; the root reads both references in full.
+   instructions. The root also reads [root lifecycle](references/root-lifecycle.md)
+   and [worker execution](references/worker-execution.md) in full; all workers receive
+   and read the execution contract.
 2. Record the run contract below in workflow-local scratch. These are evidence
    fields, not a new serialized API or executable framework.
-3. Preflight routes, dispatch mechanisms and declared resources; execute the shared
-   scheduling and delivery procedures against the caller's readiness decisions.
+3. Preflight routes, dispatch mechanisms and declared resources. Verify native
+   root periodic-check admission before launching workers or waiting unattended;
+   only then execute scheduling and delivery against the caller's readiness decisions.
+   Unavailable native control is a coordination blocker, not permission to substitute.
 4. Reconcile recovery evidence and audit the requested endpoint before completion.
 
 | Contract | Record |
 | --- | --- |
-| Identity | Repository, actual target branch/SHA, stable run/root identity, recovery location |
+| Identity | Repository, actual target branch/SHA, logical run ID, current root task ID, predecessor/handoff evidence, recovery location |
 | Scope | Fixed IDs, sources, acceptance, existing ownership and completed evidence |
 | Readiness | Dependencies, acceptance evidence per edge, decisions and dispositions |
 | Roles | Exact model IDs, effective reasoning, requested/confirmed tiers, owner limit |
+| Coordination | Native root-check binding, confirmed target/enabled/cadence, observation/result reference, next due and last execution when exposed |
+| Execution | Host/run allocation, per-command concurrency/deadline, worker-owned handles, exit and descendant-cleanup evidence |
 | Delivery | Checks, commit/PR/merge rules, docs/release metadata, follow-up classification, source-resolution rules |
 | Tracker | Identity and allowed checkpoint channel: comment, managed body block, or none |
 | Environment | Startup, target-advance, watchdog and final operations, executors and evidence |
