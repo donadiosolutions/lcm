@@ -12,6 +12,17 @@
 - For local development and pre-push verification, run only the tests relevant to the code being changed and its direct integration boundaries. If the impact is uncertain, err on the side of caution and widen the local test scope before pushing. Do not run unrelated local suites solely to duplicate the complete CI run; rely on CI to exercise the complete collected scope and enforce the 100% coverage gate.
 - Do not use coverage exclusions, `v8 ignore` directives, skipped tests, or untested production wrappers to satisfy the gate. Cover behavior through observable public seams and deterministic failure injection.
 
+## Agent Execution Safety
+
+All agent roles, including reviewers and triagers, follow the shared
+[execution lifecycle](.agents/skills/procedural-development/references/execution-lifecycle.md).
+Use explicit bounded local test-worker allocations; default to one worker per
+agent-local test command, with larger allocations set explicitly within the host
+budget. Keep independent agent lanes concurrent; do not introduce a test mutex.
+Never launch unbounded or host-stressing process trees, regardless of whether they
+are technically fork bombs. A yielded command remains owned until terminal status
+and descendant cleanup or an authorized acknowledged persistent handoff.
+
 ## Codecov Components Maintenance
 
 - Update `codecov.yml` and `test/codecov-config.test.ts` atomically whenever production TypeScript, features, or components are added, removed, moved, materially changed, or otherwise make classification stale.
@@ -56,7 +67,7 @@ npm install -g "$lcm_tarball" --ignore-scripts
 # Verify the installed package version and contents against this exact tarball.
 lcm install
 lcm doctor # must show 0 failures
-pnpm run test # must pass
+pnpm run test --maxWorkers=1 # must pass; explicit bounded local allocation
 ```
 
 Do not use `npm link` or `pnpm link --global`: installed LCM must be an
@@ -69,7 +80,12 @@ lcm connectors install <agent>
 lcm connectors doctor <agent>
 ```
 
-If anything fails, fix it before starting the next feature. A broken local env wastes time on every subsequent session (stale dist, wrong binary, hook errors, or mismatched native connector state).
+If an operation fails, preserve its evidence and defer work that depends on the
+unhealthy installed environment until the Environment Coordinator verifies recovery.
+Independent work in isolated fixtures may continue, as may otherwise-ready PRs that
+do not depend on that environment. Pending refresh or failed verification blocks
+final environment acceptance; do not claim campaign completion from stale evidence.
+This boundary does not waive prerequisite acceptance, required checks or coverage.
 
 ## Documentation Requirements
 

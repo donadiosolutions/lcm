@@ -9,12 +9,17 @@ publication, post-PR work and verified resolution; ownership is not delegated.
 Use an isolated worktree/branch from the fresh selected target, preserving unrelated
 work and repository dependency ordering. Do not stack on unmerged work where forbidden.
 
-Implementers use worker-local home/XDG/temp state, sockets, databases and test
-services. Never experiment on production state or another worker's publication
-lock. Preserve supported integration harnesses. Include required docs, release
-metadata, component classification and focused tests in the candidate.
+All roles follow [execution lifecycle](execution-lifecycle.md), including private
+home/XDG/temp state, sockets, databases, test services and generated artifacts.
+Never experiment on production state or another worker's publication lock.
+Preserve supported integration harnesses. Implementers include required docs,
+release metadata, component classification and focused tests in the candidate.
 
-All reviewers are read-only. Every PR-head change, including CI/test fixes,
+Reviewers are read-only with respect to candidate source and shared state. They may
+run bounded checks in private detached checkouts and write private reports/artifacts;
+verify candidate integrity before/after and own all launched commands through cleanup.
+
+Every PR-head change, including CI/test fixes,
 automated-review remediation, rebases and conflicts, invalidates prior cleanliness.
 An ancestor's approval does not certify its descendant.
 
@@ -45,10 +50,12 @@ An ancestor's approval does not certify its descendant.
    maintenance risks; it replaces neither first-pass reviewer.
 3. The owner reads all three reports and adjudicates every finding with severity
    and rationale. Three separate reports remain required even when role bindings
-   use the same model.
+   use the same model. Accept a worker's completion only with execution-lifecycle
+   evidence; task_complete alone does not establish that launched checks finished.
+   Pending execution/cleanup keeps the gate incomplete, not a clean review.
 
-If a reviewer writes, preserve evidence, restore only unauthorized changes, verify
-integrity and repeat/revalidate affected reports before synthesis. The root may
+If a reviewer makes unauthorized writes, preserve evidence, restore only those
+changes, verify integrity and repeat/revalidate affected reports before synthesis. The root may
 coordinate recovery but must not edit the owner's worktree.
 
 ## Candidate budget
@@ -91,7 +98,8 @@ resolution; preserve valid fixes, duplicates and successors.
 ## Publish and merge
 
 1. Owner sends `publication-requested`: item, branch, clean SHA, complete review/
-   adjudication evidence, relevant local validation, proposed PR text and follow-ups.
+   adjudication evidence, relevant local validation and execution cleanup evidence,
+   proposed PR text and follow-ups.
    Published-branch CI is not required before this request.
 2. Root verifies evidence, pushes and creates the PR under repository policy, then
    returns `pr-published` with URL and actual head. A mismatch is a new candidate.

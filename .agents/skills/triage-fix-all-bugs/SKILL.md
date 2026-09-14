@@ -19,10 +19,13 @@ resolved settings unchanged. These are invocation instructions, not CLI flags.
 Shared route preflight and best-effort tier rules apply to every role.
 
 Read repository/local instructions and project memory, [LCM integration](../shared/lcm-development.md),
-[procedural-development](../procedural-development/SKILL.md) and both its references,
+[procedural-development](../procedural-development/SKILL.md) and its coordination/delivery references,
 then [inventory/triage](references/triage.md) and [accounting](references/coordination.md)
 in full. Apply shared root, event, recovery and route rules during triage without
-starting remediation. Workers receive self-contained issue, scope and evidence briefs.
+starting remediation. Satisfy [coordination admission](../procedural-development/SKILL.md#coordination-admission)
+before triage dispatch or an unattended wait. Use the shared dispatch brief and
+execution-lifecycle contract for triagers and duplicate adjudicators too; do not
+assume an empty-history fork inherited local safety or completion rules.
 
 ## Phase boundaries
 
