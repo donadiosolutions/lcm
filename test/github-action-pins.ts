@@ -1,6 +1,8 @@
+import { load as loadYaml } from "js-yaml";
+
 export interface ActionReference {
   comment?: string;
-  kind: "external" | "invalid-local" | "local";
+  kind: "external" | "invalid-local" | "local" | "unsupported";
   line: number;
   repository?: string;
   sha?: string;
@@ -9,9 +11,35 @@ export interface ActionReference {
 }
 
 const externalAction = /^(?<repository>[^/@\s]+\/[^/@\s]+)(?:\/[^@\s]+)?@(?<sha>\S+)$/u;
-const usesLine = /^\s*(?:-\s+)?uses:\s*(?<target>[^\s#]+)(?:\s+#\s*(?<comment>\S.*?))?\s*$/u;
+const usesLine = /^\s*(?:-\s+)?uses:\s*(?<target>[^\s#]+)(?:\s+#\s*(?<comment>.*?))?\s*$/u;
 
-export function parseActionReferences(source: string, sourceName: string): ActionReference[] {
+interface EffectiveUse {
+  target: string;
+}
+
+function effectiveUses(value: unknown, uses: EffectiveUse[] = []): EffectiveUse[] {
+  if (Array.isArray(value)) {
+    for (const item of value) effectiveUses(item, uses);
+    return uses;
+  }
+  if (!value || typeof value !== "object") return uses;
+
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "uses") {
+      uses.push({ target: typeof child === "string" ? child : String(child) });
+      continue;
+    }
+    effectiveUses(child, uses);
+  }
+  return uses;
+}
+
+function sourceLine(source: string, target: string): number {
+  const index = source.split(/\r?\n/u).findIndex((line) => line.includes(target));
+  return index + 1;
+}
+
+function rawActionReferences(source: string, sourceName: string): ActionReference[] {
   return source.split(/\r?\n/u).flatMap((line, index) => {
     const match = usesLine.exec(line);
     if (!match?.groups) return [];
@@ -39,6 +67,39 @@ export function parseActionReferences(source: string, sourceName: string): Actio
   });
 }
 
+export function parseActionReferences(source: string, sourceName: string): ActionReference[] {
+  const rawReferences = rawActionReferences(source, sourceName);
+  const rawByTarget = new Map<string, ActionReference[]>();
+  for (const reference of rawReferences) {
+    const matching = rawByTarget.get(reference.target) ?? [];
+    matching.push(reference);
+    rawByTarget.set(reference.target, matching);
+  }
+
+  const references = effectiveUses(loadYaml(source)).map((effective) => {
+    const raw = rawByTarget.get(effective.target)?.shift();
+    if (raw) return raw;
+    return {
+      kind: "unsupported" as const,
+      line: sourceLine(source, effective.target),
+      source: sourceName,
+      target: effective.target,
+    };
+  });
+
+  for (const remaining of rawByTarget.values()) {
+    for (const reference of remaining) {
+      references.push({
+        kind: "unsupported",
+        line: reference.line,
+        source: sourceName,
+        target: reference.target,
+      });
+    }
+  }
+  return references;
+}
+
 function location(reference: ActionReference): string {
   return `${reference.source}:${reference.line}`;
 }
@@ -51,6 +112,9 @@ export function assertApprovedActionReferences(
     if (reference.kind === "local") continue;
     if (reference.kind === "invalid-local") {
       throw new Error(`${location(reference)} local actions must begin with ./: ${reference.target}`);
+    }
+    if (reference.kind === "unsupported") {
+      throw new Error(`${location(reference)} uses unsupported raw syntax: ${reference.target}`);
     }
     if (!reference.repository || !approvedRepositories.has(reference.repository)) {
       throw new Error(`${location(reference)} uses an unapproved action repository: ${reference.target}`);

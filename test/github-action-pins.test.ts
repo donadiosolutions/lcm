@@ -69,11 +69,28 @@ describe("GitHub Action pin policy", () => {
     }
   });
 
+  it("rejects unsupported raw uses syntax even beside a valid pinned action", () => {
+    const validAction = `- uses: actions/checkout@${validSha} # v4.2.2`;
+    const cases = [
+      `${validAction}\n- uses: actions/checkout@${alternateSha} #`,
+      `${validAction}\n- "uses": actions/checkout@${alternateSha} # v4.2.2`,
+      `${validAction}\n- { uses: actions/checkout@${alternateSha} } # v4.2.2`,
+    ];
+
+    for (const source of cases) {
+      expect(() => assertApprovedActionReferences(
+        parseActionReferences(source, "fixture.yml"),
+        approvedRepositories,
+      )).toThrow();
+    }
+  });
+
   it("allows a coherent SHA and version-comment update", () => {
     const references = parseActionReferences(
       [
-        `uses: actions/checkout@${alternateSha} # v9.0.0`,
-        `uses: actions/checkout@${alternateSha} # v9.0.0`,
+        "steps:",
+        `  - uses: actions/checkout@${alternateSha} # v9.0.0`,
+        `  - uses: actions/checkout@${alternateSha} # v9.0.0`,
       ].join("\n"),
       "fixture.yml",
     );
@@ -85,8 +102,9 @@ describe("GitHub Action pin policy", () => {
   it("rejects divergent CodeQL init and analyze pins", () => {
     const references = parseActionReferences(
       [
-        `uses: github/codeql-action/init@${validSha} # v4.0.0`,
-        `uses: github/codeql-action/analyze@${alternateSha} # v4.0.0`,
+        "steps:",
+        `  - uses: github/codeql-action/init@${validSha} # v4.0.0`,
+        `  - uses: github/codeql-action/analyze@${alternateSha} # v4.0.0`,
       ].join("\n"),
       "codeql.yml",
     );
@@ -97,9 +115,10 @@ describe("GitHub Action pin policy", () => {
   it("rejects divergent composite cache, restore, and save pins", () => {
     const references = parseActionReferences(
       [
-        `uses: actions/cache@${validSha} # v5.0.0`,
-        `uses: actions/cache/restore@${alternateSha} # v5.0.0`,
-        `uses: actions/cache/save@${validSha} # v5.0.0`,
+        "steps:",
+        `  - uses: actions/cache@${validSha} # v5.0.0`,
+        `  - uses: actions/cache/restore@${alternateSha} # v5.0.0`,
+        `  - uses: actions/cache/save@${validSha} # v5.0.0`,
       ].join("\n"),
       "action.yml",
     );
@@ -110,8 +129,9 @@ describe("GitHub Action pin policy", () => {
   it("rejects divergent Codecov pins between trusted and fork jobs", () => {
     const references = parseActionReferences(
       [
-        `uses: codecov/codecov-action@${validSha} # v7.0.0`,
-        `uses: codecov/codecov-action@${alternateSha} # v7.0.0`,
+        "steps:",
+        `  - uses: codecov/codecov-action@${validSha} # v7.0.0`,
+        `  - uses: codecov/codecov-action@${alternateSha} # v7.0.0`,
       ].join("\n"),
       "ci.yml",
     );
