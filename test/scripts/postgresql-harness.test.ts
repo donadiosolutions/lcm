@@ -1054,6 +1054,42 @@ describe("PostgreSQL harness utilities", () => {
     expect(fallback).not.toContain("shared");
   });
 
+  it("runs local PostgreSQL tests without entering the Docker runner path", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-local-runner-"));
+    const setupDocker = vi.fn();
+    const testProcess = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
+    vi.stubEnv("CI", "");
+    try {
+      await runTests({
+        runId: "a".repeat(32),
+        directory,
+        parent: directory,
+        names: { runner: "unused", network: "unused" },
+        environment: { LCM_TEST_POSTGRES_RUN_ID: "a".repeat(32) },
+      }, false, setupDocker, testProcess);
+
+      expect(setupDocker).not.toHaveBeenCalled();
+      expect(testProcess).toHaveBeenCalledOnce();
+      expect(testProcess).toHaveBeenCalledWith(
+        process.execPath,
+        expect.arrayContaining(["run", "--config"]),
+        expect.objectContaining({
+          terminateOnStop: true,
+          terminateProcessTree: true,
+          env: expect.objectContaining({
+            CI: "",
+            LCM_TEST_VITEST_RUNTIME_ROOT_PARENT: directory,
+          }),
+        }),
+      );
+      expect(createPostgresqlVitestConfiguration(testProcess.mock.calls[0][2].env).test.maxWorkers)
+        .toBe(1);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("writes CI into the Docker conformance runner environment", async () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-runner-env-"));
     const setupDocker = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
@@ -1089,6 +1125,85 @@ describe("PostgreSQL harness utilities", () => {
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  it.each(["host test process", "Docker runner attachment"])(
+    "terminates a pending %s before teardown cleanup",
+    async (pendingTarget) => {
+      const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-runner-stop-"));
+      let finishPending!: () => void;
+      let processTreeAlive = pendingTarget === "host test process";
+      const child = {
+        pid: 321,
+        kill: vi.fn((signal: string) => {
+          expect(signal).toBe("SIGTERM");
+          finishPending();
+          return true;
+        }),
+      };
+      const processRunner = vi.fn((command, args, options) => {
+        const isPending = pendingTarget === "host test process"
+          ? command === process.execPath
+          : command === "docker" && args.includes("--attach");
+        if (isPending) {
+          options.onSpawn?.(child);
+          return new Promise<void>((resolve) => { finishPending = resolve; });
+        }
+        return Promise.resolve({ stdout: "", stderr: "" });
+      });
+      const signalProcess = vi.fn((_pid: number, signal: string) => {
+        expect(signal).toBe("SIGTERM");
+        processTreeAlive = false;
+        finishPending();
+      });
+      const lifecycle = createProcessLifecycle(processRunner, {
+        platform: () => "linux",
+        signalProcess,
+        processTreeAlive: () => processTreeAlive,
+      });
+      const setupDocker = (args: string[], options?: Record<string, unknown>) => (
+        lifecycle.run("docker", args, options)
+      );
+      const testProcess = (command: string, args: string[], options?: Record<string, unknown>) => (
+        lifecycle.run(command, args, options)
+      );
+      try {
+        const tests = runTests({
+          runId: "a".repeat(32),
+          directory,
+          parent: directory,
+          names: { runner: "lcm-pg-runner-test", network: "lcm-pg-network-test" },
+          owner: { pid: 1, birth: "1", scope: "test-scope" },
+          environment: { LCM_TEST_POSTGRES_RUN_ID: "a".repeat(32) },
+        }, true, setupDocker, testProcess);
+
+        if (pendingTarget === "host test process") {
+          await vi.waitFor(() => expect(processRunner).toHaveBeenCalledWith(
+            process.execPath,
+            expect.arrayContaining([expect.stringContaining("signal.integration.ts")]),
+            expect.objectContaining({ terminateOnStop: true, terminateProcessTree: true }),
+          ));
+        } else {
+          await vi.waitFor(() => expect(processRunner).toHaveBeenCalledWith(
+            "docker",
+            ["start", "--attach", "lcm-pg-runner-test"],
+            expect.objectContaining({ terminateOnStop: true }),
+          ));
+        }
+        await expect(lifecycle.stop()).resolves.toBeUndefined();
+        if (pendingTarget === "host test process") {
+          await expect(tests).rejects.toThrow("setup is stopping");
+          expect(signalProcess).toHaveBeenCalledWith(-321, "SIGTERM");
+          expect(child.kill).not.toHaveBeenCalled();
+        } else {
+          await expect(tests).resolves.toBeUndefined();
+          expect(child.kill).toHaveBeenCalledOnce();
+          expect(signalProcess).not.toHaveBeenCalled();
+        }
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("redacts credentials, URLs, private paths, and PEM material", () => {
     const output = sanitizeHarnessText(

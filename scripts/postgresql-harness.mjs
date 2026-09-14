@@ -1549,12 +1549,12 @@ export function createHarnessCleanupOperations(context, dependencies = {}) {
   return { cleanup, teardown };
 }
 
-function createDockerRunnerEnvironment(environment, ci) {
+function createDockerRunnerEnvironment(environment) {
   return {
     ...environment,
     // The runner is a separate process and only receives the values written to
     // runner.env. Preserve CI's established Vitest pool there as well.
-    ...(ci ? { CI: "true" } : {}),
+    CI: "true",
     LCM_TEST_POSTGRES_INNER_CI: "true",
   };
 }
@@ -1626,9 +1626,16 @@ export async function runTests(context, ci, setupDocker = docker, testProcess = 
     join(repositoryRoot, "node_modules", "vitest", "vitest.mjs"),
     "run", "--config", join(repositoryRoot, "vitest.postgresql.config.ts"),
     join(repositoryRoot, "test", "postgresql", "signal.integration.ts"),
-  ], { cwd: repositoryRoot, env, secrets, processRunner: testProcess });
+  ], {
+    cwd: repositoryRoot,
+    env,
+    secrets,
+    processRunner: testProcess,
+    terminateOnStop: true,
+    terminateProcessTree: true,
+  });
   const envFile = join(context.directory, "runner.env");
-  writeFileSync(envFile, Object.entries(createDockerRunnerEnvironment(context.environment, ci))
+  writeFileSync(envFile, Object.entries(createDockerRunnerEnvironment(context.environment))
     .map(([key, value]) => `${key}=${value}`).join("\n") + "\n", { mode: 0o600 });
   await setupDocker([
     "create", "--name", context.names.runner,
@@ -1646,6 +1653,7 @@ export async function runTests(context, ci, setupDocker = docker, testProcess = 
   await runSanitizedProcess("docker", ["start", "--attach", context.names.runner], {
     processRunner: (_command, args, processOptions) => setupDocker(args, processOptions),
     secrets,
+    terminateOnStop: true,
   });
 }
 
