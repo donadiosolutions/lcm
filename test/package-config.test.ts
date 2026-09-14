@@ -121,9 +121,15 @@ describe("package.json", () => {
     } finally { rmSync(scratch, { recursive: true, force: true }); }
   });
 
-  it("has an optional SDK peer that is also available for development", () => {
-    expect(pkg.peerDependenciesMeta?.["@anthropic-ai/sdk"]).toEqual({ optional: true });
-    expect(pkg.devDependencies).toHaveProperty("@anthropic-ai/sdk", pkg.peerDependencies?.["@anthropic-ai/sdk"]);
+  it("keeps every declared SDK peer optional and available for development", () => {
+    expect(Object.keys(pkg.peerDependencies ?? {}).sort()).toEqual([
+      "@anthropic-ai/sdk",
+      "openai",
+    ]);
+    for (const [name, version] of Object.entries(pkg.peerDependencies ?? {})) {
+      expect(pkg.peerDependenciesMeta?.[name]).toEqual({ optional: true });
+      expect(pkg.devDependencies).toHaveProperty(name, version);
+    }
   });
   it("keeps the bundled MCP build graph out of published consumer dependencies", () => {
     expect(pkg.dependencies).not.toHaveProperty("@modelcontextprotocol/sdk");
@@ -334,8 +340,9 @@ describe("package.json", () => {
         expect(version).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
       }
     }
-    for (const [name, metadata] of Object.entries(pkg.peerDependenciesMeta ?? {})) {
-      if (metadata.optional) expect(pkg.devDependencies?.[name]).toBe(pkg.peerDependencies?.[name]);
+    for (const [name, version] of Object.entries(pkg.peerDependencies ?? {})) {
+      expect(pkg.peerDependenciesMeta?.[name]).toEqual({ optional: true });
+      expect(pkg.devDependencies?.[name]).toBe(version);
     }
   });
 });
@@ -368,7 +375,7 @@ describe("pnpm development configuration", () => {
   it("retains canonical direct and override dependency keys in the lock graph", () => {
     const lock = loadYaml(
       readFileSync(join(repositoryRoot, "pnpm-lock.yaml"), "utf8"),
-    ) as { packages: Record<string, unknown> };
+    ) as { packages: Record<string, { resolution?: { integrity?: unknown } }> };
     const packageKeys = Object.keys(lock.packages);
     const workspace = loadYaml(
       readFileSync(join(repositoryRoot, "pnpm-workspace.yaml"), "utf8"),
@@ -382,6 +389,9 @@ describe("pnpm development configuration", () => {
       ...overrideKeys,
     ].map(([name, version]) => `${name}@${version}`);
     expect(packageKeys).toEqual(expect.arrayContaining(expectedKeys));
+    for (const [packageKey, entry] of Object.entries(lock.packages)) {
+      expect(entry.resolution?.integrity, packageKey).toMatch(/^sha512-[A-Za-z0-9+/]{86}==$/u);
+    }
   });
 
   it("rejects a mismatched manager before installation without switching versions", () => {

@@ -62,8 +62,11 @@ export function loadCanonicalDependencyTopology({
   if (!peerMetadata || typeof peerMetadata !== "object" || Array.isArray(peerMetadata)) {
     throw new Error("peerDependenciesMeta must be a dependency map");
   }
-  for (const [name, metadata] of Object.entries(peerMetadata)) {
-    if (metadata?.optional === true && developmentDependencies[name] !== peerDependencies[name]) {
+  for (const [name, version] of Object.entries(peerDependencies)) {
+    if (peerMetadata[name]?.optional !== true) {
+      throw new Error(`optional peer ${name} must declare metadata as optional`);
+    }
+    if (developmentDependencies[name] !== version) {
       throw new Error(`optional peer ${name} must equal its development dependency`);
     }
   }

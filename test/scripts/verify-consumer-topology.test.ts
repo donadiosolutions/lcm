@@ -222,11 +222,14 @@ function writeCanonicalTopology(root: string, {
   fastUriVersion = "6.5.4",
   esbuildVersion = "5.4.3",
   optionalPeerVersion = "4.3.2",
+  peerDependencyVersion = optionalPeerVersion,
+  optionalPeerMetadata = "optional",
   nestedFastUriVersion = "3.2.1",
   qsVersion = "2.1.0",
 }: Partial<Record<
   "runtimeVersion" | "sdkVersion" | "bodyParserVersion" | "fastUriVersion" | "esbuildVersion"
-  | "optionalPeerVersion" | "nestedFastUriVersion" | "qsVersion",
+  | "optionalPeerVersion" | "peerDependencyVersion" | "optionalPeerMetadata"
+  | "nestedFastUriVersion" | "qsVersion",
   string
 >> = {}) {
   const packagePath = join(root, "package.json");
@@ -242,8 +245,10 @@ function writeCanonicalTopology(root: string, {
       esbuild: esbuildVersion,
       "optional-peer": optionalPeerVersion,
     },
-    peerDependencies: { "optional-peer": optionalPeerVersion },
-    peerDependenciesMeta: { "optional-peer": { optional: true } },
+    peerDependencies: { "optional-peer": peerDependencyVersion },
+    peerDependenciesMeta: optionalPeerMetadata === "absent" ? {} : {
+      "optional-peer": { optional: optionalPeerMetadata === "optional" },
+    },
   }, null, 2));
   writeFileSync(workspacePath, `packages:\n  - '.'\noverrides:\n  ajv>fast-uri: ${nestedFastUriVersion}\n  qs: ${qsVersion}\nonlyBuiltDependencies:\n  - esbuild\n`);
   return { packagePath, workspacePath };
@@ -308,6 +313,33 @@ describe("verify-consumer-topology", () => {
       const paths = writeCanonicalTopology(root, { runtimeVersion: "^9.8.7" });
       expect(() => module.loadCanonicalDependencyTopology(paths))
         .toThrow("dependencies.runtime-one must be an exact semver pin");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["missing", "absent"],
+    ["required", "required"],
+  ])("rejects a %s optional-peer metadata declaration", async (_label, optionalPeerMetadata) => {
+    const module = await import(scriptPath);
+    const root = isolatedRoot("canonical-topology-peer-metadata-");
+    try {
+      const paths = writeCanonicalTopology(root, { optionalPeerMetadata });
+      expect(() => module.loadCanonicalDependencyTopology(paths))
+        .toThrow("optional peer optional-peer must declare metadata as optional");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an optional peer that differs from its development pin", async () => {
+    const module = await import(scriptPath);
+    const root = isolatedRoot("canonical-topology-peer-version-");
+    try {
+      const paths = writeCanonicalTopology(root, { peerDependencyVersion: "4.3.1" });
+      expect(() => module.loadCanonicalDependencyTopology(paths))
+        .toThrow("optional peer optional-peer must equal its development dependency");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -762,6 +794,40 @@ describe("verify-consumer-topology", () => {
 });
 
 describe("consumer package manager boundary", () => {
+  it("rejects an independently installed packed manifest that differs from source", async () => {
+    const module = await import(scriptPath);
+    const scratch = isolatedRoot("verify-packed-mismatch-");
+    const commands: Array<{ command: string; args: string[] }> = [];
+    try {
+      expect(() => module.executeConsumerTopology(scratch, {
+        spawn: (command: string, args: string[], options: { cwd: string }) => {
+          commands.push({ command, args });
+          if (args[0] === "pack") {
+            return { status: 0, stdout: JSON.stringify([{ filename: "lcm.tgz" }]), stderr: "" };
+          }
+          if (args[0] === "install") {
+            const packageRoot = join(options.cwd, "node_modules", "@donadiosolutions", "lcm");
+            mkdirSync(packageRoot, { recursive: true });
+            writeFileSync(join(packageRoot, "package.json"), JSON.stringify({
+              version: "1.0.0",
+              dependencies: { ...canonicalRuntimeDependencies, "safe-regex": "2.1.0" },
+            }));
+          }
+          return { status: 0, stdout: "1.0.0\n", stderr: "" };
+        },
+      })).toThrow("packed runtime dependencies differ from the canonical manifest");
+      expect(commands.map(({ command, args }) => [command, args[0]])).toEqual([
+        [process.platform === "win32" ? "pnpm.cmd" : "pnpm", "run"],
+        [process.platform === "win32" ? "npm.cmd" : "npm", "pack"],
+        [process.platform === "win32" ? "npm.cmd" : "npm", "install"],
+        [process.platform === "win32" ? "npm.cmd" : "npm", "install"],
+      ]);
+      expect(commands.some(({ command }) => command === process.execPath)).toBe(false);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("builds with pnpm and packs and installs both consumers with npm", async () => {
     const module = await import(scriptPath);
     const scratch = isolatedRoot("verify-managers-");
