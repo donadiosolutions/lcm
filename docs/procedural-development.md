@@ -53,8 +53,25 @@ One coordinator retains the run and is the only role that publishes or merges.
 It schedules as many as seven issue owners when their work is ready and
 independent. Owners plan, coordinate implementers, validate, and adjudicate their issue;
 security-sensitive remediation uses the security implementer role. The
-coordinator reports material events promptly and sends progress at least every
-30 minutes while the workflow remains active.
+coordinator reports material events promptly. In Codex it registers a heartbeat
+automation attached to the current task, with a default 30-minute cadence, through
+`mcp__codex_app__automation_update`. The heartbeat revisits the same authorized run;
+it does not create a standalone task. Unchanged state stays quiet unless you ask
+for periodic reports.
+
+Before dispatching campaign workers, the coordinator verifies the heartbeat's
+`ACTIVE` status, cadence and target. A registered heartbeat does not prove that a
+scheduled follow-up has executed. If the runtime does not expose the required
+control, the coordinator reports that capability gap and preserves existing work
+without claiming watchdog coverage. An explicit pause stops the heartbeat; an
+ordinary resume preserves the run, scope and spent review budgets. Replacing a
+coordinator additionally requires verified predecessor shutdown and worker handoff.
+See the [heartbeat lifecycle contract](../.agents/skills/procedural-development/references/root-lifecycle.md)
+for the exact tool binding and readback fields.
+
+Workers own their command handles through terminal exit and descendant cleanup.
+Active waits remain within runtime limits, independent of the heartbeat cadence;
+a wait timeout or an interrupted agent does not prove that its commands stopped.
 
 Each owner submits the review plan and every candidate commit SHA to two
 independent reviewers: `REVIEWER_A` and `REVIEWER_B`. A separate

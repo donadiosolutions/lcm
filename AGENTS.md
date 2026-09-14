@@ -12,6 +12,20 @@
 - For local development and pre-push verification, run only the tests relevant to the code being changed and its direct integration boundaries. If the impact is uncertain, err on the side of caution and widen the local test scope before pushing. Do not run unrelated local suites solely to duplicate the complete CI run; rely on CI to exercise the complete collected scope and enforce the 100% coverage gate.
 - Do not use coverage exclusions, `v8 ignore` directives, skipped tests, or untested production wrappers to satisfy the gate. Cover behavior through observable public seams and deterministic failure injection.
 
+## Agent Execution Invariants
+
+- Never launch an unbounded or host-stressing process tree, including test runners,
+  worker pools or reproductions. Behavior that exhausts shared host resources is
+  forbidden whether or not it is technically a fork bomb. Use explicit concurrency
+  and finite execution limits within the coordinator's host/run allocation.
+- Own every launched command through terminal exit/cancellation and verified
+  task-owned descendant cleanup. Do not report `task_complete` with unresolved
+  executions. A user-authorized persistent job requires acknowledged ownership
+  handoff; shared app-server/MCP processes are not yours to kill.
+- Local Vitest runs default to one worker; `CI=true` or `CI=1` retains CI sizing.
+  Local agents must use explicit allocated limits and must not spoof CI or bypass
+  caps. Follow [worker execution](.agents/skills/procedural-development/references/worker-execution.md).
+
 ## Codecov Components Maintenance
 
 - Update `codecov.yml` and `test/codecov-config.test.ts` atomically whenever production TypeScript, features, or components are added, removed, moved, materially changed, or otherwise make classification stale.
@@ -69,7 +83,11 @@ lcm connectors install <agent>
 lcm connectors doctor <agent>
 ```
 
-If anything fails, fix it before starting the next feature. A broken local env wastes time on every subsequent session (stale dist, wrong binary, hook errors, or mismatched native connector state).
+If anything fails, preserve the evidence and have the Environment Coordinator
+recover under the existing mutex. Work that depends on the failed environment
+waits; unrelated isolated work and ready PRs may continue. Pending refresh or failed
+verification blocks final environment audit and campaign completion, not all feature
+work. Never claim a healthy environment without the required verification.
 
 ## Documentation Requirements
 

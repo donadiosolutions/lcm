@@ -1549,7 +1549,17 @@ export function createHarnessCleanupOperations(context, dependencies = {}) {
   return { cleanup, teardown };
 }
 
-async function runTests(context, ci, setupDocker = docker, testProcess = runProcess) {
+function createDockerRunnerEnvironment(environment) {
+  return {
+    ...environment,
+    // The runner is a separate process and only receives the values written to
+    // runner.env. Preserve CI's established Vitest pool there as well.
+    CI: "true",
+    LCM_TEST_POSTGRES_INNER_CI: "true",
+  };
+}
+
+export async function runTests(context, ci, setupDocker = docker, testProcess = runProcess) {
   const env = { ...process.env, ...context.environment };
   delete env.LCM_TEST_POSTGRES_FORK_PROBE;
   delete env.LCM_TEST_POSTGRES_FORK_WORKER_PID_FILE;
@@ -1616,12 +1626,17 @@ async function runTests(context, ci, setupDocker = docker, testProcess = runProc
     join(repositoryRoot, "node_modules", "vitest", "vitest.mjs"),
     "run", "--config", join(repositoryRoot, "vitest.postgresql.config.ts"),
     join(repositoryRoot, "test", "postgresql", "signal.integration.ts"),
-  ], { cwd: repositoryRoot, env, secrets });
+  ], {
+    cwd: repositoryRoot,
+    env,
+    secrets,
+    processRunner: testProcess,
+    terminateOnStop: true,
+    terminateProcessTree: true,
+  });
   const envFile = join(context.directory, "runner.env");
-  writeFileSync(envFile, Object.entries({
-    ...context.environment,
-    LCM_TEST_POSTGRES_INNER_CI: "true",
-  }).map(([key, value]) => `${key}=${value}`).join("\n") + "\n", { mode: 0o600 });
+  writeFileSync(envFile, Object.entries(createDockerRunnerEnvironment(context.environment))
+    .map(([key, value]) => `${key}=${value}`).join("\n") + "\n", { mode: 0o600 });
   await setupDocker([
     "create", "--name", context.names.runner,
     ...dockerLabelArgs(ownershipLabels(context.runId, "runner", context.owner)),
@@ -1636,8 +1651,9 @@ async function runTests(context, ci, setupDocker = docker, testProcess = runProc
     "--config", "/workspace/vitest.postgresql.config.ts",
   ]);
   await runSanitizedProcess("docker", ["start", "--attach", context.names.runner], {
-    processRunner: (_command, args, processOptions) => docker(args, processOptions),
+    processRunner: (_command, args, processOptions) => setupDocker(args, processOptions),
     secrets,
+    terminateOnStop: true,
   });
 }
 

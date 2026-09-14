@@ -158,7 +158,13 @@ export function createVitestRunRoot(
   return root;
 }
 
-export function createVitestConfiguration(root: string): UserConfig {
+export function createVitestConfiguration(
+  root: string,
+  environment: Readonly<NodeJS.ProcessEnv> = process.env,
+): UserConfig {
+  // Parallel agent runs share the host. Keep local pools bounded while preserving
+  // existing CI sizing; a larger local allocation must be explicit and verified.
+  const maxWorkers = environment.CI === "true" || environment.CI === "1" ? undefined : 1;
   return {
     cacheDir: join(root, "cache"),
     test: {
@@ -167,6 +173,7 @@ export function createVitestConfiguration(root: string): UserConfig {
       include: ["**/*.test.ts"],
       exclude: ["node_modules/**", ".claude/**"],
       pool: "forks",
+      maxWorkers,
       coverage: {
         include: ["bin/**/*.ts", "installer/**/*.ts", "src/**/*.ts"],
         reportsDirectory: join(root, "coverage"),
@@ -186,6 +193,8 @@ export function createVitestConfiguration(root: string): UserConfig {
           test: {
             name: "unit-parallel",
             pool: "forks",
+            // Inline projects do not automatically inherit root options.
+            maxWorkers,
             globalSetup: runtimeHomeGlobalSetup,
             setupFiles: runtimeHomeSetup,
             include: ["test/**/*.test.ts"],
