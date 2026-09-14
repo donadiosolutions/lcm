@@ -7,9 +7,35 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      npm:
+      npm-routine:
         patterns:
           - "*"
+        exclude-patterns:
+          - "vitest"
+          - "@vitest/coverage-v8"
+        update-types:
+          - "minor"
+          - "patch"
+      vitest-routine:
+        patterns:
+          - "vitest"
+          - "@vitest/coverage-v8"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # Remove when typescript-eslint's supported TypeScript peer range includes 7.
+      - dependency-name: "typescript"
+        versions:
+          - ">=7.0.0"
+      # Remove when Vitest 5 and its V8 coverage package pass this repository's compatibility suite.
+      - dependency-name: "vitest"
+        versions:
+          - ">=5.0.0"
+      # Remove when Vitest 5's V8 coverage package passes this repository's compatibility suite with Vitest.
+      - dependency-name: "@vitest/coverage-v8"
+        versions:
+          - ">=5.0.0"
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -18,6 +44,14 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      github-actions:
+      github-actions-routine:
         patterns:
           - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # Remove when changesets/action 2 passes this repository's protected version-PR workflow validation.
+      - dependency-name: "changesets/action"
+        versions:
+          - ">=2.0.0"

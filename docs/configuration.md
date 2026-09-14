@@ -81,17 +81,15 @@ configuration and managed daemon; repair or reinstall with `lcm install`.
 
 The published CLI contains its MCP SDK build graph in `dist/lcm.mjs`. Consumer
 installations therefore do not receive a second external SDK, Express, or AJV
-dependency path from LCM. The exact SDK, `body-parser`, and `fast-uri` versions
-used to build that runtime remain pinned with lockfile integrity in the source
-package. LCM builds with `fast-uri` 4.1.4; AJV retains its nested patched
-`fast-uri` 3.1.7 dependency path, and Express and `body-parser` resolve `qs`
-6.16.0. These releases include fixes for malformed URI authority components and
-query-string parsing advisories without exposing additional parser paths in
-consumer installations. Update LCM to receive the corrected bundled runtime.
+dependency path from LCM. The exact SDK and parser build pins are declared in
+`package.json`; their nested parser overrides are declared in
+`pnpm-workspace.yaml`, and the frozen lockfile records their integrity. This
+preserves fixes for malformed URI authority components and query-string parsing
+advisories without exposing additional parser paths in consumer installations.
+Update LCM to receive the corrected bundled runtime.
 
-LCM's optional OpenAI integration requires the OpenAI SDK 7.3.0. The SDK is
-pinned as both a development dependency and an optional peer dependency; use
-Node.js 22.12.0 or newer.
+LCM's optional OpenAI integration is pinned as both a development dependency
+and an optional peer dependency in `package.json`; use Node.js 22.12.0 or newer.
 
 When the setup wizard's **Custom server** summarizer is selected, both the
 OpenAI-compatible server URL and model name are required. The wizard retries an

@@ -110,9 +110,7 @@ describe("release workflows", () => {
     const versionQueue = versionWorkflow.jobs.version.steps.find(
       (step) => step.name === "Enforce earlier manual transition success",
     );
-    expect(versionQueue?.uses).toBe(
-      "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
-    );
+    expect(versionQueue?.uses).toMatch(/^actions\/github-script@[0-9a-f]{40}$/u);
     expect(versionQueue?.with?.script).toContain('workflow_id: "version-pr.yml"');
     expect(versionQueue?.with?.script).toContain('event: "workflow_dispatch"');
     expect(versionQueue?.with?.script).toContain('status: "completed"');
@@ -124,9 +122,7 @@ describe("release workflows", () => {
       (step) => step.name === "Resolve release channel",
     );
     expect(channel?.id).toBe("channel");
-    expect(channel?.uses).toBe(
-      "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
-    );
+    expect(channel?.uses).toMatch(/^actions\/github-script@[0-9a-f]{40}$/u);
     expect(channel?.env).toMatchObject({
       EVENT_NAME: "${{ github.event_name }}",
       REQUESTED_CHANNEL: "${{ inputs.channel }}",
@@ -150,9 +146,8 @@ describe("release workflows", () => {
       version: "pnpm run version-packages",
       createGithubReleases: false,
     });
-    expect(changesets?.uses).toBe(
-      "changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d",
-    );
+    expect(changesets?.uses).toMatch(/^changesets\/action@[0-9a-f]{40}$/u);
+    expect(versionSource).toMatch(/changesets\/action@[0-9a-f]{40} # v1\.\d+\.\d+/u);
     expect(changesets?.env?.LCM_RELEASE_CHANNEL).toBe("${{ steps.channel.outputs.channel }}");
     expect(versionWorkflow.jobs.version.steps.indexOf(channel!)).toBeLessThan(
       versionWorkflow.jobs.version.steps.indexOf(changesets!),
@@ -188,7 +183,7 @@ describe("release workflows", () => {
       expect(index("Locate pnpm store")).toBeLessThan(index("Cache pnpm store"));
       expect(index("Cache pnpm store")).toBeLessThan(index("Install dependencies"));
       const cache = job.steps[index("Cache pnpm store")];
-      expect(cache.uses).toBe("actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9");
+      expect(cache.uses).toMatch(/^actions\/cache@[0-9a-f]{40}$/u);
       expect(cache.with?.path).toBe("${{ steps.pnpm-store.outputs.path }}");
       const prefix = job.defaults?.run["working-directory"] === "release" ? "release/" : "";
       for (const name of ["package.json", "pnpm-lock.yaml", ".npmrc", "pnpm-workspace.yaml", "scripts/bootstrap-pnpm.mjs"]) {
@@ -264,9 +259,7 @@ describe("release workflows", () => {
       (step: WorkflowStep): boolean =>
         step.name === "Checkout trusted default-branch release policy",
     );
-    expect(trustedPolicy?.uses).toBe(
-      "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-    );
+    expect(trustedPolicy?.uses).toMatch(/^actions\/checkout@[0-9a-f]{40}$/u);
     expect(trustedPolicy?.with).toMatchObject({
       ref: "${{ github.workflow_sha }}",
       path: "trusted",
@@ -276,9 +269,7 @@ describe("release workflows", () => {
     const publicationPolicy = publishWorkflow.jobs.preflight.steps.find(
       (step: WorkflowStep): boolean => step.name === "Validate trusted release provenance",
     );
-    expect(publicationPolicy?.uses).toBe(
-      "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
-    );
+    expect(publicationPolicy?.uses).toMatch(/^actions\/github-script@[0-9a-f]{40}$/u);
     expect(publicationPolicy?.with?.script).toMatch(
       /join\(\s*process\.env\.GITHUB_WORKSPACE,\s*"trusted"/u,
     );
@@ -339,9 +330,7 @@ describe("release workflows", () => {
     const codex = publishWorkflow.jobs.draft.steps.find(
       (step) => step.name === "Generate Highlights with Codex",
     );
-    expect(codex?.uses).toBe(
-      "openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e",
-    );
+    expect(codex?.uses).toMatch(/^openai\/codex-action@[0-9a-f]{40}$/u);
     expect(codex?.with).toMatchObject({
       "openai-api-key": "${{ secrets.OPENAI_API_KEY }}",
       "codex-version": "0.144.6",
@@ -445,9 +434,7 @@ describe("release workflows", () => {
     );
     expect(tagChecks).toHaveLength(2);
     for (const tagCheck of tagChecks) {
-      expect(tagCheck.uses).toBe(
-        "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3",
-      );
+      expect(tagCheck.uses).toMatch(/^actions\/github-script@[0-9a-f]{40}$/u);
       expect(tagCheck?.with?.script).toContain("annotatedTag.verification?.verified !== true");
       expect(tagCheck?.with?.script).toContain('ref.object.type !== "tag"');
     }
@@ -477,7 +464,7 @@ describe("release workflows", () => {
     expect(preflightSetupNodeIndex).toBe(1);
     expect(trustedProvenanceIndex).toBe(2);
     expect(preflightSteps[preflightSetupNodeIndex]).toMatchObject({
-      uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+      uses: expect.stringMatching(/^actions\/setup-node@[0-9a-f]{40}$/u),
       with: { "node-version": 24, "registry-url": "https://registry.npmjs.org/" },
     });
     expect(preflightSetupNodeIndex).toBeLessThan(trustedProvenanceIndex);
@@ -508,9 +495,7 @@ describe("release workflows", () => {
     expect(publishWorkflow.jobs.preflight.outputs?.artifact_name).toBe(
       "${{ steps.artifact.outputs.name }}",
     );
-    expect(upload?.uses).toBe(
-      "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-    );
+    expect(upload?.uses).toMatch(/^actions\/upload-artifact@[0-9a-f]{40}$/u);
     expect(upload?.with).toMatchObject({
       name: "${{ steps.artifact.outputs.name }}",
       path: "release/release-artifact/*.tgz",
@@ -581,7 +566,7 @@ describe("release workflows", () => {
     expect(recoverySetupNodeIndex).toBe(1);
     expect(recoveryPreflight.steps.indexOf(recoveryHistory!)).toBe(2);
     expect(recoveryPreflight.steps[recoverySetupNodeIndex]).toMatchObject({
-      uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+      uses: expect.stringMatching(/^actions\/setup-node@[0-9a-f]{40}$/u),
       with: { "node-version": 24, "registry-url": "https://registry.npmjs.org/" },
     });
     expect(recoverySetupNodeIndex).toBeLessThan(recoveryPreflight.steps.indexOf(recoveryHistory!));

@@ -229,11 +229,8 @@ describe("CI workflow", () => {
       expect(bootstrap).toContain("npm_config_store_dir=%s");
       expect(bootstrap).toContain('"$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"');
       expect(steps[locateIndex]?.run).toContain('store_path="$(pnpm store path)"');
-      const cacheSha = steps === setup.runs.steps
-        ? "cdf6c1fa76f9f475f3d7449005a359c84ca0f306"
-        : "55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
       expect(steps[cacheIndex]).toMatchObject({
-        uses: `actions/cache@${cacheSha}`,
+        uses: expect.stringMatching(/^actions\/cache@[0-9a-f]{40}$/u),
         with: {
           path: "${{ steps.pnpm-store.outputs.path }}",
           key: `pnpm-store-v1-\${{ runner.os }}-\${{ runner.arch }}-node-${nodeVersion}-\${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}`,
@@ -292,15 +289,15 @@ describe("CI workflow", () => {
       ).toEqual([
         {
           name: "Checkout",
-          uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          uses: expect.stringMatching(/^actions\/checkout@[0-9a-f]{40}$/u),
         },
         {
           name: "Initialize CodeQL",
-          uses: "github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938",
+          uses: expect.stringMatching(/^github\/codeql-action\/init@[0-9a-f]{40}$/u),
         },
         {
           name: "Analyze",
-          uses: "github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938",
+          uses: expect.stringMatching(/^github\/codeql-action\/analyze@[0-9a-f]{40}$/u),
         },
       ]);
     }
@@ -370,7 +367,7 @@ describe("CI workflow", () => {
     expect(uploadStep).toMatchObject({
       name: "Upload Vitest reports",
       if: "${{ !cancelled() }}",
-      uses: "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+      uses: expect.stringMatching(/^actions\/upload-artifact@[0-9a-f]{40}$/u),
       with: {
         name: "vitest-reports",
         path:
@@ -409,12 +406,12 @@ describe("CI workflow", () => {
 
     expect(checkout).toEqual({
       name: "Checkout",
-      uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+      uses: expect.stringMatching(/^actions\/checkout@[0-9a-f]{40}$/u),
       with: { "persist-credentials": false },
     });
     expect(node).toEqual({
       name: "Set up Node.js 25.9.0",
-      uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+      uses: expect.stringMatching(/^actions\/setup-node@[0-9a-f]{40}$/u),
       with: { "node-version": "25.9.0" },
     });
     expect(install?.run).toBe("pnpm install --frozen-lockfile");
@@ -504,12 +501,10 @@ describe("CI workflow", () => {
 
     expect(job.if).toBeUndefined();
     expect(job["continue-on-error"]).toBeUndefined();
-    expect(checkout?.uses).toBe(
-      "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-    );
+    expect(checkout?.uses).toMatch(/^actions\/checkout@[0-9a-f]{40}$/u);
     expect(node).toEqual({
       name: "Set up Node.js 25.9.0",
-      uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+      uses: expect.stringMatching(/^actions\/setup-node@[0-9a-f]{40}$/u),
       with: { "node-version": "25.9.0" },
     });
     expect(install?.run).toBe("pnpm install --frozen-lockfile");
@@ -803,7 +798,7 @@ describe("CI workflow", () => {
       expect(firstUploadIndex).toBeGreaterThan(checkoutIndex);
       expect(steps[checkoutIndex]).toEqual({
         name: "Checkout source for Codecov",
-        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        uses: expect.stringMatching(/^actions\/checkout@[0-9a-f]{40}$/u),
         with: {
           repository: "${{ github.repository }}",
           ref: "${{ github.sha }}",
@@ -852,9 +847,7 @@ describe("CI workflow", () => {
       const uploads = steps.filter((step) => step.uses?.startsWith("codecov/codecov-action@"));
       expect(uploads).toHaveLength(2);
       for (const upload of uploads) {
-        expect(upload.uses).toBe(
-          "codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f",
-        );
+        expect(upload.uses).toMatch(/^codecov\/codecov-action@[0-9a-f]{40}$/u);
         expect(upload.with).toMatchObject({
           binary: "${{ runner.temp }}/codecov",
           fail_ci_if_error: true,

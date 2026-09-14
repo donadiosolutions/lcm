@@ -43,13 +43,13 @@ bin directory at the front of `PATH` for nested scripts as well.
 `pnpm-lock.yaml` is authoritative. Clean development and CI installs use
 `pnpm install --frozen-lockfile`, which refuses manifest/lockfile drift. Do not
 recreate `package-lock.json`. `.npmrc` sets exact saves, isolated linking, and
-pre/post script execution. `pnpm-workspace.yaml` scopes the workspace to the
-root. Its exact overrides retain the established `read-yaml-file` 2.1.0
-resolution, keep AJV on the patched `fast-uri` 3.1.7 line without collapsing the
-separate direct 4.x parser, and hold both Express and `body-parser` on patched
-`qs` 6.16.0. Revisit the parser overrides whenever a later security release is
-required. Dependency build scripts remain limited to `esbuild` and optional
-macOS `fsevents`.
+pre/post script execution. `package.json` is the canonical source for direct,
+development, and optional peer pins; `pnpm-workspace.yaml` is the canonical
+source for workspace overrides and permitted build scripts. Those overrides
+retain the parser fixes for AJV, Express, and `body-parser` without exposing
+their build graph to consumers. Revisit the parser overrides whenever a later
+security release is required. Dependency build scripts remain limited to
+`esbuild` and optional macOS `fsevents`.
 
 Before adding a dependency, assess its exact version and transitive findings
 with `socket package score <ecosystem> <name>@<version> --json`. Add approved
