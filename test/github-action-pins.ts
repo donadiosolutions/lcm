@@ -12,7 +12,7 @@ export interface ActionReference {
 
 const externalAction = /^(?<repository>[^/@\s]+\/[^/@\s]+)(?:\/[^@\s]+)?@(?<sha>\S+)$/u;
 const usesLine = /^\s*(?:-\s+)?uses:\s*(?<target>[^\s#]+)(?:\s+#\s*(?<comment>.*?))?\s*$/u;
-const blockScalarHeader = /:\s*[>|](?:[+-]?\d?|\d?[+-]?)\s*(?:#.*)?$/u;
+const blockScalarHeader = /(?::\s*|^\s*-\s+)[>|](?:[+-]?\d?|\d?[+-]?)\s*(?:#.*)?$/u;
 
 interface EffectiveUse {
   target: string;

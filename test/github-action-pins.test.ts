@@ -112,6 +112,33 @@ describe("GitHub Action pin policy", () => {
     }
   });
 
+  it("rejects quoted and flow uses fields despite sequence-scalar decoys", () => {
+    const action = `actions/checkout@${collisionSha}`;
+    const unsupportedForms = [
+      `  - "uses": ${action}`,
+      `  - { uses: ${action} }`,
+    ];
+    const scalarIndicators = ["|", "|-", "|2-", ">", ">+", ">2+"];
+
+    for (const indicator of scalarIndicators) {
+      for (const unsupported of unsupportedForms) {
+        const source = [
+          "decoy:",
+          `  - ${indicator}`,
+          `    uses: ${action} # v4.2.2`,
+          "steps:",
+          `  - uses: ${action} # v4.2.2`,
+          unsupported,
+        ].join("\n");
+
+        expect(() => assertApprovedActionReferences(
+          parseActionReferences(source, "fixture.yml"),
+          approvedRepositories,
+        )).toThrow();
+      }
+    }
+  });
+
   it("allows a coherent SHA and version-comment update", () => {
     const references = parseActionReferences(
       [
