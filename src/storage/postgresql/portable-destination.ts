@@ -1,3 +1,4 @@
+import { PostgreSqlRuntime } from './runtime.js';
 import { createHash } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { Client, type QueryConfig, type QueryResult, type QueryResultRow } from 'pg';
@@ -60,15 +61,16 @@ interface DestinationState {
 }
 const authorities = new WeakMap<PortableRecordWriter, DestinationState>();
 const preflights = new WeakMap<PortablePreflight, {state:DestinationState; index:PortableIndex;manifestBytes:string}>();
+const completions = new WeakMap<PortableDestinationVerification,{state:DestinationState;manifest:PortableManifest;checkpoints:readonly string[]}>();
 const INITIAL = sha256('lcm-portable-initial-v1');
-const IDENTITY_DOMAINS = ['machines','project','project-aliases'] as const;
+export const IDENTITY_DOMAINS = ['machines','project','project-aliases'] as const;
 const UUID7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 function fail(code: ConstructorParameters<typeof PortableTransferError>[0]): never {
   throw new PortableTransferError(code, code === 'aborted' || code === 'destination-uncertain');
 }
 function abort(signal?: AbortSignal): void { if(signal?.aborted) fail('aborted'); }
-function options(state:DestinationState, signal?:AbortSignal):PostgreSqlQueryOptions {
+function options(state:{input:Pick<PostgreSqlPortableDestinationInput,"expectedIdentity">}, signal?:AbortSignal):PostgreSqlQueryOptions {
   return {domain:'factory',operation:'portableTransfer',projectId:state.input.expectedIdentity.id,signal};
 }
 function checkedState(authority:PortableRecordWriter):DestinationState {
@@ -98,12 +100,12 @@ function runMatches(state:DestinationState,row:RunRow,manifest:PortableManifest)
     && row.project_sha256===state.identityFingerprint
     && bytesEqual(row.manifest_bytes,serializePortableManifest(manifest));
 }
-async function runRow(state:DestinationState,executor:PostgreSqlQueryExecutor,lock=false,signal?:AbortSignal):Promise<RunRow|undefined> {
+async function runRow(state:{input:Pick<PostgreSqlPortableDestinationInput,"expectedIdentity">},executor:PostgreSqlQueryExecutor,lock=false,signal?:AbortSignal):Promise<RunRow|undefined> {
   const result=await executor.query<RunRow>({text:`SELECT run_id,target_generation,project_id::text,CASE WHEN octet_length(manifest_bytes)<=1048576 THEN manifest_bytes END AS manifest_bytes,manifest_sha256,state,current_domain,CASE WHEN octet_length(checkpoint_bytes)<=1048576 THEN checkpoint_bytes END AS checkpoint_bytes,checkpoint_sha256,project_sha256 FROM lcm.transfer_runs WHERE project_id=$1 ${lock?'FOR UPDATE':''}`,values:[state.input.expectedIdentity.id]},options(state,signal));
   if(result.rows.length>1) fail('destination-conflict');
   return result.rows[0];
 }
-async function readIdentityFingerprint(state:DestinationState,signal?:AbortSignal,executor:PostgreSqlQueryExecutor=state.executor):Promise<string> {
+async function readIdentityFingerprint(state:{input:Pick<PostgreSqlPortableDestinationInput,"expectedIdentity">;executor:PostgreSqlQueryExecutor},signal?:AbortSignal,executor:PostgreSqlQueryExecutor=state.executor):Promise<string> {
   const binding=await executor.query({text:`SELECT p.project_id::text FROM lcm.projects p JOIN lcm.project_aliases a ON a.project_id=p.project_id JOIN lcm.machines m ON m.machine_id=a.machine_id WHERE p.project_id=$1 AND a.machine_id=$2 AND a.path=$3 AND a.normalized_path=$4`,values:[state.input.expectedIdentity.id,state.input.expectedIdentity.machineId,state.input.expectedIdentity.selectedPath,normalizeProjectPath(state.input.expectedIdentity.selectedPath!)]},options(state,signal));
   if(binding.rows.length!==1) fail('destination-conflict');
   const digest=createHash('sha256');
@@ -156,9 +158,9 @@ async function assertIdentity(state:DestinationState,signal?:AbortSignal,executo
   if(await readIdentityFingerprint(state,signal,executor)!==state.identityFingerprint) fail('destination-conflict');
   if(state.index)await assertSourceMachines(state,state.index,signal,executor);
 }
-async function assertEmpty(state:DestinationState,signal?:AbortSignal):Promise<void> {
-  for(const domain of PORTABLE_RECORD_DOMAIN_ORDER.slice(3)){
-    if((await listCanonicalHeaders(state.executor,state.input.expectedIdentity.id,domain,null,1,signal)).length) fail('destination-conflict');
+async function assertEmpty(state:DestinationState,signal?:AbortSignal,executor:PostgreSqlQueryExecutor=state.executor):Promise<void> {
+  for(const domain of PORTABLE_RECORD_DOMAIN_ORDER.filter(domain=>!(IDENTITY_DOMAINS as readonly string[]).includes(domain))){
+    if((await listCanonicalHeaders(executor,state.input.expectedIdentity.id,domain,null,1,signal)).length) fail('destination-conflict');
   }
 }
 async function connect(state:DestinationState,signal?:AbortSignal):Promise<void> {
@@ -260,31 +262,69 @@ async function preflight(state:DestinationState,manifestInput:PortableManifest,s
     return token;
   }catch(error){index.close();throw normalizePortableTransferError(error);}
 }
-async function admit(state:DestinationState,manifestInput:PortableManifest,token:PortablePreflight,signal?:AbortSignal):Promise<void>{
-  const manifest=negotiatePortableManifest(manifestInput);
+function validatePreflight(state:DestinationState,manifest:PortableManifest,token:PortablePreflight):void {
   const validation=preflights.get(token);
-  if(!validation || validation.state!==state || validation.index!==state.index || token.destinationWitnessSha256!==state.witness || validation.manifestBytes!==Buffer.from(serializePortableManifest(manifest)).toString('base64')) fail('destination-conflict');
-  await assertIdentity(state,signal);
-  try{await transaction(state,async executor=>{
-    const existing=await runRow(state,executor,true,signal);
-    if(existing){if(!runMatches(state,existing,manifest))fail('destination-conflict');return;}
-    await assertEmpty(state,signal);
+  if(!validation || validation.state!==state || validation.index!==state.index || token.destinationWitnessSha256!==state.witness || validation.manifestBytes!==Buffer.from(serializePortableManifest(manifest)).toString('base64'))fail('destination-conflict');
+}
+async function assertTransaction(state:DestinationState,executor:PostgreSqlQueryExecutor,signal?:AbortSignal):Promise<void>{
+  if(executor.transactionScope!=='active')fail('destination-conflict');
+  await assertIdentity(state,signal,executor);
+  if(await readPostgreSqlPortableWitness(executor,state.input.expectedIdentity.id,signal)!==state.witness)fail('destination-conflict');
+  const isolation=await executor.query({text:"SELECT current_setting('transaction_isolation') AS isolation,current_setting('transaction_read_only') AS readonly"},options(state,signal));
+  if(isolation.rows[0]?.isolation!=='read committed'||isolation.rows[0]?.readonly!=='off')fail('destination-conflict');
+}
+/** Admission is tentative until authoritative run readback retains the manifest. */
+export async function admitPortableDestinationInTransaction(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,manifestInput:PortableManifest,token:PortablePreflight,signal?:AbortSignal):Promise<void>{
+  const state=checkedState(authority);
+  const manifest=negotiatePortableManifest(manifestInput);
+  validatePreflight(state,manifest,token);
+  await assertTransaction(state,executor,signal);
+  const existing=await runRow(state,executor,true,signal);
+  if(existing){if(!runMatches(state,existing,manifest))fail('destination-conflict');return;}
+  await assertEmpty(state,signal,executor);
     await executor.query({text:`INSERT INTO lcm.transfer_runs (run_id,target_generation,project_id,manifest_bytes,manifest_sha256,schema_sha256,project_sha256,source_sha256,source_witness_sha256,state) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active')`,values:[state.input.runId,state.input.generationId,state.input.expectedIdentity.id,Buffer.from(serializePortableManifest(manifest)),manifest.manifestSha256,manifest.schemaSha256,state.identityFingerprint,manifest.source.sourceIdentitySha256,manifest.source.sourceWitnessSha256]},options(state,signal));
-  },signal);}catch(error){
+}
+/** Caller serializes missing-run proof on the project copy lease first. */
+export async function readPortableRunInTransaction(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,manifestInput:PortableManifest,token:PortablePreflight,signal?:AbortSignal):Promise<{state:'active'|'completed'}|null>{
+  const state=checkedState(authority);
+  const manifest=negotiatePortableManifest(manifestInput);
+  validatePreflight(state,manifest,token);
+  await assertTransaction(state,executor,signal);
+  const row=await runRow(state,executor,true,signal);
+  if(!row)return null;
+  if(!runMatches(state,row,manifest)||(row.state!=='active'&&row.state!=='completed'))fail('destination-conflict');
+  state.manifest=manifest;
+  return {state:row.state};
+}
+/** Exact immutable receipt proof, after locking the matching durable run. */
+export async function readPortableBatchReceiptInTransaction(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,batch:PortableBatch,signal?:AbortSignal):Promise<{checkpoint:PortableCheckpoint;batchSha256:string}|null>{
+  const state=checkedState(authority);
+  if(!state.manifest)fail('destination-conflict');
+  await assertTransaction(state,executor,signal);
+  const row=await runRow(state,executor,true,signal);
+  if(!row||!runMatches(state,row,state.manifest))fail('destination-conflict');
+  const checkpoint=await receipt(state,executor,batch,signal);
+  return checkpoint?{checkpoint,batchSha256:batchDigest(batch)}:null;
+}
+async function admit(state:DestinationState,authority:PortableRecordWriter,manifestInput:PortableManifest,token:PortablePreflight,signal?:AbortSignal):Promise<void>{
+  const manifest=negotiatePortableManifest(manifestInput);
+  try{await transaction(state,executor=>admitPortableDestinationInTransaction(executor,authority,manifest,token,signal),signal);}
+  catch(error){
     if(!(error instanceof PortableTransferError)||error.code!=='destination-uncertain')throw error;
     await reconcileRun(state,manifest,false);
   }
   state.manifest=manifest;
 }
-async function progress(state:DestinationState,manifestSha256:string,signal?:AbortSignal):Promise<PortableDestinationProgress>{
-  await assertIdentity(state,signal);
+
+async function progress(state:DestinationState,manifestSha256:string,signal?:AbortSignal,executor:PostgreSqlQueryExecutor=state.executor):Promise<PortableDestinationProgress>{
+  await assertIdentity(state,signal,executor);
   if(!state.manifest || state.manifest.manifestSha256!==manifestSha256)fail('destination-conflict');
-  const row=await runRow(state,state.executor,false,signal);
+  const row=await runRow(state,executor,false,signal);
   if(!row||!runMatches(state,row,state.manifest)||(row.checkpoint_bytes===null)!==(row.checkpoint_sha256===null))fail('destination-conflict');
   const checkpoints:PortableCheckpoint[]=[];
   // At most22 rows, independently bounded checkpoint bytea at schema control limit.
   for(const domain of PORTABLE_RECORD_DOMAIN_ORDER){
-    const found=await state.executor.query<{checkpoint_bytes:Buffer}>({text:'SELECT CASE WHEN octet_length(checkpoint_bytes)<=1048576 THEN checkpoint_bytes END AS checkpoint_bytes FROM lcm.transfer_batches WHERE run_id=$1 AND domain=$2 ORDER BY next_ordinal DESC LIMIT 1',values:[state.input.runId,domain]},options(state,signal));
+    const found=await executor.query<{checkpoint_bytes:Buffer}>({text:'SELECT CASE WHEN octet_length(checkpoint_bytes)<=1048576 THEN checkpoint_bytes END AS checkpoint_bytes FROM lcm.transfer_batches WHERE run_id=$1 AND domain=$2 ORDER BY next_ordinal DESC LIMIT 1',values:[state.input.runId,domain]},options(state,signal));
     if(!found.rows.length)break;
     const checkpoint=parsePortableCheckpoint(found.rows[0]!.checkpoint_bytes);
     checkpoints.push(checkpoint);if(!checkpoint.complete)break;
@@ -362,7 +402,7 @@ async function apply(state:DestinationState,authority:PortableRecordWriter,batch
     fail('destination-uncertain');
   }
 }
-async function verify(state:DestinationState,manifest:PortableManifest,signal?:AbortSignal):Promise<PortableDestinationVerification>{
+async function canonicalVerification(state:DestinationState,manifest:PortableManifest,signal?:AbortSignal,onVerified?:(result:PortableDestinationVerification)=>Promise<void>):Promise<PortableDestinationVerification>{
   const saved=await progress(state,manifest.manifestSha256,signal);
   if(saved.checkpoints.length!==PORTABLE_RECORD_DOMAIN_ORDER.length||saved.checkpoints.some(checkpoint=>!checkpoint.complete))fail('verification-failed');
   const source=await createPostgreSqlPortableSource({settings:state.input.settings,expectedOwner:state.input.expectedOwner,expectedIdentity:state.input.expectedIdentity,admission:'transfer',scratchParent:state.input.scratchParent,signal});
@@ -373,17 +413,47 @@ async function verify(state:DestinationState,manifest:PortableManifest,signal?:A
     const actual=stream.describe();
     if(actual.contentSha256!==manifest.contentSha256 || actual.domains.some((domain,index)=>domain.recordCount!==manifest.domains[index]!.recordCount||domain.prefixSha256!==manifest.domains[index]!.prefixSha256))fail('verification-failed');
     await assertIdentity(state,signal);
-    try{await transaction(state,async executor=>{
-      const row=await runRow(state,executor,true,signal);
-      if(!row||!runMatches(state,row,manifest))fail('destination-conflict');
-      await executor.query({text:"UPDATE lcm.transfer_runs SET state='completed' WHERE run_id=$1",values:[state.input.runId]},options(state,signal));
-    },signal);}catch(error){
+    const result:PortableDestinationVerification={manifestSha256:manifest.manifestSha256,contentSha256:actual.contentSha256,domains:actual.domains.map(({domain,recordCount,prefixSha256})=>({domain,recordCount,prefixSha256})),complete:true};
+    completions.set(result,{state,manifest,checkpoints:saved.checkpoints.map(checkpoint=>checkpoint.checkpointSha256)});
+    await onVerified?.(result);
+    return result;
+  }catch(error){primary=error;throw error;}
+  finally{try{if(stream)await stream.close();else await source.close();}catch{if(primary===undefined)fail('close-failed');}}
+}
+
+/** Completes only the exact terminal prefix authenticated by canonical verification. */
+async function verifiedCompletionState(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,verification:PortableDestinationVerification,signal?:AbortSignal):Promise<{state:DestinationState;row:RunRow}>{
+  const state=checkedState(authority);
+  const proof=completions.get(verification);
+  if(!proof||proof.state!==state)fail('verification-failed');
+  await assertTransaction(state,executor,signal);
+  const row=await runRow(state,executor,true,signal);
+  if(!row||!runMatches(state,row,proof.manifest))fail('destination-conflict');
+  const saved=await progress(state,proof.manifest.manifestSha256,signal,executor);
+  if(canonicalJson(saved.checkpoints.map(checkpoint=>checkpoint.checkpointSha256))!==canonicalJson(proof.checkpoints))fail('verification-failed');
+  return {state,row};
+}
+export async function completePortableDestinationInTransaction(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,verification:PortableDestinationVerification,signal?:AbortSignal):Promise<void>{
+  const {state}=await verifiedCompletionState(executor,authority,verification,signal);
+  await executor.query({text:"UPDATE lcm.transfer_runs SET state='completed' WHERE run_id=$1",values:[state.input.runId]},options(state,signal));
+}
+export async function readPortableCompletedRunInTransaction(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,verification:PortableDestinationVerification,signal?:AbortSignal):Promise<boolean>{
+  const {row}=await verifiedCompletionState(executor,authority,verification,signal);
+  if(row.state!=='active'&&row.state!=='completed')fail('destination-conflict');
+  return row.state==='completed';
+}
+
+export async function verifyPortableDestinationComplete(authority:PortableRecordWriter,manifest:PortableManifest,signal?:AbortSignal):Promise<PortableDestinationVerification>{
+  return canonicalVerification(checkedState(authority),manifest,signal);
+}
+async function verify(state:DestinationState,authority:PortableRecordWriter,manifest:PortableManifest,signal?:AbortSignal):Promise<PortableDestinationVerification>{
+  return canonicalVerification(state,manifest,signal,async result=>{
+    try{await transaction(state,executor=>completePortableDestinationInTransaction(executor,authority,result,signal),signal);}
+    catch(error){
       if(!(error instanceof PortableTransferError)||error.code!=='destination-uncertain')throw error;
       await reconcileRun(state,manifest,true);
     }
-    return {manifestSha256:manifest.manifestSha256,contentSha256:actual.contentSha256,domains:actual.domains.map(({domain,recordCount,prefixSha256})=>({domain,recordCount,prefixSha256})),complete:true};
-  }catch(error){primary=error;throw error;}
-  finally{try{if(stream)await stream.close();else await source.close();}catch{if(primary===undefined)fail('close-failed');}}
+  });
 }
 
 /** Admit a fresh isolated project generation, or resume its exact durable run. */
@@ -401,10 +471,10 @@ export async function createPostgreSqlPortableDestination(input:PostgreSqlPortab
     const boundSignal=(signal?:AbortSignal):AbortSignal|undefined=>state.input.signal&&signal?AbortSignal.any([state.input.signal,signal]):signal??state.input.signal;
     const writer:PortableRecordWriter={
       preflight:(manifest,source,signal)=>enqueue(state,()=>preflight(state,manifest,source,boundSignal(signal))),
-      admit:(manifest,token,signal)=>enqueue(state,()=>admit(state,manifest,token,boundSignal(signal))),
+      admit:(manifest,token,signal)=>enqueue(state,()=>admit(state,writer,manifest,token,boundSignal(signal))),
       readProgress:(manifest,signal)=>enqueue(state,()=>progress(state,manifest,boundSignal(signal))),
       applyBatch:(batch,signal)=>enqueue(state,()=>apply(state,writer,batch,boundSignal(signal))),
-      verifyComplete:(manifest,signal)=>enqueue(state,()=>verify(state,manifest,boundSignal(signal))),
+      verifyComplete:(manifest,signal)=>enqueue(state,()=>verify(state,writer,manifest,boundSignal(signal))),
       close:()=>{
         if(!state.closePromise){
           state.closing=true;
@@ -415,4 +485,38 @@ export async function createPostgreSqlPortableDestination(input:PostgreSqlPortab
     };
     authorities.set(writer,state);return writer;
   }catch(error){if(state.client)await state.client.end().catch(()=>undefined);throw normalizePortableTransferError(error);}
+}
+
+export type PostgreSqlPortableDestinationProbe = Readonly<{
+  destinationWitnessSha256:string;
+  identityFingerprintSha256:string;
+  nonIdentityDomainsEmpty:boolean;
+  existingRun:null|Readonly<{runId:string;targetGenerationId:string;manifestSha256:string;projectFingerprintSha256:string;state:'active'|'completed'}>;
+}>;
+/** Read-only preparation, with the default project publication guard and no writer lock. */
+export async function probePostgreSqlPortableDestination(input:Pick<PostgreSqlPortableDestinationInput,'settings'|'expectedOwner'|'expectedIdentity'|'signal'>):Promise<PostgreSqlPortableDestinationProbe>{
+  const runtime=new PostgreSqlRuntime(input.settings);
+  let primary:unknown;
+  try{
+    await verifyPostgreSqlTransferSchema(runtime,{expectedOwner:input.expectedOwner,signal:input.signal});
+    return await runtime.transaction(async executor=>{
+      const state={input,executor};
+      const safety=await executor.query({text:"SELECT current_setting('server_version_num')::int AS version,current_setting('server_encoding') AS encoding,s.ssl AS tls FROM pg_catalog.pg_stat_ssl s WHERE s.pid=pg_backend_pid()"},options(state,input.signal));
+      if(safety.rows[0]?.tls!==true||Math.floor(Number(safety.rows[0]?.version)/10000)!==18||safety.rows[0]?.encoding!=='UTF8')fail('destination-conflict');
+      const destinationWitnessSha256=await readPostgreSqlPortableWitness(executor,input.expectedIdentity.id,input.signal);
+      const identityFingerprintSha256=await readIdentityFingerprint(state,input.signal);
+      let nonIdentityDomainsEmpty=true;
+      for(const domain of PORTABLE_RECORD_DOMAIN_ORDER.filter(domain=>!(IDENTITY_DOMAINS as readonly string[]).includes(domain))){
+        if((await listCanonicalHeaders(executor,input.expectedIdentity.id,domain,null,1,input.signal)).length)nonIdentityDomainsEmpty=false;
+      }
+      const row=await runRow(state,executor,false,input.signal);
+      if(row&&(!/^[A-Za-z0-9_-]{1,128}$/u.test(row.run_id)||!/^[A-Za-z0-9_-]{1,128}$/u.test(row.target_generation)
+        || !/^[a-f0-9]{64}$/u.test(row.manifest_sha256)||row.project_sha256!==identityFingerprintSha256
+        ||(row.state!=='active'&&row.state!=='completed')))fail('destination-conflict');
+      return {destinationWitnessSha256,identityFingerprintSha256,nonIdentityDomainsEmpty,existingRun:row?{
+        runId:row.run_id,targetGenerationId:row.target_generation,manifestSha256:row.manifest_sha256,
+        projectFingerprintSha256:row.project_sha256,state:row.state as 'active'|'completed'}:null};
+    },{domain:'factory',operation:'probePortableDestination',projectId:input.expectedIdentity.id,transactionMode:'read-committed-read-write',signal:input.signal});
+  }catch(error){primary=error;throw normalizePortableTransferError(error);}
+  finally{try{await runtime.close();}catch{if(primary===undefined)fail('close-failed');}}
 }

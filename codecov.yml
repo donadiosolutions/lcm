@@ -262,7 +262,7 @@ component_management:
         - "^src/storage/portable-index\\.ts$"
         - "^src/storage/postgresql/project-storage\\.ts$"
     - component_id: "unit-migration-cutover"
-      name: "Unit - Migration and Cutover"
+      name: "Unit - Migration Capture, Copy and Cutover"
       paths:
         # #681 leaves protocol-specific manifest replacement in this component.
         # #622 keeps immutable SQLite capture, maintenance preparation, and
