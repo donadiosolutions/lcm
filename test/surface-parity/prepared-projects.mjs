@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, readdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, isAbsolute, resolve } from 'node:path';
 import { assertSemanticEqual, assertLogicalSnapshotUnchanged } from './assertions.mjs';
 
 const CASES = {
@@ -17,7 +17,22 @@ export const SCENARIO_ORDER = ['identity', 'admin', 'events', 'memory', 'compact
 const CASE_ORDER = Object.keys(CASES);
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-7[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(value);
 const hash = value => createHash('sha256').update(value).digest('hex');
-const equal = (a, b, id) => assertSemanticEqual(a, b, `prepared-${id}`);
+const safeFields = new Set(['mode', 'uid', 'gid', 'nlink', 'inode', 'dev', 'children', 'sha256', 'bytes', 'missing',
+  'directory', 'leaves', 'parent', 'content', 'value', 'witness', 'canonical', 'aliases', 'remoteProjectId', 'discovery',
+  'mapFingerprint', 'codexFingerprint', 'complete', 'sourceHashes', 'pendingSourceHashes', 'createdAt', 'updatedAt']);
+function unequalField(a, b, depth = 0) {
+  if (depth >= 3 || !a || !b || typeof a !== 'object' || typeof b !== 'object') return 'value';
+  for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    if (JSON.stringify(a[key]) === JSON.stringify(b[key])) continue;
+    const name = safeFields.has(key) ? key : /^\d+$/u.test(key) ? 'index' : 'entry';
+    return `${name}.${unequalField(a[key], b[key], depth + 1)}`;
+  }
+  return 'order';
+}
+const equal = (a, b, id) => {
+  try { return assertSemanticEqual(a, b, `prepared-${id}`); }
+  catch (error) { error.surfacePreparedField = unequalField(a, b); throw error; }
+};
 const check = (condition, id) => assert.ok(condition, `surface-prepared:${id}`);
 export function preparedCase(caseId, scenario, paths) {
   const spec = CASES[caseId];
@@ -91,7 +106,8 @@ export function capturePreparedMetadata(homeDir) {
   for (const name of readdirSync(root).sort()) {
     if (!['config.json', 'map.json', 'machine.json', 'backend-publication', 'projects', 'events', 'oldmaps'].includes(name)) visit(join(root, name), name);
   }
-  return { map, mapFile, backups, otherLeaves, backupRoot: stat ? { inode: stat.ino, dev: stat.dev, mode: stat.mode, uid: stat.uid, gid: stat.gid } : null };
+  const journals = capturePreparedJournals(homeDir);
+  return { map, mapFile, backups, otherLeaves, journals, backupRoot: stat ? { inode: stat.ino, dev: stat.dev, mode: stat.mode, uid: stat.uid, gid: stat.gid } : null };
 }
 
 export function validatePreparedBundle(caseId, scenario, paths, backend, bundle) {
@@ -136,6 +152,15 @@ export function validatePreparedDelta({ caseId, scenario, paths, backend, bundle
     // Existing CLI bootstrap republishes exactly this authenticated witness.
     // No other leaf or field acquires an atomic-publication exception.
     otherLeaves[name] = { ...newWitness, inode: oldWitness.inode };
+  }
+  if (after.journalProof) {
+    check(journalProofs.has(after.journalProof), 'journal-proof-authority');
+    equal(current.journals, after.journalProof.after, 'journal-final-capture');
+    equal(prior.journals, after.journalProof.before, 'journal-before-capture');
+    for (const path of after.journalProof.changedPaths) {
+      if (Object.hasOwn(prior.otherLeaves, path)) otherLeaves[path] = prior.otherLeaves[path];
+      else delete otherLeaves[path];
+    }
   }
   equal(otherLeaves, prior.otherLeaves ?? {}, 'other-metadata');
   let map = structuredClone(prior.map);
@@ -283,19 +308,21 @@ export function capturePreparedInputs(paths) {
     join(paths.homeDir, 'import-collision-a'), join(paths.homeDir, 'import-collision')]) visit(path);
   return entries;
 }
-export function validatePreparedInputs(caseId, scenario, paths, before, after, owner) {
+export function validatePreparedInputs(caseId, scenario, paths, before, after, owner, prefix = {}) {
   const targets = preparedCase(caseId, scenario, paths);
   if (caseId === 'identity-roots') targets.push(join(dirname(paths.projectPath), 'surface-identity-alias'));
   const allowed = new Map();
   const directory = path => allowed.set(path, { kind: 'directory' });
   const file = (path, bytes) => allowed.set(path, { kind: 'file', sha256: hash(bytes) });
-  for (const target of targets) {
+  for (const [index, target] of targets.entries()) {
+    if (index >= (prefix.targetCount ?? targets.length)) continue;
     directory(target); directory(join(target, '.git')); directory(join(target, '.git/objects'));
     file(join(target, '.git/HEAD'), 'ref: refs/heads/main\n');
     file(join(target, '.git/config'), '[core]\nrepositoryformatversion = 0\n'
       + (caseId === 'import-collisions' ? '[remote "origin"]\nurl = https://example.invalid/parity-import.git\n' : ''));
     if (caseId === 'import-collisions') {
-      directory(join(paths.homeDir, 'import-collision'));
+      if (index === 1) directory(join(paths.homeDir, 'import-collision'));
+      if (index >= (prefix.ownerCount ?? targets.length)) continue;
       directory(join(target, '.git/worktrees')); directory(join(target, '.git/worktrees/parity-owner'));
       file(join(target, '.git/worktrees/parity-owner/codex-thread.json'), '{"version":1,"ownerThreadId":"parity-ambiguous"}\n');
     }
@@ -320,4 +347,255 @@ export function validatePreparedInputs(caseId, scenario, paths, before, after, o
     check(after[path]?.kind === expected.kind, 'input-required');
     if (expected.kind === 'file') check(after[path].sha256 === expected.sha256, 'input-required-bytes');
   }
+}
+
+const journalProofs = new WeakSet();
+const journalKeys = new Set(['version', 'targetHash', 'canonical', 'sourceHashes', 'pendingSourceHashes', 'aliases',
+  'remoteProjectId', 'createdAt', 'updatedAt', 'archiveAt', 'phase', 'blockedFrom', 'backupPaths', 'discovery', 'sourceComponents', 'reason']);
+const hashString = value => typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value);
+const iso = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+function journalSchema(value, name) {
+  check(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => journalKeys.has(key)), 'journal-schema');
+  check(value.version === 1 && hashString(value.targetHash) && name === `${value.targetHash}.json`
+    && isAbsolute(value.canonical) && resolve(value.canonical) === value.canonical, 'journal-target');
+  check(Array.isArray(value.sourceHashes) && value.sourceHashes.every(hashString) && !value.sourceHashes.includes(value.targetHash)
+    && new Set(value.sourceHashes).size === value.sourceHashes.length, 'journal-sources');
+  check(value.pendingSourceHashes === undefined || (Array.isArray(value.pendingSourceHashes)
+    && value.pendingSourceHashes.every(id => value.sourceHashes.includes(id))
+    && new Set(value.pendingSourceHashes).size === value.pendingSourceHashes.length), 'journal-pending');
+  for (const key of ['aliases', 'backupPaths']) check(Array.isArray(value[key]) && value[key].every(path => typeof path === 'string' && isAbsolute(path)), `journal-${key}`);
+  check(iso(value.createdAt) && iso(value.updatedAt) && (value.archiveAt === undefined || iso(value.archiveAt)), 'journal-times');
+  check(['planned', 'merged', 'archived', 'completed', 'blocked'].includes(value.phase)
+    && (value.blockedFrom === undefined || ['planned', 'merged', 'archived'].includes(value.blockedFrom)), 'journal-phase');
+  check((value.remoteProjectId === undefined || uuid(value.remoteProjectId)) && (value.reason === undefined || typeof value.reason === 'string'), 'journal-optionals');
+  if (value.discovery !== undefined) check(value.discovery && Object.keys(value.discovery).sort().join(',') === 'codexFingerprint,complete,mapFingerprint'
+    && hashString(value.discovery.mapFingerprint) && hashString(value.discovery.codexFingerprint) && typeof value.discovery.complete === 'boolean', 'journal-discovery');
+  if (value.sourceComponents !== undefined) {
+    check(value.sourceComponents && typeof value.sourceComponents === 'object' && !Array.isArray(value.sourceComponents), 'journal-components');
+    for (const [id, component] of Object.entries(value.sourceComponents)) check(value.sourceHashes.includes(id) && component
+      && Object.keys(component).every(key => ['projectDb', 'eventsDb', 'patterns', 'patternsDigest'].includes(key))
+      && ['projectDb', 'eventsDb', 'patterns'].every(key => typeof component[key] === 'boolean')
+      && (component.patternsDigest === undefined || hashString(component.patternsDigest)), 'journal-component');
+  }
+}
+function directoryIdentity(stat) {
+  check(stat.isDirectory() && stat.uid === process.getuid(), 'journal-root-authority');
+  return { inode: stat.ino, dev: stat.dev, uid: stat.uid, gid: stat.gid, mode: stat.mode, nlink: stat.nlink };
+}
+export function capturePreparedJournals(homeDir) {
+  const path = join(homeDir, '.lcm/reconciliations');
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (!stat) return { directory: null, leaves: {}, parent: directoryIdentity(lstatSync(join(homeDir, '.lcm'))) };
+  check(stat.isDirectory() && stat.mode === 0o40700 && stat.uid === process.getuid(), 'journal-directory');
+  const children = readdirSync(path).sort();
+  check(children.length <= 4096 && children.every(name => /^[a-f0-9]{64}\.json$/u.test(name)), 'journal-boundary-children');
+  const directory = { inode: stat.ino, dev: stat.dev, uid: stat.uid, gid: stat.gid, mode: stat.mode, nlink: stat.nlink, children };
+  const leaves = {};
+  for (const name of children) {
+    const leaf = join(path, name);
+    const stat = lstatSync(leaf);
+    check(stat.isFile() && stat.size <= 4 * 1024 * 1024, 'journal-file-bound');
+    const witness = fileWitness(leaf);
+    check(witness.dev === directory.dev, 'journal-device');
+    const content = readFileSync(leaf, 'utf8');
+    check(hash(content) === witness.sha256, 'journal-capture-race');
+    const value = JSON.parse(content);
+    journalSchema(value, name);
+    leaves[name] = { witness, content, value };
+  }
+  return { directory, leaves, parent: directoryIdentity(lstatSync(join(homeDir, '.lcm'))) };
+}
+function assertJournalBytes(actual, expected, id) {
+  // Diagnose only the fixed schema field, never emit journal values or paths.
+  for (const key of journalKeys) check(JSON.stringify(actual.value[key]) === JSON.stringify(expected[key]), `journal-${id}-${key}`);
+  check(actual.content === JSON.stringify(expected, null, 2) + '\n', `journal-${id}-serialization`);
+  check(actual.witness.sha256 === hash(actual.content) && actual.witness.bytes === Buffer.byteLength(actual.content), 'journal-byte-witness');
+}
+export function validateJournalCall(before, after, operation, owner) {
+  equal({ ...after.parent, nlink: before.parent.nlink }, before.parent, 'journal-root-preserved');
+  const target = operation?.target;
+  const name = target === undefined ? undefined : `${hash(target)}.json`;
+  const old = name && before.leaves[name];
+  const current = name && after.leaves[name];
+  const changed = [];
+  let write = false;
+  if (target !== undefined) {
+    check(operation.reference?.sourceHashes.length === 0, 'journal-current-sources');
+    const { discovery, aliases, remoteProjectId } = operation.reference;
+    const fastDiscovery = operation.fastDiscovery ?? discovery;
+    const skip = old?.value.phase === 'completed' && old.value.canonical === target
+      && old.value.discovery?.complete === true && fastDiscovery.complete === true
+      && old.value.discovery.mapFingerprint === fastDiscovery.mapFingerprint && old.value.discovery.codexFingerprint === fastDiscovery.codexFingerprint;
+    if (!skip) {
+      check(current, 'journal-required');
+      const inWindow = value => iso(value) && Date.parse(value) >= Math.min(operation.start, operation.end)
+        && Date.parse(value) <= Math.max(operation.start, operation.end);
+      check(Number.isFinite(operation.start) && Number.isFinite(operation.end) && inWindow(current.value.updatedAt), 'journal-updatedAt-window');
+      if (!old) check(inWindow(current.value.createdAt), 'journal-createdAt-window');
+      else {
+        check(old.value.canonical === target, 'journal-old-canonical');
+        const retry = old.value.phase === 'blocked' && (old.value.blockedFrom ?? 'planned') === 'planned'
+          && old.value.pendingSourceHashes?.length === 0;
+        check(old.value.phase === 'completed' || retry || (old.value.pendingSourceHashes ?? old.value.sourceHashes).length === 0, 'journal-old-pending');
+        check(old.value.phase === 'completed' || remoteProjectId === old.value.remoteProjectId
+          || (retry && old.value.sourceHashes.length === 0 && old.value.remoteProjectId === undefined), 'journal-old-binding');
+      }
+      const expected = old ? structuredClone(old.value) : {
+        version: 1, targetHash: hash(target), canonical: target, sourceHashes: [], aliases,
+        ...(remoteProjectId ? { remoteProjectId } : {}), createdAt: current.value.createdAt,
+        updatedAt: current.value.updatedAt, phase: 'completed', backupPaths: [],
+      };
+      expected.aliases = [...new Set([...(old?.value.aliases ?? []), ...aliases])];
+      expected.pendingSourceHashes = [];
+      expected.discovery = discovery;
+      expected.phase = 'completed';
+      delete expected.reason;
+      expected.updatedAt = current.value.updatedAt;
+      assertJournalBytes(current, expected, 'write');
+      const witness = current.witness;
+      check(witness.mode === 0o100600 && witness.uid === owner && witness.nlink === 1 && witness.dev === after.directory?.dev
+        && witness.gid === after.directory.gid
+        && Number.isSafeInteger(witness.inode) && witness.inode > 0, 'journal-write-owner');
+      if (old) for (const field of ['mode', 'uid', 'gid', 'nlink', 'dev']) equal(witness[field], old.witness[field], `journal-owner-${field}`);
+      changed.push(`reconciliations/${name}`);
+      write = true;
+    }
+  }
+  const expectedNames = [...new Set([...Object.keys(before.leaves), ...(write ? [name] : [])])].sort();
+  equal(Object.keys(after.leaves).sort(), expectedNames, 'journal-exact-leaves');
+  for (const [key, leaf] of Object.entries(before.leaves)) if (!write || key !== name) equal(after.leaves[key], leaf, 'journal-preserved-leaf');
+  if (before.directory) equal(after.directory, { ...before.directory, children: expectedNames }, 'journal-preserved-directory');
+  else if (write) {
+    const directory = after.directory;
+    check(directory?.mode === 0o40700 && directory.uid === owner && directory.nlink === 2
+      && directory.dev === before.parent.dev && directory.gid === before.parent.gid
+      && Number.isSafeInteger(directory.inode) && directory.inode > 0, 'journal-created-directory');
+    equal(directory.children, expectedNames, 'journal-new-directory-children');
+  } else equal(after.directory, before.directory, 'journal-absent-directory');
+  if (write && (!before.directory || expectedNames.length !== Object.keys(before.leaves).length)) changed.push('reconciliations');
+  return changed;
+}
+
+// The exact finite table is scoped to original stopped callbacks. Public show
+// is deliberately a map read, never a reconciliation or refresh operation.
+export function preparedCallSequence(caseId, scenario, paths, backend) {
+  const targets = preparedCase(caseId, scenario, paths);
+  const call = (args, target, options = {}, transition) => ({ args, cwd: options.cwd ?? paths.projectPath, target, transition });
+  const create = (path, name, cwd) => call(['project', 'create', path, ...(name ? ['--name', name] : []), '--json'], backend === 'postgresql' ? path : undefined, { cwd }, backend === 'postgresql' ? path : undefined);
+  const show = path => call(['project', 'show', path, '--json']);
+  switch (caseId) {
+    case 'identity-roots': return [call(['project', 'create', targets[0], '--surface-parity-invalid-option']),
+      create(targets[0], 'Surface parity identity'), ...(backend === 'postgresql' ? [show(targets[0]), create(targets[1], 'Surface parity unrelated')] : [])];
+    case 'identity-rebound': return backend === 'postgresql' ? [create(targets[0]), show(targets[0]), show(join(dirname(paths.projectPath), 'surface-identity'))] : [];
+    case 'events-operator': return backend === 'postgresql' ? [create(targets[0], 'Surface event operator')] : [];
+    case 'events-notify': return backend === 'postgresql' ? [create(targets[0])] : [];
+    case 'import-collisions': return backend === 'postgresql' ? targets.map(path => create(path)) : [];
+    case 'promotion-root': return backend === 'postgresql' ? [create(targets[0], undefined, targets[0])] : [];
+    case 'sensitive-files': {
+      const pattern = 'parity_private_[0-9]{4}';
+      const args = [[], ['add'], ['add', pattern], ['add', pattern], ['list'], ['test'], ['test', 'before parity_private_1234 after'],
+        ['remove'], ['remove', pattern], ['remove', pattern], ['purge'], ['purge', '--yes']];
+      const reconciles = new Set([2, 3, 4, 6, 8, 9, ...(backend === 'sqlite' ? [11] : [])]);
+      return args.map((args, index) => call(['sensitive', ...args], reconciles.has(index) ? targets[0] : undefined,
+        { cwd: targets[0] }, index === 2 ? targets[0] : undefined));
+    }
+    default: throw new Error('surface-prepared:unknown-call-case');
+  }
+}
+
+export function createPreparedCallRecorder({ caseId, scenario, paths, backend, before, readEnrichedMap, captureInputs,
+  captureDiscoveryInputs, assertDiscoveryTransition, discoveryForJournal, owner }) {
+  const sequence = preparedCallSequence(caseId, scenario, paths, backend);
+  let map = structuredClone(before.metadata.map);
+  let index = 0;
+  let active;
+  let finished = false;
+  let journals = before.metadata.journals;
+  const changedPaths = new Set();
+  const calls = [];
+  let lastInputs = before.inputs;
+  const verifyMap = () => {
+    const actual = capturePreparedMetadata(paths.homeDir).map;
+    equal(actual, map, 'call-prefix-map');
+    equal(readEnrichedMap(), map, 'call-prefix-enriched-map');
+  };
+  verifyMap();
+  const baselineInputs = captureDiscoveryInputs(map);
+  const targets = preparedCase(caseId, scenario, paths);
+  const prefix = () => caseId === 'import-collisions' ? { targetCount: Math.min(index + 1, targets.length), ownerCount: index } : {};
+  const verifyInputs = stage => {
+    const spec = stage === 'after' && caseId === 'import-collisions'
+      ? { targetCount: index + 1, ownerCount: index } : prefix();
+    const currentInputs = captureInputs();
+    validatePreparedInputs(caseId, scenario, paths, before.inputs, currentInputs, owner, spec);
+    validatePreparedInputs(caseId, scenario, paths, lastInputs, currentInputs, owner, spec);
+    lastInputs = currentInputs;
+    const inputs = captureDiscoveryInputs(map);
+    const newTargets = targets.filter(path => !Object.hasOwn(before.inputs, path) && inputs.observations[path]?.[1] === 'git');
+    if (caseId === 'identity-roots' && !Object.hasOwn(before.inputs, join(dirname(paths.projectPath), 'surface-identity-alias'))) newTargets.push(join(dirname(paths.projectPath), 'surface-identity-alias'));
+    assertDiscoveryTransition(baselineInputs, inputs, { newTargets });
+    return inputs;
+  };
+  return {
+    beforeCall(args, options = {}) {
+      check(!finished && !active && sequence[index], 'call-order');
+      const spec = sequence[index];
+      equal(args, spec.args, `call-${index}-args`);
+      equal(options.cwd ?? paths.projectPath, spec.cwd, `call-${index}-cwd`);
+      check(options.stdin === undefined && options.administrator === undefined, 'call-options');
+      verifyMap();
+      const current = capturePreparedJournals(paths.homeDir);
+      validateJournalCall(journals, current, undefined, owner);
+      const inputs = verifyInputs('before');
+      const oldSourceHashes = spec.target ? journals.leaves[`${hash(spec.target)}.json`]?.value.sourceHashes ?? [] : [];
+      active = { ...spec, ...(spec.target ? {
+        reference: discoveryForJournal(inputs, map, spec.target),
+        fastDiscovery: discoveryForJournal(inputs, map, spec.target, oldSourceHashes).discovery,
+      } : {}) };
+      // The CLI seam sets this immediately before launching the original child.
+      return () => { check(active && active.start === undefined, 'call-start'); active.start = Date.now(); };
+    },
+    afterCall(result, end) {
+      check(active && active.start !== undefined, 'call-exit');
+      active.end = end;
+      const current = capturePreparedJournals(paths.homeDir);
+      for (const path of validateJournalCall(journals, current, active, owner)) changedPaths.add(path);
+      journals = current;
+      if (active.transition) {
+        const path = active.transition;
+        const id = hash(path);
+        if (caseId !== 'identity-rebound') {
+          check(!map[id], 'call-new-map-entry');
+          map = { ...map, [id]: { canonical: path, aliases: [] } };
+        } else check(map[id]?.canonical === path && map[id].remoteProjectId === undefined, 'call-unbound-alias');
+        if (backend === 'postgresql' && caseId !== 'sensitive-files') {
+          check(result.code === 0, 'call-create-result');
+          const parsed = JSON.parse(result.stdout);
+          check(parsed.local?.id === id && parsed.local.canonical === path && uuid(parsed.remote?.projectId)
+            && parsed.local.remoteProjectId === parsed.remote.projectId, 'call-create-identity');
+          map = { ...map, [id]: { ...map[id], remoteProjectId: parsed.remote.projectId } };
+        }
+      }
+      verifyMap();
+      verifyInputs('after');
+      calls.push({ start: active.start, end, target: active.target });
+      active = undefined;
+      index++;
+    },
+    finish() {
+      check(!finished && !active && index === sequence.length, 'call-complete');
+      // SQLite collision identity writes have no CLI and no journal authority.
+      if (backend === 'sqlite' && caseId === 'import-collisions') for (const path of targets) {
+        check(!map[hash(path)], 'call-sqlite-new-map');
+        map = { ...map, [hash(path)]: { canonical: path, aliases: [] } };
+      }
+      verifyMap();
+      const after = capturePreparedJournals(paths.homeDir);
+      validateJournalCall(journals, after, undefined, owner);
+      const proof = { before: before.metadata.journals, after, changedPaths: [...changedPaths], calls };
+      journalProofs.add(proof);
+      finished = true;
+      return proof;
+    },
+  };
 }

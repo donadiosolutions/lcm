@@ -12,9 +12,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { findUserSystemdPid } from '../../../dist/src/daemon/lifecycle.js';
 import { createDaemon } from '../../../dist/src/daemon/server.js';
 import { loadDaemonConfig, readDaemonConfigSnapshot, daemonConfigSnapshotWitnessEqual } from '../../../dist/src/daemon/config.js';
-import { withBackendPublicationReadRoot, assertBackendPublicationConfigReadAccess, withBackendPublicationConsumerLock, assertBackendPublicationConsumerAccess } from '../../../dist/src/storage/backend-publication.js';
+import { withBackendPublicationConsumerLockAsync, withBackendPublicationReadRoot, assertBackendPublicationConfigReadAccess, withBackendPublicationConsumerLock, assertBackendPublicationConsumerAccess } from '../../../dist/src/storage/backend-publication.js';
+import { withNativeObserverLease } from '../../surface-parity/native-observer.mjs';
 import { assertSelectedBackend } from '../../surface-parity/backend-observation.mjs';
-import { capturePreparedMetadata, capturePreparedInputs, validatePreparedInputs, createAdmissionLedger, preparedCase, runPreparedCase, validatePreparedBundle, validatePreparedDelta } from '../../surface-parity/prepared-projects.mjs';
+import { capturePreparedMetadata, createPreparedCallRecorder, capturePreparedInputs, validatePreparedInputs, createAdmissionLedger, preparedCase, runPreparedCase, validatePreparedBundle, validatePreparedDelta } from '../../surface-parity/prepared-projects.mjs';
+import { captureJournalInputs, discoveryForJournal, assertJournalInputTransition } from '../../surface-parity/journal-inputs.mjs';
+import { resolveGitProjectAnchor } from '../../../dist/src/git-project.js';
 import { isolateAsyncBoundary } from '../../surface-parity/async-isolation.mjs';
 import { classifyHomeParent, parseHomeParentWitness, witnessPayload } from '../../../dist/src/home-parent-auth.js';
 import { readBoundedRegularFileWithStat } from '../../../dist/src/security-files.js';
@@ -66,6 +69,10 @@ let lastSequence = 0;
 let activeScenario = 'startup';
 const admission = createAdmissionLedger();
 let preparing = false;
+let preparedRecorder;
+let preparedPhase;
+let preparedCallIndex = 0;
+let preparedFailureContext;
 const admittedBindings = new Map(backend === 'postgresql' ? [
   [projectPath, process.env.LCM_SURFACE_REMOTE_PROJECT_ID],
   [secondaryProjectPath, process.env.LCM_SURFACE_SECONDARY_REMOTE_PROJECT_ID],
@@ -81,7 +88,10 @@ function failure(error) {
   const knownCodes = new Set(['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'EBADF', 'EBUSY', 'EAGAIN', 'ESTALE', 'ERR_INVALID_STATE', 'ERR_INVALID_ARG_TYPE', 'ERR_SQLITE_ERROR']);
   const fallbackId = errorName ? `surface-worker:${errorName}` : knownCodes.has(error?.code) ? `surface-worker:${error.code}` : 'surface-worker:assertion';
   const frame = String(error?.stack ?? '').match(/(surface-parity-[a-z-]+\.mjs):(\d+):\d+/u);
-  return { id: `${symbolic ?? fallbackId}${frame ? `:${frame[1]}:${frame[2]}` : ''}`.slice(0, 80), digest: error?.surfaceEvidence?.stdoutErrorDigest ?? error?.surfaceEvidence?.stderrDigest ?? createHash('sha256').update(message).digest('hex') };
+  const field = typeof error?.surfacePreparedField === 'string' && /^[a-zA-Z.]{1,64}$/u.test(error.surfacePreparedField) ? `:${error.surfacePreparedField}` : '';
+  const detail = preparedFailureContext ? `${preparedFailureContext}:${(symbolic ?? fallbackId).replace(/^surface[-\w]*:/u, '')}${field}`
+    : `${symbolic ?? fallbackId}${frame ? `:${frame[1]}:${frame[2]}` : ''}`;
+  return { id: detail.slice(0, 80), digest: error?.surfaceEvidence?.stdoutErrorDigest ?? error?.surfaceEvidence?.stderrDigest ?? createHash('sha256').update(message).digest('hex') };
 }
 function send(message) {
   const json = JSON.stringify(message);
@@ -117,6 +127,9 @@ async function terminate(child) {
 }
 async function cli(args, options = {}) {
   assert.ok(!stopping, 'surface-worker:cli-after-stop');
+  if (preparedRecorder) preparedPhase = `call${preparedCallIndex}-before`;
+  const recordStart = preparedRecorder?.beforeCall(args, options);
+  recordStart?.();
   const child = launch(args, options);
   let stdout = '';
   let stderr = '';
@@ -132,14 +145,18 @@ async function cli(args, options = {}) {
   }
   const complete = new Promise((resolveExit, reject) => {
     child.once('error', reject);
-    child.once('exit', (code, signal) => resolveExit({ code, signal }));
+    child.once('exit', (code, signal) => resolveExit({ code, signal, endedAt: Date.now() }));
   });
   child.stdin.end(options.stdin ?? '');
   try {
     const result = await bounded(complete, 25000, 'cli-timeout');
     assert.ok(!overflow, 'surface-worker:cli-output-bound');
     assert.equal(result.signal, null, 'surface-worker:cli-signal');
-    return { code: result.code, stdout, stderr };
+    const output = { code: result.code, stdout, stderr };
+    if (preparedRecorder) preparedPhase = `call${preparedCallIndex}-after`;
+    preparedRecorder?.afterCall(output, result.endedAt);
+    if (preparedRecorder) { preparedCallIndex++; preparedPhase = 'callback'; }
+    return output;
   } finally { await terminate(child); }
 }
 async function availablePort() {
@@ -184,33 +201,28 @@ async function request(method, path, body, options = {}) {
   assert.ok(Buffer.byteLength(text) <= streamLimit, 'surface-worker:http-output-bound');
   return { status: response.status, body: text.length ? JSON.parse(text) : null };
 }
-async function withReadAdmission(operation) {
-  const deadline = performance.now() + 2000;
-  for (;;) {
-    try { return await operation(); }
-    catch (error) {
-      // This is solely the test observer's admission, never a public operation
-      // or its returned status. Preserve every other failure without retrying.
-      if (!(error instanceof PrivateMutationLockContentionError) || performance.now() >= deadline) throw error;
-      await delay(10);
-    }
-  }
-}
+const observerCleanupFailures = [];
 async function readProject(id, callback) {
-  const storage = await withReadAdmission(async () => {
-    // Retain the fixed selected configuration. The separate config witness
-    // still checks the real persisted backend around every public scenario.
-    readFactory ??= await createStorageBackendFactory(context.config.storage, homeDir);
-    const matches = Object.entries(readProjectMapSnapshot()).filter(([localId, entry]) => localId === id || entry.remoteProjectId === id);
-    assert.equal(matches.length, 1, 'surface-worker:read-project-unique-binding');
-    const canonical = resolve(matches[0][1].canonical);
-    assert.ok([homeDir, dirname(projectPath)].some(root => canonical === root || canonical.startsWith(`${root}/`)), 'surface-worker:read-project-owned-path');
-    const identity = resolveExistingProjectIdentity(canonical);
-    assert.ok(identity && (id === identity.id || id === identity.remoteProjectId), 'surface-worker:read-project-identity');
-    return readFactory.openExistingProject(resolveStorageIdentityContext(context.config.storage, identity, homeDir, canonical));
+  return withNativeObserverLease({
+    homeDir, backend, preparing: () => preparing,
+    admit: withBackendPublicationConsumerLockAsync,
+    assertAccess: assertBackendPublicationConsumerAccess,
+    ContentionError: PrivateMutationLockContentionError,
+    cleanupFailures: observerCleanupFailures,
+    callback,
+    open: async token => {
+      // Factory constructors retain configuration/runtime only, never this token.
+      // Each newly opened project captures this lease and closes before it ends.
+      readFactory ??= await createStorageBackendFactory(context.config.storage, homeDir, undefined, token);
+      const matches = Object.entries(readProjectMapSnapshot(homeDir, token)).filter(([localId, entry]) => localId === id || entry.remoteProjectId === id);
+      assert.equal(matches.length, 1, 'surface-worker:read-project-unique-binding');
+      const canonical = resolve(matches[0][1].canonical);
+      assert.ok([homeDir, dirname(projectPath)].some(root => canonical === root || canonical.startsWith(`${root}/`)), 'surface-worker:read-project-owned-path');
+      const identity = resolveExistingProjectIdentity(canonical, token);
+      assert.ok(identity && (id === identity.id || id === identity.remoteProjectId), 'surface-worker:read-project-identity');
+      return readFactory.openExistingProject(resolveStorageIdentityContext(context.config.storage, identity, homeDir, canonical), token);
+    },
   });
-  assert.ok(storage, 'surface-worker:existing-project');
-  try { return await callback(storage); } finally { await storage.close(); }
 }
 
 function admin(action, payload = {}) {
@@ -558,6 +570,8 @@ async function prepared(caseId, runExistingSetup) {
         assert.ok(!preparing, 'surface-prepared:concurrent-case');
         admission.beginCase(caseId);
         preparing = true;
+        preparedPhase = 'settle';
+        preparedCallIndex = 0;
         admitted = true;
       },
       settle: settlePrepared,
@@ -567,6 +581,7 @@ async function prepared(caseId, runExistingSetup) {
           'surface-prepared:owned-publisher-retained');
       },
       async captureBefore() {
+        preparedPhase = 'before';
         const before = await capture();
         assert.ok(JSON.stringify(before.authority) === JSON.stringify(authority), 'surface-prepared:prestop-authority');
         if (backend === 'postgresql') {
@@ -574,11 +589,21 @@ async function prepared(caseId, runExistingSetup) {
           assert.equal(witness.snapshotDigest, semanticDigest(before.logical.postgresql), 'surface-prepared:catalog-before');
           token = witness.token;
         }
+        const targets = preparedCase(caseId, activeScenario, paths);
+        if (caseId === 'identity-roots') targets.push(join(dirname(projectPath), 'surface-identity-alias'));
+        preparedRecorder = createPreparedCallRecorder({ caseId, scenario: activeScenario, paths, backend, before,
+          readEnrichedMap: () => readProjectMapSnapshot(homeDir), captureInputs: () => capturePreparedInputs(paths),
+          captureDiscoveryInputs: map => captureJournalInputs(homeDir, map, { resolveGitProjectAnchor, paths: targets }),
+          assertDiscoveryTransition: assertJournalInputTransition, discoveryForJournal, owner: process.getuid() });
         return before;
       },
       async captureAfter(bundle) {
+        preparedPhase = 'after';
         validatePreparedBundle(caseId, activeScenario, paths, backend, bundle);
+        const journalProof = preparedRecorder.finish();
+        preparedRecorder = undefined;
         const after = await capture();
+        after.journalProof = journalProof;
         if (backend === 'postgresql') {
           const result = await admin('prepared-projects.finish', { caseId, token,
             created: bundle.created.map(item => ({ path: item.path, remote: item.parsed.remote })) });
@@ -588,6 +613,7 @@ async function prepared(caseId, runExistingSetup) {
         return after;
       },
       validate: (before, after, bundle) => {
+        preparedPhase = 'delta';
         validatePreparedInputs(caseId, activeScenario, paths, before.inputs, after.inputs, process.getuid());
         validatePreparedDelta({ caseId, scenario: activeScenario, paths, backend, bundle, before, after, owner: process.getuid() });
         validatedBundle = bundle;
@@ -599,9 +625,9 @@ async function prepared(caseId, runExistingSetup) {
         admission.completeCase(caseId);
         if (backend === 'postgresql') for (const item of validatedBundle.created) admittedBindings.set(item.path, item.parsed.remote.projectId);
       },
-      fail: error => admission.fail(error),
+      fail: error => { preparedFailureContext ??= `${caseId}:${preparedPhase}`; return admission.fail(error); },
     }, runExistingSetup);
-  } finally { if (admitted) preparing = false; }
+  } finally { preparedRecorder = undefined; if (admitted) preparing = false; }
 }
 async function enterFaults() {
   if (directDaemon) return;
@@ -624,7 +650,7 @@ async function enterFaults() {
 }
 async function cleanup() {
   stopping = true;
-  const errors = [];
+  const errors = [...observerCleanupFailures];
   for (const operation of [closeMcp, () => readFactory?.close(), closeSnapshotReaders, () => directDaemon?.stop(), stopBaseline, ...[...childProcesses].map(child => () => terminate(child))]) {
     try { await operation(); } catch (error) { errors.push(error); }
   }

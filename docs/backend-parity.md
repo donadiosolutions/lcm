@@ -259,11 +259,72 @@ their historical fixes do not waive an assertion on the tested revision.
 Project creation prerequisites run through the actual project-create CLI with
 its fixed configured backend while the fixture's owned daemon and MCP
 publishers are closed for the entire preparation. Before setup, the fixture
-captures existing native data, catalog rows, map entries and publication
-identity. It admits only each named case's result-backed metadata additions,
-then starts a new daemon and independently checks preservation across startup.
-The CLI-only sensitive-pattern case has its own stopped local-file contract.
-These setup checks add no surface or assertion credits.
+captures existing native data, catalog rows, raw map entries, Git and Codex
+catalogue inputs, reconciliation journals, and publication identity. The raw map
+must agree with the independently enriched read view before any setup call,
+including when the SQLite map is absent. This prevents metadata backfill from
+silently becoming an allowed setup change.
+
+Both project preparation and the separate stopped sensitive-pattern case use
+the same finite reconciliation checks. Only each case's original calls, in their
+original order, can authorize a journal transition. Public project show calls
+cannot authorize reconciliation writes. The reference follows each verified
+map prefix and the declared fixture inputs; it derives discovery fingerprints
+without taking their expected values from the resulting journal. It checks Git
+common-directory identity rather than treating equal remote URLs as sufficient
+identity. Future project identities are not loaded early to satisfy a call.
+
+A declared create or sensitive-pattern reconciliation may create an exact target
+journal or refresh an existing one according to the source's completed/skip
+predicate. Incomplete discovery cannot authorize a fast skip. A skipped journal
+retains its bytes and file identity; a refresh preserves existing history,
+creation time, and remote binding while checking the precise permitted changes
+and source JSON key order. New journals have the exact completed schema and
+independently derived discovery, aliases, and pre-call binding. Created or
+refreshed timestamps must fall within that call's observed launch-to-exit
+wall-clock range. An atomic refresh may replace only its declared journal inode
+after these checks pass.
+
+The checks also require private ownership and exact journal leaves, whether the
+reconciliation directory already exists or is created by the declared call.
+Unrelated journals retain their bytes and identity. Unexpected files, symlinks,
+hardlinks, nested directories, or remaining lock, claim, or tombstone artifacts
+at the observation boundaries fail preparation. There is no blanket
+reconciliation-directory exclusion. Existing native rows, map entries, inputs,
+and configuration/publication authority remain protected independently. Only
+after setup passes does a new daemon start for the separate restart preservation
+comparison. A stable restart cannot erase a failed preparation. These setup
+checks add no surface or assertion credits and do not relax ordinary isolation
+or diagnostic immutability.
+
+The fixture's 20 native observation callbacks run outside those stopped
+preparation windows. Each holds a real backend publication consumer lease from
+factory creation when needed, through existing-project identity resolution and
+opening, through one callback, until project close completes. The fixture checks
+that its fixed home, `HOME`, and the production default home select the same
+resolved root, and validates the live token against that root and backend.
+Token-aware operations reuse that token. Cached factories retain no expired
+lease authority, and project handles are never reused across leases.
+
+Only typed private-lock contention before lease entry can retry, within the
+existing two-second acquisition budget and ten-millisecond interval. Every
+entered open, read, or close failure is fatal, including typed contention. If
+both the callback and close fail, the original failure remains primary and the
+cleanup failure is retained separately. SQLite close still performs its full
+append barrier with the existing five-second contention policy; passing the
+consumer token does not bypass the append tail or append lock. PostgreSQL close
+remains token-agnostic. Holding the lease across native or network reads can
+contend with a live publisher; a resulting public-operation or deadline failure
+still fails the run.
+
+The callbacks are read-only observations, but this is not a claim that the entire
+factory-open lifecycle leaves the filesystem unchanged: SQLite's existing
+project-open path can reconcile identity metadata. No new metadata exemption is
+created for that behavior, and every original native result, content, count,
+provenance, and preservation assertion remains required. The earlier SQLite
+observer failure's raw cause is unknown; the stronger ownership boundary does
+not establish that it was contention. These fixture and evidence changes do not
+change production behavior or require an npm release-note changeset.
 
 The certificate therefore does not claim live-daemon project-create success
 or success under arbitrary cross-process publication overlap. The live identity
