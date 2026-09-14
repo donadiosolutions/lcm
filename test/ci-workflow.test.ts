@@ -310,7 +310,7 @@ describe("CI workflow", () => {
     });
     expect(workflow.jobs.core.name).toBe("Core CI");
     expect(workflow.jobs.core.needs).toBe("environment");
-    expect(workflow.jobs.core["runs-on"]).toBe("blacksmith-4vcpu-ubuntu-2404");
+    expect(workflow.jobs.core["runs-on"]).toBe("blacksmith-8vcpu-ubuntu-2404");
     expect(workflow.jobs.postgresql.needs).toBe("environment");
     expect(workflow.jobs.postgresql["runs-on"]).toBe("blacksmith-4vcpu-ubuntu-2404");
     expect(workflow.jobs.postgresql.strategy.matrix.run).toEqual([1, 2]);
