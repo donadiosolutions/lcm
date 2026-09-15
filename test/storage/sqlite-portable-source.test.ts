@@ -770,6 +770,43 @@ describe("SQLite supplied canonical generation", () => {
     expect(readFileSync(file.path)).toEqual(before); expect(readdirSync(file.dir)).toEqual(["source.db"]);
   });
 
+  it("aborts from a real authority read and reopens after cleanup", async () => {
+    const file = fixture(); const before = readFileSync(file.path);
+    const controller = new AbortController();
+    const originalOpen = filePromises.open;
+    let readCalls = 0; let closeCalls = 0; let aborted = false;
+    const spy = vi.spyOn(filePromises, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      if (String(args[0]) === file.path) {
+        const originalRead = handle.read.bind(handle);
+        handle.read = (async (...readArgs: Parameters<typeof handle.read>) => {
+          const result = await originalRead(...readArgs);
+          readCalls += 1;
+          if (!aborted && result.bytesRead > 0) { aborted = true; controller.abort(); }
+          return result;
+        }) as typeof handle.read;
+        const originalClose = handle.close.bind(handle);
+        handle.close = (async (...closeArgs: Parameters<typeof handle.close>) => {
+          closeCalls += 1;
+          return originalClose(...closeArgs);
+        }) as typeof handle.close;
+      }
+      return handle;
+    });
+    try {
+      await expect(openSqlitePortableSource(input(file, { signal: controller.signal })))
+        .rejects.toMatchObject({ code: "aborted", retryable: true });
+      expect(readCalls).toBeGreaterThan(0);
+      expect(aborted).toBe(true);
+      expect(closeCalls).toBe(1);
+    } finally { spy.mockRestore(); }
+    const source = await open(file); sources.push(source);
+    expect((await source.readDomainPage(page("conversations"))).records).toEqual([]);
+    await source.close();
+    expect(readFileSync(file.path)).toEqual(before);
+    expect(readdirSync(file.dir)).toEqual(["source.db"]);
+  });
+
   it("observes a timer abort during real source pre-scan and cleans its validation index", async () => {
     const file = fixture(db => conversations(db, 1000));
     const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 0);
@@ -798,11 +835,21 @@ describe("SQLite supplied canonical generation", () => {
     const file = fixture(db => {
       if (kind === "instruction cache") {
         instructions(db);
-        db.prepare("UPDATE session_instruction_cache SET content=replace(hex(zeroblob(?)), '00', 'x')").run(PORTABLE_LIMITS.maxRecordBytes + 1);
+        db.prepare("UPDATE session_instruction_cache SET content=printf('%.*c', ?, 'x')").run(PORTABLE_LIMITS.maxRecordBytes + 1);
+        const witness = db.prepare("SELECT length(CAST(content AS BLOB)) AS bytes FROM session_instruction_cache").get() as { bytes: number };
+        expect(witness.bytes).toBe(PORTABLE_LIMITS.maxRecordBytes + 1);
       } else {
         native(db);
-        if (kind === "native metadata") db.prepare("UPDATE runtime_native_transcripts SET source_locator=replace(hex(zeroblob(?)), '00', 'x')").run(PORTABLE_LIMITS.maxControlBytes + 1);
-        else db.prepare("UPDATE runtime_native_transcripts SET native_payload=json_object('data',replace(hex(zeroblob(?)), '00', 'x'))").run(100 * 1024 * 1024 + 1);
+        if (kind === "native metadata") {
+          db.prepare("UPDATE runtime_native_transcripts SET source_locator=printf('%.*c', ?, 'x')").run(PORTABLE_LIMITS.maxControlBytes + 1);
+          const witness = db.prepare("SELECT length(CAST(source_locator AS BLOB)) AS bytes FROM runtime_native_transcripts").get() as { bytes: number };
+          expect(witness.bytes).toBe(PORTABLE_LIMITS.maxControlBytes + 1);
+        } else {
+          const update = db.prepare("UPDATE runtime_native_transcripts SET native_payload=json_object('data',printf('%.*c', ?, 'x'))");
+          expect(() => update.run(100 * 1024 * 1024 + 1)).not.toThrow();
+          const witness = db.prepare("SELECT length(CAST(native_payload AS BLOB)) AS bytes FROM runtime_native_transcripts").get() as { bytes: number };
+          expect(witness.bytes).toBeGreaterThan(100 * 1024 * 1024 + 1);
+        }
       }
     });
     const before = sqlitePortableFileSha256(file.path);
