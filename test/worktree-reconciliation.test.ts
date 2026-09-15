@@ -1789,6 +1789,11 @@ describe("worktree reconciliation", () => {
         "SELECT COUNT(*) AS count FROM worktree_reconciliation_sources",
       ).get()).toEqual({ count: 0 });
       blockedTarget.close();
+      const fencedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+      expect(fencedSource.prepare(
+        "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+      ).get()).toMatchObject({ name: "worktree_reconciliation_fence" });
+      fencedSource.close();
       expect(listWorktreeReconciliationJournals()).toMatchObject([{
         phase: "blocked",
         reason: "Error: stored message content is unsupported",

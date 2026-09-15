@@ -230,7 +230,8 @@ prefix of a value, so worktree reconciliation refuses the source before its
 fence commits and refuses the canonical target inside its transaction. The
 fixed error is `stored message content is unsupported`; it contains no message
 bytes, session identifiers, paths, or database IDs. Source bytes remain intact
-for inspection, and a target refusal rolls back copied rows and FTS changes.
+for inspection, and a target refusal rolls back its transaction before message
+rows are copied or FTS is rebuilt.
 
 Stop writers, keep the database and its WAL/SHM sidecars together, and make a
 verified backup before repair. Inspect affected rows offline with
