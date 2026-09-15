@@ -426,6 +426,7 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     const factory = new SQLiteLocalHookOutboxFactory();
     const repository = await factory.open(local.dbPath);
     const id = await repository.insertEvent("session", { type: "decision", category: "decision", data: "authority-bound event", priority: 1 }, "PostToolUse");
+    const nextId = await repository.insertEvent("session", { type: "decision", category: "decision", data: "authority-bound follow-up", priority: 1 }, "PostToolUse");
     await repository.observeMissingCwd(10, 1, 3);
     const observe = () => {
       const db = new DatabaseSync(local.dbPath, { readOnly: true });
@@ -436,8 +437,10 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     const operations = (token: BackendPublicationLockToken) => [
       () => repository.getUnprocessed(undefined, token),
       () => repository.getPatternReinforcement("decision", "decision", "authority-bound event", undefined, token),
+      () => repository.observeMissingCwd(11, 1, 3, token),
       () => repository.clearMissingCwd(token),
-      () => repository.markProcessed([id], token),
+      () => repository.setPrevEventId(nextId, id, token),
+      () => repository.markProcessed([id, nextId], token),
     ];
     try {
       const revoked = await withBackendPublicationConsumerLockAsync(local.homeDir, token => token);
@@ -447,11 +450,16 @@ describe("SQLiteLocalHookOutboxFactory", () => {
       });
       expect(observe()).toEqual(before);
       await withBackendPublicationConsumerLockAsync(local.homeDir, async token => {
-        expect(await repository.getUnprocessed(undefined, token)).toHaveLength(1);
+        expect(await repository.getUnprocessed(undefined, token)).toHaveLength(2);
         expect(await repository.getPatternReinforcement("decision", "decision", "authority-bound event", undefined, token))
           .toMatchObject({ totalCount: 1, distinctSessions: 1 });
+        await expect(repository.observeMissingCwd(11, 1, 3, token))
+          .resolves.toMatchObject({ observations: 2, parked: false });
+        await repository.setPrevEventId(nextId, id, token);
+        expect((await repository.getUnprocessed(undefined, token)).find(event => event.event_id === nextId))
+          .toMatchObject({ prev_event_id: id });
         await repository.clearMissingCwd(token);
-        await repository.markProcessed([id], token);
+        await repository.markProcessed([id, nextId], token);
         expect(await repository.getUnprocessed(undefined, token)).toEqual([]);
         await factory.close(token);
       });

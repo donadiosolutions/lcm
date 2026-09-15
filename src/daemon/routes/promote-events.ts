@@ -299,13 +299,14 @@ async function parkUnavailableCwdEventsUnlocked(
       Date.now(),
       MISSING_CWD_CONFIRMATION_INTERVAL_MS,
       MISSING_CWD_CONFIRMATION_OBSERVATIONS,
+      publicationLockToken,
     );
     if (!state.parked) {
       return pendingMissingCwdResult(state.observations, state.retryAfterMs);
     }
     return parkedCwdResult();
   } finally {
-    await closeRouteStorage(outboxFactory);
+    await closePromotionStorage(publicationLockToken, outboxFactory, undefined);
   }
 }
 
@@ -949,7 +950,11 @@ async function promoteEventsBatch(
           // Set correlation chain
           const correlatedErrorId = (event as EventRow & { _correlatedErrorId?: number })._correlatedErrorId;
           if (correlatedErrorId) {
-            await edb.setPrevEventId(event.event_id, correlatedErrorId);
+            await edb.setPrevEventId(
+              event.event_id,
+              correlatedErrorId,
+              publicationLockToken,
+            );
           }
 
           const epoch = event.machine_id === null || project.backend !== "sqlite"

@@ -133,6 +133,12 @@ idle restarts and converges even when a large installation revisits a sidecar
 only every 20 minutes. Until the third observation, no local `processed_at`
 checkpoint is advanced and no hook-error-ledger entry is added.
 
+When the caller already holds consumer publication admission, it forwards that
+live token through sidecar opening, missing-directory observation, and close.
+The complete parking attempt therefore reuses its already-granted admission
+without waiting on itself. A held maintenance journal continues to block
+missing-directory updates as described in the backend-publication guide.
+
 The three-observation threshold and five-minute minimum spacing are fixed
 safety constants; they are not configurable in `~/.lcm/config.json`.
 

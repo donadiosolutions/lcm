@@ -137,10 +137,15 @@ export interface LocalHookOutboxRepository {
     observedAtMs: number,
     minimumIntervalMs: number,
     requiredObservations: number,
+    publicationLockToken?: BackendPublicationLockToken,
   ): Promise<LocalHookMissingCwdState>;
   clearMissingCwd(publicationLockToken?: BackendPublicationLockToken): Promise<void>;
   pruneProcessed(olderThanDays: number): Promise<number>;
-  setPrevEventId(eventId: number, prevEventId: number): Promise<void>;
+  setPrevEventId(
+    eventId: number,
+    prevEventId: number,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<void>;
   getPatternReinforcement(
     type: string,
     category: string,
@@ -394,13 +399,14 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     observedAtMs: number,
     minimumIntervalMs: number,
     requiredObservations: number,
+    publicationLockToken?: BackendPublicationLockToken,
   ): Promise<LocalHookMissingCwdState> {
     this.assertOpen("observeMissingCwd");
     return this.admitted(() => this.database.observeMissingCwd(
       observedAtMs,
       minimumIntervalMs,
       requiredObservations,
-    ));
+    ), publicationLockToken);
   }
 
   async clearMissingCwd(publicationLockToken?: BackendPublicationLockToken): Promise<void> {
@@ -413,9 +419,16 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     return this.admitted(() => this.database.pruneProcessed(olderThanDays));
   }
 
-  async setPrevEventId(eventId: number, prevEventId: number): Promise<void> {
+  async setPrevEventId(
+    eventId: number,
+    prevEventId: number,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<void> {
     this.assertOpen("setPrevEventId");
-    this.admitted(() => this.database.setPrevEventId(eventId, prevEventId));
+    this.admitted(
+      () => this.database.setPrevEventId(eventId, prevEventId),
+      publicationLockToken,
+    );
   }
 
   async getPatternReinforcement(
