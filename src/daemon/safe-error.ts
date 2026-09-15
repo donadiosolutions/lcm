@@ -166,6 +166,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (startsQuotedQueryTail) quotedQueryTail = true;
     }
     if (
+      quotedQueryTail &&
       char === "&" &&
       startsUrlSchemeLiteral(chars, index + 1) &&
       !isFileUrlLiteral(chars, index + 1)

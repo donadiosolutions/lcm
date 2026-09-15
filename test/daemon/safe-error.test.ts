@@ -2196,6 +2196,20 @@ describe("sanitizeError", () => {
     expect(sanitizeError(first)).toBe(first);
   });
 
+  // GitHub review thread 4011654853 keeps the direct ampersand form outside
+  // the quoted-query public-URL reset introduced for Bug #1239.
+  it("keeps a direct quoted-wrapper ampersand URL conservative across passes", () => {
+    const input = "'file://host'['/private']&https://example.test/p";
+    const expected = "'file://host'['<path>']&https:<path>";
+    const first = sanitizeError(input);
+    const second = sanitizeError(first);
+    const third = sanitizeError(second);
+
+    expect(first).toBe(expected);
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+  });
+
   it.each([
     ["file://h?x=[a]\\C:\\Users\\fictional.db", "file://h?x=[a]<path>"],
     ["file://h?x=[a]\\1:\\Users\\fictional.db", "file://h?x=[a]<path>"],
