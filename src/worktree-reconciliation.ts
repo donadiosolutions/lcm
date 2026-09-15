@@ -504,7 +504,6 @@ type ReconciliationJournalAdmission = Readonly<{
 
 type ReconciliationJournalAuthorization = {
   identity: ReconciliationJournalIdentity | null | undefined;
-  parentIdentity: ReconciliationJournalParentIdentity | null | undefined;
 };
 
 function journalIdentitiesEqual(
@@ -661,7 +660,6 @@ function assertAuthorizedJournalAdmission(
 ): void {
   if (authorization.identity === undefined) {
     authorization.identity = admission?.identity ?? null;
-    authorization.parentIdentity = admission?.parentIdentity ?? null;
     return;
   }
   if (admission === null) return;
@@ -670,16 +668,6 @@ function assertAuthorizedJournalAdmission(
     || !journalIdentitiesEqual(admission.identity, authorization.identity)
   ) {
     throw new Error("worktree reconciliation journal identity changed during publication");
-  }
-  if (
-    authorization.parentIdentity === null
-    || authorization.parentIdentity === undefined
-    || !journalParentIdentitiesEqual(
-      admission.parentIdentity,
-      authorization.parentIdentity,
-    )
-  ) {
-    throw journalParentMismatchError();
   }
 }
 
@@ -725,7 +713,6 @@ function writeJournal(
   // Retain the identity of the inode we actually published before reopening
   // the pathname. A safe substitute must never become the next authorization.
   authorization.identity = publishedJournalIdentity(published);
-  authorization.parentIdentity = retainedJournalParentIdentity(parent);
   const verified = readJournalAdmission(path, parent);
   if (
     verified === null
@@ -3044,7 +3031,6 @@ export function reconcileWorktrees(
     const blockedRecording = { attempted: false };
     const journalAuthorization: ReconciliationJournalAuthorization = {
       identity: undefined,
-      parentIdentity: undefined,
     };
     const executeWithJournalParent = (
       retainedJournalParent: RetainedReconciliationJournalParent | undefined,

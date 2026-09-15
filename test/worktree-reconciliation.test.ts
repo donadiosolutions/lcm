@@ -6635,6 +6635,42 @@ describe("worktree reconciliation", () => {
     }
   });
 
+  it("journal root admission propagates non-ENOENT lstat failures", () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    const journalPath = join(root, `${targetHash}.json`);
+    const bytes = reconciliationJournalBytes(targetHash, "/project", {
+      phase: "completed",
+    });
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, bytes);
+    const rootBefore = lstatSync(root);
+    const journalBefore = lstatSync(journalPath);
+    const failure = Object.assign(new Error("injected journal root lstat failure"), {
+      code: "EACCES",
+    });
+    const originalLstat = lstatSync;
+
+    expect(() => withPatchedFs("lstatSync", ((
+      path: Parameters<typeof lstatSync>[0],
+      options?: Parameters<typeof lstatSync>[1],
+    ) => {
+      if (String(path) === root) throw failure;
+      return originalLstat(path, options as never);
+    }) as typeof lstatSync, () => listWorktreeReconciliationJournals())).toThrow(failure);
+
+    const rootAfter = lstatSync(root);
+    const journalAfter = lstatSync(journalPath);
+    expect(rootAfter.dev).toBe(rootBefore.dev);
+    expect(rootAfter.ino).toBe(rootBefore.ino);
+    expect(rootAfter.mode).toBe(rootBefore.mode);
+    expect(journalAfter.dev).toBe(journalBefore.dev);
+    expect(journalAfter.ino).toBe(journalBefore.ino);
+    expect(journalAfter.mode).toBe(journalBefore.mode);
+    expect(readFileSync(journalPath, "utf8")).toBe(bytes);
+    expect(readdirSync(root)).toEqual([`${targetHash}.json`]);
+  });
+
   it("journal root admission authenticates the root mode before listing", () => {
     const root = join(home, ".lcm", "reconciliations");
     const targetHash = "a".repeat(64);
