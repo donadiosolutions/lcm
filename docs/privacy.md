@@ -328,7 +328,24 @@ load and pass both effective custom-pattern arrays: global
 implicitly; missing or non-array values fail before source or repository
 access, while an explicit empty array means that scope has no configured custom
 rules. LCM applies those arrays plus the bundled rules recursively to every
-string key and value. Invalid UTF-8, malformed or scalar JSON, records
+string key and value. For a supported top-level Claude or Codex message, it
+then extracts text from that already-sanitized tree with the same block joining
+and trimming rules as the transcript parser and scrubs the joined text again.
+When this second pass finds a cross-block match, LCM stores the complete joined
+sanitized text in the first contributing text field and empties the remaining
+contributing fields. Array length, block types, nested Claude tool-result
+objects, unknown blocks, and recursively scrubbed metadata remain in place.
+No original plaintext is consulted during this correction.
+
+The corrected text must still match the parsed message exactly before the
+native record can be linked. Overlap between field and joined matches,
+spanning anchors or Codex trimming, and patterns that match into or out of an
+inserted `[REDACTED]` marker can produce different conservative redaction.
+LCM fails that exact linkage before storing the default-backfill batch; it does
+not restore a field-redacted fragment to make the texts agree. A joined result
+that changes again when scrubbed is quarantined as `residual-secret`.
+
+Invalid UTF-8, malformed or scalar JSON, records
 oversized in raw JSONL bytes or after scrubbing in canonical UTF-8, U+0000,
 invalid custom patterns, redacted-key collisions, residual matches, and JSON
 nested beyond the exported depth limit of 100 are rejected locally. Either
@@ -344,6 +361,13 @@ Valid safe integers, fractions whose canonical decimal spelling round-trips
 unchanged through JavaScript number formatting, surrogate pairs, and literal
 Unicode remain supported. No source payload or parser excerpt is written to
 quarantine.
+
+The joined-message scrub pipeline is versioned as `native-json-scrub/v2`.
+Upgrading from v1 causes a forward-only rescan from byte zero. Unchanged rows
+deduplicate by their stable ingest key; a corrected default-path row is one
+that did not commit under v1. LCM does not delete or rewrite older transcript
+history or claim that all older rows were cross-block safe. A rescan also
+repeats the existing local quarantine append for records that still fail.
 Pattern-based filtering still has residual risk: an organization-specific
 secret that matches no active rule can remain in the sanitized record. Test
 project patterns against representative canaries before backfill and protect
