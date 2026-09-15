@@ -493,9 +493,12 @@ function isAdmittedSourcePatternsFile(path: string): boolean {
 
 type ReconciliationJournalIdentity = Readonly<{ dev: bigint; ino: bigint }>;
 
+type ReconciliationJournalParentIdentity = Readonly<{ dev: string; ino: string }>;
+
 type ReconciliationJournalAdmission = Readonly<{
   journal: ReconciliationJournal;
   identity: ReconciliationJournalIdentity;
+  parentIdentity: ReconciliationJournalParentIdentity;
   content: string;
 }>;
 
@@ -516,7 +519,32 @@ function publishedJournalIdentity(
   return { dev: identity.dev, ino: identity.ino };
 }
 
-function readJournalAdmission(path: string): ReconciliationJournalAdmission | null {
+function journalParentIdentitiesEqual(
+  left: ReconciliationJournalParentIdentity,
+  right: ReconciliationJournalParentIdentity,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function retainedJournalParentIdentity(
+  parent: PrivateDirectoryHandle,
+): ReconciliationJournalParentIdentity {
+  return { dev: parent.witness.dev, ino: parent.witness.ino };
+}
+
+function journalParentMismatchError(): BackendPublicationJournalError {
+  const cause = new Error("authenticated journal reader observed a different parent inode");
+  return new BackendPublicationJournalError(
+    "unsafe-storage",
+    "worktree reconciliation journal parent changed during admission",
+    { cause },
+  );
+}
+
+function readJournalAdmission(
+  path: string,
+  parent?: PrivateDirectoryHandle,
+): ReconciliationJournalAdmission | null {
   let observed: ReturnType<typeof readBoundedRegularFileWithStat>;
   try {
     observed = readBoundedRegularFileWithStat(path, {
@@ -529,6 +557,13 @@ function readJournalAdmission(path: string): ReconciliationJournalAdmission | nu
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
+  }
+  const parentIdentity = { dev: observed.parentDev, ino: observed.parentIno };
+  if (
+    parent !== undefined
+    && !journalParentIdentitiesEqual(parentIdentity, retainedJournalParentIdentity(parent))
+  ) {
+    throw journalParentMismatchError();
   }
   const value = JSON.parse(observed.content) as Partial<ReconciliationJournal>;
   if (
@@ -607,12 +642,16 @@ function readJournalAdmission(path: string): ReconciliationJournalAdmission | nu
   return {
     journal: value as ReconciliationJournal,
     identity: { dev: BigInt(observed.exactDev), ino: BigInt(observed.exactIno) },
+    parentIdentity,
     content: observed.content,
   };
 }
 
-function readJournal(path: string): ReconciliationJournal | null {
-  return readJournalAdmission(path)?.journal ?? null;
+function readJournal(
+  path: string,
+  parent?: PrivateDirectoryHandle,
+): ReconciliationJournal | null {
+  return readJournalAdmission(path, parent)?.journal ?? null;
 }
 
 function assertAuthorizedJournalAdmission(
@@ -648,7 +687,7 @@ function writeJournal(
   authorization: ReconciliationJournalAuthorization,
 ): void {
   assertPrivateDirectoryEntry(parent, dirname(path), parent.witness.uid);
-  const admitted = readJournalAdmission(path);
+  const admitted = readJournalAdmission(path, parent);
   assertAuthorizedJournalAdmission(admitted, authorization);
   assertCompletedJournalIsNotBlocked(admitted, journal);
   journal.updatedAt = new Date().toISOString();
@@ -662,7 +701,7 @@ function writeJournal(
       ? { requireAbsent: true }
       : {
           beforeReplace: () => {
-            const boundary = readJournalAdmission(path);
+            const boundary = readJournalAdmission(path, parent);
             assertAuthorizedJournalAdmission(boundary, authorization);
             if (boundary === null) {
               throw new Error("worktree reconciliation journal identity changed during publication");
@@ -674,7 +713,7 @@ function writeJournal(
   // Retain the identity of the inode we actually published before reopening
   // the pathname. A safe substitute must never become the next authorization.
   authorization.identity = publishedJournalIdentity(published);
-  const verified = readJournalAdmission(path);
+  const verified = readJournalAdmission(path, parent);
   if (
     verified === null
     || !journalIdentitiesEqual(verified.identity, authorization.identity)
@@ -2573,8 +2612,11 @@ export function reconcileWorktrees(
     assertJournalParent();
     opts._observer?.("after-map-preflight");
     assertJournalParent();
-    const existingAdmission = readJournalAdmission(journalFile);
-    journalAuthorization.identity = existingAdmission?.identity ?? null;
+    const existingAdmission = readJournalAdmission(
+      journalFile,
+      retainedJournalParent?.directory,
+    );
+    assertAuthorizedJournalAdmission(existingAdmission, journalAuthorization);
     const existingJournal = existingAdmission?.journal ?? null;
     assertJournalParent();
     opts._observer?.("after-journal-admission");
@@ -2987,7 +3029,9 @@ export function reconcileWorktrees(
   ): WorktreeReconciliationResult => {
     const completion = { marked: false, published: false };
     const blockedRecording = { attempted: false };
-    const journalAuthorization: ReconciliationJournalAuthorization = { identity: undefined };
+    const journalAuthorization: ReconciliationJournalAuthorization = {
+      identity: undefined,
+    };
     const executeWithJournalParent = (
       retainedJournalParent: RetainedReconciliationJournalParent | undefined,
     ): WorktreeReconciliationResult => {
@@ -3007,7 +3051,10 @@ export function reconcileWorktrees(
         let current: ReconciliationJournal | null;
         try {
           assertRetainedReconciliationJournalParent(retainedJournalParent!);
-          const currentAdmission = readJournalAdmission(journalFile);
+          const currentAdmission = readJournalAdmission(
+            journalFile,
+            retainedJournalParent!.directory,
+          );
           assertAuthorizedJournalAdmission(currentAdmission, journalAuthorization);
           current = currentAdmission?.journal ?? null;
           assertRetainedReconciliationJournalParent(retainedJournalParent!);
@@ -3243,10 +3290,52 @@ export function clearWorktreeReconciliationCache(): void {
 export function listWorktreeReconciliationJournals(homeDir?: string): ReconciliationJournal[] {
   return withBackendPublicationConsumerLock(homeDir, () => {
     const root = reconciliationDir(homeDir);
-    if (!existsSync(root)) return [];
-    return readdirSync(root, { withFileTypes: true })
-      .filter((entry) => /^[a-f0-9]{64}\.json$/u.test(entry.name))
-      .map((entry) => readJournal(join(root, entry.name)))
-      .filter((journal): journal is ReconciliationJournal => journal !== null);
+    let rootEntry: ReturnType<typeof lstatSync>;
+    try {
+      rootEntry = lstatSync(root);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    if (!rootEntry.isDirectory()) {
+      throw new Error(
+        `worktree reconciliation journal directory is not a private directory: ${root}`,
+      );
+    }
+
+    const retainedRoot = openPrivateDirectory(root);
+    let journals: ReconciliationJournal[] | undefined;
+    let primaryError: unknown;
+    try {
+      assertPrivateDirectoryEntry(retainedRoot, root, retainedRoot.witness.uid);
+      const entries = readdirSync(root, { withFileTypes: true });
+      assertPrivateDirectoryEntry(retainedRoot, root, retainedRoot.witness.uid);
+      journals = [];
+      for (const entry of entries) {
+        if (!/^[a-f0-9]{64}\.json$/u.test(entry.name)) continue;
+        assertPrivateDirectoryEntry(retainedRoot, root, retainedRoot.witness.uid);
+        const journal = readJournal(join(root, entry.name), retainedRoot);
+        assertPrivateDirectoryEntry(retainedRoot, root, retainedRoot.witness.uid);
+        if (journal !== null) journals.push(journal);
+      }
+    } catch (error) {
+      primaryError = error;
+    }
+    const cleanupErrors = closePrivateDirectoryHandles([retainedRoot]);
+    if (primaryError !== undefined && cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [primaryError, ...cleanupErrors],
+        `reconciliation journal listing failed: ${String(primaryError)}`,
+        { cause: primaryError },
+      );
+    }
+    if (primaryError !== undefined) throw primaryError;
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        cleanupErrors,
+        "reconciliation journal listing directory cleanup failed",
+      );
+    }
+    return journals as ReconciliationJournal[];
   });
 }

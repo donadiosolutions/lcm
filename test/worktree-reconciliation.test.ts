@@ -120,11 +120,15 @@ function withReportedForeignFileOwner<T>(
     const observed = originalFstat(fd, options as never);
     if (
       !active()
-      || observed.dev !== expected.dev
-      || observed.ino !== expected.ino
+      || Number(observed.dev) !== expected.dev
+      || Number(observed.ino) !== expected.ino
     ) return observed;
     const foreign = Object.create(observed) as typeof observed;
-    Object.defineProperty(foreign, "uid", { value: expected.uid + 1 });
+    Object.defineProperty(foreign, "uid", {
+      value: typeof observed.uid === "bigint"
+        ? BigInt(expected.uid + 1)
+        : expected.uid + 1,
+    });
     return foreign;
   }) as typeof fstatSync, callback);
 }
@@ -319,9 +323,53 @@ async function importReconciliationWithDirectoryFaults(
   };
 }
 
+async function importReconciliationWithJournalParentFault(
+  mismatchReads: readonly number[],
+): Promise<{
+  module: typeof import("../src/worktree-reconciliation.js");
+  readCount: () => number;
+}> {
+  let reads = 0;
+  vi.resetModules();
+  vi.doMock("../src/security-files.js", async () => {
+    const actual = await vi.importActual<typeof import("../src/security-files.js")>(
+      "../src/security-files.js",
+    );
+    return {
+      ...actual,
+      readBoundedRegularFileWithStat: ((
+        ...args: Parameters<typeof actual.readBoundedRegularFileWithStat>
+      ) => {
+        const observed = actual.readBoundedRegularFileWithStat(...args);
+        reads += 1;
+        if (!mismatchReads.includes(reads)) return observed;
+        return {
+          content: observed.content,
+          mtimeMs: observed.mtimeMs,
+          dev: observed.dev,
+          ino: observed.ino,
+          mode: observed.mode,
+          uid: observed.uid,
+          gid: observed.gid,
+          nlink: observed.nlink,
+          parentDev: observed.parentDev,
+          parentIno: (BigInt(observed.parentIno) + 1n).toString(10),
+          exactDev: observed.exactDev,
+          exactIno: observed.exactIno,
+        };
+      }) as typeof actual.readBoundedRegularFileWithStat,
+    };
+  });
+  return {
+    module: await import("../src/worktree-reconciliation.js"),
+    readCount: () => reads,
+  };
+}
+
 function resetReconciliationModuleMocks(): void {
   vi.doUnmock("node:fs");
   vi.doUnmock("node:sqlite");
+  vi.doUnmock("../src/security-files.js");
   vi.resetModules();
 }
 
@@ -6541,6 +6589,388 @@ describe("worktree reconciliation", () => {
       "{}",
     );
     expect(() => listWorktreeReconciliationJournals()).toThrow("journal is malformed");
+  });
+
+  it.each([
+    {
+      label: "dangling symlink",
+      arrange: (root: string) => symlinkSync(`${root}.missing`, root),
+    },
+    {
+      label: "external-directory symlink",
+      arrange: (root: string) => {
+        const external = `${root}.external`;
+        makePrivateFixtureDirectory(external);
+        const targetHash = "a".repeat(64);
+        writePrivateFixtureFile(
+          join(external, `${targetHash}.json`),
+          reconciliationJournalBytes(targetHash, "/external", { phase: "completed" }),
+        );
+        symlinkSync(external, root);
+      },
+    },
+    {
+      label: "regular file",
+      arrange: (root: string) => writePrivateFixtureFile(root, "root evidence\n"),
+    },
+  ])("journal root admission refuses a $label without changing it", ({ arrange }) => {
+    const root = join(home, ".lcm", "reconciliations");
+    arrange(root);
+    const before = lstatSync(root);
+    const external = `${root}.external`;
+    const externalJournal = join(external, `${"a".repeat(64)}.json`);
+    const externalBytes = existsSync(externalJournal)
+      ? readFileSync(externalJournal, "utf8")
+      : undefined;
+
+    expect(() => listWorktreeReconciliationJournals())
+      .toThrow("reconciliation journal directory is not a private directory");
+
+    const after = lstatSync(root);
+    expect(after.dev).toBe(before.dev);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mode).toBe(before.mode);
+    if (externalBytes !== undefined) {
+      expect(readFileSync(externalJournal, "utf8")).toBe(externalBytes);
+    }
+  });
+
+  it("journal root admission propagates non-ENOENT lstat failures", () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    const journalPath = join(root, `${targetHash}.json`);
+    const bytes = reconciliationJournalBytes(targetHash, "/project", {
+      phase: "completed",
+    });
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, bytes);
+    const rootBefore = lstatSync(root);
+    const journalBefore = lstatSync(journalPath);
+    const failure = Object.assign(new Error("injected journal root lstat failure"), {
+      code: "EACCES",
+    });
+    const originalLstat = lstatSync;
+
+    expect(() => withPatchedFs("lstatSync", ((
+      path: Parameters<typeof lstatSync>[0],
+      options?: Parameters<typeof lstatSync>[1],
+    ) => {
+      if (String(path) === root) throw failure;
+      return originalLstat(path, options as never);
+    }) as typeof lstatSync, () => listWorktreeReconciliationJournals())).toThrow(failure);
+
+    const rootAfter = lstatSync(root);
+    const journalAfter = lstatSync(journalPath);
+    expect(rootAfter.dev).toBe(rootBefore.dev);
+    expect(rootAfter.ino).toBe(rootBefore.ino);
+    expect(rootAfter.mode).toBe(rootBefore.mode);
+    expect(journalAfter.dev).toBe(journalBefore.dev);
+    expect(journalAfter.ino).toBe(journalBefore.ino);
+    expect(journalAfter.mode).toBe(journalBefore.mode);
+    expect(readFileSync(journalPath, "utf8")).toBe(bytes);
+    expect(readdirSync(root)).toEqual([`${targetHash}.json`]);
+  });
+
+  it("journal root admission authenticates the root mode before listing", () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    const journalPath = join(root, `${targetHash}.json`);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(
+      journalPath,
+      reconciliationJournalBytes(targetHash, "/project", { phase: "completed" }),
+    );
+    fsChmodSync(root, 0o755);
+    const before = statSync(journalPath);
+    const bytes = readFileSync(journalPath, "utf8");
+
+    expect(() => listWorktreeReconciliationJournals())
+      .toThrow("private directory mode is not trusted");
+
+    expect(statSync(journalPath).ino).toBe(before.ino);
+    expect(readFileSync(journalPath, "utf8")).toBe(bytes);
+    expect(statSync(root).mode & 0o777).toBe(0o755);
+  });
+
+  it("journal root admission authenticates the root owner before listing", () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    const journalPath = join(root, `${targetHash}.json`);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(
+      journalPath,
+      reconciliationJournalBytes(targetHash, "/project", { phase: "completed" }),
+    );
+    const bytes = readFileSync(journalPath, "utf8");
+
+    expect(() => withReportedForeignFileOwner(
+      root,
+      () => listWorktreeReconciliationJournals(),
+    )).toThrow("private directory owner is not trusted");
+
+    expect(readFileSync(journalPath, "utf8")).toBe(bytes);
+  });
+
+  it("journal root admission refuses disappearance after positive lstat", async () => {
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root);
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      let removed = false;
+      return {
+        ...actual,
+        lstatSync: ((path: Parameters<typeof actual.lstatSync>[0], options?: unknown) => {
+          const stat = actual.lstatSync(path, options as never);
+          if (!removed && String(path) === root) {
+            removed = true;
+            actual.rmSync(root, { recursive: true });
+          }
+          return stat;
+        }) as typeof actual.lstatSync,
+      };
+    });
+    try {
+      const isolated = await import("../src/worktree-reconciliation.js");
+      expect(() => isolated.listWorktreeReconciliationJournals()).toThrow(/ENOENT/u);
+      expect(existsSync(root)).toBe(false);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal root admission fails closed when the root changes after enumeration", async () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const displaced = `${root}.displaced`;
+    const targetHash = "a".repeat(64);
+    const journalPath = join(root, `${targetHash}.json`);
+    const bytes = reconciliationJournalBytes(targetHash, "/project", { phase: "completed" });
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, bytes);
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      let replaced = false;
+      return {
+        ...actual,
+        readdirSync: ((directory: Parameters<typeof actual.readdirSync>[0], options?: unknown) => {
+          const entries = actual.readdirSync(directory, options as never);
+          if (!replaced && String(directory) === root) {
+            replaced = true;
+            actual.renameSync(root, displaced);
+            actual.mkdirSync(root, { mode: PRIVATE_DIRECTORY_MODE });
+          }
+          return entries;
+        }) as typeof actual.readdirSync,
+      };
+    });
+    try {
+      const isolated = await import("../src/worktree-reconciliation.js");
+      expect(() => isolated.listWorktreeReconciliationJournals())
+        .toThrow("private directory topology is not trusted");
+      expect(readdirSync(root)).toEqual([]);
+      expect(readFileSync(join(displaced, `${targetHash}.json`), "utf8")).toBe(bytes);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal root admission reports a close-only failure after a valid listing", async () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(
+      join(root, `${targetHash}.json`),
+      reconciliationJournalBytes(targetHash, "/project", { phase: "completed" }),
+    );
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir: join(home, "unused-target"),
+      journalDir: root,
+      failJournalClose: true,
+    });
+    try {
+      expect(() => isolated.module.listWorktreeReconciliationJournals())
+        .toThrow("reconciliation journal listing directory cleanup failed");
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal root admission preserves a read failure when close also fails", async () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(join(root, `${targetHash}.json`), "{");
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir: join(home, "unused-target"),
+      journalDir: root,
+      failJournalClose: true,
+    });
+    try {
+      let caught: unknown;
+      try {
+        isolated.module.listWorktreeReconciliationJournals();
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(AggregateError);
+      expect((caught as AggregateError).cause).toBeInstanceOf(SyntaxError);
+      expect((caught as AggregateError).errors[0]).toBeInstanceOf(SyntaxError);
+      expect(String((caught as AggregateError).errors[1]))
+        .toContain("injected reconciliation journal directory close failure");
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal root admission passes its retained parent to each journal read", async () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    const journalPath = join(root, `${targetHash}.json`);
+    const bytes = reconciliationJournalBytes(targetHash, "/project", { phase: "completed" });
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, bytes);
+    const isolated = await importReconciliationWithJournalParentFault([1]);
+    const parseSpy = vi.spyOn(JSON, "parse");
+    try {
+      let caught: unknown;
+      try {
+        isolated.module.listWorktreeReconciliationJournals();
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+      });
+      expect((caught as Error).cause).toBeInstanceOf(Error);
+      expect(String((caught as Error).cause))
+        .toContain("authenticated journal reader observed a different parent inode");
+      expect(isolated.readCount()).toBe(1);
+      expect(parseSpy.mock.calls.some(([content]) => content === bytes)).toBe(false);
+      expect(readFileSync(journalPath, "utf8")).toBe(bytes);
+    } finally {
+      parseSpy.mockRestore();
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it.each([
+    { checkpoint: "locked initial read", mismatchRead: 2 },
+    { checkpoint: "prewrite", mismatchRead: 3 },
+    { checkpoint: "beforeReplace", mismatchRead: 4 },
+  ])("journal parent witness refuses a mismatch at $checkpoint", async ({ mismatchRead }) => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const root = join(home, ".lcm", "reconciliations");
+    const journalPath = join(root, `${targetHash}.json`);
+    const bytes = reconciliationJournalBytes(targetHash, canonical);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, bytes);
+    const isolated = await importReconciliationWithJournalParentFault([mismatchRead]);
+    try {
+      let caught: unknown;
+      try {
+        isolated.module.reconcileWorktrees(main, { homeDir: home });
+      } catch (error) {
+        caught = error;
+      }
+      expect(String(caught)).toContain(
+        "worktree reconciliation journal parent changed during admission",
+      );
+      expect(isolated.readCount()).toBe(mismatchRead);
+      expect(readFileSync(journalPath, "utf8")).toBe(bytes);
+      expect(readdirSync(root).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
+      expect(existsSync(projectMapPath(home))).toBe(false);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal parent witness refuses mismatched post-publication readback", async () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const root = join(home, ".lcm", "reconciliations");
+    const journalPath = join(root, `${targetHash}.json`);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, reconciliationJournalBytes(targetHash, canonical));
+    const isolated = await importReconciliationWithJournalParentFault([5]);
+    try {
+      expect(() => isolated.module.reconcileWorktrees(main, { homeDir: home }))
+        .toThrow("worktree reconciliation journal parent changed during admission");
+      expect(isolated.readCount()).toBe(5);
+      expect(JSON.parse(readFileSync(journalPath, "utf8"))).toMatchObject({
+        targetHash,
+        phase: "completed",
+      });
+      expect(readdirSync(root).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
+      expect(existsSync(projectMapPath(home))).toBe(false);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal parent witness refuses mismatch during outer blocked recovery", async () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const root = join(home, ".lcm", "reconciliations");
+    const journalPath = join(root, `${targetHash}.json`);
+    const bytes = reconciliationJournalBytes(targetHash, canonical);
+    const primary = new Error("injected failure before outer blocked recovery");
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, bytes);
+    const isolated = await importReconciliationWithJournalParentFault([3]);
+    try {
+      let caught: unknown;
+      try {
+        isolated.module.reconcileWorktrees(main, {
+          homeDir: home,
+          _observer: (event) => {
+            if (event === "after-journal-admission") throw primary;
+          },
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(AggregateError);
+      expect((caught as AggregateError).cause).toBe(primary);
+      expect((caught as AggregateError).errors[0]).toBe(primary);
+      expect(String((caught as AggregateError).errors[1]))
+        .toContain("worktree reconciliation journal parent changed during admission");
+      expect(isolated.readCount()).toBe(3);
+      expect(readFileSync(journalPath, "utf8")).toBe(bytes);
+      expect(readdirSync(root).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
+      expect(existsSync(projectMapPath(home))).toBe(false);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal parent witness accepts an equal observed parent", async () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const root = join(home, ".lcm", "reconciliations");
+    const journalPath = join(root, `${targetHash}.json`);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, reconciliationJournalBytes(targetHash, canonical));
+    const isolated = await importReconciliationWithJournalParentFault([]);
+    try {
+      expect(isolated.module.reconcileWorktrees(main, { homeDir: home }).status)
+        .toBe("not-needed");
+      expect(isolated.readCount()).toBe(5);
+      expect(JSON.parse(readFileSync(journalPath, "utf8"))).toMatchObject({
+        targetHash,
+        phase: "completed",
+      });
+    } finally {
+      resetReconciliationModuleMocks();
+    }
   });
 
   it.each([

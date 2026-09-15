@@ -297,6 +297,8 @@ const expectedComponents = [
       // recovery, and listing hardening in this existing worktree owner.
       // #1173 keeps promoted-content reconciliation guards in this existing
       // project/worktree ownership component; no topology change.
+      // #1178 listing-root authentication and #1245 retained journal-parent
+      // witness stay in this existing unit-project-worktrees owner.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
