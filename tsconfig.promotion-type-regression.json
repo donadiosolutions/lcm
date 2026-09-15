@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": [
+    "test/promotion/dedup-type-regression.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
+}

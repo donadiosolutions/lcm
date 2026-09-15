@@ -10,7 +10,10 @@ import {
   type ExportEntry,
 } from "../../src/portable-knowledge.js";
 import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
+import { StorageOperationError } from "../../src/storage/errors.js";
 import { PostgreSqlPromotedMemoryRepository } from "../../src/storage/postgresql/memory-repositories.js";
+import { PostgreSqlIdentityRepository } from "../../src/storage/postgresql/identity-repository.js";
+import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import { assertHarnessReady, settings, withPostgreSqlTestDatabase } from "./harness.js";
 import { withCliProjectStorage } from "../../src/cli-storage.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
@@ -53,7 +56,7 @@ function document(entries: ExportEntry[]): ExportDocument {
   };
 }
 
-async function persistedRows({ administrator, project }: SelectedPostgreSqlProject) {
+async function persistedRowsFor(administrator: PostgreSqlRuntime, projectId: string) {
   const result = await administrator.query<{
     memory_id: string;
     content: string;
@@ -69,9 +72,13 @@ async function persistedRows({ administrator, project }: SelectedPostgreSqlProje
                          ORDER BY ordinal) AS tags
              FROM lcm.promoted_memories memories
             WHERE project_id = $1 ORDER BY memory_id`,
-    values: [project.projectId],
+    values: [projectId],
   }, { domain: "promoted-memory", operation: "verifyKnowledgeImport" });
   return result.rows;
+}
+
+async function persistedRows(fixture: SelectedPostgreSqlProject) {
+  return persistedRowsFor(fixture.administrator, fixture.project.projectId);
 }
 
 const PROMOTED_CONTENT = "Orchard pruning architecture decision for perennial fruit trees";
@@ -130,6 +137,109 @@ describe("PostgreSQL 18 portable knowledge v1", { timeout: 120_000 }, () => {
         metadata: { promotionNote: "retain normal promotion metadata", [DIGEST_KEY]: [expect.stringMatching(/^[a-f0-9]{64}$/u)] } });
       await expect(importKnowledge(fixture.projectPath, source)).resolves.toMatchObject({ imported: 0, skipped: 1 });
       expect(await persistedRows(fixture)).toEqual(rows);
+    });
+  });
+
+  it("merges an owner exact row omitted by a saturated fuzzy page", async () => {
+    await withSelectedPostgreSqlProject("knowledge-saturated-exact", async fixture => {
+      const repository = new PostgreSqlPromotedMemoryRepository(
+        fixture.database.runtime,
+        fixture.project.projectId,
+      );
+      const content = "alpha beta gamma";
+      const exactId = await repository.insert({
+        content,
+        tags: ["existing"],
+        sourceProjectId: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9031",
+        metadata: { canonicalNote: "retain exact metadata" },
+        confidence: 0.6,
+      });
+      const otherOwnerPath = join(fixture.projectRoot, "other-owner");
+      mkdirSync(otherOwnerPath);
+      const otherProject = await new PostgreSqlIdentityRepository(fixture.database.migrator).createProject({
+        machineId: fixture.machine.machineId,
+        displayName: "PostgreSQL saturation isolation project",
+        path: otherOwnerPath,
+        normalizedPath: otherOwnerPath,
+      });
+      const otherRepository = new PostgreSqlPromotedMemoryRepository(
+        fixture.database.runtime,
+        otherProject.projectId,
+      );
+      const otherOwnerId = await otherRepository.insert({
+        content,
+        tags: ["other-owner"],
+        confidence: 0.4,
+      });
+      const otherOwnerBefore = await persistedRowsFor(fixture.administrator, otherProject.projectId);
+      expect(otherOwnerBefore).toEqual([expect.objectContaining({
+        memory_id: otherOwnerId,
+        tags: ["other-owner"],
+      })]);
+      for (let index = 0; index < 100; index += 1) {
+        await repository.insert({
+          content: `${content} !${index}`,
+          tags: ["fuzzy"],
+          sourceProjectId: `018f22c4-6d2a-7f10-8a4c-6b8d3e5f9${String(index + 100).padStart(3, "0")}`,
+          confidence: 0.2,
+        });
+      }
+      await withCliProjectStorage(fixture.projectPath, {}, async ({ storage }) => {
+        const page = await storage.lexicalSearch.searchPromoted(content, 100, undefined, undefined);
+        expect(page).toHaveLength(100);
+        expect(page.some(candidate => candidate.id === exactId)).toBe(false);
+      });
+
+      const source = document([entry(content, ["imported"])]);
+      const rollbackFailure = new StorageOperationError(
+        "STORAGE_OPERATION_FAILED",
+        "postgresql",
+        fixture.project.projectId,
+        "promoted-memory",
+        "update",
+      );
+      const failingUpdate = vi.spyOn(PostgreSqlPromotedMemoryRepository.prototype, "update")
+        .mockRejectedValueOnce(rollbackFailure);
+      await expect(importKnowledge(fixture.projectPath, source)).rejects.toBe(rollbackFailure);
+      expect(rollbackFailure).toMatchObject({
+        code: "STORAGE_OPERATION_FAILED",
+        backend: "postgresql",
+        projectId: fixture.project.projectId,
+        domain: "promoted-memory",
+        operation: "update",
+      });
+      failingUpdate.mockRestore();
+      expect(await persistedRows(fixture)).toHaveLength(101);
+      expect((await persistedRows(fixture)).find(row => row.memory_id === exactId))
+        .toMatchObject({
+          tags: ["existing"],
+          metadata: { canonicalNote: "retain exact metadata" },
+        });
+      expect(await persistedRowsFor(fixture.administrator, otherProject.projectId))
+        .toEqual(otherOwnerBefore);
+
+      await expect(importKnowledge(fixture.projectPath, source)).resolves.toMatchObject({
+        imported: 1,
+        skipped: 0,
+      });
+      const rows = await persistedRows(fixture);
+      expect(rows.filter(row => row.content === content)).toHaveLength(1);
+      expect(rows.find(row => row.memory_id === exactId)).toMatchObject({
+        memory_id: exactId,
+        tags: expect.arrayContaining(["existing", "imported"]),
+        confidence: 0.8,
+        metadata: {
+          canonicalNote: "retain exact metadata",
+          [DIGEST_KEY]: [expect.stringMatching(/^[a-f0-9]{64}$/u)],
+        },
+      });
+      expect(await persistedRowsFor(fixture.administrator, otherProject.projectId))
+        .toEqual(otherOwnerBefore);
+
+      await expect(importKnowledge(fixture.projectPath, source)).resolves.toMatchObject({
+        imported: 0,
+        skipped: 1,
+      });
     });
   });
 

@@ -1158,6 +1158,7 @@ describe("promote-events unit boundaries", () => {
     const repositories = {
       lexicalSearch: { searchPromoted: mocks.storeSearch },
       promotedMemory: {
+        findExactContent: vi.fn().mockResolvedValue(null),
         insert: vi.fn().mockResolvedValue("inserted"),
         update: vi.fn().mockResolvedValue(undefined),
         archive: vi.fn().mockResolvedValue(undefined),
@@ -1219,6 +1220,7 @@ describe("promote-events unit boundaries", () => {
     const repositories = {
       lexicalSearch: { searchPromoted: mocks.storeSearch },
       promotedMemory: {
+        findExactContent: vi.fn().mockResolvedValue(null),
         insert: vi.fn().mockResolvedValue("inserted-provenance"),
         update: vi.fn().mockResolvedValue(undefined),
         archive: vi.fn().mockResolvedValue(undefined),
@@ -1283,6 +1285,7 @@ describe("promote-events unit boundaries", () => {
     const repositories = {
       lexicalSearch: { searchPromoted: mocks.storeSearch },
       promotedMemory: {
+        findExactContent: vi.fn().mockResolvedValue(null),
         insert: vi.fn().mockResolvedValue("unexpected-insert"),
         update: vi.fn().mockResolvedValue(undefined),
         archive: vi.fn().mockResolvedValue(undefined),

@@ -307,6 +307,23 @@ describe("PromotedStore", () => {
     expect(results).toEqual([]);
   });
 
+  it("finds the newest live byte-exact row within a project", () => {
+    const db = makeDb();
+    const store = new PromotedStore(db);
+    const older = store.insert({ content: "same punctuation!", projectId: "p1" });
+    const newer = store.insert({ content: "same punctuation!", projectId: "p1" });
+    const archived = store.insert({ content: "same punctuation!", projectId: "p1" });
+    const otherProject = store.insert({ content: "same punctuation!", projectId: "p2" });
+    db.prepare("UPDATE promoted SET created_at = ? WHERE id = ?").run("2020-01-01 00:00:00", older);
+    db.prepare("UPDATE promoted SET created_at = ? WHERE id = ?").run("2021-01-01 00:00:00", newer);
+    store.archive(archived);
+
+    expect(store.findExactContent("same punctuation!", "p1")?.id).toBe(newer);
+    expect(store.findExactContent("same punctuation!", "p2")?.id).toBe(otherProject);
+    expect(store.findExactContent("same punctuation?", "p1")).toBeNull();
+    expect(store.findExactContent("same punctuation!", "missing")).toBeNull();
+  });
+
   it("archive() soft-deletes entry and removes from FTS5", () => {
     const db = makeDb();
     const store = new PromotedStore(db);

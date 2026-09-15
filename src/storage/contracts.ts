@@ -295,6 +295,7 @@ export interface PromotedMemoryRecord {
 export interface PromotedMemoryRepository {
   insert(input: { content: string; tags?: string[]; metadata?: JsonObject; sourceSummaryId?: string; sourceProjectId?: string; sessionId?: string; depth?: number; confidence?: number }): Promise<string>;
   getById(id: string): Promise<PromotedMemoryRecord | null>;
+  findExactContent(content: string, sourceProjectId?: string): Promise<PromotedMemoryRecord | null>;
   getAll(options?: { sourceProjectId?: string; since?: string; tags?: string[] }): Promise<PromotedMemoryRecord[]>;
   listContentPrefixes(limit: number): Promise<string[]>;
   archive(id: string): Promise<void>;

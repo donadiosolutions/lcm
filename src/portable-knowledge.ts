@@ -266,6 +266,8 @@ export async function importKnowledge(
         content: scrubber.scrub(entry.content),
         tags: entry.tags.map((tag) => scrubber.scrub(tag)),
         sourceProjectId,
+        candidateScope: "owner",
+        backend: storage.backend,
         sessionId: entry.sessionId ?? undefined,
         depth: 0, confidence, thresholds: DEFAULT_DEDUP_THRESHOLDS,
       });

@@ -31,7 +31,10 @@ imported from elsewhere. Import compares against that same owner scope, so an
 existing normal promotion can be merged and retains its metadata and retry
 history. A memory's origin does not grant access to another remote project.
 SQLite keeps its existing project-origin filter for this version 1 format.
-Exact content matches merge regardless of search rank on either backend.
+For PostgreSQL, owner-bound exact content matches merge even when the row is
+outside the bounded fuzzy candidate page. Repeating the same document then
+uses its stored retry identities to skip already accepted entries. SQLite keeps
+its existing source-scoped search and deduplication behavior.
 Nonidentical content still requires the configured deduplication threshold.
 
 ## Version 1 format and privacy

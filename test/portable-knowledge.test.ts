@@ -740,6 +740,66 @@ describe("portable-knowledge — import", () => {
     } finally { db.close(); }
   });
 
+  it("uses the PostgreSQL owner exact lookup through the import proxy", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const { dbPath } = seedProject(baseDir, cwd, [{
+      content: "alpha beta gamma",
+      tags: ["existing"],
+      confidence: 0.6,
+    }]);
+    const db = new DatabaseSync(dbPath);
+    const store = new PromotedStore(db);
+    const exact = store.getAll()[0]!;
+    store.update(exact.id, { metadata: { canonicalNote: "retain" } });
+    for (let index = 0; index < 100; index += 1) {
+      store.insert({
+        content: `alpha beta gamma !${index}`,
+        tags: ["fuzzy"],
+        projectId: toProjectId(cwd),
+        confidence: 0.2,
+      });
+    }
+    const search = vi.spyOn(PromotedStore.prototype, "search").mockImplementation(function (query, limit, tags, projectId) {
+      return this.getAll({ projectId }).filter(row => row.content !== "alpha beta gamma").slice(0, limit).map(row => ({
+        id: row.id,
+        content: row.content,
+        tags: JSON.parse(row.tags),
+        projectId: row.project_id,
+        sessionId: row.session_id,
+        confidence: row.confidence,
+        createdAt: row.created_at,
+        rank: 0,
+      }));
+    });
+    const originalWithCliProjectStorage = cliStorage.withCliProjectStorage;
+    const opened = vi.spyOn(cliStorage, "withCliProjectStorage").mockImplementation((path, options, callback) =>
+      originalWithCliProjectStorage(path, options, context => callback({
+        ...context,
+        storage: {
+          ...context.storage,
+          backend: "postgresql",
+          transaction: context.storage.transaction.bind(context.storage),
+        },
+      })));
+    try {
+      const doc = makeDoc([{ content: "alpha beta gamma", tags: ["imported"], confidence: 0.9, createdAt: "2026-01-01", sessionId: null }]);
+      await expect(importKnowledge(cwd, doc, { _lcmBaseDir: baseDir })).resolves.toMatchObject({ imported: 1, skipped: 0 });
+      expect(store.getAll()).toHaveLength(101);
+      expect(store.getById(exact.id)).toMatchObject({
+        content: "alpha beta gamma",
+        tags: '["existing","imported"]',
+        confidence: 0.9,
+        metadata: expect.stringContaining("canonicalNote"),
+      });
+      await expect(importKnowledge(cwd, doc, { _lcmBaseDir: baseDir })).resolves.toMatchObject({ imported: 0, skipped: 1 });
+    } finally {
+      opened.mockRestore();
+      search.mockRestore();
+      db.close();
+    }
+  });
+
   it("indexes many source entries deduplicated into one memory for retry", async () => {
     const baseDir = makeTempDir();
     const cwd = makeTempDir();

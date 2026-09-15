@@ -183,6 +183,12 @@ The PostgreSQL project predicate still excludes memories belonging to another
 owner. SQLite keeps its existing source-project filter, so its promotion scope
 is unchanged.
 
+Promotion also performs a bounded byte-exact check inside the PostgreSQL owner
+transaction. If the exact content is outside the ranked fuzzy page, the live
+owner row is still reused and its tags and confidence are refreshed without
+creating a duplicate. Archived rows and memories owned by another project are
+excluded from this check.
+
 ### Error→Fix Correlation
 
 When a tool error is followed by a successful command with a matching prefix (within 20 events), the system correlates them as an error→fix pair. These are tagged `type:solution` and promoted with higher priority.

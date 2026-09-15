@@ -133,7 +133,7 @@ describe("PostgreSQL memory repositories", () => {
         return result([{ content: "durable" }]);
       }
       if (config.text.includes("SELECT memory.memory_id")) {
-        return result([memoryRow]);
+        return config.values?.includes("missing") ? result([]) : result([memoryRow]);
       }
       return result([]);
     });
@@ -169,6 +169,12 @@ describe("PostgreSQL memory repositories", () => {
       id: importedMemoryId,
     });
     await expect(repository.getById("missing")).resolves.toBeNull();
+    await expect(repository.findExactContent("durable", "source-a")).resolves.toMatchObject({
+      id: memoryId,
+      content: "durable",
+      projectId: "source-a",
+    });
+    await expect(repository.findExactContent("missing")).resolves.toBeNull();
     await expect(repository.getAll({
       sourceProjectId: "source-a",
       since: "2026-01-01T00:00:00.000Z",
