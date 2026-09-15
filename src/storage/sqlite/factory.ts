@@ -26,6 +26,7 @@ import type { BackendPublicationLockToken } from "../backend-publication.js";
 import { throwIfAborted } from "../../daemon/cancellation.js";
 import {
   createMachineIdentity,
+  MachineIdentityFileError,
   readMachineIdentity,
   type MachineIdentity,
   type StoredMachineIdentity,
@@ -49,6 +50,67 @@ type OwnedProjectConnection = {
   closePromise?: Promise<void>;
   releaseCommitted: boolean;
 };
+
+const MIGRATION_RECEIPT_TABLES = new Set([
+  "migration_receipt_v1_epochs",
+  "migration_receipt_v1_events",
+]);
+
+type MigrationReceiptNamespaceRow = Readonly<{
+  type: string;
+  name: string;
+  tbl_name: string;
+  sql: string | null;
+}>;
+
+function migrationReceiptNamespaceRows(
+  db: ReturnType<typeof getLcmConnection>,
+): readonly MigrationReceiptNamespaceRow[] {
+  return db.prepare(`
+    SELECT type, name, tbl_name, sql FROM sqlite_schema
+    WHERE substr(lower(name), 1, 21) = 'migration_receipt_v1_'
+       OR substr(lower(tbl_name), 1, 21) = 'migration_receipt_v1_'
+    ORDER BY type, name, tbl_name
+  `).all() as MigrationReceiptNamespaceRow[];
+}
+
+function assertMigrationReceiptEnrollmentNamespace(
+  db: ReturnType<typeof getLcmConnection>,
+): void {
+  const rows = migrationReceiptNamespaceRows(db);
+  if (rows.length === 0) return;
+  const tables = rows.filter(row => row.type === "table");
+  if (
+    tables.length !== MIGRATION_RECEIPT_TABLES.size
+    || tables.some(row => !MIGRATION_RECEIPT_TABLES.has(row.name) || row.tbl_name !== row.name)
+    || rows.some(row => {
+      if (row.type === "table") return false;
+      return row.type !== "index"
+        || row.sql !== null
+        || !row.name.startsWith("sqlite_autoindex_")
+        || !MIGRATION_RECEIPT_TABLES.has(row.tbl_name);
+    })
+  ) {
+    throw new Error("migration receipt namespace is partial or malformed");
+  }
+}
+
+function ordinaryEnrollmentMachineIdentity(
+  homeDir: string,
+  receiptNamespaceAbsent: boolean,
+): StoredMachineIdentity | null {
+  let machine: StoredMachineIdentity | null;
+  try {
+    machine = readMachineIdentity(homeDir);
+  } catch (error) {
+    if (receiptNamespaceAbsent && error instanceof MachineIdentityFileError) return null;
+    throw error;
+  }
+  if (!receiptNamespaceAbsent && (machine === null || machine.machineId === null)) {
+    throw new Error("migration receipt namespace requires a registered machine identity");
+  }
+  return machine;
+}
 
 export class SqliteStorageBackendFactory implements StorageBackendFactory {
   readonly backend = "sqlite" as const;
@@ -157,16 +219,37 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
           : { _appendBarrierOptions: this.options._appendBarrierOptions }),
         ...(publicationLockToken === undefined ? {} : { lockToken: publicationLockToken }),
       };
-      let features: LcmDbFeatures;
+      let initialization: Readonly<{
+        features: LcmDbFeatures;
+        machine: StoredMachineIdentity | null;
+        receiptNamespaceAbsent: boolean | undefined;
+      }>;
       try {
-        features = await executor.run("factory", operation, () => {
+        initialization = await executor.run("factory", operation, () => {
           throwIfAborted(signal);
           if (this.closed) this.assertOpen(identity, operation);
           const detected = (this.options.detectFeatures ?? getLcmDbFeatures)(db!);
           throwIfAborted(signal);
           if (this.closed) this.assertOpen(identity, operation);
           runLcmMigrations(db!, detected);
-          return detected;
+          const homeDir = admission.homeDir;
+          if (homeDir === undefined) {
+            return { features: detected, machine: null, receiptNamespaceAbsent: undefined };
+          }
+          if (this.options._migrationEnrollmentIdentity !== undefined) {
+            return {
+              features: detected,
+              machine: this.enrollmentMachineIdentity(homeDir, publicationLockToken),
+              receiptNamespaceAbsent: undefined,
+            };
+          }
+          const namespaceRows = migrationReceiptNamespaceRows(db!);
+          const receiptNamespaceAbsent = namespaceRows.length === 0;
+          return {
+            features: detected,
+            machine: ordinaryEnrollmentMachineIdentity(homeDir, receiptNamespaceAbsent),
+            receiptNamespaceAbsent,
+          };
         }, admission);
       } catch (error) {
         if (error instanceof StorageOperationError && error.code === "STORAGE_CLOSED") {
@@ -180,9 +263,9 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
           operation,
         );
       }
+      const { features, machine } = initialization;
       const homeDir = admission.homeDir;
       if (homeDir !== undefined) {
-        const machine = this.enrollmentMachineIdentity(homeDir, publicationLockToken);
         if (machine?.machineId !== null && machine?.machineId !== undefined) {
           await withBackendPublicationAppendBarrierAsync(homeDir, async (token) => {
             assertBackendPublicationConsumerAccess({ homeDir, backend: "sqlite", lockToken: token });
@@ -190,6 +273,12 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
             if (admittedMachine?.machineId !== machine.machineId) {
               throw new Error("SQLite migration enrollment identity changed before preparation");
             }
+            assertMigrationReceiptEnrollmentNamespace(db!);
+            assertMigrationReceiptEpochParticipant(
+              db!,
+              paths.id,
+              admittedMachine.machineId,
+            );
             const outboxFactory = new SQLiteLocalHookOutboxFactory();
             try {
               await outboxFactory.open(join(homeDir, ".lcm", "events", `${paths.id}.db`), {}, token);
@@ -205,6 +294,7 @@ export class SqliteStorageBackendFactory implements StorageBackendFactory {
               if (currentMachine?.machineId !== admittedMachine.machineId) {
                 throw new Error("SQLite migration enrollment identity changed before epoch adoption");
               }
+              assertMigrationReceiptEnrollmentNamespace(db!);
               assertMigrationReceiptEpochParticipant(
                 db!,
                 paths.id,
