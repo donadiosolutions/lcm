@@ -188,6 +188,13 @@ export type BackendMaintenancePhase =
   | "selection-completed"
   | "maintenance-aborted";
 
+/** Whether a version-3 migration-maintenance phase is terminal. */
+export function isTerminalBackendMaintenancePhase(
+  phase: BackendMaintenancePhase,
+): boolean {
+  return phase === "selection-completed" || phase === "maintenance-aborted";
+}
+
 export type BackendMaintenanceRosterEntry = Readonly<{
   machineId: string;
   queueCutoff: string | null;
@@ -2307,7 +2314,9 @@ function assertCandidateWitness(
   }
 }
 
-function parseConfigPublicationJournal(content: string): BackendPublicationJournal | BackendMaintenanceJournal {
+function parsePublicationOrMaintenanceJournal(
+  content: string,
+): BackendPublicationJournal | BackendMaintenanceJournal {
   let candidate: unknown;
   try {
     candidate = JSON.parse(content);
@@ -2340,7 +2349,7 @@ function readConsumerConfigPublicationJournal(
       }
     }
     return journal;
-  }, parseConfigPublicationJournal);
+  }, parsePublicationOrMaintenanceJournal);
 }
 
 function assertBackendPublicationConfigAccessUnlocked(
@@ -2663,6 +2672,7 @@ function writeJournal(
   homeDir: string | undefined,
   observer: BackendPublicationObserver,
   expectedChecksum?: string,
+  replaceTerminalMaintenance = false,
 ): void {
   const directory = backendPublicationDirectory(homeDir);
   const path = backendPublicationJournalPath(homeDir);
@@ -2694,7 +2704,21 @@ function writeJournal(
     }
   })();
   assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
-  const parsed = current === null ? null : parseJournal(current);
+  const parsed = current === null
+    ? null
+    : replaceTerminalMaintenance
+      ? parsePublicationOrMaintenanceJournal(current)
+      : parseJournal(current);
+  if (
+    replaceTerminalMaintenance
+    && (
+      parsed === null
+      || parsed.version !== BACKEND_MAINTENANCE_VERSION
+      || !isTerminalBackendMaintenancePhase(parsed.phase)
+    )
+  ) {
+    return fail("unexpected-state", "terminal backend maintenance changed before replacement");
+  }
   if (expectedChecksum !== undefined && (parsed === null || parsed.checksumSha256 !== expectedChecksum)) {
     return fail("unexpected-state", "backend publication journal changed before update");
   }
@@ -2716,17 +2740,29 @@ function writeJournal(
 
 function archiveTerminalJournal(
   homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
   journal: BackendPublicationJournal | BackendMaintenanceJournal,
 ): void {
   const directory = backendPublicationDirectory(homeDir);
   const history = backendPublicationHistoryDirectory(homeDir);
-  const current = readBoundedRegularFileWithStat(backendPublicationJournalPath(homeDir), {
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
+  const observed = readBoundedRegularFileWithStat(backendPublicationJournalPath(homeDir), {
     allowedRoot: directory,
     maxBytes: MAX_JOURNAL_BYTES,
     expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
     allowedModes: [0o600],
     requireSingleLink: true,
-  }).content;
+  });
+  if (
+    observed.parentDev !== directoryHandle.witness.dev
+    || observed.parentIno !== directoryHandle.witness.ino
+  ) {
+    return fail(
+      "unsafe-storage",
+      "backend publication archive source parent does not match the retained checkpoint directory",
+    );
+  }
+  const current = observed.content;
   const archived = journal.version === BACKEND_MAINTENANCE_VERSION
     ? parseMaintenanceJournal(JSON.parse(current)) : parseJournal(current);
   if (archived.checksumSha256 !== journal.checksumSha256) {
@@ -2760,6 +2796,7 @@ function archiveTerminalJournal(
   }
   syncPrivateDirectory(history);
   syncPrivateDirectory(directory);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
 }
 
 function materialToJson(file: BackendPublicationRecoveryFile): Record<string, unknown> {
@@ -3145,7 +3182,7 @@ export class BackendPublicationCoordinator {
           && existing.phase !== "selection-completed" && existing.phase !== "maintenance-aborted") {
           return fail("unresolved-publication", "backend publication journal already exists");
         }
-        archiveTerminalJournal(this.#homeDir, existing);
+        archiveTerminalJournal(this.#homeDir, directoryHandle, existing);
       }
       const now = (input.now ?? new Date()).toISOString();
       const entering = withMaintenanceChecksum({
@@ -3280,12 +3317,20 @@ export class BackendPublicationCoordinator {
   async prepare(input: PrepareBackendPublicationInput): Promise<BackendPublicationJournal> {
     return this.#locked(async (directoryHandle) => {
       const validated = validateInput(input);
-      const existing = readJournalFromDirectory(this.#homeDir, directoryHandle);
+      const existing = readParsedJournalFromDirectory(
+        this.#homeDir,
+        directoryHandle,
+        parsePublicationOrMaintenanceJournal,
+      );
       if (existing !== null) {
-        if (existing.phase !== "completed" && existing.phase !== "aborted") {
+        if (existing.version === BACKEND_MAINTENANCE_VERSION) {
+          if (!isTerminalBackendMaintenancePhase(existing.phase)) {
+            return fail("unresolved-publication", "backend publication journal already exists");
+          }
+        } else if (existing.phase !== "completed" && existing.phase !== "aborted") {
           return fail("unresolved-publication", "backend publication journal already exists");
         }
-        archiveTerminalJournal(this.#homeDir, existing);
+        archiveTerminalJournal(this.#homeDir, directoryHandle, existing);
       }
       const targetState = materialTargetWitness(validated.material);
       const initial = prospectiveJournal(validated, targetState, targetState, "preparing", null);
@@ -3301,7 +3346,14 @@ export class BackendPublicationCoordinator {
       });
       assertStateShape(observed, "observed");
       const preparing = prospectiveJournal(validated, observed, targetState, "preparing", null);
-      writeJournal(preparing, directoryHandle, this.#homeDir, this.#observer, existing?.checksumSha256);
+      writeJournal(
+        preparing,
+        directoryHandle,
+        this.#homeDir,
+        this.#observer,
+        existing?.checksumSha256,
+        existing?.version === BACKEND_MAINTENANCE_VERSION,
+      );
       this.#observer("before-material-seal", materialPath(this.#homeDir, validated.publicationId));
       const reference = sealMaterial(this.#homeDir, validated.publicationId, validated.material);
       this.#observer("after-material-seal", materialPath(this.#homeDir, validated.publicationId));

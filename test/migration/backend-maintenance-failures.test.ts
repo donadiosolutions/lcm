@@ -6,7 +6,7 @@ import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-pub
 import { BackendPublicationCoordinator, assertBackendPublicationConsumerAccess, assertBackendPublicationProjectMapAccess, backendPublicationCanonicalSha256 as hash,
   backendPublicationJournalPath, backendPublicationHistoryDirectory, readBackendMaintenanceJournal, withBackendPublicationAppendBarrier,
   withBackendPublicationAppendBarrierAsync, withBackendPublicationConsumerLockAsync, rebindBackendMaintenanceCutoff, type BackendPublicationDriver, type BackendMaintenanceJournal,
-  type EnterBackendMaintenanceInput, type PrepareBackendMaintenanceSelectionInput } from "../../src/storage/backend-publication.js";
+  type BackendPublicationRecoveryMaterial, type EnterBackendMaintenanceInput, type PrepareBackendMaintenanceSelectionInput } from "../../src/storage/backend-publication.js";
 
 const interception = vi.hoisted(() => ({ write: undefined as ((content: string) => void) | undefined, read: undefined as ((path: string, observed: Record<string, unknown>) => Record<string, unknown>) | undefined }));
 vi.mock("../../src/security-files.js", async (original) => {
@@ -23,6 +23,10 @@ const roots: string[] = [];
 const HASH = "a".repeat(64); const OTHER = "b".repeat(64);
 const MACHINE = "018f0b5d-1234-4abc-8def-1234567890ab";
 const SECOND = "118f0b5d-1234-4abc-8def-1234567890ab";
+const ABSENT_MATERIAL: BackendPublicationRecoveryMaterial = {
+  source: { config: { presence: "absent" }, projectMap: { presence: "absent" } },
+  target: { config: { presence: "absent" }, projectMap: { presence: "absent" } },
+};
 afterEach(() => { interception.read = undefined; interception.write = undefined; for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function fixture() {
   const home = mkdtempSync(join(tmpdir(), "lcm-maintenance-errors-")); roots.push(home); mkdirSync(join(home, ".lcm"), { mode: 0o700 });
@@ -140,6 +144,33 @@ describe("backend maintenance v3 failure boundaries", () => {
       return observed;
     };
     await expect(value.coordinator.enterMaintenance({ ...input(), generationId: "next" })).rejects.toThrow("changed before archive");
+    expect(() => readFileSync(join(backendPublicationHistoryDirectory(value.home), `${terminal.publicationId}.${terminal.checksumSha256}.json`))).toThrow();
+  });
+  it.each(["parentDev", "parentIno"] as const)("binds the terminal archive source to retained %s", async (field) => {
+    const value = await held();
+    const terminal = await value.coordinator.abortMaintenance({ expectedChecksumSha256: value.journal.checksumSha256,
+      sourceSelectionSha256: HASH, abortEvidenceSha256: OTHER });
+    const bytes = readFileSync(backendPublicationJournalPath(value.home));
+    let reads = 0;
+    let injected = false;
+    interception.read = (path, observed) => {
+      if (path === backendPublicationJournalPath(value.home) && ++reads === 2) {
+        injected = true;
+        return { ...observed, [field]: Number(observed[field]) + 1 };
+      }
+      return observed;
+    };
+
+    await expect(value.coordinator.prepare({
+      publicationId: "ordinary-after-maintenance",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      material: ABSENT_MATERIAL,
+      projects: [],
+    })).rejects.toMatchObject({ reason: "unsafe-storage" });
+    expect(injected).toBe(true);
+    expect(value.unexpected).not.toHaveBeenCalled();
+    expect(readFileSync(backendPublicationJournalPath(value.home))).toEqual(bytes);
     expect(() => readFileSync(join(backendPublicationHistoryDirectory(value.home), `${terminal.publicationId}.${terminal.checksumSha256}.json`))).toThrow();
   });
   it.each([[], null, [{ machineId: MACHINE, queueCutoff: null, evidenceSha256: HASH, extra: true }],
