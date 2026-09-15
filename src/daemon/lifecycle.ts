@@ -33,6 +33,7 @@ import {
   observeHttpHealth,
   type HealthObservation,
 } from "./health-observation.js";
+import { isDaemonTransportFailure } from "./http-url.js";
 import {
   canonicalSupervisorScope,
   createSupervisor,
@@ -1472,10 +1473,18 @@ async function observeDaemonHealth(
   fetchFn: typeof globalThis.fetch,
   deadline: RequestDeadline,
   token?: string,
+  onFetchRejected?: (error: unknown) => void,
 ): Promise<HealthObservation<HealthResponse>> {
   const observed = await observeHttpHealth<HealthResponse>({
     input: `http://127.0.0.1:${port}/health`,
-    fetchFn: async (input, init) => normalizeHealthResponse(await fetchFn(input, init)),
+    fetchFn: async (input, init) => {
+      try {
+        return normalizeHealthResponse(await fetchFn(input, init));
+      } catch (error) {
+        onFetchRejected?.(error);
+        throw error;
+      }
+    },
     requestInit: token
       ? { headers: { Authorization: `Bearer ${token}` } }
       : undefined,
@@ -4759,11 +4768,26 @@ async function restartDaemonUnlocked(
     };
     const recoveryOwner = captureRecoveryOwner();
     if (currentContention !== undefined && recoveryOwner === undefined) throw currentContention;
-    const healthObservation = await observeDaemonHealth(opts.port, fetchFn, healthDeadline);
+    let classifiedTransportRejection = false;
+    const healthObservation = await observeDaemonHealth(
+      opts.port,
+      fetchFn,
+      healthDeadline,
+      undefined,
+      currentContention === undefined
+        ? undefined
+        : error => { classifiedTransportRejection = isDaemonTransportFailure(error); },
+    );
     if (currentContention !== undefined) {
       if (
         healthObservation.kind !== "no-response"
-        || (healthObservation.reason !== "fetch-rejected" && healthObservation.reason !== "header-timeout")
+        || (
+          healthObservation.reason !== "header-timeout"
+          && (
+            healthObservation.reason !== "fetch-rejected"
+            || !classifiedTransportRejection
+          )
+        )
         || !localManagerEndpoint()
         || !(await secondProbeMatches())
       ) throw currentContention;

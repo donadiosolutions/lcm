@@ -275,7 +275,9 @@ function managedRecovery(
   writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
   f.seams.platform = overrides.platform ?? "linux";
   f.seams.fetch = overrides.fetch ?? vi.fn(async () => {
-    throw new Error("daemon did not answer before headers");
+    throw Object.assign(new Error("daemon did not answer before headers"), {
+      code: "ECONNREFUSED",
+    });
   }) as never;
   f.seams.isProcessAlive = vi.fn(() => true);
   let probeCalls = 0;
@@ -369,7 +371,9 @@ describe("restart publication assertion convergence", () => {
     writeFileSync(f.pidPath, "111", { mode: 0o600 });
     writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
     f.seams.fetch = vi.fn(async () => {
-      throw new Error("daemon did not answer before headers");
+      throw Object.assign(new Error("daemon did not answer before headers"), {
+        code: "ECONNREFUSED",
+      });
     }) as never;
     f.seams.isProcessAlive = vi.fn(() => true);
     const probe = vi.fn(async (spec: SupervisorSpec): Promise<SupervisorObservation> => ({
@@ -747,6 +751,21 @@ describe("restart publication assertion convergence", () => {
     await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
 
     expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention for a generic health-fetch programming rejection", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f, {
+      fetch: vi.fn(async () => {
+        throw new TypeError("Cannot read properties of undefined");
+      }) as never,
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+    expect(scenario.ensure).not.toHaveBeenCalled();
+    expect(f.seams.killProcess).not.toHaveBeenCalled();
   });
 
   it("preserves contention after response headers when the body times out", async () => {
