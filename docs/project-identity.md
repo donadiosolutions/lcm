@@ -254,12 +254,26 @@ durable merge markers make the explicit retry resumable.
 Reconciliation journals and project-sensitive pattern files are also
 authenticated before LCM reads their contents. A journal must be a regular
 file, have exactly one hard link, and use an
-owner-only mode (`0400`, `0500`, `0600`, or `0700`). Listing selects every
-journal-shaped name and authenticates each leaf that remains present, so a
-directory, symlink, FIFO, hard link, or otherwise unsafe present journal stops
-the listing. An entry that disappears after directory enumeration is omitted.
-The listing-root absence prefilter remains a separate
-limitation tracked by [#1178](https://github.com/donadiosolutions/lcm/issues/1178).
+owner-only mode (`0400`, `0500`, `0600`, or `0700`). The reconciliation journal
+directory must be a current-user-owned private directory with mode `0700`.
+Listing distinguishes a genuinely absent directory from an existing unsafe
+entry, refuses symlinked and non-directory roots without following them, and
+retains the authenticated directory while enumerating and reading its journals.
+It selects every journal-shaped name and authenticates each leaf that remains
+present, so a directory, symlink, FIFO, hard link, or otherwise unsafe present
+journal stops the listing. An entry that disappears after directory enumeration
+is omitted.
+
+During a mutating reconciliation, each journal read returns the parent device
+and inode observed by the bounded reader. LCM compares those canonical decimal
+witnesses with the already-retained journal directory before it parses or uses
+the journal. A differing witness blocks locked admission, prewrite,
+before-replace, publication readback, and blocked-state recovery without
+authorizing the substituted state. This check detects an observed parent
+replacement; it cannot prove uninterrupted namespace history if the same user
+fully restores the original parent before the reader samples it. The retained
+directory and existing journal-leaf identity checks continue to guard the
+surrounding mutation boundaries.
 Pattern files that LCM reads must be regular files with exactly one hard link.
 Reconciliation refuses a present non-regular source `sensitive-patterns.txt`
 path before snapshot, merge, or archive verification; it never opens a
