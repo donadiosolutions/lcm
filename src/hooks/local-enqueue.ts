@@ -87,7 +87,7 @@ export async function appendLocalHookEvents(input: Readonly<{
           }
           return {
             inserted: input.events.length,
-            pendingCount: (await db.getHealthStats()).unprocessed,
+            pendingCount: (await db.getHealthStats(token)).unprocessed,
           };
         } finally {
           await factory.close(token);

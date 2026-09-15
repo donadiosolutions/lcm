@@ -296,6 +296,16 @@ restore proceeds only if its own short publication admission succeeds.
 Publication-journal errors remain fail-closed. Daemon startup and network
 requests do not retain the maintenance lock.
 
+The passive sidecar sweep applies the same boundary to orphan cleanup. For each
+sidecar that may be deleted, LCM retains publication admission while it
+authenticates the file, reads health and recent-error diagnostics, closes the
+SQLite resource, and performs the final eligibility check and removal. A local
+append cannot enter between that diagnostic snapshot and deletion. If the scan
+times out, is cancelled, loses admission, or cannot close the resource, it
+preserves the sidecar and reports it as skipped or failed. A caller that already
+owns publication admission can pass its live token through these diagnostic
+reads and cleanup without contending with itself.
+
 - **Promoted store**: Events promoted via `deduplicateAndInsert()` into the main LCM database
   - Tagged with `source:passive-capture` and `hook:<PostToolUse|UserPromptSubmit>`
   - Searchable via `lcm search` and `lcm grep`

@@ -20,6 +20,7 @@ const scanMocks = vi.hoisted(() => ({
   closeFailureEnabled: false,
   descriptorGidChanged: false,
   open: vi.fn(),
+  openDescriptorPaths: new Map<number, string>(),
   remove: vi.fn(),
   onClose: undefined as (() => void) | undefined,
   onHealth: undefined as (() => void) | undefined,
@@ -34,8 +35,14 @@ vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
+    openSync: (...args: Parameters<typeof actual.openSync>) => {
+      const fd = actual.openSync(...args);
+      scanMocks.openDescriptorPaths.set(fd, String(args[0]));
+      return fd;
+    },
     closeSync: (fd: number) => {
-      scanMocks.closeDescriptor(fd);
+      scanMocks.closeDescriptor(scanMocks.openDescriptorPaths.get(fd), fd);
+      scanMocks.openDescriptorPaths.delete(fd);
       actual.closeSync(fd);
     },
     fstatSync: (...args: Parameters<typeof actual.fstatSync>) => {
@@ -128,6 +135,7 @@ describe("event sidecar parent authentication", () => {
     scanMocks.closeFailureEnabled = false;
     scanMocks.descriptorGidChanged = false;
     scanMocks.open.mockClear();
+    scanMocks.openDescriptorPaths.clear();
     scanMocks.remove.mockClear();
     scanMocks.onClose = undefined;
     scanMocks.onHealth = undefined;
@@ -199,7 +207,9 @@ describe("event sidecar parent authentication", () => {
   it("closes the retained parent after admission, enumeration, empty, and limited scans", async () => {
     chmodSync(scanMocks.eventsDir, 0o755);
     expect(await collectEventSidecars()).toEqual([]);
-    expect(scanMocks.closeDescriptor).toHaveBeenCalledOnce();
+    expect(scanMocks.closeDescriptor.mock.calls.filter(
+      ([closedPath]) => closedPath === scanMocks.eventsDir,
+    )).toHaveLength(1);
 
     chmodSync(scanMocks.eventsDir, 0o700);
     scanMocks.closeDescriptor.mockClear();
@@ -245,7 +255,9 @@ describe("event sidecar parent authentication", () => {
     expect(existsSync(path)).toBe(false);
     expect(existsSync(`${path}-wal`)).toBe(false);
     expect(existsSync(`${path}-shm`)).toBe(false);
-    expect(scanMocks.closeDescriptor).toHaveBeenCalledOnce();
+    expect(scanMocks.closeDescriptor.mock.calls.filter(
+      ([closedPath]) => closedPath === scanMocks.eventsDir,
+    )).toHaveLength(1);
   });
 
   it.each([

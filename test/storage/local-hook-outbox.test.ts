@@ -460,6 +460,66 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     } finally { await factory.close(); }
   });
 
+  it("requires the exact live token for managed diagnostic reads", async () => {
+    const local = localPathFor("diagnostic-token");
+    const other = localPathFor("diagnostic-other-home");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const repository = await factory.open(local.dbPath);
+    const diagnostics = (token?: BackendPublicationLockToken) => [
+      () => repository.getHealthStats(token),
+      () => repository.getRecentErrors(undefined, token),
+      () => repository.getDeliveryDiagnostics(token),
+    ];
+
+    try {
+      const revoked = await withBackendPublicationConsumerLockAsync(
+        local.homeDir,
+        token => token,
+      );
+      for (const run of diagnostics(revoked)) {
+        await expect(run()).rejects.toMatchObject({ reason: "permit-mismatch" });
+      }
+      await withBackendPublicationConsumerLockAsync(other.homeDir, async token => {
+        for (const run of diagnostics(token)) {
+          await expect(run()).rejects.toMatchObject({ reason: "permit-mismatch" });
+        }
+      });
+
+      let releaseOwner!: () => void;
+      let ownerEntered!: () => void;
+      const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+      const owner = withBackendPublicationConsumerLockAsync(local.homeDir, async () => {
+        ownerEntered();
+        await new Promise<void>(resolve => { releaseOwner = resolve; });
+      });
+      await entered;
+      try {
+        for (const run of diagnostics()) {
+          await expect(run()).rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+        }
+      } finally {
+        releaseOwner();
+        await owner;
+      }
+
+      await withBackendPublicationConsumerLockAsync(local.homeDir, async token => {
+        await expect(repository.getHealthStats(token)).resolves.toMatchObject({
+          totalEvents: 0,
+          unprocessed: 0,
+        });
+        await expect(repository.getRecentErrors(undefined, token)).resolves.toEqual([]);
+        await expect(repository.getDeliveryDiagnostics(token)).resolves.toMatchObject({
+          pending: 0,
+          claimed: 0,
+          retry: 0,
+        });
+        await factory.close(token);
+      });
+    } finally {
+      await factory.close();
+    }
+  });
+
   it("retries factory close after pre-release admission fails", async () => {
     const local = localPathFor("retry-close");
     const other = localPathFor("other-home");

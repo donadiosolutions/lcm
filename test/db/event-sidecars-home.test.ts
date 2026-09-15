@@ -8,6 +8,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { collectEventSidecars } from "../../src/db/event-sidecars.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
 import { SQLiteLocalHookOutboxFactory, type LocalHookOutboxRepository } from "../../src/storage/local-hook-outbox.js";
+import {
+  BackendPublicationAppendBarrierTimeoutError,
+  withBackendPublicationAppendBarrierAsync,
+  withBackendPublicationConsumerLockAsync,
+} from "../../src/storage/backend-publication.js";
+import { isLcmConnectionOpen } from "../../src/db/connection.js";
 
 const directoryHooks = vi.hoisted(() => ({
   path: "", phase: "", error: undefined as unknown,
@@ -267,8 +273,8 @@ describe("configured-home sidecar observation", () => {
     vi.useFakeTimers();
     const controller = new AbortController();
     const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
-    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options) {
-      const result = await realOpen.call(this, path, options);
+    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options, token) {
+      const result = await realOpen.call(this, path, options, token);
       if (kind === "abort") controller.abort();
       else vi.setSystemTime(Date.now() + 100);
       return result;
@@ -287,8 +293,8 @@ describe("configured-home sidecar observation", () => {
     vi.useFakeTimers();
     const controller = new AbortController();
     const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
-    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options) {
-      const result = await realOpen.call(this, path, options);
+    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options, token) {
+      const result = await realOpen.call(this, path, options, token);
       controller.abort();
       return result;
     });
@@ -306,8 +312,8 @@ describe("configured-home sidecar observation", () => {
     const controller = new AbortController();
     const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
     let opened: LocalHookOutboxRepository | undefined;
-    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options) {
-      opened = await realOpen.call(this, path, options);
+    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options, token) {
+      opened = await realOpen.call(this, path, options, token);
       vi.spyOn(opened, "getHealthStats").mockImplementationOnce(() => new Promise(() => {}));
       return opened;
     });
@@ -331,8 +337,8 @@ describe("configured-home sidecar observation", () => {
     addSidecar(thirdId);
     const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
     let openCalls = 0;
-    vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementation(async function (path, options) {
-      const result = await realOpen.call(this, path, options);
+    vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementation(async function (path, options, token) {
+      const result = await realOpen.call(this, path, options, token);
       openCalls++;
       if (openCalls === 2) controller.abort();
       return result;
@@ -347,14 +353,16 @@ describe("configured-home sidecar observation", () => {
     expect(result.some(({ file }) => file === `${thirdId}.db`)).toBe(false);
   });
 
-  it("bounds a stalled open and closes its late result exactly once", async () => {
+  it("bounds and invalidates a stalled open without creating a late repository", async () => {
     vi.useFakeTimers();
     let finishOpen!: () => void;
     let lateRepository: LocalHookOutboxRepository | undefined;
     const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
-    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options) {
+    let forwardedToken: object | undefined;
+    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockImplementationOnce(async function (path, options, token) {
+      forwardedToken = token;
       await new Promise<void>(resolve => { finishOpen = resolve; });
-      lateRepository = await realOpen.call(this, path, options);
+      lateRepository = await realOpen.call(this, path, options, token);
       return lateRepository;
     });
     const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close");
@@ -367,10 +375,134 @@ describe("configured-home sidecar observation", () => {
     expect(result[0].scanSkippedCount).toBe(3);
     expect(result).toHaveLength(1);
     expect(openSpy).toHaveBeenCalledOnce();
+    expect(forwardedToken).toBeTypeOf("object");
     finishOpen();
     await vi.advanceTimersByTimeAsync(0);
+    const opening = openSpy.mock.results[0]!.value as Promise<LocalHookOutboxRepository>;
+    await expect(opening).rejects.toMatchObject({ reason: "permit-mismatch" });
     expect(close).toHaveBeenCalledOnce();
-    await expect(lateRepository!.getHealthStats()).rejects.toThrow();
+    expect(lateRepository).toBeUndefined();
+    expect(isLcmConnectionOpen(path)).toBe(false);
     expect(existsSync(path)).toBe(true);
+  });
+
+  it("keeps caller admission live through close and stale-orphan pruning", async () => {
+    const [summary] = await withBackendPublicationConsumerLockAsync(homeDir, token =>
+      collectEventSidecars({ homeDir, publicationLockToken: token }));
+
+    expect(summary).toMatchObject({
+      path,
+      pruned: true,
+      pruneReason: "empty orphan sidecar",
+    });
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("reports competing publication admission per sidecar without pruning the tail", async () => {
+    const second = addSidecar(otherId);
+    const third = addSidecar(thirdId);
+
+    const summaries = await withBackendPublicationConsumerLockAsync(
+      homeDir,
+      () => collectEventSidecars({ homeDir }),
+    );
+
+    expect(summaries).toHaveLength(3);
+    expect(summaries.map(summary => summary.file)).toEqual([
+      `${projectId}.db`,
+      `${otherId}.db`,
+      `${thirdId}.db`,
+    ]);
+    expect(summaries.every(summary =>
+      summary.scanError?.includes("backend publication mutation is already in progress")
+      && summary.pruned === undefined)).toBe(true);
+    expect([path, second, third].every(sidecar => existsSync(sidecar))).toBe(true);
+  });
+
+  it("refuses an append between the health snapshot and stale-orphan deletion", async () => {
+    const realClose = SQLiteLocalHookOutboxFactory.prototype.close;
+    let appendError: unknown;
+    const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close")
+      .mockImplementationOnce(async function (token) {
+        appendError = await withBackendPublicationAppendBarrierAsync(homeDir, () => {
+          const writer = new EventsDb(path);
+          try {
+            writer.insertEvent(
+              "late-session",
+              { type: "decision", category: "decision", data: "late", priority: 1 },
+              "PostToolUse",
+            );
+          } finally {
+            writer.close();
+          }
+        }, undefined, { contentionWaitMs: 0 }).then(
+          () => undefined,
+          error => error,
+        );
+        return realClose.call(this, token);
+      });
+
+    const [summary] = await collectEventSidecars({ homeDir });
+
+    expect(appendError).toBeInstanceOf(BackendPublicationAppendBarrierTimeoutError);
+    expect(summary).toMatchObject({
+      path,
+      captured: 0,
+      pruned: true,
+      pruneReason: "empty orphan sidecar",
+    });
+    expect(close).toHaveBeenCalledOnce();
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("does not release admission until a stopped scan settles its real close", async () => {
+    const controller = new AbortController();
+    const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
+    const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open")
+      .mockImplementationOnce(async function (path, options, token) {
+        const repository = await realOpen.call(this, path, options, token);
+        controller.abort();
+        return repository;
+      });
+    const realClose = SQLiteLocalHookOutboxFactory.prototype.close;
+    let closeEntered!: () => void;
+    let releaseClose!: () => void;
+    const entered = new Promise<void>(resolve => { closeEntered = resolve; });
+    const closeGate = new Promise<void>(resolve => { releaseClose = resolve; });
+    const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close")
+      .mockImplementationOnce(async function (token) {
+        closeEntered();
+        await closeGate;
+        return realClose.call(this, token);
+      });
+    const resultPromise = collectEventSidecars({ homeDir, signal: controller.signal });
+    let settled = false;
+    void resultPromise.then(() => { settled = true; });
+
+    try {
+      await entered;
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      await expect(withBackendPublicationAppendBarrierAsync(
+        homeDir,
+        () => undefined,
+        undefined,
+        { contentionWaitMs: 0 },
+      )).rejects.toBeInstanceOf(BackendPublicationAppendBarrierTimeoutError);
+    } finally {
+      releaseClose();
+      await resultPromise;
+      const closing = close.mock.results[0]?.value as Promise<void> | undefined;
+      await closing;
+    }
+
+    const result = await resultPromise;
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ scanSkippedCount: 1 });
+    expect(result[0].scanSkipped).toContain("cancelled");
+    expect(open).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(existsSync(path)).toBe(true);
+    expect(isLcmConnectionOpen(path)).toBe(false);
   });
 });
