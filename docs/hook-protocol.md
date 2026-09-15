@@ -32,6 +32,12 @@ pending. That metadata is frozen atomically when the first delivery claim
 begins, so a later local correlation pass cannot change an envelope that may
 already exist in PostgreSQL.
 
+Promotion that already holds consumer publication admission forwards the same
+live token through predecessor correlation. An error-to-fix pair can therefore
+persist its predecessor and complete local acknowledgement on its first pass
+without contending with its own admission. A held maintenance journal still
+blocks correlation updates.
+
 The sequence allocator is a separate local SQLite file,
 `~/.lcm/events/.machine-sequence.sqlite`. Reservation and checkpoint update are
 one transaction. A crash between reservation and sidecar insertion can leave a

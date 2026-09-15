@@ -58,7 +58,7 @@ afterEach(() => {
   closeLcmConnection(); clearProjectMapCache(); vi.unstubAllEnvs();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
-function fixture(epoch: boolean, pattern = false) {
+function fixture(epoch: boolean, pattern = false, seedEvent = true) {
   const home = mkdtempSync(join(tmpdir(), "lcm-promotion-admission-"));
   roots.push(home);
   vi.stubEnv("HOME", home);
@@ -78,8 +78,10 @@ function fixture(epoch: boolean, pattern = false) {
   db.close();
   const sidecar = eventsDbPath(cwd);
   const events = new EventsDb(sidecar);
-  events.insertEvent("session", { type: pattern ? "file_read" : "decision", category: pattern ? "file" : "decision",
-    data: "Use explicit current publication authority for durable queue acknowledgement", priority: pattern ? 3 : 1 }, "PostToolUse");
+  if (seedEvent) {
+    events.insertEvent("session", { type: pattern ? "file_read" : "decision", category: pattern ? "file" : "decision",
+      data: "Use explicit current publication authority for durable queue acknowledgement", priority: pattern ? 3 : 1 }, "PostToolUse");
+  }
   events.close();
   return { home, cwd, path, sidecar };
 }
@@ -91,6 +93,24 @@ function snapshot(f: ReturnType<typeof fixture>, epoch: boolean) {
   const events = new EventsDb(f.sidecar);
   const pending = events.getUnprocessed(); events.close();
   return { effects, receipts, pending };
+}
+function sidecarState(sidecar: string) {
+  const db = new DatabaseSync(sidecar, { readOnly: true });
+  try {
+    return {
+      events: db.prepare(`
+        SELECT event_id, data, prev_event_id, processed_at, delivery_state
+        FROM events
+        ORDER BY event_id
+      `).all(),
+      missingCwd: db.prepare(`
+        SELECT observations, last_observed_at, parked_at
+        FROM missing_cwd_state
+      `).all(),
+    };
+  } finally {
+    db.close();
+  }
 }
 function expectReleased(home: string): void {
   expect(getPoolStats().connections.filter(connection => connection.path.startsWith(home)))
@@ -145,6 +165,153 @@ describe("canonical promotion publication admission", () => {
       token => drainEventsForCwd(makeConfig(), f.cwd, f.sidecar, undefined, undefined, { publicationLockToken: token }));
     expect(repeated).toMatchObject({ promoted: 0, errors: 0 });
     expect(snapshot(f, epoch)).toEqual(before);
+    expectReleased(f.home);
+  });
+
+  it("parks after three retained-token observations without changing queued events", async () => {
+    const f = fixture(false);
+    const before = sidecarState(f.sidecar).events;
+    rmSync(f.cwd, { recursive: true, force: true });
+    let observedAt = Date.UTC(2026, 0, 1);
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => observedAt);
+
+    try {
+      const observe = () => withBackendPublicationConsumerLockAsync(
+        f.home,
+        token => drainEventsForCwd(makeConfig(), f.cwd, f.sidecar, undefined, token),
+      );
+      await expect(observe()).resolves.toMatchObject({
+        deferred: { observations: 1, retryAfterMs: 5 * 60 * 1000 },
+      });
+      observedAt += 5 * 60 * 1000;
+      await expect(observe()).resolves.toMatchObject({
+        deferred: { observations: 2, retryAfterMs: 5 * 60 * 1000 },
+      });
+      observedAt += 5 * 60 * 1000;
+      await expect(observe()).resolves.toMatchObject({
+        terminal: { kind: "parked", reason: "unavailable-cwd" },
+      });
+    } finally {
+      clock.mockRestore();
+    }
+
+    expect(sidecarState(f.sidecar)).toEqual({
+      events: before,
+      missingCwd: [{
+        observations: 3,
+        last_observed_at: Date.UTC(2026, 0, 1) + 10 * 60 * 1000,
+        parked_at: expect.any(String),
+      }],
+    });
+    expectReleased(f.home);
+    await expect(withBackendPublicationConsumerLockAsync(f.home, async () => "released"))
+      .resolves.toBe("released");
+  }, 20_000);
+
+  it("keeps context-only missing-CWD parking outside retained admission", async () => {
+    const f = fixture(false);
+    rmSync(f.cwd, { recursive: true, force: true });
+    const withPublicationAdmission = vi.fn(<T>(operation: (token: object) => Promise<T>) =>
+      withBackendPublicationConsumerLockAsync(f.home, operation));
+
+    await expect(drainEventsForCwd(
+      makeConfig(),
+      f.cwd,
+      undefined,
+      undefined,
+      undefined,
+      { withPublicationAdmission },
+    )).resolves.toMatchObject({ deferred: { observations: 1 } });
+
+    expect(withPublicationAdmission).toHaveBeenCalledOnce();
+    expect(sidecarState(f.sidecar).missingCwd).toMatchObject([{ observations: 1 }]);
+    expectReleased(f.home);
+  });
+
+  it("closes retained-token parking when no sidecar exists", async () => {
+    const f = fixture(false);
+    rmSync(f.cwd, { recursive: true, force: true });
+    const absentSidecar = join(f.home, ".lcm", "events", "absent.db");
+
+    await expect(withBackendPublicationConsumerLockAsync(
+      f.home,
+      token => drainEventsForCwd(makeConfig(), f.cwd, absentSidecar, undefined, token),
+    )).resolves.toMatchObject({
+      terminal: { kind: "parked", reason: "unavailable-cwd" },
+      message: "no sidecar events to park for unavailable cwd",
+    });
+    expectReleased(f.home);
+  });
+
+  it("preserves a missing-CWD observation failure after retained-token cleanup", async () => {
+    const f = fixture(false);
+    rmSync(f.cwd, { recursive: true, force: true });
+    const failure = new Error("missing-CWD observation failed");
+    const observe = vi.spyOn(EventsDb.prototype, "observeMissingCwd")
+      .mockImplementationOnce(() => { throw failure; });
+
+    try {
+      await expect(withBackendPublicationConsumerLockAsync(
+        f.home,
+        token => drainEventsForCwd(makeConfig(), f.cwd, f.sidecar, undefined, token),
+      )).rejects.toBe(failure);
+    } finally {
+      observe.mockRestore();
+    }
+    expectReleased(f.home);
+    await expect(withBackendPublicationConsumerLockAsync(f.home, async () => "released"))
+      .resolves.toBe("released");
+  }, 15_000);
+
+  it("correlates and acknowledges a pair under operation-scoped admission", async () => {
+    const f = fixture(false, false, false);
+    const events = new EventsDb(f.sidecar);
+    const errorId = events.insertEvent(
+      "correlated",
+      { type: "error_tool", category: "error", data: "Bash error: npm install", priority: 1 },
+      "PostToolUse",
+    );
+    const fixId = events.insertEvent(
+      "correlated",
+      { type: "env_install", category: "env", data: "npm install --legacy-peer-deps", priority: 2 },
+      "PostToolUse",
+    );
+    events.close();
+    const withPublicationAdmission = <T>(operation: (token: object) => Promise<T>) =>
+      withBackendPublicationConsumerLockAsync(f.home, token => operation(token));
+    const context = { withPublicationAdmission };
+
+    const first = await promoteEventsForCwd(
+      makeConfig(),
+      f.cwd,
+      f.sidecar,
+      undefined,
+      undefined,
+      context,
+    );
+    expect(first).toMatchObject({ promoted: 2, correlated: 1, errors: 0 });
+    expectReleased(f.home);
+    const beforeRetry = {
+      promoted: snapshot(f, false).effects,
+      sidecar: sidecarState(f.sidecar),
+    };
+    expect(beforeRetry.promoted).toHaveLength(2);
+    expect(beforeRetry.sidecar.events).toEqual([
+      expect.objectContaining({ event_id: errorId, prev_event_id: null, processed_at: expect.any(String) }),
+      expect.objectContaining({ event_id: fixId, prev_event_id: errorId, processed_at: expect.any(String) }),
+    ]);
+    expect(snapshot(f, false).pending).toEqual([]);
+
+    await expect(promoteEventsForCwd(
+      makeConfig(),
+      f.cwd,
+      f.sidecar,
+      undefined,
+      undefined,
+      context,
+    )).resolves.toMatchObject({ promoted: 0, correlated: 0, errors: 0 });
+    expect({ promoted: snapshot(f, false).effects, sidecar: sidecarState(f.sidecar) })
+      .toEqual(beforeRetry);
     expectReleased(f.home);
   });
 });
