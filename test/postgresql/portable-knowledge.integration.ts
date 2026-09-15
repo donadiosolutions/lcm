@@ -10,6 +10,7 @@ import {
   type ExportEntry,
 } from "../../src/portable-knowledge.js";
 import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
+import { StorageOperationError } from "../../src/storage/errors.js";
 import { PostgreSqlPromotedMemoryRepository } from "../../src/storage/postgresql/memory-repositories.js";
 import { PostgreSqlIdentityRepository } from "../../src/storage/postgresql/identity-repository.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
@@ -190,9 +191,23 @@ describe("PostgreSQL 18 portable knowledge v1", { timeout: 120_000 }, () => {
       });
 
       const source = document([entry(content, ["imported"])]);
+      const rollbackFailure = new StorageOperationError(
+        "STORAGE_OPERATION_FAILED",
+        "postgresql",
+        fixture.project.projectId,
+        "promoted-memory",
+        "update",
+      );
       const failingUpdate = vi.spyOn(PostgreSqlPromotedMemoryRepository.prototype, "update")
-        .mockRejectedValueOnce(new Error("rollback canary"));
-      await expect(importKnowledge(fixture.projectPath, source)).rejects.toThrow("rollback canary");
+        .mockRejectedValueOnce(rollbackFailure);
+      await expect(importKnowledge(fixture.projectPath, source)).rejects.toBe(rollbackFailure);
+      expect(rollbackFailure).toMatchObject({
+        code: "STORAGE_OPERATION_FAILED",
+        backend: "postgresql",
+        projectId: fixture.project.projectId,
+        domain: "promoted-memory",
+        operation: "update",
+      });
       failingUpdate.mockRestore();
       expect(await persistedRows(fixture)).toHaveLength(101);
       expect((await persistedRows(fixture)).find(row => row.memory_id === exactId))
