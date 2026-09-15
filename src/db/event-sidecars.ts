@@ -15,6 +15,10 @@ import {
   type PrivateDirectoryWitness,
 } from "../security-files.js";
 import { SQLiteLocalHookOutboxFactory, type LocalHookOutboxHealth, type LocalHookErrorRecord } from "../storage/local-hook-outbox.js";
+import {
+  withBackendPublicationConsumerLockAsync,
+  type BackendPublicationLockToken,
+} from "../storage/backend-publication.js";
 import { isWorktreeReconciliationFence } from "../worktree-reconciliation-fence.js";
 
 export interface EventSidecarSummary {
@@ -45,7 +49,7 @@ export interface EventSidecarSummary {
 }
 
 export interface EventSidecarScanOptions {
-  publicationLockToken?: import("../storage/backend-publication.js").BackendPublicationLockToken;
+  publicationLockToken?: BackendPublicationLockToken;
   homeDir?: string;
   /** A local project identity hash, never a filesystem path or backend UUID. */
   projectId?: string;
@@ -99,6 +103,15 @@ async function awaitSidecarScan<T>(operation: Promise<T>, deadline: number, sign
   }
 }
 
+function assertSidecarScanActive(deadline: number, signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new EventSidecarScanStoppedError("sidecar scan cancelled");
+  }
+  if (Date.now() >= deadline) {
+    throw new EventSidecarScanStoppedError("sidecar scan skipped after timeout");
+  }
+}
+
 /** Diagnostic reads never enter the pooled EventsDb migration/creation path. */
 function readOnlySidecarFactory(
   path: string,
@@ -146,18 +159,25 @@ function readOnlySidecarFactory(
         parents: [{ path: parentPath, fd: parent.fd, device: BigInt(parent.witness.dev), inode: BigInt(parent.witness.ino) }],
       });
       return {
-        async getHealthStats(): Promise<LocalHookOutboxHealth> {
+        async getHealthStats(
+          _publicationLockToken?: BackendPublicationLockToken,
+        ): Promise<LocalHookOutboxHealth> {
           const totals = rows[0] as Omit<LocalHookOutboxHealth, "errors" | "lastError">;
           const errors = rows[1] as { errors: number; lastError: string | null };
           return { ...totals, ...errors };
         },
-        async getRecentErrors(_options: { limit: number }): Promise<LocalHookErrorRecord[]> {
+        async getRecentErrors(
+          _options: { limit: number },
+          _publicationLockToken?: BackendPublicationLockToken,
+        ): Promise<LocalHookErrorRecord[]> {
           return (rows[2] as LocalHookErrorRecord[])
             .map(row => ({ ...row, error: sanitizeHookErrorDiagnostic(row.error) }));
         },
       };
     },
-    async close() { /* The isolated reader owns and closes its connection. */ },
+    async close(
+      _publicationLockToken?: BackendPublicationLockToken,
+    ) { /* The isolated reader owns and closes its connection. */ },
   };
 }
 
@@ -416,113 +436,149 @@ async function scanEventSidecars(options: EventSidecarScanOptions): Promise<Even
 
       const projectId = file.slice(0, -".db".length);
       try {
-        assertEventSidecarParent(parent, dir, parentWitness);
-        let stat: ReturnType<typeof lstatSync>;
-        try {
-          stat = lstatSync(path);
-        } finally {
+        const scanSidecar = async (
+          publicationLockToken?: BackendPublicationLockToken,
+        ): Promise<void> => {
           assertEventSidecarParent(parent, dir, parentWitness);
-        }
-        if (stat.isSymbolicLink() || !stat.isFile()) {
-          throw new Error("sidecar path is not a regular file");
-        }
-        const outboxFactory = pruneOrphans
-          ? new SQLiteLocalHookOutboxFactory()
-          : readOnlySidecarFactory(path, stat, options, deadline, parent, dir);
-        let opened = false;
-        let summary: EventSidecarSummary;
-        try {
-          assertEventSidecarParent(parent, dir, parentWitness);
-          let db: Awaited<ReturnType<typeof outboxFactory.open>>;
+          let stat: ReturnType<typeof lstatSync>;
           try {
-            const opening = outboxFactory.open(path, { busyTimeoutMs: Math.min(500, Math.max(0, deadline - Date.now())) }, options.publicationLockToken);
-            try {
-              db = await awaitSidecarScan<Awaited<ReturnType<typeof outboxFactory.open>>>(
-                opening, deadline, options.signal,
-              );
-            } catch (error) {
-              // An injected or future asynchronous opener may finish after the
-              // budget. Its factory still owns that late resource.
-              void opening.then(() => outboxFactory.close()).catch(() => {});
-              throw error;
-            }
-            opened = true;
+            stat = lstatSync(path);
           } finally {
             assertEventSidecarParent(parent, dir, parentWitness);
           }
-          const stats = await awaitWithEventSidecarParent(
-            () => awaitSidecarScan(db.getHealthStats(), deadline, options.signal),
-            parent,
-            dir,
-            parentWitness,
-          );
-          const cwd = readCwdForProject(projectId, options.homeDir);
-          const recentErrors = options.includeRecentErrors
-            ? (await awaitWithEventSidecarParent(
-              () => awaitSidecarScan(db.getRecentErrors({ limit: 5 }), deadline, options.signal),
+          if (stat.isSymbolicLink() || !stat.isFile()) {
+            throw new Error("sidecar path is not a regular file");
+          }
+          const outboxFactory = pruneOrphans
+            ? new SQLiteLocalHookOutboxFactory()
+            : readOnlySidecarFactory(path, stat, options, deadline, parent, dir);
+          let opened = false;
+          let summary: EventSidecarSummary;
+          try {
+            assertEventSidecarParent(parent, dir, parentWitness);
+            let db: Awaited<ReturnType<typeof outboxFactory.open>>;
+            try {
+              const opening = outboxFactory.open(
+                path,
+                { busyTimeoutMs: Math.min(500, Math.max(0, deadline - Date.now())) },
+                publicationLockToken,
+              );
+              // A stopped facade opener may settle after this sidecar has
+              // returned. Observe its rejection while factory invalidation
+              // prevents that continuation from creating a repository.
+              void opening.catch(() => {});
+              try {
+                db = await awaitSidecarScan<Awaited<ReturnType<typeof outboxFactory.open>>>(
+                  opening, deadline, options.signal,
+                );
+              } catch (error) {
+                await outboxFactory.close(publicationLockToken);
+                throw error;
+              }
+              opened = true;
+            } finally {
+              assertEventSidecarParent(parent, dir, parentWitness);
+            }
+            const stats = await awaitWithEventSidecarParent(
+              () => awaitSidecarScan(
+                db.getHealthStats(publicationLockToken),
+                deadline,
+                options.signal,
+              ),
               parent,
               dir,
               parentWitness,
-            )).map(({ created_at, hook, error }) => ({
-              created_at,
-              hook,
-              error,
-            }))
-            : undefined;
-          summary = {
-            file,
-            projectId,
-            path,
-            cwd,
-            metadataMissing: cwd === undefined,
-            captured: stats.totalEvents,
-            unprocessed: stats.unprocessed,
-            errors: stats.errors,
-            lastCapture: stats.lastCapture,
-            deliveryPending: stats.deliveryPending,
-            deliveryClaimed: stats.deliveryClaimed,
-            deliveryRetry: stats.deliveryRetry,
-            deliveryReplicated: stats.deliveryReplicated,
-            deliveryAcknowledged: stats.deliveryAcknowledged,
-            deliveryAwaitingRemotePrune: stats.deliveryAwaitingRemotePrune,
-            deliveryQuarantined: stats.deliveryQuarantined,
-            oldestDeliveryAt: stats.oldestDeliveryAt,
-            recentErrors,
-          };
-        } finally {
-          if (opened) {
-            let beforeCloseError: unknown;
-            let closeError: unknown;
-            let closeFailed = false;
-            let afterCloseError: unknown;
-            try {
-              assertEventSidecarParent(parent, dir, parentWitness);
-            } catch (error) {
-              beforeCloseError = error;
+            );
+            const cwd = readCwdForProject(projectId, options.homeDir);
+            const recentErrors = options.includeRecentErrors
+              ? (await awaitWithEventSidecarParent(
+                () => awaitSidecarScan(
+                  db.getRecentErrors({ limit: 5 }, publicationLockToken),
+                  deadline,
+                  options.signal,
+                ),
+                parent,
+                dir,
+                parentWitness,
+              )).map(({ created_at, hook, error }) => ({
+                created_at,
+                hook,
+                error,
+              }))
+              : undefined;
+            summary = {
+              file,
+              projectId,
+              path,
+              cwd,
+              metadataMissing: cwd === undefined,
+              captured: stats.totalEvents,
+              unprocessed: stats.unprocessed,
+              errors: stats.errors,
+              lastCapture: stats.lastCapture,
+              deliveryPending: stats.deliveryPending,
+              deliveryClaimed: stats.deliveryClaimed,
+              deliveryRetry: stats.deliveryRetry,
+              deliveryReplicated: stats.deliveryReplicated,
+              deliveryAcknowledged: stats.deliveryAcknowledged,
+              deliveryAwaitingRemotePrune: stats.deliveryAwaitingRemotePrune,
+              deliveryQuarantined: stats.deliveryQuarantined,
+              oldestDeliveryAt: stats.oldestDeliveryAt,
+              recentErrors,
+            };
+          } finally {
+            if (opened) {
+              let beforeCloseError: unknown;
+              let closeError: unknown;
+              let closeFailed = false;
+              let afterCloseError: unknown;
+              try {
+                assertEventSidecarParent(parent, dir, parentWitness);
+              } catch (error) {
+                beforeCloseError = error;
+              }
+              try {
+                // Factory close is already bounded by the local append
+                // barrier. It must settle while publication admission is
+                // retained, even after the scan deadline or signal fires.
+                await outboxFactory.close(publicationLockToken);
+              } catch (error) {
+                closeFailed = true;
+                closeError = error;
+              }
+              try {
+                assertEventSidecarParent(parent, dir, parentWitness);
+              } catch (error) {
+                afterCloseError = error;
+              }
+              if (beforeCloseError !== undefined) throw beforeCloseError;
+              if (afterCloseError !== undefined) throw afterCloseError;
+              if (closeFailed) throw closeError;
             }
-            try {
-              await awaitSidecarScan(outboxFactory.close(), deadline, options.signal);
-            } catch (error) {
-              closeFailed = true;
-              closeError = error;
-            }
-            try {
-              assertEventSidecarParent(parent, dir, parentWitness);
-            } catch (error) {
-              afterCloseError = error;
-            }
-            if (beforeCloseError !== undefined) throw beforeCloseError;
-            if (afterCloseError !== undefined) throw afterCloseError;
-            if (closeFailed) throw closeError;
           }
-        }
-        const pruneReason = pruneOrphans ? orphanPruneReason(summary, pruneOlderThanDays) : undefined;
-        if (pruneReason) {
-          pruneSidecarFiles(path, parent, dir, parentWitness);
-          assertEventSidecarParent(parent, dir, parentWitness);
-          sidecars.push({ ...summary, pruned: true, pruneReason });
+          if (pruneOrphans) {
+            assertSidecarScanActive(deadline, options.signal);
+          }
+          const pruneReason = pruneOrphans
+            ? orphanPruneReason(summary, pruneOlderThanDays)
+            : undefined;
+          if (pruneReason) {
+            pruneSidecarFiles(path, parent, dir, parentWitness);
+            assertEventSidecarParent(parent, dir, parentWitness);
+            sidecars.push({ ...summary, pruned: true, pruneReason });
+          } else {
+            sidecars.push(summary);
+          }
+        };
+
+        if (pruneOrphans) {
+          await withBackendPublicationConsumerLockAsync(
+            options.homeDir,
+            scanSidecar,
+            { lockToken: options.publicationLockToken },
+          );
         } else {
-          sidecars.push(summary);
+          await scanSidecar();
         }
       } catch (error) {
         const code = (error as NodeJS.ErrnoException | null)?.code;

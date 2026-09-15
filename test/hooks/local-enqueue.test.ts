@@ -10,6 +10,14 @@ import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-pub
 import { backendPublicationJournalPath, backendPublicationCanonicalSha256 } from "../../src/storage/backend-publication.js";
 import * as securityFiles from "../../src/security-files.js";
 
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return {
+    ...actual,
+    homedir: () => process.env.HOME ?? actual.homedir(),
+  };
+});
+
 describe("appendLocalHookEvents", () => {
   let previousHome: string | undefined;
   let home: string;
@@ -108,6 +116,37 @@ describe("appendLocalHookEvents", () => {
     await expect(appendLocalHookEvents(input())).rejects.toThrow();
     expect(existsSync(join(home, ".lcm"))).toBe(false);
     expect(existsSync(join(home, ".lcm", "events"))).toBe(false);
+  });
+
+  it("forwards one retained publication token through enqueue diagnostics", async () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const insertEvent = vi.fn().mockResolvedValue(1);
+    const getHealthStats = vi.fn().mockResolvedValue({ unprocessed: 1 });
+    let openToken: unknown;
+    const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open")
+      .mockImplementation(async (_path, _options, token) => {
+        openToken = token;
+        return { insertEvent, getHealthStats } as never;
+      });
+    const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close");
+    try {
+      await expect(appendLocalHookEvents(input())).resolves.toEqual({
+        inserted: 1,
+        pendingCount: 1,
+      });
+      expect(openToken).toBeTypeOf("object");
+      expect(insertEvent).toHaveBeenCalledWith(
+        "session-1",
+        input().events[0],
+        "PostToolUse",
+        openToken,
+      );
+      expect(getHealthStats).toHaveBeenCalledWith(openToken);
+      expect(close).toHaveBeenCalledWith(openToken);
+    } finally {
+      open.mockRestore();
+      close.mockRestore();
+    }
   });
 
   it("fails closed when the retained root is replaced during the outbox operation", async () => {

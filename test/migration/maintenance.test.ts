@@ -370,7 +370,11 @@ describe("backend publication maintenance journal v3", () => {
     await append;
     expect(snapshot.receiptReference.queueCutoff).toBe("0000000000000000000");
     expect(snapshot.pages[0].records).toBe(1);
-    expect((await outbox.getHealthStats()).unprocessed).toBe(2);
+    const health = await withBackendPublicationAppendBarrierAsync(
+      fixture.homeDir,
+      token => outbox.getHealthStats(token),
+    );
+    expect(health.unprocessed).toBe(2);
     await factory.close();
   });
   it("recovers a refreshed held binding after failure before generation intent", async () => {

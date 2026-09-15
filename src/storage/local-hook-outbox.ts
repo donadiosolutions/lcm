@@ -155,8 +155,11 @@ export interface LocalHookOutboxRepository {
     publicationLockToken?: BackendPublicationLockToken,
   ): Promise<PatternReinforcementStats>;
   logHookError(hook: string, error: unknown, sessionId?: string): Promise<void>;
-  getHealthStats(): Promise<LocalHookOutboxHealth>;
-  getRecentErrors(options?: LocalHookErrorQuery): Promise<LocalHookErrorRecord[]>;
+  getHealthStats(publicationLockToken?: BackendPublicationLockToken): Promise<LocalHookOutboxHealth>;
+  getRecentErrors(
+    options?: LocalHookErrorQuery,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<LocalHookErrorRecord[]>;
   pruneUnprocessed(maxRows?: number, maxAgeDays?: number): Promise<{ pruned: number }>;
   pruneErrorLog(olderThanDays?: number): Promise<number>;
   claimDeliveries(input: LocalHookDeliveryClaimInput): Promise<LocalHookEventRow[]>;
@@ -190,7 +193,7 @@ export interface LocalHookOutboxRepository {
   replayQuarantined(eventUuid: string): Promise<boolean>;
   listAcknowledgedForRemotePrune(limit?: number): Promise<LocalHookEventRow[]>;
   markRemotePruned(eventUuid: string): Promise<boolean>;
-  getDeliveryDiagnostics(): Promise<LocalHookDeliveryDiagnostics>;
+  getDeliveryDiagnostics(publicationLockToken?: BackendPublicationLockToken): Promise<LocalHookDeliveryDiagnostics>;
   close(publicationLockToken?: BackendPublicationLockToken): Promise<void>;
 }
 
@@ -448,14 +451,19 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     this.admitted(() => this.database.logHookError(hook, error, sessionId));
   }
 
-  async getHealthStats(): Promise<LocalHookOutboxHealth> {
+  async getHealthStats(
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<LocalHookOutboxHealth> {
     this.assertOpen("getHealthStats");
-    return this.database.getHealthStats();
+    return this.admitted(() => this.database.getHealthStats(), publicationLockToken);
   }
 
-  async getRecentErrors(options?: LocalHookErrorQuery): Promise<LocalHookErrorRecord[]> {
+  async getRecentErrors(
+    options?: LocalHookErrorQuery,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<LocalHookErrorRecord[]> {
     this.assertOpen("getRecentErrors");
-    return this.database.getRecentErrors(options);
+    return this.admitted(() => this.database.getRecentErrors(options), publicationLockToken);
   }
 
   async pruneUnprocessed(maxRows?: number, maxAgeDays?: number): Promise<{ pruned: number }> {
@@ -543,9 +551,14 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     return this.admitted(() => this.database.markRemotePruned(eventUuid));
   }
 
-  async getDeliveryDiagnostics(): Promise<LocalHookDeliveryDiagnostics> {
+  async getDeliveryDiagnostics(
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<LocalHookDeliveryDiagnostics> {
     this.assertOpen("getDeliveryDiagnostics");
-    return this.database.getDeliveryDiagnostics();
+    return this.admitted(
+      () => this.database.getDeliveryDiagnostics(),
+      publicationLockToken,
+    );
   }
 
   close(publicationLockToken?: BackendPublicationLockToken): Promise<void> {

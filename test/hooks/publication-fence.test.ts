@@ -15,11 +15,20 @@ import {
 import {
   BackendPublicationJournalError,
   backendPublicationDirectory,
+  backendPublicationHistoryDirectory,
   backendPublicationJournalPath,
 } from "../../src/storage/backend-publication.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import * as backendPublication from "../../src/storage/backend-publication.js";
 import * as securityFiles from "../../src/security-files.js";
+
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return {
+    ...actual,
+    homedir: () => process.env.HOME ?? actual.homedir(),
+  };
+});
 
 describe("hook publication fence", () => {
   let previousHome: string | undefined;
@@ -216,11 +225,20 @@ describe("hook publication fence", () => {
   });
 
   it("fails closed when publication evidence remains without a journal", () => {
-    const directory = backendPublicationDirectory();
+    const outerHome = previousHome!;
+    const outside = [
+      backendPublicationDirectory(outerHome),
+      backendPublicationJournalPath(outerHome),
+      backendPublicationHistoryDirectory(outerHome),
+      join(backendPublicationDirectory(outerHome), "orphan.material"),
+    ];
+    expect(outside.every(path => !existsSync(path))).toBe(true);
+    const directory = backendPublicationDirectory(home);
     mkdirSync(directory, { mode: 0o700 });
     writeFileSync(join(directory, "orphan.material"), "orphan", { mode: 0o600 });
 
     expect(() => assertHookPublicationFence()).toThrow("publication evidence is incomplete");
+    expect(outside.every(path => !existsSync(path))).toBe(true);
   });
 
   it("passes explicit absent config and project-map observations to approved evidence APIs", () => {
@@ -356,9 +374,9 @@ describe("hook publication fence", () => {
   });
 
   it("fails closed for malformed publication state", () => {
-    const directory = backendPublicationDirectory();
+    const directory = backendPublicationDirectory(home);
     mkdirSync(directory, { mode: 0o700 });
-    writeFileSync(backendPublicationJournalPath(), "{", { mode: 0o600 });
+    writeFileSync(backendPublicationJournalPath(home), "{", { mode: 0o600 });
     expect(() => assertHookPublicationFence()).toThrow(BackendPublicationJournalError);
   });
 
