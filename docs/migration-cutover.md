@@ -26,6 +26,19 @@ commit with an exact receipt. Ordinary SQLite installations without a registered
 machine continue to open and process events as before. They do not fabricate an
 identity or epoch, and snapshot admission refuses their unproven history.
 
+An ordinary SQLite open first proves that no object name or target belongs to
+the `migration_receipt_v1_` namespace. With that proof, a missing, pending, or
+damaged optional `machine.json` does not block the unenrolled project. LCM leaves
+the identity file unchanged and does not create an outbox, sequence allocator,
+or receipt epoch. Bounded-file integrity failures such as an oversized identity
+file still refuse the open. Any receipt namespace evidence requires a valid
+registered identity, including partial or malformed evidence, and explicit
+migration preparation and capture remain strict. A valid registered identity
+still enrolls a project whose receipt namespace is proven absent. Use `lcm
+machine show` to inspect identity state and the existing `lcm machine recover
+<machine-uuid> --force` flow to replace a damaged identity explicitly; do not
+delete or reset receipt evidence.
+
 Snapshot capture and dry-run are strictly read-only with respect to the source.
 LCM authenticates read-only, no-follow descriptors for the project database,
 local event outbox, machine-sequence database, and each WAL or shared-memory
