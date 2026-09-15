@@ -19,6 +19,9 @@ importers:
       '@sinclair/typebox':
         specifier: 0.34.52
         version: 0.34.52
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
       commander:
         specifier: 15.0.0
         version: 15.0.0
@@ -47,9 +50,6 @@ importers:
       '@types/node':
         specifier: 26.5.0
         version: 26.5.0
-      '@types/pg':
-        specifier: 8.23.1
-        version: 8.23.1
       '@types/safe-regex':
         specifier: 1.1.6
         version: 1.1.6
