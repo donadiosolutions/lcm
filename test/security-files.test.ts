@@ -3495,6 +3495,102 @@ describe("private filesystem primitives", () => {
     expect(existsSync(path)).toBe(false);
   });
 
+  it.each([
+    ["descriptor identity", "fstat" as const, false],
+    ["descriptor identity with close failure", "fstat" as const, true],
+    ["parent identity", "lstat" as const, false],
+    ["parent identity with close failure", "lstat" as const, true],
+  ])("closes the atomic exclusive temp fd after %s fails", (_name, stage, closeFails) => {
+    const root = makeRoot();
+    const path = join(root, "atomic-identity-failure");
+    const tempPath = join(root, `.atomic-identity-failure.${"71".repeat(12)}.tmp`);
+    const identityFailure = new Error(`${stage} identity failed`);
+    const closeFailure = new Error("identity cleanup close failed");
+    const originalOpen = openSync;
+    const originalFstat = fstatSync;
+    const originalLstat = lstatSync;
+    const originalClose = closeSync;
+    let openedFd: number | undefined;
+    let cleanupFd: number | undefined;
+    let closeCalls = 0;
+    let writeCalls = 0;
+    let observed: unknown;
+    const chmod = vi.fn();
+    const link = vi.fn();
+    const remove = vi.fn();
+
+    try {
+      try {
+        withPatchedFs("openSync", ((candidate: string, flags: string | number, mode?: number) => {
+          const fd = originalOpen(candidate, flags, mode);
+          if (candidate === tempPath) {
+            openedFd = fd;
+            cleanupFd = fd;
+          }
+          return fd;
+        }) as typeof openSync, () => (
+          withPatchedFs("fstatSync", ((fd: number, options?: unknown) => {
+            if (
+              stage === "fstat"
+              && fd === openedFd
+              && (options as { bigint?: boolean } | undefined)?.bigint === true
+            ) {
+              throw identityFailure;
+            }
+            return originalFstat(fd, options as never);
+          }) as typeof fstatSync, () => (
+            withPatchedFs("lstatSync", ((candidate: Parameters<typeof lstatSync>[0], options?: unknown) => {
+              if (stage === "lstat" && candidate === root) throw identityFailure;
+              return originalLstat(candidate, options as never);
+            }) as typeof lstatSync, () => (
+              withPatchedFs("writeFileSync", (() => {
+                writeCalls += 1;
+              }) as typeof writeFileSync, () => (
+                withPatchedFs("closeSync", ((fd: number) => {
+                  if (fd !== openedFd) {
+                    originalClose(fd);
+                    return;
+                  }
+                  closeCalls += 1;
+                  originalClose(fd);
+                  cleanupFd = undefined;
+                  if (closeFails) throw closeFailure;
+                }) as typeof closeSync, () => atomicWritePrivateFileExclusive(path, "content", {
+                  chmod,
+                  link,
+                  random: () => Buffer.alloc(12, 0x71),
+                  remove,
+                }))
+              ))
+            ))
+          ))
+        ));
+      } catch (error) {
+        observed = error;
+      }
+
+      if (closeFails) {
+        expect(observed).toBeInstanceOf(AggregateError);
+        const aggregate = observed as AggregateError & { cause?: unknown };
+        expect(aggregate.errors).toEqual([identityFailure, closeFailure]);
+        expect(aggregate.cause).toBe(identityFailure);
+      } else {
+        expect(observed).toBe(identityFailure);
+      }
+      expect(openedFd).toBeTypeOf("number");
+      expect(closeCalls).toBe(1);
+      expect(writeCalls).toBe(0);
+      expect(chmod).not.toHaveBeenCalled();
+      expect(link).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+      expect(existsSync(path)).toBe(false);
+      expect(existsSync(tempPath)).toBe(true);
+      expect(readFileSync(tempPath, "utf8")).toBe("");
+    } finally {
+      if (cleanupFd !== undefined) originalClose(cleanupFd);
+    }
+  });
+
   it("keeps EEXIST cleanup-only failure distinct from ordinary contention", () => {
     const root = makeRoot();
     const path = join(root, "atomic-existing-cleanup");

@@ -1520,13 +1520,13 @@ export function atomicWritePrivateFileExclusive(
   try {
     const fd = openSync(tempPath, "wx", PRIVATE_FILE_MODE);
     ownsTempPath = true;
-    tempIdentity = privateFileIdentity(
-      fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
-      privatePathIdentity(directory),
-    );
     let descriptorErrorPresent = false;
     let descriptorError: unknown;
     try {
+      tempIdentity = privateFileIdentity(
+        fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
+        privatePathIdentity(directory),
+      );
       writeFileSync(fd, content, "utf-8");
       fsyncSync(fd);
     } catch (error) {
