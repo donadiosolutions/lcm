@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { execFileSync } from "node:child_process";
+import { ESLint } from "eslint";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -37,6 +37,11 @@ import {
   backendPublicationJournalPath,
   withBackendPublicationConsumerLockAsync,
 } from "../src/storage/backend-publication.js";
+
+const projectMapEslint = new ESLint({
+  cwd: process.cwd(),
+  overrideConfig: { rules: { "no-shadow": "error" } },
+});
 
 function resetLcmHome(): void {
   rmSync(join(homedir(), ".lcm"), { recursive: true, force: true });
@@ -118,12 +123,33 @@ describe("project map", () => {
     resetLcmHome();
   });
 
-  it("keeps project-map publication lock scopes free of shadowed token parameters", () => {
-    expect(() => execFileSync(
-      join(process.cwd(), "node_modules/.bin/eslint"),
-      ["src/project-map.ts", "--rule", "no-shadow:error"],
-      { stdio: "pipe" },
-    )).not.toThrow();
+  it("keeps project-map publication lock scopes free of shadowed token parameters", async () => {
+    const results = await projectMapEslint.lintFiles("src/project-map.ts");
+    expect(results, JSON.stringify(results)).toHaveLength(1);
+    const result = results[0];
+    expect(result).toBeDefined();
+    if (!result) throw new Error("ESLint returned no project-map result");
+    expect(result.filePath).toBe(join(process.cwd(), "src/project-map.ts"));
+    expect(result.errorCount, JSON.stringify(result.messages)).toBe(0);
+    expect(result.fatalErrorCount, JSON.stringify(result.messages)).toBe(0);
+    expect(result.warningCount, JSON.stringify(result.messages)).toBe(0);
+    expect(result.messages).toEqual([]);
+  });
+
+  it("retains no-shadow coverage for nested publication lock callback parameters", async () => {
+    const results = await projectMapEslint.lintText(
+      `function publishProject(publicationLockToken: string): void {
+  [publicationLockToken].forEach((publicationLockToken) => {
+    void publicationLockToken;
+  });
+}`,
+      { filePath: join(process.cwd(), "src/project-map-negative-control.ts") },
+    );
+    expect(results).toHaveLength(1);
+    const result = results[0];
+    expect(result).toBeDefined();
+    if (!result) throw new Error("ESLint returned no negative-control result");
+    expect(result.messages.some((message) => message.ruleId === "no-shadow" && message.severity === 2)).toBe(true);
   });
 
   afterEach(() => {
