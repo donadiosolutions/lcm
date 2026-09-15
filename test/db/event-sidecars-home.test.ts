@@ -307,6 +307,36 @@ describe("configured-home sidecar observation", () => {
     expect(openSpy).toHaveBeenCalledOnce();
   });
 
+  it("cancels when a health read aborts before its wait is registered", async () => {
+    const controller = new AbortController();
+    const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
+    const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open")
+      .mockImplementationOnce(async function (path, options, token) {
+        const repository = await realOpen.call(this, path, options, token);
+        vi.spyOn(repository, "getHealthStats").mockImplementationOnce(() => {
+          controller.abort();
+          return new Promise(() => {});
+        });
+        return repository;
+      });
+    const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close");
+    addSidecar(otherId);
+    addSidecar(thirdId);
+
+    const result = await collectEventSidecars({ homeDir, signal: controller.signal });
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ scanSkippedCount: 3 });
+    expect(result[0].scanSkipped).toContain("cancelled");
+    expect(result[0].pruned).toBeUndefined();
+    expect(open).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(isLcmConnectionOpen(path)).toBe(false);
+    for (const id of [projectId, otherId, thirdId]) {
+      expect(existsSync(join(homeDir, ".lcm", "events", `${id}.db`))).toBe(true);
+    }
+  });
+
   it("cancels a pending health read and closes without waiting for it", async () => {
     vi.useFakeTimers();
     const controller = new AbortController();
