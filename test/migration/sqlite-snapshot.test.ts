@@ -448,6 +448,13 @@ describe("authenticated SQLite snapshot artifacts", () => {
       .toEqual({ state: "absent" });
   });
 
+  it("keeps supported nonexistent-home classification absent", async () => {
+    const homeDir = join(mkdtempSync(join(tmpdir(), "lcm-snapshot-parent-")), "missing-home");
+    roots.push(join(homeDir, ".."));
+    expect(await classifySqliteSnapshotArtifact("generation-1", { homeDir }))
+      .toEqual({ state: "absent" });
+  });
+
   it.each(["0", "9223372036854775808"])("samples private sequence cutoff %s without source writes", async (next) => {
     const fixture = sourceFixture();
     fixture.openDatabases[2]!.exec(`CREATE TABLE local_hook_sequence(singleton, next_sequence); INSERT INTO local_hook_sequence VALUES(1, '${next}')`);
