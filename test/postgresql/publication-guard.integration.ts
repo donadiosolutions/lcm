@@ -189,6 +189,8 @@ describe("PostgreSQL publication guard post-wait database time", () => {
       );
       await holder.started;
       const contender = fixture.guard.renew({ ...fixture.mutation, ttlMs: TTL_MS });
+      // Observe the expected rejection before lock-wait observation can yield.
+      void contender.catch(() => {});
       try {
         await waitForPublicationWait(database, fixture.fence.projectId);
         await releaseHeldPublicationRow(holder);
@@ -214,6 +216,8 @@ describe("PostgreSQL publication guard post-wait database time", () => {
       );
       await holder.started;
       const contender = fixture.guard.release(fixture.mutation);
+      // Observe the expected rejection before lock-wait observation can yield.
+      void contender.catch(() => {});
       try {
         await waitForPublicationWait(database, fixture.fence.projectId);
         await releaseHeldPublicationRow(holder);
