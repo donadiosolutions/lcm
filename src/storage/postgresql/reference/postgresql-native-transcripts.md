@@ -182,12 +182,28 @@ has no configured custom patterns; bundled Gitleaks and native rules still
 apply.
 
 The scrubber rejects an invalid custom pattern, a collision between keys after
-redaction, and any residual match from the effective pattern set. It then
-canonicalizes the sanitized JSON, scans that complete representation again
-with the effective patterns, and only then hashes it. This complete-container
-scan detects structured key/value signatures that do not match either string
-in isolation. The scrubber version binds the pipeline version to the
-effective-pattern digest so a pattern change is observable.
+redaction, and any residual match from the effective pattern set. After the
+recursive pass, supported top-level Claude and Codex messages are extracted
+from the newly sanitized tree with the same block joining and trimming rules
+as their parser, and that joined text is scrubbed again. When a cross-block
+match changes it, the complete joined sanitized result is placed in the first
+contributing text field and the other contributing text fields are emptied.
+The existing array, block, nested Claude tool-result, unknown-block, and
+metadata structure is retained. This correction never reads original
+plaintext. The scrubber then canonicalizes the sanitized JSON, scans that
+complete representation again with the effective patterns, and only then
+hashes it. This complete-container scan detects structured key/value
+signatures that do not match either string in isolation. The scrubber version
+binds the pipeline version to the effective-pattern digest so a pattern change
+is observable.
+
+Exact message linkage remains the admission boundary. Overlapping field and
+joined matches, spanning anchors or Codex trimming, and a pattern that matches
+into or out of an inserted `[REDACTED]` marker can make the conservative native
+text differ from parser-then-scrub output. The default backfill fails before
+PostgreSQL storage rather than restoring a redacted fragment. A joined result
+that is not a scrub fixpoint is quarantined with the existing
+`residual-secret` reason.
 
 Canonicalization and repository normalization sort object keys recursively, so
 nested object member order does not create a different digest or retry
@@ -239,6 +255,15 @@ checkpointed records, and resumes destination work after the completed byte
 offset. Missing, malformed, or different scrubber versions force an
 idempotent rescan so changed pipeline or pattern semantics cannot reuse an old
 sanitized prefix. This is not a physical file seek.
+
+The default joined-message pipeline is `native-json-scrub/v2`, so a v1
+checkpoint triggers this forward-only rescan. Rows whose sanitized identity is
+unchanged deduplicate by ingest key. On the default exact-link path, a corrected
+row can only be one that did not commit under v1; the rescan does not add a
+second row at an ordinal already occupied by a v1-linked row. Existing rows are
+not deleted or rewritten, and the upgrade does not claim they were all
+cross-block safe. Records that remain invalid are appended to local quarantine
+again under the existing rescan behavior.
 
 A verified empty source persists byte offset `0`, the SHA-256 digest of the
 empty prefix, current source metadata, and the effective scrubber version

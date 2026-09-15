@@ -1,3 +1,4 @@
+import { ok as assert } from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   closeSync,
@@ -55,7 +56,7 @@ export const NATIVE_TRANSCRIPT_DEFAULT_BATCH_SIZE = 100;
 export const NATIVE_TRANSCRIPT_MAX_BATCH_SIZE = 1_000;
 export const NATIVE_TRANSCRIPT_MAX_LINK_SOURCE_ORDINAL = 2_147_483_647;
 export const NATIVE_TRANSCRIPT_SCRUB_PIPELINE_VERSION =
-  "native-json-scrub/v1";
+  "native-json-scrub/v2";
 
 const PROTECTED_NATIVE_TRANSCRIPT_MARKERS = [
   "message",
@@ -235,10 +236,11 @@ export function createNativeTranscriptScrubber(
   return {
     scrubberVersion,
     scrubJson: (value): JsonObject | JsonValue[] => {
-      const scrubbed = scrubJsonValue(
+      const recursivelyScrubbed = scrubJsonValue(
         engine,
         value,
       ) as JsonObject | JsonValue[];
+      const scrubbed = scrubJoinedMessageText(engine, recursivelyScrubbed);
       const canonical = canonicalNativeTranscriptJson(scrubbed);
       if (engine.scrub(canonical) !== canonical) {
         throw new NativeTranscriptRecordError("residual-secret");
@@ -1297,6 +1299,137 @@ function codexText(value: JsonValue | undefined): string {
   }).filter(Boolean).join("\n").trim();
 }
 
+type SupportedClaudeMessage = JsonObject & {
+  readonly role: "user" | "assistant" | "system";
+};
+
+type SupportedCodexMessage = JsonObject & {
+  readonly role: "user" | "assistant";
+};
+
+function supportedClaudeMessage(root: JsonObject): SupportedClaudeMessage | null {
+  const message = object(root.message);
+  return message !== null
+      && (
+        message.role === "user"
+        || message.role === "assistant"
+        || message.role === "system"
+      )
+    ? message as SupportedClaudeMessage
+    : null;
+}
+
+function supportedCodexMessage(root: JsonObject): SupportedCodexMessage | null {
+  if (root.type !== "response_item") return null;
+  const message = object(root.payload);
+  return message?.type === "message"
+      && (message.role === "user" || message.role === "assistant")
+    ? message as SupportedCodexMessage
+    : null;
+}
+
+interface NativeTranscriptTextLeaf {
+  readonly parent: JsonObject;
+  readonly key: string;
+}
+
+function collectClaudeTextLeaves(
+  parent: JsonObject,
+  key: string,
+  leaves: NativeTranscriptTextLeaf[],
+): void {
+  const value = parent[key];
+  if (typeof value === "string") {
+    if (value) leaves.push({ parent, key });
+    return;
+  }
+  if (!Array.isArray(value)) return;
+  for (const item of value) {
+    const block = object(item);
+    if (!block) continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      if (block.text) leaves.push({ parent: block, key: "text" });
+    } else if (block.type === "tool_result") {
+      collectClaudeTextLeaves(block, "content", leaves);
+    }
+  }
+}
+
+function collectCodexTextLeaves(
+  parent: JsonObject,
+  key: string,
+  leaves: NativeTranscriptTextLeaf[],
+): void {
+  const value = parent[key];
+  if (typeof value === "string") {
+    leaves.push({ parent, key });
+    return;
+  }
+  assert(
+    Array.isArray(value),
+    new NativeTranscriptRecordError("residual-secret"),
+  );
+  for (const item of value) {
+    const block = object(item);
+    if (
+      block
+      && (
+        block.type === "input_text"
+        || block.type === "output_text"
+        || block.type === "text"
+      )
+      && typeof block.text === "string"
+      && block.text
+    ) {
+      leaves.push({ parent: block, key: "text" });
+    }
+  }
+}
+
+function setTextLeaf(leaf: NativeTranscriptTextLeaf, value: string): void {
+  Object.defineProperty(leaf.parent, leaf.key, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+}
+
+function scrubJoinedMessageText(
+  engine: ScrubEngine,
+  value: JsonObject | JsonValue[],
+): JsonObject | JsonValue[] {
+  const root = object(value);
+  if (!root) return value;
+
+  const claudeMessage = supportedClaudeMessage(root);
+  const codexMessage = supportedCodexMessage(root);
+  if (Boolean(claudeMessage) === Boolean(codexMessage)) return value;
+
+  const message = claudeMessage ?? codexMessage;
+  assert(message, new NativeTranscriptRecordError("residual-secret"));
+  const extract = claudeMessage ? claudeText : codexText;
+  const joined = extract(message.content);
+  const scrubbedJoined = scrubString(engine, joined);
+  if (scrubbedJoined === joined) return value;
+
+  const leaves: NativeTranscriptTextLeaf[] = [];
+  if (claudeMessage) {
+    collectClaudeTextLeaves(message, "content", leaves);
+  } else {
+    collectCodexTextLeaves(message, "content", leaves);
+  }
+  const first = leaves[0];
+  assert(first, new NativeTranscriptRecordError("residual-secret"));
+  setTextLeaf(first, scrubbedJoined);
+  for (const leaf of leaves.slice(1)) setTextLeaf(leaf, "");
+  assert(
+    extract(message.content) === scrubbedJoined,
+    new NativeTranscriptRecordError("residual-secret"),
+  );
+  return value;
+}
+
 /**
  * Maps the supported sanitized client-native message records exactly as the
  * existing #85 Claude and Codex transcript parsers do.
@@ -1311,25 +1444,17 @@ export function createNativeTranscriptMessageMapper():
     ): readonly NativeTranscriptMessageCandidate[] => {
       const root = object(payload);
       if (!root) return [];
-      let role: JsonValue | undefined;
+      let role: MessageRole;
       let content = "";
       if (format.clientName === "claude-code") {
-        const message = object(root.message);
-        role = message?.role;
-        if (
-          role !== "user"
-          && role !== "assistant"
-          && role !== "system"
-        ) {
-          return [];
-        }
-        content = claudeText(message?.content);
-      } else {
-        if (root.type !== "response_item") return [];
-        const message = object(root.payload);
-        if (message?.type !== "message") return [];
+        const message = supportedClaudeMessage(root);
+        if (!message) return [];
         role = message.role;
-        if (role !== "user" && role !== "assistant") return [];
+        content = claudeText(message.content);
+      } else {
+        const message = supportedCodexMessage(root);
+        if (!message) return [];
+        role = message.role;
         content = codexText(message.content);
       }
       if (content.trim().length === 0) return [];
