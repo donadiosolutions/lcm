@@ -1229,9 +1229,9 @@ describe("promote-events route", () => {
     const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close")
       .mockImplementationOnce(async function (this: SQLiteLocalHookOutboxFactory) {
         await originalClose.call(this);
-        // Exhaust the budget after the first real scan finishes, independently
-        // of clock reads used by publication admission and operation deadlines.
-        now.mockReturnValue(30_001);
+        // The first read after close is the mandatory pre-prune stop check for
+        // this completed sidecar. Exhaust the budget only for the next loop.
+        now.mockReturnValueOnce(0).mockReturnValue(30_001);
       });
 
     const handler = createPromoteAllEventsHandler(makeConfig());
