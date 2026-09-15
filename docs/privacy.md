@@ -543,7 +543,12 @@ The `Security` section of the doctor output shows:
   pass. For example, `'file://host'['/private']?next/Users/SECRET` becomes
   `'file://host'['<path>']?next<path>`. The handoff remains within that exact
   file URL context; whitespace and URL-ending punctuation reset it, and a
-  recognized `scheme://` token is not consumed as the local path.
+  recognized `scheme://` token is not consumed as the local path. Private
+  slash paths in later ampersand-separated parameters remain covered by the
+  same handoff. When an ampersand is immediately followed by an ordinary
+  public `scheme://` URL, the quoted-query handoff expires before that URL, so
+  its scheme, authority, and path remain byte-identical. A nested exact
+  `file://` literal still starts its own bounded file-path classification.
   Classification state from an earlier quoted file URL does not carry into a
   later unquoted file URL's query tail. A public URL glued directly after the
   closing quote or bracket without whitespace may be conservatively redacted:
@@ -558,7 +563,10 @@ The `Security` section of the doctor output shows:
   following prose or URLs are classified normally. Double quotes in non-file
   URLs or structured text and ordinary quoted local paths retain their existing
   boundaries. Ordinary HTTP and HTTPS URLs retain their authorities, slashes,
-  and paths. In an unquoted exact
+  and paths. A pipe, comma, or semicolon after a closed quoted file-path wrapper
+  also expires its quoted-path provenance before a following ordinary public
+  URL, including a bracketed IPv6 URL with a port, path, query, or fragment.
+  In an unquoted exact
   `file://` URL with no path, a `?` or `#` outside still-open brackets ends the
   file URL authority classification. Following text is classified from fresh
   state: a nested non-file URL remains intact, while standalone POSIX, Windows,
@@ -568,12 +576,19 @@ The `Security` section of the doctor output shows:
   this restarted tail are tracked independently. A slash inside a still-open
   bracket is conservatively treated as a path marker even when it follows a
   word character, and a matched closing bracket keeps the context active so a
-  later backslash-based path is also redacted. Within that already-admitted
-  forced scan, an internal backslash followed by exactly one path-word code
-  point, a colon, and `/` or `\` keeps a drive-shaped continuation in the same
-  redacted span. Path-word characters include Unicode letters, numbers, and
-  marks plus `_.-@+~%$*`; this contextual rule does not make numeric,
-  non-ASCII, or punctuation labels standalone drive-path starts. Once the
+  later backslash-based path is also redacted. The same bounded nested-bracket
+  slash rule applies in a query or fragment after an outer file path has
+  already been admitted. It includes a slash after an inner closing bracket
+  and absorbs a scheme-shaped component there, while independently admitted
+  public URLs outside that confidential span remain unchanged. Within an
+  already-admitted forced or file-URL scan, an internal backslash followed by
+  zero or one path-word code point, a colon, and `/` or `\` keeps a
+  drive-shaped continuation in the same redacted span. Path-word characters
+  include Unicode letters, numbers, and marks plus `_.-@+~%$*`; this
+  contextual rule does not make numeric, non-ASCII, or punctuation labels
+  standalone drive-path starts. Longer labels, punctuation labels, and drive
+  forms without a slash or backslash after the colon stay outside this narrow
+  continuation grammar. Once the
   brackets are balanced, ordinary word-adjacent slash text remains unchanged.
   Whitespace, quoted-path, nested-URL, and delimiter termination remain
   unchanged. An unmatched closing bracket, a freshly recognized URL, or other
@@ -582,14 +597,19 @@ The `Security` section of the doctor output shows:
   Windows backslash path is also redacted when a bracketed file URL query or
   fragment hands off to it immediately after URL-ending punctuation or a
   bracketed nested non-file URL. A nested IPv6 URL keeps the enclosing bracket
-  context through a path, port, or query after its IP-literal closing bracket.
-  A balanced outer bracket may have only spaces or tabs before the backslash.
-  This handoff is consumed once. Prose, newlines, carriage returns, and other
-  whitespace end it; ordinary text and non-file URLs do not make a single
-  backslash a global path start.
-  When an unquoted local-path span starts with
-  `/scheme://`, its URL-shaped portion, including scheme and port colons, is
-  replaced by one `<path>` marker on the first pass. The span ends at whitespace
+  context through a path, port, query, or fragment after its IP-literal closing
+  bracket. A balanced outer bracket may have only spaces or tabs before the
+  backslash. This handoff is consumed once. Prose, newlines, carriage returns,
+  and other whitespace end it; ordinary text and non-file URLs do not make a
+  single backslash a global path start.
+  When an unquoted local-path span contains a scheme-shaped `scheme://`
+  component, the bounded span-local scheme colon and the component that follows
+  it are replaced within the same `<path>` marker on the first pass. This also
+  applies when the component follows earlier POSIX segments or separator runs,
+  or when its scheme text is glued to an earlier path-word run. It does not
+  treat an arbitrary colon as a path continuation, cross a recognized nested
+  exact `file://` boundary, or change a separate ordinary public URL. The span
+  ends at whitespace
   or the first unbalanced `)` or `]`, `#`, `&`, `=`, `|`, `,`, `;`, `!`, `?`,
   `}`, apostrophe, double quote, `<`, or `>`. The marker therefore stops before
   a suffix such as `?a=b`. This includes slash-prefixed URLs inside or after
