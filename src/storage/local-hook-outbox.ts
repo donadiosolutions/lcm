@@ -3,6 +3,7 @@ import { basename, dirname, resolve } from "node:path";
 import {
   withBackendPublicationAppendBarrierAsync,
   withBackendPublicationConsumerLock,
+  isTerminalBackendMaintenancePhase,
   readBackendMaintenanceJournal,
   type BackendPublicationAppendBarrierOptions,
   type BackendPublicationLockToken,
@@ -235,7 +236,7 @@ export class SQLiteLocalHookOutboxFactory {
 
       const homeDir = localOutboxHomeDir(dbPath);
       const maintenance = homeDir === undefined ? null : readBackendMaintenanceJournal(homeDir);
-      if (maintenance !== null && maintenance.phase !== "maintenance-aborted") {
+      if (maintenance !== null && !isTerminalBackendMaintenancePhase(maintenance.phase)) {
         const database = this.openCurrentSchema(dbPath, options);
         if (database === null) {
           throw new StorageOperationError(
@@ -271,7 +272,7 @@ export class SQLiteLocalHookOutboxFactory {
 
       const homeDir = localOutboxHomeDir(dbPath);
       const maintenance = homeDir === undefined ? null : readBackendMaintenanceJournal(homeDir);
-      const database = maintenance !== null && maintenance.phase !== "maintenance-aborted"
+      const database = maintenance !== null && !isTerminalBackendMaintenancePhase(maintenance.phase)
         ? this.openCurrentSchema(dbPath, options)
         : EventsDb.openExisting(dbPath, options);
       return database === null ? null : this.register(database, dbPath);

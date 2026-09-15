@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -11,8 +18,13 @@ import {
 } from "../../src/storage/local-hook-outbox.js";
 import {
   BackendPublicationCoordinator,
+  backendPublicationCanonicalSha256,
+  backendPublicationJournalPath,
+  isTerminalBackendMaintenancePhase,
   withBackendPublicationAppendBarrierAsync,
   withBackendPublicationConsumerLockAsync,
+  type BackendMaintenancePhase,
+  type BackendMaintenanceJournal,
   type BackendPublicationLockToken,
   type BackendPublicationDriver,
 } from "../../src/storage/backend-publication.js";
@@ -41,6 +53,102 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     const eventsDirectory = join(homeDir, ".lcm", "events");
     mkdirSync(eventsDirectory, { recursive: true, mode: 0o700 });
     return { homeDir, dbPath: join(eventsDirectory, `${name}.db`) };
+  }
+
+  function maintenanceCoordinator(homeDir: string): BackendPublicationCoordinator {
+    const forbidden = async (): Promise<never> => {
+      throw new Error("publication driver must not run");
+    };
+    return new BackendPublicationCoordinator({
+      homeDir,
+      driver: {
+        observeLocalState: forbidden,
+        publishProjectMap: forbidden,
+        publishConfig: forbidden,
+        restoreConfig: forbidden,
+        restoreProjectMap: forbidden,
+      },
+    });
+  }
+
+  async function maintenanceState(
+    homeDir: string,
+    phase: "maintenance-held" | "selection-prepared" | "selection-completed" | "maintenance-aborted",
+    targetBackend: "sqlite" | "postgresql" = "postgresql",
+  ): Promise<BackendMaintenanceJournal> {
+    const active = maintenanceCoordinator(homeDir);
+    const held = await active.enterMaintenance({
+      publicationId: "local-outbox-maintenance",
+      generationId: "local-outbox-generation",
+      sourceSelectionSha256: "a".repeat(64),
+      queueEvidenceSha256: "b".repeat(64),
+      roster: [{ machineId, queueCutoff: null, evidenceSha256: "a".repeat(64) }],
+    });
+    if (phase === "maintenance-held") return held;
+    if (phase === "maintenance-aborted") {
+      return active.abortMaintenance({
+        expectedChecksumSha256: held.checksumSha256,
+        sourceSelectionSha256: held.sourceSelectionSha256,
+        abortEvidenceSha256: "c".repeat(64),
+      });
+    }
+    const prepared = await active.prepareMaintenanceSelection({
+      expectedChecksumSha256: held.checksumSha256,
+      generationId: held.generationId,
+      targetBackend,
+      terminalEvidenceSha256: "c".repeat(64),
+    });
+    if (phase === "selection-prepared") return prepared;
+    return active.completeMaintenanceSelection({
+      expectedChecksumSha256: prepared.checksumSha256,
+      generationId: prepared.generationId,
+      terminalEvidenceSha256: prepared.terminalEvidenceSha256!,
+    });
+  }
+
+  async function seedVersionFourOutbox(dbPath: string, data: string): Promise<number> {
+    const seedFactory = new SQLiteLocalHookOutboxFactory();
+    const seed = await seedFactory.open(dbPath);
+    const eventId = await seed.insertEvent(
+      "migration-session",
+      { type: "decision", category: "decision", data, priority: 1 },
+      "PostToolUse",
+    );
+    await seedFactory.close();
+    const raw = new DatabaseSync(dbPath);
+    raw.exec("DROP TABLE missing_cwd_state; UPDATE schema_version SET version = 4;");
+    raw.close();
+    return eventId;
+  }
+
+  function outboxSnapshot(dbPath: string): Readonly<{
+    version: number;
+    rows: readonly Record<string, unknown>[];
+  }> {
+    const raw = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      return {
+        version: (raw.prepare("SELECT version FROM schema_version").get() as { version: number }).version,
+        rows: raw.prepare("SELECT event_id, data FROM events ORDER BY event_id").all(),
+      };
+    } finally {
+      raw.close();
+    }
+  }
+
+  function rewriteMaintenanceJournal(
+    homeDir: string,
+    update: Readonly<Record<string, unknown>>,
+    checksum = true,
+  ): void {
+    const path = backendPublicationJournalPath(homeDir);
+    const current = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    const next = { ...current, ...update };
+    if (checksum) {
+      const { checksumSha256: _checksum, ...payload } = next;
+      next.checksumSha256 = backendPublicationCanonicalSha256(payload);
+    }
+    writeFileSync(path, `${JSON.stringify(next)}\n`, { mode: 0o600 });
   }
 
   function retainedOperations(
@@ -354,6 +462,144 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     await repository?.close();
     await factory.close();
 
+  });
+
+  it("classifies only completed selection and aborted maintenance as terminal", () => {
+    const phases: readonly BackendMaintenancePhase[] = [
+      "maintenance-entering",
+      "maintenance-held",
+      "selection-prepared",
+      "selection-completed",
+      "maintenance-aborted",
+    ];
+
+    expect(phases.map(isTerminalBackendMaintenancePhase))
+      .toEqual([false, false, false, true, true]);
+  });
+
+  it.each([
+    { phase: "maintenance-aborted", targetBackend: "postgresql" },
+    { phase: "selection-completed", targetBackend: "sqlite" },
+    { phase: "selection-completed", targetBackend: "postgresql" },
+  ] as const)(
+    "admits $phase outbox upgrade for target $targetBackend through both opening methods",
+    async ({ phase, targetBackend }) => {
+      for (const method of ["open", "openExisting"] as const) {
+        const local = localPathFor(`${phase}-${targetBackend}-${method}`);
+        const retainedId = await seedVersionFourOutbox(local.dbPath, `${method}-retained`);
+        await maintenanceState(local.homeDir, phase, targetBackend);
+        const factory = new SQLiteLocalHookOutboxFactory();
+
+        const repository = await factory[method](local.dbPath);
+        expect(repository).not.toBeNull();
+        expect(outboxSnapshot(local.dbPath)).toEqual({
+          version: 5,
+          rows: [{ event_id: retainedId, data: `${method}-retained` }],
+        });
+        const appendedId = await repository!.insertEvent(
+          "post-maintenance-session",
+          { type: "decision", category: "decision", data: `${method}-appended`, priority: 1 },
+          "PostToolUse",
+        );
+        expect(appendedId).toBeGreaterThan(retainedId);
+        expect((await repository!.getUnprocessed()).map(({ data }) => data))
+          .toEqual([`${method}-retained`, `${method}-appended`]);
+        await factory.close();
+      }
+    },
+  );
+
+  it.each(["maintenance-held", "selection-prepared"] as const)(
+    "keeps version-four rows unchanged and missing-file failure shapes distinct during %s",
+    async (phase) => {
+      const homeDir = localPathFor(`${phase}-anchor`).homeDir;
+      const eventsDirectory = join(homeDir, ".lcm", "events");
+      const openPath = join(eventsDirectory, `${phase}-open.db`);
+      const existingPath = join(eventsDirectory, `${phase}-existing.db`);
+      await seedVersionFourOutbox(openPath, "open-retained");
+      await seedVersionFourOutbox(existingPath, "existing-retained");
+      await maintenanceState(homeDir, phase);
+      const factory = new SQLiteLocalHookOutboxFactory();
+      const openBefore = outboxSnapshot(openPath);
+      const existingBefore = outboxSnapshot(existingPath);
+
+      await expect(factory.open(openPath)).rejects.toThrow(
+        "events database schema is not current during migration maintenance",
+      );
+      await expect(factory.openExisting(existingPath)).rejects.toThrow(
+        "events database schema is not current during migration maintenance",
+      );
+      expect(outboxSnapshot(openPath)).toEqual(openBefore);
+      expect(outboxSnapshot(existingPath)).toEqual(existingBefore);
+
+      const missingForOpen = join(eventsDirectory, `${phase}-missing-open.db`);
+      const missingForExisting = join(eventsDirectory, `${phase}-missing-existing.db`);
+      await expect(factory.open(missingForOpen)).rejects.toMatchObject({
+        code: "STORAGE_INITIALIZATION_FAILED",
+        operation: "open",
+      });
+      await expect(factory.openExisting(missingForExisting)).resolves.toBeNull();
+      expect(existsSync(missingForOpen)).toBe(false);
+      expect(existsSync(missingForExisting)).toBe(false);
+      await factory.close();
+    },
+  );
+
+  it.each(["open", "openExisting"] as const)(
+    "keeps maintenance-entering refusal barrier-owned for %s",
+    async (method) => {
+      const local = localPathFor(`entering-${method}`);
+      await seedVersionFourOutbox(local.dbPath, "entering-retained");
+      await maintenanceState(local.homeDir, "maintenance-held");
+      rewriteMaintenanceJournal(local.homeDir, { phase: "maintenance-entering" });
+      const before = outboxSnapshot(local.dbPath);
+      const factory = new SQLiteLocalHookOutboxFactory();
+
+      await expect(factory[method](local.dbPath)).rejects.toMatchObject({
+        reason: "unresolved-publication",
+      });
+      expect(outboxSnapshot(local.dbPath)).toEqual(before);
+      await factory.close();
+    },
+  );
+
+  it.each(["open", "openExisting"] as const)(
+    "preserves explicit current-schema refusal after completed selection for %s",
+    async (method) => {
+      const local = localPathFor(`explicit-current-${method}`);
+      await seedVersionFourOutbox(local.dbPath, "explicit-current-retained");
+      await maintenanceState(local.homeDir, "selection-completed", "postgresql");
+      const before = outboxSnapshot(local.dbPath);
+      const factory = new SQLiteLocalHookOutboxFactory();
+
+      await expect(factory[method](local.dbPath, { _requireCurrentSchema: true }))
+        .rejects.toThrow("events database schema is not current during migration maintenance");
+      expect(outboxSnapshot(local.dbPath)).toEqual(before);
+      await factory.close();
+    },
+  );
+
+  it("refuses checksum-invalid terminal maintenance before writable outbox opening", async () => {
+    const local = localPathFor("invalid-terminal");
+    await seedVersionFourOutbox(local.dbPath, "checksum-retained");
+    await maintenanceState(local.homeDir, "selection-completed", "postgresql");
+    rewriteMaintenanceJournal(local.homeDir, { checksumSha256: "0".repeat(64) }, false);
+    const before = outboxSnapshot(local.dbPath);
+    const factory = new SQLiteLocalHookOutboxFactory();
+
+    await expect(factory.open(local.dbPath)).rejects.toMatchObject({ reason: "checksum-mismatch" });
+    expect(outboxSnapshot(local.dbPath)).toEqual(before);
+    await factory.close();
+  });
+
+  it("keeps absent openExisting null after completed selection", async () => {
+    const local = localPathFor("completed-absent");
+    await maintenanceState(local.homeDir, "selection-completed", "sqlite");
+    const factory = new SQLiteLocalHookOutboxFactory();
+
+    await expect(factory.openExisting(local.dbPath)).resolves.toBeNull();
+    expect(existsSync(local.dbPath)).toBe(false);
+    await factory.close();
   });
 
   it("opens only an existing local outbox without creating missing path state", async () => {

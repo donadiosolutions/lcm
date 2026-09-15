@@ -168,6 +168,15 @@ readers receive the journal checksum for their existing double-read check.
 Version-3 journals do not record a version-2 target configuration hash; terminal
 admission uses their selected backend and the current authenticated file witness.
 
+Ordinary backend publication also resumes after either terminal maintenance
+phase. Before preparing the next version-2 publication, the coordinator reads
+the terminal version-3 journal through its retained directory witness and
+archives those exact authenticated bytes. The terminal journal remains live if
+local-state observation or the initial compare-and-swap replacement fails, so
+the same prepare request can be retried. `resume()`, `abort()`, and
+`recoverPending()` remain version-2 recovery operations and do not advance a
+leftover maintenance journal.
+
 If maintenance entry is interrupted after its entering checkpoint, call
 `enterMaintenance` with the exact original publication, generation, selection,
 queue evidence and roster, plus the observed `expectedChecksumSha256` for
@@ -187,14 +196,18 @@ refreshed maintenance checksum for subsequent selection or exact retry.
 While maintenance is held, ordinary SQLite operations fail publication
 admission even through handles opened earlier. Local hook append has one narrow
 capability: its installation-global sequence allocation and matching outbox
-insert share a short append barrier. Existing outboxes must already have the
-current schema; hook open cannot opportunistically migrate or create an outbox
-during maintenance. Registered-project preparation creates and validates an
-empty outbox before adopting its receipt epoch, so its first held hook has a
-durable destination. Outbox opens share the append barrier with capture. During
-the hold, schema checks recover private copies of the main file and WAL, leaving
-the source and shared-memory sidecar untouched on schema refusal. The verified
-main-file identity is checked again before writable connection setup.
+insert share a short append barrier. During entering, held, or prepared
+maintenance, existing outboxes must already have the current schema; hook open
+cannot opportunistically migrate or create an outbox. Registered-project
+preparation creates and validates an empty outbox before adopting its receipt
+epoch, so its first held hook has a durable destination. Outbox opens share the
+append barrier with capture. During the hold, schema checks recover private
+copies of the main file and WAL, leaving the source and shared-memory sidecar
+untouched on schema refusal. The verified main-file identity is checked again
+before writable connection setup. After authenticated abort or selected-
+generation completion, ordinary outbox opens resume and may apply supported
+additive schema upgrades while retaining pending events. An internal caller
+that explicitly requires the current schema still receives schema refusal.
 Claims, processing marks, retries, acknowledgements,
 correlation updates, replay, missing-cwd updates, and pruning remain blocked.
 A valid version-2 publication, including an unfinished publication or the safe

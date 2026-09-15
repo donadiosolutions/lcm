@@ -11,16 +11,19 @@ import {
   assertBackendPublicationConsumerAccess,
   assertBackendPublicationConfigReadAccess,
   backendPublicationDirectory,
+  backendPublicationHistoryDirectory,
   backendPublicationJournalPath,
   backendPublicationCanonicalSha256,
   backendPublicationMaterialWitness,
   captureBackendPublicationFileWitness,
   readBackendPublicationJournal,
+  readBackendMaintenanceJournal,
   withBackendPublicationConfigLock,
   withBackendPublicationConsumerLock,
   withBackendPublicationAppendBarrier,
   withBackendPublicationAppendBarrierAsync,
   type BackendPublicationDriver,
+  type BackendMaintenanceJournal,
   type BackendPublicationFenceRecord,
   type BackendPublicationRecoveryFile,
   type BackendPublicationRecoveryMaterial,
@@ -332,6 +335,57 @@ function inputFor(materialInput: BackendPublicationRecoveryMaterial) {
     projects: projectInput(),
     now: new Date("2026-08-06T12:00:00.000Z"),
   };
+}
+
+async function createMaintenanceState(
+  home: string,
+  driver: BackendPublicationDriver,
+  phase: "maintenance-entering" | "maintenance-held" | "selection-prepared" | "selection-completed" | "maintenance-aborted",
+  targetBackend: "sqlite" | "postgresql" = "postgresql",
+): Promise<BackendMaintenanceJournal> {
+  const active = coordinator(home, driver);
+  const held = await active.enterMaintenance({
+    publicationId: "maintenance-publication",
+    generationId: "maintenance-generation",
+    sourceSelectionSha256: "a".repeat(64),
+    queueEvidenceSha256: "b".repeat(64),
+    roster: [{
+      machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
+      queueCutoff: null,
+      evidenceSha256: "a".repeat(64),
+    }],
+  });
+  if (phase === "maintenance-held") return held;
+  if (phase === "maintenance-entering") {
+    rewriteJournal(home, (journal) => ({ ...journal, phase }));
+    return readBackendMaintenanceJournal(home)!;
+  }
+  if (phase === "maintenance-aborted") {
+    return active.abortMaintenance({
+      expectedChecksumSha256: held.checksumSha256,
+      sourceSelectionSha256: held.sourceSelectionSha256,
+      abortEvidenceSha256: "c".repeat(64),
+    });
+  }
+  const prepared = await active.prepareMaintenanceSelection({
+    expectedChecksumSha256: held.checksumSha256,
+    generationId: held.generationId,
+    targetBackend,
+    terminalEvidenceSha256: "c".repeat(64),
+  });
+  if (phase === "selection-prepared") return prepared;
+  return active.completeMaintenanceSelection({
+    expectedChecksumSha256: prepared.checksumSha256,
+    generationId: prepared.generationId,
+    terminalEvidenceSha256: prepared.terminalEvidenceSha256!,
+  });
+}
+
+function maintenanceArchivePath(home: string, journal: BackendMaintenanceJournal): string {
+  return join(
+    backendPublicationHistoryDirectory(home),
+    `${journal.publicationId}.${journal.checksumSha256}.json`,
+  );
 }
 
 function fenceRecord(overrides: Partial<BackendPublicationFenceRecord> = {}): BackendPublicationFenceRecord {
@@ -1347,6 +1401,211 @@ describe("BackendPublicationCoordinator", () => {
     expect(fake.getState()).toEqual(targetState(input));
     expect(await coordinator(home, fake.driver).recoverPending()).toEqual(completed);
   });
+
+  it.each([
+    { phase: "maintenance-aborted", targetBackend: "postgresql" },
+    { phase: "selection-completed", targetBackend: "sqlite" },
+    { phase: "selection-completed", targetBackend: "postgresql" },
+  ] as const)(
+    "archives terminal v3 $phase for $targetBackend before ordinary prepare",
+    async ({ phase, targetBackend }) => {
+      const home = makeHome();
+      const input = material();
+      const fake = makeDriver(input);
+      const terminal = await createMaintenanceState(home, fake.driver, phase, targetBackend);
+      const terminalBytes = readFileSync(backendPublicationJournalPath(home));
+
+      const prepared = await coordinator(home, fake.driver).prepare({
+        ...inputFor(input),
+        publicationId: "ordinary-after-maintenance",
+      });
+
+      expect(prepared).toMatchObject({
+        version: 2,
+        phase: "prepared",
+        publicationId: "ordinary-after-maintenance",
+      });
+      expect(readFileSync(maintenanceArchivePath(home, terminal))).toEqual(terminalBytes);
+      expect(readBackendMaintenanceJournal(home)).toBeNull();
+      expect(readBackendPublicationJournal(home)).toEqual(prepared);
+    },
+  );
+
+  it.each([
+    { boundary: "observation", phase: "maintenance-aborted" },
+    { boundary: "observation", phase: "selection-completed" },
+    { boundary: "replacement", phase: "maintenance-aborted" },
+    { boundary: "replacement", phase: "selection-completed" },
+  ] as const)(
+    "replays terminal v3 $phase after $boundary failure",
+    async ({ boundary, phase }) => {
+      const home = makeHome();
+      const input = material();
+      const first = makeDriver(input);
+      const terminal = await createMaintenanceState(home, first.driver, phase);
+      const terminalBytes = readFileSync(backendPublicationJournalPath(home));
+      const archivePath = maintenanceArchivePath(home, terminal);
+      const nextInput = { ...inputFor(input), publicationId: "ordinary-after-failure" };
+      const failing = makeDriver(input);
+      if (boundary === "observation") {
+        failing.driver.observeLocalState = vi.fn(async () => {
+          throw new Error("crash:observe-terminal-v3");
+        });
+      }
+      const observer = (event: string): void => {
+        if (boundary === "replacement" && event === "before-journal-write") {
+          throw new Error("crash:replace-terminal-v3");
+        }
+      };
+
+      await expect(coordinator(home, failing.driver, observer).prepare(nextInput))
+        .rejects.toThrow(boundary === "observation"
+          ? "crash:observe-terminal-v3"
+          : "crash:replace-terminal-v3");
+      expect(readFileSync(backendPublicationJournalPath(home))).toEqual(terminalBytes);
+      expect(readFileSync(archivePath)).toEqual(terminalBytes);
+      expect(readBackendMaintenanceJournal(home)).toEqual(terminal);
+
+      const retry = makeDriver(input);
+      await expect(coordinator(home, retry.driver).prepare(nextInput)).resolves.toMatchObject({
+        version: 2,
+        phase: "prepared",
+        publicationId: "ordinary-after-failure",
+      });
+      expect(readFileSync(archivePath)).toEqual(terminalBytes);
+    },
+  );
+
+  it.each([
+    "maintenance-entering",
+    "maintenance-held",
+    "selection-prepared",
+  ] as const)("refuses active terminal-v3 predecessor phase %s before effects", async (phase) => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const active = await createMaintenanceState(home, fake.driver, phase);
+    const journalBytes = readFileSync(backendPublicationJournalPath(home));
+
+    await expect(coordinator(home, fake.driver).prepare({
+      ...inputFor(input),
+      publicationId: "ordinary-refused",
+    })).rejects.toMatchObject({ reason: "unresolved-publication" });
+
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(journalBytes);
+    expect(readBackendMaintenanceJournal(home)).toEqual(active);
+    expect(existsSync(backendPublicationHistoryDirectory(home))).toBe(false);
+    expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { kind: "malformed", reason: "malformed-journal" },
+    { kind: "checksum", reason: "checksum-mismatch" },
+  ] as const)("refuses $kind terminal-v3 data before ordinary publication effects", async ({ kind, reason }) => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    await createMaintenanceState(home, fake.driver, "maintenance-aborted");
+    const path = backendPublicationJournalPath(home);
+    if (kind === "malformed") {
+      rewriteJournal(home, (journal) => ({ ...journal, unexpected: true }));
+    } else {
+      const journal = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      writeFileSync(path, `${JSON.stringify({ ...journal, checksumSha256: "0".repeat(64) })}\n`, {
+        mode: 0o600,
+      });
+    }
+    const bytes = readFileSync(path);
+
+    await expect(coordinator(home, fake.driver).prepare({
+      ...inputFor(input),
+      publicationId: "ordinary-refused",
+    })).rejects.toMatchObject({ reason });
+    expect(readFileSync(path)).toEqual(bytes);
+    expect(existsSync(backendPublicationHistoryDirectory(home))).toBe(false);
+    expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+  });
+
+  it.each(["resume", "abort", "recover", "recover-abort"] as const)(
+    "keeps %s on the version-two-only recovery path",
+    async (operation) => {
+      const home = makeHome();
+      const input = material();
+      const fake = makeDriver(input);
+      const terminal = await createMaintenanceState(home, fake.driver, "selection-completed");
+      const active = coordinator(home, fake.driver);
+      const attempt = operation === "resume"
+        ? active.resume()
+        : operation === "abort"
+          ? active.abort()
+          : operation === "recover-abort"
+            ? active.recoverPending({ disposition: "abort" })
+            : active.recoverPending();
+
+      await expect(attempt).rejects.toMatchObject({ reason: "unresolved-publication" });
+      expect(readBackendMaintenanceJournal(home)).toEqual(terminal);
+      expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["missing", "changed", "active", "version-two"] as const)(
+    "refuses terminal-v3 %s drift at the initial preparing replacement checkpoint",
+    async (kind) => {
+      const home = makeHome();
+      const input = material();
+      const fake = makeDriver(input);
+      const terminal = await createMaintenanceState(home, fake.driver, "selection-completed");
+      const terminalBytes = readFileSync(backendPublicationJournalPath(home));
+      const archivePath = maintenanceArchivePath(home, terminal);
+      let versionTwoBytes: Buffer | undefined;
+      if (kind === "version-two") {
+        const otherHome = makeHome();
+        const otherDriver = makeDriver(input);
+        await coordinator(otherHome, otherDriver.driver).prepare(inputFor(input));
+        await coordinator(otherHome, otherDriver.driver).resume();
+        versionTwoBytes = readFileSync(backendPublicationJournalPath(otherHome));
+      }
+      let injected = false;
+      const active = coordinator(home, fake.driver, (event) => {
+        if (injected || event !== "before-journal-read") return;
+        injected = true;
+        if (kind === "missing") rmSync(backendPublicationJournalPath(home));
+        else if (kind === "version-two") {
+          writeFileSync(backendPublicationJournalPath(home), versionTwoBytes!, { mode: 0o600 });
+        } else if (kind === "active") {
+          rewriteJournal(home, (journal) => ({ ...journal, phase: "selection-prepared" }));
+        } else {
+          rewriteJournal(home, (journal) => ({
+            ...journal,
+            updatedAt: "2026-09-14T23:59:59.000Z",
+          }));
+        }
+      });
+
+      await expect(active.prepare({
+        ...inputFor(input),
+        publicationId: "ordinary-drifted",
+      })).rejects.toMatchObject({ reason: "unexpected-state" });
+      expect(injected).toBe(true);
+      expect(readFileSync(archivePath)).toEqual(terminalBytes);
+      expect(fake.driver.observeLocalState).toHaveBeenCalledOnce();
+      if (kind === "missing") {
+        expect(readBackendPublicationJournal(home)).toBeNull();
+        expect(existsSync(backendPublicationJournalPath(home))).toBe(false);
+      } else if (kind === "version-two") {
+        expect(readBackendPublicationJournal(home)).toMatchObject({
+          version: 2,
+          phase: "completed",
+        });
+        expect(readBackendMaintenanceJournal(home)).toBeNull();
+      } else {
+        expect(() => readBackendPublicationJournal(home)).toThrow("migration maintenance");
+        expect(readBackendMaintenanceJournal(home)?.phase).toBe(
+          kind === "active" ? "selection-prepared" : "selection-completed",
+        );
+      }
+    },
+  );
 
   it("archives terminal journal evidence before starting the next publication", async () => {
     const home = makeHome();
