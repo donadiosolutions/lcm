@@ -161,6 +161,9 @@ closing the temporary descriptor also fails. The ordinary replacement writer
 also retains temporary-file cleanup errors. Durable writes retain subsequent
 cleanup errors in descriptor, temporary-file, and parent-directory order.
 These diagnostics help distinguish the original failure from cleanup trouble.
+After an exclusive temporary file is opened, an identity-capture failure still
+receives exactly one close attempt. The identity error remains the primary cause
+if closing also fails, and the unauthenticated temporary name is left in place.
 
 Exclusive creation has distinct outcomes. The non-durable
 `atomicWritePrivateFileExclusive` helper preserves pre-publication failures
