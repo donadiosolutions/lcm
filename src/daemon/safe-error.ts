@@ -471,16 +471,16 @@ function startsUrlSchemeLiteral(chars: readonly string[], index: number): boolea
 function isUrlSchemeColon(chars: readonly string[], index: number, lowerBound: number): boolean {
   if (chars[index] !== ":" || chars[index + 1] !== "/" || chars[index + 2] !== "/") return false;
   let start = index;
-  while (start > lowerBound && URL_SCHEME_CHARACTER_PATTERN.test(chars[start - 1] ?? "")) start -= 1;
-  return URL_SCHEME_START_PATTERN.test(chars[start] ?? "");
+  while (start > lowerBound && URL_SCHEME_CHARACTER_PATTERN.test(chars[start - 1])) start -= 1;
+  return URL_SCHEME_START_PATTERN.test(chars[start]);
 }
 
 function isSpanLocalSchemeColon(chars: readonly string[], start: number, index: number): boolean {
   if (chars[index] !== ":" || chars[index + 1] !== "/" || chars[index + 2] !== "/") return false;
   let cursor = index - 1;
   let hasSchemeLetter = false;
-  while (cursor >= start && URL_SCHEME_CHARACTER_PATTERN.test(chars[cursor] ?? "")) {
-    if (URL_SCHEME_START_PATTERN.test(chars[cursor] ?? "")) hasSchemeLetter = true;
+  while (cursor >= start && URL_SCHEME_CHARACTER_PATTERN.test(chars[cursor])) {
+    if (URL_SCHEME_START_PATTERN.test(chars[cursor])) hasSchemeLetter = true;
     cursor -= 1;
   }
   return hasSchemeLetter;
