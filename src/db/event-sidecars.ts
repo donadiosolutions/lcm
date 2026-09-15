@@ -103,6 +103,15 @@ async function awaitSidecarScan<T>(operation: Promise<T>, deadline: number, sign
   }
 }
 
+function assertSidecarScanActive(deadline: number, signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new EventSidecarScanStoppedError("sidecar scan cancelled");
+  }
+  if (Date.now() >= deadline) {
+    throw new EventSidecarScanStoppedError("sidecar scan skipped after timeout");
+  }
+}
+
 /** Diagnostic reads never enter the pooled EventsDb migration/creation path. */
 function readOnlySidecarFactory(
   path: string,
@@ -546,6 +555,9 @@ async function scanEventSidecars(options: EventSidecarScanOptions): Promise<Even
               if (afterCloseError !== undefined) throw afterCloseError;
               if (closeFailed) throw closeError;
             }
+          }
+          if (pruneOrphans) {
+            assertSidecarScanActive(deadline, options.signal);
           }
           const pruneReason = pruneOrphans
             ? orphanPruneReason(summary, pruneOlderThanDays)

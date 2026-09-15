@@ -97,6 +97,8 @@ component_management:
         # #1197 keeps independent SessionEnd background failure containment hook-owned.
         # #1259 keeps publication-fence error classification and ordered final
         # root-validation/descriptor-close evidence in the existing hooks owner.
+        # #1229 forwards local-enqueue health diagnostics through its live
+        # publication token in this existing hooks owner.
         # PreCompact initial unsafe-storage diagnostics remain in that same owner.
         - "src/hooks/"
     # #1201 keeps process-only observation, its parser/client, and route allowlist here.
@@ -205,6 +207,8 @@ component_management:
         # #898's guarded dual-JSON eligibility keeps this search in the same owner.
         # #989 retains event-sidecar parent authentication in this owner.
         # #1101 retains numeric skipped-sidecar counts in this owner.
+        # #1191 retains publication admission through mutating sidecar reads,
+        # close, stop rechecks, eligibility, and orphan pruning in this owner.
         # #992 keeps pre-initialization SQLite leaf admission and final
         # opened-identity fencing local-persistence-owned.
         # #1020 keeps UTC message timestamp mapping in conversation-store-owned
@@ -276,6 +280,8 @@ component_management:
       paths:
         # #622 keeps outbox connection admission and current-schema validation here.
         # #1247 keeps explicit promotion queue admission in this component.
+        # #1229 admits local outbox health, recent-error, and delivery
+        # diagnostics through an optional live publication token here.
         - "^src/storage/local-hook-event-sequence\\.ts$"
         - "^src/storage/local-hook-outbox\\.ts$"
         - "^src/storage/local-hook-outbox-schema\\.ts$"

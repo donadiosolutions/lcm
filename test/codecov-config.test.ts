@@ -99,6 +99,8 @@ const expectedComponents = [
     // #1197 keeps independent SessionEnd background failure containment hook-owned.
     // #1259 keeps publication-fence error classification and ordered final
     // root-validation/descriptor-close evidence in the existing hooks owner.
+    // #1229 forwards local-enqueue health diagnostics through its live
+    // publication token in this existing hooks owner.
     // PreCompact initial unsafe-storage diagnostics remain in that same owner.
     paths: ["src/hooks/"],
   },
@@ -165,6 +167,8 @@ const expectedComponents = [
     // #898 applies required promoted tags before the caller result maximum while retaining local-persistence ownership.
     // #898's guarded dual-JSON eligibility keeps this search in the same owner.
     // #989 retains event-sidecar parent authentication in this owner.
+    // #1191 retains publication admission through mutating sidecar reads,
+    // close, stop rechecks, eligibility, and orphan pruning in this owner.
     // #1082 keeps SQLite promoted-content NUL admission and replay guards in
     // local persistence; this change does not alter component ownership.
     // #618 optional receipt schema admission stays local-persistence-owned.
@@ -216,6 +220,8 @@ const expectedComponents = [
     name: "Unit - Local Event Storage",
     // #622 keeps outbox connection admission and current-schema validation here.
     // #1247 keeps explicit promotion queue admission in this component.
+    // #1229 admits local outbox health, recent-error, and delivery diagnostics
+    // through an optional live publication token here.
     paths: [
       "^src/storage/local-hook-event-sequence\\.ts$",
       "^src/storage/local-hook-outbox\\.ts$",
@@ -588,7 +594,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(240);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1196 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -717,6 +723,8 @@ describe("Codecov configuration", () => {
       // #837 consumer-admission descriptor cleanup remains storage-owned.
       // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
+      // #1229 local outbox diagnostic admission stays local-event-storage-owned.
+      ["src/storage/local-hook-outbox.ts", "unit-local-event-storage"],
       ["src/storage/local-hook-outbox-schema.ts", "unit-local-event-storage"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
       ["src/migration/maintenance.ts", "unit-migration-cutover"],
@@ -732,6 +740,7 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.
       // #1101 numeric skipped-sidecar counts stay local-persistence-owned.
+      // #1191 mutating sidecar scan lifetime stays local-persistence-owned.
       ["src/db/event-sidecars.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"],
@@ -752,6 +761,8 @@ describe("Codecov configuration", () => {
       ["src/store/conversation-store.ts", "unit-local-persistence"],
       ["src/db/stored-timestamp.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
+      // #1229 local-enqueue health-token forwarding stays hook-owned.
+      ["src/hooks/local-enqueue.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],
       // #1155 retains SessionStart outbox pruning admission in the hook owner.

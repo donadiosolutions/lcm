@@ -505,4 +505,35 @@ describe("configured-home sidecar observation", () => {
     expect(existsSync(path)).toBe(true);
     expect(isLcmConnectionOpen(path)).toBe(false);
   });
+
+  it.each(["abort", "deadline"] as const)(
+    "does not prune when %s stops the scan as close settles",
+    async (kind) => {
+      vi.useFakeTimers();
+      const controller = new AbortController();
+      const realClose = SQLiteLocalHookOutboxFactory.prototype.close;
+      const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close")
+        .mockImplementationOnce(async function (token) {
+          await realClose.call(this, token);
+          if (kind === "abort") controller.abort();
+          else vi.setSystemTime(Date.now() + 100);
+        });
+
+      const result = await collectEventSidecars({
+        homeDir,
+        signal: controller.signal,
+        timeoutMs: 25,
+      });
+
+      expect(result).toHaveLength(1);
+      expect(result[0].scanSkipped).toContain(
+        kind === "abort" ? "cancelled" : "timeout",
+      );
+      expect(result[0]).toMatchObject({ scanSkippedCount: 1 });
+      expect(result[0].pruned).toBeUndefined();
+      expect(existsSync(path)).toBe(true);
+      expect(close).toHaveBeenCalledOnce();
+      expect(isLcmConnectionOpen(path)).toBe(false);
+    },
+  );
 });
