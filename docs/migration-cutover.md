@@ -35,6 +35,19 @@ SQLite recovery, `quick_check`, schema inspection, UTF-8 admission, and
 opens the source through SQLite, checkpoints it, changes its mode, runs a source
 migration, cleans a sidecar, or writes its directory.
 
+These snapshot and queue-evidence APIs require a callable process UID lookup
+and a descriptor namespace that supports enumeration plus authenticated
+directory traversal. LCM proves traversal through retained directory
+descriptors before using descriptor-relative paths; it does not fall back to
+ordinary pathnames. A platform without those capabilities is refused with
+`SqliteSnapshotError` reason `unsupported-platform` after input validation and
+before source opens, locks, artifact or evidence writes, queue iteration, or
+callbacks. Classification and inspection also refuse missing UID capability,
+including for an otherwise absent generation. On a supported platform, a
+missing home or generation still classifies as absent. If the descriptor
+namespace becomes unavailable while checking whether a private mutation-lock
+owner disappeared, recovery fails closed instead of consuming its retry.
+
 Private raw database/WAL copies and normalized database artifacts are sealed to
 read-only mode before their final file sync. A mode-change or final-sync failure
 prevents publication of the committed snapshot marker.

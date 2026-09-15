@@ -1,16 +1,22 @@
 import { constants, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, closeSync, writeFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
+  admitDescriptorPlatformCapabilities,
+  authenticatedDescriptorEntries,
+  isUnsupportedPlatformCapabilityFailure,
   assertPrivateDirectoryEntry, openPrivateDirectory, readBoundedRegularFileWithStat,
+  retainedDirectoryDescriptorPath,
+  requireSupportedProcessUid,
   syncPrivateDirectory,
+  type DescriptorCapabilityOperations,
 } from "../security-files.js";
 import { canonicalJson } from "../storage/portable-record.js";
 import { backendPublicationCanonicalSha256, type BackendMaintenanceJournal } from "../storage/backend-publication.js";
 import { getMigrationReceiptEpoch, iterateMigrationReceiptChecksums, findMatchingMigrationReceipt, migrationReceiptEnvelopeSha256, MIGRATION_RECEIPT_SCHEMA_SHA256, type MigrationReceiptEnvelope, type MigrationQueueRecord } from "./receipts.js";
-import { inspectSqliteSnapshotArtifact, type SqliteSnapshotArtifactWitness } from "./sqlite-snapshot.js";
+import { inspectSqliteSnapshotArtifact, SqliteSnapshotError, type SqliteSnapshotArtifactWitness } from "./sqlite-snapshot.js";
 
 const PAGE_RECORDS = 128;
 const PAGE_BYTES = 128 * 1024;
@@ -46,7 +52,52 @@ function evidencePath(homeDir: string, generationId: string): string {
 type ImmutableReaderOperations = Readonly<{
   openDatabase?: (path: string) => DatabaseSync;
   descriptors?: typeof descriptorIdentities;
+  /** @internal Deterministic descriptor-capability seam. */
+  _capabilitiesForTesting?: Partial<DescriptorCapabilityOperations>;
 }>;
+
+function mapQueueCapabilityError(error: unknown): never {
+  if (isUnsupportedPlatformCapabilityFailure(error)) {
+    throw new SqliteSnapshotError("unsupported-platform", undefined, { cause: error });
+  }
+  throw error;
+}
+
+function admitQueueCapabilities(
+  homeDir: string,
+  operations: ImmutableReaderOperations,
+  traversal: boolean,
+): number {
+  try {
+    if (traversal) {
+      return admitDescriptorPlatformCapabilities(
+        parse(homeDir).root,
+        operations._capabilitiesForTesting,
+      );
+    }
+    const uid = requireSupportedProcessUid(
+      operations._capabilitiesForTesting?.getuid ?? process.getuid,
+    );
+    authenticatedDescriptorEntries(operations._capabilitiesForTesting);
+    return uid;
+  } catch (error) {
+    mapQueueCapabilityError(error);
+  }
+}
+
+function queueDescriptorPath(
+  fd: number,
+  operations: ImmutableReaderOperations,
+): string {
+  try {
+    return retainedDirectoryDescriptorPath(
+      fd,
+      operations._capabilitiesForTesting,
+    );
+  } catch (error) {
+    mapQueueCapabilityError(error);
+  }
+}
 
 function openArtifactDatabase(homeDir: string, artifact: SqliteSnapshotArtifactWitness, role: string, operations: ImmutableReaderOperations): DatabaseSync | null {
   const file = artifact.roles.find((value) => value.role === role)?.normalizedMain;
@@ -54,7 +105,8 @@ function openArtifactDatabase(homeDir: string, artifact: SqliteSnapshotArtifactW
   const path = join(homeDir, ".lcm", "migration-snapshots", "generations", artifact.generationId, file.relativePath);
   // Immutable mode never creates or updates a WAL/SHM, even if an adversary
   // replaces a pathname with a live source. Revalidate the artifact after reads.
-  const descriptors = operations.descriptors ?? descriptorIdentities;
+  const descriptors = operations.descriptors
+    ?? (() => descriptorIdentities(operations._capabilitiesForTesting));
   const before = descriptors();
   const uri = `${pathToFileURL(path).href}?mode=ro&immutable=1`;
   const database = operations.openDatabase === undefined ? new DatabaseSync(uri, { readOnly: true }) : operations.openDatabase(uri);
@@ -67,12 +119,21 @@ function openArtifactDatabase(homeDir: string, artifact: SqliteSnapshotArtifactW
   } catch (error) { database.close(); throw error; }
 }
 
-function descriptorIdentities(): Array<readonly [number, Readonly<{ dev: string; ino: string }>]> {
+function descriptorIdentities(
+  capabilities: Partial<DescriptorCapabilityOperations> = {},
+): Array<readonly [number, Readonly<{ dev: string; ino: string }>]> {
   const result: Array<readonly [number, Readonly<{ dev: string; ino: string }>]> = [];
-  for (const name of readdirSync("/dev/fd")) {
+  let entries: readonly string[];
+  try {
+    entries = authenticatedDescriptorEntries(capabilities);
+  } catch (error) {
+    mapQueueCapabilityError(error);
+  }
+  for (const name of entries) {
     const fd = Number(name);
     try {
-      const stat = fstatSync(fd, { bigint: true });
+      const stat = capabilities.fstat?.(fd)
+        ?? fstatSync(fd, { bigint: true });
       result.push([fd, { dev: stat.dev.toString(), ino: stat.ino.toString() }]);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EBADF") throw error;
@@ -94,6 +155,7 @@ export async function withMigrationQueueEvidence<T>(
   _operationsForTesting: ImmutableReaderOperations = {},
 ): Promise<T> {
   const verified = await inspectSqliteSnapshotArtifact(artifact.generationId, { homeDir });
+  admitQueueCapabilities(homeDir, _operationsForTesting, true);
   if (canonicalJson(verified) !== canonicalJson(artifact)) throw new Error("migration artifact authority is invalid");
   const authority = artifact.authority;
   if (authority.projectIdentity.scope !== "local" || maintenance.roster.length !== 1
@@ -213,7 +275,9 @@ export async function sealMigrationQueueEvidence(
   reference: Omit<MigrationReceiptReference, "queueSetSha256">,
   records: Iterable<MigrationQueueRecord>,
   revalidateAuthority: () => void,
+  _operationsForTesting: ImmutableReaderOperations = {},
 ): Promise<AuthenticatedSqliteMigrationSnapshot> {
+  admitQueueCapabilities(homeDir, _operationsForTesting, true);
   const root = join(homeDir, ".lcm", "migration-evidence");
   try { mkdirSync(root, { mode: 0o700 }); syncPrivateDirectory(join(homeDir, ".lcm")); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -222,7 +286,11 @@ export async function sealMigrationQueueEvidence(
   try {
     const path = evidencePath(homeDir, artifact.generationId);
     if (existsSync(path)) {
-      const existing = await inspectAuthenticatedSqliteMigrationSnapshot(artifact.generationId, homeDir);
+      const existing = await inspectAuthenticatedSqliteMigrationSnapshot(
+        artifact.generationId,
+        homeDir,
+        _operationsForTesting,
+      );
       const queueHash = canonicalListHash();
       for (const record of records) queueHash.add(record);
       if (existing.artifact.checksumSha256 !== artifact.checksumSha256
@@ -241,7 +309,11 @@ export async function sealMigrationQueueEvidence(
         assertPrivateDirectoryEntry(handle, path);
         const page = { version: 1, artifactSha256: artifact.artifactSha256, ordinal: pages.length, records: chunk };
         const name = `${pages.length.toString().padStart(6, "0")}.json`;
-        const identity = writeEvidence(`/dev/fd/${handle.fd}/${name}`, page, PAGE_BYTES);
+        const identity = writeEvidence(
+          join(queueDescriptorPath(handle.fd, _operationsForTesting), name),
+          page,
+          PAGE_BYTES,
+        );
         assertPrivateDirectoryEntry(handle, path);
         pages.push({ name, sha256: hash(page), records: chunk.length, ...identity });
       };
@@ -266,11 +338,19 @@ export async function sealMigrationQueueEvidence(
         evidenceDirectory: { dev: String(directory.dev), ino: String(directory.ino) },
       };
       const result = { ...body, checksumSha256: hash(body) };
-      writeEvidence(`/dev/fd/${handle.fd}/witness.json`, result, MAX_INDEX_BYTES);
+      writeEvidence(
+        join(queueDescriptorPath(handle.fd, _operationsForTesting), "witness.json"),
+        result,
+        MAX_INDEX_BYTES,
+      );
       fsyncSync(handle.fd);
       assertPrivateDirectoryEntry(handle, path);
       revalidateAuthority();
-      return await inspectAuthenticatedSqliteMigrationSnapshot(artifact.generationId, homeDir);
+      return await inspectAuthenticatedSqliteMigrationSnapshot(
+        artifact.generationId,
+        homeDir,
+        _operationsForTesting,
+      );
     } finally { handle.close(); }
   } finally { rootHandle.close(); }
 }
@@ -278,10 +358,12 @@ export async function sealMigrationQueueEvidence(
 export async function inspectAuthenticatedSqliteMigrationSnapshot(
   generationId: string,
   homeDir: string,
+  _operationsForTesting: ImmutableReaderOperations = {},
 ): Promise<AuthenticatedSqliteMigrationSnapshot> {
   // The physical inspector authenticates generation syntax and all original
   // artifact identities before the evidence path is constructed.
   const artifact = await inspectSqliteSnapshotArtifact(generationId, { homeDir });
+  const expectedUid = admitQueueCapabilities(homeDir, _operationsForTesting, true);
   const path = evidencePath(homeDir, generationId);
   const root = join(homeDir, ".lcm", "migration-evidence");
   const rootHandle = openPrivateDirectory(root);
@@ -290,7 +372,7 @@ export async function inspectAuthenticatedSqliteMigrationSnapshot(
     try {
       const read = (name: string, maximum: number) => readBoundedRegularFileWithStat(join(path, name), {
         allowedRoot: path, maxBytes: maximum, allowedModes: [0o400], requireSingleLink: true,
-        expectedUid: process.getuid!(),
+        expectedUid,
       });
       const value = JSON.parse(read("witness.json", MAX_INDEX_BYTES).content) as AuthenticatedSqliteMigrationSnapshot;
       const { checksumSha256, ...body } = value;
@@ -329,7 +411,7 @@ export async function inspectAuthenticatedSqliteMigrationSnapshot(
         if (canonicalJson(value.receiptReference) !== canonicalJson({ ...reference, queueSetSha256: recomputed.finish() })) {
           throw new Error("migration evidence differs from immutable receipt and queue authority");
         }
-      });
+      }, _operationsForTesting);
       assertPrivateDirectoryEntry(rootHandle, root);
       assertPrivateDirectoryEntry(handle, path);
       return value;

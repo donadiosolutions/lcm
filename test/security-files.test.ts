@@ -12,6 +12,7 @@ import {
   symlinkSync,
   appendFileSync,
   closeSync,
+  constants,
   fchmodSync,
   fsyncSync,
   fstatSync,
@@ -35,6 +36,8 @@ import {
   atomicWritePrivateFile,
   atomicWritePrivateFileDurable,
   atomicWritePrivateFileExclusive,
+  admitDescriptorPlatformCapabilities,
+  authenticatedDescriptorEntries,
   assertPrivateDirectory,
   assertPrivateDirectoryEntry,
   copyRegularFilePrivateExclusive,
@@ -45,14 +48,18 @@ import {
   openPrivateDirectory,
   openPrivateDirectoryForCreation,
   openPrivateDirectoryIfExists,
+  privateFileAbsentAtRetainedParent,
   PrivateDirectoryTopologyError,
   PrivateFileCollisionError,
   PrivateFilePublicationTopologyError,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
+  retainedDirectoryDescriptorPath,
+  requireSupportedProcessUid,
   syncPrivateDirectory,
   writePrivateFileExclusive,
   OWNER_ONLY_FILE_MODES,
+  UnsupportedPlatformCapabilityError,
 } from "../src/security-files.js";
 import * as securityFiles from "../src/security-files.js";
 
@@ -97,6 +104,108 @@ function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T)
 }
 
 describe("private filesystem primitives", () => {
+  it("proves retained descriptor traversal through the literal descendant path", () => {
+    const root = makeRoot();
+    const fd = openSync(root, constants.O_RDONLY | constants.O_DIRECTORY);
+    const expected = fstatSync(fd, { bigint: true });
+    let statPath = "";
+    let readlinkPath = "";
+    try {
+      expect(retainedDirectoryDescriptorPath(fd, {
+        fstat: () => expected,
+        readlink: (path) => {
+          readlinkPath = path;
+          return root;
+        },
+        stat: (path) => {
+          statPath = path;
+          return expected;
+        },
+      })).toBe(`/proc/self/fd/${fd}`);
+    } finally {
+      closeSync(fd);
+    }
+    expect(readlinkPath).toBe(`/proc/self/fd/${fd}`);
+    expect(statPath).toBe(`/proc/self/fd/${fd}/.`);
+  });
+
+  it("distinguishes unsupported descriptor namespaces from topology and I/O errors", () => {
+    const root = makeRoot();
+    const fd = openSync(root, constants.O_RDONLY | constants.O_DIRECTORY);
+    const actual = fstatSync(fd, { bigint: true });
+    const missing = Object.assign(new Error("namespace missing"), { code: "ENOENT" });
+    const denied = Object.assign(new Error("namespace denied"), { code: "EACCES" });
+    const io = Object.assign(new Error("descriptor stat failed"), { code: "EIO" });
+    try {
+      expect(() => retainedDirectoryDescriptorPath(fd, {
+        fstat: () => actual,
+        readlink: () => { throw missing; },
+      })).toThrow(UnsupportedPlatformCapabilityError);
+      expect(() => retainedDirectoryDescriptorPath(fd, {
+        fstat: () => actual,
+        readlink: () => { throw denied; },
+      })).toThrow(denied);
+      expect(() => retainedDirectoryDescriptorPath(fd, {
+        fstat: () => { throw io; },
+      })).toThrow(io);
+      expect(() => retainedDirectoryDescriptorPath(fd, {
+        fstat: () => actual,
+        readlink: () => root,
+        stat: () => new Proxy(actual, {
+          get: (target, property) => property === "ino"
+            ? target.ino + 1n
+            : Reflect.get(target, property, target),
+        }),
+      })).toThrow(PrivateDirectoryTopologyError);
+    } finally {
+      closeSync(fd);
+    }
+    expect(() => authenticatedDescriptorEntries({
+      readdir: () => { throw missing; },
+    })).toThrow(UnsupportedPlatformCapabilityError);
+    expect(() => authenticatedDescriptorEntries({
+      readdir: () => { throw denied; },
+    })).toThrow(denied);
+  });
+
+  it("validates UID results and preserves descriptor-probe cleanup failures", () => {
+    expect(requireSupportedProcessUid(undefined)).toBe(process.getuid!());
+    expect(() => requireSupportedProcessUid(null)).toThrow(UnsupportedPlatformCapabilityError);
+    expect(() => requireSupportedProcessUid(() => -1)).toThrow(UnsupportedPlatformCapabilityError);
+    expect(() => requireSupportedProcessUid(() => Number.MAX_SAFE_INTEGER + 1))
+      .toThrow(UnsupportedPlatformCapabilityError);
+
+    const root = makeRoot();
+    const closeFailure = new Error("probe close failed");
+    expect(() => admitDescriptorPlatformCapabilities(root, {
+      close: (fd) => {
+        closeSync(fd);
+        throw closeFailure;
+      },
+    })).toThrow(closeFailure);
+
+    const missing = Object.assign(new Error("namespace disappeared"), { code: "ENOENT" });
+    let aggregate: unknown;
+    try {
+      admitDescriptorPlatformCapabilities(root, {
+        readlink: () => { throw missing; },
+        close: (fd) => {
+          closeSync(fd);
+          throw closeFailure;
+        },
+      });
+    } catch (error) {
+      aggregate = error;
+    }
+    expect(aggregate).toBeInstanceOf(AggregateError);
+    expect((aggregate as AggregateError).errors).toEqual([
+      expect.any(UnsupportedPlatformCapabilityError),
+      closeFailure,
+    ]);
+    expect((aggregate as AggregateError).cause)
+      .toBeInstanceOf(UnsupportedPlatformCapabilityError);
+  });
+
   it("publishes through a borrowed parent without repairing or closing it", () => {
     const root = makeRoot();
     chmodSync(root, 0o700);
@@ -2926,6 +3035,67 @@ describe("private filesystem primitives", () => {
     rmSync(path, { recursive: true });
     symlinkSync(join(root, "missing-target"), path);
     expect(absence(path)).toBe(false);
+  });
+
+  it("refuses absent-leaf evidence when descriptor traversal is unavailable", () => {
+    const root = makeRoot();
+    const path = join(root, "candidate");
+    const unavailable = Object.assign(new Error("descriptor namespace unavailable"), {
+      code: "ENOENT",
+    });
+    const closeParent = vi.fn((handle: ReturnType<typeof openPrivateDirectory>) => {
+      handle.close();
+    });
+
+    expect(() => privateFileAbsentAtRetainedParent(path, {
+      _descriptorPathForTesting: () => {
+        throw unavailable;
+      },
+      _closeParentForTesting: closeParent,
+    } as never)).toThrow(unavailable);
+    expect(closeParent).toHaveBeenCalledOnce();
+
+    let proofs = 0;
+    expect(() => privateFileAbsentAtRetainedParent(path, {
+      _descriptorPathForTesting: (fd: number) => {
+        proofs += 1;
+        if (proofs === 2) throw unavailable;
+        return `/proc/self/fd/${fd}`;
+      },
+    } as never)).toThrow(unavailable);
+    expect(proofs).toBe(2);
+
+    const closeFailure = new Error("absence parent close failed");
+    let aggregate: unknown;
+    try {
+      privateFileAbsentAtRetainedParent(path, {
+        _descriptorPathForTesting: () => { throw unavailable; },
+        _closeParentForTesting: (handle) => {
+          handle.close();
+          throw closeFailure;
+        },
+      });
+    } catch (error) {
+      aggregate = error;
+    }
+    expect(aggregate).toBeInstanceOf(AggregateError);
+    expect((aggregate as AggregateError).cause).toBe(unavailable);
+    expect((aggregate as AggregateError).errors).toEqual([unavailable, closeFailure]);
+  });
+
+  it("requires ambient UID support but accepts an explicit UID for absence", () => {
+    const root = makeRoot();
+    const path = join(root, "candidate");
+    const uid = process.getuid!();
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    try {
+      Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+      expect(() => privateFileAbsentAtRetainedParent(path)).toThrow();
+      expect(privateFileAbsentAtRetainedParent(path, { expectedUid: uid })).toBe(true);
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
   });
 
   it("refuses absence evidence for a different expected parent", () => {

@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -11,18 +11,21 @@ import { withMigrationQueueEvidence, sealMigrationQueueEvidence, inspectAuthenti
 
 const faults = vi.hoisted(() => ({
   inventory: false,
-  failDescriptorStat: false,
+  writePaths: [] as string[],
 }));
 vi.mock("node:fs", async (original) => {
   const actual = await original<typeof import("node:fs")>();
   return { ...actual,
-    readdirSync: (...args: Parameters<typeof actual.readdirSync>) => {
-      if (String(args[0]) === "/dev/fd") faults.inventory = true;
-      return actual.readdirSync(...args);
+    openSync: (...args: Parameters<typeof actual.openSync>) => {
+      const path = String(args[0]);
+      if (path.startsWith("/proc/self/fd/") && path !== "/proc/self/fd") {
+        faults.writePaths.push(path);
+      }
+      return actual.openSync(...args);
     },
-    fstatSync: (...args: Parameters<typeof actual.fstatSync>) => {
-      if (faults.inventory && faults.failDescriptorStat) throw Object.assign(new Error("inventory stat failed"), { code: "EIO" });
-      return actual.fstatSync(...args);
+    readdirSync: (...args: Parameters<typeof actual.readdirSync>) => {
+      if (String(args[0]) === "/proc/self/fd") faults.inventory = true;
+      return actual.readdirSync(...args);
     },
   };
 });
@@ -32,7 +35,7 @@ const FOREIGN = "118f0b5d-1234-4abc-8def-1234567890ab";
 const EPOCH = "218f0b5d-1234-4abc-8def-1234567890ab";
 const PROJECT = "a".repeat(64);
 const roots: string[] = [];
-afterEach(() => { faults.inventory = false; faults.failDescriptorStat = false; for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { faults.inventory = false; faults.writePaths = []; for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const sequence = (value: number) => value.toString().padStart(19, "0");
 function envelope(index = 0): MigrationReceiptEnvelope {
   return { eventUuid: `318f0b5d-1234-4abc-8def-${index.toString(16).padStart(12, "0")}`, eventVersion: 1,
@@ -102,6 +105,82 @@ function rewriteWitness(input: Fixture, change: (witness: MutableWitness) => voi
 }
 
 describe("immutable migration queue evidence", () => {
+  it("refuses queue APIs before effects when UID support is unavailable", async () => {
+    const input = await fixture();
+    const evidence = await read(input);
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    try {
+      Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+      await expect(withMigrationQueueEvidence(
+        input.home,
+        input.artifact,
+        input.maintenance,
+        async () => undefined,
+      )).rejects.toMatchObject({ reason: "unsupported-platform" });
+      await expect(sealMigrationQueueEvidence(
+        input.home,
+        input.artifact,
+        evidence.reference,
+        evidence.records,
+        () => undefined,
+      )).rejects.toMatchObject({ reason: "unsupported-platform" });
+      await expect(inspectAuthenticatedSqliteMigrationSnapshot(
+        "generation-1",
+        input.home,
+      )).rejects.toMatchObject({ reason: "unsupported-platform" });
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
+    expect(existsSync(directory(input))).toBe(false);
+  });
+
+  it("refuses unavailable descriptor enumeration before queue consumption", async () => {
+    const input = await fixture();
+    const consume = vi.fn(async () => undefined);
+    const unavailable = Object.assign(new Error("descriptor namespace unavailable"), {
+      code: "ENOENT",
+    });
+    await expect(withMigrationQueueEvidence(
+      input.home,
+      input.artifact,
+      input.maintenance,
+      consume,
+      {
+        _capabilitiesForTesting: {
+          readdir: () => {
+            throw unavailable;
+          },
+        },
+      } as never,
+    )).rejects.toMatchObject({ reason: "unsupported-platform" });
+    expect(consume).not.toHaveBeenCalled();
+  });
+
+  it("maps descriptor namespace loss after admission to unsupported-platform", async () => {
+    const input = await fixture();
+    const unavailable = Object.assign(new Error("descriptor namespace lost"), {
+      code: "ENOENT",
+    });
+    let inventories = 0;
+    await expect(withMigrationQueueEvidence(
+      input.home,
+      input.artifact,
+      input.maintenance,
+      async () => undefined,
+      {
+        _capabilitiesForTesting: {
+          readdir: (path) => {
+            inventories += 1;
+            if (inventories > 1) throw unavailable;
+            return readdirSync(path);
+          },
+        },
+      },
+    )).rejects.toMatchObject({ reason: "unsupported-platform" });
+    expect(inventories).toBe(2);
+  });
+
   it("streams exact represented and retained records and authenticates retries", async () => {
     const input = await fixture({ count: 3, configure: ({ project, events }) => {
       project.exec("BEGIN IMMEDIATE");
@@ -114,6 +193,8 @@ describe("immutable migration queue evidence", () => {
     expect(evidence.records.map((record) => record.disposition)).toEqual(["represented", "represented", "retained"]);
     expect(evidence.records.map((record) => record.receiptChecksumSha256 === null)).toEqual([false, false, true]);
     const result = await seal(input); expect(result.receiptReference.queueSetSha256).toBe(hash(evidence.records));
+    expect(faults.writePaths.some((path) => path.endsWith("/000000.json"))).toBe(true);
+    expect(faults.writePaths.some((path) => path.endsWith("/witness.json"))).toBe(true);
     expect(await inspectAuthenticatedSqliteMigrationSnapshot("generation-1", input.home)).toEqual(result);
     expect(await seal(input)).toEqual(result);
   });
@@ -362,10 +443,24 @@ describe("immutable migration queue evidence", () => {
   });
   it("fails closed on non-EBADF process descriptor inventory errors", async () => {
     const input = await fixture();
-    faults.inventory = false;
-    faults.failDescriptorStat = true;
-    await expect(read(input)).rejects.toThrow("inventory stat failed");
-    expect(faults.inventory).toBe(true);
+    const failure = Object.assign(new Error("inventory stat failed"), { code: "EIO" });
+    let fstats = 0;
+    await expect(withMigrationQueueEvidence(
+      input.home,
+      input.artifact,
+      input.maintenance,
+      async () => undefined,
+      {
+        _capabilitiesForTesting: {
+          fstat: (fd) => {
+            fstats += 1;
+            if (fstats > 1) throw failure;
+            return fstatSync(fd, { bigint: true }) as never;
+          },
+        },
+      },
+    )).rejects.toThrow(failure);
+    expect(fstats).toBe(2);
   });
 
   it("refuses ambiguous descriptor inventory and closes the opened immutable reader", async () => {

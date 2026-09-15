@@ -57,6 +57,8 @@ export type PrivateMutationLockOperations = {
   readonly deleteRegularFile: typeof deleteRegularFile;
   /** @internal Deterministic owner-disappearance seam. */
   readonly _beforeOwnerReadPostStatForTesting?: () => void;
+  /** @internal Deterministic retained-descriptor namespace seam. */
+  readonly _descriptorPathForTesting?: (fd: number) => string;
 };
 
 const DEFAULT_PRIVATE_MUTATION_LOCK_OPERATIONS: PrivateMutationLockOperations = {
@@ -367,6 +369,7 @@ function acquireMutationLock(
       if (error instanceof BoundedFileIdentityChangedError) {
         if (!privateFileAbsentAtRetainedParent(lockPath, {
           expectedParent: error.parentIdentity,
+          _descriptorPathForTesting: operations._descriptorPathForTesting,
         })) throw error;
       } else if (!isMissingFileError(error)) {
         throw error;
