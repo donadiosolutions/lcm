@@ -7,6 +7,7 @@ import { runLcmMigrations } from "../../src/db/migration.js";
 import { PromotedStore } from "../../src/db/promoted.js";
 import { deduplicateAndInsert } from "../../src/promotion/dedup.js";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
+import { createRepositoryInsert } from "./dedup-test-helper.js";
 
 const tempDirs: string[] = [];
 afterEach(() => {
@@ -25,8 +26,23 @@ function makeDb() {
 
 function dedupDeps(db: ReturnType<typeof makeDb>, store: PromotedStore) {
   const promotedMemory = {
-    insert: async (input: Omit<Parameters<PromotedStore["insert"]>[0], "projectId">) =>
-      store.insert({ ...input, projectId: "p1" }),
+    insert: createRepositoryInsert(store, "p1"),
+    findExactContent: async (content: string, sourceProjectId?: string) => {
+      const row = store.findExactContent(content, sourceProjectId ?? "p1");
+      return row ? {
+        id: row.id,
+        content: row.content,
+        tags: JSON.parse(row.tags),
+        metadata: JSON.parse(row.metadata),
+        sourceSummaryId: row.source_summary_id,
+        projectId: row.project_id,
+        sessionId: row.session_id,
+        depth: row.depth,
+        confidence: row.confidence,
+        createdAt: row.created_at,
+        archivedAt: row.archived_at,
+      } : null;
+    },
     update: async (id: string, fields: Parameters<PromotedStore["update"]>[1]) => store.update(id, fields),
     archive: async (id: string) => store.archive(id),
   };
@@ -58,8 +74,23 @@ function repositoryDeps(
   projectId: string,
 ) {
   const promotedMemory = {
-    insert: async (input: Omit<Parameters<PromotedStore["insert"]>[0], "projectId">) =>
-      store.insert({ ...input, projectId: input.sourceProjectId ?? projectId }),
+    insert: createRepositoryInsert(store, projectId),
+    findExactContent: vi.fn(async (content: string, sourceProjectId?: string) => {
+      const row = store.findExactContent(content, sourceProjectId ?? projectId);
+      return row ? {
+        id: row.id,
+        content: row.content,
+        tags: JSON.parse(row.tags),
+        metadata: JSON.parse(row.metadata),
+        sourceSummaryId: row.source_summary_id,
+        projectId: row.project_id,
+        sessionId: row.session_id,
+        depth: row.depth,
+        confidence: row.confidence,
+        createdAt: row.created_at,
+        archivedAt: row.archived_at,
+      } : null;
+    }),
     update: async (id: string, fields: Parameters<PromotedStore["update"]>[1]) => store.update(id, fields),
     archive: async (id: string) => store.archive(id),
   };
@@ -91,6 +122,32 @@ function repositoryDeps(
 }
 
 describe("deduplicateAndInsert", () => {
+  it("resolves SQLite exact lookup to the bound project when provenance is omitted", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-dedup-exact-adapter-"));
+    tempDirs.push(directory);
+    const factory = new SqliteStorageBackendFactory({ resolveProject: () => ({
+      id: "bound-project", dbPath: join(directory, "project.db"),
+    }) });
+    const storage = await factory.openProject({ id: "bound-project", canonical: directory });
+    try {
+      const boundId = await storage.promotedMemory.insert({ content: "bound exact" });
+      const externalId = await storage.promotedMemory.insert({
+        content: "external exact", sourceProjectId: "external-project",
+      });
+      expect(await storage.promotedMemory.findExactContent("bound exact"))
+        .toMatchObject({ id: boundId, projectId: "bound-project" });
+      expect(await storage.promotedMemory.findExactContent("external exact"))
+        .toBeNull();
+      expect(await storage.promotedMemory.findExactContent("external exact", "external-project"))
+        .toMatchObject({ id: externalId, projectId: "external-project" });
+      await storage.promotedMemory.archive(externalId);
+      expect(await storage.promotedMemory.findExactContent("external exact", "external-project"))
+        .toBeNull();
+    } finally {
+      await factory.close();
+    }
+  });
+
   it("keeps caller-owned repository insertion inside its real rollback transaction", async () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-dedup-transaction-"));
     tempDirs.push(directory);
@@ -131,7 +188,7 @@ describe("deduplicateAndInsert", () => {
     const archive = vi.fn().mockResolvedValue(undefined);
     const repositories = {
       lexicalSearch: { searchPromoted },
-      promotedMemory: { insert, update, archive },
+      promotedMemory: { findExactContent: vi.fn().mockResolvedValue(null), insert, update, archive },
     };
     const transaction = async <T>(callback: (value: typeof repositories) => Promise<T>) => callback(repositories);
 
@@ -157,7 +214,10 @@ describe("deduplicateAndInsert", () => {
     const update = vi.fn().mockResolvedValue(undefined);
     const repositories = {
       lexicalSearch: { searchPromoted },
-      promotedMemory: { insert, update, archive: vi.fn().mockResolvedValue(undefined) },
+      promotedMemory: {
+        findExactContent: vi.fn().mockResolvedValue(null),
+        insert, update, archive: vi.fn().mockResolvedValue(undefined),
+      },
     };
     const transaction = async <T>(callback: (value: typeof repositories) => Promise<T>) => callback(repositories);
     const base = {
@@ -211,6 +271,7 @@ describe("deduplicateAndInsert", () => {
     const repositories = {
       lexicalSearch: { searchPromoted },
       promotedMemory: {
+        findExactContent: vi.fn().mockResolvedValue(null),
         insert,
         update: vi.fn().mockResolvedValue(undefined),
         archive: vi.fn().mockResolvedValue(undefined),
@@ -249,7 +310,7 @@ describe("deduplicateAndInsert", () => {
     const archive = vi.fn().mockResolvedValue(undefined);
     const repositories = {
       lexicalSearch: { searchPromoted },
-      promotedMemory: { insert, update, archive },
+      promotedMemory: { findExactContent: vi.fn().mockResolvedValue(null), insert, update, archive },
     };
     const transaction = async <T>(callback: (value: typeof repositories) => Promise<T>) => callback(repositories);
 
@@ -346,6 +407,7 @@ describe("deduplicateAndInsert", () => {
       const repositories = {
         lexicalSearch: { searchPromoted },
         promotedMemory: {
+          findExactContent: vi.fn().mockResolvedValue(null),
           insert,
           update: vi.fn().mockResolvedValue(undefined),
           archive: vi.fn().mockResolvedValue(undefined),
@@ -383,6 +445,147 @@ describe("deduplicateAndInsert", () => {
       ]);
     },
   );
+
+  it("uses an exact owner lookup when the PostgreSQL fuzzy page is saturated", async () => {
+    const searchPromoted = vi.fn().mockResolvedValue([
+      { id: "fuzzy-1", content: "unrelated punctuation", tags: [], projectId: "owner", sessionId: null, confidence: 0.2, createdAt: "2026-01-01T00:00:00.000Z", rank: 0 },
+      { id: "fuzzy-2", content: "another candidate", tags: [], projectId: "owner", sessionId: null, confidence: 0.3, createdAt: "2026-01-02T00:00:00.000Z", rank: 0 },
+    ]);
+    const exact = {
+      id: "exact-owner",
+      content: "same punctuation!",
+      tags: ["existing"],
+      metadata: {},
+      sourceSummaryId: null,
+      projectId: "owner",
+      sessionId: null,
+      depth: 0,
+      confidence: 0.8,
+      createdAt: "2025-01-01T00:00:00.000Z",
+      archivedAt: null,
+    };
+    const findExactContent = vi.fn().mockResolvedValue(exact);
+    const insert = vi.fn().mockResolvedValue("inserted");
+    const update = vi.fn().mockResolvedValue(undefined);
+    const archive = vi.fn().mockResolvedValue(undefined);
+    const repositories = {
+      lexicalSearch: { searchPromoted },
+      promotedMemory: { findExactContent, insert, update, archive },
+    };
+    const transaction = async <T>(callback: (value: typeof repositories) => Promise<T>) => callback(repositories);
+
+    await expect(deduplicateAndInsert({
+      transaction,
+      repositories,
+      content: "same punctuation!",
+      tags: ["incoming"],
+      sourceProjectId: "incoming-source",
+      candidateScope: "owner",
+      backend: "postgresql",
+      depth: 0,
+      confidence: 0.7,
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 2 },
+    })).resolves.toBe("exact-owner");
+
+    expect(findExactContent).toHaveBeenCalledWith("same punctuation!", undefined);
+    expect(searchPromoted).toHaveBeenCalledWith("same punctuation!", 2, undefined, undefined);
+    expect(insert).not.toHaveBeenCalled();
+    expect(update).toHaveBeenCalledWith("exact-owner", { confidence: 0.8, tags: ["existing", "incoming"] });
+  });
+
+  it("uses an exact owner lookup when punctuation produces an empty fuzzy page", async () => {
+    const searchPromoted = vi.fn().mockResolvedValue([]);
+    const exact = {
+      id: "punctuation-owner",
+      content: "!!!",
+      tags: ["existing"],
+      metadata: {},
+      sourceSummaryId: null,
+      projectId: "owner",
+      sessionId: null,
+      depth: 0,
+      confidence: 0.6,
+      createdAt: "2025-01-01T00:00:00.000Z",
+      archivedAt: null,
+    };
+    const findExactContent = vi.fn().mockResolvedValue(exact);
+    const insert = vi.fn().mockResolvedValue("inserted");
+    const update = vi.fn().mockResolvedValue(undefined);
+    const archive = vi.fn().mockResolvedValue(undefined);
+    const repositories = {
+      lexicalSearch: { searchPromoted },
+      promotedMemory: { findExactContent, insert, update, archive },
+    };
+    const transaction = async <T>(callback: (value: typeof repositories) => Promise<T>) => callback(repositories);
+
+    await expect(deduplicateAndInsert({
+      transaction,
+      repositories,
+      content: "!!!",
+      tags: ["incoming"],
+      sourceProjectId: "incoming-source",
+      candidateScope: "owner",
+      backend: "postgresql",
+      depth: 0,
+      confidence: 0.7,
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+    })).resolves.toBe("punctuation-owner");
+
+    expect(searchPromoted).toHaveBeenCalledWith("!!!", 10, undefined, undefined);
+    expect(findExactContent).toHaveBeenCalledWith("!!!", undefined);
+    expect(insert).not.toHaveBeenCalled();
+    expect(update).toHaveBeenCalledWith("punctuation-owner", {
+      confidence: 0.7,
+      tags: ["existing", "incoming"],
+    });
+  });
+
+  it("preserves fuzzy page order when the exact owner row is already present", async () => {
+    const exact = {
+      id: "exact-owner",
+      content: "same content",
+      tags: ["existing"],
+      metadata: {},
+      sourceSummaryId: null,
+      projectId: "owner",
+      sessionId: null,
+      depth: 0,
+      confidence: 0.8,
+      createdAt: "2025-01-01T00:00:00.000Z",
+      archivedAt: null,
+    };
+    const searchPromoted = vi.fn().mockResolvedValue([
+      { id: "exact-owner", content: "same content", tags: ["ranked"], projectId: "owner", sessionId: null, confidence: 0.7, createdAt: "2026-01-01T00:00:00.000Z", rank: -1 },
+      { id: "other", content: "same content", tags: [], projectId: "owner", sessionId: null, confidence: 0.2, createdAt: "2026-01-02T00:00:00.000Z", rank: -1 },
+    ]);
+    const findExactContent = vi.fn().mockResolvedValue(exact);
+    const update = vi.fn().mockResolvedValue(undefined);
+    const archive = vi.fn().mockResolvedValue(undefined);
+    const insert = vi.fn().mockResolvedValue("inserted");
+    const repositories = {
+      lexicalSearch: { searchPromoted },
+      promotedMemory: { findExactContent, insert, update, archive },
+    };
+    const transaction = async <T>(callback: (value: typeof repositories) => Promise<T>) => callback(repositories);
+
+    await expect(deduplicateAndInsert({
+      transaction,
+      repositories,
+      content: "same content",
+      tags: ["incoming"],
+      sourceProjectId: "source",
+      candidateScope: "owner",
+      backend: "postgresql",
+      depth: 0,
+      confidence: 0.9,
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 2 },
+    })).resolves.toBe("exact-owner");
+    expect(update).toHaveBeenCalledWith("exact-owner", {
+      confidence: 0.9,
+      tags: ["ranked", "incoming"],
+    });
+    expect(archive).toHaveBeenCalledWith("other");
+  });
 
   it.each(["repositories", "legacy"] as const)("merges exact ranked content through %s without lowering the fuzzy threshold", async mode => {
     const db = makeDb();

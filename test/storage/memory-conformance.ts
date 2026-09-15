@@ -31,6 +31,10 @@ export async function exercisePromotedMemoryRepositoryConformance(
     },
     projectId: "external-project",
   });
+  expect(await repository.findExactContent("durable memory", "external-project"))
+    .toMatchObject({ id: memoryId, content: "durable memory" });
+  expect(await repository.findExactContent("durable memory", "missing"))
+    .toBeNull();
   expect(await repository.getById("missing")).toBeNull();
   expect(await repository.getAll({
     sourceProjectId: "external-project",

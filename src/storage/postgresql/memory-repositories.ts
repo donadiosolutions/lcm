@@ -737,6 +737,45 @@ implements PromotedMemoryRepository {
     });
   }
 
+  async findExactContent(
+    content: string,
+    sourceProjectId?: string,
+  ): Promise<PromotedMemoryRecord | null> {
+    const operation = "findExactContent";
+    const candidateContent = string(
+      content,
+      this.access.projectId,
+      "promoted-memory",
+      operation,
+      "content",
+    );
+    const candidateSourceProjectId = sourceProjectId === undefined
+      ? null
+      : string(
+          sourceProjectId,
+          this.access.projectId,
+          "promoted-memory",
+          operation,
+          "source_project_id",
+        );
+    return this.access.read(operation, async (executor) => {
+      const result = await executor.query<MemoryRow>({
+        text: `SELECT ${MEMORY_COLUMNS}
+               FROM lcm.promoted_memories AS memory
+               WHERE memory.project_id = $1
+                 AND memory.archived_at IS NULL
+                 AND memory.content OPERATOR(pg_catalog.=) $2::pg_catalog.text
+                 AND ($3::pg_catalog.text IS NULL
+                      OR memory.source_project_id OPERATOR(pg_catalog.=) $3)
+               ORDER BY memory.created_at DESC, memory.memory_id DESC
+               LIMIT 1`,
+        values: [this.access.projectId, candidateContent, candidateSourceProjectId],
+      }, this.access.context(operation));
+      const row = result.rows[0];
+      return row ? memoryFromRow(row, this.access.projectId, operation) : null;
+    });
+  }
+
   async getAll(
     options: Parameters<PromotedMemoryRepository["getAll"]>[0] = {},
   ): Promise<PromotedMemoryRecord[]> {

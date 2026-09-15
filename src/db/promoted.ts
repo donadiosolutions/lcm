@@ -314,6 +314,19 @@ export class PromotedStore {
     return row ? publicPromotedRow(row) : null;
   }
 
+  findExactContent(content: string, projectId: string): PromotedRow | null {
+    const row = this.db.prepare(
+      `SELECT ${promotedContentProjection("promoted")}
+       FROM promoted
+       WHERE archived_at IS NULL
+         AND content = ?
+         AND project_id = ?
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1`,
+    ).get(content, projectId) as (PromotedRow & PromotedContentRow) | undefined;
+    return row ? publicPromotedRow(row) : null;
+  }
+
   search(query: string, limit: number, filterTags?: string[], projectId?: string): SearchResult[] {
     const terms = query
       .replace(/[^\w\s]/g, " ")
