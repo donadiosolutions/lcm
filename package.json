@@ -65,6 +65,7 @@
   "dependencies": {
     "@hono/node-server": "2.1.1",
     "@sinclair/typebox": "0.34.52",
+    "@types/pg": "8.23.1",
     "commander": "15.0.0",
     "js-yaml": "5.4.1",
     "pg": "8.23.0",
@@ -76,7 +77,6 @@
     "@modelcontextprotocol/sdk": "1.30.0",
     "@types/js-yaml": "4.0.9",
     "@types/node": "26.5.0",
-    "@types/pg": "8.23.1",
     "@types/safe-regex": "1.1.6",
     "@vitest/coverage-v8": "4.1.10",
     "body-parser": "2.3.0",

@@ -14,6 +14,10 @@ new CLI command. It prepares and verifies an isolated destination. It does not
 select a backend, publish a generation, replace an active project, activate an
 outbox, or perform a cutover.
 
+The published package includes the PostgreSQL declaration dependency required by
+the storage and portable APIs. TypeScript consumers can import the package root
+or any published storage subpath without installing `@types/pg` separately.
+
 ## Optional migration receipt metadata
 
 SQLite sources and resumed SQLite destinations may contain the exact optional

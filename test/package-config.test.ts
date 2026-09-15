@@ -108,6 +108,10 @@ describe("package.json", () => {
     });
     expect(pkg.scripts.postbuild).toContain("pnpm run verify:portable-package");
   });
+  it("publishes PostgreSQL declarations as a production dependency", () => {
+    expect(pkg.dependencies).toHaveProperty("@types/pg", "8.23.1");
+    expect(pkg.devDependencies).not.toHaveProperty("@types/pg");
+  });
   it("imports and typechecks portable APIs from an offline extracted tarball", { timeout: 120_000 }, () => {
     npmPackInventory();
     const scratch = mkdtempSync(join(tmpdir(), "lcm-portable-package-"));
