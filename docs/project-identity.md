@@ -233,6 +233,18 @@ promoted content is unsupported` and does not include memory content, IDs,
 paths, or tags. See the
 [offline promoted-memory repair procedure](privacy.md#embedded-nul-in-promoted-memory).
 
+Legacy conversation messages use the same SQLite boundary check. During
+worktree reconciliation, a `messages.content` value that is not `TEXT` or
+contains an embedded NUL is refused with `stored message content is
+unsupported`. The source check preserves the legacy database and leaves it
+unfenced for repair; a target refusal rolls back the target transaction while
+the source fence may remain committed. Inspect the source or target offline
+with `typeof(content)`, `hex(content)`, and `instr(content, char(0))`, correct
+the unsupported value in a verified backup, and rerun reconciliation. The
+promoted-memory repair procedure below documents promoted rows only; it is not
+a shipped message-repair command. Empty, Unicode, and literal JSON-escaped
+`\\u0000` text remain valid message content.
+
 The canonical target's `meta.json` is a separate leaf-file trust boundary. LCM
 refuses to parse or reuse it when its owner differs from the admitted project
 directory owner (`file owner is not trusted`) or when it has more than one hard

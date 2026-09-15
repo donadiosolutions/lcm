@@ -1678,6 +1678,161 @@ describe("worktree reconciliation", () => {
     expect(existsSync(fixture.sourcePath)).toBe(true);
   });
 
+  it("refuses a source message TEXT value containing an embedded NUL before fencing", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "message-nul-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "message-nul-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec(
+      "UPDATE messages SET content = CAST(X'410042' AS TEXT)",
+    );
+    source.close();
+
+    const targetBefore = readFileSync(fixture.targetPath);
+    const mapBefore = readFileSync(projectMapPath());
+    let caught: unknown;
+    try {
+      reconcileWorktrees(fixture.main);
+    } catch (error) {
+      caught = error;
+    }
+    expect(String(caught)).toBe("Error: stored message content is unsupported");
+    expect(String(caught)).not.toContain(fixture.sourcePath);
+    expect(String(caught)).not.toContain("message-nul-source");
+    expect(readFileSync(fixture.targetPath)).toEqual(targetBefore);
+    expect(readFileSync(projectMapPath())).toEqual(mapBefore);
+    const preserved = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(preserved.prepare("SELECT typeof(content) AS type, hex(content) AS content FROM messages").get())
+      .toEqual({ type: "text", content: "410042" });
+    expect(preserved.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toBeUndefined();
+    preserved.close();
+  });
+
+  it.each([
+    { label: "leading NUL", hex: "006D657373616765" },
+    { label: "interior NUL", hex: "6D65737300616765" },
+    { label: "trailing NUL", hex: "6D65737361676500" },
+    { label: "non-TEXT BLOB", hex: "6D657373616765", blob: true },
+  ])("refuses source message $label content and retries after in-place repair", ({ hex, blob }) => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "message-unsupported-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "message-unsupported-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    const contentExpression = blob ? `X'${hex}'` : `CAST(X'${hex}' AS TEXT)`;
+    source.exec(`UPDATE messages SET content = ${contentExpression}`);
+    source.close();
+
+    const targetBefore = readFileSync(fixture.targetPath);
+    const mapBefore = readFileSync(projectMapPath());
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "stored message content is unsupported",
+    );
+    expect(readFileSync(fixture.targetPath)).toEqual(targetBefore);
+    expect(readFileSync(projectMapPath())).toEqual(mapBefore);
+    const blockedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(blockedSource.prepare(
+      "SELECT typeof(content) AS type, hex(content) AS content FROM messages",
+    ).get()).toEqual({ type: blob ? "blob" : "text", content: hex });
+    expect(blockedSource.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toBeUndefined();
+    blockedSource.close();
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      reason: "Error: stored message content is unsupported",
+    }]);
+
+    const repairedSource = new DatabaseSync(fixture.sourcePath);
+    repairedSource.prepare("UPDATE messages SET content = ?").run("repaired source");
+    repairedSource.close();
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const mergedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(mergedTarget.prepare(
+      `SELECT hex(m.content) AS content
+       FROM messages m JOIN conversations c ON c.conversation_id = m.conversation_id
+       WHERE c.session_id = 'message-unsupported-source'`,
+    ).get()).toEqual({ content: "726570616972656420736F75726365" });
+    mergedTarget.close();
+  });
+
+  it.each([true, false])(
+    "refuses unsupported target message content before collision comparison (FTS %s)",
+    (fts5Available) => {
+      const fixture = makeProjectReconciliation(home);
+      makeDatabase(fixture.targetPath, "message-collision", "source", fixture.targetHash);
+      makeDatabase(fixture.sourcePath, "message-collision", "source", fixture.sourceHash);
+      const target = new DatabaseSync(fixture.targetPath);
+      target.exec("UPDATE messages SET content = CAST(X'736F7572636500737566666978' AS TEXT)");
+      target.close();
+
+      const targetBefore = new DatabaseSync(fixture.targetPath, { readOnly: true });
+      const targetMessageBefore = targetBefore.prepare(
+        "SELECT typeof(content) AS type, hex(content) AS content FROM messages",
+      ).get();
+      targetBefore.close();
+      let caught: unknown;
+      try {
+        reconcileWorktrees(fixture.main, { _fts5Available: fts5Available });
+      } catch (error) {
+        caught = error;
+      }
+      expect(String(caught)).toBe("Error: stored message content is unsupported");
+      expect(String(caught)).not.toContain(fixture.targetPath);
+      expect(String(caught)).not.toContain("message-collision");
+      const blockedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+      expect(blockedTarget.prepare(
+        "SELECT typeof(content) AS type, hex(content) AS content FROM messages",
+      ).get()).toEqual(targetMessageBefore);
+      expect(blockedTarget.prepare(
+        "SELECT COUNT(*) AS count FROM worktree_reconciliation_sources",
+      ).get()).toEqual({ count: 0 });
+      blockedTarget.close();
+      expect(listWorktreeReconciliationJournals()).toMatchObject([{
+        phase: "blocked",
+        reason: "Error: stored message content is unsupported",
+      }]);
+
+      const repairedTarget = new DatabaseSync(fixture.targetPath);
+      repairedTarget.prepare("UPDATE messages SET content = ?").run("source");
+      repairedTarget.close();
+      expect(reconcileWorktrees(fixture.main, { _fts5Available: fts5Available }))
+        .toMatchObject({ status: "completed" });
+    },
+  );
+
+  it.each([
+    { fts5Available: true, content: "" },
+    { fts5Available: true, content: "こんにちは世界" },
+    { fts5Available: true, content: "literal \\u0000" },
+    { fts5Available: false, content: "" },
+    { fts5Available: false, content: "こんにちは世界" },
+    { fts5Available: false, content: "literal \\u0000" },
+  ])(
+    "reconciles valid message content byte-exactly (FTS $fts5Available, $content)",
+    ({ fts5Available, content }) => {
+      const fixture = makeProjectReconciliation(home);
+      const sessionId = "message-valid-source";
+      makeDatabase(fixture.targetPath, "message-valid-target", "target", fixture.targetHash);
+      makeDatabase(fixture.sourcePath, sessionId, "source", fixture.sourceHash);
+      const source = new DatabaseSync(fixture.sourcePath);
+      source.prepare("UPDATE messages SET content = ?").run(content);
+      const expected = source.prepare("SELECT hex(content) AS content FROM messages").get();
+      source.close();
+
+      expect(reconcileWorktrees(fixture.main, { _fts5Available: fts5Available }))
+        .toMatchObject({ status: "completed" });
+      const target = new DatabaseSync(fixture.targetPath, { readOnly: true });
+      expect(target.prepare(
+        `SELECT hex(m.content) AS content
+         FROM messages m JOIN conversations c ON c.conversation_id = m.conversation_id
+         WHERE c.session_id = ?`,
+      ).get(sessionId)).toEqual(expected);
+      target.close();
+    },
+  );
+
   it.each([
     { label: "leading NUL", hex: "006D656D6F7279" },
     { label: "interior NUL", hex: "6D656D00726F7279" },
@@ -9967,6 +10122,40 @@ describe("worktree reconciliation", () => {
     evidence.close();
   }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
 
+  it("re-fences unsupported source message content after a completed target merge", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "message-marker-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "message-marker-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec("UPDATE messages SET content = CAST(X'736F7572636500737566666978' AS TEXT)");
+    source.close();
+    const target = new DatabaseSync(fixture.targetPath);
+    target.exec(`
+      CREATE TABLE worktree_reconciliation_sources (
+        source_hash TEXT PRIMARY KEY,
+        merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    target.prepare(
+      "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
+    ).run(fixture.sourceHash);
+    target.close();
+    makeEvents(join(home, ".lcm", "events", `${fixture.targetHash}.db`), "message-marker-target");
+    makeEvents(join(home, ".lcm", "events", `${fixture.sourceHash}.db`), "message-marker-source");
+    const result = reconcileWorktrees(fixture.main);
+    expect(result.status).toBe("completed");
+    const merged = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(merged.prepare(
+      "SELECT hex(content) AS content FROM messages WHERE message_id = 1",
+    ).get()).toEqual({ content: "746172676574" });
+    merged.close();
+    const backup = result.backupPaths.find((path) => path.includes("oldprojects"))!;
+    const evidence = new DatabaseSync(join(backup, "db.sqlite"), { readOnly: true });
+    expect(evidence.prepare("SELECT hex(content) AS content FROM messages").get())
+      .toEqual({ content: "736F7572636500737566666978" });
+    evidence.close();
+  }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
+
   it("refuses unsupported source content if its completed marker disappears", () => {
     const fixture = makeProjectReconciliation(home);
     makeDatabase(fixture.targetPath, "marker-race-target", "target", fixture.targetHash);
@@ -10030,6 +10219,63 @@ describe("worktree reconciliation", () => {
     ).get()).toMatchObject({ name: "worktree_reconciliation_fence" });
     preservedSource.close();
 
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+  }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
+
+  it("refuses unsupported source message content if its completed marker disappears", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "message-marker-race-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "message-marker-race-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec("UPDATE messages SET content = CAST(X'736F7572636500737566666978' AS TEXT)");
+    source.close();
+    const target = new DatabaseSync(fixture.targetPath);
+    target.exec(`
+      CREATE TABLE worktree_reconciliation_sources (
+        source_hash TEXT PRIMARY KEY,
+        merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    target.prepare(
+      "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
+    ).run(fixture.sourceHash);
+    target.close();
+    const instrumentation = instrumentTargetReconciliationCommit(
+      () => undefined,
+      {
+        onBegin: (openedTarget) => {
+          openedTarget.prepare(
+            "DELETE FROM worktree_reconciliation_sources WHERE source_hash = ?",
+          ).run(fixture.sourceHash);
+        },
+      },
+    );
+    try {
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "stored message content is unsupported",
+      );
+    } finally {
+      instrumentation.restore();
+    }
+    const preservedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(preservedTarget.prepare(
+      "SELECT COUNT(*) AS count FROM worktree_reconciliation_sources WHERE source_hash = ?",
+    ).get(fixture.sourceHash)).toEqual({ count: 1 });
+    expect(preservedTarget.prepare(
+      "SELECT hex(content) AS content FROM messages WHERE message_id = 1",
+    ).get()).toEqual({ content: "746172676574" });
+    preservedTarget.close();
+    const preservedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(preservedSource.prepare("SELECT hex(content) AS content FROM messages").get())
+      .toEqual({ content: "736F7572636500737566666978" });
+    expect(preservedSource.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toMatchObject({ name: "worktree_reconciliation_fence" });
+    preservedSource.close();
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      reason: "Error: stored message content is unsupported",
+    }]);
     expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
   }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
 

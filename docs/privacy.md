@@ -222,6 +222,29 @@ contains a known truncated legacy value, repair the canonical target with the
 offline procedure above. This refusal
 behavior is implemented by [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
 
+### Embedded NUL in legacy conversation messages
+
+Legacy `messages.content` values must be SQLite `TEXT` without an embedded NUL
+character (`U+0000`). The Node SQLite binding can otherwise expose only the
+prefix of a value, so worktree reconciliation refuses the source before its
+fence commits and refuses the canonical target inside its transaction. The
+fixed error is `stored message content is unsupported`; it contains no message
+bytes, session identifiers, paths, or database IDs. Source bytes remain intact
+for inspection, and a target refusal rolls back copied rows and FTS changes.
+
+Stop writers, keep the database and its WAL/SHM sidecars together, and make a
+verified backup before repair. Inspect affected rows offline with
+`typeof(content)`, `hex(content)`, and `instr(content, char(0))`, then correct
+the intended scalar value and rerun reconciliation. Do not use the promoted
+memory script above for `messages`; it is an inline, promoted-only diagnostic
+and repair procedure, not a shipped general-purpose migration. Empty,
+multi-byte Unicode, and literal JSON-escaped `\\u0000` message text remain
+supported; an actual NUL byte or a BLOB is refused. If a source completion
+marker already exists, reconciliation preserves the existing replay boundary
+and archives the source without auditing its message bytes. If that marker
+disappears during the target transaction, LCM revalidates the source and
+refuses unsupported message content before copying it.
+
 No data is sent to any Long Context Manager (LCM) server. There is no telemetry.
 An explicitly configured PostgreSQL backend is a user-operated remote-primary
 store; daemon project writes and reads use it only after the publication and
