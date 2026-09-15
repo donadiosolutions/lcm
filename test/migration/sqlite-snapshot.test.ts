@@ -45,6 +45,10 @@ import {
   type SqliteSnapshotOperations,
   type SqliteSnapshotSourceByteWitness,
 } from "../../src/migration/sqlite-snapshot.js";
+import {
+  PrivateDirectoryTopologyError,
+  UnsupportedPlatformCapabilityError,
+} from "../../src/security-files.js";
 
 const HASH = "a".repeat(64);
 const MACHINE_ID = "018f0b5d-1234-4abc-8def-1234567890ab";
@@ -224,6 +228,233 @@ async function captureFixture(
 }
 
 describe("authenticated SQLite snapshot artifacts", () => {
+  it("refuses every filesystem snapshot export when UID support is unavailable", async () => {
+    const fixture = await heldFixture();
+    const before = sourceState(fixture.authority);
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    const captureOptions = {
+      homeDir: fixture.homeDir,
+      generationId: "generation-1",
+      maintenanceChecksumSha256: fixture.maintenanceChecksumSha256,
+      expectedSourceBytes: fixture.expectedSourceBytes,
+    };
+    try {
+      Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+      const calls = [
+        () => classifySqliteSnapshotArtifact("generation-1", { homeDir: fixture.homeDir }),
+        () => inspectSqliteSnapshotArtifact("generation-1", { homeDir: fixture.homeDir }),
+        () => captureSqliteSnapshotArtifact(fixture.authority, captureOptions),
+        () => dryRunSqliteSnapshotArtifact(fixture.authority, { homeDir: fixture.homeDir }),
+        () => authenticateSqliteSnapshotSourceBytes(fixture.authority, {
+          homeDir: fixture.homeDir,
+          lockToken: {} as never,
+        }),
+        () => authenticateSqliteSnapshotCaptureBinding(fixture.authority, {
+          homeDir: fixture.homeDir,
+          lockToken: {} as never,
+        }),
+      ];
+      for (const call of calls) {
+        await expect(call()).rejects.toMatchObject({ reason: "unsupported-platform" });
+      }
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
+    expect(sourceState(fixture.authority)).toEqual(before);
+  });
+
+  it("refuses descriptor-dependent snapshot exports before their effects", async () => {
+    const fixture = await heldFixture();
+    const before = sourceState(fixture.authority);
+    const unavailable = Object.assign(new Error("descriptor namespace unavailable"), {
+      code: "ENOENT",
+    });
+    const operations = {
+      readdir: (path: string) => {
+        if (path === "/proc/self/fd") throw unavailable;
+        return readdirSync(path);
+      },
+    } satisfies Partial<SqliteSnapshotOperations>;
+    const calls = [
+      () => classifySqliteSnapshotArtifact("generation-1", {
+        homeDir: fixture.homeDir,
+        _operationsForTesting: operations,
+      }),
+      () => inspectSqliteSnapshotArtifact("generation-1", {
+        homeDir: fixture.homeDir,
+        _operationsForTesting: operations,
+      }),
+      () => captureSqliteSnapshotArtifact(fixture.authority, {
+        homeDir: fixture.homeDir,
+        generationId: "generation-1",
+        maintenanceChecksumSha256: fixture.maintenanceChecksumSha256,
+        expectedSourceBytes: fixture.expectedSourceBytes,
+        _operationsForTesting: operations,
+      }),
+      () => dryRunSqliteSnapshotArtifact(fixture.authority, {
+        homeDir: fixture.homeDir,
+        _operationsForTesting: operations,
+      }),
+      () => authenticateSqliteSnapshotSourceBytes(fixture.authority, {
+        homeDir: fixture.homeDir,
+        lockToken: {} as never,
+        _operationsForTesting: operations,
+      }),
+      () => authenticateSqliteSnapshotCaptureBinding(fixture.authority, {
+        homeDir: fixture.homeDir,
+        lockToken: {} as never,
+        _operationsForTesting: operations,
+      }),
+    ];
+    for (const call of calls) {
+      await expect(call()).rejects.toMatchObject({ reason: "unsupported-platform" });
+    }
+    expect(sourceState(fixture.authority)).toEqual(before);
+    expect(() => statSync(join(fixture.homeDir, ".lcm", "migration-snapshots")))
+      .toThrow();
+  });
+
+  it("preserves non-capability admission errors and capability cleanup context", async () => {
+    for (const code of ["EACCES", "EIO"] as const) {
+      const fixture = sourceFixture();
+      const failure = Object.assign(new Error(`descriptor ${code}`), { code });
+      const operations = {
+        readdir: (path: string) => {
+          if (path === "/proc/self/fd") throw failure;
+          return readdirSync(path);
+        },
+      } satisfies Partial<SqliteSnapshotOperations>;
+      await expect(dryRunSqliteSnapshotArtifact(fixture.authority, {
+        homeDir: fixture.homeDir,
+        _operationsForTesting: operations,
+      })).rejects.toMatchObject({ reason: "snapshot-io", cause: failure });
+      await expect(classifySqliteSnapshotArtifact("generation-1", {
+        homeDir: fixture.homeDir,
+        _operationsForTesting: operations,
+      })).rejects.toMatchObject({ reason: "snapshot-io", cause: failure });
+    }
+
+    const cleanupOnly = sourceFixture();
+    const closeFailure = new Error("probe close failed");
+    await expect(dryRunSqliteSnapshotArtifact(cleanupOnly.authority, {
+      homeDir: cleanupOnly.homeDir,
+      _operationsForTesting: {
+        close: (fd) => {
+          closeSync(fd);
+          throw closeFailure;
+        },
+      },
+    })).rejects.toMatchObject({ reason: "snapshot-io", cause: closeFailure });
+    await expect(classifySqliteSnapshotArtifact("generation-1", {
+      homeDir: cleanupOnly.homeDir,
+      _operationsForTesting: {
+        close: (fd) => {
+          closeSync(fd);
+          throw closeFailure;
+        },
+      },
+    })).rejects.toMatchObject({ reason: "snapshot-io", cause: closeFailure });
+
+    const topology = sourceFixture();
+    await expect(classifySqliteSnapshotArtifact("generation-1", {
+      homeDir: topology.homeDir,
+      _operationsForTesting: {
+        stat: (path) => {
+          const actual = statSync(path, { bigint: true });
+          return new Proxy(actual, {
+            get: (value, property) => property === "dev"
+              ? value.dev + 1n
+              : Reflect.get(value, property, value),
+          });
+        },
+      },
+    })).rejects.toMatchObject({
+      reason: "snapshot-io",
+      cause: expect.any(PrivateDirectoryTopologyError),
+    });
+
+    const combined = sourceFixture();
+    const unavailable = Object.assign(new Error("namespace disappeared"), {
+      code: "ENOENT",
+    });
+    let thrown: unknown;
+    try {
+      await dryRunSqliteSnapshotArtifact(combined.authority, {
+        homeDir: combined.homeDir,
+        _operationsForTesting: {
+          readlink: () => { throw unavailable; },
+          close: (fd) => {
+            closeSync(fd);
+            throw closeFailure;
+          },
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ reason: "unsupported-platform" });
+    expect((thrown as SqliteSnapshotError).cause).toBeInstanceOf(AggregateError);
+  });
+
+  it("maps UID capability loss after admission to unsupported-platform", async () => {
+    const fixture = sourceFixture();
+    let calls = 0;
+    await expect(dryRunSqliteSnapshotArtifact(fixture.authority, {
+      homeDir: fixture.homeDir,
+      _operationsForTesting: {
+        getuid: () => {
+          calls += 1;
+          if (calls > 1) {
+            throw new UnsupportedPlatformCapabilityError("UID capability disappeared");
+          }
+          return process.getuid!();
+        },
+      },
+    })).rejects.toMatchObject({ reason: "unsupported-platform" });
+    expect(calls).toBeGreaterThan(1);
+  });
+
+  it("preserves UID capability refusal while reading a checked control", async () => {
+    const fixture = await heldFixture();
+    await captureFixture(fixture);
+    let controlOpened = false;
+    await expect(classifySqliteSnapshotArtifact("generation-1", {
+      homeDir: fixture.homeDir,
+      _operationsForTesting: {
+        open: (path, flags, mode) => {
+          const fd = mode === undefined ? openSync(path, flags) : openSync(path, flags, mode);
+          if (path.endsWith("/registrations/generation-1.intent.json")) controlOpened = true;
+          return fd;
+        },
+        getuid: () => {
+          if (controlOpened) {
+            throw new UnsupportedPlatformCapabilityError("UID capability disappeared");
+          }
+          return process.getuid!();
+        },
+      },
+    })).rejects.toMatchObject({ reason: "unsupported-platform" });
+    expect(controlOpened).toBe(true);
+  });
+
+  it("keeps supported missing-home classification absent for a 0755 home", async () => {
+    const homeDir = join(mkdtempSync(join(tmpdir(), "lcm-snapshot-parent-")), "missing-home");
+    roots.push(join(homeDir, ".."));
+    mkdirSync(homeDir, { mode: 0o755 });
+    chmodSync(homeDir, 0o755);
+    expect(statSync(homeDir).mode & 0o777).toBe(0o755);
+    expect(await classifySqliteSnapshotArtifact("generation-1", { homeDir }))
+      .toEqual({ state: "absent" });
+  });
+
+  it("keeps supported nonexistent-home classification absent", async () => {
+    const homeDir = join(mkdtempSync(join(tmpdir(), "lcm-snapshot-parent-")), "missing-home");
+    roots.push(join(homeDir, ".."));
+    expect(await classifySqliteSnapshotArtifact("generation-1", { homeDir }))
+      .toEqual({ state: "absent" });
+  });
+
   it.each(["0", "9223372036854775808"])("samples private sequence cutoff %s without source writes", async (next) => {
     const fixture = sourceFixture();
     fixture.openDatabases[2]!.exec(`CREATE TABLE local_hook_sequence(singleton, next_sequence); INSERT INTO local_hook_sequence VALUES(1, '${next}')`);
@@ -253,7 +484,7 @@ describe("authenticated SQLite snapshot artifacts", () => {
           if (boundary === "before-cutoff-read") reading = true;
           if (boundary === point) { chmodSync(path, 0o600); appendFileSync(path, "tampered"); chmodSync(path, 0o400); }
         },
-        readdir: (path) => point === "descriptor" && reading && path === "/dev/fd" && ++reads === 2 ? [] : readdirSync(path),
+        readdir: (path) => point === "descriptor" && reading && path === "/proc/self/fd" && ++reads === 2 ? [] : readdirSync(path),
       } }))).rejects.toThrow();
     expect(sha256(fixture.authority.machineSequenceDbPath + "-wal")).toBe(before);
   });
@@ -567,7 +798,7 @@ describe("authenticated SQLite snapshot artifacts", () => {
           fstat: (fd) => {
             const actual = fstatSync(fd, { bigint: true });
             fstatCalls += 1;
-            return fstatCalls === 2 ? new Proxy(actual, {
+            return fstatCalls === 3 ? new Proxy(actual, {
               get: (target, property) => property === "size" ? 9n * 1024n * 1024n * 1024n : Reflect.get(target, property, target),
             }) : actual;
           },
@@ -577,7 +808,7 @@ describe("authenticated SQLite snapshot artifacts", () => {
     )).rejects.toMatchObject({ reason: "source-unsafe" });
 
     const parent = sourceFixture();
-    let first = true;
+    let parentFstatCalls = 0;
     await expect(withBackendPublicationConsumerLockAsync(
       parent.homeDir,
       (lockToken) => authenticateSqliteSnapshotSourceBytes(parent.authority, {
@@ -586,8 +817,8 @@ describe("authenticated SQLite snapshot artifacts", () => {
         _operationsForTesting: {
           fstat: (fd) => {
             const actual = fstatSync(fd, { bigint: true });
-            if (!first) return actual;
-            first = false;
+            parentFstatCalls += 1;
+            if (parentFstatCalls !== 2) return actual;
             return new Proxy(actual, {
               get: (target, property) => property === "ino" ? target.ino + 1n : Reflect.get(target, property, target),
             });
@@ -1127,20 +1358,25 @@ describe("authenticated SQLite snapshot artifacts", () => {
 
   it("refuses non-EBADF descriptor inspection failures before opening SQLite", async () => {
     const fixture = await heldFixture();
-    let inventory = false;
+    let inventories = 0;
+    let fstats = 0;
     let opened = false;
     await expect(captureFixture(fixture, {
       readdir: (path) => {
-        if (path === "/dev/fd") inventory = true;
+        if (path === "/proc/self/fd") inventories += 1;
         return readdirSync(path);
       },
       fstat: (fd) => {
-        if (inventory) throw Object.assign(new Error("descriptor stat failed"), { code: "EIO" });
+        fstats += 1;
+        if (inventories > 1) {
+          throw Object.assign(new Error("descriptor stat failed"), { code: "EIO" });
+        }
         return fstatSync(fd, { bigint: true });
       },
       openDatabase: () => { opened = true; throw new Error("unexpected SQLite open"); },
     })).rejects.toMatchObject({ reason: "snapshot-io" });
-    expect(inventory).toBe(true);
+    expect(inventories).toBe(2);
+    expect(fstats).toBeGreaterThan(1);
     expect(opened).toBe(false);
   });
 
@@ -1210,7 +1446,6 @@ describe("authenticated SQLite snapshot artifacts", () => {
 
   it("fails closed when a source open fails and its descriptor cannot close", async () => {
     const fixture = sourceFixture();
-    let fstatCalls = 0;
     let rejectedFd: number | undefined;
     await expect(withBackendPublicationConsumerLockAsync(
       fixture.homeDir,
@@ -1218,12 +1453,16 @@ describe("authenticated SQLite snapshot artifacts", () => {
         homeDir: fixture.homeDir,
         lockToken,
         _operationsForTesting: {
+          open: (path, flags, mode) => {
+            const fd = mode === undefined ? openSync(path, flags) : openSync(path, flags, mode);
+            if (path === fixture.authority.projectDbPath) rejectedFd = fd;
+            return fd;
+          },
           fstat: (fd) => {
             const actual = fstatSync(fd, { bigint: true });
-            fstatCalls += 1;
-            if (fstatCalls !== 2) return actual;
-            rejectedFd = fd;
-            return new Proxy(actual, { get: (stat, property) => property === "mode" ? 0o644n : Reflect.get(stat, property, stat) });
+            return fd === rejectedFd
+              ? new Proxy(actual, { get: (stat, property) => property === "mode" ? 0o644n : Reflect.get(stat, property, stat) })
+              : actual;
           },
           close: (fd) => {
             closeSync(fd);
@@ -1233,6 +1472,7 @@ describe("authenticated SQLite snapshot artifacts", () => {
       }),
       { allowUnresolved: true },
     )).rejects.toMatchObject({ reason: "snapshot-io" });
+    expect(rejectedFd).toBeDefined();
   });
 
   it("detects retained parent identity change after source reads", async () => {

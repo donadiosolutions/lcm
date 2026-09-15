@@ -10,18 +10,28 @@ import {
   mkdirSync,
   openSync,
   readSync,
+  readlinkSync,
   readdirSync,
   realpathSync,
   rmSync,
   rmdirSync,
+  statSync,
   unlinkSync,
   writeSync,
   type BigIntStats as FsBigIntStats,
 } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { withPrivateMutationLockAsync } from "../private-mutation-lock.js";
+import {
+  admitDescriptorPlatformCapabilities,
+  authenticatedDescriptorEntries,
+  isUnsupportedPlatformCapabilityFailure,
+  retainedDirectoryDescriptorPath,
+  requireSupportedProcessUid,
+  type DescriptorCapabilityOperations,
+} from "../security-files.js";
 import { canonicalJson } from "../storage/portable-record.js";
 import {
   backendPublicationCanonicalSha256,
@@ -181,6 +191,7 @@ export type SqliteSnapshotErrorReason =
   | "snapshot-tampered"
   | "source-unsafe"
   | "source-changed"
+  | "unsupported-platform"
   | "unsupported-sqlite"
   | "snapshot-io";
 
@@ -220,10 +231,15 @@ type DatabaseInspection = Readonly<{
 export interface SqliteSnapshotOperations {
   now(): Date;
   nonce(): string;
+  /** @internal Deterministic process-identity seam. */
+  getuid?(): number;
   open(path: string, flags: number, mode?: number): number;
   close(fd: number): void;
   fstat(fd: number): BigIntStats;
   lstat(path: string): BigIntStats;
+  /** @internal Deterministic descriptor-traversal seams. */
+  stat?(path: string): BigIntStats;
+  readlink?(path: string): string;
   read(fd: number, buffer: Buffer, offset: number, length: number, position: number): number;
   write(fd: number, buffer: Buffer, offset: number, length: number, position: number | null): number;
   fsync(fd: number): void;
@@ -294,10 +310,6 @@ function exactKeys(value: RecordValue, keys: readonly string[]): boolean {
 
 function errorCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
-}
-
-function currentUid(): number {
-  return process.getuid!();
 }
 
 function mode(stat: BigIntStats): number {
@@ -421,10 +433,13 @@ function inspectDatabase(path: string, normalize: boolean, authenticateOpened?: 
 const DEFAULT_OPERATIONS: SqliteSnapshotOperations = {
   now: () => new Date(),
   nonce: () => randomBytes(24).toString("hex"),
+  getuid: () => requireSupportedProcessUid(),
   open: (path, flags, fileMode) => fileMode === undefined ? openSync(path, flags) : openSync(path, flags, fileMode),
   close: (fd) => closeSync(fd),
   fstat: (fd) => fstatSync(fd, { bigint: true }),
   lstat: (path) => lstatSync(path, { bigint: true }),
+  stat: (path) => statSync(path, { bigint: true }),
+  readlink: (path) => readlinkSync(path),
   read: (fd, buffer, offset, length, position) => readSync(fd, buffer, offset, length, position),
   write: (fd, buffer, offset, length, position) => writeSync(fd, buffer, offset, length, position),
   fsync: (fd) => fsyncSync(fd),
@@ -443,18 +458,26 @@ const DEFAULT_OPERATIONS: SqliteSnapshotOperations = {
   observe: () => undefined,
 };
 
+type ResolvedSnapshotOperations = SqliteSnapshotOperations & Required<Pick<
+  SqliteSnapshotOperations,
+  "getuid" | "stat" | "readlink"
+>>;
+
 type Context = Readonly<{
   homeDir: string;
   generationId: string;
   maintenanceChecksumSha256?: string;
   lockToken?: BackendPublicationLockToken;
-  ops: SqliteSnapshotOperations;
+  ops: ResolvedSnapshotOperations;
   ownedFiles: Map<string, BigIntStats>;
 }>;
 
 function contextFor(options: ClassificationOptions & Partial<Pick<SqliteSnapshotOptions, "generationId" | "maintenanceChecksumSha256" | "lockToken">>): Context {
   if (!exactPath(options.homeDir)) throw new SqliteSnapshotError("invalid-input");
-  const ops = Object.freeze({ ...DEFAULT_OPERATIONS, ...options._operationsForTesting });
+  const ops = Object.freeze({
+    ...DEFAULT_OPERATIONS,
+    ...options._operationsForTesting,
+  }) as ResolvedSnapshotOperations;
   return {
     homeDir: options.homeDir,
     ownedFiles: new Map(),
@@ -463,6 +486,42 @@ function contextFor(options: ClassificationOptions & Partial<Pick<SqliteSnapshot
     ...(options.lockToken === undefined ? {} : { lockToken: options.lockToken }),
     ops,
   };
+}
+
+function descriptorCapabilityOperations(
+  context: Context,
+): Partial<DescriptorCapabilityOperations> {
+  return {
+    getuid: context.ops.getuid,
+    open: (path, flags) => context.ops.open(path, flags),
+    close: context.ops.close,
+    fstat: context.ops.fstat,
+    stat: context.ops.stat,
+    readlink: context.ops.readlink,
+    readdir: context.ops.readdir,
+  };
+}
+
+function currentUid(context: Context): number {
+  return requireSupportedProcessUid(context.ops.getuid);
+}
+
+function admitDescriptorPlatform(context: Context): void {
+  admitDescriptorPlatformCapabilities(
+    parse(context.homeDir).root,
+    descriptorCapabilityOperations(context),
+  );
+}
+
+function descriptorEntries(context: Context): readonly string[] {
+  return authenticatedDescriptorEntries(descriptorCapabilityOperations(context));
+}
+
+function retainedDescriptorPath(context: Context, fd: number): string {
+  return retainedDirectoryDescriptorPath(
+    fd,
+    descriptorCapabilityOperations(context),
+  );
 }
 
 async function observe(context: Context, boundary: SqliteSnapshotBoundary, path: string, role: SqliteSnapshotRole | null): Promise<void> {
@@ -491,7 +550,7 @@ function lockPath(context: Context): string {
 
 function assertDirectory(context: Context, path: string): BigIntStats {
   const stat = context.ops.lstat(path);
-  const uid = currentUid();
+  const uid = currentUid(context);
   if (!stat.isDirectory() || stat.isSymbolicLink() || mode(stat) !== DIRECTORY_MODE || Number(stat.uid) !== uid) {
     throw new InternalSnapshotError("unsafe");
   }
@@ -590,8 +649,8 @@ function streamHash(context: Context, fd: number, expectedSize: bigint, maximum:
   return hash.digest("hex");
 }
 
-function validateSourceStat(stat: BigIntStats, maximum: bigint): void {
-  const uid = currentUid();
+function validateSourceStat(context: Context, stat: BigIntStats, maximum: bigint): void {
+  const uid = currentUid(context);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n || !OWNER_FILE_MODES.has(mode(stat))
     || Number(stat.uid) !== uid || stat.size < 0n || stat.size > maximum) {
     throw new InternalSnapshotError("unsafe");
@@ -633,7 +692,7 @@ function openSourceFile(context: Context, path: string, maximum: bigint): Retain
   const fd = context.ops.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const stat = context.ops.fstat(fd);
-    validateSourceStat(stat, maximum);
+    validateSourceStat(context, stat, maximum);
     sourcePathMatches(context, path, stat);
     return { path, fd, stat, maximum };
   } catch (error) {
@@ -716,7 +775,7 @@ function copyPrivateFile(
   try {
     const sourceStat = context.ops.fstat(sourceFd);
     if (!sameInode(sourceStat, context.ownedFiles.get(source)!)) throw new InternalSnapshotError("changed");
-    validateSourceStat(sourceStat, SOURCE_LIMIT);
+    validateSourceStat(context, sourceStat, SOURCE_LIMIT);
     sourcePathMatches(context, source, sourceStat);
     if (decimal(sourceStat.size) !== expected.size) throw new InternalSnapshotError("changed");
     const copied = copySourceToExclusive(context, { path: source, fd: sourceFd, stat: sourceStat, maximum: SOURCE_LIMIT }, destination);
@@ -866,7 +925,7 @@ async function authenticateSourceRoleBytes<T>(
 }
 
 function liveDescriptors(context: Context): number[] {
-  return context.ops.readdir("/dev/fd").map(Number).filter((fd) => {
+  return descriptorEntries(context).map(Number).filter((fd) => {
     try { context.ops.fstat(fd); return true; } catch (error) {
       if (errorCode(error) === "EBADF") return false;
       throw error;
@@ -904,7 +963,7 @@ async function captureRole(
       if (!sameInode(parent, assertDirectory(context, destinationRoot))) throw new InternalSnapshotError("changed");
       for (const path of privatePaths) {
         const stat = context.ops.lstat(path);
-        validateSourceStat(stat, SOURCE_LIMIT);
+        validateSourceStat(context, stat, SOURCE_LIMIT);
         if (!sameInode(stat, context.ownedFiles.get(path)!)) throw new InternalSnapshotError("changed");
       }
       for (const suffix of ["-shm", "-journal"]) {
@@ -913,14 +972,14 @@ async function captureRole(
     };
     await observe(context, "before-private-inspection", normalizedMainPath, role);
     authenticatePrivate();
-    // /dev/fd enumerates actual process handles on supported Unix systems. Keep
+    // The admitted descriptor namespace enumerates actual process handles. Keep
     // only live descriptors: the enumeration itself temporarily opens a handle.
     const before = liveDescriptors(context);
     inspection = context.ops.inspectDatabase(normalizedMainPath, true, () => {
       const opened = liveDescriptors(context).filter((fd) => !before.includes(fd));
       if (opened.length !== 1) throw new InternalSnapshotError("unsafe");
       const actual = context.ops.fstat(opened[0]!);
-      validateSourceStat(actual, SOURCE_LIMIT);
+      validateSourceStat(context, actual, SOURCE_LIMIT);
       if (!sameInode(actual, context.ownedFiles.get(normalizedMainPath)!)) throw new InternalSnapshotError("unsafe");
       authenticatePrivate();
     }, context.ops.openDatabase);
@@ -938,7 +997,7 @@ async function captureRole(
       const fd = context.ops.open(path, constants.O_RDWR | constants.O_NOFOLLOW);
       try {
         const stat = context.ops.fstat(fd);
-        validateSourceStat(stat, SOURCE_LIMIT);
+        validateSourceStat(context, stat, SOURCE_LIMIT);
         if (!sameInode(stat, context.ownedFiles.get(path)!)) throw new InternalSnapshotError("changed");
         context.ops.fchmod(fd, ARTIFACT_MODE);
         context.ops.fsync(fd);
@@ -1030,6 +1089,7 @@ export async function authenticateSqliteSnapshotSourceBytes(
     _operationsForTesting: options._operationsForTesting,
   });
   try {
+    admitDescriptorPlatform(context);
     return await withBackendPublicationConsumerLockAsync(context.homeDir, async () => {
       const roles: SqliteSnapshotSourceRoleWitness[] = [];
       for (const input of roleInputs(authority)) {
@@ -1087,7 +1147,7 @@ function readSmallFile(context: Context, path: string, expectedMode = CONTROL_MO
   const fd = context.ops.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const stat = context.ops.fstat(fd);
-    const uid = currentUid();
+    const uid = currentUid(context);
     if (!stat.isFile() || stat.nlink !== 1n || mode(stat) !== expectedMode || stat.size < 1n
       || stat.size > BigInt(CONTROL_LIMIT) || Number(stat.uid) !== uid) {
       throw new InternalSnapshotError("invalid");
@@ -1110,6 +1170,7 @@ function readControl(context: Context, path: string): RecordValue {
   let value: unknown;
   try { value = JSON.parse(readSmallFile(context, path).toString("utf8")); } catch (error) {
     if (error instanceof InternalSnapshotError) throw error;
+    if (isUnsupportedPlatformCapabilityFailure(error)) throw error;
     throw new InternalSnapshotError("invalid", { cause: error });
   }
   if (!isRecord(value) || typeof value.checksumSha256 !== "string" || !HASH.test(value.checksumSha256)) {
@@ -1312,7 +1373,9 @@ function mapClassificationError(
   error: unknown,
   generationId: string,
 ): Extract<SqliteSnapshotClassification, { state: "tampered" }> {
-  void error;
+  if (isUnsupportedPlatformCapabilityFailure(error)) {
+    throw new SqliteSnapshotError("unsupported-platform", undefined, { cause: error });
+  }
   return { state: "tampered", generationId };
 }
 
@@ -1322,7 +1385,17 @@ export async function classifySqliteSnapshotArtifact(
 ): Promise<SqliteSnapshotClassification> {
   const generationId = validateGeneration(generationValue);
   const context = contextFor({ ...options, generationId });
-  try { return classifyInternal(context, generationId); } catch (error) {
+  try {
+    admitDescriptorPlatform(context);
+  } catch (error) {
+    if (isUnsupportedPlatformCapabilityFailure(error)) {
+      throw new SqliteSnapshotError("unsupported-platform", undefined, { cause: error });
+    }
+    throw new SqliteSnapshotError("snapshot-io", undefined, { cause: error });
+  }
+  try {
+    return classifyInternal(context, generationId);
+  } catch (error) {
     return mapClassificationError(error, generationId);
   }
 }
@@ -1373,6 +1446,9 @@ function classificationFailure(classification: Exclude<SqliteSnapshotClassificat
 
 function mapCaptureError(error: unknown): never {
   if (error instanceof SqliteSnapshotError) throw error;
+  if (isUnsupportedPlatformCapabilityFailure(error)) {
+    throw new SqliteSnapshotError("unsupported-platform", undefined, { cause: error });
+  }
   if (error instanceof InternalSnapshotError) {
     if (error.kind === "changed") throw new SqliteSnapshotError("source-changed", undefined, { cause: error });
     if (error.kind === "unsafe") throw new SqliteSnapshotError("source-unsafe", undefined, { cause: error });
@@ -1390,6 +1466,7 @@ export async function captureSqliteSnapshotArtifact(
   if (!HASH.test(options.maintenanceChecksumSha256)) throw new SqliteSnapshotError("invalid-input");
   const context = contextFor(options);
   try {
+    admitDescriptorPlatform(context);
     return await withBackendPublicationConsumerLockAsync(context.homeDir, async (token) =>
       withPrivateMutationLockAsync(lockPath(context), "sqlite snapshot artifact", async () => {
         const maintenance = assertMaintenance(context, authority);
@@ -1467,6 +1544,7 @@ async function inspectSqliteSnapshotSource(
     _operationsForTesting: options._operationsForTesting,
   });
   try {
+    admitDescriptorPlatform(context);
     return await withBackendPublicationConsumerLockAsync(context.homeDir, async (token) => {
       ensureArtifactDirectories(context);
       const inspections = ensureChildDirectory(context, rootPath(context), "inspections");
@@ -1535,7 +1613,7 @@ async function inspectSqliteSnapshotSource(
           try {
             if (!sameInode(scratchIdentity, assertDirectory(context, scratch))
               || !sameInode(inspectionsIdentity, assertDirectory(context, inspections))) throw new InternalSnapshotError("changed");
-            const retainedRoot = `/dev/fd/${scratchFd}`;
+            const retainedRoot = retainedDescriptorPath(context, scratchFd);
             for (const leaf of context.ops.readdir(retainedRoot)) {
               const path = join(retainedRoot, leaf);
               const owned = context.ownedFiles.get(join(scratch, leaf));
@@ -1549,7 +1627,10 @@ async function inspectSqliteSnapshotSource(
             }
             if (!sameInode(scratchIdentity, assertDirectory(context, scratch))
               || !sameInode(inspectionsIdentity, assertDirectory(context, inspections))) throw new InternalSnapshotError("changed");
-            context.ops.rmdir(`/dev/fd/${inspectionsFd}/${basename(scratch)}`);
+            context.ops.rmdir(join(
+              retainedDescriptorPath(context, inspectionsFd),
+              basename(scratch),
+            ));
             context.ops.fsync(inspectionsFd);
           } catch (cleanupError) {
             if (bodyError === undefined) throw cleanupError;
