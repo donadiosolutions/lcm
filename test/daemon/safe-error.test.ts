@@ -474,11 +474,11 @@ describe("sanitizeError", () => {
   });
 
   it.each([
-    ["'file://host'['/private']?x=[https://y.test/p]\\Users\\SECRET", "'file://host'['<path>']?x=[https:<path>]<path>"],
-    ["'file://host'['/private']#x=[http://y.test/p]\\Users\\SECRET", "'file://host'['<path>']#x=[http:<path>]<path>"],
-    ['"file://host["/private"]?x=[http://y.test/p]\\Users\\SECRET', '"file://host["<path>"]?x=[http:<path>]<path>'],
-    ['"file://host["/private"]#x=[https://y.test/p]\\Users\\SECRET', '"file://host["<path>"]#x=[https:<path>]<path>'],
-  ] as const)("redacts backslash tails after bracketed URLs in quoted file queries: %#", (input, expected) => {
+    ["'file://host'['/private']?x=[https://y.test/p]\\Users\\SECRET", "'file://host'['<path>']?x=[https://y.test/p]<path>"],
+    ["'file://host'['/private']#x=[http://y.test/p]\\Users\\SECRET", "'file://host'['<path>']#x=[http://y.test/p]<path>"],
+    ['"file://host["/private"]?x=[http://y.test/p]\\Users\\SECRET', '"file://host["<path>"]?x=[http://y.test/p]<path>'],
+    ['"file://host["/private"]#x=[https://y.test/p]\\Users\\SECRET', '"file://host["<path>"]#x=[https://y.test/p]<path>'],
+  ] as const)("preserves bracketed URLs and redacts their quoted-file tails: %#", (input, expected) => {
     const result = sanitizeError(input);
 
     expect(result).toBe(expected);
@@ -1387,14 +1387,17 @@ describe("sanitizeError", () => {
   it.each([
     [
       "https://outer.test/x?q=file://one.invalid/Users/ahttps://two.invalid/Users/b",
-      "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>",
     ],
     [
       "https://outer.test/x?q=file://one.invalid/Users/a-https://two.invalid/Users/b",
-      "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>",
     ],
-  ] as const)("preserves adjacent non-file scheme residuals: %#", (input, expected) => {
-    expect(sanitizeError(input)).toBe(expected);
+  ] as const)("absorbs adjacent non-file scheme components into active paths: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
   });
 
   it.each([
@@ -2016,34 +2019,236 @@ describe("sanitizeError", () => {
     expect(sanitizeError(firstPass)).toBe(expected);
   });
 
-  // Bug #1234 owns the deliberately excluded zero-label continuation.
-  it("preserves the empty-label forced continuation boundary for Bug #1234", () => {
+  // Bug #1234 extends the admitted continuation grammar to the zero-label form.
+  it("redacts the empty-label forced continuation for Bug #1234", () => {
     const input = "file://host.invalid?x=[a/\\:\\Users\\canary\\private.db]";
-    const expected = "file://host.invalid?x=[a<path>:\\Users\\canary\\private.db]";
+    const expected = "file://host.invalid?x=[a<path>]";
 
-    expect(sanitizeError(input)).toBe(expected);
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  // Leading file-path starts use a distinct classifier and are not fixed by
-  // Bug #1156's forced-scan-only transition.
+  // Leading file-path starts use a distinct classifier from Bug #1156's
+  // forced-scan-only transition. The S8 continuation repair covers both seams.
   it.each([
     [
       "file://host.invalid?x=[\\1:\\Users\\canary\\private.db]",
-      "file://host.invalid?x=[<path>:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[<path>]",
     ],
     [
       "file://host.invalid?x=[\\Ç:\\Users\\canary\\private.db]",
-      "file://host.invalid?x=[<path>:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[<path>]",
     ],
-  ] as const)("preserves leading drive-like classifier scope: %#", (input, expected) => {
-    expect(sanitizeError(input)).toBe(expected);
+  ] as const)("redacts leading drive-like continuations in one pass: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  // Bug #1111 owns the known repeated-pass drift for this nested HTTPS form.
-  it("preserves the nested HTTPS first-pass boundary for Bug #1111", () => {
-    expect(sanitizeError("file://host.invalid?x=[a/b/https://public.test/p]")).toBe(
-      "file://host.invalid?x=[a<path>://public.test/p]",
-    );
+  // Bug #1111's historical nested-HTTPS row now follows the same span-local
+  // scheme-colon rule as Bugs #1243 and #1246.
+  it("converges the historical nested HTTPS row for Bug #1111", () => {
+    const first = sanitizeError("file://host.invalid?x=[a/b/https://public.test/p]");
+
+    expect(first).toBe("file://host.invalid?x=[a<path>]");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  const sanitizerS8CanonicalCases = [
+    [
+      1228,
+      "'file://host'['/private']|https://[fe80::1]/x",
+      "'file://host'['<path>']|https://[fe80::1]/x",
+      ["/private"],
+    ],
+    [
+      1234,
+      "file://host.invalid?x=[a/\\:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+      ["Users", "canary", "private.db"],
+    ],
+    [
+      1234,
+      "file://host.invalid#x=[a/\\:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+      ["Users", "canary", "private.db"],
+    ],
+    [
+      1236,
+      "file://host.invalid?x=[a\\b/\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+      ["Users", "canary", "private.db"],
+    ],
+    [
+      1236,
+      "file://host.invalid#x=[a\\b/\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+      ["Users", "canary", "private.db"],
+    ],
+    [
+      1239,
+      "'file://h'['/private']?a/Users/alice/notes&b/Users/bob/secret.db",
+      "'file://h'['<path>']?a<path>&b<path>",
+      ["Users", "alice", "notes", "bob", "secret.db"],
+    ],
+    [1243, "/Users/a/https://e.test/p", "<path>", ["e.test"]],
+    [1243, "/Users/a//https://e.test/p", "<path>", ["e.test"]],
+    [1243, "/1https://e.test/p", "<path>", ["e.test"]],
+    [1243, "//https://e.test/p", "<path>", ["e.test"]],
+    [
+      1246,
+      "file://host.invalid?x=[a|\\https://y.test/p\\Users\\canary\\private.db",
+      "file://host.invalid?x=[a|<path>",
+      ["y.test", "Users", "canary", "private.db"],
+    ],
+    [
+      1246,
+      "file://host.invalid?x=a\\https://y.test/p\\Users\\canary\\private.db",
+      "file://host.invalid?x=a<path>",
+      ["y.test", "Users", "canary", "private.db"],
+    ],
+    [
+      1260,
+      "file://h?x=[https://[::1]#f]\\Users\\fictional.db",
+      "file://h?x=[https://[::1]#f]<path>",
+      ["fictional.db"],
+    ],
+    [
+      1261,
+      "file://h?x=[a]\\1:\\Users\\fictional.db",
+      "file://h?x=[a]<path>",
+      ["Users", "fictional.db"],
+    ],
+    [
+      1261,
+      "file://h?x=[https://[::1]/p]\\1:\\Users\\fictional.db",
+      "file://h?x=[https://[::1]/p]<path>",
+      ["Users", "fictional.db"],
+    ],
+    [
+      1263,
+      "file://h/p?x=[[a]/b]\\Users\\fictional.db",
+      "file://h<path>?x=[[a]<path>]<path>",
+      ["fictional.db"],
+    ],
+    [
+      1263,
+      "file://h/p?x=[[a]/https://example.test/t]\\Users\\fictional.db",
+      "file://h<path>?x=[[a]<path>]<path>",
+      ["example.test", "fictional.db"],
+    ],
+    [
+      1263,
+      "file://h/p?x=[[a]/http://example.test/t]\\Users\\fictional.db",
+      "file://h<path>?x=[[a]<path>]<path>",
+      ["example.test", "fictional.db"],
+    ],
+    [
+      1263,
+      "file://h/p?x=[[[a]]/https://example.test/t]\\Users\\fictional.db",
+      "file://h<path>?x=[[[a]]<path>]<path>",
+      ["example.test", "fictional.db"],
+    ],
+  ] as const;
+
+  it.each(sanitizerS8CanonicalCases)(
+    "redacts S8 issue #%i private spans in one stable pass: %#",
+    (_issue, input, expected, absent) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected);
+      for (const privateFragment of absent) expect(first).not.toContain(privateFragment);
+      expect(second).toBe(first);
+      expect(third).toBe(first);
+    },
+  );
+
+  it.each([
+    [
+      "'file://host'['/private']|https://[fe80::1]:443/x?q=1",
+      "'file://host'['<path>']|https://[fe80::1]:443/x?q=1",
+    ],
+    [
+      "'file://host'['/private'],https://[fe80::1]:443/x?q=1",
+      "'file://host'['<path>'],https://[fe80::1]:443/x?q=1",
+    ],
+    [
+      "'file://host'['/private'];http://[2001:db8::1]:8080/public/path?q=1",
+      "'file://host'['<path>'];http://[2001:db8::1]:8080/public/path?q=1",
+    ],
+    ["http://[2001:db8::1]/public/path", "http://[2001:db8::1]/public/path"],
+    [
+      "'file://host'['/private'] https://[fe80::1]/x",
+      "'file://host'['<path>'] https://[fe80::1]/x",
+    ],
+  ] as const)("keeps S8 quoted-file public URL boundaries: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+  });
+
+  it.each([
+    ["file://h?x=[a]\\C:\\Users\\fictional.db", "file://h?x=[a]<path>"],
+    ["file://h?x=[a]\\1:\\Users\\fictional.db", "file://h?x=[a]<path>"],
+    ["file://h?x=[a]\\Ç:\\Users\\fictional.db", "file://h?x=[a]<path>"],
+    ["file://h?x=[a]\\\\1:\\Users\\fictional.db", "file://h?x=[a]<path>"],
+    [
+      "file://h?x=[a]\\!:\\Users\\fictional.db",
+      "file://h?x=[a]\\!:\\Users\\fictional.db",
+    ],
+    [
+      "file://h?x=[a]\\AB:\\Users\\fictional.db",
+      "file://h?x=[a]<path>:\\Users\\fictional.db",
+    ],
+    [
+      "file://h?x=[a]\\12:\\Users\\fictional.db",
+      "file://h?x=[a]<path>:\\Users\\fictional.db",
+    ],
+    [
+      "file://h?x=[a]\\C:note\\Users\\fictional.db",
+      "file://h?x=[a]<path>:note\\Users\\fictional.db",
+    ],
+  ] as const)("keeps S8 post-wrapper drive grammar narrow: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "'file://h'['/private']?a/Users/alice&https://example.test/x",
+      "'file://h'['<path>']?a<path>&https://example.test/x",
+    ],
+    [
+      "'file://h'['/private']?a/Users/alice&file://two.invalid/Users/b",
+      "'file://h'['<path>']?a<path>&file://two.invalid<path>",
+    ],
+    ["/Users/a/https://e.test/p | https://public.test/x", "<path> | https://public.test/x"],
+    ["'/Users/a/https://e.test/p'", "'<path>'"],
+    ["/Users/a/file://nested.invalid/p", "<path>"],
+    ["/Users/a/file:/nested/p", "<path>"],
+    [
+      "file://h/p?x=[https://example.test/t]",
+      "file://h<path>?x=[https://example.test/t]",
+    ],
+    ["file://h/p?x=plain", "file://h<path>?x=plain"],
+  ] as const)("keeps S8 public and nested span boundaries: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
   it.each([

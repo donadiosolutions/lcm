@@ -94,6 +94,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let pendingNestedUrlContinuation = false;
   let queryOrFragment = false;
   let queryOrFragmentStart = -1;
+  let nestedPublicUrlBracketDepth = 0;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
@@ -114,6 +115,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedPathEndedSeparator = -1;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
+      nestedPublicUrlBracketDepth = 0;
       if (!preservesClosedBracketHandoff) {
         fileTailBracketDepth = 0;
         pendingFileTailBackslash = false;
@@ -134,7 +136,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         }
       } else {
         const continuesNestedUrl =
-          pendingNestedUrlContinuation && (char === "/" || char === ":" || char === "?");
+          pendingNestedUrlContinuation && (char === "/" || char === ":" || char === "?" || char === "#");
         pendingFileTailBackslash = false;
         pendingNestedUrlContinuation = false;
         if (!fileTailBoundaryEvent && !continuesNestedUrl) fileTailBracketDepth = 0;
@@ -163,6 +165,17 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       queryOrFragmentStart = index;
       if (startsQuotedQueryTail) quotedQueryTail = true;
     }
+    if (
+      char === "&" &&
+      startsUrlSchemeLiteral(chars, index + 1) &&
+      !isFileUrlLiteral(chars, index + 1)
+    ) {
+      // A fresh public URL ends quoted-query provenance without ending an
+      // ordinary private ampersand parameter continuation.
+      quotedPathEnded = false;
+      quotedQueryTail = false;
+      quotedPathEndedSeparator = -1;
+    }
     const nestedFileSchemeStart = isNestedFileUrlStart(chars, index)
       ? index + 1
       : queryOrFragment &&
@@ -180,6 +193,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       restartedPathlessFile = false;
       quotedQueryTail = false;
       restartedPathlessBrackets = 0;
+      nestedPublicUrlBracketDepth = 0;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = quoteCode(chars[nestedFileSchemeStart - 1]);
@@ -208,9 +222,21 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (separator >= 0 && char === "]" && brackets > 0) {
       const closesFilePathWrapper = foundFilePath && brackets === filePathBracketDepth;
       brackets -= 1;
+      if (nestedPublicUrlBracketDepth > brackets) nestedPublicUrlBracketDepth = 0;
       if (closesFilePathWrapper) {
         filePathBracketDepth = brackets;
         if (chars[index + 1] === "/" || chars[index + 1] === "\\") foundFilePath = false;
+      }
+      if (
+        exactFileScheme &&
+        !foundFilePath &&
+        brackets === 0 &&
+        schemeQuote !== 0 &&
+        quoteCode(chars[index - 1]) === schemeQuote
+      ) {
+        quotedPathEnded = true;
+        quotedPathEndedSeparator = separator;
+        schemeQuote = 0;
       }
       continue;
     }
@@ -233,10 +259,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       fileSchemeLength = 0;
       schemeQuote = 0;
       restartedPathlessFile = true;
+      quotedPathEnded = false;
+      quotedPathEndedSeparator = -1;
       restartedPathlessBrackets = 0;
       fileTailBracketDepth = 0;
       pendingFileTailBackslash = false;
       pendingNestedUrlContinuation = false;
+      nestedPublicUrlBracketDepth = 0;
       continue;
     }
     if (
@@ -248,6 +277,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryTail = false;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
+      nestedPublicUrlBracketDepth = 0;
     }
     // Conservatively keep supported punctuation and embedded double quotes in
     // an exact file URL authority until the first path separator. A matching
@@ -258,6 +288,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     const fileAuthorityDelimiter =
       exactFileScheme &&
       !foundFilePath &&
+      !quotedPathEnded &&
       (char === '"' || FILE_URL_AUTHORITY_DELIMITERS.has(char)) &&
       !(
         schemeQuote !== 0 &&
@@ -293,12 +324,28 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath = false;
       filePathBracketDepth = 0;
       restartedPathlessFile = false;
+      quotedPathEnded = false;
       quotedQueryTail = false;
+      quotedPathEndedSeparator = -1;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
+      nestedPublicUrlBracketDepth = 0;
       continue;
     }
     if (separator >= 0) {
+      if (
+        exactFileScheme &&
+        foundFilePath &&
+        queryOrFragmentStart > separator &&
+        brackets > 0 &&
+        isUrlSchemeColon(chars, index, queryOrFragmentStart + 1)
+      ) {
+        // Preserve a public URL admitted independently inside the query. A
+        // forced slash before its scheme still owns the enclosing private span.
+        authority[index + 1] = 1;
+        authority[index + 2] = 1;
+        nestedPublicUrlBracketDepth = brackets;
+      }
       if (
         quotedQueryTail &&
         brackets === 0 &&
@@ -307,7 +354,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         !startsUrlSchemeLiteral(chars, index + 1)
       ) {
         forcedPath[index] = 1;
-        quotedQueryTail = false;
+        continue;
+      }
+      if (
+        exactFileScheme &&
+        foundFilePath &&
+        queryOrFragmentStart > separator &&
+        isNestedBracketPathStart(char, brackets, nestedPublicUrlBracketDepth > 0)
+      ) {
+        forcedPath[index] = 1;
         continue;
       }
       if (char === "/" && !quotedPathEnded) authority[index] = 1;
@@ -330,7 +385,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       }
       continue;
     }
-    if (restartedPathlessFile && restartedPathlessBrackets > 0 && char === "/") {
+    if (restartedPathlessFile && isNestedBracketPathStart(char, restartedPathlessBrackets, false)) {
       forcedPath[index] = 1;
       schemeLength = 0;
       fileSchemeLength = 0;
@@ -413,6 +468,28 @@ function startsUrlSchemeLiteral(chars: readonly string[], index: number): boolea
   return chars[cursor] === ":" && chars[cursor + 1] === "/" && chars[cursor + 2] === "/";
 }
 
+function isUrlSchemeColon(chars: readonly string[], index: number, lowerBound: number): boolean {
+  if (chars[index] !== ":" || chars[index + 1] !== "/" || chars[index + 2] !== "/") return false;
+  let start = index;
+  while (start > lowerBound && URL_SCHEME_CHARACTER_PATTERN.test(chars[start - 1] ?? "")) start -= 1;
+  return URL_SCHEME_START_PATTERN.test(chars[start] ?? "");
+}
+
+function isSpanLocalSchemeColon(chars: readonly string[], start: number, index: number): boolean {
+  if (chars[index] !== ":" || chars[index + 1] !== "/" || chars[index + 2] !== "/") return false;
+  let cursor = index - 1;
+  let hasSchemeLetter = false;
+  while (cursor >= start && URL_SCHEME_CHARACTER_PATTERN.test(chars[cursor] ?? "")) {
+    if (URL_SCHEME_START_PATTERN.test(chars[cursor] ?? "")) hasSchemeLetter = true;
+    cursor -= 1;
+  }
+  return hasSchemeLetter;
+}
+
+function isNestedBracketPathStart(char: string, depth: number, insidePublicUrl: boolean): boolean {
+  return char === "/" && depth > 0 && !insidePublicUrl;
+}
+
 function isDoubledDriveColonInPath(chars: readonly string[], index: number, windows: boolean): boolean {
   const boundary = chars[index - 2];
   return (
@@ -446,11 +523,12 @@ function fileUrlDriveColonIndex(chars: readonly string[], start: number): number
   return -1;
 }
 
-function forcedDriveContinuationColonIndex(chars: readonly string[], index: number): number {
-  if (!isPathWord(chars[index + 1])) return -1;
-  if (chars[index + 2] !== ":") return -1;
-  if (chars[index + 3] !== "/" && chars[index + 3] !== "\\") return -1;
-  return index + 2;
+function pathDriveContinuationColonIndex(chars: readonly string[], index: number): number {
+  // Continuations admit an empty label or one path-word code point only.
+  const colonIndex = isPathWord(chars[index + 1]) ? index + 2 : index + 1;
+  if (chars[colonIndex] !== ":") return -1;
+  if (chars[colonIndex + 1] !== "/" && chars[colonIndex + 1] !== "\\") return -1;
+  return colonIndex;
 }
 
 function forcedSeparatorRunHasBackslash(chars: readonly string[], start: number): boolean {
@@ -468,7 +546,7 @@ function scanAbsolutePath(
   start: number,
   windows: boolean,
   driveColonIndex: number,
-  allowForcedDriveContinuation: boolean,
+  allowPathDriveContinuation: boolean,
   nestedFileSchemeStarts: Uint8Array,
   quote?: string,
 ): { end: number; sawNonSeparator: boolean } {
@@ -479,9 +557,8 @@ function scanAbsolutePath(
   let brackets = 0;
   let sawPathCharacter = false;
   let sawNonSeparator = false;
-  const slashPrefixedUrlPath =
-    quote === undefined && chars[start] === "/" && startsUrlSchemeLiteral(chars, start + 1);
   let singleSlashFileTail = false;
+  let spanLocalUrlComponent = false;
   while (index < chars.length) {
     const char = chars[index];
     if (quote === undefined && nestedFileSchemeStarts[index] === 1) break;
@@ -551,8 +628,8 @@ function scanAbsolutePath(
       index = cursor;
       continue;
     }
-    if (allowForcedDriveContinuation && char === "\\") {
-      const continuationColonIndex = forcedDriveContinuationColonIndex(chars, index);
+    if (allowPathDriveContinuation && char === "\\") {
+      const continuationColonIndex = pathDriveContinuationColonIndex(chars, index);
       if (continuationColonIndex >= 0) {
         windowsContext = true;
         activeDriveColonIndex = continuationColonIndex;
@@ -570,8 +647,13 @@ function scanAbsolutePath(
       index += 1;
       continue;
     }
-    if (slashPrefixedUrlPath && char === ":") {
+    if (quote === undefined && isSpanLocalSchemeColon(chars, start, index)) {
+      spanLocalUrlComponent = true;
       sawNonSeparator = true;
+      index += 1;
+      continue;
+    }
+    if (spanLocalUrlComponent && char === ":") {
       index += 1;
       continue;
     }
@@ -659,7 +741,7 @@ function sanitizeAbsolutePaths(message: string): string {
       start,
       windows,
       driveColonIndex,
-      forcedPath,
+      forcedPath || fileUrl,
       urlPathStarts.nestedFileSchemeStarts,
       quote,
     );
