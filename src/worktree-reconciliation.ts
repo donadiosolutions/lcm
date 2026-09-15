@@ -885,6 +885,19 @@ function assertSupportedPromotedContent(db: DatabaseSync): void {
   }
 }
 
+function assertSupportedMessageContent(db: DatabaseSync): void {
+  if (!tableExists(db, "messages")) return;
+  const unsupported = db.prepare(
+    `SELECT 1
+     FROM messages
+     WHERE typeof(content) <> 'text' OR instr(content, char(0)) > 0
+     LIMIT 1`,
+  ).get();
+  if (unsupported !== undefined) {
+    throw new Error("stored message content is unsupported");
+  }
+}
+
 function hasCompletedMainSource(targetPath: string, sourceHash: string): boolean {
   if (!isRegularFile(targetPath)) return false;
   const target = new DatabaseSync(targetPath, { readOnly: true });
@@ -1570,7 +1583,10 @@ function mergeMainDatabase(
     source,
     commitFence,
   ) => {
-    if (!sourceWasMerged) assertSupportedPromotedContent(source);
+    if (!sourceWasMerged) {
+      assertSupportedPromotedContent(source);
+      assertSupportedMessageContent(source);
+    }
     commitFence();
     assertTarget();
     return withNormalizedMainSnapshot(
@@ -1610,8 +1626,12 @@ function mergeMainDatabase(
               assertTarget();
               return;
             }
-            if (sourceWasMerged) assertSupportedPromotedContent(normalizedSource);
+            if (sourceWasMerged) {
+              assertSupportedPromotedContent(normalizedSource);
+              assertSupportedMessageContent(normalizedSource);
+            }
             assertSupportedPromotedContent(target);
+            assertSupportedMessageContent(target);
             for (const conversation of rows(
               normalizedSource,
               "SELECT * FROM conversations ORDER BY conversation_id",
