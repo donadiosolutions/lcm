@@ -1170,6 +1170,7 @@ function readControl(context: Context, path: string): RecordValue {
   let value: unknown;
   try { value = JSON.parse(readSmallFile(context, path).toString("utf8")); } catch (error) {
     if (error instanceof InternalSnapshotError) throw error;
+    if (isUnsupportedPlatformCapabilityFailure(error)) throw error;
     throw new InternalSnapshotError("invalid", { cause: error });
   }
   if (!isRecord(value) || typeof value.checksumSha256 !== "string" || !HASH.test(value.checksumSha256)) {
@@ -1375,7 +1376,6 @@ function mapClassificationError(
   if (isUnsupportedPlatformCapabilityFailure(error)) {
     throw new SqliteSnapshotError("unsupported-platform", undefined, { cause: error });
   }
-  if (error instanceof SqliteSnapshotError) throw error;
   return { state: "tampered", generationId };
 }
 
@@ -1387,6 +1387,13 @@ export async function classifySqliteSnapshotArtifact(
   const context = contextFor({ ...options, generationId });
   try {
     admitDescriptorPlatform(context);
+  } catch (error) {
+    if (isUnsupportedPlatformCapabilityFailure(error)) {
+      throw new SqliteSnapshotError("unsupported-platform", undefined, { cause: error });
+    }
+    throw new SqliteSnapshotError("snapshot-io", undefined, { cause: error });
+  }
+  try {
     return classifyInternal(context, generationId);
   } catch (error) {
     return mapClassificationError(error, generationId);

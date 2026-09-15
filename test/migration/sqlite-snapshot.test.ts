@@ -45,7 +45,10 @@ import {
   type SqliteSnapshotOperations,
   type SqliteSnapshotSourceByteWitness,
 } from "../../src/migration/sqlite-snapshot.js";
-import { UnsupportedPlatformCapabilityError } from "../../src/security-files.js";
+import {
+  PrivateDirectoryTopologyError,
+  UnsupportedPlatformCapabilityError,
+} from "../../src/security-files.js";
 
 const HASH = "a".repeat(64);
 const MACHINE_ID = "018f0b5d-1234-4abc-8def-1234567890ab";
@@ -316,14 +319,19 @@ describe("authenticated SQLite snapshot artifacts", () => {
     for (const code of ["EACCES", "EIO"] as const) {
       const fixture = sourceFixture();
       const failure = Object.assign(new Error(`descriptor ${code}`), { code });
+      const operations = {
+        readdir: (path: string) => {
+          if (path === "/proc/self/fd") throw failure;
+          return readdirSync(path);
+        },
+      } satisfies Partial<SqliteSnapshotOperations>;
       await expect(dryRunSqliteSnapshotArtifact(fixture.authority, {
         homeDir: fixture.homeDir,
-        _operationsForTesting: {
-          readdir: (path) => {
-            if (path === "/proc/self/fd") throw failure;
-            return readdirSync(path);
-          },
-        },
+        _operationsForTesting: operations,
+      })).rejects.toMatchObject({ reason: "snapshot-io", cause: failure });
+      await expect(classifySqliteSnapshotArtifact("generation-1", {
+        homeDir: fixture.homeDir,
+        _operationsForTesting: operations,
       })).rejects.toMatchObject({ reason: "snapshot-io", cause: failure });
     }
 
@@ -338,6 +346,33 @@ describe("authenticated SQLite snapshot artifacts", () => {
         },
       },
     })).rejects.toMatchObject({ reason: "snapshot-io", cause: closeFailure });
+    await expect(classifySqliteSnapshotArtifact("generation-1", {
+      homeDir: cleanupOnly.homeDir,
+      _operationsForTesting: {
+        close: (fd) => {
+          closeSync(fd);
+          throw closeFailure;
+        },
+      },
+    })).rejects.toMatchObject({ reason: "snapshot-io", cause: closeFailure });
+
+    const topology = sourceFixture();
+    await expect(classifySqliteSnapshotArtifact("generation-1", {
+      homeDir: topology.homeDir,
+      _operationsForTesting: {
+        stat: (path) => {
+          const actual = statSync(path, { bigint: true });
+          return new Proxy(actual, {
+            get: (value, property) => property === "dev"
+              ? value.dev + 1n
+              : Reflect.get(value, property, value),
+          });
+        },
+      },
+    })).rejects.toMatchObject({
+      reason: "snapshot-io",
+      cause: expect.any(PrivateDirectoryTopologyError),
+    });
 
     const combined = sourceFixture();
     const unavailable = Object.assign(new Error("namespace disappeared"), {
@@ -380,9 +415,35 @@ describe("authenticated SQLite snapshot artifacts", () => {
     expect(calls).toBeGreaterThan(1);
   });
 
+  it("preserves UID capability refusal while reading a checked control", async () => {
+    const fixture = await heldFixture();
+    await captureFixture(fixture);
+    let controlOpened = false;
+    await expect(classifySqliteSnapshotArtifact("generation-1", {
+      homeDir: fixture.homeDir,
+      _operationsForTesting: {
+        open: (path, flags, mode) => {
+          const fd = mode === undefined ? openSync(path, flags) : openSync(path, flags, mode);
+          if (path.endsWith("/registrations/generation-1.intent.json")) controlOpened = true;
+          return fd;
+        },
+        getuid: () => {
+          if (controlOpened) {
+            throw new UnsupportedPlatformCapabilityError("UID capability disappeared");
+          }
+          return process.getuid!();
+        },
+      },
+    })).rejects.toMatchObject({ reason: "unsupported-platform" });
+    expect(controlOpened).toBe(true);
+  });
+
   it("keeps supported missing-home classification absent for a 0755 home", async () => {
     const homeDir = join(mkdtempSync(join(tmpdir(), "lcm-snapshot-parent-")), "missing-home");
     roots.push(join(homeDir, ".."));
+    mkdirSync(homeDir, { mode: 0o755 });
+    chmodSync(homeDir, 0o755);
+    expect(statSync(homeDir).mode & 0o777).toBe(0o755);
     expect(await classifySqliteSnapshotArtifact("generation-1", { homeDir }))
       .toEqual({ state: "absent" });
   });
@@ -1290,20 +1351,25 @@ describe("authenticated SQLite snapshot artifacts", () => {
 
   it("refuses non-EBADF descriptor inspection failures before opening SQLite", async () => {
     const fixture = await heldFixture();
-    let inventory = false;
+    let inventories = 0;
+    let fstats = 0;
     let opened = false;
     await expect(captureFixture(fixture, {
       readdir: (path) => {
-        if (path === "/proc/self/fd") inventory = true;
+        if (path === "/proc/self/fd") inventories += 1;
         return readdirSync(path);
       },
       fstat: (fd) => {
-        if (inventory) throw Object.assign(new Error("descriptor stat failed"), { code: "EIO" });
+        fstats += 1;
+        if (inventories > 1) {
+          throw Object.assign(new Error("descriptor stat failed"), { code: "EIO" });
+        }
         return fstatSync(fd, { bigint: true });
       },
       openDatabase: () => { opened = true; throw new Error("unexpected SQLite open"); },
     })).rejects.toMatchObject({ reason: "snapshot-io" });
-    expect(inventory).toBe(true);
+    expect(inventories).toBe(2);
+    expect(fstats).toBeGreaterThan(1);
     expect(opened).toBe(false);
   });
 
@@ -1373,7 +1439,6 @@ describe("authenticated SQLite snapshot artifacts", () => {
 
   it("fails closed when a source open fails and its descriptor cannot close", async () => {
     const fixture = sourceFixture();
-    let fstatCalls = 0;
     let rejectedFd: number | undefined;
     await expect(withBackendPublicationConsumerLockAsync(
       fixture.homeDir,
@@ -1381,12 +1446,16 @@ describe("authenticated SQLite snapshot artifacts", () => {
         homeDir: fixture.homeDir,
         lockToken,
         _operationsForTesting: {
+          open: (path, flags, mode) => {
+            const fd = mode === undefined ? openSync(path, flags) : openSync(path, flags, mode);
+            if (path === fixture.authority.projectDbPath) rejectedFd = fd;
+            return fd;
+          },
           fstat: (fd) => {
             const actual = fstatSync(fd, { bigint: true });
-            fstatCalls += 1;
-            if (fstatCalls !== 2) return actual;
-            rejectedFd = fd;
-            return new Proxy(actual, { get: (stat, property) => property === "mode" ? 0o644n : Reflect.get(stat, property, stat) });
+            return fd === rejectedFd
+              ? new Proxy(actual, { get: (stat, property) => property === "mode" ? 0o644n : Reflect.get(stat, property, stat) })
+              : actual;
           },
           close: (fd) => {
             closeSync(fd);
@@ -1396,6 +1465,7 @@ describe("authenticated SQLite snapshot artifacts", () => {
       }),
       { allowUnresolved: true },
     )).rejects.toMatchObject({ reason: "snapshot-io" });
+    expect(rejectedFd).toBeDefined();
   });
 
   it("detects retained parent identity change after source reads", async () => {

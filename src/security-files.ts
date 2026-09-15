@@ -295,24 +295,26 @@ export function admitDescriptorPlatformCapabilities(
   const ops = { ...DEFAULT_DESCRIPTOR_CAPABILITY_OPERATIONS, ...operations };
   const uid = requireSupportedProcessUid(ops.getuid);
   const fd = ops.open(probeDirectory, PRIVATE_DIRECTORY_OPEN_FLAGS);
+  let hasPrimaryError = false;
   let primaryError: unknown;
   try {
     authenticatedDescriptorEntries(ops);
     retainedDirectoryDescriptorPath(fd, ops);
   } catch (error) {
+    hasPrimaryError = true;
     primaryError = error;
   }
   try {
     ops.close(fd);
   } catch (closeError) {
-    if (primaryError === undefined) throw closeError;
+    if (!hasPrimaryError) throw closeError;
     throw new AggregateError(
       [primaryError, closeError],
       "descriptor capability admission and probe cleanup failed",
       { cause: primaryError },
     );
   }
-  if (primaryError !== undefined) throw primaryError;
+  if (hasPrimaryError) throw primaryError;
   return uid;
 }
 

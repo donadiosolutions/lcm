@@ -9,7 +9,6 @@ import {
   isUnsupportedPlatformCapabilityFailure,
   assertPrivateDirectoryEntry, openPrivateDirectory, readBoundedRegularFileWithStat,
   retainedDirectoryDescriptorPath,
-  requireSupportedProcessUid,
   syncPrivateDirectory,
   type DescriptorCapabilityOperations,
 } from "../security-files.js";
@@ -66,20 +65,12 @@ function mapQueueCapabilityError(error: unknown): never {
 function admitQueueCapabilities(
   homeDir: string,
   operations: ImmutableReaderOperations,
-  traversal: boolean,
 ): number {
   try {
-    if (traversal) {
-      return admitDescriptorPlatformCapabilities(
-        parse(homeDir).root,
-        operations._capabilitiesForTesting,
-      );
-    }
-    const uid = requireSupportedProcessUid(
-      operations._capabilitiesForTesting?.getuid ?? process.getuid,
+    return admitDescriptorPlatformCapabilities(
+      parse(homeDir).root,
+      operations._capabilitiesForTesting,
     );
-    authenticatedDescriptorEntries(operations._capabilitiesForTesting);
-    return uid;
   } catch (error) {
     mapQueueCapabilityError(error);
   }
@@ -155,7 +146,7 @@ export async function withMigrationQueueEvidence<T>(
   _operationsForTesting: ImmutableReaderOperations = {},
 ): Promise<T> {
   const verified = await inspectSqliteSnapshotArtifact(artifact.generationId, { homeDir });
-  admitQueueCapabilities(homeDir, _operationsForTesting, true);
+  admitQueueCapabilities(homeDir, _operationsForTesting);
   if (canonicalJson(verified) !== canonicalJson(artifact)) throw new Error("migration artifact authority is invalid");
   const authority = artifact.authority;
   if (authority.projectIdentity.scope !== "local" || maintenance.roster.length !== 1
@@ -277,7 +268,7 @@ export async function sealMigrationQueueEvidence(
   revalidateAuthority: () => void,
   _operationsForTesting: ImmutableReaderOperations = {},
 ): Promise<AuthenticatedSqliteMigrationSnapshot> {
-  admitQueueCapabilities(homeDir, _operationsForTesting, true);
+  admitQueueCapabilities(homeDir, _operationsForTesting);
   const root = join(homeDir, ".lcm", "migration-evidence");
   try { mkdirSync(root, { mode: 0o700 }); syncPrivateDirectory(join(homeDir, ".lcm")); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -363,7 +354,7 @@ export async function inspectAuthenticatedSqliteMigrationSnapshot(
   // The physical inspector authenticates generation syntax and all original
   // artifact identities before the evidence path is constructed.
   const artifact = await inspectSqliteSnapshotArtifact(generationId, { homeDir });
-  const expectedUid = admitQueueCapabilities(homeDir, _operationsForTesting, true);
+  const expectedUid = admitQueueCapabilities(homeDir, _operationsForTesting);
   const path = evidencePath(homeDir, generationId);
   const root = join(homeDir, ".lcm", "migration-evidence");
   const rootHandle = openPrivateDirectory(root);

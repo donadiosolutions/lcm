@@ -166,6 +166,43 @@ describe("private filesystem primitives", () => {
     expect(() => authenticatedDescriptorEntries({
       readdir: () => { throw denied; },
     })).toThrow(denied);
+    const typed = new UnsupportedPlatformCapabilityError("already classified");
+    expect(() => authenticatedDescriptorEntries({
+      readdir: () => { throw typed; },
+    })).toThrow(typed);
+  });
+
+  it.each([
+    ["retained descriptor", "expected-directory"],
+    ["namespace target", "actual-directory"],
+    ["device identity", "device"],
+    ["inode identity", "inode"],
+  ] as const)("rejects mismatched retained-directory %s topology", (_label, mismatch) => {
+    const root = makeRoot();
+    const fd = openSync(root, constants.O_RDONLY | constants.O_DIRECTORY);
+    const actual = fstatSync(fd, { bigint: true });
+    const proxy = (target: typeof actual, property: PropertyKey, value: unknown) =>
+      new Proxy(target, {
+        get: (stat, name) => name === property ? value : Reflect.get(stat, name, stat),
+      });
+    try {
+      expect(() => retainedDirectoryDescriptorPath(fd, {
+        fstat: () => mismatch === "expected-directory"
+          ? proxy(actual, "isDirectory", () => false)
+          : actual,
+        readlink: () => root,
+        stat: () => {
+          if (mismatch === "actual-directory") {
+            return proxy(actual, "isDirectory", () => false);
+          }
+          if (mismatch === "device") return proxy(actual, "dev", actual.dev + 1n);
+          if (mismatch === "inode") return proxy(actual, "ino", actual.ino + 1n);
+          return actual;
+        },
+      })).toThrow(PrivateDirectoryTopologyError);
+    } finally {
+      closeSync(fd);
+    }
   });
 
   it("validates UID results and preserves descriptor-probe cleanup failures", () => {
@@ -204,6 +241,38 @@ describe("private filesystem primitives", () => {
     ]);
     expect((aggregate as AggregateError).cause)
       .toBeInstanceOf(UnsupportedPlatformCapabilityError);
+  });
+
+  it("preserves an undefined descriptor-probe failure with and without cleanup failure", () => {
+    const root = makeRoot();
+    let threw = false;
+    let thrown: unknown = "not thrown";
+    try {
+      admitDescriptorPlatformCapabilities(root, {
+        readlink: () => { throw undefined; },
+      });
+    } catch (error) {
+      threw = true;
+      thrown = error;
+    }
+    expect(threw).toBe(true);
+    expect(thrown).toBeUndefined();
+
+    const closeFailure = new Error("probe close failed");
+    try {
+      admitDescriptorPlatformCapabilities(root, {
+        readlink: () => { throw undefined; },
+        close: (fd) => {
+          closeSync(fd);
+          throw closeFailure;
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(AggregateError);
+    expect((thrown as AggregateError).errors).toEqual([undefined, closeFailure]);
+    expect((thrown as AggregateError).cause).toBeUndefined();
   });
 
   it("publishes through a borrowed parent without repairing or closing it", () => {

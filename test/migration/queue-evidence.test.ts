@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -179,6 +179,48 @@ describe("immutable migration queue evidence", () => {
       },
     )).rejects.toMatchObject({ reason: "unsupported-platform" });
     expect(inventories).toBe(2);
+  });
+
+  it("preserves non-capability admission and retained-traversal failures", async () => {
+    const admitted = await fixture();
+    const admissionFailure = Object.assign(new Error("descriptor inventory failed"), {
+      code: "EIO",
+    });
+    await expect(withMigrationQueueEvidence(
+      admitted.home,
+      admitted.artifact,
+      admitted.maintenance,
+      async () => undefined,
+      {
+        _capabilitiesForTesting: {
+          readdir: () => { throw admissionFailure; },
+        },
+      },
+    )).rejects.toBe(admissionFailure);
+
+    const traversed = await fixture();
+    const evidence = await read(traversed);
+    const traversalFailure = Object.assign(new Error("descriptor traversal failed"), {
+      code: "EIO",
+    });
+    let traversals = 0;
+    await expect(sealMigrationQueueEvidence(
+      traversed.home,
+      traversed.artifact,
+      evidence.reference,
+      evidence.records,
+      () => undefined,
+      {
+        _capabilitiesForTesting: {
+          readlink: (path) => {
+            traversals += 1;
+            if (traversals > 1) throw traversalFailure;
+            return readlinkSync(path);
+          },
+        },
+      },
+    )).rejects.toBe(traversalFailure);
+    expect(traversals).toBe(2);
   });
 
   it("streams exact represented and retained records and authenticates retries", async () => {
@@ -464,11 +506,19 @@ describe("immutable migration queue evidence", () => {
   });
 
   it("refuses ambiguous descriptor inventory and closes the opened immutable reader", async () => {
-    const input = await fixture(); let database: DatabaseSync | undefined;
+    const input = await fixture(); let database: DatabaseSync | undefined; let inventories = 0;
     await expect(withMigrationQueueEvidence(input.home, input.artifact, input.maintenance, async () => undefined, {
       descriptors: () => [],
+      _capabilitiesForTesting: {
+        readdir: (path) => {
+          inventories += 1;
+          if (inventories > 1) throw new Error("explicit descriptors seam lost precedence");
+          return readdirSync(path);
+        },
+      },
       openDatabase: (uri) => { database = new DatabaseSync(uri, { readOnly: true }); return database; },
     })).rejects.toThrow("immutable reader opened a replaced artifact");
+    expect(inventories).toBe(1);
     expect(() => database!.prepare("SELECT 1")).toThrow();
   });
   it.each(["witness", "directory", "page reference", "page content", "fractional records"])("refuses noncanonical %s shape even after rechecksumming", async (kind) => {
