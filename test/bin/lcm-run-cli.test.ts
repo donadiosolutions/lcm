@@ -1857,6 +1857,121 @@ describe("runCli daemon-backed and utility actions", () => {
     expect(consoleError).toHaveBeenCalledWith(`  ${FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC}`);
   });
 
+  it("refuses retained publication evidence drift before managed restart", async () => {
+    configureCanonicalRestartFixture();
+    const config = state.loadConfig() as unknown as DaemonConfig;
+    const admissions = ["accepted", "accepted", "changed", "changed"];
+    state.restartDaemon.mockImplementationOnce(async (restartOptions: {
+      _validateBeforeManagedRestart?: () => void;
+    }) => {
+      restartOptions._validateBeforeManagedRestart?.();
+      return { connected: true, restarted: true, spawned: false, pid: 42 };
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    expect((await invoke(["daemon", "restart"], {
+      migrate: () => { throw new PrivateMutationLockContentionError("publication busy"); },
+      sleep: async () => undefined,
+      _readDaemonConfigSnapshot: () => restartSnapshot(config),
+      _assertBackendPublicationConfigReadAccess: () => ({
+        journalChecksumSha256: admissions.shift()!,
+      }),
+      _withBackendPublicationReadRoot: (_homeDir, callback) => callback(() => undefined),
+    }))?.message).toBe("exit:1");
+
+    expect(admissions).toEqual([]);
+    expect(consoleError).toHaveBeenCalledWith(`  ${FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC}`);
+  });
+
+  it("refuses a relative publication home that changes before managed restart", async () => {
+    const originalCwd = process.cwd();
+    const nextCwd = actualFs.mkdtempSync(join(foregroundFixtureRoot!, "restart-cwd-"));
+    state.runtimeHome = "relative-home";
+    state.runtimePidPath = join("relative-home", ".lcm", "daemon.pid");
+    const config = state.loadConfig() as unknown as DaemonConfig;
+    state.restartDaemon.mockImplementationOnce(async (restartOptions: {
+      _validateBeforeManagedRestart?: () => void;
+    }) => {
+      process.chdir(nextCwd);
+      restartOptions._validateBeforeManagedRestart?.();
+      return { connected: true, restarted: true, spawned: false, pid: 42 };
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      expect((await invoke(["daemon", "restart"], {
+        migrate: () => { throw new PrivateMutationLockContentionError("publication busy"); },
+        sleep: async () => undefined,
+        _readDaemonConfigSnapshot: () => restartSnapshot(config),
+        _assertBackendPublicationConfigReadAccess: () => ({ journalChecksumSha256: null }),
+        _withBackendPublicationReadRoot: (_homeDir, callback) => callback(() => undefined),
+      }))?.message).toBe("exit:1");
+    } finally {
+      process.chdir(originalCwd);
+      actualFs.rmSync(nextCwd, { recursive: true, force: true });
+    }
+
+    expect(consoleError).toHaveBeenCalledWith(`  ${FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC}`);
+  });
+
+  it.each([
+    ["initial load", undefined],
+    ["observational load", new PrivateMutationLockContentionError("publication busy")],
+  ] as const)("sanitizes an unknown %s restart configuration failure", async (_name, contention) => {
+    configureCanonicalRestartFixture();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    expect((await invoke(["daemon", "restart"], {
+      migrate: () => {
+        if (contention === undefined) throw new Error("SECRET_INITIAL");
+        throw contention;
+      },
+      sleep: async () => undefined,
+      ...(contention === undefined ? {} : {
+        _readDaemonConfigSnapshot: () => { throw new Error("SECRET_OBSERVATION"); },
+      }),
+    }))?.message).toBe("exit:1");
+
+    expect(consoleError).toHaveBeenCalledWith(
+      "  lcm daemon unavailable (ambiguous); run 'lcm daemon restart' or 'lcm doctor'.",
+    );
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain("SECRET_");
+  });
+
+  it.each([
+    ["port", { daemon: { port: 43_338 }, storage: { backend: "sqlite" as const } }],
+    ["backend", { daemon: { port: 43_337 }, storage: { backend: "postgresql" as const } }],
+  ] as const)("refuses %s drift discovered immediately before managed restart", async (_name, observed) => {
+    configureCanonicalRestartFixture();
+    const requested = {
+      ...(state.loadConfig() as unknown as DaemonConfig),
+      daemon: { ...(state.loadConfig() as unknown as DaemonConfig).daemon, port: 43_337 },
+      storage: { ...(state.loadConfig() as unknown as DaemonConfig).storage, backend: "sqlite" as const },
+    };
+    state.loadConfig.mockReturnValueOnce(requested);
+    state.restartDaemon.mockImplementationOnce(async (restartOptions: {
+      _validateBeforeManagedRestart?: () => void;
+    }) => {
+      restartOptions._validateBeforeManagedRestart?.();
+      return { connected: true, restarted: true, spawned: false, pid: 42 };
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    expect((await invoke(["daemon", "restart"], {
+      migrate: vi.fn(),
+      sleep: async () => undefined,
+      _readDaemonConfigSnapshot: () => restartSnapshot({
+        ...requested,
+        daemon: { ...requested.daemon, ...observed.daemon },
+        storage: { ...requested.storage, ...observed.storage },
+      }),
+      _assertBackendPublicationConfigReadAccess: () => ({ journalChecksumSha256: null }),
+      _withBackendPublicationReadRoot: (_homeDir, callback) => callback(() => undefined),
+    }))?.message).toBe("exit:1");
+
+    expect(consoleError).toHaveBeenCalledWith(`  ${FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC}`);
+  });
+
   it("preserves the known contention diagnostic and sanitizes unknown restart errors", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
     state.restartDaemon.mockRejectedValueOnce(new PrivateMutationLockContentionError("SECRET_BUSY"));

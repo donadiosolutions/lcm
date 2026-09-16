@@ -543,6 +543,50 @@ describe("restart publication assertion convergence", () => {
   });
 
   it.each([
+    ["relative executable", (f: ReturnType<typeof fixture>, scenario: ReturnType<typeof managedRecovery>) => {
+      scenario.restartOptions.spawnCommand = "relative-node";
+    }],
+    ["non-canonical state root", (f: ReturnType<typeof fixture>) => {
+      f.seams.realpath = () => { throw new Error("canonicalization failed"); };
+    }],
+    ["invalid supervisor specification", (_f: ReturnType<typeof fixture>, scenario: ReturnType<typeof managedRecovery>) => {
+      scenario.restartOptions.expectedRuntimeDigest = "invalid";
+    }],
+    ["rejected supervisor probe", (_f: ReturnType<typeof fixture>, scenario: ReturnType<typeof managedRecovery>) => {
+      scenario.probe.mockRejectedValueOnce(new Error("probe failed"));
+    }],
+  ] as const)("preserves contention for a %s", async (_name, configure) => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    configure(f, scenario);
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+    expect(scenario.ensure).not.toHaveBeenCalled();
+  });
+
+  it("uses the fail-closed default publication-owner probe", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    delete scenario.restartOptions._readPrivateMutationLockOwnerForTesting;
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("uses the fail-closed default process-birth probe", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    delete scenario.restartOptions._processStartTimeForTesting;
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ["missing owner", () => null, () => "birth-111"],
     ["wrong owner PID", () => ({ version: 1 as const, pid: 333, processStartTime: "birth-333", nonce: "a".repeat(32) }), () => "birth-111"],
     ["null owner birth", () => ({ version: 1 as const, pid: 111, processStartTime: null, nonce: "a".repeat(32) }), () => "birth-111"],
@@ -556,6 +600,48 @@ describe("restart publication assertion convergence", () => {
 
     expect(scenario.stopAndStart).not.toHaveBeenCalled();
     expect(scenario.ensure).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when the recovery birth probe throws", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f, {
+      birth: () => { throw new Error("birth probe failed"); },
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when recovery aborts during its birth proof", async () => {
+    const f = fixture();
+    const abort = new AbortController();
+    const scenario = managedRecovery(f, {
+      abortSignal: abort.signal,
+      owner: () => {
+        abort.abort();
+        return {
+          version: 1,
+          pid: 111,
+          processStartTime: "birth-111",
+          nonce: "a".repeat(32),
+        };
+      },
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when no birth-proof budget remains", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    scenario.restartOptions.spawnTimeoutMs = 3;
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
   });
 
   it("bounds every recovery birth proof by the remaining lifecycle deadline", async () => {
@@ -693,6 +779,61 @@ describe("restart publication assertion convergence", () => {
     await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
 
     expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when the health deadline expires after manager probing", async () => {
+    const f = fixture();
+    let expired = false;
+    const scenario = managedRecovery(f, {
+      now: () => expired ? 1_001 : 0,
+      observation: spec => {
+        expired = true;
+        return {
+          kind: "registered-running-valid",
+          name: spec.name,
+          scopeDigest: spec.scopeDigest,
+          nonce: spec.nonce,
+          managerPid: 111,
+        };
+      },
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when convergence cannot reserve one health millisecond", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    scenario.restartOptions.spawnTimeoutMs = 1;
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when the publication-owner probe throws", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f, {
+      owner: () => { throw new Error("owner probe failed"); },
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("propagates an ordinary managed restart failure after contention authorization", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    const failure = new Error("managed restart failed");
+    scenario.stopAndStart.mockRejectedValueOnce(failure);
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(failure);
+
+    expect(scenario.stopAndStart).toHaveBeenCalledOnce();
+    expect(scenario.ensure).not.toHaveBeenCalled();
   });
 
   it("uses only the canonical backend-publication owner proof", async () => {
