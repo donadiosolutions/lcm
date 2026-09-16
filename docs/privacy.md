@@ -612,12 +612,16 @@ The `Security` section of the doctor output shows:
   POSIX component beginning with a Unicode symbol. An ampersand absolute-path
   handoff also ends the nested URL substate, so later private values in the same
   wrapper use the enclosing owner, including after another explicit public URL.
-  A pipe absolute-path handoff records its originating wrapper depth and retains
-  one enclosing-owner handoff through that specific close, so a private path
-  immediately after it is also redacted without widening later in-wrapper pipe
-  values. Quoted-file query ownership likewise resumes after an immediate
-  private path that follows a public URL, allowing later word-bearing private
-  parameters to redact on the same pass.
+  Pipe absolute-path handoffs are retained independently at each originating
+  wrapper depth, so closing an inner wrapper consumes only its own one-use tail
+  while outer handoffs remain pending. Repeated handoffs at the same depth stay
+  bounded by that depth, and resets clear all pending depths. Quoted-file query
+  ownership remains independent from a nested public-URL child, allowing every
+  immediate bare path and later word-bearing private parameter to redact on the
+  same pass. A nested exact file URL retains its own path/query classification
+  while bound to the observable enclosing owner; after the child span ends, a
+  later private value returns to that parent grammar without trusting marker
+  text. Public, named, and relative child values retain their existing syntax.
   An unquoted exact file wrapper immediately followed by an ampersand-separated
   public URL is recognized from that observable syntax on every pass. The
   doubled-bracket pathless policy retains the observable scheme, authority, and

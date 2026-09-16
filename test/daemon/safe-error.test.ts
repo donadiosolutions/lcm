@@ -2991,6 +2991,45 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it("redacts repeated quoted-query bare paths before a word-bearing path", () => {
+    const input =
+      "'file://h'['/private']?a/Users/alice&https://e.test/x&/PrivateOne/a&/PrivateTwo/b&d/Users/carol";
+    const expected =
+      "'file://h'['<path>']?a<path>&https://e.test/x&<path>&<path>&d<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("PrivateOne");
+    expect(first).not.toContain("PrivateTwo");
+    expect(first).not.toContain("carol");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "drive and UNC",
+      "'file://h'['/private']?a/Users/alice&https://e.test/x&/Users/bob&drive=C:\\Users\\carol\\secret.db&unc=\\\\server\\share\\secret.db",
+      "'file://h'['<path>']?a<path>&https://e.test/x&<path>&drive=<path>&unc=<path>",
+    ],
+    [
+      "later public URL",
+      "'file://h'['/private']?a/Users/alice&https://e.test/x&/Users/bob&https://p.test/y&c/Users/carol",
+      "'file://h'['<path>']?a<path>&https://e.test/x&<path>&https://p.test/y&c<path>",
+    ],
+    [
+      "named public values",
+      "'file://h'['/private']?a/Users/alice&https://e.test/x?key=/public&next=/also&/Users/bob",
+      "'file://h'['<path>']?a<path>&https://e.test/x?key=/public&next=/also&<path>",
+    ],
+  ] as const)("preserves quoted-query %s boundaries", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("consumes a nested pipe handoff at its originating wrapper close", () => {
     const input = "file://h?x=[[https://e.test/t|/Users/a/one]\\Users\\b\\two]";
     const expected = "file://h?x=[[https://e.test/t|<path>]<path>]";
@@ -3003,6 +3042,49 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it("retains pending pipe handoffs at two wrapper depths", () => {
+    const input =
+      "file://h?x=[https://e.test/t|/Users/a/one&/Users/b/two&[https://p.test/x|/Users/c/three]\\Users\\d\\four]\\Users\\e\\five";
+    const expected =
+      "file://h?x=[https://e.test/t|<path>&<path>&[https://p.test/x|<path>]<path>]<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(first).not.toContain("\\Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "three depths",
+      "file://h?x=[https://a.test/t|/Users/a/one&[https://b.test/t|/Users/b/two&[https://c.test/t|/Users/c/three]\\Users\\c\\tail]\\Users\\b\\tail]\\Users\\a\\tail",
+      "file://h?x=[https://a.test/t|<path>&[https://b.test/t|<path>&[https://c.test/t|<path>]<path>]<path>]<path>",
+    ],
+    [
+      "repeated same depth",
+      "file://h?x=[https://a.test/t|/Users/a/one|/Users/b/two]\\Users\\c\\tail",
+      "file://h?x=[https://a.test/t|<path>|<path>]<path>",
+    ],
+    [
+      "close without tail",
+      "file://h?x=[https://a.test/t|/Users/a/one]done",
+      "file://h?x=[https://a.test/t|<path>]done",
+    ],
+    [
+      "whitespace reset",
+      "file://h?x=[https://a.test/t|/Users/a/one \\Users\\b\\two]",
+      "file://h?x=[https://a.test/t|<path> \\Users\\b\\two]",
+    ],
+  ] as const)("keeps pipe handoffs bounded for %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("restores enclosing ownership after a later public URL", () => {
     const input =
       "file://h?x=[https://e.test/t&/Users/a/one&https://p.test/x&\\Users\\bob\\secret.db]";
@@ -3011,6 +3093,90 @@ describe("sanitizeError", () => {
 
     expect(first).toBe(expected);
     expect(first).not.toContain("/Users");
+    expect(first).not.toContain("bob");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "root-relative Windows",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>]",
+    ],
+    [
+      "POSIX",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&/TopSecret/c/three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>]",
+    ],
+  ] as const)("restores enclosing ownership after nested file URLs: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("TopSecret");
+    expect(first).not.toContain("\\Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "hosted and root-relative Windows",
+      "file://h?x=[https://e.test/t&/Users/a/one&file://host/Users/b/two&\\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://host<path>&<path>]",
+    ],
+    [
+      "UNC",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\\\server\\share\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>]",
+    ],
+    [
+      "drive",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&C:\\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>]",
+    ],
+    [
+      "later public and relative values",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&https://p.test/x&relative/path]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&https://p.test/x&relative/path]",
+    ],
+    [
+      "whitespace reset",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two \\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path> \\Users\\c\\three]",
+    ],
+    [
+      "unclosed wrapper",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>",
+    ],
+    [
+      "own query",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two?key=/public&next=/also&\\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>?key=<path>&next=<path>&<path>]",
+    ],
+    [
+      "own fragment",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two#key=/public&next=/also&\\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>#key=<path>&next=<path>&<path>]",
+    ],
+  ] as const)("keeps nested file child and parent boundaries for %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts repeated pipe Windows paths inside one wrapper", () => {
+    const input =
+      "file://h?x=[https://e.test/t|\\Users\\alice\\one.db|\\Users\\bob\\secret.db]";
+    const expected = "file://h?x=[https://e.test/t|<path>|<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
     expect(first).not.toContain("bob");
     expect(first).not.toContain("secret.db");
     expect(sanitizeError(first)).toBe(first);
