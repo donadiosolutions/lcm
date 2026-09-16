@@ -3417,6 +3417,83 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it("returns from a later public child to a retained exact-file parent", () => {
+    const input =
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/SECRET_A&https://public.test/x&later/Users/final/SECRET_FINAL]";
+    const expected =
+      "file://h?x=[file://<path>?key=<path>&later<path>&https://public.test/x&later<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET_A");
+    expect(first).not.toContain("SECRET_FINAL");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "hosted fragment and named public child",
+      "file://h?x=[file://host/Users/a/one#key=/public&later/Users/a/secret&https://p.test/x?key=/public&next=/also&later/Users/final/secret]",
+      "file://h?x=[file://host<path>#key=<path>&later<path>&https://p.test/x?key=/public&next=/also&later<path>]",
+    ],
+    [
+      "IPv6 child and mixed-case backslash root",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&https://[::1]/p&later/uSeRs\\final\\secret]",
+      "file://h?x=[file://<path>?key=<path>&later<path>&https://[::1]/p&later<path>]",
+    ],
+    [
+      "unclosed wrapper",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&https://p.test/x&later/Users/final/secret",
+      "file://h?x=[file://<path>?key=<path>&later<path>&https://p.test/x&later<path>",
+    ],
+    [
+      "alternating public children",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&https://p.test/one&later/Users/b/secret&ftp://p.test/two&later/Users/c/secret]",
+      "file://h?x=[file://<path>?key=<path>&later<path>&https://p.test/one&later<path>&ftp://p.test/two&later<path>]",
+    ],
+  ] as const)("retains returned parent across %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(first).not.toContain("/uSeRs");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("retains public-child return at two nested parent depths", () => {
+    const input =
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&[file:///Users/b/two#key=/public&later/Users/b/secret&https://inner.test/x&later/Users/inner/secret]&https://outer.test/x&later/Users/outer/secret]";
+    const expected =
+      "file://h?x=[file://<path>?key=<path>&later<path>&[file://<path>#key=<path>&later<path>&https://inner.test/x&later<path>]&https://outer.test/x&later<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "matching close",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&https://p.test/x]&later/Users/outside",
+      "file://h?x=[file://<path>?key=<path>&later<path>&https://p.test/x]&later/Users/outside",
+    ],
+    [
+      "whitespace reset",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&https://p.test/x later/Users/outside]",
+      "file://h?x=[file://<path>?key=<path>&later<path>&https://p.test/x later/Users/outside]",
+    ],
+  ] as const)("expires retained public-child parent at %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("redacts repeated pipe Windows paths inside one wrapper", () => {
     const input =
       "file://h?x=[https://e.test/t|\\Users\\alice\\one.db|\\Users\\bob\\secret.db]";

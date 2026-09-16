@@ -624,11 +624,13 @@ The `Security` section of the doctor output shows:
   word-bearing private value. Closing an inner wrapper removes only that depth,
   preserving still-open outer owners until their matching close or a hard
   reset. Within a child query or fragment, an ampersand word-bearing `Users`
-  root returns to the retained parent and redacts on the same pass. This does
-  not trust marker text, classify ordinary relative values as private on that
-  transition, or make backslashes global. The direct-relative query/fragment
-  family remains deferred: its first pass preserves the relative bytes and its
-  next stable pass conservatively redacts them.
+  root returns to the retained parent and redacts on the same pass. The same
+  narrow handoff remains available after an intervening public URL child while
+  that wrapper depth is retained. This does not trust marker text, classify
+  ordinary relative values as private on that transition, or make backslashes
+  global. The direct-relative query/fragment family remains deferred: its first
+  pass preserves the relative bytes and its next stable pass conservatively
+  redacts them.
   An unquoted exact file wrapper immediately followed by an ampersand-separated
   public URL is recognized from that observable syntax on every pass. The
   doubled-bracket pathless policy retains the observable scheme, authority, and

@@ -473,14 +473,24 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryPublicUrl = false;
       continue;
     }
+    const retainedParentPrivatePathStart =
+      char === "&" &&
+      nestedFileUrlParentOwnerBracketDepths.has(pathlessFileQueryOwnerBracketDepth)
+        ? wordBearingPrivateRootPathStart(chars, index + 1)
+        : -1;
     if (
       pathlessFileQueryBracketDepth > 0 &&
-      (char === "&" || char === "|") &&
-      (chars[index + 1] === "/" || chars[index + 1] === "\\")
+      (((char === "&" || char === "|") &&
+        (chars[index + 1] === "/" || chars[index + 1] === "\\")) ||
+        retainedParentPrivatePathStart >= 0)
     ) {
       // A nested public URL owns its query slashes, but an immediate absolute
       // path after a delimiter returns to the enclosing file-query grammar.
-      forcedPath[index + 1] = 1;
+      if (retainedParentPrivatePathStart >= 0) {
+        forcedPath[retainedParentPrivatePathStart] = 1;
+      } else {
+        forcedPath[index + 1] = 1;
+      }
       if (char === "&") {
         separator = -1;
         exactFileScheme = false;
