@@ -2748,10 +2748,11 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("keeps doubled-bracket named public queries stable before Bug #1294 Windows tails", () => {
+  it("retains doubled-bracket public URL syntax before Bug #1294 Windows tails", () => {
     const input =
       "file://h?x=[[a]/https://e.test/t?key=/public&next=/also]\\Users\\alice\\secret.db";
-    const expected = "file://h?x=[[a]<path>?key=/public&next=/also]<path>";
+    const expected =
+      "file://h?x=[[a]<path>https://e.test/t?key=/public&next=/also]<path>";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -2761,10 +2762,11 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("keeps doubled-bracket named public queries stable before immediate private paths", () => {
+  it("retains doubled-bracket public URL syntax before immediate private paths", () => {
     const input =
       "file://h?x=[[a]/https://e.test/t?key=/public&next=/also&/Users/alice/secret.db]";
-    const expected = "file://h?x=[[a]<path>?key=/public&next=/also&<path>]";
+    const expected =
+      "file://h?x=[[a]<path>https://e.test/t?key=/public&next=/also&<path>]";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -2774,9 +2776,9 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("redacts private paths after canonical doubled-bracket public-query markers", () => {
+  it("conservatively redacts slash values after literal doubled-bracket path markers", () => {
     const input = "file://h?x=[[a]<path>?key=/public&next=/also]/Users/alice/secret.db";
-    const expected = "file://h?x=[[a]<path>?key=/public&next=/also]<path>";
+    const expected = "file://h?x=[[a]<path>?key=<path>&next=<path>]<path>";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -2786,10 +2788,23 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("keeps bracketed named public values stable before Bug #1294 Windows tails", () => {
+  it("does not trust raw doubled-bracket path markers as public-query provenance", () => {
+    const input = "file://h?x=[[a]<path>?key=/Users/alice/secret.db]";
+    const expected = "file://h?x=[[a]<path>?key=<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("retains bracketed public URL syntax before Bug #1294 Windows tails", () => {
     const input =
       "file://h?x=[[a]/https://e.test/t?key=[/public]&next=/also]\\Users\\alice\\secret.db";
-    const expected = "file://h?x=[[a]<path>?key=[/public]&next=/also]<path>";
+    const expected =
+      "file://h?x=[[a]<path>https://e.test/t?key=[/public]&next=/also]<path>";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -2799,10 +2814,10 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("keeps bracketed named public values stable before generated-marker POSIX tails", () => {
+  it("conservatively redacts bracketed slash values after literal path markers", () => {
     const input =
       "file://h?x=[[a]<path>?key=[/public]&next=/also]/Users/alice/secret.db";
-    const expected = "file://h?x=[[a]<path>?key=[/public]&next=/also]<path>";
+    const expected = "file://h?x=[[a]<path>?key=[<path>]&next=<path>]<path>";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);

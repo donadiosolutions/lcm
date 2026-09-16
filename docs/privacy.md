@@ -611,13 +611,16 @@ The `Security` section of the doctor output shows:
   active through repeated immediate paths in the same wrapper, including a
   POSIX component beginning with a Unicode symbol. A private path immediately
   after the nested URL's closing wrapper is also redacted on the same pass.
-  Sanitized unquoted file-path wrappers retain only enough provenance to keep a
-  following ampersand-separated public URL byte-identical on later passes. The
-  canonical marker produced when the doubled-bracket pathless policy absorbs a
-  nested public URL also keeps that URL's named slash-bearing query values public
-  on later passes. Separately quoted wrappers retain their conservative
-  unspaced-URL behavior. These boundaries make the first sanitized result stable
-  without treating an arbitrary `<path>` marker as trusted context.
+  An unquoted exact file wrapper immediately followed by an ampersand-separated
+  public URL is recognized from that observable syntax on every pass. The
+  doubled-bracket pathless policy retains the observable scheme, authority, and
+  path of a slash-prefixed nested public URL when it has a query or fragment.
+  Later passes therefore derive ownership of named slash-bearing values from the
+  retained URL syntax. A literal `<path>` followed directly by `?` or `#` carries
+  no provenance; slash-bearing values in that ambiguous form are conservatively
+  redacted. Separately quoted wrappers retain their conservative unspaced-URL
+  behavior. These boundaries make the first sanitized result stable without
+  treating an arbitrary `<path>` marker as trusted context.
   When an unquoted local-path span contains a scheme-shaped `scheme://`
   component, the bounded span-local scheme colon and the component that follows
   it are replaced within the same `<path>` marker on the first pass. This also

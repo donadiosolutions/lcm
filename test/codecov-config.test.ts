@@ -129,7 +129,8 @@ const expectedComponents = [
       // #1060 adjacent nested-file schemes, #1113 doubled-colon drive tails,
       // #1117 glued authorities, #1111 bracketed nested-URL idempotence,
       // #1118/#1303 quoted query-tail handoff, #1128 active own-query and
-      // IPv6 bracket-boundary backslash paths, #1294 generated-query and
+      // IPv6 bracket-boundary backslash paths, #1294 retained-query syntax and
+      // raw-marker collision handling,
       // #1304 closed-bracket path handoff, #1312/#1313 repeated POSIX/Windows
       // nested-public delimiter handoff,
       // #1317 stable unquoted-wrapper public URLs, #1141 single-slash file
