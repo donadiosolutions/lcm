@@ -190,6 +190,8 @@ const expectedComponents = [
       // directory-witness authentication in this owner.
       // #1240 keeps authenticated terminal-maintenance configuration admission here.
       // #1292 preserves structured parser errors on terminal journal archive rereads.
+      // #1285 retains terminal archive history identity through exclusive
+      // publication, exact replay, and descriptor-bound durability flushes.
       "^src/storage/backend-publication\\.ts$",
       // #910 keeps shared publication retry deadlines monotonic in this owner.
       "^src/storage/publication-convergence\\.ts$",

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   chmodSync,
+  fsyncSync,
   mkdirSync,
   readdirSync,
 } from "node:fs";
@@ -17,6 +18,7 @@ import {
   type PrivateMutationLockOperations,
 } from "../private-mutation-lock.js";
 import {
+  atomicWritePrivateFile,
   atomicWritePrivateFileDurable,
   consumeBoundedRegularFile,
   assertPrivateDirectory,
@@ -26,6 +28,8 @@ import {
   syncPrivateDirectory,
   isOwnerOnlyFileMode,
   openPrivateDirectoryIfExists,
+  PrivateDirectoryTopologyError,
+  PrivateFileCollisionError,
 } from "../security-files.js";
 import type { StorageBackendName } from "./contracts.js";
 import {
@@ -2738,6 +2742,137 @@ function writeJournal(
   assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
 }
 
+function archiveUnsafeStorage(message: string, cause: unknown): never {
+  throw new BackendPublicationJournalError("unsafe-storage", message, { cause });
+}
+
+function assertRetainedArchivePublicationDirectory(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+): void {
+  try {
+    const observed = assertPrivateDirectory(
+      directoryHandle,
+      backendPublicationDirectory(homeDir),
+    );
+    if (
+      observed.dev !== directoryHandle.witness.dev
+      || observed.ino !== directoryHandle.witness.ino
+      || observed.gid !== directoryHandle.witness.gid
+    ) {
+      throw new Error("private directory identity changed");
+    }
+  } catch (error) {
+    return archiveUnsafeStorage(
+      "backend publication directory changed during terminal journal archive",
+      error,
+    );
+  }
+}
+
+function assertRetainedArchiveHistoryDirectory(
+  history: string,
+  historyHandle: ReturnType<typeof openPrivateDirectory>,
+): void {
+  try {
+    const observed = assertPrivateDirectory(historyHandle, history);
+    if (
+      observed.dev !== historyHandle.witness.dev
+      || observed.ino !== historyHandle.witness.ino
+      || observed.gid !== historyHandle.witness.gid
+    ) {
+      throw new Error("private directory identity changed");
+    }
+  } catch (error) {
+    return archiveUnsafeStorage(
+      "backend publication history directory changed during terminal journal archive",
+      error,
+    );
+  }
+}
+
+type ArchiveHistoryOperationOutcome<T> =
+  | Readonly<{ succeeded: true; value: T }>
+  | Readonly<{ succeeded: false; error: unknown }>;
+
+function completeArchiveHistoryOperation<T>(
+  historyHandle: ReturnType<typeof openPrivateDirectory>,
+  outcome: ArchiveHistoryOperationOutcome<T>,
+): T {
+  let closeErrorPresent = false;
+  let closeError: unknown;
+  try {
+    historyHandle.close();
+  } catch (error) {
+    closeErrorPresent = true;
+    closeError = error;
+  }
+  if (!closeErrorPresent) {
+    if (outcome.succeeded) return outcome.value;
+    throw outcome.error;
+  }
+  if (outcome.succeeded) throw closeError;
+  const aggregate = new AggregateError(
+    [outcome.error, closeError],
+    "backend publication archive operation and history cleanup failed",
+    { cause: outcome.error },
+  );
+  if (outcome.error instanceof BackendPublicationJournalError) {
+    throw new BackendPublicationJournalError(
+      outcome.error.reason,
+      outcome.error.message,
+      { cause: aggregate },
+    );
+  }
+  throw aggregate;
+}
+
+function withRetainedArchiveHistoryDirectory<T>(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+  observer: BackendPublicationObserver,
+  callback: (historyHandle: ReturnType<typeof openPrivateDirectory>) => T,
+): T {
+  const history = backendPublicationHistoryDirectory(homeDir);
+  let historyHandle: ReturnType<typeof openPrivateDirectory> | undefined;
+  let outcome: ArchiveHistoryOperationOutcome<T>;
+  try {
+    assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+    observer("before-terminal-journal-history-open", history);
+    try {
+      historyHandle = openPrivateDirectoryIfExists(history);
+    } catch (error) {
+      return archiveUnsafeStorage("backend publication history directory cannot be opened", error);
+    }
+    if (historyHandle === undefined) {
+      observer("before-terminal-journal-history-create", history);
+      assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+      try {
+        mkdirSync(history, { mode: 0o700 });
+      } catch (error) {
+        return archiveUnsafeStorage("backend publication history directory cannot be created", error);
+      }
+      try {
+        historyHandle = openPrivateDirectory(history);
+      } catch (error) {
+        return archiveUnsafeStorage("created backend publication history directory is unsafe", error);
+      }
+    }
+    assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+    assertRetainedArchiveHistoryDirectory(history, historyHandle);
+    outcome = { succeeded: true, value: callback(historyHandle) };
+  } catch (error) {
+    outcome = { succeeded: false, error };
+  }
+  if (historyHandle === undefined) {
+    if (outcome.succeeded) {
+      throw new Error("backend publication history operation completed without a retained directory");
+    }
+    throw outcome.error;
+  }
+  return completeArchiveHistoryOperation(historyHandle, outcome);
+}
+
 function archiveTerminalJournal(
   homeDir: string | undefined,
   directoryHandle: BackendPublicationDirectoryHandle,
@@ -2774,35 +2909,71 @@ function archiveTerminalJournal(
   ) {
     return fail("unexpected-state", "backend publication journal changed before archive");
   }
-  let historyHandle;
-  try {
-    historyHandle = openPrivateDirectory(history);
-  } catch (error) {
-    if (!isMissing(error)) throw error;
-    mkdirSync(history, { mode: 0o700 });
-    historyHandle = openPrivateDirectory(history);
-  }
-  historyHandle.close();
   const archivePath = join(history, journal.publicationId + "." + journal.checksumSha256 + ".json");
-  try {
-    atomicWritePrivateFileDurable(archivePath, current, {
-      requireAbsent: true,
-      maxExistingBytes: MAX_JOURNAL_BYTES,
-    });
-  } catch (error) {
-    if (!(error instanceof Error) || error.message !== "private file already exists") throw error;
-    readBoundedRegularFileWithStat(archivePath, {
-      allowedRoot: history,
-      maxBytes: MAX_JOURNAL_BYTES,
-      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
-      allowedModes: [0o600],
-      requireSingleLink: true,
-      expectedRawSha256: sha256(current),
-    });
-  }
-  syncPrivateDirectory(history);
-  syncPrivateDirectory(directory);
-  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
+  withRetainedArchiveHistoryDirectory(
+    homeDir,
+    directoryHandle,
+    observer,
+    (historyHandle) => {
+      observer("before-terminal-journal-archive-publication", archivePath);
+      assertRetainedArchiveHistoryDirectory(history, historyHandle);
+      try {
+        atomicWritePrivateFile(
+          archivePath,
+          current,
+          {},
+          historyHandle,
+          { requireAbsent: true },
+        );
+      } catch (error) {
+        if (!(error instanceof PrivateFileCollisionError)) {
+          if (error instanceof PrivateDirectoryTopologyError) {
+            return archiveUnsafeStorage(
+              "backend publication archive publication topology is unsafe",
+              error,
+            );
+          }
+          throw error;
+        }
+        assertRetainedArchiveHistoryDirectory(history, historyHandle);
+        observer("before-terminal-journal-archive-replay", archivePath);
+        assertRetainedArchiveHistoryDirectory(history, historyHandle);
+        let replay;
+        try {
+          replay = readBoundedRegularFileWithStat(archivePath, {
+            allowedRoot: history,
+            maxBytes: MAX_JOURNAL_BYTES,
+            expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+            allowedModes: [0o600],
+            requireSingleLink: true,
+            expectedRawSha256: sha256(current),
+          });
+        } catch (replayError) {
+          return archiveUnsafeStorage("backend publication archive replay is unsafe", replayError);
+        }
+        if (
+          replay.content !== current
+          || replay.parentDev !== historyHandle.witness.dev
+          || replay.parentIno !== historyHandle.witness.ino
+        ) {
+          return archiveUnsafeStorage(
+            "backend publication archive replay does not match the retained history directory",
+            new Error("archive replay identity or bytes changed"),
+          );
+        }
+        assertRetainedArchiveHistoryDirectory(history, historyHandle);
+      }
+
+      observer("after-terminal-journal-archive-publication", archivePath);
+      observer("before-terminal-journal-history-sync", history);
+      assertRetainedArchiveHistoryDirectory(history, historyHandle);
+      fsyncSync(historyHandle.fd);
+      assertRetainedArchiveHistoryDirectory(history, historyHandle);
+      assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+      fsyncSync(directoryHandle.fd);
+      assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+    },
+  );
 }
 
 function materialToJson(file: BackendPublicationRecoveryFile): Record<string, unknown> {

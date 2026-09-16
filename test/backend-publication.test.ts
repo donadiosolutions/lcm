@@ -1,6 +1,6 @@
 import { AsyncResource } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
@@ -170,6 +170,75 @@ type PublicationDirectoryGeneration = {
   closed: number;
   fstatPhases: string[];
 };
+
+type ArchiveDirectoryDescriptor = {
+  path: string;
+  fd: number;
+  closed: number;
+};
+
+async function withTrackedArchiveDirectoryDescriptors<T>(
+  home: string,
+  callback: (tracking: Readonly<{
+    records: ArchiveDirectoryDescriptor[];
+    syncOrder: string[];
+    beginSyncOrder: () => void;
+    failNextSync: (path: string, error: Error) => void;
+  }>) => Promise<T>,
+): Promise<T> {
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+  const originalClose = nodeFs.closeSync as (fd: number) => void;
+  const originalFstat = nodeFs.fstatSync as (...args: unknown[]) => unknown;
+  const originalFsync = nodeFs.fsyncSync as (fd: number) => void;
+  const publication = backendPublicationDirectory(home);
+  const history = backendPublicationHistoryDirectory(home);
+  const trackedPaths = new Set([publication, history]);
+  const records: ArchiveDirectoryDescriptor[] = [];
+  const syncOrder: string[] = [];
+  const syncFailures = new Map<string, Error>();
+  let recordSyncOrder = false;
+  const activeRecord = (fd: number): ArchiveDirectoryDescriptor | undefined => (
+    [...records].reverse().find((record) => record.fd === fd && record.closed === 0)
+  );
+
+  return withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+    const fd = originalOpen(path, ...args);
+    if (trackedPaths.has(path)) records.push({ path, fd, closed: 0 });
+    return fd;
+  }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+    const record = activeRecord(fd);
+    originalClose(fd);
+    if (record !== undefined) record.closed += 1;
+  }) as never, async () => withPatchedFsAsync("fstatSync", ((fd: number, ...args: unknown[]) => {
+    const observed = originalFstat(fd, ...args);
+    if (recordSyncOrder && syncOrder.length < 6) {
+      const record = activeRecord(fd);
+      if (record?.path === history) syncOrder.push("history-assert");
+      if (record?.path === publication) syncOrder.push("outer-assert");
+    }
+    return observed;
+  }) as never, async () => withPatchedFsAsync("fsyncSync", ((fd: number) => {
+    const record = activeRecord(fd);
+    if (recordSyncOrder && syncOrder.length < 6) {
+      if (record?.path === history) syncOrder.push("history-fsync");
+      if (record?.path === publication) syncOrder.push("outer-fsync");
+    }
+    if (record !== undefined) {
+      const failure = syncFailures.get(record.path);
+      if (failure !== undefined) {
+        syncFailures.delete(record.path);
+        throw failure;
+      }
+    }
+    originalFsync(fd);
+  }) as never, async () => callback({
+    records,
+    syncOrder,
+    beginSyncOrder: () => { recordSyncOrder = true; },
+    failNextSync: (path, error) => { syncFailures.set(path, error); },
+  })))));
+}
 
 async function withTrackedPublicationDirectoryGenerations<T>(
   directories: readonly string[],
@@ -3162,7 +3231,11 @@ describe("BackendPublicationCoordinator", () => {
       await expect(coordinator(historyHome, makeDriver(historyInput).driver).prepare({
         ...inputFor(historyInput),
         publicationId: "publication-2",
-      })).rejects.toThrow("history mkdir denied");
+      })).rejects.toMatchObject({
+        reason: "unsafe-storage",
+        message: "backend publication history directory cannot be created",
+        cause: historyFailure,
+      });
     } finally {
       nodeFs.mkdirSync = originalMkdir;
       syncBuiltinESMExports();
@@ -3807,6 +3880,560 @@ describe("BackendPublicationCoordinator", () => {
     expect(statSync(victim).mode & 0o777).toBe(0o755);
   });
 
+  it("refuses a rebound history directory after descriptor admission", async () => {
+    const home = makeHome();
+    const input = material();
+    const first = makeDriver(input);
+    await coordinator(home, first.driver).prepare(inputFor(input));
+    const completed = await coordinator(home, first.driver).resume();
+    const terminalBytes = readFileSync(backendPublicationJournalPath(home));
+    const history = backendPublicationHistoryDirectory(home);
+    const originalHistory = `${history}.retained`;
+    mkdirSync(history, { mode: 0o700 });
+    const archiveName = `${completed.publicationId}.${completed.checksumSha256}.json`;
+    const next = countingDriver(input);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalStat = nodeFs.statSync as (...args: unknown[]) => unknown;
+    let injected = false;
+
+    await expect(withPatchedFsAsync("statSync", ((path: string, ...args: unknown[]) => {
+      const observed = originalStat(path, ...args);
+      if (!injected && path === history) {
+        injected = true;
+        renameSync(history, originalHistory);
+        mkdirSync(history, { mode: 0o700 });
+      }
+      return observed;
+    }) as never, async () => coordinator(home, next.driver).prepare({
+      ...inputFor(input),
+      publicationId: "publication-2",
+    }))).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+    expect(injected).toBe(true);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(terminalBytes);
+    expect(existsSync(join(history, archiveName))).toBe(false);
+    expect(existsSync(join(originalHistory, archiveName))).toBe(false);
+    expect(next.calls).toEqual([]);
+    expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
+  });
+
+  it.each([2, 3] as const)(
+    "retains one history descriptor and syncs the v%s archive in fd order",
+    async (version) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, version);
+      const attempt = countingDriver(material());
+      const observed = await withTrackedArchiveDirectoryDescriptors(home, async (tracking) => {
+        const prepared = await coordinator(home, attempt.driver, (event) => {
+          if (event === "before-terminal-journal-history-sync") tracking.beginSyncOrder();
+        }).prepare({
+          ...inputFor(material()),
+          publicationId: "publication-2",
+        });
+        return {
+          prepared,
+          records: tracking.records,
+          syncOrder: tracking.syncOrder,
+        };
+      });
+      const history = backendPublicationHistoryDirectory(home);
+      const archivePath = join(
+        history,
+        `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+      );
+      const historyRecords = observed.records.filter((record) => record.path === history);
+
+      expect(observed.prepared).toMatchObject({ publicationId: "publication-2", phase: "prepared" });
+      expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+      expect(statSync(history).mode & 0o777).toBe(0o700);
+      expect(statSync(archivePath).mode & 0o777).toBe(0o600);
+      expect(attempt.calls).toEqual(["observe-local-state"]);
+      expect(historyRecords).toHaveLength(1);
+      expect(historyRecords[0]?.closed).toBe(1);
+      expect(observed.syncOrder).toEqual([
+        "history-assert",
+        "history-fsync",
+        "history-assert",
+        "outer-assert",
+        "outer-fsync",
+        "outer-assert",
+      ]);
+    },
+  );
+
+  it("treats post-open ENOENT as unsafe instead of recreating history", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const historyIdentity = statSync(history);
+    const attempt = countingDriver(material());
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalStat = nodeFs.statSync as (...args: unknown[]) => unknown;
+    let injected = false;
+
+    await expect(withPatchedFsAsync("statSync", ((path: string, ...args: unknown[]) => {
+      if (!injected && path === history) {
+        injected = true;
+        throw Object.assign(new Error("history vanished after open"), { code: "ENOENT" });
+      }
+      return originalStat(path, ...args);
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    }))).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+    expect(injected).toBe(true);
+    expect(statSync(history).dev).toBe(historyIdentity.dev);
+    expect(statSync(history).ino).toBe(historyIdentity.ino);
+    expect(existsSync(join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    ))).toBe(false);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("refuses a history create race without adopting the entrant", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    const attempt = countingDriver(material());
+    let injected = false;
+
+    await expect(coordinator(home, attempt.driver, (event) => {
+      if (!injected && event === "before-terminal-journal-history-create") {
+        injected = true;
+        mkdirSync(history, { mode: 0o700 });
+      }
+    }).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+    expect(injected).toBe(true);
+    expect(statSync(history).mode & 0o777).toBe(0o700);
+    expect(existsSync(join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    ))).toBe(false);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it.each(["file", "symlink", "non-private-directory"] as const)(
+    "refuses an unsafe existing history %s without repairing it",
+    async (kind) => {
+      const home = makeHome();
+      await terminalArchiveFixture(home, 2);
+      const history = backendPublicationHistoryDirectory(home);
+      if (kind === "file") writeFileSync(history, "unsafe", { mode: 0o600 });
+      if (kind === "non-private-directory") mkdirSync(history, { mode: 0o755 });
+      if (kind === "symlink") {
+        const victim = join(home, "history-victim");
+        mkdirSync(victim, { mode: 0o700 });
+        symlinkSync(victim, history, "dir");
+      }
+      const attempt = countingDriver(material());
+
+      await expect(coordinator(home, attempt.driver).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      })).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+      expect(existsSync(history)).toBe(true);
+      if (kind === "file") expect(readFileSync(history, "utf8")).toBe("unsafe");
+      if (kind === "non-private-directory") expect(statSync(history).mode & 0o777).toBe(0o755);
+      expect(attempt.calls).toEqual([]);
+    },
+  );
+
+  it("refuses outer publication-directory drift during history admission", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const attempt = countingDriver(material());
+    let originalDirectory: string | undefined;
+
+    await expect(coordinator(home, attempt.driver, (event) => {
+      if (originalDirectory === undefined && event === "before-terminal-journal-history-open") {
+        originalDirectory = rebindPublicationDirectoryWithEvidence(home).originalDirectory;
+      }
+    }).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+    expect(originalDirectory).toBeDefined();
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(existsSync(join(originalDirectory!, "history"))).toBe(false);
+    expect(existsSync(backendPublicationHistoryDirectory(home))).toBe(false);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it.each(["publication", "replay", "sync"] as const)(
+    "refuses history replacement before archive %s",
+    async (stage) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, 2);
+      const history = backendPublicationHistoryDirectory(home);
+      const archiveName = `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`;
+      if (stage === "publication") mkdirSync(history, { mode: 0o700 });
+      if (stage === "replay") {
+        const setup = countingDriver(material());
+        await expect(coordinator(home, setup.driver, (event) => {
+          if (event === "before-journal-write") throw new Error("stop after archive publication");
+        }).prepare({
+          ...inputFor(material()),
+          publicationId: "publication-2",
+        })).rejects.toThrow("stop after archive publication");
+        expect(readFileSync(join(history, archiveName))).toEqual(fixture.bytes);
+      }
+      const originalHistory = `${history}.${stage}-retained`;
+      const attempt = countingDriver(material());
+      const boundary = stage === "publication"
+        ? "before-terminal-journal-archive-publication"
+        : stage === "replay"
+          ? "before-terminal-journal-archive-replay"
+          : "before-terminal-journal-history-sync";
+      let injected = false;
+
+      await expect(coordinator(home, attempt.driver, (event) => {
+        if (!injected && event === boundary) {
+          injected = true;
+          renameSync(history, originalHistory);
+          mkdirSync(history, { mode: 0o700 });
+        }
+      }).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      })).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+      expect(injected).toBe(true);
+      expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+      expect(existsSync(join(history, archiveName))).toBe(false);
+      expect(existsSync(join(originalHistory, archiveName))).toBe(stage === "publication" ? false : true);
+      expect(attempt.calls).toEqual([]);
+      expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
+    },
+  );
+
+  it.each(["different-bytes", "wrong-mode", "multiple-links", "oversize"] as const)(
+    "refuses archive replay with %s",
+    async (kind) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, 2);
+      const history = backendPublicationHistoryDirectory(home);
+      mkdirSync(history, { mode: 0o700 });
+      const archivePath = join(
+        history,
+        `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+      );
+      const content = kind === "different-bytes"
+        ? Buffer.from("different archive bytes\n")
+        : kind === "oversize"
+          ? Buffer.alloc((1024 * 1024) + 1, "x")
+          : fixture.bytes;
+      writeFileSync(archivePath, content, { mode: 0o600 });
+      if (kind === "wrong-mode") chmodSync(archivePath, 0o640);
+      if (kind === "multiple-links") linkSync(archivePath, join(history, "archive-alias"));
+      const attempt = countingDriver(material());
+
+      await expect(coordinator(home, attempt.driver).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      })).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+      expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+      expect(attempt.calls).toEqual([]);
+      expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
+    },
+  );
+
+  it.each([2, 3] as const)(
+    "replays an exact v%s archive through one retained history descriptor",
+    async (version) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, version);
+      const initial = countingDriver(material());
+      await expect(coordinator(home, initial.driver, (event) => {
+        if (event === "before-journal-write") throw new Error("stop after exact archive");
+      }).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      })).rejects.toThrow("stop after exact archive");
+      const history = backendPublicationHistoryDirectory(home);
+      const archivePath = join(
+        history,
+        `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+      );
+      const retry = countingDriver(material());
+      const observed = await withTrackedArchiveDirectoryDescriptors(home, async (tracking) => {
+        const prepared = await coordinator(home, retry.driver).prepare({
+          ...inputFor(material()),
+          publicationId: "publication-2",
+        });
+        return { prepared, records: tracking.records };
+      });
+      const historyRecords = observed.records.filter((record) => record.path === history);
+
+      expect(observed.prepared).toMatchObject({ phase: "prepared" });
+      expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+      expect(historyRecords).toHaveLength(1);
+      expect(historyRecords[0]?.closed).toBe(1);
+      expect(retry.calls).toEqual(["observe-local-state"]);
+    },
+  );
+
+  it("refuses an exact replay reported from a different parent identity", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    writeFileSync(archivePath, fixture.bytes, { mode: 0o600 });
+    const attempt = countingDriver(material());
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalStat = nodeFs.statSync as (...args: unknown[]) => unknown;
+    let archiveFd: number | undefined;
+
+    await expect(withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === archivePath) archiveFd = fd;
+      return fd;
+    }) as never, async () => withPatchedFsAsync("statSync", ((path: string, ...args: unknown[]) => {
+      const observed = originalStat(path, ...args) as Record<PropertyKey, unknown>;
+      if (archiveFd === undefined || path !== history || !((args[0] as { bigint?: boolean } | undefined)?.bigint)) {
+        return observed;
+      }
+      return new Proxy(observed, {
+        get(target, property, receiver) {
+          if (property === "dev") return BigInt(Reflect.get(target, property, receiver) as bigint) + 1n;
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })))).rejects.toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication archive replay does not match the retained history directory",
+    });
+
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("refuses archive replay whose descriptor owner is not trusted", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    writeFileSync(archivePath, fixture.bytes, { mode: 0o600 });
+    const attempt = countingDriver(material());
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalFstat = nodeFs.fstatSync as (...args: unknown[]) => unknown;
+    let archiveFd: number | undefined;
+
+    await expect(withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === archivePath) archiveFd = fd;
+      return fd;
+    }) as never, async () => withPatchedFsAsync("fstatSync", ((fd: number, ...args: unknown[]) => {
+      const observed = originalFstat(fd, ...args) as Record<PropertyKey, unknown>;
+      if (fd !== archiveFd) return observed;
+      return new Proxy(observed, {
+        get(target, property, receiver) {
+          if (property === "uid") return Number(Reflect.get(target, property, receiver)) + 1;
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })))).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it.each(["history", "outer"] as const)(
+    "preserves an exact archive for retry when %s fsync fails",
+    async (target) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, 2);
+      const history = backendPublicationHistoryDirectory(home);
+      const archivePath = join(
+        history,
+        `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+      );
+      const attempt = countingDriver(material());
+      const failure = new Error(`${target} fsync failed`);
+      let records: ArchiveDirectoryDescriptor[] = [];
+
+      await expect(withTrackedArchiveDirectoryDescriptors(home, async (tracking) => {
+        records = tracking.records;
+        tracking.failNextSync(
+          target === "history" ? history : backendPublicationDirectory(home),
+          failure,
+        );
+        return coordinator(home, attempt.driver).prepare({
+          ...inputFor(material()),
+          publicationId: "publication-2",
+        });
+      })).rejects.toBe(failure);
+
+      expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+      expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+      expect(readdirSync(history)).toEqual([archivePath.split("/").at(-1)]);
+      expect(records.filter((record) => record.path === history)).toHaveLength(1);
+      expect(records.find((record) => record.path === history)?.closed).toBe(1);
+      expect(attempt.calls).toEqual([]);
+      expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
+
+      const retry = countingDriver(material());
+      await expect(coordinator(home, retry.driver).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      })).resolves.toMatchObject({ phase: "prepared" });
+      expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+      expect(retry.calls).toEqual(["observe-local-state"]);
+    },
+  );
+
+  it("fails on history cleanup alone, closes once, and replays the complete archive", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    const attempt = countingDriver(material());
+    const cleanupFailure = new Error("history close failed");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalClose = nodeFs.closeSync as (fd: number) => void;
+    let historyFd: number | undefined;
+    let historyCloseCalls = 0;
+
+    await expect(withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === history) historyFd = fd;
+      return fd;
+    }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+      originalClose(fd);
+      if (fd === historyFd) {
+        historyCloseCalls += 1;
+        throw cleanupFailure;
+      }
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })))).rejects.toBe(cleanupFailure);
+
+    expect(historyCloseCalls).toBe(1);
+    expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+    await expect(coordinator(home, countingDriver(material()).driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })).resolves.toMatchObject({ phase: "prepared" });
+  });
+
+  it("preserves a structured primary archive refusal when history cleanup also fails", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const retainedHistory = `${history}.primary-retained`;
+    const attempt = countingDriver(material());
+    const cleanupFailure = new Error("history close failed after refusal");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalClose = nodeFs.closeSync as (fd: number) => void;
+    let historyFd: number | undefined;
+    let historyCloseCalls = 0;
+    let caught: unknown;
+
+    try {
+      await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+        const fd = originalOpen(path, ...args);
+        if (path === history) historyFd = fd;
+        return fd;
+      }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+        originalClose(fd);
+        if (fd === historyFd) {
+          historyCloseCalls += 1;
+          throw cleanupFailure;
+        }
+      }) as never, async () => coordinator(home, attempt.driver, (event) => {
+        if (event === "before-terminal-journal-archive-publication") {
+          renameSync(history, retainedHistory);
+          mkdirSync(history, { mode: 0o700 });
+        }
+      }).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      })));
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(BackendPublicationJournalError);
+    expect(caught).toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication history directory changed during terminal journal archive",
+      cause: expect.any(AggregateError),
+    });
+    const aggregate = (caught as BackendPublicationJournalError).cause as AggregateError;
+    expect(aggregate.errors).toHaveLength(2);
+    expect(aggregate.errors[0]).toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication history directory changed during terminal journal archive",
+    });
+    expect(aggregate.errors[1]).toBe(cleanupFailure);
+    expect(historyCloseCalls).toBe(1);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("cleans its known unpublished archive temp after exclusive link failure", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    const attempt = countingDriver(material());
+    const linkFailure = new Error("archive link failed before publication");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalLink = nodeFs.linkSync as (...args: unknown[]) => void;
+
+    await expect(withPatchedFsAsync("linkSync", ((source: string, destination: string, ...args: unknown[]) => {
+      if (destination === archivePath) throw linkFailure;
+      return originalLink(source, destination, ...args);
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    }))).rejects.toBe(linkFailure);
+
+    expect(readdirSync(history)).toEqual([]);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+    expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
+  });
+
   it("covers archive replay with missing uid evidence and rejects an unsafe archive path", async () => {
     const home = makeHome();
     const input = material();
@@ -3847,7 +4474,7 @@ describe("BackendPublicationCoordinator", () => {
     await expect(coordinator(unsafeHome, makeDriver(unsafeInput).driver).prepare({
       ...inputFor(unsafeInput),
       publicationId: "publication-2",
-    })).rejects.toThrow("regular file");
+    })).rejects.toMatchObject({ reason: "unsafe-storage" });
   });
 
   it("requires exact identities for persisted state and does not match unresolved targets", async () => {
