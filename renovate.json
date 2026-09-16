@@ -11,7 +11,7 @@
   "separateMajorMinor": true,
   "pinDigests": true,
   "github-actions": {
-    "managerFilePatterns": ["/^\\.github\\/actions\\/.+\\/action\\.ya?ml$/"]
+    "managerFilePatterns": ["/^\\.github\\/actions\\/(?:.+\\/)?action\\.ya?ml$/"]
   },
   "customManagers": [
     {
