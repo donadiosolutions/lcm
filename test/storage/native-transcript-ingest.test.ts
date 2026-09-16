@@ -2936,16 +2936,31 @@ describe("native transcript backfill coordinator", () => {
     ]);
   });
 
-  it("fails closed when the real parser rejects a null content element", async () => {
+  it("links native Claude text when the real parser ignores a null block", async () => {
     const content = `${JSON.stringify({
       message: {
         role: "user",
         content: [null, { type: "text", text: "safe" }],
       },
     })}\n`;
-    expect(parseTranscriptText(content)).toEqual([]);
+    const parsed = parseTranscriptText(content);
+    expect(parsed).toEqual([{
+      role: "user",
+      content: "safe",
+      tokenCount: 1,
+    }]);
     const repo = repository();
-    const resolveExact = vi.fn(async () => null);
+    const messageResolver = createExactNativeTranscriptMessageResolver({
+      getNativeTranscriptMessageSnapshot: vi.fn(async () => parsed.map(
+        (message, messageSequence) => ({
+          messageId: 9,
+          conversationId: 7,
+          messageSequence,
+          role: message.role as "user" | "assistant" | "system",
+          content: message.content,
+        }),
+      )),
+    });
 
     await expect(runNativeTranscriptBackfill({
       repository: repo,
@@ -2961,12 +2976,15 @@ describe("native transcript backfill coordinator", () => {
       format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
       nativeSessionId: "session-1",
       sourceLocator: "sessions/session.jsonl",
-      messageResolver: { resolveExact },
-    })).rejects.toBeInstanceOf(NativeTranscriptLinkError);
-    expect(resolveExact).toHaveBeenCalledWith(expect.objectContaining({
-      content: "safe",
-    }));
-    expect(repo.ingestBatch).not.toHaveBeenCalled();
+      messageResolver,
+    })).resolves.toMatchObject({ importedCount: 1 });
+    expect(repo.batches).toHaveLength(1);
+    expect(repo.batches[0]?.records).toHaveLength(1);
+    expect(repo.batches[0]?.records[0]?.messageLinks).toEqual([{
+      conversationId: 7,
+      messageId: 9,
+      sourceOrdinal: 0,
+    }]);
   });
 
   it("quarantines expanded records before mapping and persists the next record", async () => {
