@@ -131,8 +131,8 @@ component_management:
         # #1118/#1303 quoted query-tail handoff, #1128 active own-query and
         # IPv6 bracket-boundary backslash paths, #1294 retained-query syntax and
         # raw-marker collision handling, contextual Windows-root ownership, and
-        # ampersand/quoted-query parent-child lifetime, persistent nested-file
-        # parent return, and independently depth-bound pipe wrapper handoffs,
+        # ampersand/quoted-query parent-child lifetime, independently depth-bound
+        # nested-file parent return, and pipe wrapper handoffs,
         # #1304 closed-bracket path handoff, #1312/#1313 repeated POSIX/Windows
         # nested-public delimiter handoff,
         # #1317 stable unquoted-wrapper public URLs, #1141 single-slash file

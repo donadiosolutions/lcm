@@ -3260,6 +3260,65 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it("retains outer returned-parent ownership after an inner file child closes", () => {
+    const input =
+      "file://h?x=[https://o.test/t&/Users/o/one&file:///Users/a/two&[https://i.test/t&/Users/i/one&file:///Users/b/two&\\Users\\i\\three]&\\Users\\o\\after]";
+    const expected =
+      "file://h?x=[https://o.test/t&<path>&file://<path>&[https://i.test/t&<path>&file://<path>&<path>]&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("\\Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "hosted children",
+      "file://h?x=[https://o.test/t&/Users/o/one&file://outer/Users/a/two&[https://i.test/t&/Users/i/one&file://inner/Users/b/two&\\Users\\i\\three]&\\Users\\o\\after]",
+      "file://h?x=[https://o.test/t&<path>&file://outer<path>&[https://i.test/t&<path>&file://inner<path>&<path>]&<path>]",
+    ],
+    [
+      "inner child query",
+      "file://h?x=[https://o.test/t&/Users/o/one&file:///Users/a/two&[https://i.test/t&/Users/i/one&file:///Users/b/two?key=/public&\\Users\\i\\three]&\\Users\\o\\after]",
+      "file://h?x=[https://o.test/t&<path>&file://<path>&[https://i.test/t&<path>&file://<path>?key=<path>&<path>]&<path>]",
+    ],
+    [
+      "inner child fragment",
+      "file://h?x=[https://o.test/t&/Users/o/one&file:///Users/a/two&[https://i.test/t&/Users/i/one&file:///Users/b/two#key=/public&\\Users\\i\\three]&\\Users\\o\\after]",
+      "file://h?x=[https://o.test/t&<path>&file://<path>&[https://i.test/t&<path>&file://<path>#key=<path>&<path>]&<path>]",
+    ],
+    [
+      "three returned-parent depths",
+      "file://h?x=[https://a.test/t&file:///Users/a/one&[https://b.test/t&file:///Users/b/two&[https://c.test/t&file:///Users/c/three&\\Users\\c\\tail]&\\Users\\b\\tail]&\\Users\\a\\tail]",
+      "file://h?x=[https://a.test/t&file://<path>&[https://b.test/t&file://<path>&[https://c.test/t&file://<path>&<path>]&<path>]&<path>]",
+    ],
+    [
+      "unclosed outer wrapper",
+      "file://h?x=[https://o.test/t&file:///Users/a/two&[https://i.test/t&file:///Users/b/two&\\Users\\i\\three]&\\Users\\o\\after",
+      "file://h?x=[https://o.test/t&file://<path>&[https://i.test/t&file://<path>&<path>]&<path>",
+    ],
+  ] as const)("retains nested-file returned parents for %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("preserves deferred direct-relative successor over-redaction", () => {
+    const input =
+      "file://h?x=[https://o.test/t&/Users/o/one&file:///Users/a/two&relative/path]";
+    const expected =
+      "file://h?x=[https://o.test/t&<path>&file://<path>&relative<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("redacts repeated pipe Windows paths inside one wrapper", () => {
     const input =
       "file://h?x=[https://e.test/t|\\Users\\alice\\one.db|\\Users\\bob\\secret.db]";

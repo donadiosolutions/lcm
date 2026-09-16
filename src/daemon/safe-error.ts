@@ -85,6 +85,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const nestedFileSchemeStarts = new Uint8Array(chars.length);
   const pipePathHandoffWrapperDepths = new Set<number>();
   const repeatedPipeHandoffWrapperDepths = new Set<number>();
+  const nestedFileUrlParentOwnerBracketDepths = new Set<number>();
   let schemeLength = 0;
   let fileSchemeLength = 0;
   let schemeQuote = 0;
@@ -99,7 +100,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let quotedPathEndedSeparator = -1;
   let restartedPathlessBrackets = 0;
   let pathlessFileQueryOwnerBracketDepth = 0;
-  let nestedFileUrlParentOwnerBracketDepth = 0;
+  let activeNestedFileUrlParentOwnerBracketDepth = 0;
   let fileTailBracketDepth = 0;
   let pendingFileTailBackslash = false;
   let pendingNestedUrlContinuation = false;
@@ -133,7 +134,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       pathlessFileQueryOwnerBracketDepth = 0;
       pipePathHandoffWrapperDepths.clear();
       repeatedPipeHandoffWrapperDepths.clear();
-      nestedFileUrlParentOwnerBracketDepth = 0;
+      nestedFileUrlParentOwnerBracketDepths.clear();
+      activeNestedFileUrlParentOwnerBracketDepth = 0;
       queryOrFragment = false;
       nestedPublicUrlBracketDepth = 0;
       pathlessFileQueryBracketDepth = 0;
@@ -169,8 +171,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         forcedPath[index + 1] = 1;
       }
     }
-    if (closingPathlessFileQueryOwnerDepth === nestedFileUrlParentOwnerBracketDepth) {
-      nestedFileUrlParentOwnerBracketDepth = 0;
+    if (closingPathlessFileQueryOwnerDepth > 0) {
+      nestedFileUrlParentOwnerBracketDepths.delete(closingPathlessFileQueryOwnerDepth);
+      if (closingPathlessFileQueryOwnerDepth === activeNestedFileUrlParentOwnerBracketDepth) {
+        activeNestedFileUrlParentOwnerBracketDepth = 0;
+      }
     }
     if (closingPathlessFileQueryOwnerDepth > 0) {
       repeatedPipeHandoffWrapperDepths.delete(closingPathlessFileQueryOwnerDepth);
@@ -276,7 +281,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         ? index + 1
         : -1;
     if ((separator >= 0 || restartedPathlessFile) && nestedFileSchemeStart >= 0) {
-      nestedFileUrlParentOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
+      activeNestedFileUrlParentOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
+      if (activeNestedFileUrlParentOwnerBracketDepth > 0) {
+        nestedFileUrlParentOwnerBracketDepths.add(activeNestedFileUrlParentOwnerBracketDepth);
+      }
       nestedFileSchemeStarts[nestedFileSchemeStart] = 1;
       separator = nestedFileSchemeStart + 4;
       brackets = 0;
@@ -299,7 +307,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       continue;
     }
     if (
-      nestedFileUrlParentOwnerBracketDepth > 0 &&
+      activeNestedFileUrlParentOwnerBracketDepth > 0 &&
       exactFileScheme &&
       foundFilePath &&
       queryOrFragment &&
@@ -310,7 +318,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       continue;
     }
     if (
-      nestedFileUrlParentOwnerBracketDepth > 0 &&
+      activeNestedFileUrlParentOwnerBracketDepth > 0 &&
       exactFileScheme &&
       foundFilePath &&
       char === "&"
@@ -329,10 +337,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         fileSchemeLength = 0;
         schemeQuote = 0;
         queryOrFragment = false;
+        activeNestedFileUrlParentOwnerBracketDepth = 0;
       }
     }
     if (
-      nestedFileUrlParentOwnerBracketDepth > 0 &&
+      nestedFileUrlParentOwnerBracketDepths.size > 0 &&
       !exactFileScheme &&
       separator < 0 &&
       char === "&"
@@ -434,7 +443,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       restartedPathlessBrackets = 0;
       pipePathHandoffWrapperDepths.clear();
       repeatedPipeHandoffWrapperDepths.clear();
-      nestedFileUrlParentOwnerBracketDepth = 0;
+      nestedFileUrlParentOwnerBracketDepths.clear();
+      activeNestedFileUrlParentOwnerBracketDepth = 0;
       fileTailBracketDepth = 0;
       pendingFileTailBackslash = false;
       pendingNestedUrlContinuation = false;
@@ -648,7 +658,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       authority[index + 2] = 1;
       exactFileScheme = schemeLength === FILE_SCHEME.length && fileSchemeLength === FILE_SCHEME.length;
       if (exactFileScheme && pathlessFileQueryOwnerBracketDepth > 0) {
-        nestedFileUrlParentOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
+        activeNestedFileUrlParentOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
+        nestedFileUrlParentOwnerBracketDepths.add(activeNestedFileUrlParentOwnerBracketDepth);
       }
       foundFilePath = false;
       filePathBracketDepth = 0;

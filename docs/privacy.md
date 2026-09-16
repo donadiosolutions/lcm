@@ -620,10 +620,12 @@ The `Security` section of the doctor output shows:
   immediate bare path and later word-bearing private parameter to redact on the
   same pass. A nested exact file URL retains its own path/query classification
   while bound to the observable enclosing owner; after the child span ends, a
-  persistent returned-parent mode classifies every later same-wrapper bare or
-  word-bearing private value until the matching close or a hard reset. This
-  does not trust marker text or make backslashes global. Public, named, and
-  relative child values retain their existing syntax.
+  depth-keyed returned-parent set classifies every later same-wrapper bare or
+  word-bearing private value. Closing an inner wrapper removes only that depth,
+  preserving still-open outer owners until their matching close or a hard
+  reset. This does not trust marker text or make backslashes global. Public and
+  named child values retain their existing syntax; a direct ordinary relative
+  successor remains conservatively redacted pending its separate follow-up.
   An unquoted exact file wrapper immediately followed by an ampersand-separated
   public URL is recognized from that observable syntax on every pass. The
   doubled-bracket pathless policy retains the observable scheme, authority, and
