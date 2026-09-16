@@ -3319,6 +3319,104 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it.each([
+    [
+      "pathless query",
+      "file://h?x=[https://e.test/t&/Users/o/one&file:///Users/a/one?key=/public&later/Users/tail/secret]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>?key=<path>&later<path>]",
+    ],
+    [
+      "hosted fragment",
+      "file://h?x=[https://e.test/t&/Users/o/one&file://host/Users/a/one#key=/public&later/Users/tail/secret]",
+      "file://h?x=[https://e.test/t&<path>&file://host<path>#key=<path>&later<path>]",
+    ],
+    [
+      "unclosed query wrapper",
+      "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&later/Users/tail/secret",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later<path>",
+    ],
+  ] as const)("returns from nested-file %s for private word-bearing roots", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("Users/tail/secret");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("returns from nested-file child queries at two retained depths", () => {
+    const input =
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&[file:///Users/b/two#key=/public&later/Users/b/secret]&later/Users/outer/secret]";
+    const expected =
+      "file://h?x=[file://<path>?key=<path>&later<path>&[file://<path>#key=<path>&later<path>]&later<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("returns from repeated nested-file query children at one depth", () => {
+    const input =
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&file://host/Users/b/two#key=/public&later/Users/b/secret]";
+    const expected =
+      "file://h?x=[file://<path>?key=<path>&later<path>&file://host<path>#key=<path>&later<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "query",
+      "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&relative/path]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative/path]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative<path>]",
+    ],
+    [
+      "fragment",
+      "file://h?x=[https://e.test/t&file:///Users/a/one#key=/public&docs/readme/more]",
+      "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs/readme/more]",
+      "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs<path>]",
+    ],
+    [
+      "incomplete Users root",
+      "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&later/Users]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later/Users]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later<path>]",
+    ],
+  ] as const)("preserves deferred Bug #1336 %s pass sequence", (_name, input, firstExpected, stableExpected) => {
+    const first = sanitizeError(input);
+    const second = sanitizeError(first);
+
+    expect(first).toBe(firstExpected);
+    expect(second).toBe(stableExpected);
+    expect(sanitizeError(second)).toBe(second);
+  });
+
+  it.each([
+    [
+      "matching close",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/tail/secret]&later/Users/outside",
+      "file://h?x=[file://<path>?key=<path>&later<path>]&later/Users/outside",
+    ],
+    [
+      "whitespace reset",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/tail/secret later/Users/outside]",
+      "file://h?x=[file://<path>?key=<path>&later<path> later/Users/outside]",
+    ],
+  ] as const)("expires nested-file query return at %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("redacts repeated pipe Windows paths inside one wrapper", () => {
     const input =
       "file://h?x=[https://e.test/t|\\Users\\alice\\one.db|\\Users\\bob\\secret.db]";

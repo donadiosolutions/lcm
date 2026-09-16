@@ -77,6 +77,16 @@ function startsWordBearingSlashPath(chars: readonly string[], index: number): bo
   return chars[cursor] === "/" && isPathWord(chars[cursor + 1]);
 }
 
+function wordBearingPrivateRootPathStart(chars: readonly string[], index: number): number {
+  if (!isPathWord(chars[index])) return -1;
+  let cursor = index + 1;
+  while (isPathWord(chars[cursor])) cursor += 1;
+  if (chars[cursor] !== "/") return -1;
+  const root = chars.slice(cursor + 1, cursor + 6).join("").toLowerCase();
+  if (root !== "users" || (chars[cursor + 6] !== "/" && chars[cursor + 6] !== "\\")) return -1;
+  return cursor;
+}
+
 function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const authority = new Uint8Array(chars.length);
   const file = new Uint8Array(chars.length);
@@ -323,11 +333,18 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath &&
       char === "&"
     ) {
+      const wordBearingPrivatePathStart = queryOrFragment
+        ? wordBearingPrivateRootPathStart(chars, index + 1)
+        : -1;
       const returnsToParent =
-        !queryOrFragment || chars[index + 1] === "/" || chars[index + 1] === "\\";
+        !queryOrFragment ||
+        chars[index + 1] === "/" ||
+        chars[index + 1] === "\\" ||
+        wordBearingPrivatePathStart >= 0;
       if (returnsToParent && (chars[index + 1] === "/" || chars[index + 1] === "\\")) {
         forcedPath[index + 1] = 1;
       }
+      if (wordBearingPrivatePathStart >= 0) forcedPath[wordBearingPrivatePathStart] = 1;
       if (returnsToParent) {
         separator = -1;
         exactFileScheme = false;
