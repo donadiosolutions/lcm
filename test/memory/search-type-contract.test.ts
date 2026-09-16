@@ -31,10 +31,16 @@ const options: Parameters<MemoryApi["search"]>[1] = {
   tags: ["decision"],
 };
 
+const invalidOptions: Parameters<MemoryApi["search"]>[1] = {
+  // @ts-expect-error cwd remains string-only.
+  cwd: 42,
+};
+
 void created.search("query", options);
 void memory.search("query", options);
 void created.search("query");
 void memory.search("query");
+void invalidOptions;
 `);
 
   const config: ts.CompilerOptions = {
@@ -49,7 +55,9 @@ void memory.search("query");
   };
   const host = ts.createCompilerHost(config);
   const program = ts.createProgram([fixture], config, host);
-  return ts.getPreEmitDiagnostics(program);
+  const sourceFile = program.getSourceFile(fixture);
+  if (!sourceFile) throw new Error(`Type contract fixture is missing from the program: ${fixture}`);
+  return ts.getPreEmitDiagnostics(program, sourceFile);
 }
 
 describe("MemoryApi search type contract", () => {
