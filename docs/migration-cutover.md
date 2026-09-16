@@ -100,6 +100,14 @@ outbox.
 its physical artifact, exact receipt reference, bounded queue page references,
 and a checksum. It reauthenticates machine identity, project metadata, aliases,
 configuration, and the held maintenance journal before sealing and returning.
+Authenticated capture validates its authority, source-byte witness, maintenance
+checksum, home directory, and generation before checking process UID and retained
+descriptor support. Dry-run validates its home directory before the same
+capability check. Either wrapper reports an unsupported platform before capture
+enters the append barrier or dry-run reads configuration, project, machine, or
+source authority. Ordinary descriptor probe and cleanup failures remain snapshot
+I/O errors. The lower-level snapshot calls repeat capability admission so a
+capability lost after wrapper preflight is still refused before source access.
 The actual copied machine-sequence counter must equal the journal cutoff. The
 currently supported participant set is the authenticated local machine; a shared
 project or another participant without acknowledged fencing is refused.

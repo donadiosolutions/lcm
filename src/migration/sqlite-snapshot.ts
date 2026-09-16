@@ -1457,14 +1457,64 @@ function mapCaptureError(error: unknown): never {
   throw new SqliteSnapshotError("snapshot-io", undefined, { cause: error });
 }
 
+type ValidatedCaptureInput = Readonly<{
+  authority: AuthenticatedSqliteSnapshotAuthority;
+  expectedSourceBytes: SqliteSnapshotSourceByteWitness;
+  context: Context;
+}>;
+
+function validateCaptureInput(
+  authorityValue: AuthenticatedSqliteSnapshotAuthority,
+  options: SqliteSnapshotOptions,
+): ValidatedCaptureInput {
+  const authority = validateAuthority(authorityValue);
+  const expectedSourceBytes = validateSourceByteWitness(
+    options.expectedSourceBytes,
+    authority,
+  );
+  if (!HASH.test(options.maintenanceChecksumSha256)) {
+    throw new SqliteSnapshotError("invalid-input");
+  }
+  return {
+    authority,
+    expectedSourceBytes,
+    context: contextFor(options),
+  };
+}
+
+/** @internal Validate capture input and descriptor capabilities without effects. */
+export function preflightSqliteSnapshotCapture(
+  authorityValue: AuthenticatedSqliteSnapshotAuthority,
+  options: SqliteSnapshotOptions,
+): void {
+  const { context } = validateCaptureInput(authorityValue, options);
+  try {
+    admitDescriptorPlatform(context);
+  } catch (error) {
+    mapCaptureError(error);
+  }
+}
+
+/** @internal Validate dry-run context and descriptor capabilities without effects. */
+export function preflightSqliteSnapshotDryRun(
+  options: SqliteSnapshotDryRunOptions,
+): void {
+  const context = contextFor(options);
+  try {
+    admitDescriptorPlatform(context);
+  } catch (error) {
+    mapCaptureError(error);
+  }
+}
+
 export async function captureSqliteSnapshotArtifact(
   authorityValue: AuthenticatedSqliteSnapshotAuthority,
   options: SqliteSnapshotOptions,
 ): Promise<SqliteSnapshotArtifactWitness> {
-  const authority = validateAuthority(authorityValue);
-  const expectedSourceBytes = validateSourceByteWitness(options.expectedSourceBytes, authority);
-  if (!HASH.test(options.maintenanceChecksumSha256)) throw new SqliteSnapshotError("invalid-input");
-  const context = contextFor(options);
+  const { authority, expectedSourceBytes, context } = validateCaptureInput(
+    authorityValue,
+    options,
+  );
   try {
     admitDescriptorPlatform(context);
     return await withBackendPublicationConsumerLockAsync(context.homeDir, async (token) =>

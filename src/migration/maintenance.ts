@@ -29,15 +29,17 @@ import type { StorageBackendName } from "../storage/contracts.js";
 import {
   captureSqliteSnapshotArtifact,
   authenticateSqliteSnapshotCaptureBinding,
-  validateSourceByteWitness,
   authenticateSqliteSnapshotSourceBytes,
   classifySqliteSnapshotArtifact,
   dryRunSqliteSnapshotArtifact,
   inspectSqliteSnapshotArtifact,
+  preflightSqliteSnapshotCapture,
+  preflightSqliteSnapshotDryRun,
   type AuthenticatedSqliteSnapshotAuthority,
   type SqliteSnapshotArtifactWitness,
   type SqliteSnapshotClassification,
   type SqliteSnapshotDryRun,
+  type SqliteSnapshotDryRunOptions,
   type SqliteSnapshotOptions,
   type SqliteSnapshotSourceByteOptions,
   type SqliteSnapshotSourceByteWitness,
@@ -164,7 +166,7 @@ export async function captureAuthenticatedSqliteMigrationSource(
   options: SqliteSnapshotOptions,
 ): Promise<AuthenticatedSqliteMigrationSnapshot> {
   assertAuthenticatedAuthority(authority);
-  validateSourceByteWitness(options.expectedSourceBytes, authority);
+  preflightSqliteSnapshotCapture(authority, options);
   const expected = canonicalJson(authority);
   return withBackendPublicationAppendBarrierAsync(options.homeDir, async (token) => {
     let captureOptions = options;
@@ -226,9 +228,17 @@ export async function authenticateSqliteMigrationSourceBytes(
 export async function dryRunAuthenticatedSqliteMigrationSource(
   cwd: string,
   homeDir: string,
+  options: Pick<SqliteSnapshotDryRunOptions, "_operationsForTesting"> = {},
 ): Promise<SqliteSnapshotDryRun> {
+  const snapshotOptions: SqliteSnapshotDryRunOptions = {
+    homeDir,
+    ...(options._operationsForTesting === undefined
+      ? {}
+      : { _operationsForTesting: options._operationsForTesting }),
+  };
+  preflightSqliteSnapshotDryRun(snapshotOptions);
   const authority = authenticateSqliteMigrationSource(cwd, homeDir);
-  return dryRunSqliteSnapshotArtifact(authority, { homeDir });
+  return dryRunSqliteSnapshotArtifact(authority, snapshotOptions);
 }
 
 export function classifyImmutableSqliteSnapshot(
