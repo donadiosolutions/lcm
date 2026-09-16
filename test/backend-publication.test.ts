@@ -1,6 +1,6 @@
 import { AsyncResource } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
@@ -23,6 +23,7 @@ import {
   withBackendPublicationAppendBarrier,
   withBackendPublicationAppendBarrierAsync,
   type BackendPublicationDriver,
+  type BackendPublicationJournal,
   type BackendMaintenanceJournal,
   type BackendPublicationFenceRecord,
   type BackendPublicationRecoveryFile,
@@ -386,6 +387,174 @@ function maintenanceArchivePath(home: string, journal: BackendMaintenanceJournal
     backendPublicationHistoryDirectory(home),
     `${journal.publicationId}.${journal.checksumSha256}.json`,
   );
+}
+
+type TerminalArchiveFixture = Readonly<{
+  bytes: Buffer;
+  journal: BackendPublicationJournal | BackendMaintenanceJournal;
+  version: 2 | 3;
+}>;
+
+async function terminalArchiveFixture(
+  home: string,
+  version: 2 | 3,
+): Promise<TerminalArchiveFixture> {
+  const input = material();
+  const fake = makeDriver(input);
+  let journal: BackendPublicationJournal | BackendMaintenanceJournal;
+  if (version === 2) {
+    await coordinator(home, fake.driver).prepare(inputFor(input));
+    journal = await coordinator(home, fake.driver).resume();
+  } else {
+    journal = await createMaintenanceState(home, fake.driver, "selection-completed");
+  }
+  return {
+    bytes: readFileSync(backendPublicationJournalPath(home)),
+    journal,
+    version,
+  };
+}
+
+function validJournalBytes(
+  bytes: Buffer,
+  mutate: (journal: Record<string, unknown>) => Record<string, unknown>,
+): Buffer {
+  const current = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+  const next = mutate(current);
+  const { checksumSha256: _checksum, ...payload } = next;
+  return Buffer.from(`${JSON.stringify({
+    ...payload,
+    checksumSha256: backendPublicationCanonicalSha256(payload),
+  })}\n`);
+}
+
+function countingDriver(input: BackendPublicationRecoveryMaterial): Readonly<{
+  calls: string[];
+  driver: BackendPublicationDriver;
+}> {
+  const base = makeDriver(input).driver;
+  const calls: string[] = [];
+  return {
+    calls,
+    driver: {
+      async observeLocalState(context) {
+        calls.push("observe-local-state");
+        return base.observeLocalState(context);
+      },
+      async publishProjectMap(context) {
+        calls.push("publish-project-map");
+        return base.publishProjectMap(context);
+      },
+      async publishConfig(context) {
+        calls.push("publish-config");
+        return base.publishConfig(context);
+      },
+      async restoreConfig(context) {
+        calls.push("restore-config");
+        return base.restoreConfig(context);
+      },
+      async restoreProjectMap(context) {
+        calls.push("restore-project-map");
+        return base.restoreProjectMap(context);
+      },
+    },
+  };
+}
+
+type ArchiveRereadOperation = "prepare" | "enter-maintenance";
+
+type ArchiveRereadReplacement =
+  | "malformed-json"
+  | "null"
+  | "array"
+  | "scalar"
+  | "unsupported-version"
+  | "unknown-field"
+  | "malformed-checksum"
+  | "payload-checksum-mismatch"
+  | "cross-version"
+  | "same-version-change";
+
+const ARCHIVE_REREAD_REFUSALS = [
+  { name: "malformed JSON after v2", version: 2, replacement: "malformed-json", reason: "malformed-journal", message: "backend publication journal is not valid JSON" },
+  { name: "malformed JSON after v3", version: 3, replacement: "malformed-json", reason: "malformed-journal", message: "backend publication journal is not valid JSON" },
+  { name: "null JSON", version: 2, replacement: "null", reason: "malformed-journal", message: "backend publication journal is not an object" },
+  { name: "array JSON", version: 3, replacement: "array", reason: "malformed-journal", message: "backend publication journal is not an object" },
+  { name: "scalar JSON", version: 2, replacement: "scalar", reason: "malformed-journal", message: "backend publication journal is not an object" },
+  { name: "unsupported v2-shaped version", version: 2, replacement: "unsupported-version", reason: "malformed-journal", message: "backend publication journal fields are malformed" },
+  { name: "unsupported v3-shaped version", version: 3, replacement: "unsupported-version", reason: "malformed-journal", message: "backend publication journal has unknown fields" },
+  { name: "unknown v2 field", version: 2, replacement: "unknown-field", reason: "malformed-journal", message: "backend publication journal has unknown fields" },
+  { name: "unknown v3 field", version: 3, replacement: "unknown-field", reason: "malformed-journal", message: "backend maintenance journal has unknown fields" },
+  { name: "malformed v2 checksum", version: 2, replacement: "malformed-checksum", reason: "malformed-journal", message: "backend publication journal checksum is malformed" },
+  { name: "malformed v3 checksum", version: 3, replacement: "malformed-checksum", reason: "checksum-mismatch", message: "backend maintenance journal checksum does not match" },
+  { name: "v2 payload checksum mismatch", version: 2, replacement: "payload-checksum-mismatch", reason: "checksum-mismatch", message: "backend publication journal checksum does not match" },
+  { name: "v3 payload checksum mismatch", version: 3, replacement: "payload-checksum-mismatch", reason: "checksum-mismatch", message: "backend maintenance journal checksum does not match" },
+  { name: "v2-to-v3 substitution", version: 2, replacement: "cross-version", reason: "unexpected-state", message: "backend publication journal changed before archive" },
+  { name: "v3-to-v2 substitution", version: 3, replacement: "cross-version", reason: "unexpected-state", message: "backend publication journal changed before archive" },
+  { name: "valid changed v2 checksum", version: 2, replacement: "same-version-change", reason: "unexpected-state", message: "backend publication journal changed before archive" },
+  { name: "valid changed v3 checksum", version: 3, replacement: "same-version-change", reason: "unexpected-state", message: "backend publication journal changed before archive" },
+] as const satisfies readonly Readonly<{
+  name: string;
+  version: 2 | 3;
+  replacement: ArchiveRereadReplacement;
+  reason: BackendPublicationJournalError["reason"];
+  message: string;
+}>[];
+
+async function runArchiveRereadOperation(
+  operation: ArchiveRereadOperation,
+  home: string,
+  driver: BackendPublicationDriver,
+  observer: (event: string, path: string) => void,
+): Promise<BackendPublicationJournal | BackendMaintenanceJournal> {
+  const active = coordinator(home, driver, observer);
+  if (operation === "prepare") {
+    return active.prepare({
+      ...inputFor(material()),
+      publicationId: "archive-reread-next",
+    });
+  }
+  return active.enterMaintenance({
+    publicationId: "archive-reread-maintenance",
+    generationId: "archive-reread-generation",
+    sourceSelectionSha256: "d".repeat(64),
+    queueEvidenceSha256: "e".repeat(64),
+    roster: [{
+      machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
+      queueCutoff: null,
+      evidenceSha256: "f".repeat(64),
+    }],
+  });
+}
+
+async function replacementArchiveBytes(
+  fixture: TerminalArchiveFixture,
+  replacement: ArchiveRereadReplacement,
+): Promise<Buffer> {
+  if (replacement === "malformed-json") return Buffer.from(`{"version":${fixture.version}`);
+  if (replacement === "null") return Buffer.from("null\n");
+  if (replacement === "array") return Buffer.from("[]\n");
+  if (replacement === "scalar") return Buffer.from('"terminal"\n');
+  if (replacement === "cross-version") {
+    const otherHome = makeHome();
+    return (await terminalArchiveFixture(otherHome, fixture.version === 2 ? 3 : 2)).bytes;
+  }
+  if (replacement === "unsupported-version") {
+    return validJournalBytes(fixture.bytes, (journal) => ({ ...journal, version: 99 }));
+  }
+  if (replacement === "unknown-field") {
+    return validJournalBytes(fixture.bytes, (journal) => ({ ...journal, unexpected: true }));
+  }
+  if (replacement === "same-version-change") {
+    return validJournalBytes(fixture.bytes, (journal) => ({
+      ...journal,
+      updatedAt: "2026-09-16T12:00:00.000Z",
+    }));
+  }
+  const journal = JSON.parse(fixture.bytes.toString("utf8")) as Record<string, unknown>;
+  if (replacement === "malformed-checksum") journal.checksumSha256 = "not-a-checksum";
+  else journal.updatedAt = "2026-09-16T12:00:00.000Z";
+  return Buffer.from(`${JSON.stringify(journal)}\n`);
 }
 
 function fenceRecord(overrides: Partial<BackendPublicationFenceRecord> = {}): BackendPublicationFenceRecord {
@@ -1525,6 +1694,123 @@ describe("BackendPublicationCoordinator", () => {
     expect(existsSync(backendPublicationHistoryDirectory(home))).toBe(false);
     expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
   });
+
+  it("returns a structured error for malformed terminal-v3 archive rereads", async () => {
+    const home = makeHome();
+    await terminalArchiveFixture(home, 3);
+    const journalPath = backendPublicationJournalPath(home);
+    const malformed = Buffer.from('{"version":3');
+    const replacementPath = join(home, "malformed-terminal-v3.json");
+    writeFileSync(replacementPath, malformed, { mode: 0o600 });
+    const attempt = countingDriver(material());
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    let journalReads = 0;
+    let thrown: unknown;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      if (path === journalPath && ++journalReads === 2) renameSync(replacementPath, journalPath);
+      return originalOpen(path, ...args);
+    }) as never, async () => {
+      try {
+        await coordinator(home, attempt.driver).prepare({
+          ...inputFor(material()),
+          publicationId: "archive-reread-next",
+        });
+      } catch (error) {
+        thrown = error;
+      }
+    });
+
+    expect(journalReads).toBe(2);
+    expect(thrown).toBeInstanceOf(BackendPublicationJournalError);
+    expect(thrown).toMatchObject({
+      name: "BackendPublicationJournalError",
+      reason: "malformed-journal",
+      message: "backend publication journal is not valid JSON",
+    });
+    expect(readFileSync(journalPath)).toEqual(malformed);
+    expect(existsSync(backendPublicationHistoryDirectory(home))).toBe(false);
+    expect(existsSync(join(backendPublicationDirectory(home), "archive-reread-next.material"))).toBe(false);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it.each(([
+    "prepare",
+    "enter-maintenance",
+  ] as const).flatMap((operation) => ARCHIVE_REREAD_REFUSALS.map((testCase) => ({
+    ...testCase,
+    operation,
+  }))))(
+    "$operation refuses $name before archive or successor effects",
+    async ({ operation, version, replacement, reason, message }) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, version);
+      const journalPath = backendPublicationJournalPath(home);
+      const replacementBytes = await replacementArchiveBytes(fixture, replacement);
+      const directory = backendPublicationDirectory(home);
+      const entriesBefore = readdirSync(directory).sort();
+      const attempt = countingDriver(material());
+      let injections = 0;
+      let thrown: unknown;
+
+      try {
+        await runArchiveRereadOperation(operation, home, attempt.driver, (event, path) => {
+          if (event !== "before-terminal-journal-archive-read") return;
+          injections += 1;
+          expect(path).toBe(journalPath);
+          writeFileSync(path, replacementBytes, { mode: 0o600 });
+        });
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(injections).toBe(1);
+      expect(thrown).toBeInstanceOf(BackendPublicationJournalError);
+      expect(thrown).toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason,
+        message,
+      });
+      expect(readFileSync(journalPath)).toEqual(replacementBytes);
+      expect(readdirSync(directory).sort()).toEqual(entriesBefore);
+      expect(existsSync(backendPublicationHistoryDirectory(home))).toBe(false);
+      expect(existsSync(join(directory, "archive-reread-next.material"))).toBe(false);
+      expect(attempt.calls).toEqual([]);
+    },
+  );
+
+  it.each(([
+    "prepare",
+    "enter-maintenance",
+  ] as const).flatMap((operation) => ([2, 3] as const).map((version) => ({ operation, version }))))(
+    "$operation archives an exact terminal-v$version reread",
+    async ({ operation, version }) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, version);
+      const journalPath = backendPublicationJournalPath(home);
+      const attempt = countingDriver(material());
+      let injections = 0;
+
+      const result = await runArchiveRereadOperation(operation, home, attempt.driver, (event, path) => {
+        if (event !== "before-terminal-journal-archive-read") return;
+        injections += 1;
+        expect(path).toBe(journalPath);
+        writeFileSync(path, fixture.bytes, { mode: 0o600 });
+      });
+
+      expect(injections).toBe(1);
+      expect(result).toMatchObject(operation === "prepare"
+        ? { version: 2, phase: "prepared", publicationId: "archive-reread-next" }
+        : { version: 3, phase: "maintenance-held", publicationId: "archive-reread-maintenance" });
+      const archivePath = join(
+        backendPublicationHistoryDirectory(home),
+        `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+      );
+      expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+      expect(attempt.calls).toEqual(operation === "prepare" ? ["observe-local-state"] : []);
+    },
+  );
 
   it.each(["resume", "abort", "recover", "recover-abort"] as const)(
     "keeps %s on the version-two-only recovery path",
