@@ -606,14 +606,18 @@ The `Security` section of the doctor output shows:
   and other whitespace end it; ordinary text and non-file URLs do not make a
   single backslash a global path start. Within a bracketed pathless file query,
   a nested public URL keeps its ordinary path and slash-bearing named query
-  values. An ampersand or pipe immediately followed by an absolute path returns
-  to the enclosing private-path grammar, and a private path immediately after
-  the nested URL's closing wrapper is redacted on the same pass. Sanitized
-  unquoted file-path wrappers retain only enough provenance to keep a following
-  ampersand-separated public URL byte-identical on later passes. Separately
-  quoted wrappers retain their conservative unspaced-URL behavior. These
-  boundaries make the first sanitized result stable without treating an
-  arbitrary `<path>` marker as trusted context.
+  values. An ampersand or pipe immediately followed by a supported POSIX or
+  Windows root returns to the enclosing private-path grammar. That owner remains
+  active through repeated immediate paths in the same wrapper, including a
+  POSIX component beginning with a Unicode symbol. A private path immediately
+  after the nested URL's closing wrapper is also redacted on the same pass.
+  Sanitized unquoted file-path wrappers retain only enough provenance to keep a
+  following ampersand-separated public URL byte-identical on later passes. The
+  canonical marker produced when the doubled-bracket pathless policy absorbs a
+  nested public URL also keeps that URL's named slash-bearing query values public
+  on later passes. Separately quoted wrappers retain their conservative
+  unspaced-URL behavior. These boundaries make the first sanitized result stable
+  without treating an arbitrary `<path>` marker as trusted context.
   When an unquoted local-path span contains a scheme-shaped `scheme://`
   component, the bounded span-local scheme colon and the component that follows
   it are replaced within the same `<path>` marker on the first pass. This also

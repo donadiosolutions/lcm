@@ -2748,6 +2748,83 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it("keeps doubled-bracket named public queries stable before Bug #1294 Windows tails", () => {
+    const input =
+      "file://h?x=[[a]/https://e.test/t?key=/public&next=/also]\\Users\\alice\\secret.db";
+    const expected = "file://h?x=[[a]<path>?key=/public&next=/also]<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("keeps doubled-bracket named public queries stable before immediate private paths", () => {
+    const input =
+      "file://h?x=[[a]/https://e.test/t?key=/public&next=/also&/Users/alice/secret.db]";
+    const expected = "file://h?x=[[a]<path>?key=/public&next=/also&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts repeated nested-public ampersand paths in the same wrapper", () => {
+    const input = "file://h?x=[https://e.test/t&/Users/a/one.db&/Users/b/two.db]";
+    const expected = "file://h?x=[https://e.test/t&<path>&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(first).not.toContain("one.db");
+    expect(first).not.toContain("two.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts nested-public ampersand Windows-root paths", () => {
+    const input = "file://h?x=[https://example.test/t&\\Users\\alice\\secret.db]";
+    const expected = "file://h?x=[https://example.test/t&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts nested-public ampersand POSIX paths beginning with a Unicode symbol", () => {
+    const input = "file://h?x=[https://example.test/t&/📁/secret.db]";
+    const expected = "file://h?x=[https://example.test/t&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("📁");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts bare ampersand paths after public URLs in quoted file queries", () => {
+    const input = "'file://h'['/private']?a/Users/alice&https://e.test/x&/Users/bob/two.db";
+    const expected = "'file://h'['<path>']?a<path>&https://e.test/x&<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/private");
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("bob");
+    expect(first).not.toContain("two.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("bounds URL authority classification work by input length", () => {
     const authority = `${"host-segment".repeat(64)}.invalid`;
     const path = Array.from({ length: 256 }, (_, index) => `segment-${index}`).join("/");
