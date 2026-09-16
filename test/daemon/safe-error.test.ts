@@ -2976,6 +2976,73 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it("keeps quoted-query ownership after an immediate public URL path handoff", () => {
+    const input =
+      "'file://h'['/private']?a/Users/alice&https://e.test/x&/Users/bob&c/Users/carol";
+    const expected =
+      "'file://h'['<path>']?a<path>&https://e.test/x&<path>&c<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("bob");
+    expect(first).not.toContain("carol");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("consumes a nested pipe handoff at its originating wrapper close", () => {
+    const input = "file://h?x=[[https://e.test/t|/Users/a/one]\\Users\\b\\two]";
+    const expected = "file://h?x=[[https://e.test/t|<path>]<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(first).not.toContain("\\Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("restores enclosing ownership after a later public URL", () => {
+    const input =
+      "file://h?x=[https://e.test/t&/Users/a/one&https://p.test/x&\\Users\\bob\\secret.db]";
+    const expected = "file://h?x=[https://e.test/t&<path>&https://p.test/x&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(first).not.toContain("bob");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    ["public", "file://h?x=[https://e.test/t]", "file://h?x=[https://e.test/t]"],
+    [
+      "named",
+      "file://h?x=[https://e.test/t?key=/public&next=/also]",
+      "file://h?x=[https://e.test/t?key=/public&next=/also]",
+    ],
+    ["relative", "file://h?x=[https://e.test/t|relative/path]", "file://h?x=[https://e.test/t|relative/path]"],
+    [
+      "IPv6",
+      "file://h?x=[https://[::1]/p|\\Users\\first.db|\\Users\\second.db",
+      "file://h?x=[https://[::1]/p|<path>|\\Users\\second.db",
+    ],
+    [
+      "deferred Bug #1332",
+      "file://h?x=[value|later=\\Users\\bob\\secret.db]",
+      "file://h?x=[value|later=<path>]",
+    ],
+  ] as const)("preserves post-review 5 %s control", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("redacts repeated nested-public ampersand paths in the same wrapper", () => {
     const input = "file://h?x=[https://e.test/t&/Users/a/one.db&/Users/b/two.db]";
     const expected = "file://h?x=[https://e.test/t&<path>&<path>]";
