@@ -1,6 +1,6 @@
 import { AsyncResource } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, fsyncSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
@@ -219,6 +219,7 @@ async function withTrackedArchiveDirectoryDescriptors<T>(
     records: ArchiveDirectoryDescriptor[];
     events: ArchiveDirectoryEvent[];
     beginSyncOrder: () => void;
+    completeSyncOrder: () => void;
     admitted: () => Readonly<{
       history: ArchiveDirectoryDescriptor;
       outer: ArchiveDirectoryDescriptor;
@@ -267,12 +268,14 @@ async function withTrackedArchiveDirectoryDescriptors<T>(
     return fd;
   }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
     const record = activeRecord(fd);
-    if (recordSyncOrder && record?.path === history) {
-      events.push(eventFor("close", record, originalFstat(fd, { bigint: true })));
-      recordSyncOrder = false;
-    }
+    const closeStat = recordSyncOrder && record !== undefined
+      ? originalFstat(fd, { bigint: true })
+      : undefined;
     originalClose(fd);
     if (record !== undefined) record.closed += 1;
+    if (record !== undefined && closeStat !== undefined) {
+      events.push(eventFor("close", record, closeStat));
+    }
   }) as never, async () => withPatchedFsAsync("fstatSync", ((fd: number, ...args: unknown[]) => {
     const observed = originalFstat(fd, ...args);
     if (recordSyncOrder) {
@@ -307,6 +310,12 @@ async function withTrackedArchiveDirectoryDescriptors<T>(
         throw new Error("archive directory descriptors were not admitted before sync");
       }
       recordSyncOrder = true;
+    },
+    completeSyncOrder: () => {
+      if (!recordSyncOrder || admittedHistory === undefined || admittedHistory.closed !== 1) {
+        throw new Error("archive directory operation completed before retained history cleanup");
+      }
+      recordSyncOrder = false;
     },
     admitted: () => {
       if (admittedHistory === undefined || admittedOuter === undefined) {
@@ -4004,6 +4013,7 @@ describe("BackendPublicationCoordinator", () => {
       const observed = await withTrackedArchiveDirectoryDescriptors(home, async (tracking) => {
         const prepared = await coordinator(home, attempt.driver, (event) => {
           if (event === "before-terminal-journal-history-sync") tracking.beginSyncOrder();
+          if (event === "after-terminal-journal-history-operation") tracking.completeSyncOrder();
         }).prepare({
           ...inputFor(material()),
           publicationId: "publication-2",
@@ -4040,12 +4050,54 @@ describe("BackendPublicationCoordinator", () => {
         expectedArchiveDirectoryEvent("close", observed.admitted.history),
       ];
       assertExactArchiveDirectoryEvents(observed.events, expectedEvents);
-      expect(() => assertExactArchiveDirectoryEvents([
-        ...observed.events,
-        expectedArchiveDirectoryEvent("fsync", observed.admitted.outer),
-      ], expectedEvents)).toThrow();
     },
   );
+
+  it("captures and rejects a real post-close retained-outer fsync", async () => {
+    const home = makeHome();
+    await terminalArchiveFixture(home, 2);
+    const attempt = countingDriver(material());
+    let injected = false;
+    const observed = await withTrackedArchiveDirectoryDescriptors(home, async (tracking) => {
+      const prepared = await coordinator(home, attempt.driver, (event) => {
+        if (event === "before-terminal-journal-history-sync") tracking.beginSyncOrder();
+        if (event === "after-terminal-journal-history-operation") {
+          fsyncSync(tracking.admitted().outer.fd);
+          injected = true;
+          tracking.completeSyncOrder();
+        }
+      }).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      });
+      return {
+        prepared,
+        admitted: tracking.admitted(),
+        events: tracking.events,
+        records: tracking.records,
+      };
+    });
+    const expectedEvents = [
+      expectedArchiveDirectoryEvent("assert", observed.admitted.history),
+      expectedArchiveDirectoryEvent("fsync", observed.admitted.history),
+      expectedArchiveDirectoryEvent("assert", observed.admitted.history),
+      expectedArchiveDirectoryEvent("assert", observed.admitted.outer),
+      expectedArchiveDirectoryEvent("fsync", observed.admitted.outer),
+      expectedArchiveDirectoryEvent("assert", observed.admitted.outer),
+      expectedArchiveDirectoryEvent("close", observed.admitted.history),
+    ];
+
+    expect(injected).toBe(true);
+    expect(observed.prepared).toMatchObject({ phase: "prepared" });
+    assertExactArchiveDirectoryEvents(observed.events, [
+      ...expectedEvents,
+      expectedArchiveDirectoryEvent("fsync", observed.admitted.outer),
+    ]);
+    expect(() => assertExactArchiveDirectoryEvents(observed.events, expectedEvents)).toThrow();
+    expect(observed.records.filter(
+      (record) => record.path === backendPublicationHistoryDirectory(home),
+    )[0]?.closed).toBe(1);
+  });
 
   it("treats post-open ENOENT as unsafe instead of recreating history", async () => {
     const home = makeHome();

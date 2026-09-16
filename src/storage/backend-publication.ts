@@ -2974,6 +2974,7 @@ function archiveTerminalJournal(
       assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
     },
   );
+  observer("after-terminal-journal-history-operation", history);
 }
 
 function materialToJson(file: BackendPublicationRecoveryFile): Record<string, unknown> {

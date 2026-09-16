@@ -1345,34 +1345,44 @@ export function atomicWritePrivateFile(
     } finally {
       if (ownsTempPath && tempIdentity !== undefined) {
         if (primaryError instanceof PrivateFileCollisionError) {
-          let cleanupErrorPresent = false;
-          let cleanupError: unknown;
+          let removalErrorPresent = false;
+          let removalError: unknown;
+          let removed = false;
           try {
-            const removed = unlinkPrivateFileIfIdentityMatches(
+            removed = unlinkPrivateFileIfIdentityMatches(
               tempPath,
               tempIdentity,
               (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
               undefined,
               1n,
             );
-            if (!removed) {
-              try {
-                assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
-              } catch (topologyError) {
-                throw new PrivateDirectoryTopologyError(
-                  "private exclusive publication temp cleanup was not completed",
-                  { cause: topologyError },
-                );
-              }
-              throw new Error("private exclusive publication temp cleanup was not completed");
-            }
-            ownsTempPath = false;
           } catch (error) {
-            cleanupErrorPresent = true;
-            cleanupError = error;
+            removalErrorPresent = true;
+            removalError = error;
           }
-          if (cleanupErrorPresent) {
+          if (removalErrorPresent) {
+            const cleanupErrors = [removalError];
+            try {
+              assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+            } catch (topologyError) {
+              cleanupErrors.push(topologyError);
+            }
+            primaryError = privateFilePublicationCleanupFailure(primaryError, ...cleanupErrors);
+          } else if (!removed) {
+            let cleanupError: unknown = new Error(
+              "private exclusive publication temp cleanup was not completed",
+            );
+            try {
+              assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+            } catch (topologyError) {
+              cleanupError = new PrivateDirectoryTopologyError(
+                "private exclusive publication temp cleanup was not completed",
+                { cause: topologyError },
+              );
+            }
             primaryError = privateFilePublicationCleanupFailure(primaryError, cleanupError);
+          } else {
+            ownsTempPath = false;
           }
         } else {
           try {

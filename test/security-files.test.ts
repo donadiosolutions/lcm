@@ -506,6 +506,49 @@ describe("private filesystem primitives", () => {
     }
   });
 
+  it("preserves collision cleanup and topology errors when removal rebinds the parent", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    writeFileSync(join(replacement, "sentinel"), "replacement", { mode: 0o600 });
+    const target = join(active, "metadata.json");
+    writeFileSync(target, "winner", { mode: 0o600 });
+    const parent = openPrivateDirectory(active);
+    const cleanupFailure = Object.assign(new Error("cleanup failed after parent rebound"), { code: "EIO" });
+    let observed: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "loser", {
+          remove: () => {
+            renameSync(active, displaced);
+            renameSync(replacement, active);
+            throw cleanupFailure;
+          },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        observed = error;
+      }
+
+      expect(observed).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(observed).not.toBeInstanceOf(PrivateFileCollisionError);
+      const aggregate = (observed as Error).cause as AggregateError & { cause?: unknown };
+      expect(aggregate).toBeInstanceOf(AggregateError);
+      expect(aggregate.errors[0]).toBeInstanceOf(PrivateFileCollisionError);
+      expect(aggregate.errors[1]).toBe(cleanupFailure);
+      expect(aggregate.errors[2]).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(aggregate.cause).toBe(aggregate.errors[0]);
+      expect(readFileSync(join(displaced, "metadata.json"), "utf8")).toBe("winner");
+      expect(readdirSync(displaced).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toHaveLength(1);
+      expect(readFileSync(join(active, "sentinel"), "utf8")).toBe("replacement");
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
   it("fails closed when collision cleanup refuses an untrusted replacement", () => {
     const root = makeRoot();
     const parent = openPrivateDirectory(root);
