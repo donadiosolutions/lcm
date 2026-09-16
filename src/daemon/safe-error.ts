@@ -96,6 +96,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let quotedQueryTail = false;
   let quotedPathEndedSeparator = -1;
   let restartedPathlessBrackets = 0;
+  let pathlessFileQueryOwnerBracketDepth = 0;
   let fileTailBracketDepth = 0;
   let pendingFileTailBackslash = false;
   let pendingNestedUrlContinuation = false;
@@ -125,6 +126,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryTail = false;
       quotedPathEndedSeparator = -1;
       restartedPathlessBrackets = 0;
+      pathlessFileQueryOwnerBracketDepth = 0;
       queryOrFragment = false;
       nestedPublicUrlBracketDepth = 0;
       pathlessFileQueryBracketDepth = 0;
@@ -137,6 +139,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         pendingNestedUrlContinuation = false;
       }
       continue;
+    }
+    if (pathlessFileQueryOwnerBracketDepth > 0 && char === "[") {
+      pathlessFileQueryOwnerBracketDepth += 1;
+    } else if (pathlessFileQueryOwnerBracketDepth > 0 && char === "]") {
+      pathlessFileQueryOwnerBracketDepth -= 1;
+    } else if (restartedPathlessFile && char === "[") {
+      pathlessFileQueryOwnerBracketDepth = 1;
     }
     const fileTailBoundaryEvent =
       fileTailBracketDepth > 0 && (char === "]" || URL_END_DELIMITERS.has(char));
@@ -157,6 +166,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         pendingNestedUrlContinuation = false;
         if (!fileTailBoundaryEvent && !continuesNestedUrl) fileTailBracketDepth = 0;
       }
+    }
+    if (
+      pathlessFileQueryOwnerBracketDepth > 0 &&
+      separator < 0 &&
+      !pathlessNestedPublicUrlActive &&
+      char === "\\" &&
+      chars[index - 1] === "="
+    ) {
+      forcedPath[index] = 1;
+      continue;
     }
     if (fileTailBracketDepth > 0 && char === "[") {
       fileTailBracketDepth += 1;

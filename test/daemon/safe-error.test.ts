@@ -2800,6 +2800,62 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it.each([
+    [
+      "query",
+      "file://h?x=[[a]<path>?key=\\Users\\alice\\secret.db]",
+      "file://h?x=[[a]<path>?key=<path>]",
+    ],
+    [
+      "fragment",
+      "file://h?x=[[a]<path>#key=\\Users\\alice\\secret.db]",
+      "file://h?x=[[a]<path>#key=<path>]",
+    ],
+    [
+      "arbitrary literal",
+      "file://h?x=[[a]<opaque>?key=\\Users\\alice\\secret.db]",
+      "file://h?x=[[a]<opaque>?key=<path>]",
+    ],
+  ] as const)("redacts contextual Windows roots after %s text", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "ordinary <opaque>?key=\\Users\\alice\\secret.db prose",
+    "https://e.test/t?key=\\Users\\alice\\secret.db",
+  ] as const)("does not make single-root Windows paths global: %s", (input) => {
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it.each([
+    [
+      "query",
+      "file://h?x=[[a]/https://e.test/t?key=/public&next=/also]\\Users\\alice\\secret.db",
+      "file://h?x=[[a]<path>https://e.test/t?key=/public&next=/also]<path>",
+    ],
+    [
+      "fragment",
+      "file://h?x=[[a]/https://e.test/t#key=/public&next=/also]\\Users\\alice\\secret.db",
+      "file://h?x=[[a]<path>https://e.test/t#key=/public&next=/also]<path>",
+    ],
+  ] as const)("retains actual nested public URL %s syntax", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("retains bracketed public URL syntax before Bug #1294 Windows tails", () => {
     const input =
       "file://h?x=[[a]/https://e.test/t?key=[/public]&next=/also]\\Users\\alice\\secret.db";

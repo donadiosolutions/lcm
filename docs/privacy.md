@@ -618,9 +618,13 @@ The `Security` section of the doctor output shows:
   Later passes therefore derive ownership of named slash-bearing values from the
   retained URL syntax. A literal `<path>` followed directly by `?` or `#` carries
   no provenance; slash-bearing values in that ambiguous form are conservatively
-  redacted. Separately quoted wrappers retain their conservative unspaced-URL
-  behavior. These boundaries make the first sanitized result stable without
-  treating an arbitrary `<path>` marker as trusted context.
+  redacted. The observable outer brackets of a pathless file query or fragment
+  remain the owner across arbitrary literal text, so a query or fragment value
+  beginning with a root-relative Windows backslash is also redacted while that
+  wrapper remains open. This does not make a single backslash a path start in
+  ordinary prose or non-file URLs. Separately quoted wrappers retain their
+  conservative unspaced-URL behavior. These boundaries make the first sanitized
+  result stable without treating an arbitrary `<path>` marker as trusted context.
   When an unquoted local-path span contains a scheme-shaped `scheme://`
   component, the bounded span-local scheme colon and the component that follows
   it are replaced within the same `<path>` marker on the first pass. This also
