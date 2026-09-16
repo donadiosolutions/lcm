@@ -223,7 +223,12 @@ describe("dependency automation configuration", () => {
     expect(matchingManagers(".github/actions/setup-ci/action.yml")).toEqual([
       "github-actions",
     ]);
-    expect(matchingManagers(".github/actions/nested/setup/action.yaml")).toEqual([]);
+    expect(matchingManagers(".github/actions/nested/setup/action.yaml")).toEqual([
+      "github-actions",
+    ]);
+    expect(matchingManagers(".github/actions/example/action.YAML")).toEqual([]);
+    expect(matchingManagers(".github/actions/example/action.yaml.bak")).toEqual([]);
+    expect(matchingManagers(".github/actions/example/my-action.yaml")).toEqual([]);
     expect(matchingManagers("scripts/postgresql-images.mjs")).toEqual(["custom.regex"]);
     expect(matchingManagers("package.json")).toEqual([]);
     expect(matchingManagers("pnpm-lock.yaml")).toEqual([]);
