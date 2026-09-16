@@ -547,8 +547,11 @@ The `Security` section of the doctor output shows:
   slash paths in later ampersand-separated parameters remain covered by the
   same handoff. When an ampersand is immediately followed by an ordinary
   public `scheme://` URL, the quoted-query handoff expires before that URL, so
-  its scheme, authority, and path remain byte-identical. A nested exact
-  `file://` literal still starts its own bounded file-path classification.
+  its scheme, authority, and path remain byte-identical. A later
+  ampersand-separated word-bearing private path resumes the surrounding quoted
+  file query's handoff. Named public URL parameters such as `&next=/public`
+  remain part of that public URL. A nested exact `file://` literal still starts
+  its own bounded file-path classification.
   Classification state from an earlier quoted file URL does not carry into a
   later unquoted file URL's query tail. A public URL glued directly after the
   closing quote or bracket without whitespace may be conservatively redacted:
@@ -601,7 +604,16 @@ The `Security` section of the doctor output shows:
   bracket. A balanced outer bracket may have only spaces or tabs before the
   backslash. This handoff is consumed once. Prose, newlines, carriage returns,
   and other whitespace end it; ordinary text and non-file URLs do not make a
-  single backslash a global path start.
+  single backslash a global path start. Within a bracketed pathless file query,
+  a nested public URL keeps its ordinary path and slash-bearing named query
+  values. An ampersand or pipe immediately followed by an absolute path returns
+  to the enclosing private-path grammar, and a private path immediately after
+  the nested URL's closing wrapper is redacted on the same pass. Sanitized
+  unquoted file-path wrappers retain only enough provenance to keep a following
+  ampersand-separated public URL byte-identical on later passes. Separately
+  quoted wrappers retain their conservative unspaced-URL behavior. These
+  boundaries make the first sanitized result stable without treating an
+  arbitrary `<path>` marker as trusted context.
   When an unquoted local-path span contains a scheme-shaped `scheme://`
   component, the bounded span-local scheme colon and the component that follows
   it are replaced within the same `<path>` marker on the first pass. This also

@@ -2599,6 +2599,155 @@ describe("sanitizeError", () => {
     expect(sanitizeError(secondPass)).toBe(secondPass);
   });
 
+  it("redacts Bug #1294 Windows tails after nested public URL brackets in one pass", () => {
+    const input = "file://h?x=[[a]/https://example.test/t]\\Users\\fictional.db";
+    const expected = "file://h?x=[[a]<path>]<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("Users");
+    expect(first).not.toContain("fictional.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts Bug #1303 later quoted-query private parameters in one pass", () => {
+    const input = "'file://h'['/private']?a/Users/alice&https://e.test/x&c/Users/bob/secret.db";
+    const expected = "'file://h'['<path>']?a<path>&https://e.test/x&c<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/private");
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("bob");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts Bug #1304 paths after closed nested public URL brackets in one pass", () => {
+    const input = "file://h/p?x=[https://e.test/t]/Users/alice/secret.db";
+    const expected = "file://h<path>?x=[https://e.test/t]<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts Bug #1312 absolute paths after nested public URL ampersands in one pass", () => {
+    const input = "file://h?x=[https://example.test/t&/Users/alice/secret.db]";
+    const expected = "file://h?x=[https://example.test/t&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("preserves Bug #1313 pipe-delimited absolute-path redaction as a stable regression", () => {
+    const input = "file://h?x=[https://example.test/t|/Users/alice/secret.db]";
+    const expected = "file://h?x=[https://example.test/t|<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("keeps Bug #1317 unquoted wrapper output stable while preserving its public URL", () => {
+    const input = "file://host['/private']&https://e.test/p";
+    const expected = "file://host['<path>']&https://e.test/p";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/private");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("keeps slash-bearing values inside ordinary nested public queries", () => {
+    const input = "file://h?x=[https://example.test/t?a=/public]";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps named slash-bearing parameters inside nested public queries", () => {
+    const input = "file://h?x=[https://example.test/t?key=/public/path&next=/also/public]";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps relative ampersand continuations inside nested public URLs", () => {
+    const input = "file://h?x=[https://example.test/t&relative/path]";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps relative pipe continuations inside nested public URLs", () => {
+    const input = "file://h?x=[https://example.test/t|relative/path]";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps nested IPv6 public URL authority brackets and query syntax", () => {
+    const input = "file://h?x=[https://[fe80::1]/p?q=1]";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps ordinary public URLs in pathless file queries", () => {
+    const input = "file://h?x=https://e.test/p";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps Bug #1317 generated-marker output byte-identical", () => {
+    const input = "file://host['<path>']&https://e.test/p";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps separately quoted wrappers conservatively redacted", () => {
+    const input = "'file://host'['/private']&https://example.test/p";
+    const expected = "'file://host'['<path>']&https:<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("preserves public URLs after whitespace-separated unquoted wrappers", () => {
+    const input = "file://host['/private'] https://e.test/p";
+    const expected = "file://host['<path>'] https://e.test/p";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("bounds URL authority classification work by input length", () => {
     const authority = `${"host-segment".repeat(64)}.invalid`;
     const path = Array.from({ length: 256 }, (_, index) => `segment-${index}`).join("/");

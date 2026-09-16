@@ -128,10 +128,12 @@ const expectedComponents = [
       // quoted/root-only backslash handoff, #1010 pathless-tail brackets,
       // #1060 adjacent nested-file schemes, #1113 doubled-colon drive tails,
       // #1117 glued authorities, #1111 bracketed nested-URL idempotence,
-      // #1118 quoted query-tail handoff, #1128 active own-query and IPv6
-      // # bracket-boundary backslash paths, #1141 single-slash file tails,
-      // # and #1156 forced drive-after-content continuations remain
-      // # daemon-core-owned.
+      // #1118/#1303 quoted query-tail handoff, #1128 active own-query and
+      // IPv6 bracket-boundary backslash paths, #1294/#1304 closed-bracket
+      // path handoff, #1312/#1313 nested-public delimiter handoff,
+      // #1317 stable unquoted-wrapper public URLs, #1141 single-slash file
+      // tails, and #1156 forced drive-after-content continuations remain
+      // daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
