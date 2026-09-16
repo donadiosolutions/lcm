@@ -261,6 +261,94 @@ function assertExactWorkflowJobPermissions(workflow, expectedPermissions) {
   }
 }
 
+function replaceExactlyOnce(source, pattern, replacement) {
+  const matches = source.match(pattern) ?? [];
+  assert.equal(
+    matches.length,
+    1,
+    `Expected exactly one mutation target for ${pattern}`,
+  );
+  return source.replace(pattern, replacement);
+}
+
+function assertTrustedCheckoutStep(workflow) {
+  const lines = workflow.split("\n");
+  const checkoutHeaders = lines.flatMap((line, index) => {
+    const match = line.match(/^(\s*)- name: Checkout trusted workflow code\s*$/u);
+    return match ? [{ index, indent: match[1] }] : [];
+  });
+  assert.equal(
+    checkoutHeaders.length,
+    1,
+    "Expected exactly one trusted checkout step",
+  );
+  const [{ index: stepStart, indent: stepIndent }] = checkoutHeaders;
+  const siblingPattern = new RegExp(`^${stepIndent}-\\s+`, "u");
+  const stepEnd = lines.findIndex(
+    (line, index) => index > stepStart && siblingPattern.test(line),
+  );
+  assert.notEqual(
+    stepEnd,
+    -1,
+    "Expected an immediate sibling after the trusted checkout step",
+  );
+  assert.equal(
+    lines[stepEnd],
+    `${stepIndent}- name: Mark configured high-priority issues as temporarily exempt`,
+    "Expected the priority exemption step as the immediate next sibling",
+  );
+
+  const stepLines = lines.slice(stepStart, stepEnd);
+  const propertyIndent = `${stepIndent}  `;
+  const directUses = stepLines.filter((line) => (
+    line.startsWith(`${propertyIndent}uses:`)
+  ));
+  assert.equal(
+    directUses.length,
+    1,
+    "Expected exactly one direct uses property in the trusted checkout step",
+  );
+  assert.ok(
+    new RegExp(
+      `^${propertyIndent}uses: actions/checkout@[0-9a-f]{40}\\s+#\\s*v[0-9]`,
+      "u",
+    ).test(directUses[0]),
+    "Trusted checkout must use actions/checkout at a lowercase 40-hex pin with a version comment",
+  );
+
+  const directWithIndexes = stepLines.flatMap((line, index) => (
+    line === `${propertyIndent}with:` ? [index] : []
+  ));
+  assert.equal(
+    directWithIndexes.length,
+    1,
+    "Expected exactly one direct with mapping in the trusted checkout step",
+  );
+  const withStart = directWithIndexes[0];
+  const withEndOffset = stepLines.slice(withStart + 1).findIndex((line) => {
+    if (line.trim() === "") return false;
+    const indentation = line.match(/^(\s*)/u)[1].length;
+    return indentation <= propertyIndent.length;
+  });
+  const withEnd = withEndOffset === -1
+    ? stepLines.length
+    : withStart + 1 + withEndOffset;
+  const directChildIndent = `${propertyIndent}  `;
+  const persistenceProperties = stepLines
+    .slice(withStart + 1, withEnd)
+    .filter((line) => line.startsWith(`${directChildIndent}persist-credentials:`));
+  assert.equal(
+    persistenceProperties.length,
+    1,
+    "Expected exactly one direct persist-credentials property in checkout inputs",
+  );
+  assert.equal(
+    persistenceProperties[0],
+    `${directChildIndent}persist-credentials: false`,
+    "Expected checkout persist-credentials to be false",
+  );
+}
+
 const sourceIssue = {
   number: 42,
   title: "Daemon crashes while compacting",
@@ -976,10 +1064,13 @@ test("workflow binds evidence and the required model split", async () => {
     staleWorkflow,
     /permissions:\s*\n\s+contents: read\s*\n\s+issues: write/u,
   );
-  assert.match(
+  assertTrustedCheckoutStep(staleWorkflow);
+  const alternateValidCheckout = replaceExactlyOnce(
     staleWorkflow,
-    /actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1[\s\S]*?persist-credentials: false/u,
+    /actions\/checkout@[0-9a-f]{40} # v[0-9][^\n]*/gu,
+    "actions/checkout@1111111111111111111111111111111111111111 # v999.0.0",
   );
+  assertTrustedCheckoutStep(alternateValidCheckout);
   assert.match(staleWorkflow, /internal-stale-priority-exempt/u);
   assert.doesNotMatch(staleWorkflow, /p0-critical|p1-high/u);
   assert.match(
@@ -994,6 +1085,133 @@ test("workflow binds evidence and the required model split", async () => {
     staleWorkflow.indexOf("for (const issueNumber of exempt)")
     > staleWorkflow.indexOf("} while (cursor !== null);"),
   );
+});
+
+test("rejects malformed trusted checkout step structures", async (t) => {
+  const workflow = await readFile(
+    new URL("../workflows/stale.yml", import.meta.url),
+    "utf8",
+  );
+  const checkoutTarget = /actions\/checkout@[0-9a-f]{40}/gu;
+  const checkoutUsesLine = /        uses: actions\/checkout@[0-9a-f]{40} # v[0-9][^\n]*/gu;
+  const checkoutHeader = /      - name: Checkout trusted workflow code/gu;
+  const persistenceLine = /          persist-credentials: false/gu;
+  const withBlock = /        with:\n          persist-credentials: false/gu;
+  const boundaryHeader = /      - name: Mark configured high-priority issues as temporarily exempt/gu;
+  const mutants = [
+    {
+      name: "different action identity",
+      pattern: /actions\/checkout@/gu,
+      replacement: "untrusted/checkout@",
+    },
+    {
+      name: "branch ref",
+      pattern: checkoutTarget,
+      replacement: "actions/checkout@main",
+    },
+    {
+      name: "39-character ref",
+      pattern: checkoutTarget,
+      replacement: `actions/checkout@${"1".repeat(39)}`,
+    },
+    {
+      name: "41-character ref",
+      pattern: checkoutTarget,
+      replacement: `actions/checkout@${"1".repeat(41)}`,
+    },
+    {
+      name: "uppercase ref",
+      pattern: checkoutTarget,
+      replacement: `actions/checkout@A${"1".repeat(39)}`,
+    },
+    {
+      name: "missing version comment",
+      pattern: /(        uses: actions\/checkout@[0-9a-f]{40}) # v[0-9][^\n]*/gu,
+      replacement: "$1",
+    },
+    {
+      name: "malformed version comment",
+      pattern: /(        uses: actions\/checkout@[0-9a-f]{40}) # v[0-9][^\n]*/gu,
+      replacement: "$1 # release 7",
+    },
+    {
+      name: "missing persistence property",
+      pattern: persistenceLine,
+      replacement: "          fetch-depth: 1",
+    },
+    {
+      name: "true persistence property",
+      pattern: persistenceLine,
+      replacement: "          persist-credentials: true",
+    },
+    {
+      name: "malformed persistence property",
+      pattern: persistenceLine,
+      replacement: "          persist-credentials: 'false'",
+    },
+    {
+      name: "duplicate named step",
+      pattern: checkoutHeader,
+      replacement: [
+        "      - name: Checkout trusted workflow code",
+        "        run: echo decoy",
+        "",
+        "      - name: Checkout trusted workflow code",
+      ].join("\n"),
+    },
+    {
+      name: "duplicate direct uses property",
+      pattern: checkoutUsesLine,
+      replacement: "$&\n$&",
+    },
+    {
+      name: "duplicate direct persistence property",
+      pattern: persistenceLine,
+      replacement: "$&\n$&",
+    },
+    {
+      name: "persistence nested beneath a decoy mapping",
+      pattern: withBlock,
+      replacement: "        env:\n          persist-credentials: false",
+    },
+    {
+      name: "shadowing direct with mapping",
+      pattern: withBlock,
+      replacement: [
+        "        with:",
+        "          persist-credentials: false",
+        "        with:",
+        "          fetch-depth: 1",
+      ].join("\n"),
+    },
+    {
+      name: "uses nested beneath a decoy mapping",
+      pattern: checkoutUsesLine,
+      replacement: "        env:\n  $&",
+    },
+    {
+      name: "renamed immediate sibling boundary",
+      pattern: boundaryHeader,
+      replacement: "      - name: Renamed priority exemption step",
+    },
+    {
+      name: "interposed sibling step",
+      pattern: boundaryHeader,
+      replacement: [
+        "      - name: Unexpected sibling",
+        "        run: echo unexpected",
+        "",
+        "      - name: Mark configured high-priority issues as temporarily exempt",
+      ].join("\n"),
+    },
+  ];
+
+  for (const { name, pattern, replacement } of mutants) {
+    await t.test(name, () => {
+      const mutant = replaceExactlyOnce(workflow, pattern, replacement);
+      assert.throws(() => assertTrustedCheckoutStep(mutant));
+    });
+  }
 });
 
 test("documents core read failures separately from security evidence gaps", async () => {
