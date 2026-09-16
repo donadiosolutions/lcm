@@ -214,6 +214,21 @@ describe("dependency automation configuration", () => {
     expect(renovateExists).toBe(true);
   });
 
+  it.each([".github/actions/action.yml", ".github/actions/action.yaml"])(
+    "assigns the root composite action %s only to the GitHub Actions manager",
+    (fileName) => {
+      expect(matchingManagers(fileName)).toEqual(["github-actions"]);
+    },
+  );
+
+  it.each([
+    ".github/actions/action.YAML",
+    ".github/actions/action.yaml.bak",
+    ".github/actions/my-action.yaml",
+  ])("does not assign the root lookalike %s to a Renovate manager", (fileName) => {
+    expect(matchingManagers(fileName)).toEqual([]);
+  });
+
   it("gives hosted Renovate exactly one owner for each approved file family", () => {
     expect(renovate.enabledManagers).toEqual(["github-actions", "custom.regex"]);
     expect(renovate.includePaths).toEqual([
@@ -223,7 +238,12 @@ describe("dependency automation configuration", () => {
     expect(matchingManagers(".github/actions/setup-ci/action.yml")).toEqual([
       "github-actions",
     ]);
-    expect(matchingManagers(".github/actions/nested/setup/action.yaml")).toEqual([]);
+    expect(matchingManagers(".github/actions/nested/setup/action.yaml")).toEqual([
+      "github-actions",
+    ]);
+    expect(matchingManagers(".github/actions/example/action.YAML")).toEqual([]);
+    expect(matchingManagers(".github/actions/example/action.yaml.bak")).toEqual([]);
+    expect(matchingManagers(".github/actions/example/my-action.yaml")).toEqual([]);
     expect(matchingManagers("scripts/postgresql-images.mjs")).toEqual(["custom.regex"]);
     expect(matchingManagers("package.json")).toEqual([]);
     expect(matchingManagers("pnpm-lock.yaml")).toEqual([]);
