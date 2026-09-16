@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Command } from "commander";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 const state = vi.hoisted(() => ({
   exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
@@ -358,8 +359,11 @@ async function captureRunCliActions(): Promise<Map<string, ActionHandler>> {
   return captured;
 }
 
-async function invoke(args: string[]): Promise<Error | undefined> {
-  try { await runCli(["node", "lcm", ...args]); return undefined; }
+async function invoke(
+  args: string[],
+  seams?: NonNullable<Parameters<typeof runCli>[1]>,
+): Promise<Error | undefined> {
+  try { await runCli(["node", "lcm", ...args], seams); return undefined; }
   catch (error) { return error instanceof Error ? error : new Error(String(error)); }
 }
 
@@ -1569,6 +1573,122 @@ describe("runCli scanning and portable knowledge boundaries", () => {
       vi.useRealTimers();
     }
   });
+
+  it.each([
+    ["matching config", undefined, undefined, undefined],
+    ["port drift", 4_444, undefined, undefined],
+    ["backend drift", undefined, "postgresql" as const, undefined],
+    ["observation failure", undefined, undefined, new Error("snapshot unavailable")],
+  ] as const)(
+    "validates compact-drain recovery at CLI dispatch for %s",
+    async (_name, observedPort, observedBackend, observationFailure) => {
+      vi.useFakeTimers();
+      const priorPaths = {
+        home: state.runtimeHome,
+        pid: state.runtimePidPath,
+        token: state.runtimeTokenPath,
+      };
+      state.runtimeHome = "/lcm";
+      state.runtimePidPath = "/lcm/.lcm/daemon.pid";
+      state.runtimeTokenPath = "/lcm/.lcm/daemon.token";
+      const config = {
+        daemon: { port: observedPort ?? 3_737 },
+        storage: { backend: observedBackend ?? "sqlite" },
+        llm: {
+          provider: "openai", apiMode: "responses", requestTimeoutMs: 1_000,
+          retry: { maxAttempts: 2, initialDelayMs: 1, maxDelayMs: 2, multiplier: 2 },
+        },
+        compaction: { autoCompactMinTokens: 1 },
+      };
+      const witness = {
+        presence: "present" as const,
+        rawSha256: "a".repeat(64),
+        byteLength: 100,
+        dev: "1",
+        ino: "2",
+        mtimeMs: 3,
+      };
+      let validationError: unknown;
+      const readSnapshot = vi.fn(() => {
+        if (observationFailure !== undefined) throw observationFailure;
+        return { config, witness } as never;
+      });
+      try {
+        state.health.mockReset();
+        state.cancelInvocation.mockReset();
+        state.health
+          .mockResolvedValueOnce({
+            status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+            daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+            pid: 9,
+          })
+          .mockResolvedValueOnce(null)
+          .mockResolvedValueOnce({
+            status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+            daemonInstanceId: "33333333-3333-4333-8333-333333333333",
+            runtimeDigest: "runtime",
+          });
+        state.restartDaemon.mockImplementationOnce(async (restartOptions: {
+          _validateBeforeManagedRestart?: () => void | Promise<void>;
+        }) => {
+          try {
+            await restartOptions._validateBeforeManagedRestart?.();
+          } catch (error) {
+            validationError = error;
+            throw error;
+          }
+          return { connected: true, restarted: true, stoppedPid: 9, pid: 10 };
+        });
+        state.cancelInvocation
+          .mockImplementationOnce(async (target: unknown) => ({
+            ...target as object,
+            state: "cancelling",
+            activeCount: 1,
+            workCount: 1,
+            commitCount: 0,
+            leaseExpiresAt: null,
+          }))
+          .mockImplementationOnce(async (target: unknown) => ({
+            ...target as object,
+            state: "cancelled",
+            activeCount: 0,
+            workCount: 0,
+            commitCount: 0,
+            leaseExpiresAt: null,
+          }));
+        state.batchSignal = "SIGINT";
+        const pending = invoke(["compact", "--no-promote"], {
+          migrate: vi.fn(),
+          sleep: async () => undefined,
+          _readDaemonConfigSnapshot: readSnapshot,
+          _assertBackendPublicationConfigReadAccess: () => ({ journalChecksumSha256: null }),
+          _withBackendPublicationReadRoot: (_homeDir, callback) => callback(() => undefined),
+        });
+        await vi.waitFor(() => expect(state.cancelInvocation).toHaveBeenCalledOnce());
+        await vi.advanceTimersByTimeAsync(1_000);
+        await expect(pending).resolves.toBeUndefined();
+
+        expect(state.restartDaemon).toHaveBeenCalledOnce();
+        if (observationFailure !== undefined) {
+          expect(validationError).toBe(observationFailure);
+          expect(readSnapshot).toHaveBeenCalledOnce();
+        } else if (observedPort !== undefined || observedBackend !== undefined) {
+          expect(validationError).toBeInstanceOf(BackendPublicationJournalError);
+          expect((validationError as Error).message)
+            .toBe("compact drain recovery configuration changed before managed restart");
+          expect(readSnapshot).toHaveBeenCalledTimes(2);
+        } else {
+          expect(validationError).toBeUndefined();
+          expect(readSnapshot).toHaveBeenCalledTimes(4);
+        }
+      } finally {
+        state.runtimeHome = priorPaths.home;
+        state.runtimePidPath = priorPaths.pid;
+        state.runtimeTokenPath = priorPaths.token;
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("covers TTY all-provider import directory filtering", async () => {
     Object.defineProperty(process.stderr, "isTTY", { configurable: true, value: true });

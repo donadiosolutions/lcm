@@ -42,6 +42,7 @@ const expectedComponents = [
     component_id: "unit-cli",
     name: "Unit - CLI",
     // #1132 keeps foreground PID publication at the CLI boundary.
+    // #1233 keeps publication-contention restart recovery at the CLI boundary.
     paths: ["bin/", "src/cli/", "^src/cli-help\\.ts$", "^src/cli-storage\\.ts$"],
   },
   {
@@ -321,6 +322,7 @@ const expectedComponents = [
       // #865/#966 convergence and birth budgeting remain lifecycle-owned;
       // #1073 bounds legacy PID/token evidence within that same owner. #1132
       // keeps unscoped detached PID publication lifecycle-owned.
+      // #1233 keeps publication-contention managed restart recovery lifecycle-owned.
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",

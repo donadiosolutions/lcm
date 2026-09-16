@@ -287,6 +287,68 @@ metadata, and manager identity checks reduce accidental or cross-user access;
 they do not turn same-UID filesystem state into a capability. LCM therefore
 does not offer detached offline force-recovery or a PID/pathname-only fallback.
 
+### Restart while daemon-owned publication is busy
+
+An explicit `lcm daemon restart` can recover one narrow managed-service case:
+the current daemon owns the backend-publication lock but does not produce HTTP
+response headers. This is a supported recovery path for an already managed
+daemon. It does not diagnose or fix the underlying cause of an unresponsive
+daemon, including possible CPU starvation.
+
+Before the service manager may stop anything, LCM requires all of the following
+evidence to agree:
+
+- the existing `config.json` is parsed from two bounded, descriptor-bound reads
+  under a retained private-root check, and both reads name the same port and
+  storage backend;
+- both config reads pass publication-journal admission with the same checksum;
+  an absent journal is accepted where normal SQLite admission permits it, and a
+  terminal admitted journal is accepted, while an unresolved publication is
+  refused;
+- the canonical backend-publication lock owner names the exact manager PID,
+  carries a non-null process birth, and matches a bounded live process-birth
+  observation;
+- systemd or launchd reports the exact registered, running service, the
+  canonical PID file names that same live process, and it owns the configured
+  loopback listener; and
+- a second manager probe plus fresh config, journal, root, PID, listener, lock
+  owner, nonce, and process-birth checks remain unchanged immediately before
+  the manager stop.
+
+Only a transport rejection or header deadline before any response can use this
+path. A response of any kind, including malformed content or a body timeout
+after headers, keeps the normal authenticated refusal behavior. An abort,
+expired lifecycle deadline, missing configuration, unknown publication home,
+unsafe or changed root, pending or mismatched journal, missing or unrelated
+lock owner, unknown process birth, stopped or legacy service, unavailable or
+ambiguous manager, changed PID/listener, or any revalidation drift refuses the
+restart without signaling the process.
+
+The recovery-only header wait is capped at two seconds and at one half of the
+remaining lifecycle deadline. The reserved half remains available for the
+second manager proof, final identity checks, managed stop/start, and replacement
+admission; reaching the overall deadline still refuses recovery.
+
+Each process-birth read receives at most 100 milliseconds and no more than one
+quarter of the remaining lifecycle deadline. This fail-closed proof can be
+unavailable under heavy load, especially on macOS where the birth observation
+uses a bounded system command. Wait for the host to recover enough to provide
+the proof, preserve the refusal evidence, and retry once. Do not run repeated
+restart loops.
+
+The observational path does not acquire another exclusive recovery lock.
+Concurrent requests rely on the service manager's existing identity checks and
+serialization; a request that observes another replacement during its final
+proof becomes the stale request and refuses without issuing a second stop. This
+does not promise a global exactly-once restart for simultaneous requests.
+
+After an authorized manager stop, the replacement still has to pass the normal
+locked backend-publication and authenticated daemon admission. A stale lock
+owner may be reclaimed only by that existing lock-acquisition machinery after
+the verified process has stopped. This recovery path never deletes, renames, or
+reclaims a lock from read-only evidence, and a busy or invalid replacement gate
+still makes the command fail.
+
 ## The three health outcomes
 
 The lifecycle client keeps the response boundary distinct from transport
