@@ -4,6 +4,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { load as loadYaml } from "js-yaml";
 import {
   buildClassificationPrompt,
   buildClassificationSchema,
@@ -271,26 +272,141 @@ function replaceExactlyOnce(source, pattern, replacement) {
   return source.replace(pattern, replacement);
 }
 
-function assertTrustedCheckoutStep(workflow) {
-  const lines = workflow.split("\n");
-  const checkoutHeaders = lines.flatMap((line, index) => {
-    const match = line.match(/^(\s*)- name: Checkout trusted workflow code\s*$/u);
-    return match ? [{ index, indent: match[1] }] : [];
+function endOfIndentedYamlBlock(lines, start, indentation) {
+  const offset = lines.slice(start + 1).findIndex((line) => {
+    if (line.trim() === "" || line.trimStart().startsWith("#")) return false;
+    return line.match(/^(\s*)/u)[1].length <= indentation;
   });
+  return offset === -1 ? lines.length : start + 1 + offset;
+}
+
+function assertTrustedCheckoutStep(workflow) {
+  let parsedWorkflow;
+  try {
+    parsedWorkflow = loadYaml(workflow);
+  } catch {
+    assert.fail(
+      "Expected workflow YAML without duplicate semantic mapping keys",
+    );
+  }
+  assert.ok(
+    parsedWorkflow !== null
+      && typeof parsedWorkflow === "object"
+      && !Array.isArray(parsedWorkflow),
+    "Expected the workflow document to be a mapping",
+  );
+  const staleJob = parsedWorkflow.jobs?.stale;
+  assert.ok(
+    staleJob !== null && typeof staleJob === "object" && !Array.isArray(staleJob),
+    "Expected the effective jobs.stale mapping",
+  );
+  const effectiveSteps = staleJob.steps;
+  assert.ok(
+    Array.isArray(effectiveSteps),
+    "Expected effective jobs.stale.steps to be a sequence",
+  );
+  const effectiveCheckoutIndexes = effectiveSteps.flatMap((step, index) => (
+    step !== null
+      && typeof step === "object"
+      && !Array.isArray(step)
+      && step.name === "Checkout trusted workflow code"
+      ? [index]
+      : []
+  ));
+  assert.equal(
+    effectiveCheckoutIndexes.length,
+    1,
+    "Expected exactly one effective trusted checkout step",
+  );
+  const [effectiveStepIndex] = effectiveCheckoutIndexes;
+  const effectiveCheckout = effectiveSteps[effectiveStepIndex];
+  assert.equal(
+    effectiveSteps[effectiveStepIndex + 1]?.name,
+    "Mark configured high-priority issues as temporarily exempt",
+    "Expected the priority exemption step as the immediate effective sibling",
+  );
+  assert.ok(
+    /^actions\/checkout@[0-9a-f]{40}$/u.test(effectiveCheckout.uses),
+    "Effective trusted checkout must use a lowercase 40-hex actions/checkout pin",
+  );
+  assert.ok(
+    effectiveCheckout.with !== null
+      && typeof effectiveCheckout.with === "object"
+      && !Array.isArray(effectiveCheckout.with),
+    "Expected effective checkout inputs to be a mapping",
+  );
+  assert.equal(
+    effectiveCheckout.with["persist-credentials"],
+    false,
+    "Expected effective checkout persist-credentials to be false",
+  );
+
+  const lines = workflow.split("\n");
+  const jobsIndexes = lines.flatMap((line, index) => (
+    line === "jobs:" ? [index] : []
+  ));
+  assert.equal(jobsIndexes.length, 1, "Expected one canonical raw jobs mapping");
+  const [jobsStart] = jobsIndexes;
+  const jobsEnd = endOfIndentedYamlBlock(lines, jobsStart, 0);
+  const staleJobIndexes = lines.flatMap((line, index) => (
+    index > jobsStart && index < jobsEnd && line === "  stale:" ? [index] : []
+  ));
+  assert.equal(
+    staleJobIndexes.length,
+    1,
+    "Expected one canonical raw stale job mapping",
+  );
+  const [staleJobStart] = staleJobIndexes;
+  const staleJobEnd = endOfIndentedYamlBlock(lines, staleJobStart, 2);
+  const stepsIndexes = lines.flatMap((line, index) => (
+    index > staleJobStart && index < staleJobEnd && line === "    steps:"
+      ? [index]
+      : []
+  ));
+  assert.equal(
+    stepsIndexes.length,
+    1,
+    "Expected one canonical raw stale steps sequence",
+  );
+  const [stepsStart] = stepsIndexes;
+  const stepsIndent = lines[stepsStart].match(/^(\s*)/u)[1];
+  const stepsEnd = endOfIndentedYamlBlock(
+    lines,
+    stepsStart,
+    stepsIndent.length,
+  );
+  const expectedStepIndent = `${stepsIndent}  `;
+  const rawSiblingPattern = new RegExp(`^${expectedStepIndent}-\\s+`, "u");
+  const rawSiblingIndexes = lines.flatMap((line, index) => (
+    index > stepsStart
+      && index < stepsEnd
+      && rawSiblingPattern.test(line)
+      ? [index]
+      : []
+  ));
+  const checkoutHeaders = rawSiblingIndexes.flatMap((index) => (
+    lines[index] === `${expectedStepIndent}- name: Checkout trusted workflow code`
+      ? [index]
+      : []
+  ));
   assert.equal(
     checkoutHeaders.length,
     1,
-    "Expected exactly one trusted checkout step",
+    "Expected exactly one canonical raw trusted checkout step",
   );
-  const [{ index: stepStart, indent: stepIndent }] = checkoutHeaders;
-  const siblingPattern = new RegExp(`^${stepIndent}-\\s+`, "u");
-  const stepEnd = lines.findIndex(
-    (line, index) => index > stepStart && siblingPattern.test(line),
+  const [stepStart] = checkoutHeaders;
+  const stepIndent = lines[stepStart].match(/^(\s*)/u)[1];
+  const rawStepIndex = rawSiblingIndexes.indexOf(stepStart);
+  assert.equal(
+    rawStepIndex,
+    effectiveStepIndex,
+    "Expected raw and effective trusted checkout step positions to match",
   );
+  const stepEnd = rawSiblingIndexes[rawStepIndex + 1];
   assert.notEqual(
     stepEnd,
-    -1,
-    "Expected an immediate sibling after the trusted checkout step",
+    undefined,
+    "Expected an immediate raw sibling after the trusted checkout step",
   );
   assert.equal(
     lines[stepEnd],
@@ -1209,6 +1325,121 @@ test("rejects malformed trusted checkout step structures", async (t) => {
   for (const { name, pattern, replacement } of mutants) {
     await t.test(name, () => {
       const mutant = replaceExactlyOnce(workflow, pattern, replacement);
+      assert.throws(() => assertTrustedCheckoutStep(mutant));
+    });
+  }
+});
+
+test("binds the trusted checkout assertion to the effective YAML step", async () => {
+  const workflow = await readFile(
+    new URL("../workflows/stale.yml", import.meta.url),
+    "utf8",
+  );
+  let mutant = replaceExactlyOnce(
+    workflow,
+    /      - name: Checkout trusted workflow code\n        uses: actions\/checkout@[0-9a-f]{40} # v[0-9][^\n]*/gu,
+    [
+      "      - name: Mutable checkout",
+      "        uses: actions/checkout@main",
+    ].join("\n"),
+  );
+  mutant = replaceExactlyOnce(
+    mutant,
+    /    runs-on: ubuntu-latest/gu,
+    [
+      "    runs-on: ubuntu-latest",
+      "    name: |",
+      "      - name: Checkout trusted workflow code",
+      "        uses: actions/checkout@1111111111111111111111111111111111111111 # v999.0.0",
+      "        with:",
+      "          persist-credentials: false",
+      "      - name: Mark configured high-priority issues as temporarily exempt",
+    ].join("\n"),
+  );
+
+  const parsed = loadYaml(mutant);
+  assert.equal(parsed.jobs.stale.steps[0].name, "Mutable checkout");
+  assert.equal(parsed.jobs.stale.steps[0].uses, "actions/checkout@main");
+  assert.equal(
+    parsed.jobs.stale.steps.some(
+      (step) => step.name === "Checkout trusted workflow code",
+    ),
+    false,
+  );
+  assert.throws(() => assertTrustedCheckoutStep(mutant));
+});
+
+test("rejects semantically duplicate checkout keys", async (t) => {
+  const workflow = await readFile(
+    new URL("../workflows/stale.yml", import.meta.url),
+    "utf8",
+  );
+  const checkoutUsesLine = /        uses: actions\/checkout@[0-9a-f]{40} # v[0-9][^\n]*/gu;
+  const withBlock = /        with:\n          persist-credentials: false/gu;
+  const persistenceLine = /          persist-credentials: false/gu;
+  const mutants = [
+    {
+      name: "quoted duplicate uses key",
+      pattern: checkoutUsesLine,
+      replacement: "$&\n        \"uses\" : actions/checkout@main",
+      expectedUses: "actions/checkout@main",
+    },
+    {
+      name: "whitespace duplicate uses key",
+      pattern: checkoutUsesLine,
+      replacement: "$&\n        uses : actions/checkout@main",
+      expectedUses: "actions/checkout@main",
+    },
+    {
+      name: "quoted duplicate with key with a flow value",
+      pattern: withBlock,
+      replacement: [
+        "$&",
+        "        \"with\" : { persist-credentials: true }",
+      ].join("\n"),
+      expectedPersistence: true,
+    },
+    {
+      name: "whitespace duplicate with key with a flow value",
+      pattern: withBlock,
+      replacement: [
+        "$&",
+        "        with : { persist-credentials: true }",
+      ].join("\n"),
+      expectedPersistence: true,
+    },
+    {
+      name: "quoted duplicate persist-credentials key",
+      pattern: persistenceLine,
+      replacement: "$&\n          \"persist-credentials\" : true",
+      expectedPersistence: true,
+    },
+    {
+      name: "whitespace duplicate persist-credentials key",
+      pattern: persistenceLine,
+      replacement: "$&\n          persist-credentials : true",
+      expectedPersistence: true,
+    },
+  ];
+
+  for (const {
+    name,
+    pattern,
+    replacement,
+    expectedUses,
+    expectedPersistence,
+  } of mutants) {
+    await t.test(name, () => {
+      const mutant = replaceExactlyOnce(workflow, pattern, replacement);
+      const parsed = loadYaml(mutant, { json: true });
+      const checkout = parsed.jobs.stale.steps[0];
+      if (expectedUses) assert.equal(checkout.uses, expectedUses);
+      if (expectedPersistence !== undefined) {
+        assert.equal(
+          checkout.with["persist-credentials"],
+          expectedPersistence,
+        );
+      }
       assert.throws(() => assertTrustedCheckoutStep(mutant));
     });
   }
