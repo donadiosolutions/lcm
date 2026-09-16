@@ -15,6 +15,7 @@ component_management:
         # #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
         # #1132 keeps foreground PID publication at the CLI boundary.
         # #1201 keeps diagnostic-only identity admission CLI-owned.
+        # #1233 keeps publication-contention restart recovery at the CLI boundary.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
@@ -359,6 +360,8 @@ component_management:
         # project/worktree ownership component; no topology change.
         # #1178 listing-root authentication and #1245 retained journal-parent
         # witness stay in this existing unit-project-worktrees owner.
+        # #1316 keeps SQLite message-byte admission in this existing
+        # unit-project-worktrees owner; no taxonomy or topology change.
         - "^src/worktree-reconciliation\\.ts$"
     # #1201 keeps doctor identity observation and unverified queue readiness here.
     - component_id: "unit-diagnostics"
@@ -385,6 +388,7 @@ component_management:
         # bounded legacy PID/token evidence in the same lifecycle owner. Their
         # paired managed lifecycle tests remain this component's coverage boundary.
         # #1132 keeps unscoped detached PID publication lifecycle-owned.
+        # #1233 keeps publication-contention managed restart recovery lifecycle-owned.
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"

@@ -885,16 +885,37 @@ function assertSupportedPromotedContent(db: DatabaseSync): void {
   }
 }
 
+const MESSAGE_CONTENT_DECODER = new TextDecoder("utf-8", { fatal: true });
+
 function assertSupportedMessageContent(db: DatabaseSync): void {
   if (!tableExists(db, "messages")) return;
-  const unsupported = db.prepare(
-    `SELECT 1
-     FROM messages
-     WHERE typeof(content) <> 'text' OR instr(content, char(0)) > 0
-     LIMIT 1`,
-  ).get();
-  if (unsupported !== undefined) {
-    throw new Error("stored message content is unsupported");
+  const first = db.prepare(
+    `SELECT message_id, typeof(content) AS content_type,
+            CAST(content AS BLOB) AS content_bytes
+       FROM messages ORDER BY message_id LIMIT 1`,
+  );
+  const continuation = db.prepare(
+    `SELECT message_id, typeof(content) AS content_type,
+            CAST(content AS BLOB) AS content_bytes
+       FROM messages WHERE message_id > ? ORDER BY message_id LIMIT 1`,
+  );
+  first.setReadBigInts(true);
+  continuation.setReadBigInts(true);
+  let current = first.get() as {
+    message_id: bigint;
+    content_type: string;
+    content_bytes: Uint8Array;
+  } | undefined;
+  while (current !== undefined) {
+    if (current.content_type !== "text" || current.content_bytes.includes(0)) {
+      throw new Error("stored message content is unsupported");
+    }
+    try {
+      MESSAGE_CONTENT_DECODER.decode(current.content_bytes);
+    } catch {
+      throw new Error("stored message content is unsupported");
+    }
+    current = continuation.get(current.message_id) as typeof current;
   }
 }
 

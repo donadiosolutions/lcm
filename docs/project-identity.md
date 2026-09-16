@@ -233,18 +233,30 @@ promoted content is unsupported` and does not include memory content, IDs,
 paths, or tags. See the
 [offline promoted-memory repair procedure](privacy.md#embedded-nul-in-promoted-memory).
 
-Legacy conversation messages use the same SQLite boundary check. During
-worktree reconciliation, a `messages.content` value that is not `TEXT` or
-contains an embedded NUL is refused with `stored message content is
-unsupported`. The source check preserves the legacy database and leaves it
-unfenced for repair; a target refusal rolls back the target transaction while
-the source fence may remain committed. Inspect the source or target offline
-with `typeof(content)`, `hex(content)`, and `instr(content, char(0))`, correct
-the unsupported value in the live legacy database after taking a verified
-backup, and rerun reconciliation. See the [offline promoted-memory repair
-procedure](privacy.md#embedded-nul-in-promoted-memory) for promoted rows only;
-it is not a shipped message-repair command. Empty, Unicode, and literal
-JSON-escaped `\\u0000` text remain valid message content.
+When no canonical completion marker exists for a source, legacy conversation
+messages use the same SQLite boundary check. On that merge path,
+`messages.content` must be well-formed UTF-8 SQLite `TEXT` without an embedded
+NUL. An existing marker skips the merge and this admission check, preserving the
+marker as a replay boundary rather than a retrospective content audit.
+Malformed bytes, a NUL, or non-`TEXT` storage
+are refused with `stored message content is unsupported`; the error contains
+no content, session, path, or database identifier. The source check runs before
+its fence commits, preserving the legacy database and exact bytes for offline
+inspection and repair. The target check runs inside its transaction before
+conversation comparison or copy, completion-marker insertion, and FTS rebuild;
+it rolls those changes back while the source fence may remain committed. If an
+observed completion marker disappears inside that transaction, LCM revalidates
+the normalized source bytes before copying.
+
+Take a verified backup, stop writers, and inspect the refused source or target
+offline with `typeof(content)`, `hex(content)`, and
+`instr(content, char(0))`. Correct the unsupported value in place, then rerun
+reconciliation to continue from its durable fence and marker state. See the
+[offline promoted-memory repair procedure](privacy.md#embedded-nul-in-promoted-memory)
+for promoted rows only; it is not a shipped message-repair command. Empty text,
+valid multi-byte Unicode, a genuine `U+FFFD` replacement character encoded as
+UTF-8 `EF BF BD`, and literal JSON-escaped `\\u0000` text remain valid. A
+malformed byte that a driver would display as `U+FFFD` remains unsupported.
 
 The canonical target's `meta.json` is a separate leaf-file trust boundary. LCM
 refuses to parse or reuse it when its owner differs from the admitted project

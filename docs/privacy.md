@@ -222,29 +222,34 @@ contains a known truncated legacy value, repair the canonical target with the
 offline procedure above. This refusal
 behavior is implemented by [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
 
-### Embedded NUL in legacy conversation messages
+### Unsupported legacy conversation message bytes
 
-Legacy `messages.content` values must be SQLite `TEXT` without an embedded NUL
-character (`U+0000`). The Node SQLite binding can otherwise expose only the
-prefix of a value, so worktree reconciliation refuses the source before its
-fence commits and refuses the canonical target inside its transaction. The
-fixed error is `stored message content is unsupported`; it contains no message
-bytes, session identifiers, paths, or database IDs. Source bytes remain intact
-for inspection, and a target refusal rolls back its transaction before message
-rows are copied or FTS is rebuilt.
+Legacy `messages.content` values must be well-formed UTF-8 SQLite `TEXT` without
+an embedded NUL character (`U+0000`). The Node SQLite binding can replace
+malformed bytes or expose only the prefix before a NUL, so worktree
+reconciliation refuses the source before its fence commits and refuses the
+canonical target inside its transaction. The fixed error is `stored message
+content is unsupported`; it contains no message bytes, session identifiers,
+paths, or database IDs. A source refusal preserves the original bytes for
+offline inspection and repair. A target refusal rolls back its transaction
+before message rows are copied, completion markers are written, or FTS is
+rebuilt; the source fence may already be committed.
 
 Stop writers, keep the database and its WAL/SHM sidecars together, and make a
 verified backup before repair. Inspect affected rows offline with
 `typeof(content)`, `hex(content)`, and `instr(content, char(0))`, then correct
 the intended scalar value and rerun reconciliation. Do not use the promoted
 memory script above for `messages`; it is an inline, promoted-only diagnostic
-and repair procedure, not a shipped general-purpose migration. Empty,
-multi-byte Unicode, and literal JSON-escaped `\\u0000` message text remain
-supported; an actual NUL byte or a BLOB is refused. If a source completion
-marker already exists, reconciliation preserves the existing replay boundary
-and archives the source without auditing its message bytes. If that marker
-disappears during the target transaction, LCM revalidates the source and
-refuses unsupported message content before copying it.
+and repair procedure, not a shipped general-purpose migration. Empty text,
+valid multi-byte Unicode, a genuine replacement character (`U+FFFD`, encoded as
+UTF-8 `EF BF BD`), and literal JSON-escaped `\\u0000` text remain supported.
+Malformed UTF-8, an actual NUL byte, and non-`TEXT` storage are refused. If a
+source completion marker already exists, reconciliation preserves the existing
+replay boundary and archives the source without auditing its message bytes. If
+that marker disappears during the target transaction, LCM revalidates the
+source bytes and refuses unsupported content before copying it. After an
+offline in-place repair, rerun reconciliation to continue from its durable
+fence and marker state.
 
 No data is sent to any Long Context Manager (LCM) server. There is no telemetry.
 An explicitly configured PostgreSQL backend is a user-operated remote-primary
