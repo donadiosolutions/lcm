@@ -2742,11 +2742,15 @@ function archiveTerminalJournal(
   homeDir: string | undefined,
   directoryHandle: BackendPublicationDirectoryHandle,
   journal: BackendPublicationJournal | BackendMaintenanceJournal,
+  observer: BackendPublicationObserver,
 ): void {
   const directory = backendPublicationDirectory(homeDir);
   const history = backendPublicationHistoryDirectory(homeDir);
+  const journalPath = backendPublicationJournalPath(homeDir);
   assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
-  const observed = readBoundedRegularFileWithStat(backendPublicationJournalPath(homeDir), {
+  observer("before-terminal-journal-archive-read", journalPath);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
+  const observed = readBoundedRegularFileWithStat(journalPath, {
     allowedRoot: directory,
     maxBytes: MAX_JOURNAL_BYTES,
     expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
@@ -2763,9 +2767,11 @@ function archiveTerminalJournal(
     );
   }
   const current = observed.content;
-  const archived = journal.version === BACKEND_MAINTENANCE_VERSION
-    ? parseMaintenanceJournal(JSON.parse(current)) : parseJournal(current);
-  if (archived.checksumSha256 !== journal.checksumSha256) {
+  const archived = parsePublicationOrMaintenanceJournal(current);
+  if (
+    archived.version !== journal.version
+    || archived.checksumSha256 !== journal.checksumSha256
+  ) {
     return fail("unexpected-state", "backend publication journal changed before archive");
   }
   let historyHandle;
@@ -3182,7 +3188,7 @@ export class BackendPublicationCoordinator {
           && existing.phase !== "selection-completed" && existing.phase !== "maintenance-aborted") {
           return fail("unresolved-publication", "backend publication journal already exists");
         }
-        archiveTerminalJournal(this.#homeDir, directoryHandle, existing);
+        archiveTerminalJournal(this.#homeDir, directoryHandle, existing, this.#observer);
       }
       const now = (input.now ?? new Date()).toISOString();
       const entering = withMaintenanceChecksum({
@@ -3330,7 +3336,7 @@ export class BackendPublicationCoordinator {
         } else if (existing.phase !== "completed" && existing.phase !== "aborted") {
           return fail("unresolved-publication", "backend publication journal already exists");
         }
-        archiveTerminalJournal(this.#homeDir, directoryHandle, existing);
+        archiveTerminalJournal(this.#homeDir, directoryHandle, existing, this.#observer);
       }
       const targetState = materialTargetWitness(validated.material);
       const initial = prospectiveJournal(validated, targetState, targetState, "preparing", null);

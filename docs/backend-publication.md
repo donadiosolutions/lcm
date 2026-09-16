@@ -177,6 +177,17 @@ the same prepare request can be retried. `resume()`, `abort()`, and
 `recoverPending()` remain version-2 recovery operations and do not advance a
 leftover maintenance journal.
 
+Immediately before creating terminal history, LCM validates the journal reread
+through the same version-2/version-3 parser used for initial admission. Malformed
+JSON, non-object data, unsupported versions, invalid shapes, and checksum failures
+retain their structured journal error reasons. An internally valid reread whose
+version or checksum differs from the initially admitted record is refused as an
+unexpected state. Refusal preserves the current journal bytes and occurs before
+history, driver, recovery-material, or successor-journal effects.
+Legacy version-2 malformed checksum syntax remains `malformed-journal`, while
+version-3 malformed checksum syntax and payload-invalid checksums in either
+version remain `checksum-mismatch`.
+
 If maintenance entry is interrupted after its entering checkpoint, call
 `enterMaintenance` with the exact original publication, generation, selection,
 queue evidence and roster, plus the observed `expectedChecksumSha256` for
