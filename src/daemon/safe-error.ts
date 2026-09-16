@@ -329,7 +329,20 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         fileSchemeLength = 0;
         schemeQuote = 0;
         queryOrFragment = false;
-        nestedFileUrlParentOwnerBracketDepth = 0;
+      }
+    }
+    if (
+      nestedFileUrlParentOwnerBracketDepth > 0 &&
+      !exactFileScheme &&
+      separator < 0 &&
+      char === "&"
+    ) {
+      if (chars[index + 1] === "/" || chars[index + 1] === "\\") {
+        forcedPath[index + 1] = 1;
+      } else if (startsWordBearingSlashPath(chars, index + 1)) {
+        let pathStart = index + 1;
+        while (isPathWord(chars[pathStart])) pathStart += 1;
+        forcedPath[pathStart] = 1;
       }
     }
     if (restartedPathlessFile && char === "[") {

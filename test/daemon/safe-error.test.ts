@@ -3169,6 +3169,97 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it("retains nested-file parent ownership across repeated Windows roots", () => {
+    const input =
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three&\\Users\\d\\four]";
+    const expected =
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("\\Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "three pathless roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three&\\Users\\d\\four&\\Users\\e\\five]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&<path>&<path>]",
+    ],
+    [
+      "hosted roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file://host/Users/b/two&\\Users\\c\\three&\\Users\\d\\four]",
+      "file://h?x=[https://e.test/t&<path>&file://host<path>&<path>&<path>]",
+    ],
+    [
+      "child query roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two?key=/public&\\Users\\c\\three&\\Users\\d\\four]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>?key=<path>&<path>&<path>]",
+    ],
+    [
+      "child fragment roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two#key=/public&\\Users\\c\\three&\\Users\\d\\four]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>#key=<path>&<path>&<path>]",
+    ],
+    [
+      "unclosed wrapper roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three&\\Users\\d\\four",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&<path>",
+    ],
+    [
+      "repeated POSIX roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&/Private/c/three&/Private/d/four]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&<path>]",
+    ],
+    [
+      "UNC and drive roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\\\server\\share\\three&C:\\Users\\d\\four]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&<path>]",
+    ],
+    [
+      "bare and word-bearing roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three&later/Users/d/four]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&later<path>]",
+    ],
+    [
+      "named Windows root",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&name=\\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&name=<path>]",
+    ],
+    [
+      "public and relative successors",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three&https://p.test/x&relative/path]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&https://p.test/x&relative/path]",
+    ],
+  ] as const)("retains returned nested-file parent for %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "matching close",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three]\\Users\\outside",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>]<path>",
+    ],
+    [
+      "whitespace reset",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three \\Users\\outside]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path> \\Users\\outside]",
+    ],
+  ] as const)("expires returned nested-file parent at %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("redacts repeated pipe Windows paths inside one wrapper", () => {
     const input =
       "file://h?x=[https://e.test/t|\\Users\\alice\\one.db|\\Users\\bob\\secret.db]";
