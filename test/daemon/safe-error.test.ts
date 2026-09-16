@@ -2906,6 +2906,45 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
   });
 
+  it.each([
+    [
+      "Windows",
+      "file://h?x=[https://e.test/t|/Users/a/one]\\Users\\b\\two",
+      "file://h?x=[https://e.test/t|<path>]<path>",
+    ],
+    [
+      "POSIX",
+      "file://h?x=[https://e.test/t|/Users/a/one]/Users/b/two",
+      "file://h?x=[https://e.test/t|<path>]<path>",
+    ],
+  ] as const)("redacts %s paths after pipe handoff wrappers", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "file://h?x=[https://e.test/t|relative/path]",
+    "file://h?x=[https://[fe80::1]/p?q=1|relative/path]",
+  ] as const)("keeps pipe public, relative, and IPv6 controls stable: %s", (input) => {
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("preserves deferred Bug #1332 contextual over-redaction", () => {
+    const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
+    const expected = "file://h?x=[value|later=<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("redacts repeated nested-public ampersand paths in the same wrapper", () => {
     const input = "file://h?x=[https://e.test/t&/Users/a/one.db&/Users/b/two.db]";
     const expected = "file://h?x=[https://e.test/t&<path>&<path>]";
