@@ -272,12 +272,102 @@ function replaceExactlyOnce(source, pattern, replacement) {
   return source.replace(pattern, replacement);
 }
 
+function replaceTrustedCheckoutWitnessExactlyOnce(
+  workflow,
+  pattern,
+  replacement,
+) {
+  const {
+    lines,
+    stepStart,
+    stepEnd,
+  } = trustedCheckoutRawWitness(workflow);
+  const witness = lines.slice(stepStart, stepEnd + 1).join("\n");
+  const mutatedWitness = replaceExactlyOnce(witness, pattern, replacement);
+  return [
+    ...lines.slice(0, stepStart),
+    ...mutatedWitness.split("\n"),
+    ...lines.slice(stepEnd + 1),
+  ].join("\n");
+}
+
 function endOfIndentedYamlBlock(lines, start, indentation) {
   const offset = lines.slice(start + 1).findIndex((line) => {
     if (line.trim() === "" || line.trimStart().startsWith("#")) return false;
     return line.match(/^(\s*)/u)[1].length <= indentation;
   });
   return offset === -1 ? lines.length : start + 1 + offset;
+}
+
+function trustedCheckoutRawWitness(workflow) {
+  const lines = workflow.split("\n");
+  const jobsIndexes = lines.flatMap((line, index) => (
+    line === "jobs:" ? [index] : []
+  ));
+  assert.equal(jobsIndexes.length, 1, "Expected one canonical raw jobs mapping");
+  const [jobsStart] = jobsIndexes;
+  const jobsEnd = endOfIndentedYamlBlock(lines, jobsStart, 0);
+  const staleJobIndexes = lines.flatMap((line, index) => (
+    index > jobsStart && index < jobsEnd && line === "  stale:" ? [index] : []
+  ));
+  assert.equal(
+    staleJobIndexes.length,
+    1,
+    "Expected one canonical raw stale job mapping",
+  );
+  const [staleJobStart] = staleJobIndexes;
+  const staleJobEnd = endOfIndentedYamlBlock(lines, staleJobStart, 2);
+  const stepsIndexes = lines.flatMap((line, index) => (
+    index > staleJobStart && index < staleJobEnd && line === "    steps:"
+      ? [index]
+      : []
+  ));
+  assert.equal(
+    stepsIndexes.length,
+    1,
+    "Expected one canonical raw stale steps sequence",
+  );
+  const [stepsStart] = stepsIndexes;
+  const stepsIndent = lines[stepsStart].match(/^(\s*)/u)[1];
+  const stepsEnd = endOfIndentedYamlBlock(
+    lines,
+    stepsStart,
+    stepsIndent.length,
+  );
+  const expectedStepIndent = `${stepsIndent}  `;
+  const rawSiblingPattern = new RegExp(`^${expectedStepIndent}-\\s+`, "u");
+  const rawSiblingIndexes = lines.flatMap((line, index) => (
+    index > stepsStart
+      && index < stepsEnd
+      && rawSiblingPattern.test(line)
+      ? [index]
+      : []
+  ));
+  const checkoutHeaders = rawSiblingIndexes.flatMap((index) => (
+    lines[index] === `${expectedStepIndent}- name: Checkout trusted workflow code`
+      ? [index]
+      : []
+  ));
+  assert.equal(
+    checkoutHeaders.length,
+    1,
+    "Expected exactly one canonical raw trusted checkout step",
+  );
+  const [stepStart] = checkoutHeaders;
+  const rawStepIndex = rawSiblingIndexes.indexOf(stepStart);
+  const stepEnd = rawSiblingIndexes[rawStepIndex + 1];
+  assert.notEqual(
+    stepEnd,
+    undefined,
+    "Expected an immediate raw sibling after the trusted checkout step",
+  );
+  return {
+    lines,
+    rawStepIndex,
+    stepEnd,
+    stepIndent: lines[stepStart].match(/^(\s*)/u)[1],
+    stepStart,
+  };
 }
 
 function assertTrustedCheckoutStep(workflow) {
@@ -335,78 +425,31 @@ function assertTrustedCheckoutStep(workflow) {
       && !Array.isArray(effectiveCheckout.with),
     "Expected effective checkout inputs to be a mapping",
   );
+  const persistenceInputKeys = Object.keys(effectiveCheckout.with).filter(
+    (key) => key.toLowerCase() === "persist-credentials",
+  );
+  assert.deepEqual(
+    persistenceInputKeys,
+    ["persist-credentials"],
+    "Expected one canonical case-insensitive persist-credentials input",
+  );
   assert.equal(
     effectiveCheckout.with["persist-credentials"],
     false,
     "Expected effective checkout persist-credentials to be false",
   );
 
-  const lines = workflow.split("\n");
-  const jobsIndexes = lines.flatMap((line, index) => (
-    line === "jobs:" ? [index] : []
-  ));
-  assert.equal(jobsIndexes.length, 1, "Expected one canonical raw jobs mapping");
-  const [jobsStart] = jobsIndexes;
-  const jobsEnd = endOfIndentedYamlBlock(lines, jobsStart, 0);
-  const staleJobIndexes = lines.flatMap((line, index) => (
-    index > jobsStart && index < jobsEnd && line === "  stale:" ? [index] : []
-  ));
-  assert.equal(
-    staleJobIndexes.length,
-    1,
-    "Expected one canonical raw stale job mapping",
-  );
-  const [staleJobStart] = staleJobIndexes;
-  const staleJobEnd = endOfIndentedYamlBlock(lines, staleJobStart, 2);
-  const stepsIndexes = lines.flatMap((line, index) => (
-    index > staleJobStart && index < staleJobEnd && line === "    steps:"
-      ? [index]
-      : []
-  ));
-  assert.equal(
-    stepsIndexes.length,
-    1,
-    "Expected one canonical raw stale steps sequence",
-  );
-  const [stepsStart] = stepsIndexes;
-  const stepsIndent = lines[stepsStart].match(/^(\s*)/u)[1];
-  const stepsEnd = endOfIndentedYamlBlock(
+  const {
     lines,
-    stepsStart,
-    stepsIndent.length,
-  );
-  const expectedStepIndent = `${stepsIndent}  `;
-  const rawSiblingPattern = new RegExp(`^${expectedStepIndent}-\\s+`, "u");
-  const rawSiblingIndexes = lines.flatMap((line, index) => (
-    index > stepsStart
-      && index < stepsEnd
-      && rawSiblingPattern.test(line)
-      ? [index]
-      : []
-  ));
-  const checkoutHeaders = rawSiblingIndexes.flatMap((index) => (
-    lines[index] === `${expectedStepIndent}- name: Checkout trusted workflow code`
-      ? [index]
-      : []
-  ));
-  assert.equal(
-    checkoutHeaders.length,
-    1,
-    "Expected exactly one canonical raw trusted checkout step",
-  );
-  const [stepStart] = checkoutHeaders;
-  const stepIndent = lines[stepStart].match(/^(\s*)/u)[1];
-  const rawStepIndex = rawSiblingIndexes.indexOf(stepStart);
+    rawStepIndex,
+    stepEnd,
+    stepIndent,
+    stepStart,
+  } = trustedCheckoutRawWitness(workflow);
   assert.equal(
     rawStepIndex,
     effectiveStepIndex,
     "Expected raw and effective trusted checkout step positions to match",
-  );
-  const stepEnd = rawSiblingIndexes[rawStepIndex + 1];
-  assert.notEqual(
-    stepEnd,
-    undefined,
-    "Expected an immediate raw sibling after the trusted checkout step",
   );
   assert.equal(
     lines[stepEnd],
@@ -1181,7 +1224,7 @@ test("workflow binds evidence and the required model split", async () => {
     /permissions:\s*\n\s+contents: read\s*\n\s+issues: write/u,
   );
   assertTrustedCheckoutStep(staleWorkflow);
-  const alternateValidCheckout = replaceExactlyOnce(
+  const alternateValidCheckout = replaceTrustedCheckoutWitnessExactlyOnce(
     staleWorkflow,
     /actions\/checkout@[0-9a-f]{40} # v[0-9][^\n]*/gu,
     "actions/checkout@1111111111111111111111111111111111111111 # v999.0.0",
@@ -1324,7 +1367,11 @@ test("rejects malformed trusted checkout step structures", async (t) => {
 
   for (const { name, pattern, replacement } of mutants) {
     await t.test(name, () => {
-      const mutant = replaceExactlyOnce(workflow, pattern, replacement);
+      const mutant = replaceTrustedCheckoutWitnessExactlyOnce(
+        workflow,
+        pattern,
+        replacement,
+      );
       assert.throws(() => assertTrustedCheckoutStep(mutant));
     });
   }
@@ -1335,7 +1382,7 @@ test("binds the trusted checkout assertion to the effective YAML step", async ()
     new URL("../workflows/stale.yml", import.meta.url),
     "utf8",
   );
-  let mutant = replaceExactlyOnce(
+  let mutant = replaceTrustedCheckoutWitnessExactlyOnce(
     workflow,
     /      - name: Checkout trusted workflow code\n        uses: actions\/checkout@[0-9a-f]{40} # v[0-9][^\n]*/gu,
     [
@@ -1367,6 +1414,30 @@ test("binds the trusted checkout assertion to the effective YAML step", async ()
     false,
   );
   assert.throws(() => assertTrustedCheckoutStep(mutant));
+});
+
+test("keeps trusted checkout mutations scoped to the stale job", async () => {
+  const workflow = await readFile(
+    new URL("../workflows/stale.yml", import.meta.url),
+    "utf8",
+  );
+  const workflowWithAnotherCheckout = `${workflow.trimEnd()}
+
+  compatibility-checkout:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout another workspace
+        uses: actions/checkout@2222222222222222222222222222222222222222 # v999.0.0
+        with:
+          persist-credentials: false
+`;
+  assertTrustedCheckoutStep(workflowWithAnotherCheckout);
+  const alternateValidCheckout = replaceTrustedCheckoutWitnessExactlyOnce(
+    workflowWithAnotherCheckout,
+    /actions\/checkout@[0-9a-f]{40} # v[0-9][^\n]*/gu,
+    "actions/checkout@1111111111111111111111111111111111111111 # v999.0.0",
+  );
+  assertTrustedCheckoutStep(alternateValidCheckout);
 });
 
 test("rejects semantically duplicate checkout keys", async (t) => {
@@ -1420,6 +1491,13 @@ test("rejects semantically duplicate checkout keys", async (t) => {
       replacement: "$&\n          persist-credentials : true",
       expectedPersistence: true,
     },
+    {
+      name: "case-variant persist-credentials key",
+      pattern: persistenceLine,
+      replacement: "$&\n          Persist-Credentials: true",
+      expectedPersistence: false,
+      expectedVariantKey: "Persist-Credentials",
+    },
   ];
 
   for (const {
@@ -1428,9 +1506,14 @@ test("rejects semantically duplicate checkout keys", async (t) => {
     replacement,
     expectedUses,
     expectedPersistence,
+    expectedVariantKey,
   } of mutants) {
     await t.test(name, () => {
-      const mutant = replaceExactlyOnce(workflow, pattern, replacement);
+      const mutant = replaceTrustedCheckoutWitnessExactlyOnce(
+        workflow,
+        pattern,
+        replacement,
+      );
       const parsed = loadYaml(mutant, { json: true });
       const checkout = parsed.jobs.stale.steps[0];
       if (expectedUses) assert.equal(checkout.uses, expectedUses);
@@ -1439,6 +1522,9 @@ test("rejects semantically duplicate checkout keys", async (t) => {
           checkout.with["persist-credentials"],
           expectedPersistence,
         );
+      }
+      if (expectedVariantKey) {
+        assert.equal(checkout.with[expectedVariantKey], true);
       }
       assert.throws(() => assertTrustedCheckoutStep(mutant));
     });
