@@ -306,6 +306,8 @@ const expectedComponents = [
       // project/worktree ownership component; no topology change.
       // #1178 listing-root authentication and #1245 retained journal-parent
       // witness stay in this existing unit-project-worktrees owner.
+      // #1316 keeps SQLite message-byte admission in this existing
+      // unit-project-worktrees owner; no taxonomy or topology change.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
