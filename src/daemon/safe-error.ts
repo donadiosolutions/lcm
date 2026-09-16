@@ -248,6 +248,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     if (restartedPathlessFile && char === "]" && restartedPathlessBrackets > 0) {
       restartedPathlessBrackets -= 1;
+      if (pathlessFileQueryBracketDepth > 0) {
+        pathlessFileQueryBracketDepth -= 1;
+        if (pathlessFileQueryBracketDepth === 0) pathlessNestedPublicUrlActive = false;
+      }
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;
