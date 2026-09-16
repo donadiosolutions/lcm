@@ -87,6 +87,15 @@ function wordBearingPrivateRootPathStart(chars: readonly string[], index: number
   return cursor;
 }
 
+function wordBearingWindowsValuePathStart(chars: readonly string[], index: number): number {
+  if (!isPathWord(chars[index])) return -1;
+  let cursor = index + 1;
+  while (isPathWord(chars[cursor])) cursor += 1;
+  if (chars[cursor] !== "=") return -1;
+  const valueStart = cursor + 1;
+  return chars[valueStart] === "\\" || isWindowsDrivePathStart(chars, valueStart) ? valueStart : -1;
+}
+
 function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const authority = new Uint8Array(chars.length);
   const file = new Uint8Array(chars.length);
@@ -262,8 +271,19 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (startsQuotedQueryTail) quotedQueryTail = true;
     }
     if ((quotedQueryTail || quotedQueryPublicUrl) && char === "&") {
+      const privateRootPathStart = quotedQueryPublicUrl
+        ? wordBearingPrivateRootPathStart(chars, index + 1)
+        : -1;
+      const windowsValuePathStart = quotedQueryPublicUrl
+        ? wordBearingWindowsValuePathStart(chars, index + 1)
+        : -1;
       if (chars[index + 1] === "/") {
         forcedPath[index + 1] = 1;
+        quotedQueryTail = true;
+        quotedQueryPublicUrl = false;
+        quotedQueryPublicUrlOwnQueryOrFragment = false;
+      } else if (privateRootPathStart >= 0 || windowsValuePathStart >= 0) {
+        forcedPath[privateRootPathStart >= 0 ? privateRootPathStart : windowsValuePathStart] = 1;
         quotedQueryTail = true;
         quotedQueryPublicUrl = false;
         quotedQueryPublicUrlOwnQueryOrFragment = false;

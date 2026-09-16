@@ -3531,6 +3531,18 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it("preserves the pre-query broad word-bearing private return", () => {
+    const input =
+      "'file://h'['/private']?a/Users/PARENT&https://cdn.test/logo&relative/path";
+    const expected =
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo&relative<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it.each([
     [
       "bare private return",
@@ -3548,6 +3560,49 @@ describe("sanitizeError", () => {
       "'file://h'['<path>']?a<path>&https://cdn.test/logo&<path>&https://p.test/x",
     ],
   ] as const)("preserves quoted public child %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "named Windows root",
+      "'file://h'['/private']?a/Users/PARENT&https://cdn.test/logo?a=1&name=\\Users\\SECRET\\path&https://later.test/x&c/Users/LATER/path",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&name=<path>&https://later.test/x&c<path>",
+    ],
+    [
+      "named drive",
+      "'file://h'['/private']?a/Users/PARENT&https://cdn.test/logo?a=1&drive=C:\\Users\\SECRET\\path&https://later.test/x&c/Users/LATER/path",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&drive=<path>&https://later.test/x&c<path>",
+    ],
+    [
+      "named UNC",
+      "'file://h'['/private']?a/Users/PARENT&https://cdn.test/logo?a=1&unc=\\\\server\\share\\SECRET&https://later.test/x&c/Users/LATER/path",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&unc=<path>&https://later.test/x&c<path>",
+    ],
+  ] as const)("restores quoted parent after public-child %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
+    expect(first).not.toContain("LATER");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "'file://h'['/private']?a/Users/PARENT&https://cdn.test/logo?a=1&c/Public/path",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&c/Public/path",
+    ],
+    [
+      "'file://h'['/private']?a/Users/PARENT&https://cdn.test/logo?a=1&c/Users",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&c/Users",
+    ],
+  ] as const)("keeps quoted public-child non-private word value intact: %s", (input, expected) => {
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);

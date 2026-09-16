@@ -131,8 +131,8 @@ const expectedComponents = [
       // #1118/#1303 quoted query-tail handoff, #1128 active own-query and
       // IPv6 bracket-boundary backslash paths, #1294 retained-query syntax and
       // raw-marker collision handling, contextual Windows-root ownership, and
-      // ampersand/quoted-public query lifetime, depth-bound nested-file
-      // parent/query/public and named-root return, and pipe wrapper handoffs,
+      // ampersand/quoted-public query/private-return lifetime, depth-bound
+      // nested-file parent/query/public return, and pipe wrapper handoffs,
       // #1304 closed-bracket path handoff, #1312/#1313 repeated POSIX/Windows
       // nested-public delimiter handoff,
       // #1317 stable unquoted-wrapper public URLs, #1141 single-slash file

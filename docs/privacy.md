@@ -628,12 +628,13 @@ The `Security` section of the doctor output shows:
   narrow handoff remains available after an intervening public URL child while
   that wrapper depth is retained, including a named root-relative Windows
   value. Quoted public URLs keep ordinary relative and named slash-bearing
-  parameters inside their own query or fragment; a bare absolute path still
-  returns to the quoted-file parent. This does not trust marker text, classify
-  ordinary relative values as private on the returned-parent transition, or
-  make backslashes global. The direct-relative nested-file query/fragment family
-  remains deferred: its first pass preserves the relative bytes and its next
-  stable pass conservatively redacts them.
+  parameters inside their own query or fragment. A bare absolute path, complete
+  word-bearing `Users` root, or named Windows/drive/UNC value returns to the
+  quoted-file parent and restores that parent for later children. This does not
+  trust marker text, classify ordinary relative values as private on the
+  returned-parent transition, or make backslashes global. The direct-relative
+  nested-file query/fragment family remains deferred: its first pass preserves
+  the relative bytes and its next stable pass conservatively redacts them.
   An unquoted exact file wrapper immediately followed by an ampersand-separated
   public URL is recognized from that observable syntax on every pass. The
   doubled-bracket pathless policy retains the observable scheme, authority, and
