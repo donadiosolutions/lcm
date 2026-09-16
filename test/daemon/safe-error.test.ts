@@ -2625,6 +2625,25 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it.each([
+    [
+      "non-word",
+      "'file://h'['/private']?a/Users/alice&https://e.test/x&=/Users/bob/secret.db",
+      "'file://h'['<path>']?a<path>&https://e.test/x&=/Users/bob/secret.db",
+    ],
+    [
+      "word-bearing",
+      "'file://h'['/private']?a/Users/alice&https://e.test/x&later/Users/bob/secret.db",
+      "'file://h'['<path>']?a<path>&https://e.test/x&later<path>",
+    ],
+  ] as const)("distinguishes %s paths after quoted-query public URLs", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("redacts Bug #1304 paths after closed nested public URL brackets in one pass", () => {
     const input = "file://h/p?x=[https://e.test/t]/Users/alice/secret.db";
     const expected = "file://h<path>?x=[https://e.test/t]<path>";
@@ -2893,6 +2912,18 @@ describe("sanitizeError", () => {
     expect(first).not.toContain("/Users");
     expect(first).not.toContain("bob");
     expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("balances nested brackets after returning from a public URL path handoff", () => {
+    const input =
+      "file://h?x=[https://e.test/t&/Users/a/one&key=[/Users/b/two]]";
+    const expected = "file://h?x=[https://e.test/t&<path>&key=[<path>]]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
     expect(sanitizeError(first)).toBe(first);
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
