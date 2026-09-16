@@ -155,7 +155,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         }
       } else {
         const continuesNestedUrl =
-          pendingNestedUrlContinuation && (char === "/" || char === ":" || char === "?" || char === "#");
+          pendingNestedUrlContinuation &&
+          (char === "/" || char === ":" || char === "?" || char === "#" || char === "&");
         pendingFileTailBackslash = false;
         pendingNestedUrlContinuation = false;
         if (!fileTailBoundaryEvent && !continuesNestedUrl) fileTailBracketDepth = 0;
@@ -241,6 +242,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     if (restartedPathlessFile && char === "[") {
       restartedPathlessBrackets += 1;
+      if (pathlessFileQueryBracketDepth > 0) pathlessFileQueryBracketDepth += 1;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;

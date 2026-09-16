@@ -2786,6 +2786,32 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it("keeps bracketed named public values stable before Bug #1294 Windows tails", () => {
+    const input =
+      "file://h?x=[[a]/https://e.test/t?key=[/public]&next=/also]\\Users\\alice\\secret.db";
+    const expected = "file://h?x=[[a]<path>?key=[/public]&next=/also]<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("keeps bracketed named public values stable before generated-marker POSIX tails", () => {
+    const input =
+      "file://h?x=[[a]<path>?key=[/public]&next=/also]/Users/alice/secret.db";
+    const expected = "file://h?x=[[a]<path>?key=[/public]&next=/also]<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("redacts repeated nested-public ampersand paths in the same wrapper", () => {
     const input = "file://h?x=[https://e.test/t&/Users/a/one.db&/Users/b/two.db]";
     const expected = "file://h?x=[https://e.test/t&<path>&<path>]";
