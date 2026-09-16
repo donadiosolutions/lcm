@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { join, relative, resolve } from "node:path";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { homedir } from "node:os";
+import { syncBuiltinESMExports } from "node:module";
 
 import { eventsDbPath, eventsDir } from "../src/db/events-path.js";
 import { projectDir, projectDbPath, projectMetaPath } from "../src/daemon/project.js";
@@ -53,6 +55,21 @@ describe("test runtime home isolation", () => {
       expect(eventsDir()).toBe(join(nextHome, ".lcm", "events"));
     } finally {
       process.env.HOME = originalHome;
+      rmSync(nextHome, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an imported homedir binding synchronized with the fixture HOME", () => {
+    const originalHome = process.env.HOME;
+    const nextHome = mkdtempSync(join(tmpdir(), "lcm-runtime-homedir-change-"));
+    process.env.HOME = nextHome;
+    try {
+      expect(homedir()).toBe(nextHome);
+      syncBuiltinESMExports();
+      expect(homedir()).toBe(nextHome);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
       rmSync(nextHome, { recursive: true, force: true });
     }
   });

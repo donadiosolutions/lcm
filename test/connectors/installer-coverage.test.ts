@@ -401,9 +401,11 @@ describe("installer defensive branches", () => {
     withTempHome((cwd) => {
       const originalPath = process.env.PATH;
       const originalHome = process.env.HOME;
+      const originalUserProfile = process.env.USERPROFILE;
       const calls: Array<{ env: NodeJS.ProcessEnv }> = [];
       process.env.PATH = "unsafe\npath";
       process.env.HOME = "";
+      process.env.USERPROFILE = "";
       try {
         const inventory = listConnectorInventory(cwd, {
           codexCliRunner: (request) => {
@@ -419,6 +421,8 @@ describe("installer defensive branches", () => {
         else process.env.PATH = originalPath;
         if (originalHome === undefined) delete process.env.HOME;
         else process.env.HOME = originalHome;
+        if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = originalUserProfile;
       }
     });
   });

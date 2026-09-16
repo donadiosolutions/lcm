@@ -33,6 +33,7 @@ import {
   observeHttpHealth,
   type HealthObservation,
 } from "./health-observation.js";
+import { isDaemonTransportFailure } from "./http-url.js";
 import {
   canonicalSupervisorScope,
   createSupervisor,
@@ -312,6 +313,8 @@ function isManagedInterruptionResult(
 export type RestartDaemonOptions = EnsureDaemonOptions & {
   /** Optional caller validation hook. It always completes before any signal is sent. */
   validateBeforeRestart?: () => void | Promise<void>;
+  /** @internal Revalidate lock-free caller evidence immediately before a managed restart. */
+  _validateBeforeManagedRestart?: () => void | Promise<void>;
   _ensureDaemonOverride?: (options: EnsureDaemonOptions) => Promise<EnsureDaemonResult>;
   _isManagedProcessOverride?: (pid: number) => boolean;
 };
@@ -480,6 +483,12 @@ function supervisorNonce(): string {
   // The manager name is the stable state-root mutex; the nonce identifies one
   // concrete launch and must never be reused across starts or restarts.
   return randomBytes(16).toString("hex");
+}
+
+function isObservedSupervisorNonce(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length <= 128
+    && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(value);
 }
 
 function supervisorCommandRunner(
@@ -1464,10 +1473,18 @@ async function observeDaemonHealth(
   fetchFn: typeof globalThis.fetch,
   deadline: RequestDeadline,
   token?: string,
+  onFetchRejected?: (error: unknown) => void,
 ): Promise<HealthObservation<HealthResponse>> {
   const observed = await observeHttpHealth<HealthResponse>({
     input: `http://127.0.0.1:${port}/health`,
-    fetchFn: async (input, init) => normalizeHealthResponse(await fetchFn(input, init)),
+    fetchFn: async (input, init) => {
+      try {
+        return normalizeHealthResponse(await fetchFn(input, init));
+      } catch (error) {
+        onFetchRejected?.(error);
+        throw error;
+      }
+    },
     requestInit: token
       ? { headers: { Authorization: `Bearer ${token}` } }
       : undefined,
@@ -4016,16 +4033,28 @@ export async function restartDaemon(opts: RestartDaemonOptions): Promise<Restart
     { kind: "replacement-owned" },
     replacementBudget,
   );
-  await currentWrap(() => assertLifecycleBackendPublication(opts));
+  let currentContention: PrivateMutationLockContentionError | undefined;
+  try {
+    await currentWrap(() => assertLifecycleBackendPublication(opts));
+  } catch (error) {
+    if (!(error instanceof PrivateMutationLockContentionError)) throw error;
+    currentContention = error;
+  }
   const result = await restartDaemonUnlocked({
     ...opts,
     _restartPublicationRetryBudget: replacementBudget,
-  });
+  }, currentContention);
+  if (currentContention !== undefined && (!result.connected || !result.restarted)) {
+    throw currentContention;
+  }
   await replacementWrap(() => assertLifecycleBackendPublication(opts));
   return result;
 }
 
-async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<RestartDaemonResult> {
+async function restartDaemonUnlocked(
+  opts: RestartDaemonOptions,
+  currentContention?: PrivateMutationLockContentionError,
+): Promise<RestartDaemonResult> {
   validateSpawnTimeout(opts.spawnTimeoutMs);
   const hasTestScopeProperty = Object.prototype.hasOwnProperty.call(opts, "_testScope");
   if (hasTestScopeProperty && !isDaemonLifecycleTestScope(opts._testScope)) {
@@ -4107,6 +4136,7 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
   }
   const {
     validateBeforeRestart,
+    _validateBeforeManagedRestart,
     _ensureDaemonOverride,
     _isManagedProcessOverride,
     _restartPublicationRetryBudget,
@@ -4114,7 +4144,7 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
     ...ensureOptions
   } = opts;
   void _ignoredInitialPublicationRetry;
-  await validateBeforeRestart?.();
+  if (currentContention === undefined) await validateBeforeRestart?.();
   if (
     testScope
     && !lifecycleScopeOwnsExactStatePaths(testScope, opts.pidFilePath, tokenPath)
@@ -4179,6 +4209,10 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
   const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
   const verificationDeadline = monotonicNow() + opts.spawnTimeoutMs;
+  const processBirthProbe: typeof processStartTime = opts._processStartTimeForTesting
+    ?? (testScope !== undefined || hermeticSeams !== undefined ? (() => null) : processStartTime);
+  const readOwnerProbe: typeof readPrivateMutationLockOwner = opts._readPrivateMutationLockOwnerForTesting
+    ?? (testScope !== undefined || hermeticSeams !== undefined ? (() => null) : readPrivateMutationLockOwner);
   const managerKind = managedSupervisorKind(platform, opts.enforceUserManagerParent);
   function remainingVerificationDeadline(): RequestDeadline | null {
     const timeoutMs = verificationDeadline - monotonicNow();
@@ -4186,6 +4220,18 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
       ? null
       : { timeoutMs, setTimeoutFn, clearTimeoutFn, abortSignal: opts._abortSignal };
   }
+  const readRecoveryBirth = (pid: number): string | null => {
+    if (opts._abortSignal?.aborted) return null;
+    const remainingMs = verificationDeadline - monotonicNow();
+    if (remainingMs < 1) return null;
+    const timeoutMs = Math.min(100, Math.floor(remainingMs / 4));
+    if (timeoutMs < 1) return null;
+    try {
+      return processBirthProbe(pid, undefined, { timeoutMs });
+    } catch {
+      return null;
+    }
+  };
   async function isAuthenticatedDaemonAtPort(port: number, pid: number): Promise<boolean> {
     const healthDeadline = remainingVerificationDeadline();
     if (!healthDeadline) return false;
@@ -4254,12 +4300,14 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
       ? [...baseSpawnArgs, ...daemonLifecycleTestIdentityArgs(testScope)]
       : baseSpawnArgs;
     if (!isAbsolute(executable) || args.some((arg) => typeof arg !== "string")) {
+      if (currentContention !== undefined) throw currentContention;
       return restartRefusal("ambiguous", "managed daemon supervisor could not be constructed; inspect the daemon configuration and retry");
     }
     let scope: ReturnType<typeof canonicalSupervisorScope>;
     try {
       scope = canonicalSupervisorScope(stateRoot, realpath);
     } catch {
+      if (currentContention !== undefined) throw currentContention;
       return restartRefusal("ambiguous", "managed daemon state root is not canonical; inspect the daemon configuration and retry");
     }
     const launchEnvironment = managedLaunchEnvironmentFor(
@@ -4286,6 +4334,7 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
         realpath,
       });
     } catch {
+      if (currentContention !== undefined) throw currentContention;
       return restartRefusal("ambiguous", "managed daemon supervisor specification is invalid; inspect the daemon configuration and retry");
     }
     const supervisor = opts._supervisorOverride
@@ -4301,6 +4350,7 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
           now: monotonicNow,
         });
     if (opts._abortSignal?.aborted) {
+      if (currentContention !== undefined) throw currentContention;
       return restartRefusal("response-timeout", "daemon lifecycle was interrupted before legacy migration");
     }
     let observation: SupervisorObservation;
@@ -4309,7 +4359,25 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
       // allowlisted preflight-unavailable result may fall through before mutation.
       observation = await supervisor.probe(spec, { deadline: verificationDeadline });
     } catch {
+      if (currentContention !== undefined) throw currentContention;
       return restartRefusal("ambiguous", "managed daemon supervisor probe failed; inspect the manager and retry");
+    }
+    if (currentContention !== undefined && observation.kind !== "registered-running-valid") {
+      throw currentContention;
+    }
+    if (
+      currentContention !== undefined
+      && observation.kind === "registered-running-valid"
+      && (
+        observation.scopeDigest !== spec.scopeDigest
+        || observation.name !== spec.name
+        || !isObservedSupervisorNonce(observation.nonce)
+        || !Number.isSafeInteger(observation.managerPid)
+        || observation.managerPid <= 0
+      )
+    ) throw currentContention;
+    if (currentContention !== undefined && _validateBeforeManagedRestart === undefined) {
+      throw currentContention;
     }
     if (observation.kind === "unavailable") {
       if (!isSupervisorPreflightUnavailableReason(observation.reason)) {
@@ -4652,9 +4720,100 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
         && second.name === spec.name
         && second.managerPid === managerPid;
     };
-    const healthDeadline = remainingVerificationDeadline();
-    if (!healthDeadline) return restartRefusal("response-timeout", "daemon restart verification deadline expired");
-    const healthObservation = await observeDaemonHealth(opts.port, fetchFn, healthDeadline);
+    const remainingHealthDeadline = remainingVerificationDeadline();
+    if (!remainingHealthDeadline) {
+      if (currentContention !== undefined) throw currentContention;
+      return restartRefusal("response-timeout", "daemon restart verification deadline expired");
+    }
+    const healthDeadline = currentContention === undefined
+      ? remainingHealthDeadline
+      : {
+          ...remainingHealthDeadline,
+          timeoutMs: Math.min(
+            PUBLICATION_CONVERGENCE_MS,
+            Math.floor(remainingHealthDeadline.timeoutMs / 2),
+          ),
+        };
+    if (currentContention !== undefined && healthDeadline.timeoutMs < 1) {
+      throw currentContention;
+    }
+    const publicationHome = publicationHomeForLifecycle(opts);
+    const publicationOwnerPath = publicationHome === undefined
+      ? undefined
+      : join(publicationHome, ".lcm.backend-publication.lock");
+    const captureRecoveryOwner = (): Readonly<{
+      pid: number;
+      processStartTime: string;
+      nonce: string;
+    }> | undefined => {
+      if (currentContention === undefined || managerPid === undefined || publicationOwnerPath === undefined) {
+        return undefined;
+      }
+      try {
+        const owner = readOwnerProbe(publicationOwnerPath, "backend publication");
+        if (
+          owner === null
+          || owner.pid !== managerPid
+          || owner.processStartTime === null
+          || readRecoveryBirth(managerPid) !== owner.processStartTime
+        ) return undefined;
+        return {
+          pid: owner.pid,
+          processStartTime: owner.processStartTime,
+          nonce: owner.nonce,
+        };
+      } catch {
+        return undefined;
+      }
+    };
+    const recoveryOwner = captureRecoveryOwner();
+    if (currentContention !== undefined && recoveryOwner === undefined) throw currentContention;
+    let classifiedTransportRejection = false;
+    const healthObservation = await observeDaemonHealth(
+      opts.port,
+      fetchFn,
+      healthDeadline,
+      undefined,
+      currentContention === undefined
+        ? undefined
+        : error => { classifiedTransportRejection = isDaemonTransportFailure(error); },
+    );
+    if (currentContention !== undefined) {
+      if (
+        healthObservation.kind !== "no-response"
+        || (
+          healthObservation.reason !== "header-timeout"
+          && (
+            healthObservation.reason !== "fetch-rejected"
+            || !classifiedTransportRejection
+          )
+        )
+        || !localManagerEndpoint()
+        || !(await secondProbeMatches())
+      ) throw currentContention;
+      try {
+        await _validateBeforeManagedRestart?.();
+      } catch {
+        throw currentContention;
+      }
+      const finalOwner = captureRecoveryOwner();
+      if (
+        finalOwner === undefined
+        || recoveryOwner === undefined
+        || finalOwner.pid !== recoveryOwner.pid
+        || finalOwner.processStartTime !== recoveryOwner.processStartTime
+        || finalOwner.nonce !== recoveryOwner.nonce
+        || !localManagerEndpoint()
+        || opts._abortSignal?.aborted
+        || remainingVerificationDeadline() === null
+      ) throw currentContention;
+      try {
+        return await stopStartAndEnsure();
+      } catch (error) {
+        rethrowPublicationContention(error);
+        throw error;
+      }
+    }
     if (healthObservation.kind === "no-response") {
       // Explicit restart is the one operation allowed to recover a live job
       // with no HTTP response, but only with the manager PID/listener proof.
@@ -4713,6 +4872,7 @@ async function restartDaemonUnlocked(opts: RestartDaemonOptions): Promise<Restar
     const managedResult = await runManagedRestart(managerKind);
     if (managedResult !== null) return managedResult;
   }
+  if (currentContention !== undefined) throw currentContention;
 
   async function isManaged(pid: number): Promise<boolean> {
     if (_isManagedProcessOverride) return _isManagedProcessOverride(pid);
