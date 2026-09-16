@@ -122,6 +122,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let pathlessNestedPublicUrlHasBracket = false;
   let slashPrefixedNestedPublicSchemeStart = -1;
   let quotedQueryPublicUrl = false;
+  let quotedQueryPublicUrlOwnQueryOrFragment = false;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
@@ -153,6 +154,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       pathlessNestedPublicUrlHasBracket = false;
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
+      quotedQueryPublicUrlOwnQueryOrFragment = false;
       if (!preservesClosedBracketHandoff) {
         fileTailBracketDepth = 0;
         pendingFileTailBackslash = false;
@@ -250,6 +252,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
 
       queryOrFragment = true;
       queryOrFragmentStart = index;
+      if (quotedQueryPublicUrl) quotedQueryPublicUrlOwnQueryOrFragment = true;
       if (slashPrefixedNestedPublicSchemeStart >= 0) {
         // Retain observable public URL syntax instead of reconstructing
         // provenance from a user-controlled textual redaction marker.
@@ -258,16 +261,22 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       }
       if (startsQuotedQueryTail) quotedQueryTail = true;
     }
-    if ((quotedQueryPublicUrl || quotedQueryTail) && char === "&") {
+    if ((quotedQueryTail || quotedQueryPublicUrl) && char === "&") {
       if (chars[index + 1] === "/") {
         forcedPath[index + 1] = 1;
         quotedQueryTail = true;
         quotedQueryPublicUrl = false;
-      } else if (quotedQueryPublicUrl && startsWordBearingSlashPath(chars, index + 1)) {
+        quotedQueryPublicUrlOwnQueryOrFragment = false;
+      } else if (
+        quotedQueryPublicUrl &&
+        !quotedQueryPublicUrlOwnQueryOrFragment &&
+        startsWordBearingSlashPath(chars, index + 1)
+      ) {
         // A later word-bearing parameter resumes the surrounding quoted-file
         // query without treating named public URL parameters as private paths.
         quotedQueryTail = true;
         quotedQueryPublicUrl = false;
+        quotedQueryPublicUrlOwnQueryOrFragment = false;
       }
     }
     if (
@@ -282,6 +291,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryTail = false;
       quotedPathEndedSeparator = -1;
       quotedQueryPublicUrl = true;
+      quotedQueryPublicUrlOwnQueryOrFragment = false;
     }
     const nestedFileSchemeStart = isNestedFileUrlStart(chars, index)
       ? index + 1
@@ -309,6 +319,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       pathlessNestedPublicUrlActive = false;
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
+      quotedQueryPublicUrlOwnQueryOrFragment = false;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = quoteCode(chars[nestedFileSchemeStart - 1]);
@@ -471,6 +482,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       pathlessNestedPublicUrlHasBracket = false;
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
+      quotedQueryPublicUrlOwnQueryOrFragment = false;
       continue;
     }
     const retainedParentPrivatePathStart =
@@ -478,20 +490,29 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       nestedFileUrlParentOwnerBracketDepths.has(pathlessFileQueryOwnerBracketDepth)
         ? wordBearingPrivateRootPathStart(chars, index + 1)
         : -1;
+    const retainedParentNamedWindowsPathStart =
+      char === "\\" &&
+      chars[index - 1] === "=" &&
+      nestedFileUrlParentOwnerBracketDepths.has(pathlessFileQueryOwnerBracketDepth)
+        ? index
+        : -1;
     if (
       pathlessFileQueryBracketDepth > 0 &&
       (((char === "&" || char === "|") &&
         (chars[index + 1] === "/" || chars[index + 1] === "\\")) ||
-        retainedParentPrivatePathStart >= 0)
+        retainedParentPrivatePathStart >= 0 ||
+        retainedParentNamedWindowsPathStart >= 0)
     ) {
       // A nested public URL owns its query slashes, but an immediate absolute
       // path after a delimiter returns to the enclosing file-query grammar.
       if (retainedParentPrivatePathStart >= 0) {
         forcedPath[retainedParentPrivatePathStart] = 1;
+      } else if (retainedParentNamedWindowsPathStart >= 0) {
+        forcedPath[retainedParentNamedWindowsPathStart] = 1;
       } else {
         forcedPath[index + 1] = 1;
       }
-      if (char === "&") {
+      if (char === "&" || retainedParentNamedWindowsPathStart >= 0) {
         separator = -1;
         exactFileScheme = false;
         foundFilePath = false;
@@ -530,6 +551,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       pathlessNestedPublicUrlActive = false;
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
+      quotedQueryPublicUrlOwnQueryOrFragment = false;
     }
     // Conservatively keep supported punctuation and embedded double quotes in
     // an exact file URL authority until the first path separator. A matching
@@ -586,6 +608,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       pathlessNestedPublicUrlActive = false;
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
+      quotedQueryPublicUrlOwnQueryOrFragment = false;
       continue;
     }
     if (separator >= 0) {
@@ -661,6 +684,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       pathlessNestedPublicUrlActive = false;
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
+      quotedQueryPublicUrlOwnQueryOrFragment = false;
       file[index] = 1;
       continue;
     }

@@ -3494,6 +3494,67 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it("redacts a named Windows root after a later public child", () => {
+    const input =
+      "file://h?x=[https://z.test/t&file:///Users/CHILD/path&https://a.test/t&name=\\Users\\SECRET\\path]";
+    const expected =
+      "file://h?x=[https://z.test/t&file://<path>&https://a.test/t&name=<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "query relative parameter",
+      "'file://h'['/private']?a/Users/alice&https://cdn.test/logo?a=1&relative/path",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&relative/path",
+    ],
+    [
+      "fragment relative parameter",
+      "'file://h'['/private']?a/Users/alice&https://cdn.test/logo#x=1&docs/readme/more",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo#x=1&docs/readme/more",
+    ],
+    [
+      "named slash parameter",
+      "'file://h'['/private']?a/Users/alice&https://cdn.test/logo?a=1&next=/public/path",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&next=/public/path",
+    ],
+  ] as const)("keeps quoted public URL internal %s intact", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "bare private return",
+      "'file://h'['/private']?a/Users/alice&https://cdn.test/logo&/Users/bob",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo&<path>",
+    ],
+    [
+      "word-bearing private return",
+      "'file://h'['/private']?a/Users/alice&https://cdn.test/logo&c/Users/bob",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo&c<path>",
+    ],
+    [
+      "later independent public URL",
+      "'file://h'['/private']?a/Users/alice&https://cdn.test/logo&/Users/bob&https://p.test/x",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo&<path>&https://p.test/x",
+    ],
+  ] as const)("preserves quoted public child %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("redacts repeated pipe Windows paths inside one wrapper", () => {
     const input =
       "file://h?x=[https://e.test/t|\\Users\\alice\\one.db|\\Users\\bob\\secret.db]";
