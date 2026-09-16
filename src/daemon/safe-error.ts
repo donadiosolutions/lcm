@@ -370,6 +370,17 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       // A nested public URL owns its query slashes, but an immediate absolute
       // path after a delimiter returns to the enclosing file-query grammar.
       forcedPath[index + 1] = 1;
+      if (char === "&") {
+        separator = -1;
+        exactFileScheme = false;
+        foundFilePath = false;
+        filePathBracketDepth = 0;
+        schemeLength = 0;
+        fileSchemeLength = 0;
+        schemeQuote = 0;
+        queryOrFragment = false;
+        nestedPublicUrlBracketDepth = 0;
+      }
       pathlessNestedPublicUrlActive = false;
     }
     if (pathlessFileQueryBracketDepth > 0 && char === "[") {

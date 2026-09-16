@@ -2883,6 +2883,29 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it("returns later Windows values to the enclosing owner after a public URL path handoff", () => {
+    const input =
+      "file://h?x=[https://e.test/t&/Users/a/one&key=\\Users\\bob\\secret.db]";
+    const expected = "file://h?x=[https://e.test/t&<path>&key=<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(first).not.toContain("bob");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "file://h?x=[https://e.test/t?key=/public&next=/also]",
+    "file://h?x=[https://e.test/t&relative/path]",
+  ] as const)("keeps nested public named and relative controls stable: %s", (input) => {
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
   it("redacts repeated nested-public ampersand paths in the same wrapper", () => {
     const input = "file://h?x=[https://e.test/t&/Users/a/one.db&/Users/b/two.db]";
     const expected = "file://h?x=[https://e.test/t&<path>&<path>]";

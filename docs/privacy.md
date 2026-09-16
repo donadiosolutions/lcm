@@ -609,8 +609,10 @@ The `Security` section of the doctor output shows:
   values. An ampersand or pipe immediately followed by a supported POSIX or
   Windows root returns to the enclosing private-path grammar. That owner remains
   active through repeated immediate paths in the same wrapper, including a
-  POSIX component beginning with a Unicode symbol. A private path immediately
-  after the nested URL's closing wrapper is also redacted on the same pass.
+  POSIX component beginning with a Unicode symbol. An ampersand absolute-path
+  handoff also ends the nested URL substate, so later private values in the same
+  wrapper use the enclosing owner. A private path immediately after the nested
+  URL's closing wrapper is also redacted on the same pass.
   An unquoted exact file wrapper immediately followed by an ampersand-separated
   public URL is recognized from that observable syntax on every pass. The
   doubled-bracket pathless policy retains the observable scheme, authority, and
