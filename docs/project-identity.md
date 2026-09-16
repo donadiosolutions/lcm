@@ -233,9 +233,10 @@ promoted content is unsupported` and does not include memory content, IDs,
 paths, or tags. See the
 [offline promoted-memory repair procedure](privacy.md#embedded-nul-in-promoted-memory).
 
-Legacy conversation messages use the same SQLite boundary check. During
-worktree reconciliation, `messages.content` must be well-formed UTF-8 SQLite
-`TEXT` without an embedded NUL. Malformed bytes, a NUL, or non-`TEXT` storage
+Legacy conversation messages use the same SQLite boundary check when no existing
+canonical completion marker skips the merge. On that path, `messages.content`
+must be well-formed UTF-8 SQLite `TEXT` without an embedded NUL.
+Malformed bytes, a NUL, or non-`TEXT` storage
 are refused with `stored message content is unsupported`; the error contains
 no content, session, path, or database identifier. The source check runs before
 its fence commits, preserving the legacy database and exact bytes for offline
