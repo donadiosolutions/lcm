@@ -476,7 +476,7 @@ describe("private filesystem primitives", () => {
     }
   });
 
-  it("keeps destination collision classified when exclusive cleanup also fails", () => {
+  it("preserves destination collision and exclusive cleanup failure in order", () => {
     const root = makeRoot();
     const parent = openPrivateDirectory(root);
     const target = join(root, "metadata.json");
@@ -491,14 +491,60 @@ describe("private filesystem primitives", () => {
       } catch (error) {
         observed = error;
       }
-      expect(observed).toBeInstanceOf(PrivateFileCollisionError);
+      expect(observed).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(observed).not.toBeInstanceOf(PrivateFileCollisionError);
+      const aggregate = (observed as Error).cause as AggregateError & { cause?: unknown };
+      expect(aggregate).toBeInstanceOf(AggregateError);
+      expect(aggregate.message).toBe("private file publication and temporary cleanup failed");
+      expect(aggregate.errors[0]).toBeInstanceOf(PrivateFileCollisionError);
+      expect(aggregate.errors[1]).toBe(cleanupFailure);
+      expect(aggregate.cause).toBe(aggregate.errors[0]);
       expect(readFileSync(target, "utf8")).toBe("winner");
+      expect(readdirSync(root).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toHaveLength(1);
     } finally {
       parent.close();
     }
   });
 
-  it("keeps destination collision classified when the parent also changes", () => {
+  it("fails closed when collision cleanup refuses an untrusted replacement", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"77".repeat(12)}.tmp`);
+    const collision = Object.assign(new Error("destination exists"), { code: "EEXIST" });
+    writeFileSync(target, "winner", { mode: 0o600 });
+    let observed: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "loser", {
+          random: () => Buffer.alloc(12, 0x77),
+          link: (source) => {
+            rmSync(source);
+            writeFileSync(source, "untrusted replacement", { mode: 0o600 });
+            throw collision;
+          },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        observed = error;
+      }
+
+      expect(observed).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(observed).not.toBeInstanceOf(PrivateFileCollisionError);
+      const aggregate = (observed as Error).cause as AggregateError & { cause?: unknown };
+      expect(aggregate).toBeInstanceOf(AggregateError);
+      expect(aggregate.errors[0]).toBeInstanceOf(PrivateFileCollisionError);
+      expect(aggregate.errors[1]).toMatchObject({
+        message: "private exclusive publication temp cleanup was not completed",
+      });
+      expect(aggregate.cause).toBe(aggregate.errors[0]);
+      expect(readFileSync(target, "utf8")).toBe("winner");
+      expect(readFileSync(tempPath, "utf8")).toBe("untrusted replacement");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("preserves collision and cleanup refusal when the parent also changes", () => {
     const sandbox = makeRoot();
     const active = join(sandbox, "active");
     const displaced = join(sandbox, "displaced");
@@ -522,11 +568,22 @@ describe("private filesystem primitives", () => {
       } catch (error) {
         thrown = error;
       }
-      expect(thrown).toBeInstanceOf(PrivateFileCollisionError);
+      expect(thrown).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(thrown).not.toBeInstanceOf(PrivateFileCollisionError);
       expect(thrown).not.toBeInstanceOf(PrivateFilePublicationTopologyError);
-      expect((thrown as Error).cause).toBe(collision);
+      const aggregate = (thrown as Error).cause as AggregateError & { cause?: unknown };
+      expect(aggregate).toBeInstanceOf(AggregateError);
+      expect(aggregate.errors[0]).toBeInstanceOf(PrivateFileCollisionError);
+      expect((aggregate.errors[0] as Error).cause).toBe(collision);
+      expect(aggregate.errors[1]).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(aggregate.errors[1]).toMatchObject({
+        message: "private exclusive publication temp cleanup was not completed",
+        cause: expect.any(PrivateDirectoryTopologyError),
+      });
+      expect(aggregate.cause).toBe(aggregate.errors[0]);
       expect(readFileSync(join(displaced, "metadata.json"), "utf8")).toBe("winner");
       expect(existsSync(target)).toBe(false);
+      expect(readdirSync(displaced).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toHaveLength(1);
     } finally {
       parent.close();
     }

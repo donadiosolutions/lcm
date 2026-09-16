@@ -78,6 +78,8 @@ const expectedComponents = [
       "^src/scrub\\.ts$",
       "^src/secret-key\\.ts$",
       // #1032 keeps retained-parent atomic-write outcome hardening in this owner.
+      // #1285 preserves ordered collision and task-owned temporary cleanup
+      // evidence in the retained-parent exclusive private-file writer.
       "^src/security-files\\.ts$",
       // #1133 keeps project-pattern owner/single-link admission and authenticated
       // single-snapshot scrubbing in this existing configuration-security owner.

@@ -73,6 +73,8 @@ component_management:
         - "^src/runtime-root\\.ts$"
         - "^src/scrub\\.ts$"
         - "^src/secret-key\\.ts$"
+        # #1285 preserves ordered collision and task-owned temporary cleanup
+        # evidence in the retained-parent exclusive private-file writer.
         - "^src/security-files\\.ts$"
         # #1133 keeps project-pattern owner/single-link admission and authenticated
         # single-snapshot scrubbing in this existing configuration-security owner.

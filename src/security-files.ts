@@ -1344,15 +1344,47 @@ export function atomicWritePrivateFile(
       }
     } finally {
       if (ownsTempPath && tempIdentity !== undefined) {
-        try {
-          unlinkPrivateFileIfIdentityMatches(
-            tempPath,
-            tempIdentity,
-            (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
-            undefined,
-            published ? 2n : 1n,
-          );
-        } catch { /* preserve the exclusive publication failure */ }
+        if (primaryError instanceof PrivateFileCollisionError) {
+          let cleanupErrorPresent = false;
+          let cleanupError: unknown;
+          try {
+            const removed = unlinkPrivateFileIfIdentityMatches(
+              tempPath,
+              tempIdentity,
+              (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+              undefined,
+              1n,
+            );
+            if (!removed) {
+              try {
+                assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+              } catch (topologyError) {
+                throw new PrivateDirectoryTopologyError(
+                  "private exclusive publication temp cleanup was not completed",
+                  { cause: topologyError },
+                );
+              }
+              throw new Error("private exclusive publication temp cleanup was not completed");
+            }
+            ownsTempPath = false;
+          } catch (error) {
+            cleanupErrorPresent = true;
+            cleanupError = error;
+          }
+          if (cleanupErrorPresent) {
+            primaryError = privateFilePublicationCleanupFailure(primaryError, cleanupError);
+          }
+        } else {
+          try {
+            unlinkPrivateFileIfIdentityMatches(
+              tempPath,
+              tempIdentity,
+              (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+              undefined,
+              published ? 2n : 1n,
+            );
+          } catch { /* preserve the exclusive publication failure */ }
+        }
       }
     }
     if (primaryErrorPresent) throw primaryError;
