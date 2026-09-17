@@ -740,6 +740,8 @@ describe("Codecov configuration", () => {
       ["src/daemon/supervisor.ts", "integration-service-managers"],
       // #837 consumer-admission descriptor cleanup remains storage-owned.
       // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
+      // #1307 explicit-only retained append admission for non-append mutation
+      // participants stays storage-abstractions-owned.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
       // #1229 local outbox diagnostic admission stays local-event-storage-owned.
       ["src/storage/local-hook-outbox.ts", "unit-local-event-storage"],
@@ -759,6 +761,8 @@ describe("Codecov configuration", () => {
       // #989 event-sidecar parent authentication stays local-persistence-owned.
       // #1101 numeric skipped-sidecar counts stay local-persistence-owned.
       // #1191 mutating sidecar scan lifetime stays local-persistence-owned.
+      // #1307 queue-before-consumer ordering for mutating sidecar scans stays
+      // local-persistence-owned.
       ["src/db/event-sidecars.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"],

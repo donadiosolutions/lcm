@@ -7,6 +7,8 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BackendPublicationCoordinator,
+  BackendPublicationAppendBarrierTimeoutError,
+  BackendPublicationRetainedAppendAdmissionStoppedError,
   BackendPublicationJournalError,
   assertBackendPublicationConsumerAccess,
   assertBackendPublicationConfigReadAccess,
@@ -20,8 +22,10 @@ import {
   readBackendMaintenanceJournal,
   withBackendPublicationConfigLock,
   withBackendPublicationConsumerLock,
+  withBackendPublicationConsumerLockAsync,
   withBackendPublicationAppendBarrier,
   withBackendPublicationAppendBarrierAsync,
+  withBackendPublicationRetainedAppendAdmissionAsync,
   type BackendPublicationDriver,
   type BackendPublicationJournal,
   type BackendMaintenanceJournal,
@@ -5776,6 +5780,479 @@ describe("revocable mutation permits", () => {
     expect(effects).toBe(1);
     await expect(withBackendPublicationAppendBarrierAsync(home, async () => "next"))
       .resolves.toBe("next");
+  });
+
+  it("retains tail, consumer, and private-lock order without follower overtake", async () => {
+    const home = makeHome();
+    const order: string[] = [];
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      order.push("owner");
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const retained = withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      async token => {
+        order.push("retained");
+        expect(withBackendPublicationConsumerLock(
+          home,
+          nested => nested,
+          { lockToken: token },
+        )).toBe(token);
+      },
+      undefined,
+      {
+        contentionWaitMs: 5_000,
+        externalLockAttempts: 1,
+        _appendLockObserver: event => {
+          if (event === "before-main-lock-publish") order.push("retained-lock");
+        },
+      },
+    );
+    const follower = withBackendPublicationAppendBarrierAsync(home, async () => {
+      order.push("follower");
+    });
+    await Promise.resolve();
+    expect(order).toEqual(["owner"]);
+    releaseOwner();
+    await Promise.all([owner, retained, follower]);
+    expect(order).toEqual(["owner", "retained-lock", "retained", "follower"]);
+  });
+
+  it("grants retained append authority only to the exact explicit token", async () => {
+    const home = makeHome();
+    await withBackendPublicationRetainedAppendAdmissionAsync(home, async token => {
+      expect(withBackendPublicationConsumerLock(
+        home,
+        nested => nested,
+        { lockToken: token },
+      )).toBe(token);
+      await expect(withBackendPublicationAppendBarrierAsync(
+        home,
+        nested => nested,
+        token,
+      )).resolves.toBe(token);
+      await expect(withBackendPublicationAppendBarrierAsync(
+        home,
+        async () => undefined,
+        undefined,
+        { contentionWaitMs: 0 },
+      )).rejects.toBeInstanceOf(BackendPublicationAppendBarrierTimeoutError);
+    }, undefined, { contentionWaitMs: 5_000, externalLockAttempts: 1 });
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => "released"))
+      .resolves.toBe("released");
+  });
+
+  it("suppresses active-token ambience and restores the outer append context", async () => {
+    const home = makeHome();
+    await withBackendPublicationAppendBarrierAsync(home, async token => {
+      await withBackendPublicationRetainedAppendAdmissionAsync(
+        home,
+        async retainedToken => {
+          expect(retainedToken).toBe(token);
+          await expect(withBackendPublicationAppendBarrierAsync(
+            home,
+            async () => undefined,
+            undefined,
+            { contentionWaitMs: 0 },
+          )).rejects.toBeInstanceOf(BackendPublicationAppendBarrierTimeoutError);
+          await expect(withBackendPublicationAppendBarrierAsync(
+            home,
+            nested => nested,
+            retainedToken,
+          )).resolves.toBe(token);
+        },
+        token,
+        { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+      );
+      await expect(withBackendPublicationAppendBarrierAsync(home, nested => nested))
+        .resolves.toBe(token);
+    });
+  });
+
+  it("preserves borrowed consumer authority across every pre-effect outcome", async () => {
+    const home = makeHome();
+    await withBackendPublicationConsumerLockAsync(home, async token => {
+      const assertBorrowed = (): void => {
+        expect(withBackendPublicationConsumerLock(
+          home,
+          nested => nested,
+          { lockToken: token },
+        )).toBe(token);
+      };
+      await withBackendPublicationRetainedAppendAdmissionAsync(
+        home,
+        async nested => { expect(nested).toBe(token); },
+        token,
+        { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+      );
+      assertBorrowed();
+
+      const callbackFailure = new Error("retained callback failed");
+      await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+        home,
+        async () => { throw callbackFailure; },
+        token,
+        { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+      )).rejects.toBe(callbackFailure);
+      assertBorrowed();
+
+      const controller = new AbortController();
+      controller.abort();
+      await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+        home,
+        async () => { throw new Error("pre-aborted callback ran"); },
+        token,
+        { contentionWaitMs: 5_000, signal: controller.signal, externalLockAttempts: 1 },
+      )).rejects.toMatchObject({ reason: "aborted" });
+      assertBorrowed();
+
+      await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+        home,
+        async () => { throw new Error("deadline callback ran"); },
+        token,
+        { contentionWaitMs: 0, externalLockAttempts: 1 },
+      )).rejects.toMatchObject({ reason: "deadline" });
+      assertBorrowed();
+
+      await expect(withBackendPublicationAppendBarrierAsync(
+        home,
+        async () => undefined,
+        undefined,
+        { contentionWaitMs: 0 },
+      )).rejects.toBeInstanceOf(BackendPublicationAppendBarrierTimeoutError);
+      assertBorrowed();
+    });
+  });
+
+  it("keeps borrowed tokens live after active-token callback failure", async () => {
+    const home = makeHome();
+    const callbackFailure = new Error("nested retained failure");
+    await withBackendPublicationAppendBarrierAsync(home, async token => {
+      await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+        home,
+        async () => { throw callbackFailure; },
+        token,
+        { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+      )).rejects.toBe(callbackFailure);
+      await expect(withBackendPublicationAppendBarrierAsync(home, nested => nested))
+        .resolves.toBe(token);
+    });
+  });
+
+  it("rejects revoked and wrong-home retained tokens", async () => {
+    const home = makeHome();
+    const other = makeHome();
+    let revoked!: object;
+    await withBackendPublicationConsumerLockAsync(home, async token => {
+      revoked = token;
+      await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+        other,
+        async () => undefined,
+        token,
+        { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+      )).rejects.toMatchObject({ reason: "permit-mismatch" });
+    });
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      async () => undefined,
+      revoked,
+      { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+    )).rejects.toMatchObject({ reason: "permit-mismatch" });
+  });
+
+  it("aborts predecessor waiting, removes wait resources, and preserves queue order", async () => {
+    vi.useFakeTimers();
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const controller = new AbortController();
+    const add = vi.spyOn(controller.signal, "addEventListener");
+    const remove = vi.spyOn(controller.signal, "removeEventListener");
+    const effect = vi.fn();
+    const retained = withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      effect,
+      undefined,
+      { contentionWaitMs: 5_000, signal: controller.signal, externalLockAttempts: 1 },
+    );
+    await Promise.resolve();
+    expect(vi.getTimerCount()).toBe(1);
+    controller.abort();
+    await expect(retained).rejects.toMatchObject({ reason: "aborted" });
+    expect(effect).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(add).toHaveBeenCalledOnce();
+    expect(remove).toHaveBeenCalledOnce();
+
+    let followerEntered = false;
+    const follower = withBackendPublicationAppendBarrierAsync(home, async () => {
+      followerEntered = true;
+    });
+    await Promise.resolve();
+    expect(followerEntered).toBe(false);
+    releaseOwner();
+    await Promise.all([owner, follower]);
+    expect(followerEntered).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it("cleans the predecessor timer and listener when the predecessor wins", async () => {
+    vi.useFakeTimers();
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const controller = new AbortController();
+    const remove = vi.spyOn(controller.signal, "removeEventListener");
+    const retained = withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      async () => "admitted",
+      undefined,
+      { contentionWaitMs: 5_000, signal: controller.signal, externalLockAttempts: 1 },
+    );
+    await Promise.resolve();
+    expect(vi.getTimerCount()).toBe(1);
+    releaseOwner();
+    await owner;
+    await expect(retained).resolves.toBe("admitted");
+    expect(vi.getTimerCount()).toBe(0);
+    expect(remove).toHaveBeenCalledOnce();
+    vi.useRealTimers();
+  });
+
+  it("refuses exact-deadline predecessor settlement without late effects", async () => {
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    let now = 0;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const effect = vi.fn();
+    const retained = withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      effect,
+      undefined,
+      {
+        contentionWaitMs: 10,
+        externalLockAttempts: 1,
+        _now: () => now,
+        _wait: async () => {
+          now = 10;
+          releaseOwner();
+          await owner;
+        },
+      },
+    );
+    await expect(retained).rejects.toMatchObject({ reason: "deadline" });
+    expect(effect).not.toHaveBeenCalled();
+    await owner;
+  });
+
+  it("stops retained admission cancelled after its activity assertion", async () => {
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const controller = new AbortController();
+    const add = vi.spyOn(controller.signal, "addEventListener");
+    const effect = vi.fn();
+    let nowCalls = 0;
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      effect,
+      undefined,
+      {
+        contentionWaitMs: 5_000,
+        externalLockAttempts: 1,
+        signal: controller.signal,
+        _now: () => {
+          nowCalls += 1;
+          if (nowCalls === 2) controller.abort();
+          return 0;
+        },
+      },
+    )).rejects.toMatchObject({ reason: "aborted" });
+    expect(effect).not.toHaveBeenCalled();
+    expect(add).not.toHaveBeenCalled();
+    releaseOwner();
+    await owner;
+  });
+
+  it("stops retained admission whose deadline expires before waiting", async () => {
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const effect = vi.fn();
+    const waits = vi.fn(async () => undefined);
+    let nowCalls = 0;
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      effect,
+      undefined,
+      {
+        contentionWaitMs: 10,
+        externalLockAttempts: 1,
+        _now: () => {
+          nowCalls += 1;
+          return nowCalls >= 3 ? 10 : 0;
+        },
+        _wait: waits,
+      },
+    )).rejects.toMatchObject({ reason: "deadline" });
+    expect(effect).not.toHaveBeenCalled();
+    expect(waits).not.toHaveBeenCalled();
+    releaseOwner();
+    await owner;
+  });
+
+  it("stops retained admission aborted while registering its listener", async () => {
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const controller = new AbortController();
+    const add = vi.spyOn(controller.signal, "addEventListener");
+    const remove = vi.spyOn(controller.signal, "removeEventListener");
+    const effect = vi.fn();
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      effect,
+      undefined,
+      {
+        contentionWaitMs: 5_000,
+        externalLockAttempts: 1,
+        signal: controller.signal,
+        _now: () => 0,
+        _wait: async () => { controller.abort(); },
+      },
+    )).rejects.toMatchObject({ reason: "aborted" });
+    expect(effect).not.toHaveBeenCalled();
+    expect(add).toHaveBeenCalledOnce();
+    expect(remove).toHaveBeenCalledOnce();
+    releaseOwner();
+    await owner;
+  });
+
+  it("attempts unrelated external contention once and preserves callback failures", async () => {
+    const home = makeHome();
+    const contention = new PrivateMutationLockContentionError("external append owner");
+    let attempts = 0;
+    const effect = vi.fn();
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      effect,
+      undefined,
+      {
+        contentionWaitMs: 5_000,
+        externalLockAttempts: 1,
+        _appendLockObserver: event => {
+          if (event === "before-main-lock-publish") {
+            attempts += 1;
+            throw contention;
+          }
+        },
+      },
+    )).rejects.toBe(contention);
+    expect(attempts).toBe(1);
+    expect(effect).not.toHaveBeenCalled();
+
+    let now = 0;
+    const callbackFailure = new PrivateMutationLockContentionError("callback failure");
+    let effects = 0;
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      async () => {
+        effects += 1;
+        now = 10;
+        throw callbackFailure;
+      },
+      undefined,
+      { contentionWaitMs: 10, externalLockAttempts: 1, _now: () => now },
+    )).rejects.toBe(callbackFailure);
+    expect(effects).toBe(1);
+  });
+
+  it("cleans owned authority after callback and private-lock cleanup failures", async () => {
+    const home = makeHome();
+    const callbackFailure = new Error("callback failed");
+    let callbackEffects = 0;
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      async () => {
+        callbackEffects += 1;
+        throw callbackFailure;
+      },
+      undefined,
+      { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+    )).rejects.toBe(callbackFailure);
+    expect(callbackEffects).toBe(1);
+
+    const cleanupFailure = new Error("retained append cleanup failed");
+    let cleanupEffects = 0;
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      async () => { cleanupEffects += 1; },
+      undefined,
+      {
+        contentionWaitMs: 5_000,
+        externalLockAttempts: 1,
+        _appendLockObserver: event => {
+          if (event === "before-main-lock-release-read") throw cleanupFailure;
+        },
+      },
+    )).rejects.toBe(cleanupFailure);
+    expect(cleanupEffects).toBe(1);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => "next"))
+      .resolves.toBe("next");
+  });
+
+  it("validates the retained helper's one-shot acquisition contract", async () => {
+    const effect = vi.fn();
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      makeHome(),
+      effect,
+      undefined,
+      { externalLockAttempts: 2 as 1 },
+    )).rejects.toThrow("requires one external lock attempt");
+    expect(effect).not.toHaveBeenCalled();
+    expect(new BackendPublicationRetainedAppendAdmissionStoppedError("aborted"))
+      .toMatchObject({ name: "BackendPublicationRetainedAppendAdmissionStoppedError" });
   });
 
   it("reuses exact-home append authority in the synchronous wrappers", () => {
