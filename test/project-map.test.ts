@@ -38,10 +38,6 @@ import {
   serializeWorktreeReconciliationFence,
 } from "../src/worktree-reconciliation-fence.js";
 import {
-  PrivateDirectoryTopologyError,
-  PrivateFilePublicationTopologyError,
-} from "../src/security-files.js";
-import {
   BackendPublicationJournalError,
   backendPublicationDirectory,
   backendPublicationJournalPath,
@@ -747,34 +743,66 @@ describe("project map", () => {
     expect(isAuthenticatedRetiredProjectIdentityFence(fence, oldId)).toBe(true);
   });
 
-  it("restores the retired map when the writer reports a completed publication", () => {
-    const canonical = makeDir("retired-publication-outcome-rollback");
-    const oldId = writeRetiredProjectFixture(canonical);
-    const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
-    const fence = join(homedir(), ".lcm", "projects", oldId);
-    const beforeFence = readFileSync(fence);
-    const beforeMap = readFileSync(projectMapPath(), "utf8");
-    const phases: string[] = [];
-    // A writer that reports a completed or indeterminate publication is
-    // restored even when this process never observed the replacement.
-    const reported = new PrivateFilePublicationTopologyError(
-      "published",
-      new PrivateDirectoryTopologyError("injected retained parent rebind"),
-      undefined,
-    );
+  it.each(["published", "unknown"] as const)(
+    "keeps a writer-reported %s publication authoritative after the visible rename",
+    (outcome) => {
+      const canonical = makeDir(`retired-publication-outcome-${outcome}`);
+      const oldId = writeRetiredProjectFixture(canonical);
+      const normalized = normalizeProjectPath(canonical);
+      const newId = retiredProjectIdentitySuccessor(oldId, normalized);
+      const projects = join(homedir(), ".lcm", "projects");
+      const root = join(homedir(), ".lcm");
+      const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+      const originalRename = nodeFs.renameSync as (...args: unknown[]) => void;
+      const originalLstat = nodeFs.lstatSync as (...args: unknown[]) => unknown;
+      let renamed = false;
+      let topologyFailureInjected = false;
+      try {
+        nodeFs.renameSync = ((...args: unknown[]) => {
+          originalRename(...args);
+          if (String(args[1]) !== projectMapPath()) return;
+          renamed = true;
+          // The renamed successor map is now visible to hooks before the
+          // writer completes its retained-parent post-check.
+          mkdirSync(join(projects, newId), { recursive: true, mode: 0o700 });
+          if (outcome === "unknown") {
+            throw new Error("injected ambiguous rename response");
+          }
+        });
+        nodeFs.lstatSync = ((...args: unknown[]) => {
+          if (renamed && !topologyFailureInjected && String(args[0]) === root) {
+            topologyFailureInjected = true;
+            throw new Error("injected post-rename retained-parent failure");
+          }
+          return originalLstat(...args);
+        });
+        syncBuiltinESMExports();
 
-    expect(() => renewRetiredProjectIdentity(canonical, {
-      _beforeMapReplaceForTesting: (phase) => {
-        phases.push(phase);
-        if (phase === "publish") throw reported;
-      },
-    })).toThrow(reported);
-    expect(phases).toEqual(["publish", "rollback"]);
-    expect(readFileSync(projectMapPath(), "utf8")).toBe(beforeMap);
-    expect(readProjectMapSnapshot()[oldId]).toMatchObject({ canonical });
-    expect(readProjectMapSnapshot()[newId]).toBeUndefined();
-    expect(readFileSync(fence)).toEqual(beforeFence);
-  });
+        expect(() => renewRetiredProjectIdentity(canonical)).toThrow(
+          outcome === "published"
+            ? "private file rename completed, but retained parent topology is not trusted"
+            : "private file publication outcome is unknown",
+        );
+      } finally {
+        nodeFs.renameSync = originalRename;
+        nodeFs.lstatSync = originalLstat;
+        syncBuiltinESMExports();
+      }
+
+      expect(renamed).toBe(true);
+      expect(topologyFailureInjected).toBe(true);
+      expect(readProjectMapSnapshot()).toEqual({
+        [newId]: { canonical: normalized, aliases: [] },
+      });
+      expect(existsSync(join(projects, newId))).toBe(true);
+      expect(renewRetiredProjectIdentity(canonical)).toEqual({
+        oldId,
+        newId,
+        canonical: normalized,
+        changed: false,
+      });
+    },
+  );
 
   it("does not attempt rollback after a post-rename writer failure", () => {
     const canonical = makeDir("retired-post-rename-rollback-failure");
@@ -783,16 +811,12 @@ describe("project map", () => {
     const fence = join(homedir(), ".lcm", "projects", oldId);
     const beforeFence = readFileSync(fence);
     const primary = new Error("injected post-rename publication failure");
-    const rollbackFailure = new Error("injected rollback replace failure");
     const phases: string[] = [];
     let thrown: unknown;
 
     try {
       renewRetiredProjectIdentity(canonical, {
-        _beforeMapReplaceForTesting: (phase) => {
-          phases.push(phase);
-          if (phase === "rollback") throw rollbackFailure;
-        },
+        _beforeMapReplaceForTesting: phase => phases.push(phase),
         _afterMapReplaceForTesting: () => { throw primary; },
       });
     } catch (error) {

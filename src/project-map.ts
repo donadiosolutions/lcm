@@ -25,7 +25,6 @@ import {
   ensurePrivateDirectory,
   openPrivateDirectory,
   openPrivateDirectoryIfExists,
-  PrivateFilePublicationTopologyError,
   OWNER_ONLY_FILE_MODES,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
@@ -310,7 +309,7 @@ type RetiredProjectIdentityRenewalOptions = Readonly<{
   /** @internal Deterministic project-map snapshot read failure seam. */
   _readMapFileForTesting?: typeof readMapFile;
   /** @internal Observe or race the retained-root replacement boundary. */
-  _beforeMapReplaceForTesting?: (phase: "publish" | "rollback") => void;
+  _beforeMapReplaceForTesting?: (phase: "publish") => void;
   /** @internal Deterministic writer failure after the publishing rename landed. */
   _afterMapReplaceForTesting?: () => void;
   /** @internal Deterministic failure after map publication and before readback. */
@@ -806,16 +805,8 @@ export function renewRetiredProjectIdentity(
     let primaryError: unknown;
     let result: RetiredProjectIdentityRenewal | undefined;
     const readRenewalMap = options._readMapFileForTesting ?? readMapFile;
-    const assertRetainedRoot = (): void => {
-      assertStableRetainedPrivateDirectory(
-        evidence.root,
-        evidence.rootPath,
-        evidence.root.witness,
-        evidence.expectedUid,
-      );
-    };
     const retainedMapWrite = (
-      phase: "publish" | "rollback",
+      phase: "publish",
       validate: () => void,
     ): RetainedProjectMapWrite => ({
       parent: evidence.root,
@@ -846,85 +837,54 @@ export function renewRetiredProjectIdentity(
         assertRenewableProjectEntry(map[oldId]!, canonical);
         assertUnoccupiedRetiredProjectSuccessor(map, newId);
         assertRetiredIdentityRenewalEvidence(evidence, true);
-        const publicationFile = readMapFile(projectMapPath());
-        if (publicationFile === null) {
+        if (readMapFile(projectMapPath()) === null) {
           throw new Error("retired project map disappeared before publication");
         }
-        const rollback = { content: publicationFile.content, map: cloneMap(map) };
 
         const renewed = cloneMap(map);
         delete renewed[oldId];
         renewed[newId] = { canonical, aliases: [] };
-        // The publishing writer can fail after its rename already replaced
-        // the map, because the post-replacement topology check and the
-        // writer's cache refresh both run afterwards. The rollback snapshot
-        // is therefore reachable before the write starts instead of only
-        // after it returns. A publication topology failure before the
-        // callback either published or cannot prove that it did not, so that
-        // uncertain outcome is restored. Once the callback exposes `newId`,
-        // hooks may materialize successor state without this lock and the
-        // publication must remain authoritative through every later failure.
-        // Every earlier refusal leaves the retired map already in place and
-        // must not be rewritten.
-        let published = false;
-        try {
-          writeProjectMap(renewed, undefined, {
-            retainedWrite: retainedMapWrite(
-              "publish",
-              () => assertRetiredIdentityRenewalEvidence(evidence, true),
-            ),
-            onMapPublished: () => {
-              published = true;
-              options._afterMapReplaceForTesting?.();
-            },
-          });
-          options._afterMapPublicationForTesting?.();
-          // The atomic replace above already made `newId` the authoritative
-          // binding. Hook-side identity resolution deliberately resolves
-          // without the publication lock, so a concurrent hook that observes
-          // the published map may legitimately create the successor storage
-          // directory, the `events` directory, or `events/<newId>.db` in this
-          // window. Successor absence only proves the successor was unoccupied
-          // at the moment of the rekey, so it stays an obligation of the
-          // pre-publication validations and of the publishing write's
-          // `beforeReplace` boundary. Demanding it again here would roll the
-          // map back to the fenced `oldId` while leaving that hook-created
-          // sidecar behind, and every retry would then refuse the occupied
-          // successor. Retained-descriptor and retained-fence authentication
-          // still run in full, so a same-UID rebinding of `.lcm`,
-          // `projects`, `events`, or the retired fence still fails closed.
-          assertRetiredIdentityRenewalEvidence(evidence, false);
-          const readback = loadProjectMap({
-            strict: true,
-            reload: true,
-            _publicationLockToken: publicationLockToken,
-          });
-          if (
-            readback[oldId] !== undefined
-            || readback[newId] === undefined
-            || Object.keys(readback).length !== Object.keys(renewed).length
-            || !projectMapEntriesEqual(readback[newId]!, renewed[newId]!)
-          ) {
-            throw new Error("retired project identity renewal readback failed");
-          }
-        } catch (error) {
-          if (published || !(error instanceof PrivateFilePublicationTopologyError)) {
-            throw error;
-          }
-          try {
-            restoreProjectMapSnapshot(
-              rollback.content,
-              rollback.map,
-              retainedMapWrite("rollback", assertRetainedRoot),
-            );
-          } catch (rollbackError) {
-            throw new AggregateError(
-              [error, rollbackError],
-              "retired project identity renewal failed after publication and rollback failed",
-              { cause: error },
-            );
-          }
-          throw error;
+        // The rename can expose `newId` before the writer completes its
+        // retained-parent post-check, calls `onMapPublished`, or refreshes the
+        // process cache. A reported `published` or `unknown` outcome may
+        // therefore already be visible to hooks, which resolve without this
+        // lock and can immediately materialize successor storage. Never
+        // restore `oldId` after a publication attempt: every failure before
+        // the rename leaves the retired map untouched, while every uncertain
+        // outcome must preserve the only binding hooks may have observed.
+        writeProjectMap(renewed, undefined, {
+          retainedWrite: retainedMapWrite(
+            "publish",
+            () => assertRetiredIdentityRenewalEvidence(evidence, true),
+          ),
+          onMapPublished: () => options._afterMapReplaceForTesting?.(),
+        });
+        options._afterMapPublicationForTesting?.();
+        // The atomic replace above already made `newId` the authoritative
+        // binding. Hook-side identity resolution deliberately resolves
+        // without the publication lock, so a concurrent hook that observes
+        // the published map may legitimately create the successor storage
+        // directory, the `events` directory, or `events/<newId>.db` in this
+        // window. Successor absence only proves the successor was unoccupied
+        // at the moment of the rekey, so it stays an obligation of the
+        // pre-publication validations and of the publishing write's
+        // `beforeReplace` boundary. Retained-descriptor and retained-fence
+        // authentication still run in full, so a same-UID rebinding of
+        // `.lcm`, `projects`, `events`, or the retired fence still fails
+        // closed without undoing an observable publication.
+        assertRetiredIdentityRenewalEvidence(evidence, false);
+        const readback = loadProjectMap({
+          strict: true,
+          reload: true,
+          _publicationLockToken: publicationLockToken,
+        });
+        if (
+          readback[oldId] !== undefined
+          || readback[newId] === undefined
+          || Object.keys(readback).length !== Object.keys(renewed).length
+          || !projectMapEntriesEqual(readback[newId]!, renewed[newId]!)
+        ) {
+          throw new Error("retired project identity renewal readback failed");
         }
         result = { oldId, newId, canonical, changed: true };
       }
@@ -1163,37 +1123,6 @@ function writeProjectMap(
     metadataPopulated: opts.metadataPopulated ?? cache?.metadataPopulated ?? false,
   };
   return { path, backupPath };
-}
-
-function restoreProjectMapSnapshot(
-  content: string,
-  map: ProjectMap,
-  retainedWrite: RetainedProjectMapWrite,
-): void {
-  const path = projectMapPath();
-  assertPrivateDirectory(
-    retainedWrite.parent,
-    dirname(path),
-    retainedWrite.parent.witness,
-    retainedWrite.parent.witness.uid,
-  );
-  atomicWritePrivateFile(
-    path,
-    content,
-    {},
-    retainedWrite.parent,
-    { beforeReplace: retainedWrite.beforeReplace },
-  );
-  const statPath = join(
-    retainedDirectoryDescriptorPath(retainedWrite.parent.fd),
-    basename(path),
-  );
-  cache = {
-    path,
-    mtimeMs: statSync(statPath).mtimeMs,
-    map: cloneMap(map),
-    metadataPopulated: false,
-  };
 }
 
 function recoveryProjectMapContent(

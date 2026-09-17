@@ -14,9 +14,9 @@ renewed project can still recover its sidecar when the map is unavailable.
 Reconciliation authenticates renewed bindings reached through distinct local
 aliases, preserves valid aliases on the successor, and refuses ambiguous or
 foreign canonical bindings before source discovery.
-After the successor map publication becomes observable, it remains
-authoritative through later validation or readback failures so concurrent hook
-storage cannot be stranded behind a restored retired binding.
+After successor map publication becomes observable or its outcome is unknown,
+it remains authoritative through later validation or readback failures so
+concurrent hook storage cannot be stranded behind a restored retired binding.
 Preserve bounded per-item identity and outcomes throughout compact progress and
 summaries, keeping invocation-wide failure totals in the live header, the
 failure event, and the final summary instead of repeating them on later
