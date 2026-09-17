@@ -376,6 +376,8 @@ const expectedComponents = [
       "^src/storage/postgresql/extensions\\.ts$",
       // #1195 keeps packaged SQL loading and checksum verification in
       // the existing PostgreSQL schema owner.
+      // #1306 adds the 0007 promoted-content digest migration and its
+      // schema snapshot, keeping the packaged migration manifest here.
       "^src/storage/postgresql/migrations\\.ts$",
       "^src/storage/postgresql/provisioning\\.ts$",
       "^src/storage/postgresql/runtime-readiness\\.ts$",
@@ -406,6 +408,8 @@ const expectedComponents = [
     component_id: "integration-postgresql-memory",
     name: "Integration - PostgreSQL Memory",
     paths: [
+      // #1306 indexes owner exact-content lookup by a generated SHA-256
+      // digest, retaining the raw-equality residual it always used.
       "^src/storage/postgresql/memory-repositories\\.ts$",
       "^src/storage/postgresql/summary-context-repositories\\.ts$",
     ],
@@ -758,7 +762,11 @@ describe("Codecov configuration", () => {
       ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
       // #1195 checksummed packaged migration loading remains schema-owned.
+      // #1306 adds the 0007 promoted-content digest migration and its
+      // schema snapshot, keeping the packaged migration manifest here.
       ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"],
+      // #1306 indexes owner exact-content lookup by a generated SHA-256
+      // digest, retaining the raw-equality residual it always used.
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.

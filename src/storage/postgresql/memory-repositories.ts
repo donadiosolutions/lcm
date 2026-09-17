@@ -764,6 +764,8 @@ implements PromotedMemoryRepository {
                FROM lcm.promoted_memories AS memory
                WHERE memory.project_id = $1
                  AND memory.archived_at IS NULL
+                 AND memory.content_sha256 OPERATOR(pg_catalog.=)
+                   public.digest($2, 'sha256')
                  AND memory.content OPERATOR(pg_catalog.=) $2::pg_catalog.text
                  AND ($3::pg_catalog.text IS NULL
                       OR memory.source_project_id OPERATOR(pg_catalog.=) $3)

@@ -398,7 +398,7 @@ describe("PostgreSQL schema baseline", () => {
                  )
                ORDER BY index_relation.relname`,
       }, { domain: "factory", operation: "inspectExplicitSchemaIndexes" });
-      expect(explicitIndexes.rowCount).toBe(52);
+      expect(explicitIndexes.rowCount).toBe(53);
       expect(explicitIndexes.rows.map(({ index_name }) => index_name))
         .not.toContain("message_parts_metadata_idx");
       const provenanceIndex = explicitIndexes.rows.find(
@@ -439,6 +439,14 @@ describe("PostgreSQL schema baseline", () => {
       )?.index_definition).toContain(
         "USING gin (lcm.normalize_search_text(tag) gin_trgm_ops)",
       );
+      expect(explicitIndexes.rows.find(
+        ({ index_name }) => index_name === "promoted_memories_content_sha256_idx",
+      )?.index_definition).toContain(
+        "(project_id, content_sha256, created_at DESC, memory_id DESC)",
+      );
+      expect(explicitIndexes.rows.find(
+        ({ index_name }) => index_name === "promoted_memories_content_sha256_idx",
+      )?.index_definition).toContain("WHERE (archived_at IS NULL)");
 
       const scope = await seedScope(database.migrator);
       const splitConversation = await database.migrator.query<{ conversation_id: string }>({
@@ -532,6 +540,7 @@ describe("PostgreSQL schema baseline", () => {
         { table_name: "large_files", column_name: "file_id_sha256", data_type: "bytea" },
         { table_name: "messages", column_name: "search_document", data_type: "tsvector" },
         { table_name: "native_transcripts", column_name: "native_session_id_sha256", data_type: "bytea" },
+        { table_name: "promoted_memories", column_name: "content_sha256", data_type: "bytea" },
         { table_name: "promoted_memories", column_name: "search_document", data_type: "tsvector" },
         { table_name: "promoted_memories", column_name: "source_summary_id_sha256", data_type: "bytea" },
         { table_name: "promoted_memory_tags", column_name: "normalized_tag", data_type: "text" },
