@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import { loadDaemonConfig } from "./daemon/config.js";
 import { ensureProjectDirForIdentity, projectIdentity, projectPathsForIdentity } from "./daemon/project.js";
-import { hashProjectPath, readProjectMapSnapshot, resolveExistingProjectIdentity } from "./project-map.js";
+import { hashProjectPath, readProjectMapSnapshot, resolveExistingProjectIdentity, resolveProjectIdentity } from "./project-map.js";
 import { configPath, lcmHomeDir } from "./runtime-paths.js";
 import { ensurePrivateDirectory, atomicWritePrivateFileExclusive } from "./security-files.js";
 import { selectStorageBackendForConfig, assertStorageBackendPublication } from "./storage/backend.js";
@@ -13,6 +13,8 @@ import { createStorageBackendFactory } from "./storage/factory.js";
 import { resolveStorageIdentityContext } from "./storage/identity-context.js";
 import { withPublicationAdmissionRetry, type PublicationConvergence } from "./storage/publication-convergence.js";
 import { SqliteStorageBackendFactory } from "./storage/sqlite/factory.js";
+import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
+import { assertProjectStorageIdentityActive } from "./worktree-reconciliation-fence.js";
 
 export class CliProjectStorageMissingError extends Error {
   constructor() {
@@ -57,6 +59,16 @@ export async function withCliProjectStorage<T>(
         if (customBase) {
           try { canonical = realpathSync(cwd); } catch { /* Keep the established missing-path identity. */ }
         }
+        if (!customBase) {
+          // Classify a retired local project-identity fence before any
+          // backend-specific identity resolution runs, independently of the
+          // selected storage backend. A PostgreSQL binding's remote-identity
+          // lookup can throw before reaching a later SQLite-only check, which
+          // would shadow this diagnostic with a generic discovery failure.
+          ensureWorktreeProjectReconciled(cwd, undefined, { _publicationLockToken: token });
+          const localPreview = resolveProjectIdentity(cwd, { _publicationLockToken: token });
+          assertProjectStorageIdentityActive(projectPathsForIdentity(localPreview).dir, localPreview.id);
+        }
         const identity = customBase
           ? { id: hashProjectPath(canonical), canonical }
           : projectIdentity(cwd, config.storage, token);
@@ -67,6 +79,9 @@ export async function withCliProjectStorage<T>(
           : projectPathsForIdentity(local);
         const project = { ...paths, id: identity.id };
         const context = { project, config };
+        if (customBase) {
+          assertProjectStorageIdentityActive(paths.dir, localId);
+        }
         await options.prepare?.(context);
         if (options.create && config.storage.backend === "sqlite") {
           if (customBase) {

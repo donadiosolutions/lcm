@@ -17,7 +17,14 @@ import {
 } from "../../src/daemon/project.js";
 import type { ResolvedStorageConfig } from "../../src/daemon/config.js";
 import { recoverMachineIdentity } from "../../src/machine-identity.js";
-import { clearProjectMapCache, resolveProjectIdentity, setRemoteProjectBinding } from "../../src/project-map.js";
+import {
+  clearProjectMapCache,
+  hashProjectPath,
+  resolveProjectIdentity,
+  retiredProjectIdentitySuccessor,
+  setRemoteProjectBinding,
+} from "../../src/project-map.js";
+import { serializeWorktreeReconciliationFence } from "../../src/worktree-reconciliation-fence.js";
 import * as securityFiles from "../../src/security-files.js";
 
 const POSTGRESQL_STORAGE = {
@@ -1325,14 +1332,58 @@ describe("secure project-root handoff", () => {
       ["a".repeat(64)]: null,
       ["b".repeat(64)]: { canonical: 42, aliases: [] },
       ["c".repeat(64)]: { canonical: "\u0000", aliases: [] },
-    }));
-    expect(localProjectIdentity("/project", home).canonical).toBe("/project");
-    expect(localProjectIdentity("/project", home).id).toMatch(/^[a-f0-9]{64}$/u);
+    }), { mode: 0o600 });
+    // Every entry is individually malformed (bad hash key, null entry, a
+    // non-string canonical, and a canonical that fails path normalization),
+    // so none reach `matches.push` and the snapshot falls back exactly as
+    // an empty/absent map would.
+    const identity = localProjectIdentity("/project", home);
+    expect(identity.canonical).toBe("/project");
+    expect(identity.id).toBe(hashProjectPath("/project"));
+  });
+
+  it("tolerates a platform without process.getuid when reading the compatibility snapshot", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    writeFileSync(join(home, ".lcm", "map.json"), "null", { mode: 0o600 });
+    const originalGetuid = process.getuid;
+    process.getuid = undefined;
+    try {
+      const identity = localProjectIdentity("/project", home);
+      expect(identity.canonical).toBe("/project");
+      expect(identity.id).toBe(hashProjectPath("/project"));
+    } finally {
+      process.getuid = originalGetuid;
+    }
+  });
+
+  it("falls back when no compatibility-map entry matches the canonical path", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({
+      ["1".repeat(64)]: { canonical: "/other-project", aliases: [] },
+    }), { mode: 0o600 });
+
+    const identity = localProjectIdentity("/project", home);
+
+    expect(identity.canonical).toBe("/project");
+    expect(identity.id).toBe(hashProjectPath("/project"));
+  });
+
+  it("falls back when multiple compatibility-map entries match the canonical path", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({
+      ["1".repeat(64)]: { canonical: "/project", aliases: [] },
+      ["2".repeat(64)]: { canonical: "/other-project", aliases: ["/project"] },
+    }), { mode: 0o600 });
+
+    const identity = localProjectIdentity("/project", home);
+
+    expect(identity.canonical).toBe("/project");
+    expect(identity.id).toBe(hashProjectPath("/project"));
   });
 
   it("falls back when the compatibility snapshot is not an object", () => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });
-    writeFileSync(join(home, ".lcm", "map.json"), "null");
+    writeFileSync(join(home, ".lcm", "map.json"), "null", { mode: 0o600 });
 
     const identity = localProjectIdentity("/project", home);
 
@@ -1340,18 +1391,65 @@ describe("secure project-root handoff", () => {
     expect(identity.id).toBe(localProjectIdentity("/project", join(home, "other-home")).id);
   });
 
-  it("preserves a valid compatibility-map identity and derives its sidecar path", () => {
+  it("re-derives the canonical path hash for a compatibility-map entry that is not an authenticated successor", () => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });
     const mappedId = "d".repeat(64);
     writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({
       [mappedId]: { canonical: "/project", aliases: ["/project-alias"] },
-    }));
+    }), { mode: 0o600 });
 
     const identity = localProjectIdentity("/project", home);
 
+    // An arbitrary sidecar key that is neither the plain path hash nor an
+    // authenticated retired-identity successor is never trusted as-is: the
+    // hook ID is always re-derived from the stable canonical path.
     expect(identity.canonical).toBe(resolve("/project"));
+    expect(identity.id).toBe(hashProjectPath(resolve("/project")));
+    expect(identity.id).not.toBe(mappedId);
     expect(identity.id).toBe(localProjectId("/project", home));
     expect(localProjectDir("/project", home)).toContain(join("projects", identity.id));
+  });
+
+  it("accepts a renewed successor identity authenticated by its retired-identity fence", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const projectsDir = join(home, ".lcm", "projects");
+    mkdirSync(projectsDir, { mode: 0o700 });
+    const canonical = "/project";
+    const retiredId = hashProjectPath(canonical);
+    const successorId = retiredProjectIdentitySuccessor(retiredId, canonical);
+    writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({
+      [successorId]: { canonical, aliases: [] },
+    }), { mode: 0o600 });
+    writeFileSync(
+      join(projectsDir, retiredId),
+      serializeWorktreeReconciliationFence(retiredId, "project"),
+      { mode: 0o600 },
+    );
+
+    const identity = localProjectIdentity(canonical, home);
+
+    expect(identity.id).toBe(successorId);
+    expect(identity.id).not.toBe(retiredId);
+    expect(identity.canonical).toBe(canonical);
+  });
+
+  it("does not accept a claimed successor id without an authenticated retired-identity fence", () => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    // No "projects" directory and no fence file: the map claims the
+    // successor id, but nothing authenticates the retirement, so the
+    // identity must fall back to the plain canonical path hash.
+    const canonical = "/project";
+    const retiredId = hashProjectPath(canonical);
+    const successorId = retiredProjectIdentitySuccessor(retiredId, canonical);
+    writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({
+      [successorId]: { canonical, aliases: [] },
+    }), { mode: 0o600 });
+
+    const identity = localProjectIdentity(canonical, home);
+
+    expect(identity.id).toBe(retiredId);
+    expect(identity.id).not.toBe(successorId);
+    expect(identity.canonical).toBe(canonical);
   });
 
   it.each([

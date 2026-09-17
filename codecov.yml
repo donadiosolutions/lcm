@@ -16,6 +16,8 @@ component_management:
         # #1132 keeps foreground PID publication at the CLI boundary.
         # #1201 keeps diagnostic-only identity admission CLI-owned.
         # #1233 keeps publication-contention restart recovery at the CLI boundary.
+        # #1283 keeps retired-identity renewal CLI admission and bounded
+        # compact progress rendering in the existing CLI component.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
@@ -78,6 +80,7 @@ component_management:
         # single-snapshot scrubbing in this existing configuration-security owner.
         - "^src/sensitive\\.ts$"
         - "^src/shell-quote\\.ts$"
+        # #1283 keeps sanitize-then-bound terminal fields in this owner.
         - "^src/terminal-sanitize\\.ts$"
         - "^src/types\\.ts$"
         - "^src/url-display\\.ts$"
@@ -100,6 +103,8 @@ component_management:
         # root-validation/descriptor-close evidence in the existing hooks owner.
         # #1229 forwards local-enqueue health diagnostics through its live
         # publication token in this existing hooks owner.
+        # #1270 keeps exact retired-fence event scrubbing and terminal-only
+        # hook diagnostics within the existing hooks component.
         # PreCompact initial unsafe-storage diagnostics remain in that same owner.
         - "src/hooks/"
     # #1201 keeps process-only observation, its parser/client, and route allowlist here.
@@ -120,6 +125,7 @@ component_management:
         - "^src/daemon/orientation\\.ts$"
         - "^src/daemon/project-queue\\.ts$"
         - "^src/daemon/publication-queue\\.ts$"
+        # #1270/#1283 keep renewed hook identity selection daemon-core-owned.
         - "^src/daemon/project\\.ts$"
         # Monotonic proxy startup polling remains daemon-core-owned.
         - "^src/daemon/proxy-manager\\.ts$"
@@ -324,6 +330,8 @@ component_management:
       name: "Unit - Compaction and Summarization"
       paths:
         # #618 authenticated batch discovery remains within this compaction owner.
+        # #1283 keeps authenticated retired-fence discovery and structured
+        # item progress in this existing compaction component.
         - "^src/batch-compact\\.ts$"
         - "^src/compaction\\.ts$"
         - "^src/large-files\\.ts$"
@@ -351,6 +359,8 @@ component_management:
         - "^src/portable-knowledge\\.ts$"
         # #1049 keeps project metadata owner and single-link admission in this
         # existing component; no taxonomy, status, or policy change.
+        # #1270/#1283 keep exact project-fence classification and deterministic
+        # local successor renewal in this existing project/worktree component.
         - "^src/project-map\\.ts$"
         - "^src/worktree-reconciliation-fence\\.ts$"
         # #1044 keeps the existing owner; no taxonomy, status, or policy change.

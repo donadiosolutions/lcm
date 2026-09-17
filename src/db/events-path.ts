@@ -6,6 +6,7 @@ import {
   normalizeProjectIdentityPath,
   normalizeProjectPath,
   resolveExistingProjectIdentity,
+  retiredProjectIdentitySuccessor,
 } from "../project-map.js";
 import { lcmHomeDir } from "../runtime-paths.js";
 import {
@@ -17,6 +18,7 @@ import {
   readBoundedRegularFile,
 } from "../security-files.js";
 import type { BackendPublicationLockToken } from "../storage/backend-publication.js";
+import { isAuthenticatedRetiredProjectIdentityFence } from "../worktree-reconciliation-fence.js";
 
 const IDENTITY_EVIDENCE_VERSION = 1;
 const MAX_IDENTITY_EVIDENCE_BYTES = 4 * 1024;
@@ -39,6 +41,25 @@ type ExistingEventsDbPathOptions = Readonly<{
 
 function effectiveUid(): number | undefined {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
+
+/**
+ * Authenticate an identity-evidence id against its own canonical path. A
+ * plain path-hash id always matches, exactly as before. A renewed successor
+ * id (see `retiredProjectIdentitySuccessor`) is authenticated only when the
+ * retained predecessor fence for that same retirement is genuinely present,
+ * mirroring the identical `isAuthenticatedRetiredProjectIdentityFence` proof
+ * that `parseLocalProjectMapCompatibility` already requires before it will
+ * ever hand a hook that successor id. Any other id is rejected.
+ */
+function isAuthenticatedIdentityEvidenceId(canonical: string, id: string): boolean {
+  const plainId = hashProjectPath(canonical);
+  if (id === plainId) return true;
+  return id === retiredProjectIdentitySuccessor(plainId, canonical)
+    && isAuthenticatedRetiredProjectIdentityFence(
+      join(lcmHomeDir(), "projects", plainId),
+      plainId,
+    );
 }
 
 function identityEvidencePath(normalizedCwd: string): string {
@@ -98,7 +119,7 @@ function existingSidecarFromIdentityEvidence(
       || resolve(record.canonical) !== record.canonical
       || typeof record.id !== "string"
       || !PROJECT_ID_PATTERN.test(record.id)
-      || hashProjectPath(record.canonical) !== record.id
+      || !isAuthenticatedIdentityEvidenceId(record.canonical, record.id)
     ) {
       return undefined;
     }

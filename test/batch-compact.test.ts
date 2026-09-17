@@ -1,24 +1,66 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { batchCompact, findUncompacted, formatLlmDiagnostic, runBatchWorkerPool } from "../src/batch-compact.js";
+import {
+  batchCompact,
+  findUncompacted,
+  formatLlmDiagnostic,
+  runBatchWorkerPool,
+  type CompactProgressEvent,
+} from "../src/batch-compact.js";
 import * as cliStorage from "../src/cli-storage.js";
 import * as daemonConfig from "../src/daemon/config.js";
 import { DaemonClient } from "../src/daemon/client.js";
-import { closeLcmConnection, getLcmConnection, getPoolStats } from "../src/db/connection.js";
+import {
+  captureExistingLcmSnapshot,
+  closeLcmConnection,
+  getLcmConnection,
+  getPoolStats,
+  SQLITE_PREVIEW_SNAPSHOT_ERROR,
+} from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
-import { addProjectAlias, clearProjectMapCache, projectMapPath } from "../src/project-map.js";
+import {
+  addProjectAlias,
+  clearProjectMapCache,
+  projectMapPath,
+  renewRetiredProjectIdentity,
+} from "../src/project-map.js";
 import {
   ensureProjectDir,
   MAX_PROJECT_METADATA_BYTES,
   projectPaths,
 } from "../src/daemon/project.js";
+import {
+  RETIRED_PROJECT_IDENTITY_DIAGNOSTIC,
+  serializeWorktreeReconciliationFence,
+} from "../src/worktree-reconciliation-fence.js";
+import { NinjaRenderer } from "../src/cli/pipeline-runner.js";
+import { makeProgressState } from "../src/cli/progress-state.js";
 
 const FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS = 15_000;
+const mutableFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+
+function withBuiltinFsOverride<T>(
+  name: string,
+  replacement: unknown,
+  operation: () => T,
+): T {
+  const original = mutableFs[name];
+  mutableFs[name] = replacement;
+  syncBuiltinESMExports();
+  try {
+    return operation();
+  } finally {
+    mutableFs[name] = original;
+    syncBuiltinESMExports();
+  }
+}
 
 function resetLcmHome(): void {
   rmSync(join(homedir(), ".lcm"), { recursive: true, force: true });
@@ -68,6 +110,84 @@ function seedConversations(dbPath: string, ids: readonly number[] = [1, 2]): voi
   } finally {
     closeLcmConnection(dbPath);
   }
+}
+
+function fileSha256(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function sqliteJournalMode(dbPath: string): string {
+  const db = new DatabaseSync(dbPath);
+  try {
+    const row = db.prepare("PRAGMA journal_mode").get() as { journal_mode: unknown };
+    if (typeof row.journal_mode !== "string") throw new Error("missing SQLite journal mode");
+    return row.journal_mode;
+  } finally {
+    db.close();
+  }
+}
+
+function sqliteSidecars(dbPath: string): Array<{ name: string; bytes: Buffer }> {
+  const parent = dirname(dbPath);
+  const leaf = basename(dbPath);
+  return readdirSync(parent)
+    .filter(name => name === `${leaf}-wal` || name === `${leaf}-shm` || name === `${leaf}-journal`)
+    .sort()
+    .map(name => ({ name, bytes: readFileSync(join(parent, name)) }));
+}
+
+function sqliteSourceFiles(dbPath: string): Array<{ name: string; mode: number; sha256: string }> {
+  const parent = dirname(dbPath);
+  const leaf = basename(dbPath);
+  return readdirSync(parent)
+    .filter(name => name === leaf || name === `${leaf}-wal` || name === `${leaf}-shm` || name === `${leaf}-journal`)
+    .sort()
+    .map(name => ({
+      name,
+      mode: statSync(join(parent, name)).mode & 0o777,
+      sha256: fileSha256(join(parent, name)),
+    }));
+}
+
+function previewSnapshotDirectories(root: string): string[] {
+  return readdirSync(root).filter(name => name.startsWith("lcm-sqlite-preview-")).sort();
+}
+
+function openCommittedWalFixture(dbPath: string, projectId = "wal-project"): DatabaseSync {
+  seedConversation(dbPath);
+  const writer = new DatabaseSync(dbPath);
+  writer.exec("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0");
+  writer.exec(`BEGIN IMMEDIATE;
+    CREATE TABLE wal_preview_probe(value TEXT NOT NULL);
+    INSERT INTO wal_preview_probe(value) VALUES ('wal-only');
+    INSERT INTO conversations (conversation_id, session_id) VALUES (2, 'wal-session');
+    COMMIT;`);
+  insertMessages(writer, 2);
+  writer.prepare("INSERT INTO runtime_native_transcripts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+    "wal-native-transcript",
+    projectId,
+    "local",
+    "codex",
+    "jsonl",
+    "1",
+    "wal-session",
+    "sessions/wal-only.jsonl",
+    1,
+    "2026-09-16 00:00:00",
+    "2026-09-16 00:00:01",
+    "1",
+    "d".repeat(64),
+    "e".repeat(64),
+    '{"message":"scrubbed"}',
+  );
+  return writer;
+}
+
+function copyCrashWalFixture(sourcePath: string, destinationPath: string): void {
+  copyFileSync(sourcePath, destinationPath);
+  copyFileSync(`${sourcePath}-wal`, `${destinationPath}-wal`);
+  chmodSync(destinationPath, 0o600);
+  chmodSync(`${destinationPath}-wal`, 0o600);
 }
 
 function sizedProjectMetadata(cwd: string, targetBytes: number): string {
@@ -127,6 +247,128 @@ describe("batch compaction discovery", () => {
     }
   });
 
+  it.each([true, false])(
+    "classifies an exact retired project fence before %s discovery child lookup",
+    async (dryRun) => {
+      const cwd = makeDir(`compact-retired-fence-${dryRun ? "dry" : "normal"}`);
+      const paths = projectPaths(cwd);
+      ensureProjectDir(cwd);
+      rmSync(paths.dir, { recursive: true });
+      writeFileSync(
+        paths.dir,
+        serializeWorktreeReconciliationFence(paths.id, "project"),
+        { mode: 0o600 },
+      );
+      const events: CompactProgressEvent[] = [];
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+      expect(await batchCompact({
+        minTokens: 100,
+        dryRun,
+        port: 3737,
+        cwd,
+        onEvent: event => events.push(event),
+      })).toMatchObject({ failures: 1 });
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: "discovery-item-start",
+          index: 1,
+          total: 1,
+          project: paths.canonical,
+        }),
+        expect.objectContaining({
+          type: "phase-failure",
+          phase: "Compact",
+          project: paths.canonical,
+          message: RETIRED_PROJECT_IDENTITY_DIAGNOSTIC,
+        }),
+        { type: "discovery-clear" },
+      ]));
+    },
+  );
+
+  it("stops enumerating the retired identity after supported renewal", async () => {
+    const cwd = makeDir("compact-retired-renewed");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    rmSync(paths.dir, { recursive: true });
+    writeFileSync(
+      paths.dir,
+      serializeWorktreeReconciliationFence(paths.id, "project"),
+      { mode: 0o600 },
+    );
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737, cwd }))
+      .toMatchObject({ failures: 1 });
+
+    const renewed = renewRetiredProjectIdentity(cwd);
+    const events: CompactProgressEvent[] = [];
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: true,
+      port: 3737,
+      cwd,
+      onEvent: event => events.push(event),
+    })).toEqual({ compacted: 0, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [] });
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "discovery-item-start",
+      projectId: renewed.newId,
+    }));
+    expect(events).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ projectId: renewed.oldId }),
+    ]));
+  });
+
+  it("carries one unambiguous native source locator through dry-run progress", async () => {
+    const cwd = makeDir("compact-native-source-locator");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const db = new DatabaseSync(paths.dbPath);
+    try {
+      db.prepare("INSERT INTO runtime_native_transcripts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+        "native-transcript",
+        paths.id,
+        "local",
+        "codex",
+        "jsonl",
+        "1",
+        "session-1",
+        "sessions/native-session.jsonl",
+        1,
+        "2026-09-16 00:00:00",
+        "2026-09-16 00:00:01",
+        "1",
+        "b".repeat(64),
+        "c".repeat(64),
+        '{"message":"scrubbed"}',
+      );
+    } finally {
+      db.close();
+    }
+    const events: CompactProgressEvent[] = [];
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await batchCompact({
+      minTokens: 100,
+      dryRun: true,
+      port: 3737,
+      cwd,
+      onEvent: event => events.push(event),
+    });
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "session-terminal",
+      outcome: "dry-run",
+      identity: expect.objectContaining({
+        project: paths.canonical,
+        sessionId: "session-1",
+        conversationId: 1,
+        sourceLocator: "sessions/native-session.jsonl",
+      }),
+    }));
+  });
+
   it("leaves unmigrated SQLite schema and user version unchanged during preview", async () => {
     const cwd = makeDir("compact-unmigrated-preview");
     const paths = projectPaths(cwd);
@@ -145,6 +387,1033 @@ describe("batch compaction discovery", () => {
       expect(reopened.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").all()).toEqual(schema);
     } finally { reopened.close(); }
     expect(getPoolStats().totalConnections).toBe(0);
+  });
+
+  it("leaves SQLite bytes, mode, journal mode, and sidecars unchanged during preview", async () => {
+    const cwd = makeDir("compact-read-only-preview");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const journalMode = sqliteJournalMode(paths.dbPath);
+    chmodSync(paths.dbPath, 0o640);
+    writeFileSync(`${paths.dbPath}-journal`, "preexisting-sidecar", { mode: 0o640 });
+    const before = {
+      digest: fileSha256(paths.dbPath),
+      mode: statSync(paths.dbPath).mode & 0o777,
+      sidecars: sqliteSidecars(paths.dbPath),
+    };
+
+    expect(await findUncompacted(100, true, cwd)).toEqual([
+      expect.objectContaining({ sessionId: "session-1", messages: 9, tokens: 250 }),
+    ]);
+
+    expect(fileSha256(paths.dbPath)).toBe(before.digest);
+    expect(statSync(paths.dbPath).mode & 0o777).toBe(before.mode);
+    expect(sqliteSidecars(paths.dbPath)).toEqual(before.sidecars);
+    expect(getPoolStats().totalConnections).toBe(0);
+
+    rmSync(`${paths.dbPath}-journal`);
+    expect(sqliteJournalMode(paths.dbPath)).toBe(journalMode);
+  });
+
+  it("opens an existing main-only preview through a private disposable snapshot", () => {
+    const cwd = makeDir("compact-read-only-media");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    chmodSync(paths.dbPath, 0o440);
+    const snapshotRoot = makeDir("compact-read-only-media-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const beforeDigest = fileSha256(paths.dbPath);
+    const beforeSidecars = sqliteSidecars(paths.dbPath);
+    const snapshot = captureExistingLcmSnapshot(paths.dbPath, {
+      _snapshotForTesting: { tempRoot: snapshotRoot },
+    });
+    expect(snapshot).not.toBeNull();
+    if (snapshot === null) throw new Error("preview snapshot was not opened");
+    try {
+      expect(snapshot.db.prepare("SELECT session_id FROM conversations WHERE conversation_id = 1").get())
+        .toMatchObject({ session_id: "session-1" });
+      snapshot.db.exec("UPDATE conversations SET title = 'copy-only' WHERE conversation_id = 1");
+      expect(snapshot.db.prepare("SELECT title FROM conversations WHERE conversation_id = 1").get())
+        .toMatchObject({ title: "copy-only" });
+    } finally {
+      snapshot.close();
+    }
+    snapshot.close();
+
+    expect(statSync(paths.dbPath).mode & 0o777).toBe(0o440);
+    expect(fileSha256(paths.dbPath)).toBe(beforeDigest);
+    expect(sqliteSidecars(paths.dbPath)).toEqual(beforeSidecars);
+    expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+  });
+
+  it("captures committed live WAL-only rows, schema, and provenance without changing the source", async () => {
+    const cwd = makeDir("compact-live-wal-preview");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    const snapshotRoot = makeDir("compact-live-wal-preview-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const writer = openCommittedWalFixture(paths.dbPath, paths.id);
+    const before = sqliteSourceFiles(paths.dbPath);
+    try {
+      const snapshot = captureExistingLcmSnapshot(paths.dbPath, {
+        _snapshotForTesting: { tempRoot: snapshotRoot },
+      });
+      expect(snapshot).not.toBeNull();
+      if (snapshot === null) throw new Error("live WAL snapshot was not opened");
+      try {
+        expect(snapshot.db.prepare("SELECT value FROM wal_preview_probe").get())
+          .toEqual({ value: "wal-only" });
+        expect(snapshot.db.prepare("SELECT session_id FROM conversations WHERE conversation_id = 2").get())
+          .toEqual({ session_id: "wal-session" });
+        snapshot.db.exec("INSERT INTO wal_preview_probe(value) VALUES ('copy-only')");
+        expect(snapshot.db.prepare("SELECT count(*) AS count FROM wal_preview_probe").get())
+          .toEqual({ count: 2 });
+      } finally {
+        snapshot.close();
+      }
+      const events: CompactProgressEvent[] = [];
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await batchCompact({
+        minTokens: 100,
+        dryRun: true,
+        port: 3737,
+        cwd,
+        onEvent: event => events.push(event),
+      });
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "session-terminal",
+        outcome: "dry-run",
+        identity: expect.objectContaining({
+          sessionId: "wal-session",
+          sourceLocator: "sessions/wal-only.jsonl",
+        }),
+      }));
+      expect(sqliteSourceFiles(paths.dbPath)).toEqual(before);
+      expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("rebuilds private shared memory for a retained crash WAL without copying source SHM", () => {
+    const sourceCwd = makeDir("compact-crash-wal-source");
+    const sourcePaths = projectPaths(sourceCwd);
+    ensureProjectDir(sourceCwd);
+    const writer = openCommittedWalFixture(sourcePaths.dbPath);
+    const crashParent = makeDir("compact-crash-wal-retained");
+    chmodSync(crashParent, 0o700);
+    const crashPath = join(crashParent, "db.sqlite");
+    copyCrashWalFixture(sourcePaths.dbPath, crashPath);
+    writer.close();
+    const snapshotRoot = makeDir("compact-crash-wal-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const before = sqliteSourceFiles(crashPath);
+
+    const snapshot = captureExistingLcmSnapshot(crashPath, {
+      _snapshotForTesting: { tempRoot: snapshotRoot },
+    });
+    expect(snapshot).not.toBeNull();
+    if (snapshot === null) throw new Error("crash WAL snapshot was not opened");
+    try {
+      expect(snapshot.db.prepare("SELECT value FROM wal_preview_probe").get())
+        .toEqual({ value: "wal-only" });
+    } finally {
+      snapshot.close();
+    }
+    expect(sqliteSourceFiles(crashPath)).toEqual(before);
+    expect(before.map(file => file.name)).not.toContain("db.sqlite-shm");
+    expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+  });
+
+  it("retries one transient WAL generation drift and returns the new committed generation", () => {
+    const cwd = makeDir("compact-wal-retry");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    const writer = openCommittedWalFixture(paths.dbPath);
+    const snapshotRoot = makeDir("compact-wal-retry-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const attempts: number[] = [];
+    try {
+      const snapshot = captureExistingLcmSnapshot(paths.dbPath, {
+        _snapshotForTesting: {
+          tempRoot: snapshotRoot,
+          afterCopy: ({ attempt }) => {
+            attempts.push(attempt);
+            if (attempt === 1) writer.exec("INSERT INTO wal_preview_probe(value) VALUES ('new-generation')");
+          },
+        },
+      });
+      expect(snapshot).not.toBeNull();
+      if (snapshot === null) throw new Error("retried snapshot was not opened");
+      try {
+        expect(snapshot.db.prepare("SELECT value FROM wal_preview_probe ORDER BY rowid").all())
+          .toEqual([{ value: "wal-only" }, { value: "new-generation" }]);
+      } finally {
+        snapshot.close();
+      }
+      expect(attempts).toEqual([1, 2]);
+      expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("exhausts exactly three attempts under permanent WAL churn and cleans every copy", () => {
+    const cwd = makeDir("compact-wal-exhaustion");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    const writer = openCommittedWalFixture(paths.dbPath);
+    const snapshotRoot = makeDir("compact-wal-exhaustion-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const attempts: number[] = [];
+    try {
+      expect(() => captureExistingLcmSnapshot(paths.dbPath, {
+        _snapshotForTesting: {
+          tempRoot: snapshotRoot,
+          afterCopy: ({ attempt }) => {
+            attempts.push(attempt);
+            writer.exec(`INSERT INTO wal_preview_probe(value) VALUES ('generation-${attempt}')`);
+          },
+        },
+      })).toThrow(SQLITE_PREVIEW_SNAPSHOT_ERROR);
+      expect(attempts).toEqual([1, 2, 3]);
+      expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it.each(["appearance", "disappearance", "checkpoint"] as const)(
+    "retries a WAL %s generation transition without returning a partial source",
+    (transition) => {
+      const cwd = makeDir(`compact-wal-${transition}`);
+      const paths = projectPaths(cwd);
+      ensureProjectDir(cwd);
+      const snapshotRoot = makeDir(`compact-wal-${transition}-snapshots`);
+      chmodSync(snapshotRoot, 0o700);
+      let writer: DatabaseSync | undefined;
+      if (transition !== "appearance") writer = openCommittedWalFixture(paths.dbPath);
+      else seedConversation(paths.dbPath);
+      const attempts: number[] = [];
+      try {
+        const snapshot = captureExistingLcmSnapshot(paths.dbPath, {
+          _snapshotForTesting: {
+            tempRoot: snapshotRoot,
+            afterCopy: ({ attempt }) => {
+              attempts.push(attempt);
+              if (attempt !== 1) return;
+              if (transition === "appearance") {
+                writer = new DatabaseSync(paths.dbPath);
+                writer.exec("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0");
+                writer.exec("CREATE TABLE appeared_in_wal(value TEXT); INSERT INTO appeared_in_wal VALUES ('visible')");
+              } else if (transition === "disappearance") {
+                writer!.close();
+                writer = undefined;
+              } else {
+                writer!.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+              }
+            },
+          },
+        });
+        expect(snapshot).not.toBeNull();
+        if (snapshot === null) throw new Error("transition snapshot was not opened");
+        try {
+          if (transition === "appearance") {
+            expect(snapshot.db.prepare("SELECT value FROM appeared_in_wal").get())
+              .toEqual({ value: "visible" });
+          } else {
+            expect(snapshot.db.prepare("SELECT value FROM wal_preview_probe").get())
+              .toEqual({ value: "wal-only" });
+          }
+        } finally {
+          snapshot.close();
+        }
+        expect(attempts).toEqual([1, 2]);
+        expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+      } finally {
+        writer?.close();
+      }
+    },
+  );
+
+  it.each(["main replacement", "WAL replacement", "WAL truncation", "WAL extension"] as const)(
+    "fails closed on a source %s and removes the private attempt",
+    (mutation) => {
+      const sourceCwd = makeDir(`compact-source-${mutation.replaceAll(" ", "-")}`);
+      const sourcePaths = projectPaths(sourceCwd);
+      ensureProjectDir(sourceCwd);
+      const writer = openCommittedWalFixture(sourcePaths.dbPath);
+      const retainedParent = makeDir(`compact-retained-${mutation.replaceAll(" ", "-")}`);
+      chmodSync(retainedParent, 0o700);
+      const retainedPath = join(retainedParent, "db.sqlite");
+      copyCrashWalFixture(sourcePaths.dbPath, retainedPath);
+      writer.close();
+      const snapshotRoot = makeDir(`compact-source-${mutation.replaceAll(" ", "-")}-snapshots`);
+      chmodSync(snapshotRoot, 0o700);
+      const attempts: number[] = [];
+
+      expect(() => captureExistingLcmSnapshot(retainedPath, {
+        _snapshotForTesting: {
+          tempRoot: snapshotRoot,
+          afterCopy: ({ attempt }) => {
+            attempts.push(attempt);
+            if (mutation === "main replacement") {
+              renameSync(retainedPath, `${retainedPath}.old`);
+              copyFileSync(`${retainedPath}.old`, retainedPath);
+            } else if (mutation === "WAL replacement") {
+              renameSync(`${retainedPath}-wal`, `${retainedPath}-wal.old`);
+              copyFileSync(`${retainedPath}-wal.old`, `${retainedPath}-wal`);
+            } else if (mutation === "WAL truncation") {
+              const walPath = `${retainedPath}-wal`;
+              const currentSize = statSync(walPath).size;
+              if (currentSize <= 1) throw new Error("WAL truncation fixture requires at least two bytes");
+              truncateSync(walPath, currentSize - 1);
+            } else {
+              appendFileSync(`${retainedPath}-wal`, "extended");
+            }
+          },
+        },
+      })).toThrow(SQLITE_PREVIEW_SNAPSHOT_ERROR);
+      expect(attempts).toEqual(
+        mutation === "main replacement" || mutation === "WAL replacement"
+          ? [1]
+          : [1, 2, 3],
+      );
+      expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+    },
+  );
+
+  it("cleans the private snapshot after a preview query failure", () => {
+    const cwd = makeDir("compact-preview-query-failure");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const snapshotRoot = makeDir("compact-preview-query-failure-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const snapshot = captureExistingLcmSnapshot(paths.dbPath, {
+      _snapshotForTesting: { tempRoot: snapshotRoot },
+    });
+    expect(snapshot).not.toBeNull();
+    if (snapshot === null) throw new Error("query-failure snapshot was not opened");
+    try {
+      expect(() => snapshot.db.prepare("SELECT * FROM missing_preview_table").all()).toThrow();
+    } finally {
+      snapshot.close();
+    }
+    expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+  });
+
+  it("preserves existing-only absence semantics for memory and a missing parent", () => {
+    expect(captureExistingLcmSnapshot(":memory:")).toBeNull();
+    expect(captureExistingLcmSnapshot(join(homedir(), "missing-preview-parent", "db.sqlite")))
+      .toBeNull();
+  });
+
+  it("retries membership drift observed immediately after source descriptors open", () => {
+    const cwd = makeDir("compact-preview-membership-open-race");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const snapshotRoot = makeDir("compact-preview-membership-open-race-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const attempts: number[] = [];
+    const snapshot = captureExistingLcmSnapshot(paths.dbPath, {
+      _snapshotForTesting: {
+        tempRoot: snapshotRoot,
+        afterSourceOpen: ({ attempt }) => {
+          attempts.push(attempt);
+          if (attempt === 1) writeFileSync(`${paths.dbPath}-shm`, "appeared", { mode: 0o600 });
+        },
+      },
+    });
+    expect(snapshot).not.toBeNull();
+    if (snapshot === null) throw new Error("membership-race snapshot was not opened");
+    snapshot.close();
+    expect(attempts).toEqual([1, 2]);
+    expect(readFileSync(`${paths.dbPath}-shm`, "utf8")).toBe("appeared");
+    expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+  });
+
+  it.each(["transient", "persistent", "strict"] as const)(
+    "handles %s WAL disappearance between membership and retained open",
+    (scenario) => {
+      const cwd = makeDir(`compact-preview-wal-pre-open-${scenario}`);
+      const paths = projectPaths(cwd);
+      ensureProjectDir(cwd);
+      const writer = openCommittedWalFixture(paths.dbPath);
+      const snapshotRoot = makeDir(`compact-preview-wal-pre-open-${scenario}-snapshots`);
+      chmodSync(snapshotRoot, 0o700);
+      const before = sqliteSourceFiles(paths.dbPath);
+      const attempts: number[] = [];
+      const originalOpen = mutableFs.openSync as (...args: unknown[]) => number;
+      const canary = Object.assign(new Error("injected retained WAL open failure"), {
+        code: scenario === "strict" ? "EACCES" : "ENOENT",
+      });
+      let failures = 0;
+      const replacement = (...args: unknown[]): number => {
+        const path = String(args[0]);
+        const retainedWal = path.startsWith("/proc/self/fd/")
+          && path.endsWith(`/${basename(paths.dbPath)}-wal`);
+        if (retainedWal && (scenario !== "transient" || failures === 0)) {
+          failures += 1;
+          throw canary;
+        }
+        return Reflect.apply(originalOpen, mutableFs, args);
+      };
+
+      try {
+        withBuiltinFsOverride("openSync", replacement, () => {
+          const operation = () => captureExistingLcmSnapshot(paths.dbPath, {
+            _snapshotForTesting: {
+              tempRoot: snapshotRoot,
+              beforeAttempt: ({ attempt }) => attempts.push(attempt),
+            },
+          });
+          if (scenario === "transient") {
+            const snapshot = operation();
+            expect(snapshot).not.toBeNull();
+            if (snapshot === null) throw new Error("transient WAL retry returned no snapshot");
+            try {
+              expect(snapshot.db.prepare("SELECT value FROM wal_preview_probe").get())
+                .toEqual({ value: "wal-only" });
+            } finally {
+              snapshot.close();
+            }
+          } else {
+            let thrown: unknown;
+            try { operation(); } catch (error) { thrown = error; }
+            expect(thrown).toMatchObject({ message: SQLITE_PREVIEW_SNAPSHOT_ERROR });
+            if (scenario === "strict") {
+              expect((thrown as Error & { cause: unknown }).cause).toBe(canary);
+            }
+          }
+        });
+        expect(attempts).toEqual(
+          scenario === "transient" ? [1, 2] : scenario === "persistent" ? [1, 2, 3] : [1],
+        );
+        expect(failures).toBe(scenario === "persistent" ? 3 : 1);
+        expect(sqliteSourceFiles(paths.dbPath)).toEqual(before);
+        expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+        expect(getPoolStats().totalConnections).toBe(0);
+      } finally {
+        writer.close();
+      }
+    },
+  );
+
+  it("refuses a WAL-less retry when pre-open disappearance leaves main unchanged", () => {
+    const sourceCwd = makeDir("compact-preview-wal-pre-open-real-source");
+    const sourcePaths = projectPaths(sourceCwd);
+    ensureProjectDir(sourceCwd);
+    const writer = openCommittedWalFixture(sourcePaths.dbPath);
+    const retainedParent = makeDir("compact-preview-wal-pre-open-real");
+    chmodSync(retainedParent, 0o700);
+    const retainedPath = join(retainedParent, "db.sqlite");
+    copyCrashWalFixture(sourcePaths.dbPath, retainedPath);
+    writer.close();
+    const walPath = `${retainedPath}-wal`;
+    const displacedWal = `${walPath}.displaced`;
+    const beforeMain = fileSha256(retainedPath);
+    const beforeWal = fileSha256(walPath);
+    const snapshotRoot = makeDir("compact-preview-wal-pre-open-real-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const attempts: number[] = [];
+    const originalOpen = mutableFs.openSync as (...args: unknown[]) => number;
+    let injected = false;
+    const replacement = (...args: unknown[]): number => {
+      const path = String(args[0]);
+      if (!injected && path.startsWith("/proc/self/fd/")
+        && path.endsWith(`/${basename(retainedPath)}-wal`)) {
+        injected = true;
+        renameSync(walPath, displacedWal);
+        throw Object.assign(new Error("injected real WAL disappearance"), { code: "ENOENT" });
+      }
+      return Reflect.apply(originalOpen, mutableFs, args);
+    };
+
+    try {
+      withBuiltinFsOverride("openSync", replacement, () => {
+        expect(() => captureExistingLcmSnapshot(retainedPath, {
+          _snapshotForTesting: {
+            tempRoot: snapshotRoot,
+            beforeAttempt: ({ attempt }) => attempts.push(attempt),
+          },
+        })).toThrow(SQLITE_PREVIEW_SNAPSHOT_ERROR);
+      });
+      expect(injected).toBe(true);
+      expect(attempts).toEqual([1, 2]);
+      expect(fileSha256(retainedPath)).toBe(beforeMain);
+      expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+    } finally {
+      if (existsSync(displacedWal)) renameSync(displacedWal, walPath);
+    }
+    expect(fileSha256(walPath)).toBe(beforeWal);
+  });
+
+  it("conservatively refuses a checkpoint at pre-open WAL disappearance", () => {
+    const cwd = makeDir("compact-preview-wal-pre-open-checkpoint");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    let writer: DatabaseSync | undefined = openCommittedWalFixture(paths.dbPath);
+    const snapshotRoot = makeDir("compact-preview-wal-pre-open-checkpoint-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const attempts: number[] = [];
+    const originalOpen = mutableFs.openSync as (...args: unknown[]) => number;
+    let injected = false;
+    const replacement = (...args: unknown[]): number => {
+      const path = String(args[0]);
+      if (!injected && path.startsWith("/proc/self/fd/")
+        && path.endsWith(`/${basename(paths.dbPath)}-wal`)) {
+        injected = true;
+        writer!.close();
+        writer = undefined;
+        throw Object.assign(new Error("injected checkpointed WAL disappearance"), {
+          code: "ENOENT",
+        });
+      }
+      return Reflect.apply(originalOpen, mutableFs, args);
+    };
+
+    try {
+      withBuiltinFsOverride("openSync", replacement, () => {
+        expect(() => captureExistingLcmSnapshot(paths.dbPath, {
+          _snapshotForTesting: {
+            tempRoot: snapshotRoot,
+            beforeAttempt: ({ attempt }) => attempts.push(attempt),
+          },
+        })).toThrow(SQLITE_PREVIEW_SNAPSHOT_ERROR);
+      });
+      expect(injected).toBe(true);
+      expect(attempts).toEqual([1, 2]);
+      expect(existsSync(`${paths.dbPath}-wal`)).toBe(false);
+      expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+    } finally {
+      writer?.close();
+    }
+  });
+
+  it.each(["main", "WAL"] as const)(
+    "refuses a cross-attempt %s inode replacement after generation drift",
+    (role) => {
+      const cwd = makeDir(`compact-preview-cross-attempt-${role.toLowerCase()}`);
+      const paths = projectPaths(cwd);
+      ensureProjectDir(cwd);
+      const writer = openCommittedWalFixture(paths.dbPath);
+      const snapshotRoot = makeDir(`compact-preview-cross-attempt-${role.toLowerCase()}-snapshots`);
+      chmodSync(snapshotRoot, 0o700);
+      const attempts: number[] = [];
+      try {
+        expect(() => captureExistingLcmSnapshot(paths.dbPath, {
+          _snapshotForTesting: {
+            tempRoot: snapshotRoot,
+            beforeAttempt: ({ attempt }) => {
+              attempts.push(attempt);
+              if (attempt !== 2) return;
+              const path = role === "main" ? paths.dbPath : `${paths.dbPath}-wal`;
+              renameSync(path, `${path}.old`);
+              copyFileSync(`${path}.old`, path);
+            },
+            afterCopy: ({ attempt }) => {
+              if (attempt === 1) writer.exec("INSERT INTO wal_preview_probe(value) VALUES ('drift')");
+            },
+          },
+        })).toThrow(SQLITE_PREVIEW_SNAPSHOT_ERROR);
+        expect(attempts).toEqual([1, 2]);
+        expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+      } finally {
+        writer.close();
+      }
+    },
+  );
+
+  it("refuses a rollback-mode database with a journal and removes the private attempt", () => {
+    const parent = makeDir("compact-rollback-journal");
+    chmodSync(parent, 0o700);
+    const dbPath = join(parent, "db.sqlite");
+    const db = new DatabaseSync(dbPath);
+    db.exec("CREATE TABLE rollback_probe(value TEXT)");
+    db.close();
+    writeFileSync(`${dbPath}-journal`, "potentially-hot", { mode: 0o600 });
+    const snapshotRoot = makeDir("compact-rollback-journal-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const before = sqliteSourceFiles(dbPath);
+
+    expect(() => captureExistingLcmSnapshot(dbPath, {
+      _snapshotForTesting: { tempRoot: snapshotRoot },
+    })).toThrow(SQLITE_PREVIEW_SNAPSHOT_ERROR);
+    expect(sqliteSourceFiles(dbPath)).toEqual(before);
+    expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+  });
+
+  it("refuses WAL disappearance without a changed main generation", () => {
+    const sourceCwd = makeDir("compact-stale-wal-disappearance-source");
+    const sourcePaths = projectPaths(sourceCwd);
+    ensureProjectDir(sourceCwd);
+    const writer = openCommittedWalFixture(sourcePaths.dbPath);
+    const retainedParent = makeDir("compact-stale-wal-disappearance");
+    chmodSync(retainedParent, 0o700);
+    const retainedPath = join(retainedParent, "db.sqlite");
+    copyCrashWalFixture(sourcePaths.dbPath, retainedPath);
+    writer.close();
+    const snapshotRoot = makeDir("compact-stale-wal-disappearance-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const attempts: number[] = [];
+
+    expect(() => captureExistingLcmSnapshot(retainedPath, {
+      _snapshotForTesting: {
+        tempRoot: snapshotRoot,
+        afterCopy: ({ attempt, walPath }) => {
+          attempts.push(attempt);
+          if (attempt === 1) rmSync(walPath);
+        },
+      },
+    })).toThrow(SQLITE_PREVIEW_SNAPSHOT_ERROR);
+    expect(attempts).toEqual([1]);
+    expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+  });
+
+  it("cleans the private attempt when opening the copied database fails", () => {
+    const cwd = makeDir("compact-preview-open-failure");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const snapshotRoot = makeDir("compact-preview-open-failure-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const canary = new Error("injected private preview open failure");
+
+    expect(() => captureExistingLcmSnapshot(paths.dbPath, {
+      _snapshotForTesting: {
+        tempRoot: snapshotRoot,
+        openDatabase: () => { throw canary; },
+      },
+    })).toThrow(SQLITE_PREVIEW_SNAPSHOT_ERROR);
+    expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+  });
+
+  it("retains a close failure after closing SQLite and cleaning the private attempt", () => {
+    const cwd = makeDir("compact-preview-close-failure");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const snapshotRoot = makeDir("compact-preview-close-failure-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const canary = new Error("injected private preview close failure");
+    const snapshot = captureExistingLcmSnapshot(paths.dbPath, {
+      _snapshotForTesting: {
+        tempRoot: snapshotRoot,
+        closeDatabase: (database) => {
+          database.close();
+          throw canary;
+        },
+      },
+    });
+    expect(snapshot).not.toBeNull();
+    if (snapshot === null) throw new Error("close-failure snapshot was not opened");
+
+    expect(() => snapshot.close()).toThrow(canary);
+    expect(snapshot.db.isOpen).toBe(false);
+    expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+  });
+
+  it("reports both close and authenticated cleanup failure without deleting an unexpected entry", () => {
+    const cwd = makeDir("compact-preview-combined-cleanup-failure");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const snapshotRoot = makeDir("compact-preview-combined-cleanup-failure-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    let snapshotPath = "";
+    const snapshot = captureExistingLcmSnapshot(paths.dbPath, {
+      _snapshotForTesting: {
+        tempRoot: snapshotRoot,
+        afterCopy: (input) => { snapshotPath = input.snapshotPath; },
+        closeDatabase: (database) => {
+          database.close();
+          throw new Error("injected close failure");
+        },
+      },
+    });
+    expect(snapshot).not.toBeNull();
+    if (snapshot === null) throw new Error("combined-failure snapshot was not opened");
+    const unexpected = join(dirname(snapshotPath), "unexpected-directory");
+    mkdirSync(unexpected, { mode: 0o700 });
+
+    try {
+      expect(() => snapshot.close()).toThrow(AggregateError);
+      expect(existsSync(unexpected)).toBe(true);
+    } finally {
+      rmSync(dirname(snapshotPath), { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    "copy short read",
+    "copy extra byte",
+    "revalidation short read",
+    "revalidation extra byte",
+    "copy zero write",
+  ] as const)("fails closed and cleans after an injected %s", (fault) => {
+    const cwd = makeDir(`compact-preview-${fault.replaceAll(" ", "-")}`);
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const snapshotRoot = makeDir(`compact-preview-${fault.replaceAll(" ", "-")}-snapshots`);
+    chmodSync(snapshotRoot, 0o700);
+    let afterCopy = false;
+    let injected = false;
+    let sawBulkRead = false;
+    const originalRead = mutableFs.readSync as (...args: unknown[]) => number;
+    const originalWrite = mutableFs.writeSync as (...args: unknown[]) => number;
+    const readReplacement = (...args: unknown[]): number => {
+      const length = Number(args[3]);
+      if (length > 20) sawBulkRead = true;
+      const copyPhase = !afterCopy;
+      const targetPhase = fault.startsWith("copy") ? copyPhase : afterCopy;
+      if (targetPhase && fault.endsWith("short read") && length > 20) {
+        injected = true;
+        return 0;
+      }
+      if (targetPhase && fault.endsWith("extra byte") && sawBulkRead && length === 1) {
+        injected = true;
+        return 1;
+      }
+      return Reflect.apply(originalRead, mutableFs, args);
+    };
+    const writeReplacement = (...args: unknown[]): number => {
+      if (!injected) {
+        injected = true;
+        return 0;
+      }
+      return Reflect.apply(originalWrite, mutableFs, args);
+    };
+    expect(() => captureExistingLcmSnapshot(paths.dbPath, {
+      _snapshotForTesting: {
+        tempRoot: snapshotRoot,
+        ...(fault === "copy zero write"
+          ? { write: writeReplacement as never }
+          : { read: readReplacement as never }),
+        afterCopy: () => { afterCopy = true; },
+      },
+    })).toThrow(SQLITE_PREVIEW_SNAPSHOT_ERROR);
+    expect(injected).toBe(true);
+    expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+  });
+
+  it.each([
+    "source path identity",
+    "copied leaf identity",
+    "source path read error",
+  ] as const)("fails closed and cleans after an injected %s failure", (fault) => {
+    const cwd = makeDir(`compact-preview-${fault.replaceAll(" ", "-")}`);
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const snapshotRoot = makeDir(`compact-preview-${fault.replaceAll(" ", "-")}-snapshots`);
+    chmodSync(snapshotRoot, 0o700);
+    const originalLstat = mutableFs.lstatSync as (...args: unknown[]) => ReturnType<typeof statSync>;
+    let afterCopy = false;
+    let injected = false;
+    const replacement = (...args: unknown[]): ReturnType<typeof statSync> => {
+      const path = String(args[0]);
+      if (!injected && fault === "source path identity" && path === paths.dbPath) {
+        injected = true;
+        const stat = Reflect.apply(originalLstat, mutableFs, args);
+        return new Proxy(stat, { get: (target, property, receiver) =>
+          property === "ino" ? BigInt(target.ino) + 1n : Reflect.get(target, property, receiver) });
+      }
+      if (!injected && fault === "copied leaf identity"
+        && path.startsWith("/proc/self/fd/") && path.endsWith("/main.sqlite")) {
+        injected = true;
+        const stat = Reflect.apply(originalLstat, mutableFs, args);
+        return new Proxy(stat, { get: (target, property, receiver) =>
+          property === "isFile" ? () => false : Reflect.get(target, property, receiver) });
+      }
+      if (!injected && afterCopy && fault === "source path read error" && path === paths.dbPath) {
+        injected = true;
+        throw Object.assign(new Error("injected lstat failure"), { code: "EACCES" });
+      }
+      return Reflect.apply(originalLstat, mutableFs, args);
+    };
+
+    withBuiltinFsOverride("lstatSync", replacement, () => {
+      expect(() => captureExistingLcmSnapshot(paths.dbPath, {
+        _snapshotForTesting: {
+          tempRoot: snapshotRoot,
+          afterCopy: () => { afterCopy = true; },
+        },
+      })).toThrow(SQLITE_PREVIEW_SNAPSHOT_ERROR);
+    });
+    expect(injected).toBe(true);
+    expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+  });
+
+  it("removes a newly-created temp directory when private admission fails", () => {
+    const cwd = makeDir("compact-preview-temp-admission-failure");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const snapshotRoot = makeDir("compact-preview-temp-admission-failure-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const originalOpen = mutableFs.openSync as (...args: unknown[]) => number;
+    let injected = false;
+    const replacement = (...args: unknown[]): number => {
+      if (!injected && String(args[0]).includes("lcm-sqlite-preview-")) {
+        injected = true;
+        throw Object.assign(new Error("injected temp admission failure"), { code: "EACCES" });
+      }
+      return Reflect.apply(originalOpen, mutableFs, args);
+    };
+
+    withBuiltinFsOverride("openSync", replacement, () => {
+      expect(() => captureExistingLcmSnapshot(paths.dbPath, {
+        _snapshotForTesting: { tempRoot: snapshotRoot },
+      })).toThrow(SQLITE_PREVIEW_SNAPSHOT_ERROR);
+    });
+    expect(injected).toBe(true);
+    expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+  });
+
+  it("removes a newly-created temp directory when permission tightening fails", () => {
+    const cwd = makeDir("compact-preview-temp-chmod-failure");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const snapshotRoot = makeDir("compact-preview-temp-chmod-failure-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const originalChmod = mutableFs.chmodSync as (...args: unknown[]) => void;
+    const primary = new Error("injected preview chmod failure");
+    let injected = false;
+    const replacement = (...args: unknown[]): void => {
+      if (!injected && String(args[0]).includes("lcm-sqlite-preview-")) {
+        injected = true;
+        throw primary;
+      }
+      Reflect.apply(originalChmod, mutableFs, args);
+    };
+
+    withBuiltinFsOverride("chmodSync", replacement, () => {
+      expect(() => captureExistingLcmSnapshot(paths.dbPath, {
+        _snapshotForTesting: { tempRoot: snapshotRoot },
+      })).toThrow(SQLITE_PREVIEW_SNAPSHOT_ERROR);
+    });
+    expect(injected).toBe(true);
+    expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+  });
+
+  it("preserves chmod and removal failures when private temp initialization cannot be cleaned", () => {
+    const cwd = makeDir("compact-preview-temp-chmod-cleanup-failure");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const snapshotRoot = makeDir("compact-preview-temp-chmod-cleanup-failure-snapshots");
+    chmodSync(snapshotRoot, 0o700);
+    const originalChmod = mutableFs.chmodSync as (...args: unknown[]) => void;
+    const originalRmdir = mutableFs.rmdirSync as (...args: unknown[]) => void;
+    const primary = new Error("injected preview chmod failure");
+    const cleanup = new Error("injected preview removal failure");
+    let chmodInjected = false;
+    let cleanupInjected = false;
+    const chmodReplacement = (...args: unknown[]): void => {
+      if (!chmodInjected && String(args[0]).includes("lcm-sqlite-preview-")) {
+        chmodInjected = true;
+        throw primary;
+      }
+      Reflect.apply(originalChmod, mutableFs, args);
+    };
+    const rmdirReplacement = (...args: unknown[]): void => {
+      if (!cleanupInjected && String(args[0]).includes("lcm-sqlite-preview-")) {
+        cleanupInjected = true;
+        throw cleanup;
+      }
+      Reflect.apply(originalRmdir, mutableFs, args);
+    };
+    let thrown: unknown;
+
+    try {
+      withBuiltinFsOverride("chmodSync", chmodReplacement, () =>
+        withBuiltinFsOverride("rmdirSync", rmdirReplacement, () => {
+          try {
+            captureExistingLcmSnapshot(paths.dbPath, {
+              _snapshotForTesting: { tempRoot: snapshotRoot },
+            });
+          } catch (error) {
+            thrown = error;
+          }
+        }));
+      expect(thrown).toMatchObject({
+        message: SQLITE_PREVIEW_SNAPSHOT_ERROR,
+        cause: expect.any(AggregateError),
+      });
+      expect((thrown as Error & { cause: AggregateError }).cause.errors).toEqual([primary, cleanup]);
+      expect(chmodInjected).toBe(true);
+      expect(cleanupInjected).toBe(true);
+      expect(previewSnapshotDirectories(snapshotRoot)).toHaveLength(1);
+    } finally {
+      for (const leaf of previewSnapshotDirectories(snapshotRoot)) {
+        rmSync(join(snapshotRoot, leaf), { recursive: true, force: true });
+      }
+    }
+  });
+
+  it.each(["source", "parent"] as const)(
+    "cleans the private copy when retained %s descriptor close reports failure",
+    (role) => {
+      const cwd = makeDir(`compact-preview-${role}-close-failure`);
+      const paths = projectPaths(cwd);
+      ensureProjectDir(cwd);
+      seedConversation(paths.dbPath);
+      const snapshotRoot = makeDir(`compact-preview-${role}-close-failure-snapshots`);
+      chmodSync(snapshotRoot, 0o700);
+      const target = statSync(role === "source" ? paths.dbPath : dirname(paths.dbPath), { bigint: true });
+      const originalClose = mutableFs.closeSync as (...args: unknown[]) => void;
+      const actualFs = createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
+      let armed = false;
+      let injected = false;
+      const replacement = (...args: unknown[]): void => {
+        const fd = Number(args[0]);
+        if (!injected && armed) {
+          const stat = actualFs.fstatSync(fd, { bigint: true });
+          if (stat.dev === target.dev && stat.ino === target.ino) {
+            injected = true;
+            Reflect.apply(originalClose, mutableFs, args);
+            throw new Error(`injected ${role} close failure`);
+          }
+        }
+        Reflect.apply(originalClose, mutableFs, args);
+      };
+
+      withBuiltinFsOverride("closeSync", replacement, () => {
+        expect(() => captureExistingLcmSnapshot(paths.dbPath, {
+          _snapshotForTesting: {
+            tempRoot: snapshotRoot,
+            afterCopy: () => { armed = true; },
+          },
+        })).toThrow(SQLITE_PREVIEW_SNAPSHOT_ERROR);
+      });
+      expect(injected).toBe(true);
+      expect(previewSnapshotDirectories(snapshotRoot)).toEqual([]);
+    },
+  );
+
+  it("attaches a native transcript source locator during direct non-preview discovery", async () => {
+    const cwd = makeDir("compact-native-source-locator");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const db = new DatabaseSync(paths.dbPath);
+    const nativePayload = '{"message":"scrubbed"}';
+    const contentSha256 = createHash("sha256").update(nativePayload).digest("hex");
+    db.prepare(
+      "INSERT INTO runtime_native_transcripts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    ).run(
+      "native-source-locator-transcript",
+      paths.id,
+      "local",
+      "codex",
+      "jsonl",
+      "1",
+      "session-1",
+      "sessions/native-source.jsonl",
+      1,
+      "2026-09-16 00:00:00",
+      "2026-09-16 00:00:01",
+      "1",
+      contentSha256,
+      "1".repeat(64),
+      nativePayload,
+    );
+    db.close();
+
+    expect(await findUncompacted(100, false, cwd)).toEqual([
+      expect.objectContaining({ sessionId: "session-1", sourceLocator: "sessions/native-source.jsonl" }),
+    ]);
+  });
+
+  it("omits the source locator during preview discovery when the transcript query fails", async () => {
+    const cwd = makeDir("compact-native-source-locator-query-failure");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const db = new DatabaseSync(paths.dbPath);
+    db.exec("DROP TABLE runtime_native_transcripts");
+    db.close();
+
+    expect(await findUncompacted(100, true, cwd)).toEqual([
+      expect.objectContaining({ sessionId: "session-1" }),
+    ]);
+    const [candidate] = await findUncompacted(100, true, cwd);
+    expect(candidate).not.toHaveProperty("sourceLocator");
+  });
+
+  it("omits the source locator during direct discovery when storage exposes no native transcripts", async () => {
+    const cwd = makeDir("compact-storage-without-native-transcripts");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+
+    const realWithCliProjectStorage = cliStorage.withCliProjectStorage;
+    vi.spyOn(cliStorage, "withCliProjectStorage").mockImplementationOnce((targetCwd, options, callback) =>
+      realWithCliProjectStorage(targetCwd, options, context =>
+        callback({ ...context, storage: { ...context.storage, nativeTranscripts: undefined } })));
+
+    const [candidate] = await findUncompacted(100, false, cwd);
+    expect(candidate).toMatchObject({ sessionId: "session-1", messages: 9, tokens: 250 });
+    expect(candidate).not.toHaveProperty("sourceLocator");
+  });
+
+  it("carries a native transcript source locator through active-session and failure progress payloads", async () => {
+    const cwd = makeDir("compact-source-locator-failure-progress");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const db = new DatabaseSync(paths.dbPath);
+    const nativePayload = '{"message":"scrubbed"}';
+    const contentSha256 = createHash("sha256").update(nativePayload).digest("hex");
+    db.prepare(
+      "INSERT INTO runtime_native_transcripts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    ).run(
+      "native-source-locator-failure-transcript",
+      paths.id,
+      "local",
+      "codex",
+      "jsonl",
+      "1",
+      "session-1",
+      "sessions/native-source-failure.jsonl",
+      1,
+      "2026-09-16 00:00:00",
+      "2026-09-16 00:00:01",
+      "1",
+      contentSha256,
+      "3".repeat(64),
+      nativePayload,
+    );
+    db.close();
+
+    vi.spyOn(DaemonClient.prototype, "post").mockRejectedValue(new Error("compact failed"));
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const progress: Array<Partial<ProgressState>> = [];
+    const events: CompactProgressEvent[] = [];
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      onProgress: patch => progress.push(patch),
+      onEvent: event => events.push(event),
+    })).toMatchObject({ failures: 1 });
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "session-start",
+      identity: expect.objectContaining({ sourceLocator: "sessions/native-source-failure.jsonl" }),
+    }));
+    const failurePatch = progress.find(patch => Array.isArray(patch.errors) && patch.errors.length > 0);
+    expect(failurePatch?.errors).toContainEqual(expect.objectContaining({
+      sessionId: "session-1",
+      sourceLocator: "sessions/native-source-failure.jsonl",
+    }));
   });
 
   it("counts paginated messages and keeps descending token priority", async () => {
@@ -188,7 +1457,7 @@ describe("batch compaction discovery", () => {
       onProgress: patch => progress.push(patch),
     })).toMatchObject({ failures: 1 });
     expect(stdout).not.toHaveBeenCalled();
-    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("compaction request failed"));
+    expect(stderr.mock.calls.flat().join(" ")).not.toContain(cwd);
     expect(JSON.stringify([stderr.mock.calls, progress])).not.toContain(canary);
   });
 
@@ -214,7 +1483,7 @@ describe("batch compaction discovery", () => {
     ]);
     const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
     expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737 })).toMatchObject({ failures: 2 });
-    expect(output).toHaveBeenCalledWith(expect.stringContaining("project storage discovery failed"));
+    expect(output.mock.calls.flat().join(" ")).not.toContain(cwd);
     expect(getPoolStats().totalConnections).toBe(0);
   });
 
@@ -251,7 +1520,7 @@ describe("batch compaction discovery", () => {
     expect(conversations).toHaveLength(1);
     expect(conversations[0].cwd).toBe(paths.canonical);
     expect(conversations[0].sessionId).toBe("session-1");
-    expect(execSpy.mock.calls.filter(([sql]) => sql === "PRAGMA busy_timeout = 5000")).toHaveLength(1);
+    expect(execSpy).not.toHaveBeenCalled();
     expect(getPoolStats().totalConnections).toBe(0);
 
     const victim = makeDir("compact-alias-victim");
@@ -313,7 +1582,8 @@ describe("batch compaction discovery", () => {
     const legacyLink = join(homedir(), "compact-legacy-link");
     symlinkSync(canonical, legacyLink, "dir");
     const projectDir = join(homedir(), ".lcm", "projects", "a".repeat(64));
-    mkdirSync(projectDir, { recursive: true });
+    mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+    chmodSync(projectDir, 0o700);
     writeFileSync(join(projectDir, "meta.json"), JSON.stringify({ cwd: legacyLink }));
     seedConversation(join(projectDir, "db.sqlite"));
 
@@ -345,6 +1615,68 @@ describe("batch compaction discovery", () => {
     expect(post).toHaveBeenCalledTimes(2);
     expect(progress.find(patch => patch.errors)).toMatchObject({ completed: 0, current: undefined });
     expect(progress.at(-1)).toMatchObject({ completed: 1, current: undefined });
+  });
+
+  it("keeps two failed compact items single-owned across event and progress updates", async () => {
+    const cwd = makeDir("compact-error-snapshot-ownership");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversations(paths.dbPath);
+    vi.spyOn(DaemonClient.prototype, "post")
+      .mockRejectedValueOnce(new Error("first failure"))
+      .mockResolvedValueOnce({});
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const state = makeProgressState({
+      phases: [{ name: "Compact", status: "active" }],
+      total: 2,
+    });
+    const output: string[] = [];
+    const errorSnapshots: string[][] = [];
+    const renderer = new NinjaRenderer({
+      state,
+      renderOpts: { isTTY: false, width: 120, color: false, verbose: true },
+      output: {
+        columns: 120,
+        write: (chunk: string | Uint8Array) => {
+          output.push(String(chunk));
+          return true;
+        },
+      },
+      handleSignals: false,
+    });
+
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      maxConcurrency: 1,
+      onEvent: event => renderer.handleEvent(event),
+      onProgress: patch => {
+        if (patch.errors !== undefined) {
+          errorSnapshots.push(patch.errors.map(error => error.sessionId));
+        }
+        Object.assign(state, patch);
+      },
+    });
+
+    expect(result.failures).toBe(2);
+    expect(state.errors).toEqual([
+      expect.objectContaining({ sessionId: "session-1", message: "compaction request failed" }),
+      expect.objectContaining({ sessionId: "session-2", message: "malformed compact response" }),
+    ]);
+    expect(errorSnapshots).toEqual([
+      ["session-1"],
+      ["session-1", "session-2"],
+    ]);
+    output.length = 0;
+    renderer.printSummary();
+    const summary = output.join("");
+    expect(summary.match(/session-1/gu)).toHaveLength(1);
+    expect(summary.match(/session-2/gu)).toHaveLength(1);
+    expect(summary).toMatch(/Failed\s+2/u);
+    expect(summary).toMatch(/Failure total\s+2/u);
   });
 
   it("retains SQLite scan failures while compacting readable projects", async () => {
@@ -391,7 +1723,7 @@ describe("batch compaction discovery", () => {
       }],
     });
     expect(progress.at(-1)).toMatchObject({ completed: 1 });
-    expect(error).toHaveBeenCalledWith(expect.stringContaining(`compact scan failed for ${corruptCwd}`));
+    expect(error.mock.calls.flat().join(" ")).not.toContain(corruptCwd);
     expect(log).not.toHaveBeenCalledWith("Nothing to compact — no sessions are currently eligible.");
   });
 
@@ -618,9 +1950,7 @@ describe("batch compaction discovery", () => {
       const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
       Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
       try {
-        expect(await findUncompacted(100, true)).toEqual([
-          expect.objectContaining({ cwd: paths.canonical }),
-        ]);
+        expect(await findUncompacted(100, true)).toEqual([]);
       } finally {
         if (descriptor) Object.defineProperty(process, "getuid", descriptor);
         else delete (process as { getuid?: unknown }).getuid;
@@ -713,8 +2043,8 @@ describe("batch compaction discovery", () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining(
       "2 sessions compacted, 0.6k → 0.3k tokens (49% reduction, 0.3k freed)",
     ));
-    expect(log).toHaveBeenCalledWith(`${firstLabel} done  (0.3k → 0.3k tokens, 0% reduction)`);
-    expect(log).toHaveBeenCalledWith(`${secondLabel} done  (0.3k → 0.0k tokens, 90% reduction)`);
+    expect(log.mock.calls.flat().join(" ")).not.toContain(firstLabel);
+    expect(log.mock.calls.flat().join(" ")).not.toContain(secondLabel);
     expect(post).toHaveBeenNthCalledWith(1, "/compact", expect.objectContaining({
       fast_mode: false,
       request_timeout_ms: 120_000,
@@ -819,10 +2149,15 @@ describe("batch compaction discovery", () => {
 
     expect(result.failures).toBe(1);
     expect(stdout).not.toHaveBeenCalled();
-    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("FAILED (compaction request failed)"));
+    expect(stderr.mock.calls.flat().join(" ")).not.toContain(cwd);
     expect(JSON.stringify([stderr.mock.calls, progress])).not.toContain(safeMessage);
     expect(progress.find(patch => patch.errors)?.errors).toEqual([
-      { sessionId: "session-1", message: "compaction request failed" },
+      expect.objectContaining({
+        project: paths.canonical,
+        sessionId: "session-1",
+        conversationId: 1,
+        message: "compaction request failed",
+      }),
     ]);
   });
 
@@ -853,7 +2188,7 @@ describe("batch compaction discovery", () => {
     });
 
     expect(result).toEqual({ compacted: 1, unchanged: 1, skipped: 0, failures: 0, compactedProjects: [paths.canonical] });
-    expect(log).toHaveBeenCalledWith(`${paths.canonical} conv #1 (9 msgs, 0.3k tokens) unchanged (Summarization disabled — no summarizer configured.)`);
+    expect(log.mock.calls.flat().join(" ")).not.toContain(paths.canonical);
     expect(progress.find(patch => patch.lastResult?.sessionId === "session-1")?.lastResult).toMatchObject({
       tokensBefore: 125,
       tokensAfter: 120,
@@ -880,7 +2215,7 @@ describe("batch compaction discovery", () => {
     });
 
     expect(result).toEqual({ compacted: 0, unchanged: 1, skipped: 0, failures: 0, compactedProjects: [] });
-    expect(log).toHaveBeenCalledWith(`${paths.canonical} conv #1 (9 msgs, 0.3k tokens) unchanged (No compaction needed.)`);
+    expect(log.mock.calls.flat().join(" ")).not.toContain(paths.canonical);
     expect(progress.at(-1)?.lastResult).toMatchObject({ tokensBefore: 250, tokensAfter: 250 });
   });
 
@@ -1119,7 +2454,10 @@ describe("batch compaction discovery", () => {
       onProgress: patch => progress.push(patch),
     })).toEqual({ compacted: 0, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [] });
     expect(progress).toContainEqual({ total: 2 });
-    expect(progress.at(-1)).toEqual({ completed: 2 });
+    expect(progress.at(-1)).toMatchObject({
+      completed: 2,
+      lastResult: { outcome: "dry-run", conversationId: 2 },
+    });
     expect(log).toHaveBeenCalledWith(expect.stringContaining("Found 2 uncompacted conversations"));
 
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
@@ -1127,16 +2465,25 @@ describe("batch compaction discovery", () => {
       .mockResolvedValueOnce({ skipped: true })
       .mockRejectedValueOnce("no details");
     progress.length = 0;
+    const events: CompactProgressEvent[] = [];
     expect(await batchCompact({
       minTokens: 100,
       dryRun: false,
       port: 3737,
       cwd,
       onProgress: patch => progress.push(patch),
+      onEvent: event => events.push(event),
     })).toEqual({ compacted: 0, unchanged: 0, skipped: 1, failures: 1, compactedProjects: [] });
     expect(post).toHaveBeenCalledTimes(2);
-    expect(log).toHaveBeenCalledWith(`${paths.canonical} conv #1 (9 msgs, 0.3k tokens) skipped (already in progress)`);
-    expect(log).toHaveBeenCalledWith(`${paths.canonical} conv #2 (9 msgs, 0.3k tokens) FAILED (unknown error)`);
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "session-terminal", outcome: "skipped" }),
+      expect.objectContaining({
+        type: "session-terminal",
+        outcome: "failed",
+        message: "unknown error",
+      }),
+    ]));
+    expect(log.mock.calls.flat().join(" ")).not.toContain(paths.canonical);
     expect(log).toHaveBeenCalledWith("\nBatch compact complete.");
   });
 
@@ -1158,7 +2505,7 @@ describe("batch compaction discovery", () => {
       compactedProjects: [paths.canonical],
     });
     expect(log).toHaveBeenCalledWith(expect.stringContaining("Found 1 uncompacted conversation ("));
-    expect(log).toHaveBeenCalledWith(`${paths.canonical} conv #1 (9 msgs, 0.3k tokens) done`);
+    expect(log.mock.calls.flat().join(" ")).not.toContain(paths.canonical);
     expect(log).toHaveBeenCalledWith(expect.stringContaining("1 session compacted"));
   });
 
@@ -1169,10 +2516,6 @@ describe("batch compaction discovery", () => {
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
     seedConversations(paths.dbPath, [1, 2, 3, 4, 5]);
     const conversations = await findUncompacted(100, true, cwd);
-    const labels = new Map(conversations.map(conv => [
-      conv.sessionId,
-      `${conv.cwd} conv #${conv.conversationId} (${conv.messages} msgs, ${(conv.tokens / 1000).toFixed(1)}k tokens)`,
-    ]));
     const gates = new Map(conversations.map(conv => {
       let release!: () => void;
       const promise = new Promise<void>(resolve => { release = resolve; });
@@ -1193,6 +2536,7 @@ describe("batch compaction discovery", () => {
       return outcome;
     });
     const lines: string[] = [];
+    const events: CompactProgressEvent[] = [];
     vi.spyOn(console, "error").mockImplementation((line?: unknown) => { lines.push(String(line)); });
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
@@ -1202,6 +2546,7 @@ describe("batch compaction discovery", () => {
       port: 3737,
       cwd,
       maxConcurrency: 5,
+      onEvent: event => events.push(event),
     });
     await vi.waitFor(() => expect(post).toHaveBeenCalledTimes(5));
     for (const sessionId of ["session-5", "session-3", "session-2", "session-4", "session-1"]) {
@@ -1216,23 +2561,18 @@ describe("batch compaction discovery", () => {
       compactedProjects: [paths.canonical],
     });
 
-    const completionLines = lines.filter(line => [...labels.values()].some(label => line.includes(label)));
-    expect(completionLines).toHaveLength(5);
-    expect(completionLines.every(line => !line.includes("\n") && !line.includes("\r"))).toBe(true);
-    expect(completionLines.every(line => [...labels.values()].some(label => line.startsWith(`${label} `)))).toBe(true);
-    expect(completionLines).toEqual(expect.arrayContaining([
-      `${labels.get("session-1")} done`,
-      `${labels.get("session-2")} done`,
-      `${labels.get("session-3")} unchanged (No action)`,
-      `${labels.get("session-4")} skipped (already in progress)`,
-      `${labels.get("session-5")} FAILED (compaction request failed)`,
+    const terminals = events.filter((event): event is Extract<CompactProgressEvent, { type: "session-terminal" }> =>
+      event.type === "session-terminal");
+    expect(terminals).toHaveLength(5);
+    expect(terminals.map(event => [event.identity.sessionId, event.outcome])).toEqual(expect.arrayContaining([
+      ["session-1", "done"],
+      ["session-2", "done"],
+      ["session-3", "unchanged"],
+      ["session-4", "skipped"],
+      ["session-5", "failed"],
     ]));
-    expect(lines).not.toEqual(expect.arrayContaining([
-      " done",
-      " skipped (already in progress)",
-      " unchanged (No action)",
-      " FAILED (compaction request failed)",
-    ]));
+    expect(terminals.every(event => event.identity.project === paths.canonical)).toBe(true);
+    expect(lines.join(" ")).not.toContain(paths.canonical);
   });
 
   it("includes the conversation label in verbose completion lines", async () => {
@@ -1241,15 +2581,31 @@ describe("batch compaction discovery", () => {
     ensureProjectDir(cwd);
     writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
     seedConversation(paths.dbPath);
-    const label = `${paths.canonical} conv #1 (9 msgs, 0.3k tokens)`;
     vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
     const lines: string[] = [];
+    const events: CompactProgressEvent[] = [];
     vi.spyOn(console, "error").mockImplementation((line?: unknown) => { lines.push(String(line)); });
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
-    await batchCompact({ minTokens: 100, dryRun: false, port: 3737, cwd, verbose: true });
+    await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      verbose: true,
+      onEvent: event => events.push(event),
+    });
 
-    expect(lines).toContain(`${label} done  (0.3k → 0.1k tokens, 80% reduction)`);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "session-terminal",
+      outcome: "done",
+      identity: expect.objectContaining({
+        project: paths.canonical,
+        sessionId: "session-1",
+        conversationId: 1,
+      }),
+    }));
+    expect(lines.join(" ")).not.toContain(paths.canonical);
   });
 
   it("limits concurrent compaction requests, keeps the oldest active session current, and orders projects by discovery", async () => {
@@ -1284,6 +2640,7 @@ describe("batch compaction discovery", () => {
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const progress: Array<Partial<ProgressState>> = [];
+    const events: CompactProgressEvent[] = [];
 
     const pending = batchCompact({
       minTokens: 100,
@@ -1291,6 +2648,7 @@ describe("batch compaction discovery", () => {
       port: 3737,
       maxConcurrency: 2,
       onProgress: patch => progress.push(patch),
+      onEvent: event => events.push(event),
     });
     await vi.waitFor(() => expect(post).toHaveBeenCalledTimes(2));
     const active = progress.filter(patch => patch.activeSessions !== undefined);
@@ -1308,7 +2666,9 @@ describe("batch compaction discovery", () => {
     });
     expect(progress.at(-1)?.activeSessions).toEqual([]);
     expect(progress.at(-1)?.current).toBeUndefined();
-    expect(log.mock.calls.filter(([line]) => String(line).includes("done")).length).toBe(2);
+    expect(events.filter(event => event.type === "session-terminal" && event.outcome === "done")).toHaveLength(2);
+    expect(log.mock.calls.flat().join(" ")).not.toContain(firstPaths.canonical);
+    expect(log.mock.calls.flat().join(" ")).not.toContain(secondPaths.canonical);
     expect(log).not.toHaveBeenCalledWith(expect.stringContaining("compacting:"));
   });
 

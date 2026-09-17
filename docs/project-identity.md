@@ -117,6 +117,41 @@ Git remote, repository name, directory contents, or matching display names.
 
 ## Linked worktrees and reconciliation
 
+### Retired local identities
+
+Worktree reconciliation can intentionally leave
+`~/.lcm/projects/<old-local-id>` as a regular-file fence. The fence records
+that the old local identity was retired; it is ownership evidence and must not
+be deleted, moved, or replaced. If the same canonical path later becomes an
+independent project, an older path-derived map key can collide with that fence.
+LCM then reports a retired local project identity instead of a generic
+`ENOTDIR` or storage-discovery failure.
+
+Recover from that exact diagnosis in the affected project:
+
+```bash
+lcm project renew-retired-identity
+# or select the canonical project explicitly
+lcm project renew-retired-identity /work/project
+```
+
+Renewal is deliberately narrow. It accepts one current, canonical, local
+binding whose key is the original path hash, with no aliases or PostgreSQL
+identity. The `projects/` parent must remain private and stable, and the fence
+must be a current-user-owned, owner-only, single-link regular file with the
+exact version, old hash, project kind, and bytes produced by reconciliation.
+The deterministic versioned successor map key, its project storage, and its
+event sidecar must all be unoccupied. LCM revalidates those facts immediately
+before atomically rekeying and reading back `map.json`; it never moves or
+deletes the fence and never moves a database.
+
+The command is safe to retry. If the same authenticated predecessor fence and
+successor binding are already present, it reports an idempotent no-op. After a
+successful or already-completed renewal, retry the original hook or compact
+command. Any alias, remote binding, ambiguous owner, occupied successor,
+malformed fence, unsafe mode/owner/link count, or race remains a strict refusal
+that requires inspection rather than automatic repair.
+
 On first local storage access after upgrade, LCM checks the current checkout's
 verified Git common directory. If older `map.json` entries treated linked
 worktrees as separate projects, LCM acquires a private cross-process lock and

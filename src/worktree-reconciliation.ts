@@ -32,6 +32,8 @@ import {
   listProjectMapEntries,
   projectMapPath,
   readProjectMapSnapshot,
+  resolveExistingProjectIdentity,
+  retiredProjectIdentitySuccessor,
   type ProjectIdentity,
   type ProjectMapEntry,
   withProjectMapReconciliationLock,
@@ -68,6 +70,7 @@ import {
   parseLocalHookMachineSequence,
 } from "./storage/local-hook-event-sequence.js";
 import {
+  isAuthenticatedRetiredProjectIdentityFence,
   isWorktreeReconciliationFence,
   serializeWorktreeReconciliationFence,
 } from "./worktree-reconciliation-fence.js";
@@ -2567,6 +2570,8 @@ export function reconcileWorktrees(
     readonly _discoveryObserver?: (path: string) => void;
     /** @internal Token held by a caller that already has publication admission. */
     readonly _publicationLockToken?: BackendPublicationLockToken;
+    /** @internal Persisted identity that must remain the reconciliation target. */
+    readonly _targetIdentity?: ProjectIdentity;
   } = {},
 ): WorktreeReconciliationResult {
   if (opts._publicationLockToken === undefined) {
@@ -2577,8 +2582,15 @@ export function reconcileWorktrees(
       }));
   }
   const anchor = resolveGitProjectAnchor(path);
-  const canonical = anchor?.canonical ?? resolve(path);
-  const targetHash = hashProjectPath(canonical);
+  const discoveredCanonical = anchor?.canonical ?? resolve(path);
+  if (opts._targetIdentity !== undefined
+    && resolve(opts._targetIdentity.canonical) !== discoveredCanonical) {
+    throw new Error("mapped project identity does not match the current Git repository");
+  }
+  const canonical = opts._targetIdentity === undefined
+    ? discoveredCanonical
+    : resolve(opts._targetIdentity.canonical);
+  const targetHash = opts._targetIdentity?.id ?? hashProjectPath(canonical);
   if (!anchor) {
     return {
       status: "not-needed",
@@ -3199,6 +3211,22 @@ export function reconcileWorktrees(
   }
 }
 
+function authenticatedRenewedReconciliationTarget(
+  cwd: string,
+  identity: ProjectIdentity | undefined,
+): ProjectIdentity | undefined {
+  if (identity === undefined) return undefined;
+  const anchor = resolveGitProjectAnchor(cwd);
+  if (anchor === null || resolve(identity.canonical) !== anchor.canonical) return undefined;
+  const retiredId = hashProjectPath(anchor.canonical);
+  const successorId = retiredProjectIdentitySuccessor(retiredId, anchor.canonical);
+  if (identity.id !== successorId) return undefined;
+  if (!isAuthenticatedRetiredProjectIdentityFence(projectStateDir(retiredId), retiredId)) {
+    return undefined;
+  }
+  return { ...identity, canonical: anchor.canonical };
+}
+
 export function ensureWorktreeProjectReconciled(
   cwd: string,
   identity?: ProjectIdentity,
@@ -3224,13 +3252,17 @@ export function ensureWorktreeProjectReconciled(
         _publicationLockToken: publicationLockToken,
       }));
   }
-  const anchor = identity ? undefined : resolveGitProjectAnchor(cwd);
-  if (!identity && !anchor) {
+  const persistedIdentity = identity
+    ?? resolveExistingProjectIdentity(cwd, opts._publicationLockToken)
+    ?? undefined;
+  const renewedTarget = authenticatedRenewedReconciliationTarget(cwd, persistedIdentity);
+  const anchor = identity || renewedTarget ? undefined : resolveGitProjectAnchor(cwd);
+  if (!identity && !renewedTarget && !anchor) {
     return reconcileWorktrees(cwd, {
       _publicationLockToken: opts._publicationLockToken,
     });
   }
-  const project = identity ?? {
+  const project = renewedTarget ?? identity ?? {
     id: hashProjectPath(anchor!.canonical),
     canonical: anchor!.canonical,
   };
@@ -3297,6 +3329,7 @@ export function ensureWorktreeProjectReconciled(
     _maxDiscoveryEntries: opts._maxDiscoveryEntries,
     _discoveryObserver: opts._discoveryObserver,
     _publicationLockToken: opts._publicationLockToken,
+    _targetIdentity: renewedTarget,
   });
   const publishedDiscovery = result.journalPath
     ? readJournal(result.journalPath)?.discovery

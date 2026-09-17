@@ -1,15 +1,17 @@
 import type { ExtractedEvent } from "./extractors.js";
 import { statSync } from "node:fs";
 import { dirname } from "node:path";
+import { join } from "node:path";
 import { loadHookConfig } from "./config.js";
-import { localProjectDir } from "../daemon/project.js";
-import { configPath } from "../runtime-paths.js";
+import { localProjectIdentity } from "../daemon/project.js";
+import { configPath, lcmHomeDir } from "../runtime-paths.js";
 import { ScrubEngine } from "../scrub.js";
 import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
 import {
   isBackendPublicationJournalError,
 } from "./publication-fence.js";
 import { OWNER_ONLY_FILE_MODES, readBoundedRegularFile } from "../security-files.js";
+import { assertProjectStorageIdentityActive } from "../worktree-reconciliation-fence.js";
 
 interface ScrubCacheEntry {
   engine: ScrubEngine;
@@ -102,7 +104,10 @@ export async function scrubExtractedEvents(
   // Hook capture must not enter backend-selected project-map reconciliation.
   // The local sidecar identity remains stable for ordinary projects and uses
   // the compatibility snapshot for already-mapped aliases/worktrees.
-  const scrubber = await getScrubber(patterns, localProjectDir(cwd));
+  const identity = localProjectIdentity(cwd);
+  const projDir = join(lcmHomeDir(), "projects", identity.id);
+  assertProjectStorageIdentityActive(projDir, identity.id);
+  const scrubber = await getScrubber(patterns, projDir);
   return events.map((event) => ({
     ...event,
     data: scrubber.scrub(event.data),

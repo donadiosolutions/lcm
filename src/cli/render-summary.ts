@@ -4,7 +4,7 @@
  */
 
 import type { ProgressState } from './progress-state.js';
-import { sanitizeTerminalText } from '../terminal-sanitize.js';
+import { boundedTerminalText } from '../terminal-sanitize.js';
 import type { RenderOpts } from './render-frame.js';
 
 function fmtTokens(n: number): string {
@@ -83,6 +83,8 @@ export function printSummary(state: ProgressState, opts: RenderOpts, output: Pic
   if (state.phaseErrors.length > 0) {
     rows.push(['Phase failed', String(state.phaseErrors.length)]);
   }
+  const failureTotal = state.errors.length + state.phaseErrors.length;
+  if (failureTotal > 0) rows.push(['Failure total', String(failureTotal)]);
 
   const labelWidth = Math.max(...rows.map(([l]) => l.length));
   for (const [label, value] of rows) {
@@ -94,18 +96,23 @@ export function printSummary(state: ProgressState, opts: RenderOpts, output: Pic
   // Error list
   if (state.errors.length > 0) {
     output.write('\n  Failed:\n');
-    for (const { sessionId, message } of state.errors) {
-      output.write(`    ${sanitizeTerminalText(sessionId)}: ${sanitizeTerminalText(message)}\n`);
+    for (const { project, sessionId, conversationId, sourceLocator, message } of state.errors) {
+      const identity = [
+        project ? boundedTerminalText(project, 48) : undefined,
+        boundedTerminalText(sessionId, 32),
+        conversationId === undefined ? undefined : `conversation ${conversationId}`,
+        sourceLocator ? `source ${boundedTerminalText(sourceLocator, 48)}` : undefined,
+      ].filter((part): part is string => part !== undefined).join(' · ');
+      output.write(`    ${identity}: ${boundedTerminalText(message, Math.max(16, width - 8))}\n`);
     }
   }
   if (state.phaseErrors.length > 0) {
     output.write('\n  Phase failures:\n');
     for (const { phase, target, message } of state.phaseErrors) {
-      const safePhase = sanitizeTerminalText(phase);
-      const safeTarget = target ? ` (${sanitizeTerminalText(target)})` : '';
-      output.write(`    ${safePhase}${safeTarget}: ${sanitizeTerminalText(message)}\n`);
+      const safePhase = boundedTerminalText(phase, 32);
+      const safeTarget = target ? ` (${boundedTerminalText(target, 48)})` : '';
+      output.write(`    ${safePhase}${safeTarget}: ${boundedTerminalText(message, Math.max(16, width - 8))}\n`);
     }
   }
-
   output.write('\n');
 }

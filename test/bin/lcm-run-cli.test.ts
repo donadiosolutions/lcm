@@ -58,6 +58,7 @@ const state = vi.hoisted(() => ({
   installResult: { path: "/connector", requiresRestart: false } as Record<string, unknown>,
   removeResult: true,
   batchResult: { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/project"] },
+  compactEvents: [] as Array<Record<string, unknown>>,
   importResult: { imported: 1, skipped: 0, failed: 0 },
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
   provider: "openai",
@@ -288,7 +289,9 @@ vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((va
   total: 0, completed: 0, errors: [], phaseErrors: [], tokensIn: 0, tokensOut: 0, messagesIn: 0, ...value,
 })) }));
 vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
-  start = vi.fn(); stop = vi.fn(); sessionDone = vi.fn(); printSummary = vi.fn();
+  start = vi.fn(); stop = vi.fn(); sessionDone = vi.fn();
+  handleEvent = vi.fn((event: Record<string, unknown>) => state.compactEvents.push(event));
+  printSummary = vi.fn();
 } }));
 vi.mock("../../src/daemon/server.js", () => ({ createDaemon: state.createDaemon }));
 vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: state.ensureAuthToken, readAuthToken: state.readAuthToken }));
@@ -545,6 +548,7 @@ beforeEach(() => {
   state.provisionError = undefined;
   state.daemonClientInstances = 0;
   state.batchResult = { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/project"] };
+  state.compactEvents = [];
   state.migrateLegacyHome.mockReset();
   state.migrateLegacyHome.mockImplementation(() => undefined);
 });
@@ -3580,12 +3584,15 @@ describe("runCli failure and alternate presentation branches", () => {
   });
 
   it("fails compact and explicit promotion when promotion requests fail", async () => {
-    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     state.post.mockRejectedValueOnce(new Error("promote\u001b[31m\nfailed"));
     expect(await invoke(["compact"])).toBeUndefined();
     expect(process.exitCode).toBe(1);
-    expect(error.mock.calls.flat().join("\n")).toContain("promote failed");
-    expect(error.mock.calls.flat().join("\n")).not.toContain("\u001b");
+    expect(state.compactEvents).toContainEqual(expect.objectContaining({
+      type: "phase-failure",
+      phase: "Promote",
+      project: "/project",
+      message: "promote\u001b[31m\nfailed",
+    }));
     expect(state.ensureDaemon).toHaveBeenCalledTimes(1);
     process.exitCode = undefined;
     state.post.mockRejectedValueOnce("promote failed");

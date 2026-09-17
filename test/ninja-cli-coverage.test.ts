@@ -3,11 +3,49 @@ import { NinjaRenderer } from "../src/cli/pipeline-runner.js";
 import { makeProgressState, type ProgressState } from "../src/cli/progress-state.js";
 import { renderFrame, type RenderOpts } from "../src/cli/render-frame.js";
 import { printSummary } from "../src/cli/render-summary.js";
+import type { CompactProgressEvent } from "../src/batch-compact.js";
 
 const NOW = new Date("2026-01-01T00:00:00.000Z");
 
 function opts(overrides: Partial<RenderOpts> = {}): RenderOpts {
   return { isTTY: true, width: 80, color: false, verbose: false, ...overrides };
+}
+
+class AnsiScreen {
+  private readonly rows: string[] = [""];
+  private row = 0;
+  private column = 0;
+
+  write(chunk: string): void {
+    for (let index = 0; index < chunk.length;) {
+      const rest = chunk.slice(index);
+      const csi = /^\u001b\[([0-9;]*)([A-Za-z])/u.exec(rest);
+      if (csi) {
+        const amount = Number(csi[1] || "1");
+        if (csi[2] === "A") this.row = Math.max(0, this.row - amount);
+        else if (csi[2] === "K" && csi[1] === "2") this.rows[this.row] = "";
+        index += csi[0].length;
+        continue;
+      }
+      const codePoint = chunk[index]!;
+      if (codePoint === "\r") {
+        this.column = 0;
+      } else if (codePoint === "\n") {
+        this.row += 1;
+        this.column = 0;
+        this.rows[this.row] ??= "";
+      } else {
+        const line = this.rows[this.row] ?? "";
+        this.rows[this.row] = `${line.slice(0, this.column)}${codePoint}${line.slice(this.column + 1)}`;
+        this.column += 1;
+      }
+      index += 1;
+    }
+  }
+
+  visibleLines(): string[] {
+    return this.rows.map(line => line.trimEnd()).filter(line => line.length > 0);
+  }
 }
 
 function completedState(overrides: Partial<ProgressState> = {}): ProgressState {
@@ -93,6 +131,58 @@ describe("renderFrame coverage boundaries", () => {
     expect(output).toContain("  [provider]");
   });
 
+  it("preserves native TTY lifecycle lines above immediate and later frame redraws", () => {
+    const screen = new AnsiScreen();
+    const output = {
+      columns: 100,
+      write: (chunk: string | Uint8Array) => {
+        screen.write(String(chunk));
+        return true;
+      },
+    };
+    const state = makeProgressState({ phases: [{ name: "Compact", status: "active" }], total: 2 });
+    const renderer = new NinjaRenderer({ state, renderOpts: opts({ width: 100 }), output });
+    renderer.start();
+    renderer.handleEvent({ type: "discovery-start", total: 1 });
+    renderer.handleEvent({
+      type: "discovery-item-start",
+      index: 1,
+      total: 1,
+      projectId: "a".repeat(64),
+      project: "/project",
+    });
+    renderer.handleEvent({ type: "discovery-clear" });
+    for (const [conversationId, sessionId, outcome] of [
+      [41, "session-one", "done"],
+      [42, "session-two", "skipped"],
+    ] as const) {
+      const identity = { project: "/project", sessionId, conversationId };
+      renderer.handleEvent({
+        type: "session-start",
+        identity,
+        messages: 9,
+        tokens: 250,
+        startedAt: NOW.getTime(),
+      });
+      renderer.handleEvent({
+        type: "session-terminal",
+        identity,
+        outcome,
+        messages: 9,
+        tokensBefore: 250,
+        tokensAfter: outcome === "done" ? 50 : undefined,
+        elapsed: 10,
+      });
+    }
+    vi.advanceTimersByTime(124);
+    renderer.stop();
+
+    const visible = screen.visibleLines();
+    expect(visible.filter(line => line.includes("scanning project 1/1 /project"))).toHaveLength(1);
+    expect(visible.filter(line => line.includes("done /project") && line.includes("session-one") && line.includes("conversation 41"))).toHaveLength(1);
+    expect(visible.filter(line => line.includes("skipped /project") && line.includes("session-two") && line.includes("conversation 42"))).toHaveLength(1);
+  });
+
   it("renders verbose tokens without reduction, ratio, or provider", () => {
     const state = completedState({
       lastResult: { sessionId: "same", messages: 1, tokensBefore: 500, tokensAfter: 500, elapsed: 0 },
@@ -104,7 +194,7 @@ describe("renderFrame coverage boundaries", () => {
     const state = makeProgressState({ total: 0, dryRun: true });
     state.errors.push({ sessionId: "bad", message: "failed" });
     const output = renderFrame(state, opts({ color: true }), 0);
-    expect(output).toContain("\u001b[31m1 failed\u001b[0m");
+    expect(output).toContain("\u001b[31mfailure total 1\u001b[0m");
     expect(output).toContain("[dry-run]");
     expect(output).toContain("[░░░░░░░░░░░░░░░░░░░░░░] 0%");
     expect(output).toContain("  …");
@@ -114,7 +204,7 @@ describe("renderFrame coverage boundaries", () => {
     const state = makeProgressState({ total: 2 });
     state.phaseErrors.push({ phase: "Promote", target: "/project", message: "failed" });
     const output = renderFrame(state, opts({ width: 20 }), 0);
-    expect(output).toContain("1 failed");
+    expect(output).toContain("failure total 1");
     expect(output).not.toContain("[");
   });
 
@@ -189,13 +279,14 @@ describe("printSummary", () => {
     const output = writes.join("");
     expect(output).toContain("● Import  →  ● Compact          Failed ✗");
     expect(output).toContain("[██████████████████████] 100%  1,234 msgs  ~1.0M → ~1.0k tokens, 1000.0×");
-    expect(output).toContain("Sessions      3 processed");
-    expect(output).toContain("DAG nodes     10  (+2 new)");
-    expect(output).toContain("DAG depth     3");
-    expect(output).toContain("Memories      4 promoted");
-    expect(output).toContain("Total time    2.5s");
-    expect(output).toContain("Failed        1");
-    expect(output).toContain("Phase failed  2");
+    expect(output).toContain("Sessions       3 processed");
+    expect(output).toContain("DAG nodes      10  (+2 new)");
+    expect(output).toContain("DAG depth      3");
+    expect(output).toContain("Memories       4 promoted");
+    expect(output).toContain("Total time     2.5s");
+    expect(output).toContain("Failed         1");
+    expect(output).toContain("Phase failed   2");
+    expect(output).toContain("Failure total  3");
     expect(output).toContain("bro ken: network failed");
     expect(output).toContain("Promote: daemon unavailable");
     expect(output).toContain("Pro mote (/pro ject): request failed");
@@ -231,6 +322,31 @@ describe("printSummary", () => {
     expect(output).toContain("Aborted");
     expect(output).toContain("500 tokens");
     expect(output).not.toContain("Memories");
+  });
+
+  it.each([
+    ["native TTY", opts()],
+    ["verbose TTY", opts({ verbose: true })],
+    ["non-TTY", opts({ isTTY: false })],
+    ["captured ANSI", opts({ color: true })],
+  ] as const)("prints one canonical final failure total in %s summaries", (_name, renderOptions) => {
+    writes.length = 0;
+    const state = makeProgressState({ phases: [{ name: "Compact", status: "done" }], total: 1 });
+    state.errors.push({
+      project: "/project",
+      sessionId: "session-one",
+      conversationId: 41,
+      message: "request failed",
+    });
+
+    printSummary(state, renderOptions);
+
+    const normalized = writes.join("")
+      .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
+      .replace(/\r/gu, "")
+      .replace(/\s+/gu, " ");
+    expect(normalized.match(/failure total 1/giu)).toHaveLength(1);
+    expect(normalized.match(/\/project · session-one · conversation 41/gu)).toHaveLength(1);
   });
 });
 
@@ -319,6 +435,114 @@ describe("NinjaRenderer lifecycle", () => {
     verbose.stop();
     expect(writes.join("")).toContain("[1/2]");
     expect(writes.join("")).toContain("✓ session-one");
+  });
+
+  it.each([
+    ["native TTY", opts()],
+    ["verbose TTY", opts({ verbose: true })],
+    ["non-TTY", opts({ isTTY: false })],
+  ] as const)("owns sanitized discovery and terminal identity in %s", (name, renderOptions) => {
+    const state = makeProgressState({ phases: [{ name: "Compact", status: "active" }], total: 2 });
+    const renderer = new NinjaRenderer({ state, renderOpts: { ...renderOptions } });
+    renderer.start();
+    const events: CompactProgressEvent[] = [
+      { type: "discovery-start", total: 1 },
+      {
+        type: "discovery-item-start",
+        index: 1,
+        total: 1,
+        projectId: "a".repeat(64),
+        project: `/project\u001b[31m\n${"p".repeat(100)}`,
+      },
+      { type: "discovery-clear" },
+      {
+        type: "session-start",
+        identity: {
+          project: "/project-one",
+          sessionId: "session\none",
+          conversationId: 41,
+          sourceLocator: `source\u001b]8;;https://invalid\u0007-${"s".repeat(100)}`,
+        },
+        messages: 9,
+        tokens: 250,
+        startedAt: NOW.getTime(),
+      },
+      {
+        type: "session-terminal",
+        identity: {
+          project: "/project-one",
+          sessionId: "session\none",
+          conversationId: 41,
+          sourceLocator: "source-one",
+        },
+        outcome: "failed",
+        messages: 9,
+        tokensBefore: 250,
+        message: `request\nfailed ${"m".repeat(200)}`,
+        elapsed: 10,
+      },
+      {
+        type: "session-start",
+        identity: { project: "/project-two", sessionId: "session-two", conversationId: 42 },
+        messages: 10,
+        tokens: 300,
+        startedAt: NOW.getTime(),
+      },
+      {
+        type: "session-terminal",
+        identity: { project: "/project-two", sessionId: "session-two", conversationId: 42 },
+        outcome: "done",
+        messages: 10,
+        tokensBefore: 300,
+        tokensAfter: 30,
+        provider: `provider\n${"x".repeat(100)}`,
+        elapsed: 20,
+      },
+    ];
+    for (const event of events) renderer.handleEvent(event);
+    renderer.stop();
+    renderer.printSummary();
+
+    const captured = writes.join("");
+    const normalized = captured
+      .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
+      .replace(/\r/gu, "");
+    expect(normalized).toContain("scanning project 1/1");
+    expect(normalized).toContain("/project");
+    expect(normalized).toContain("session one");
+    expect(normalized).toContain("conversation 41");
+    expect(normalized).toContain("source-one");
+    expect(normalized).toContain("session-two");
+    expect(normalized).toContain("conversation 42");
+    expect(normalized).toContain("done");
+    // Contract (reviewer thread 4028334454): a per-item session-terminal line
+    // reports only that item's own outcome. The cumulative failure total must
+    // not be appended there, even for an item that comes after a failure.
+    const doneLine = normalized
+      .split("\n")
+      .find(line => /\bdone\b/u.test(line) && line.includes("session-two"));
+    expect(doneLine).toBeDefined();
+    expect(doneLine).not.toContain("failure total");
+    // The cumulative total still belongs on the live TTY header (native,
+    // non-verbose mode only) and in the final summary, which is always
+    // rendered here via the trailing printSummary() call.
+    if (name === "native TTY") {
+      expect(normalized).toContain("failure total 1");
+    }
+    expect(normalized).toContain("Failure total  1");
+    expect(normalized).not.toContain("https://invalid");
+    expect(state.discovery).toBeUndefined();
+    expect(state.errors).toEqual([
+      expect.objectContaining({
+        project: "/project-one",
+        sessionId: "session\none",
+        conversationId: 41,
+        message: expect.stringContaining("request"),
+      }),
+    ]);
+    const failedSection = normalized.slice(normalized.lastIndexOf("Failed:"));
+    expect(failedSection.match(/session one/gu)).toHaveLength(1);
+    expect(failedSection).not.toContain("failure total");
   });
 
   it("does not write an empty non-TTY session frame", () => {
@@ -428,5 +652,65 @@ describe("NinjaRenderer lifecycle", () => {
     expect(state.aborted).toBe(true);
     expect(exit).not.toHaveBeenCalled();
     renderer.stop();
+  });
+
+  it("records a phase-failure event with a target project and reports the running failure total", () => {
+    const state = makeProgressState({ total: 1 });
+    const renderer = new NinjaRenderer({ state, renderOpts: opts({ isTTY: false }) });
+    renderer.handleEvent({ type: "phase-failure", phase: "Compact", project: "/project-one", message: "daemon unavailable" });
+    expect(state.phaseErrors).toEqual([
+      { phase: "Compact", target: "/project-one", message: "daemon unavailable" },
+    ]);
+    const captured = writes.join("");
+    expect(captured).toContain("  failed /project-one: daemon unavailable (failure total 1)\n");
+  });
+
+  it("records a phase-failure event without a project and omits the target from state and the line", () => {
+    const state = makeProgressState({ total: 1 });
+    state.phaseErrors.push({ phase: "Import", message: "already failed once" });
+    const renderer = new NinjaRenderer({ state, renderOpts: opts({ isTTY: false }) });
+    renderer.handleEvent({ type: "phase-failure", phase: "Import", message: "project discovery failed" });
+    expect(state.phaseErrors).toEqual([
+      { phase: "Import", message: "already failed once" },
+      { phase: "Import", message: "project discovery failed" },
+    ]);
+    expect(state.phaseErrors[1]).not.toHaveProperty("target");
+    const captured = writes.join("");
+    expect(captured).toContain("  failed: project discovery failed (failure total 2)\n");
+  });
+
+  it("falls back to the default failure message when a failed session-terminal event omits one", () => {
+    const state = makeProgressState({ total: 1 });
+    const renderer = new NinjaRenderer({ state, renderOpts: opts({ isTTY: false }) });
+    const identity = { project: "/project", sessionId: "session-one", conversationId: 7 };
+    renderer.handleEvent({
+      type: "session-terminal",
+      identity,
+      outcome: "failed",
+      messages: 3,
+      tokensBefore: 100,
+      elapsed: 5,
+    });
+    expect(state.errors).toEqual([
+      expect.objectContaining({
+        project: "/project",
+        sessionId: "session-one",
+        conversationId: 7,
+        message: "compaction request failed",
+      }),
+    ]);
+    expect(state.lastResult).toEqual(
+      expect.objectContaining({ project: "/project", sessionId: "session-one", conversationId: 7, outcome: "failed" }),
+    );
+  });
+
+  it("skips the ninja frame write when the renderer redraws before start() clears the first-frame flag", () => {
+    const state = makeProgressState({ total: 1 });
+    const renderer = new NinjaRenderer({ state, renderOpts: opts() });
+    renderer.handleEvent({ type: "discovery-clear" });
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).not.toContain("[3A");
+    expect(writes[0]).not.toContain("");
+    expect(writes[0]).toContain("  …");
   });
 });

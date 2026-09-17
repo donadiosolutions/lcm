@@ -6,6 +6,7 @@ import {
   hashProjectPath,
   normalizeProjectIdentityPath,
   projectMapPath,
+  retiredProjectIdentitySuccessor,
   resolveProjectIdentity,
   type ProjectIdentity,
 } from "../project-map.js";
@@ -16,6 +17,7 @@ import {
   openPrivateDirectory,
   openPrivateDirectoryIfExists,
   openPrivateDirectoryForCreation,
+  OWNER_ONLY_FILE_MODES,
   readBoundedRegularFile,
   type PrivateDirectoryHandle,
   type PrivateDirectoryWitness,
@@ -25,6 +27,7 @@ import type { BackendPublicationLockToken } from "../storage/backend-publication
 import { resolveStorageIdentityContext } from "../storage/identity-context.js";
 import type { ResolvedStorageConfig } from "./config.js";
 import { ensureWorktreeProjectReconciled } from "../worktree-reconciliation.js";
+import { isAuthenticatedRetiredProjectIdentityFence } from "../worktree-reconciliation-fence.js";
 
 export const MAX_PROJECT_METADATA_BYTES = 1024 * 1024;
 const MAX_PROJECT_MAP_COMPATIBILITY_BYTES = 4 * 1024 * 1024;
@@ -149,6 +152,9 @@ function parseLocalProjectMapCompatibility(
     const content = readBoundedRegularFile(path, {
       allowedRoot: lcmHomeDir(homeDir),
       maxBytes: MAX_PROJECT_MAP_COMPATIBILITY_BYTES,
+      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      allowedModes: OWNER_ONLY_FILE_MODES,
+      requireSingleLink: true,
     });
     const value: unknown = JSON.parse(content);
     if (value === null || typeof value !== "object" || Array.isArray(value)) return fallback;
@@ -178,8 +184,15 @@ function parseLocalProjectMapCompatibility(
     // Map keys are historical storage names and may be replaced atomically
     // during worktree reconciliation. Derive the hook ID from the stable
     // canonical path so an old/new map pair cannot make eventsDbPath oscillate.
+    const retiredId = hashProjectPath(normalizeProjectIdentityPath(matched.canonical));
+    const successorId = retiredProjectIdentitySuccessor(retiredId, matched.canonical);
+    const acceptsSuccessor = matched.id === successorId
+      && isAuthenticatedRetiredProjectIdentityFence(
+        join(lcmHomeDir(homeDir), "projects", retiredId),
+        retiredId,
+      );
     return {
-      id: hashProjectPath(normalizeProjectIdentityPath(matched.canonical)),
+      id: acceptsSuccessor ? successorId : retiredId,
       canonical: matched.canonical,
     };
   } catch {

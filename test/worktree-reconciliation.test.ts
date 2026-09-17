@@ -38,6 +38,8 @@ import {
   hashProjectPath,
   listProjectMapEntries,
   projectMapPath,
+  renewRetiredProjectIdentity,
+  retiredProjectIdentitySuccessor,
   setRemoteProjectBinding,
 } from "../src/project-map.js";
 import {
@@ -46,12 +48,14 @@ import {
   listWorktreeReconciliationJournals,
   reconcileWorktrees,
 } from "../src/worktree-reconciliation.js";
-import { projectDbPath, projectIdentity } from "../src/daemon/project.js";
+import { projectDbPath, projectIdentity, projectPaths } from "../src/daemon/project.js";
+import { withCliProjectStorage } from "../src/cli-storage.js";
 import { recoverMachineIdentity } from "../src/machine-identity.js";
 import type { ResolvedStorageConfig } from "../src/daemon/config.js";
 import { EventsDb } from "../src/hooks/events-db.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
 import * as securityFiles from "../src/security-files.js";
+import { serializeWorktreeReconciliationFence } from "../src/worktree-reconciliation-fence.js";
 
 const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
   backend: "postgresql",
@@ -64,6 +68,7 @@ const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
     statementTimeoutMs: 60_000,
   },
 };
+const SQLITE_STORAGE: ResolvedStorageConfig = { backend: "sqlite" };
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const CACHE_RECONCILIATION_TIMEOUT_MS = 10_000;
@@ -5137,6 +5142,146 @@ describe("worktree reconciliation", () => {
       "SELECT session_id FROM conversations WHERE session_id = 'legacy-postgresql-binding'",
     ).get()).toEqual({ session_id: "legacy-postgresql-binding" });
     target.close();
+  });
+
+  it("keeps a renewed retired identity as the configured reconciliation target across fresh caches", async () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const oldId = hashProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [oldId]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    const projects = join(home, ".lcm", "projects");
+    makePrivateFixtureDirectory(projects, { recursive: true });
+    const oldFence = join(projects, oldId);
+    const fenceBytes = serializeWorktreeReconciliationFence(oldId, "project");
+    writePrivateFixtureFile(oldFence, fenceBytes);
+    clearProjectMapCache();
+
+    expect(renewRetiredProjectIdentity(main)).toEqual({
+      oldId,
+      newId,
+      canonical,
+      changed: true,
+    });
+    clearProjectMapCache();
+    clearGitProjectAnchorCache();
+    clearWorktreeReconciliationCache();
+
+    expect(projectIdentity(linked, SQLITE_STORAGE)).toMatchObject({
+      id: newId,
+      localProjectId: newId,
+      canonical,
+    });
+    expect(projectPaths(linked)).toMatchObject({ id: newId, canonical });
+    const first = await withCliProjectStorage(linked, { create: true }, async ({ project, storage }) => {
+      await storage.conversations.getOrCreateConversation("renewed-session");
+      return project;
+    });
+    expect(first).toMatchObject({ id: newId, canonical });
+    expect(listProjectMapEntries()).toEqual({
+      [newId]: expect.objectContaining({ canonical }),
+    });
+    expect(readFileSync(oldFence, "utf8")).toBe(fenceBytes);
+    expect(lstatSync(oldFence).isFile()).toBe(true);
+    expect(existsSync(join(oldFence, "db.sqlite"))).toBe(false);
+    expect(existsSync(join(projects, oldId, "meta.json"))).toBe(false);
+
+    clearProjectMapCache();
+    clearGitProjectAnchorCache();
+    clearWorktreeReconciliationCache();
+    expect(await withCliProjectStorage(linked, { create: false }, async ({ project, storage }) => ({
+      project,
+      sessions: (await storage.conversations.listConversations()).map(row => row.sessionId),
+    }))).toEqual({
+      project: expect.objectContaining({ id: newId, canonical }),
+      sessions: ["renewed-session"],
+    });
+    expect(listProjectMapEntries()).toEqual({
+      [newId]: expect.objectContaining({ canonical }),
+    });
+    expect(readFileSync(oldFence, "utf8")).toBe(fenceBytes);
+    expect(lstatSync(oldFence).isFile()).toBe(true);
+  });
+
+  it("still reconciles an ordinary non-renewed Git project by its plain path hash", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+
+    expect(projectIdentity(linked, SQLITE_STORAGE)).toMatchObject({
+      id: targetHash,
+      localProjectId: targetHash,
+      canonical,
+    });
+    expect(projectPaths(linked)).toMatchObject({ id: targetHash, canonical });
+    expect(listProjectMapEntries()).toEqual({
+      [targetHash]: expect.objectContaining({ canonical }),
+    });
+  });
+
+  it("rejects a reconciliation target identity that does not match the discovered Git repository", () => {
+    const { main } = makeRepository(home);
+    const foreignCanonical = join(home, "not-this-repository");
+    makePrivateFixtureDirectory(foreignCanonical);
+
+    expect(() => reconcileWorktrees(main, {
+      _targetIdentity: { id: hashProjectPath(foreignCanonical), canonical: foreignCanonical },
+    })).toThrow("mapped project identity does not match the current Git repository");
+  });
+
+  it("does not accept a successor-shaped identity as renewed when its retired fence is absent", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const oldId = hashProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    // The project map already points at the successor id, exactly like a
+    // completed renewal, but no retired fence was ever installed at oldId
+    // (for example: the map file was hand-edited, or renewal partially
+    // failed before the fence-authentication invariant was established).
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [newId]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    clearProjectMapCache();
+
+    const result = ensureWorktreeProjectReconciled(linked);
+    expect(result.targetHash).toBe(oldId);
+    expect(result.canonical).toBe(canonical);
+    // Without an authenticated retired fence, the successor entry is not
+    // treated as a renewal target at all: ordinary reconciliation reclaims
+    // the unauthenticated successor map entry as a same-repository source
+    // and folds it back under the plain path hash, exactly as it would for
+    // any other legacy alias of the same canonical path.
+    expect(projectIdentity(linked, SQLITE_STORAGE)).toMatchObject({
+      id: oldId,
+      localProjectId: oldId,
+      canonical,
+    });
+    expect(listProjectMapEntries()).toEqual({
+      [oldId]: expect.objectContaining({ canonical }),
+    });
+  });
+
+  it("does not accept a successor-shaped identity as renewed when its retired fence content is not authenticated", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const oldId = hashProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [newId]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    const projects = join(home, ".lcm", "projects");
+    makePrivateFixtureDirectory(projects, { recursive: true });
+    // A byte-mismatched fence (wrong embedded hash) at the retired path must
+    // never be treated as an authenticated renewal fence.
+    writePrivateFixtureFile(
+      join(projects, oldId),
+      serializeWorktreeReconciliationFence(newId, "project"),
+    );
+    clearProjectMapCache();
+
+    expect(() => ensureWorktreeProjectReconciled(linked)).toThrow();
   });
 
   it("rejects conflicting legacy bindings before PostgreSQL admission mutates project state", () => {

@@ -5,12 +5,19 @@ import {
   eventsDir,
   existingEventsDbPath,
 } from "../../src/db/events-path.js";
-import { hashProjectPath, normalizeProjectIdentityPath, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
+import {
+  hashProjectPath,
+  normalizeProjectIdentityPath,
+  normalizeProjectPath,
+  projectMapPath,
+  retiredProjectIdentitySuccessor,
+} from "../../src/project-map.js";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { tmpdir } from "node:os";
 import { openPrivateDirectory } from "../../src/security-files.js";
+import { serializeWorktreeReconciliationFence } from "../../src/worktree-reconciliation-fence.js";
 
 describe("backend-independent local project identity", () => {
   let previousHome: string | undefined;
@@ -259,6 +266,136 @@ describe("backend-independent local project identity", () => {
       rmSync(primary, { recursive: true, force: true });
       rmSync(linked, { recursive: true, force: true });
     }
+  });
+
+  it("recovers a renewed successor sidecar from identity evidence when the retained fence is authenticated", () => {
+    const canonical = normalizeProjectIdentityPath(project);
+    const plainId = hashProjectPath(canonical);
+    const successorId = retiredProjectIdentitySuccessor(plainId, canonical);
+    const projectsDir = join(home, ".lcm", "projects");
+    mkdirSync(projectsDir, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(projectsDir, plainId),
+      serializeWorktreeReconciliationFence(plainId, "project"),
+      { mode: 0o600 },
+    );
+
+    const sidecarDir = join(home, ".lcm", "events");
+    mkdirSync(sidecarDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(sidecarDir, `${plainId}.identity.json`), JSON.stringify({
+      version: 1,
+      cwd: canonical,
+      canonical,
+      id: successorId,
+    }), { mode: 0o600 });
+    const sidecar = join(sidecarDir, `${successorId}.db`);
+    writeFileSync(sidecar, "");
+
+    expect(existsSync(projectMapPath())).toBe(false);
+    expect(existingEventsDbPath(project)).toBe(sidecar);
+  });
+
+  it("rejects a renewed successor id when the retained predecessor fence is absent", () => {
+    const canonical = normalizeProjectIdentityPath(project);
+    const plainId = hashProjectPath(canonical);
+    const successorId = retiredProjectIdentitySuccessor(plainId, canonical);
+
+    const sidecarDir = join(home, ".lcm", "events");
+    mkdirSync(sidecarDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(sidecarDir, `${plainId}.identity.json`), JSON.stringify({
+      version: 1,
+      cwd: canonical,
+      canonical,
+      id: successorId,
+    }), { mode: 0o600 });
+    writeFileSync(join(sidecarDir, `${successorId}.db`), "");
+
+    expect(existsSync(join(home, ".lcm", "projects"))).toBe(false);
+    expect(existingEventsDbPath(project)).toBeUndefined();
+  });
+
+  it("rejects a renewed successor id when the retained fence content does not authenticate it", () => {
+    const canonical = normalizeProjectIdentityPath(project);
+    const plainId = hashProjectPath(canonical);
+    const successorId = retiredProjectIdentitySuccessor(plainId, canonical);
+    const projectsDir = join(home, ".lcm", "projects");
+    mkdirSync(projectsDir, { recursive: true, mode: 0o700 });
+    // A fence file exists at the right location but authenticates a
+    // different retirement hash entirely, so it must not be trusted.
+    writeFileSync(
+      join(projectsDir, plainId),
+      serializeWorktreeReconciliationFence("f".repeat(64), "project"),
+      { mode: 0o600 },
+    );
+
+    const sidecarDir = join(home, ".lcm", "events");
+    mkdirSync(sidecarDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(sidecarDir, `${plainId}.identity.json`), JSON.stringify({
+      version: 1,
+      cwd: canonical,
+      canonical,
+      id: successorId,
+    }), { mode: 0o600 });
+    writeFileSync(join(sidecarDir, `${successorId}.db`), "");
+
+    expect(existingEventsDbPath(project)).toBeUndefined();
+  });
+
+  it("rejects identity evidence whose id is neither the plain hash nor its authenticated successor", () => {
+    const canonical = normalizeProjectIdentityPath(project);
+    const plainId = hashProjectPath(canonical);
+    const bogusId = "c".repeat(64);
+    const projectsDir = join(home, ".lcm", "projects");
+    mkdirSync(projectsDir, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(projectsDir, plainId),
+      serializeWorktreeReconciliationFence(plainId, "project"),
+      { mode: 0o600 },
+    );
+
+    const sidecarDir = join(home, ".lcm", "events");
+    mkdirSync(sidecarDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(sidecarDir, `${plainId}.identity.json`), JSON.stringify({
+      version: 1,
+      cwd: canonical,
+      canonical,
+      id: bogusId,
+    }), { mode: 0o600 });
+    writeFileSync(join(sidecarDir, `${bogusId}.db`), "");
+
+    expect(existingEventsDbPath(project)).toBeUndefined();
+  });
+
+  it("recovers a renewed successor sidecar end-to-end through eventsDbPath and the retired map binding", () => {
+    // Exercises the real write path (publishIdentityEvidence via
+    // eventsDbPath) together with the real hook-identity acceptance path in
+    // parseLocalProjectMapCompatibility, proving the two halves agree.
+    const canonical = normalizeProjectIdentityPath(project);
+    const plainId = hashProjectPath(canonical);
+    const successorId = retiredProjectIdentitySuccessor(plainId, canonical);
+    const projectsDir = join(home, ".lcm", "projects");
+    mkdirSync(projectsDir, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(projectsDir, plainId),
+      serializeWorktreeReconciliationFence(plainId, "project"),
+      { mode: 0o600 },
+    );
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [successorId]: { canonical, aliases: [] },
+    }), { mode: 0o600 });
+    chmodSync(projectMapPath(), 0o600);
+
+    const dbPath = eventsDbPath(project);
+    expect(dbPath).toBe(join(eventsDir(), `${successorId}.db`));
+    const evidencePath = join(eventsDir(), `${plainId}.identity.json`);
+    expect(existsSync(evidencePath)).toBe(true);
+    writeFileSync(dbPath, "");
+
+    // Now simulate an unavailable/unreadable project map: recovery must fall
+    // back to the identity evidence written above and still resolve the
+    // same successor sidecar.
+    rmSync(projectMapPath(), { force: true });
+    expect(existingEventsDbPath(project)).toBe(dbPath);
   });
 });
 
