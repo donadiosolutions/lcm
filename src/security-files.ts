@@ -85,6 +85,20 @@ export class PrivateFileCollisionError extends PrivateDirectoryTopologyError {
   }
 }
 
+/**
+ * A create-if-absent private publication collided and its task-owned temporary
+ * inode could not be proven removed.  This deliberately is not a
+ * PrivateFileCollisionError, so a caller that accepts an ordinary replay
+ * collision cannot silently accept incomplete cleanup.  A caller that must
+ * still classify the primary failure as a collision opts in through this type.
+ */
+export class PrivateFileCollisionCleanupError extends PrivateDirectoryTopologyError {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super(message, options);
+    this.name = "PrivateFileCollisionCleanupError";
+  }
+}
+
 /** A retained bounded-file descriptor no longer matches its pathname witness. */
 export type BoundedFileParentIdentity = Readonly<{
   mode: number;
@@ -790,6 +804,9 @@ function privateFilePublicationCleanupFailure(
       primaryError.operation,
     );
   }
+  if (primaryError instanceof PrivateFileCollisionError) {
+    return new PrivateFileCollisionCleanupError(primaryError.message, { cause: aggregate });
+  }
   if (primaryError instanceof PrivateDirectoryTopologyError) {
     return new PrivateDirectoryTopologyError(primaryError.message, { cause: aggregate });
   }
@@ -1344,15 +1361,55 @@ export function atomicWritePrivateFile(
       }
     } finally {
       if (ownsTempPath && tempIdentity !== undefined) {
-        try {
-          unlinkPrivateFileIfIdentityMatches(
-            tempPath,
-            tempIdentity,
-            (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
-            undefined,
-            published ? 2n : 1n,
-          );
-        } catch { /* preserve the exclusive publication failure */ }
+        if (primaryError instanceof PrivateFileCollisionError) {
+          let removalErrorPresent = false;
+          let removalError: unknown;
+          let removed = false;
+          try {
+            removed = unlinkPrivateFileIfIdentityMatches(
+              tempPath,
+              tempIdentity,
+              (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+              undefined,
+              1n,
+            );
+          } catch (error) {
+            removalErrorPresent = true;
+            removalError = error;
+          }
+          if (removalErrorPresent) {
+            const cleanupErrors = [removalError];
+            try {
+              assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+            } catch (topologyError) {
+              cleanupErrors.push(topologyError);
+            }
+            primaryError = privateFilePublicationCleanupFailure(primaryError, ...cleanupErrors);
+          } else if (!removed) {
+            let cleanupError: unknown = new Error(
+              "private exclusive publication temp cleanup was not completed",
+            );
+            try {
+              assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+            } catch (topologyError) {
+              cleanupError = new PrivateDirectoryTopologyError(
+                "private exclusive publication temp cleanup was not completed",
+                { cause: topologyError },
+              );
+            }
+            primaryError = privateFilePublicationCleanupFailure(primaryError, cleanupError);
+          }
+        } else {
+          try {
+            unlinkPrivateFileIfIdentityMatches(
+              tempPath,
+              tempIdentity,
+              (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+              undefined,
+              published ? 2n : 1n,
+            );
+          } catch { /* preserve the exclusive publication failure */ }
+        }
       }
     }
     if (primaryErrorPresent) throw primaryError;

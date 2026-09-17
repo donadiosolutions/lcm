@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   chmodSync,
+  fsyncSync,
   mkdirSync,
   readdirSync,
 } from "node:fs";
@@ -17,15 +18,19 @@ import {
   type PrivateMutationLockOperations,
 } from "../private-mutation-lock.js";
 import {
+  atomicWritePrivateFile,
   atomicWritePrivateFileDurable,
   consumeBoundedRegularFile,
   assertPrivateDirectory,
+  assertPrivateDirectoryEntry,
   OWNER_ONLY_FILE_MODES,
   openPrivateDirectory,
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
   isOwnerOnlyFileMode,
   openPrivateDirectoryIfExists,
+  PrivateDirectoryTopologyError,
+  PrivateFileCollisionError,
 } from "../security-files.js";
 import type { StorageBackendName } from "./contracts.js";
 import {
@@ -2738,6 +2743,203 @@ function writeJournal(
   assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
 }
 
+function archiveUnsafeStorage(message: string, cause: unknown): never {
+  throw new BackendPublicationJournalError("unsafe-storage", message, { cause });
+}
+
+function assertRetainedArchivePublicationDirectory(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+): void {
+  try {
+    const observed = assertPrivateDirectory(
+      directoryHandle,
+      backendPublicationDirectory(homeDir),
+    );
+    if (
+      observed.dev !== directoryHandle.witness.dev
+      || observed.ino !== directoryHandle.witness.ino
+      || observed.gid !== directoryHandle.witness.gid
+    ) {
+      throw new Error("private directory identity changed");
+    }
+  } catch (error) {
+    return archiveUnsafeStorage(
+      "backend publication directory changed during terminal journal archive",
+      error,
+    );
+  }
+}
+
+function assertRetainedArchiveHistoryDirectory(
+  history: string,
+  historyHandle: ReturnType<typeof openPrivateDirectory>,
+): void {
+  try {
+    // The realpath-based comparison below only proves the retained
+    // descriptor and the resolved pathname currently agree; it also follows
+    // any symlink placed at the final path component. Bind the descriptor to
+    // the exact, non-symlink directory entry first so a same-UID final
+    // component substitution cannot hide behind symlink resolution or a
+    // reused dev/ino pair.
+    assertPrivateDirectoryEntry(historyHandle, history);
+    const observed = assertPrivateDirectory(historyHandle, history);
+    if (
+      observed.dev !== historyHandle.witness.dev
+      || observed.ino !== historyHandle.witness.ino
+      || observed.gid !== historyHandle.witness.gid
+    ) {
+      throw new Error("private directory identity changed");
+    }
+  } catch (error) {
+    return archiveUnsafeStorage(
+      "backend publication history directory changed during terminal journal archive",
+      error,
+    );
+  }
+}
+
+/**
+ * Bind a freshly retained history-directory descriptor to its pathname
+ * immediately after it is created. This proves the descriptor that will be
+ * used for the remainder of the archive operation is, right now, the
+ * non-symlink `history` entry with exact 0700 mode and our UID.
+ *
+ * It does not retroactively verify the identity `mkdirSync` created a moment
+ * earlier. POSIX has no atomic create-and-open for directories, and the
+ * obvious alternative -- create under an unguessable staging name and rename
+ * it onto `history` -- is not available here: rename replaces an empty
+ * directory, so it would silently adopt and clobber a concurrent creator's
+ * directory, which "refuses a history create race without adopting the
+ * entrant" forbids. Failing closed on a racing entrant is the stronger
+ * property, so the mkdir-then-open shape is kept and every window after the
+ * open is closed instead: nothing later in the operation can rely on a
+ * descriptor that silently drifted from the pathname without this check
+ * failing closed first.
+ */
+function bindRetainedArchiveHistoryDirectoryEntry(
+  history: string,
+  historyHandle: ReturnType<typeof openPrivateDirectory>,
+  message: string,
+): void {
+  try {
+    assertPrivateDirectoryEntry(historyHandle, history);
+  } catch (error) {
+    archiveUnsafeStorage(message, error);
+  }
+}
+
+type ArchiveHistoryOperationOutcome<T> =
+  | Readonly<{ succeeded: true; value: T }>
+  | Readonly<{ succeeded: false; error: unknown }>;
+
+function completeArchiveHistoryOperation<T>(
+  historyHandle: ReturnType<typeof openPrivateDirectory>,
+  outcome: ArchiveHistoryOperationOutcome<T>,
+): T {
+  let closeErrorPresent = false;
+  let closeError: unknown;
+  try {
+    historyHandle.close();
+  } catch (error) {
+    closeErrorPresent = true;
+    closeError = error;
+  }
+  if (!closeErrorPresent) {
+    if (outcome.succeeded) return outcome.value;
+    throw outcome.error;
+  }
+  if (outcome.succeeded) throw closeError;
+  const aggregate = new AggregateError(
+    [outcome.error, closeError],
+    "backend publication archive operation and history cleanup failed",
+    { cause: outcome.error },
+  );
+  if (outcome.error instanceof BackendPublicationJournalError) {
+    throw new BackendPublicationJournalError(
+      outcome.error.reason,
+      outcome.error.message,
+      { cause: aggregate },
+    );
+  }
+  throw aggregate;
+}
+
+type RetainedArchiveHistoryDirectory = Readonly<{
+  historyHandle: ReturnType<typeof openPrivateDirectory>;
+  created: boolean;
+}>;
+
+/**
+ * Acquire the retained history directory, creating it when absent. Every
+ * failure here throws before a descriptor exists, so the caller never has to
+ * reason about an unacquired handle: this returns a live descriptor or throws.
+ *
+ * Binding a freshly created descriptor to its entry is deliberately left to
+ * the caller. That check can fail, and a failure after acquisition must still
+ * close the descriptor and aggregate any close failure with it, which only
+ * the caller's completion path does.
+ */
+function openRetainedArchiveHistoryDirectory(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+  observer: BackendPublicationObserver,
+  history: string,
+): RetainedArchiveHistoryDirectory {
+  assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+  observer("before-terminal-journal-history-open", history);
+  let existingHandle;
+  try {
+    existingHandle = openPrivateDirectoryIfExists(history);
+  } catch (error) {
+    return archiveUnsafeStorage("backend publication history directory cannot be opened", error);
+  }
+  if (existingHandle !== undefined) return { historyHandle: existingHandle, created: false };
+  observer("before-terminal-journal-history-create", history);
+  assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+  try {
+    mkdirSync(history, { mode: 0o700 });
+  } catch (error) {
+    return archiveUnsafeStorage("backend publication history directory cannot be created", error);
+  }
+  try {
+    return { historyHandle: openPrivateDirectory(history), created: true };
+  } catch (error) {
+    return archiveUnsafeStorage("created backend publication history directory is unsafe", error);
+  }
+}
+
+function withRetainedArchiveHistoryDirectory<T>(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+  observer: BackendPublicationObserver,
+  callback: (historyHandle: ReturnType<typeof openPrivateDirectory>) => T,
+): T {
+  const history = backendPublicationHistoryDirectory(homeDir);
+  const { historyHandle, created } = openRetainedArchiveHistoryDirectory(
+    homeDir,
+    directoryHandle,
+    observer,
+    history,
+  );
+  let outcome: ArchiveHistoryOperationOutcome<T>;
+  try {
+    if (created) {
+      bindRetainedArchiveHistoryDirectoryEntry(
+        history,
+        historyHandle,
+        "created backend publication history directory is unsafe",
+      );
+    }
+    assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+    assertRetainedArchiveHistoryDirectory(history, historyHandle);
+    outcome = { succeeded: true, value: callback(historyHandle) };
+  } catch (error) {
+    outcome = { succeeded: false, error };
+  }
+  return completeArchiveHistoryOperation(historyHandle, outcome);
+}
+
 function archiveTerminalJournal(
   homeDir: string | undefined,
   directoryHandle: BackendPublicationDirectoryHandle,
@@ -2774,35 +2976,72 @@ function archiveTerminalJournal(
   ) {
     return fail("unexpected-state", "backend publication journal changed before archive");
   }
-  let historyHandle;
-  try {
-    historyHandle = openPrivateDirectory(history);
-  } catch (error) {
-    if (!isMissing(error)) throw error;
-    mkdirSync(history, { mode: 0o700 });
-    historyHandle = openPrivateDirectory(history);
-  }
-  historyHandle.close();
   const archivePath = join(history, journal.publicationId + "." + journal.checksumSha256 + ".json");
-  try {
-    atomicWritePrivateFileDurable(archivePath, current, {
-      requireAbsent: true,
-      maxExistingBytes: MAX_JOURNAL_BYTES,
-    });
-  } catch (error) {
-    if (!(error instanceof Error) || error.message !== "private file already exists") throw error;
-    readBoundedRegularFileWithStat(archivePath, {
-      allowedRoot: history,
-      maxBytes: MAX_JOURNAL_BYTES,
-      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
-      allowedModes: [0o600],
-      requireSingleLink: true,
-      expectedRawSha256: sha256(current),
-    });
-  }
-  syncPrivateDirectory(history);
-  syncPrivateDirectory(directory);
-  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
+  withRetainedArchiveHistoryDirectory(
+    homeDir,
+    directoryHandle,
+    observer,
+    (historyHandle) => {
+      observer("before-terminal-journal-archive-publication", archivePath);
+      assertRetainedArchiveHistoryDirectory(history, historyHandle);
+      try {
+        atomicWritePrivateFile(
+          archivePath,
+          current,
+          {},
+          historyHandle,
+          { requireAbsent: true },
+        );
+      } catch (error) {
+        if (!(error instanceof PrivateFileCollisionError)) {
+          if (error instanceof PrivateDirectoryTopologyError) {
+            return archiveUnsafeStorage(
+              "backend publication archive publication topology is unsafe",
+              error,
+            );
+          }
+          throw error;
+        }
+        assertRetainedArchiveHistoryDirectory(history, historyHandle);
+        observer("before-terminal-journal-archive-replay", archivePath);
+        assertRetainedArchiveHistoryDirectory(history, historyHandle);
+        let replay;
+        try {
+          replay = readBoundedRegularFileWithStat(archivePath, {
+            allowedRoot: history,
+            maxBytes: MAX_JOURNAL_BYTES,
+            expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+            allowedModes: [0o600],
+            requireSingleLink: true,
+            expectedRawSha256: sha256(current),
+          });
+        } catch (replayError) {
+          return archiveUnsafeStorage("backend publication archive replay is unsafe", replayError);
+        }
+        if (
+          replay.content !== current
+          || replay.parentDev !== historyHandle.witness.dev
+          || replay.parentIno !== historyHandle.witness.ino
+        ) {
+          return archiveUnsafeStorage(
+            "backend publication archive replay does not match the retained history directory",
+            new Error("archive replay identity or bytes changed"),
+          );
+        }
+        assertRetainedArchiveHistoryDirectory(history, historyHandle);
+      }
+
+      observer("after-terminal-journal-archive-publication", archivePath);
+      observer("before-terminal-journal-history-sync", history);
+      assertRetainedArchiveHistoryDirectory(history, historyHandle);
+      fsyncSync(historyHandle.fd);
+      assertRetainedArchiveHistoryDirectory(history, historyHandle);
+      assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+      fsyncSync(directoryHandle.fd);
+      assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+    },
+  );
+  observer("after-terminal-journal-history-operation", history);
 }
 
 function materialToJson(file: BackendPublicationRecoveryFile): Record<string, unknown> {

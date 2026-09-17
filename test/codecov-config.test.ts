@@ -78,6 +78,8 @@ const expectedComponents = [
       "^src/scrub\\.ts$",
       "^src/secret-key\\.ts$",
       // #1032 keeps retained-parent atomic-write outcome hardening in this owner.
+      // #1285 preserves ordered collision and task-owned temporary cleanup
+      // evidence in the retained-parent exclusive private-file writer.
       "^src/security-files\\.ts$",
       // #1133 keeps project-pattern owner/single-link admission and authenticated
       // single-snapshot scrubbing in this existing configuration-security owner.
@@ -196,6 +198,8 @@ const expectedComponents = [
       // directory-witness authentication in this owner.
       // #1240 keeps authenticated terminal-maintenance configuration admission here.
       // #1292 preserves structured parser errors on terminal journal archive rereads.
+      // #1285 retains terminal archive history identity through exclusive
+      // publication, exact replay, and descriptor-bound durability flushes.
       "^src/storage/backend-publication\\.ts$",
       // #910 keeps shared publication retry deadlines monotonic in this owner.
       "^src/storage/publication-convergence\\.ts$",

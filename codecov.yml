@@ -73,6 +73,8 @@ component_management:
         - "^src/runtime-root\\.ts$"
         - "^src/scrub\\.ts$"
         - "^src/secret-key\\.ts$"
+        # #1285 preserves ordered collision and task-owned temporary cleanup
+        # evidence in the retained-parent exclusive private-file writer.
         - "^src/security-files\\.ts$"
         # #1133 keeps project-pattern owner/single-link admission and authenticated
         # single-snapshot scrubbing in this existing configuration-security owner.
@@ -249,6 +251,8 @@ component_management:
         # #837 retains consumer-admission descriptor cleanup in this owner.
         # #1240 keeps authenticated terminal-maintenance configuration admission here.
         # #1292 preserves structured parser errors on terminal journal archive rereads.
+        # #1285 retains terminal archive history identity through exclusive
+        # publication, exact replay, and descriptor-bound durability flushes.
         # #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
         # #906 keeps bounded publication-convergence probe expiry and error
         # selection in this storage-abstractions owner.

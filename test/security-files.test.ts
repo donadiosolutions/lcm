@@ -50,6 +50,7 @@ import {
   openPrivateDirectoryIfExists,
   privateFileAbsentAtRetainedParent,
   PrivateDirectoryTopologyError,
+  PrivateFileCollisionCleanupError,
   PrivateFileCollisionError,
   PrivateFilePublicationTopologyError,
   readBoundedRegularFile,
@@ -476,7 +477,7 @@ describe("private filesystem primitives", () => {
     }
   });
 
-  it("keeps destination collision classified when exclusive cleanup also fails", () => {
+  it("preserves destination collision and exclusive cleanup failure in order", () => {
     const root = makeRoot();
     const parent = openPrivateDirectory(root);
     const target = join(root, "metadata.json");
@@ -491,14 +492,117 @@ describe("private filesystem primitives", () => {
       } catch (error) {
         observed = error;
       }
-      expect(observed).toBeInstanceOf(PrivateFileCollisionError);
+      expect(observed).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(observed).not.toBeInstanceOf(PrivateFileCollisionError);
+      expect(observed).toBeInstanceOf(PrivateFileCollisionCleanupError);
+      const aggregate = (observed as Error).cause as AggregateError & { cause?: unknown };
+      expect(aggregate).toBeInstanceOf(AggregateError);
+      expect(aggregate.message).toBe("private file publication and temporary cleanup failed");
+      expect(aggregate.errors[0]).toBeInstanceOf(PrivateFileCollisionError);
+      expect(aggregate.errors[1]).toBe(cleanupFailure);
+      expect(aggregate.cause).toBe(aggregate.errors[0]);
       expect(readFileSync(target, "utf8")).toBe("winner");
+      expect(readdirSync(root).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toHaveLength(1);
     } finally {
       parent.close();
     }
   });
 
-  it("keeps destination collision classified when the parent also changes", () => {
+  it("preserves collision cleanup and topology errors when removal rebinds the parent", () => {
+    const sandbox = makeRoot();
+    const active = join(sandbox, "active");
+    const displaced = join(sandbox, "displaced");
+    const replacement = join(sandbox, "replacement");
+    mkdirSync(active, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    writeFileSync(join(replacement, "sentinel"), "replacement", { mode: 0o600 });
+    const target = join(active, "metadata.json");
+    writeFileSync(target, "winner", { mode: 0o600 });
+    const parent = openPrivateDirectory(active);
+    const cleanupFailure = Object.assign(new Error("cleanup failed after parent rebound"), { code: "EIO" });
+    let observed: unknown;
+    try {
+      try {
+        atomicWritePrivateFile(target, "loser", {
+          remove: () => {
+            renameSync(active, displaced);
+            renameSync(replacement, active);
+            throw cleanupFailure;
+          },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        observed = error;
+      }
+
+      expect(observed).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(observed).not.toBeInstanceOf(PrivateFileCollisionError);
+      expect(observed).toBeInstanceOf(PrivateFileCollisionCleanupError);
+      const aggregate = (observed as Error).cause as AggregateError & { cause?: unknown };
+      expect(aggregate).toBeInstanceOf(AggregateError);
+      expect(aggregate.errors[0]).toBeInstanceOf(PrivateFileCollisionError);
+      expect(aggregate.errors[1]).toBe(cleanupFailure);
+      expect(aggregate.errors[2]).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(aggregate.cause).toBe(aggregate.errors[0]);
+      expect(readFileSync(join(displaced, "metadata.json"), "utf8")).toBe("winner");
+      expect(readdirSync(displaced).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toHaveLength(1);
+      expect(readFileSync(join(active, "sentinel"), "utf8")).toBe("replacement");
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("fails closed when collision cleanup refuses an untrusted replacement", () => {
+    const root = makeRoot();
+    const parent = openPrivateDirectory(root);
+    const target = join(root, "metadata.json");
+    const tempPath = join(root, `.metadata.json.${"77".repeat(12)}.tmp`);
+    const collision = Object.assign(new Error("destination exists"), { code: "EEXIST" });
+    writeFileSync(target, "winner", { mode: 0o600 });
+    let observed: unknown;
+    let preparedIno: bigint | undefined;
+    let replacementIno: bigint | undefined;
+    try {
+      try {
+        atomicWritePrivateFile(target, "loser", {
+          random: () => Buffer.alloc(12, 0x77),
+          link: (source) => {
+            // Allocate the replacement inode while the prepared temporary is
+            // still linked, then rename it over the prepared pathname.  A
+            // remove-then-create sequence lets a filesystem reuse the just
+            // freed inode, which would make identity-bound cleanup succeed and
+            // silently defeat this regression on some runners.
+            const replacement = `${source}.untrusted`;
+            preparedIno = (statSync(source, { bigint: true })).ino;
+            writeFileSync(replacement, "untrusted replacement", { mode: 0o600 });
+            replacementIno = (statSync(replacement, { bigint: true })).ino;
+            renameSync(replacement, source);
+            throw collision;
+          },
+        }, parent, { requireAbsent: true });
+      } catch (error) {
+        observed = error;
+      }
+
+      expect(replacementIno).not.toBe(preparedIno);
+      expect(observed).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(observed).not.toBeInstanceOf(PrivateFileCollisionError);
+      expect(observed).toBeInstanceOf(PrivateFileCollisionCleanupError);
+      const aggregate = (observed as Error).cause as AggregateError & { cause?: unknown };
+      expect(aggregate).toBeInstanceOf(AggregateError);
+      expect(aggregate.errors[0]).toBeInstanceOf(PrivateFileCollisionError);
+      expect(aggregate.errors[1]).toMatchObject({
+        message: "private exclusive publication temp cleanup was not completed",
+      });
+      expect(aggregate.cause).toBe(aggregate.errors[0]);
+      expect(readFileSync(target, "utf8")).toBe("winner");
+      expect(readFileSync(tempPath, "utf8")).toBe("untrusted replacement");
+    } finally {
+      parent.close();
+    }
+  });
+
+  it("preserves collision and cleanup refusal when the parent also changes", () => {
     const sandbox = makeRoot();
     const active = join(sandbox, "active");
     const displaced = join(sandbox, "displaced");
@@ -522,11 +626,23 @@ describe("private filesystem primitives", () => {
       } catch (error) {
         thrown = error;
       }
-      expect(thrown).toBeInstanceOf(PrivateFileCollisionError);
+      expect(thrown).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(thrown).not.toBeInstanceOf(PrivateFileCollisionError);
+      expect(thrown).toBeInstanceOf(PrivateFileCollisionCleanupError);
       expect(thrown).not.toBeInstanceOf(PrivateFilePublicationTopologyError);
-      expect((thrown as Error).cause).toBe(collision);
+      const aggregate = (thrown as Error).cause as AggregateError & { cause?: unknown };
+      expect(aggregate).toBeInstanceOf(AggregateError);
+      expect(aggregate.errors[0]).toBeInstanceOf(PrivateFileCollisionError);
+      expect((aggregate.errors[0] as Error).cause).toBe(collision);
+      expect(aggregate.errors[1]).toBeInstanceOf(PrivateDirectoryTopologyError);
+      expect(aggregate.errors[1]).toMatchObject({
+        message: "private exclusive publication temp cleanup was not completed",
+        cause: expect.any(PrivateDirectoryTopologyError),
+      });
+      expect(aggregate.cause).toBe(aggregate.errors[0]);
       expect(readFileSync(join(displaced, "metadata.json"), "utf8")).toBe("winner");
       expect(existsSync(target)).toBe(false);
+      expect(readdirSync(displaced).filter(name => /^\.metadata\.json\..+\.tmp$/u.test(name))).toHaveLength(1);
     } finally {
       parent.close();
     }

@@ -188,6 +188,31 @@ Legacy version-2 malformed checksum syntax remains `malformed-journal`, while
 version-3 malformed checksum syntax and payload-invalid checksums in either
 version remain `checksum-mismatch`.
 
+Terminal archive publication retains one authenticated `history/` directory
+descriptor and its original device/inode identity from admission through the
+archive write or exact replay and both directory flushes. Only an initial
+no-follow descriptor open that reports absence permits LCM to create
+`history/`, non-recursively and with mode `0700`; an `EEXIST` create race or an
+unsafe file, symlink, owner, or mode is refused without repair or replacement.
+Archive creation is exclusive. If the checksum-named archive already exists,
+LCM accepts it only when its exact bytes and raw SHA-256 match the live terminal
+journal, its mode is `0600`, its owner is the expected user when the platform
+supports that check, it has one link, and its parent identity matches the
+retained history descriptor. LCM then flushes that retained history descriptor
+before the already-retained outer publication descriptor. A replacement or
+flush failure leaves the terminal journal live, and a retry may replay an
+already-complete authenticated archive.
+
+These checks revalidate both retained descriptors and their pathnames at each
+security boundary. They detect substitutions observed at those boundaries, but
+the archive mutation remains pathname-based and cannot provide a fully
+descriptor-relative guarantee against a same-UID process that can replace paths
+between checks. Keep the home and `.lcm` trees private and treat an
+`unsafe-storage` refusal as evidence to preserve and diagnose. Retry safety
+begins after exclusive archive publication returns, when its temporary alias is
+gone and the archive has one link; LCM does not claim cleanup after arbitrary
+process termination inside that generic publication helper.
+
 If maintenance entry is interrupted after its entering checkpoint, call
 `enterMaintenance` with the exact original publication, generation, selection,
 queue evidence and roster, plus the observed `expectedChecksumSha256` for
