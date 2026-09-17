@@ -5221,14 +5221,14 @@ describe("worktree reconciliation", () => {
     });
   });
 
-  it("rejects a reconciliation target identity that does not match the discovered Git repository", () => {
+  it("rejects a reconciliation target identity that does not match the discovered project directory", () => {
     const { main } = makeRepository(home);
     const foreignCanonical = join(home, "not-this-repository");
     makePrivateFixtureDirectory(foreignCanonical);
 
     expect(() => reconcileWorktrees(main, {
       _targetIdentity: { id: hashProjectPath(foreignCanonical), canonical: foreignCanonical },
-    })).toThrow("mapped project identity does not match the current Git repository");
+    })).toThrow("mapped project identity does not match the current project directory");
   });
 
   it("fails closed when a successor-shaped identity's retired fence is absent", () => {
@@ -5289,6 +5289,113 @@ describe("worktree reconciliation", () => {
     expect(() => ensureWorktreeProjectReconciled(linked)).toThrow(
       "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile",
     );
+  });
+
+  // `lcm project reconcile-worktrees`, `createProject`, and
+  // `showReconciledLocalProject` call `reconcileWorktrees` directly and never
+  // supply an authenticated target identity, so the fail-closed rule has to
+  // live in `reconcileWorktrees` itself rather than only in
+  // `ensureWorktreeProjectReconciled`.
+  it("refuses a direct reconciliation of an unauthenticated successor without folding it", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const oldId = hashProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [newId]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    const successorDb = join(home, ".lcm", "projects", newId, "db.sqlite");
+    const successorEvents = join(home, ".lcm", "events", `${newId}.db`);
+    makeDatabase(successorDb, "renewed-session", "renewed content", newId);
+    makeEvents(successorEvents, "renewed-session");
+    clearProjectMapCache();
+    const mapBefore = readFileSync(projectMapPath(), "utf8");
+    const dbBefore = readFileSync(successorDb);
+    const eventsBefore = readFileSync(successorEvents);
+
+    expect(() => reconcileWorktrees(linked)).toThrow(
+      "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile",
+    );
+
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(mapBefore);
+    expect(readFileSync(successorDb)).toEqual(dbBefore);
+    expect(readFileSync(successorEvents)).toEqual(eventsBefore);
+    expect(existsSync(join(home, ".lcm", "projects", oldId))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "events", `${oldId}.db`))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
+    expect(listProjectMapEntries()).toEqual({
+      [newId]: { canonical, aliases: [] },
+    });
+  });
+
+  it("reports the fence refusal, not a filesystem error, for a tampered retired fence", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const oldId = hashProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [newId]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    const projects = join(home, ".lcm", "projects");
+    makePrivateFixtureDirectory(projects, { recursive: true });
+    const tamperedBytes = serializeWorktreeReconciliationFence(newId, "project");
+    writePrivateFixtureFile(join(projects, oldId), tamperedBytes);
+    clearProjectMapCache();
+
+    // The retired path holds a regular file, so folding backwards onto it
+    // would fail with a bare ENOTDIR while creating the retired project
+    // directory. Authenticating before discovery replaces that with the
+    // actionable fence diagnostic.
+    let refusal: unknown;
+    try {
+      reconcileWorktrees(linked);
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toBe(
+      "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile",
+    );
+    expect((refusal as NodeJS.ErrnoException).code).toBeUndefined();
+    expect(readFileSync(join(projects, oldId), "utf8")).toBe(tamperedBytes);
+    expect(lstatSync(join(projects, oldId)).isFile()).toBe(true);
+  });
+
+  it("targets the authenticated successor when a renewed project is reconciled directly", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const oldId = hashProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [oldId]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    const projects = join(home, ".lcm", "projects");
+    makePrivateFixtureDirectory(projects, { recursive: true });
+    const fenceBytes = serializeWorktreeReconciliationFence(oldId, "project");
+    writePrivateFixtureFile(join(projects, oldId), fenceBytes);
+    clearProjectMapCache();
+    expect(renewRetiredProjectIdentity(main)).toEqual({
+      oldId,
+      newId,
+      canonical,
+      changed: true,
+    });
+    clearProjectMapCache();
+    clearGitProjectAnchorCache();
+    clearWorktreeReconciliationCache();
+
+    const result = reconcileWorktrees(linked);
+
+    expect(result.targetHash).toBe(newId);
+    expect(result.canonical).toBe(canonical);
+    expect(result.sourceHashes).toEqual([]);
+    expect(result.status).toBe("not-needed");
+    expect(listProjectMapEntries()).toEqual({
+      [newId]: { canonical, aliases: [] },
+    });
+    expect(readFileSync(join(projects, oldId), "utf8")).toBe(fenceBytes);
+    expect(lstatSync(join(projects, oldId)).isFile()).toBe(true);
   });
 
   it("rejects conflicting legacy bindings before PostgreSQL admission mutates project state", () => {

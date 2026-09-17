@@ -3,10 +3,11 @@ import { join, resolve } from "node:path";
 import { localProjectIdentity } from "../daemon/project.js";
 import {
   hashProjectPath,
+  isAuthenticatedRetiredProjectIdentitySuccessor,
+  isRetiredProjectIdentitySuccessor,
   normalizeProjectIdentityPath,
   normalizeProjectPath,
   resolveExistingProjectIdentity,
-  retiredProjectIdentitySuccessor,
 } from "../project-map.js";
 import { lcmHomeDir } from "../runtime-paths.js";
 import {
@@ -18,7 +19,6 @@ import {
   readBoundedRegularFile,
 } from "../security-files.js";
 import type { BackendPublicationLockToken } from "../storage/backend-publication.js";
-import { isAuthenticatedRetiredProjectIdentityFence } from "../worktree-reconciliation-fence.js";
 
 const IDENTITY_EVIDENCE_VERSION = 1;
 const MAX_IDENTITY_EVIDENCE_BYTES = 4 * 1024;
@@ -55,11 +55,7 @@ function effectiveUid(): number | undefined {
 function isAuthenticatedIdentityEvidenceId(canonical: string, id: string): boolean {
   const plainId = hashProjectPath(canonical);
   if (id === plainId) return true;
-  return id === retiredProjectIdentitySuccessor(plainId, canonical)
-    && isAuthenticatedRetiredProjectIdentityFence(
-      join(lcmHomeDir(), "projects", plainId),
-      plainId,
-    );
+  return isAuthenticatedRetiredProjectIdentitySuccessor(id, plainId, canonical);
 }
 
 function identityEvidencePath(normalizedCwd: string): string {
@@ -173,7 +169,19 @@ export function existingEventsDbPath(
     try {
       assertPrivateDirectory(handle, directory, witness);
       if (identity) {
-        result = join(directory, `${identity.id}.db`);
+        const retiredId = hashProjectPath(identity.canonical);
+        const successorUnauthenticated = isRetiredProjectIdentitySuccessor(
+          identity.id,
+          retiredId,
+          identity.canonical,
+        ) && !isAuthenticatedRetiredProjectIdentitySuccessor(
+          identity.id,
+          retiredId,
+          identity.canonical,
+        );
+        result = successorUnauthenticated
+          ? undefined
+          : join(directory, `${identity.id}.db`);
       } else {
         const evidenced = existingSidecarFromIdentityEvidence(cwd, expectedUid);
         if (evidenced) {

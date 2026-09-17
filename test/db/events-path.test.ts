@@ -12,6 +12,7 @@ import {
   projectMapPath,
   retiredProjectIdentitySuccessor,
 } from "../../src/project-map.js";
+import { localProjectIdentity } from "../../src/daemon/project.js";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -341,6 +342,37 @@ describe("backend-independent local project identity", () => {
     expect(existingEventsDbPath(project)).toBeUndefined();
   });
 
+  it.each([
+    { fence: "absent" as const },
+    { fence: "tampered" as const },
+  ])("refuses a map-backed renewed successor when its predecessor fence is $fence", ({ fence }) => {
+    const canonical = normalizeProjectIdentityPath(project);
+    const retiredId = hashProjectPath(canonical);
+    const successorId = retiredProjectIdentitySuccessor(retiredId, canonical);
+    const sidecarDir = join(home, ".lcm", "events");
+    mkdirSync(sidecarDir, { recursive: true, mode: 0o700 });
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [successorId]: { canonical, aliases: [] },
+    }), { mode: 0o600 });
+    chmodSync(projectMapPath(), 0o600);
+    if (fence === "tampered") {
+      const projectsDir = join(home, ".lcm", "projects");
+      mkdirSync(projectsDir, { recursive: true, mode: 0o700 });
+      writeFileSync(
+        join(projectsDir, retiredId),
+        serializeWorktreeReconciliationFence("f".repeat(64), "project"),
+        { mode: 0o600 },
+      );
+    }
+
+    const writeIdentity = localProjectIdentity(project);
+    const writePath = eventsDbPath(project);
+    const recoveryPath = existingEventsDbPath(project);
+    expect(writeIdentity).toEqual({ id: retiredId, canonical });
+    expect(writePath).toBe(join(sidecarDir, `${retiredId}.db`));
+    expect(recoveryPath).toBeUndefined();
+  });
+
   it("rejects identity evidence whose id is neither the plain hash nor its authenticated successor", () => {
     const canonical = normalizeProjectIdentityPath(project);
     const plainId = hashProjectPath(canonical);
@@ -390,6 +422,7 @@ describe("backend-independent local project identity", () => {
     const evidencePath = join(eventsDir(), `${plainId}.identity.json`);
     expect(existsSync(evidencePath)).toBe(true);
     writeFileSync(dbPath, "");
+    expect(existingEventsDbPath(project)).toBe(dbPath);
 
     // Now simulate an unavailable/unreadable project map: recovery must fall
     // back to the identity evidence written above and still resolve the

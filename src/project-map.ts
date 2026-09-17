@@ -56,6 +56,7 @@ import {
   type BackendPublicationLockToken,
   type BackendPublicationRecoveryFile,
 } from "./storage/backend-publication.js";
+import { isAuthenticatedRetiredProjectIdentityFence } from "./worktree-reconciliation-fence.js";
 
 export type ProjectMapEntry = {
   canonical: string;
@@ -211,6 +212,29 @@ export function retiredProjectIdentitySuccessor(
     .update("\0")
     .update(canonicalPath)
     .digest("hex");
+}
+
+/** Recognize the only successor shape created by retired-identity renewal. */
+export function isRetiredProjectIdentitySuccessor(
+  identityId: string,
+  retiredId: string,
+  canonicalPath: string,
+): boolean {
+  return identityId === retiredProjectIdentitySuccessor(retiredId, canonicalPath);
+}
+
+/** Authenticate a successor-shaped identity with its retained predecessor fence. */
+export function isAuthenticatedRetiredProjectIdentitySuccessor(
+  identityId: string,
+  retiredId: string,
+  canonicalPath: string,
+  homeDir?: string,
+): boolean {
+  return isRetiredProjectIdentitySuccessor(identityId, retiredId, canonicalPath)
+    && isAuthenticatedRetiredProjectIdentityFence(
+      join(projectsDir(homeDir), retiredId),
+      retiredId,
+    );
 }
 
 export type RetiredProjectIdentityRenewal = Readonly<{

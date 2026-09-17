@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -37,6 +38,7 @@ import {
   projectMapPath,
   removeProjectAlias,
   resolveProjectIdentity,
+  retiredProjectIdentitySuccessor,
   setRemoteProjectBinding,
   showProjectMapEntry,
 } from "../src/project-map.js";
@@ -67,11 +69,14 @@ import {
 import { withPrivateMutationLockAsync } from "../src/private-mutation-lock.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
 import { PostgreSqlRuntime } from "../src/storage/postgresql/runtime.js";
+import { runLcmMigrations } from "../src/db/migration.js";
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const MACHINE_B = "018f22c4-6d2a-7f10-9a4c-6b8d3e5f9013";
 const PROJECT_A = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9020";
 const PROJECT_B = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021";
+const MISSING_FENCE_REFUSAL =
+  "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile";
 const SQLITE_CONFIG: ResolvedStorageConfig = { backend: "sqlite" };
 const POSTGRESQL_CONFIG: ResolvedStorageConfig = {
   backend: "postgresql",
@@ -432,6 +437,106 @@ describe("identity service", () => {
     git(main, "commit", "-qm", "initial");
     git(main, "worktree", "add", "-qb", `${name}-linked`, linked);
     return { main, linked };
+  }
+
+  /** Minimal real migrated LCM database, large enough to be a fold source. */
+  function makeDatabase(path: string, sessionId: string): void {
+    mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
+    const db = new DatabaseSync(path);
+    runLcmMigrations(db);
+    db.prepare(
+      `INSERT INTO conversations(
+         session_id, title, bootstrapped_at, created_at, updated_at
+       ) VALUES(?, ?, ?, ?, ?)`,
+    ).run(sessionId, "title", "2026-01-01", "2026-01-01", "2026-01-02");
+    db.close();
+  }
+
+  /** Minimal real event sidecar, large enough to be a fold source. */
+  function makeEvents(path: string, sessionId: string): void {
+    mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
+    const db = new DatabaseSync(path);
+    db.exec(`
+      CREATE TABLE schema_version(version INTEGER NOT NULL);
+      INSERT INTO schema_version VALUES(3);
+      CREATE TABLE events (
+        event_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+        seq INTEGER NOT NULL DEFAULT 0, type TEXT NOT NULL, category TEXT NOT NULL,
+        data TEXT NOT NULL, priority INTEGER DEFAULT 3, source_hook TEXT NOT NULL,
+        prev_event_id INTEGER, processed_at TEXT, created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE TABLE error_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, hook TEXT NOT NULL, error TEXT NOT NULL,
+        session_id TEXT, created_at TEXT DEFAULT (datetime('now'))
+      );
+    `);
+    db.prepare(
+      `INSERT INTO events(
+         session_id, seq, type, category, data, priority, source_hook, created_at
+       ) VALUES(?, 1, 'decision', 'test', '{}', 1, 'PostToolUse', '2026-01-01')`,
+    ).run(sessionId);
+    db.close();
+  }
+
+  type UnauthenticatedSuccessor = {
+    readonly linked: string;
+    readonly canonical: string;
+    readonly retiredId: string;
+    readonly successorId: string;
+    readonly successorDb: string;
+    readonly successorEvents: string;
+  };
+
+  /**
+   * Git-anchored project whose map is keyed by a successor id with no
+   * predecessor fence: the exact shape a hand-edited map or a renewal that
+   * failed before installing its fence leaves behind.
+   */
+  function plantUnauthenticatedSuccessor(name: string): UnauthenticatedSuccessor {
+    const { main, linked } = makeRepository(name);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const retiredId = hashProjectPath(canonical);
+    const successorId = retiredProjectIdentitySuccessor(retiredId, canonical);
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [successorId]: { canonical, aliases: [] },
+    }, null, 2)}\n`, { mode: 0o600 });
+    const successorDb = join(home, ".lcm", "projects", successorId, "db.sqlite");
+    const successorEvents = join(home, ".lcm", "events", `${successorId}.db`);
+    makeDatabase(successorDb, "renewed-session");
+    makeEvents(successorEvents, "renewed-session");
+    clearProjectMapCache();
+    clearGitProjectAnchorCache();
+    clearWorktreeReconciliationCache();
+    return { linked, canonical, retiredId, successorId, successorDb, successorEvents };
+  }
+
+  function successorBytes(planted: UnauthenticatedSuccessor): {
+    readonly map: string;
+    readonly db: Buffer;
+    readonly events: Buffer;
+  } {
+    return {
+      map: readFileSync(projectMapPath(), "utf8"),
+      db: readFileSync(planted.successorDb),
+      events: readFileSync(planted.successorEvents),
+    };
+  }
+
+  function expectSuccessorUntouched(
+    planted: UnauthenticatedSuccessor,
+    before: ReturnType<typeof successorBytes>,
+  ): void {
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(before.map);
+    expect(readFileSync(planted.successorDb)).toEqual(before.db);
+    expect(readFileSync(planted.successorEvents)).toEqual(before.events);
+    expect(existsSync(join(home, ".lcm", "projects", planted.retiredId))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "events", `${planted.retiredId}.db`))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
+    expect(listProjectMapEntries()).toEqual({
+      [planted.successorId]: { canonical: planted.canonical, aliases: [] },
+    });
   }
 
   async function register(): Promise<void> {
@@ -1941,6 +2046,49 @@ describe("identity service", () => {
     });
     expect(Object.values(unlinkedMap).flatMap((entry) => entry.aliases))
       .not.toContain(unlinkAlias);
+  });
+
+  // A successor-shaped map key is reachable only through renewal, so it is
+  // proof the project was already renewed. `createProject` reconciles through
+  // `withReconciledRemoteProjectIdentityMutationLock` and never supplies an
+  // authenticated target identity, so without the fail-closed rule inside
+  // `reconcileWorktrees` this call would target the retired hash, classify the
+  // live successor as a legacy source, and fold its database and event sidecar
+  // backwards — silently undoing the renewal while the user only asked to
+  // create a PostgreSQL project.
+  it("refuses remote project creation for a successor identity with no predecessor fence", async () => {
+    await register();
+    const planted = plantUnauthenticatedSuccessor("unauthenticated-create");
+    const before = successorBytes(planted);
+    repository.createProject.mockClear();
+    vi.mocked(deps.openSession!).mockClear();
+
+    await expect(createProject(POSTGRESQL_CONFIG, planted.linked, {}, deps))
+      .rejects.toThrow(MISSING_FENCE_REFUSAL);
+
+    expect(deps.openSession).not.toHaveBeenCalled();
+    expect(repository.createProject).not.toHaveBeenCalled();
+    expectSuccessorUntouched(planted, before);
+  });
+
+  // `showReconciledLocalProject` is the other direct `reconcileWorktrees`
+  // caller without an authenticated target identity. Both of its production
+  // callers — local alias linking and unlinking — have to inherit the same
+  // refusal, so neither one can fold a live renewed project backwards onto its
+  // retired identity as a side effect of an ordinary map lookup.
+  it("refuses local link and unlink for a successor identity with no predecessor fence", async () => {
+    const planted = plantUnauthenticatedSuccessor("unauthenticated-show");
+    const aliasPath = makeProject("unauthenticated-show-alias");
+    const before = successorBytes(planted);
+
+    await expect(linkProject(SQLITE_CONFIG, planted.linked, aliasPath, {}, deps))
+      .rejects.toThrow(MISSING_FENCE_REFUSAL);
+    clearWorktreeReconciliationCache();
+    await expect(unlinkProject(SQLITE_CONFIG, planted.linked, deps))
+      .rejects.toThrow(MISSING_FENCE_REFUSAL);
+
+    expect(deps.openSession).not.toHaveBeenCalled();
+    expectSuccessorUntouched(planted, before);
   });
 
   it("rejects conflicting legacy worktree bindings before remote link or local mutation", async () => {

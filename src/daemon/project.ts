@@ -4,9 +4,9 @@ import { join, resolve, normalize, join as pathJoin, dirname, basename, parse } 
 import { lcmHomeDir } from "../runtime-paths.js";
 import {
   hashProjectPath,
+  isAuthenticatedRetiredProjectIdentitySuccessor,
   normalizeProjectIdentityPath,
   projectMapPath,
-  retiredProjectIdentitySuccessor,
   resolveProjectIdentity,
   type ProjectIdentity,
 } from "../project-map.js";
@@ -27,7 +27,6 @@ import type { BackendPublicationLockToken } from "../storage/backend-publication
 import { resolveStorageIdentityContext } from "../storage/identity-context.js";
 import type { ResolvedStorageConfig } from "./config.js";
 import { ensureWorktreeProjectReconciled } from "../worktree-reconciliation.js";
-import { isAuthenticatedRetiredProjectIdentityFence } from "../worktree-reconciliation-fence.js";
 
 export const MAX_PROJECT_METADATA_BYTES = 1024 * 1024;
 const MAX_PROJECT_MAP_COMPATIBILITY_BYTES = 4 * 1024 * 1024;
@@ -185,14 +184,14 @@ function parseLocalProjectMapCompatibility(
     // during worktree reconciliation. Derive the hook ID from the stable
     // canonical path so an old/new map pair cannot make eventsDbPath oscillate.
     const retiredId = hashProjectPath(normalizeProjectIdentityPath(matched.canonical));
-    const successorId = retiredProjectIdentitySuccessor(retiredId, matched.canonical);
-    const acceptsSuccessor = matched.id === successorId
-      && isAuthenticatedRetiredProjectIdentityFence(
-        join(lcmHomeDir(homeDir), "projects", retiredId),
-        retiredId,
-      );
+    const acceptsSuccessor = isAuthenticatedRetiredProjectIdentitySuccessor(
+      matched.id,
+      retiredId,
+      matched.canonical,
+      homeDir,
+    );
     return {
-      id: acceptsSuccessor ? successorId : retiredId,
+      id: acceptsSuccessor ? matched.id : retiredId,
       canonical: matched.canonical,
     };
   } catch {

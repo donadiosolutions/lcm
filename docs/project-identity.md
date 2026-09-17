@@ -152,6 +152,35 @@ command. Any alias, remote binding, ambiguous owner, occupied successor,
 malformed fence, unsafe mode/owner/link count, or race remains a strict refusal
 that requires inspection rather than automatic repair.
 
+A completed renewal is then enforced wherever LCM reconciles or admits writes.
+Only renewal can create a successor-shaped map key, so LCM treats that key as
+proof the project was already renewed and requires the retained predecessor
+fence before acting on it. When the fence is absent or no longer authenticates,
+reconciliation refuses with `renewed project identity is missing its
+predecessor reconciliation fence; refusing to reconcile` instead of falling
+back to the retired path hash, which would treat the renewed project's live
+database and event sidecar as a legacy source, fold them into the retired
+identity, archive the successor, and rekey `map.json` backwards. The refusal
+reaches `lcm project reconcile-worktrees`, `lcm project create`,
+`lcm project link`, `lcm project unlink`, and the storage admission a mutating
+compact run performs, because each of them reconciles before it touches project
+state. It happens before any source discovery or merge, so nothing is copied,
+archived, or moved.
+
+Prompt hooks do not fail on such a binding. They resolve the project under the
+retired path hash rather than the unauthenticated successor, and sidecar
+recovery reports no existing sidecar instead of one that writes would not use,
+so a hook keeps writing under a single consistent identity. Restore the fence
+from backup and retry; do not delete the successor binding to work around the
+refusal.
+
+These checks never require a Git anchor, because an ordinary directory renews
+exactly as a repository does. A renewed project reached through a symlinked
+path therefore reconciles normally: the mapped identity and the discovered
+directory are normalized the same way before they are compared. A genuine
+mismatch reports `mapped project identity does not match the current project
+directory`.
+
 On first local storage access after upgrade, LCM checks the current checkout's
 verified Git common directory. If older `map.json` entries treated linked
 worktrees as separate projects, LCM acquires a private cross-process lock and

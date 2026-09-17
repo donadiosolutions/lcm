@@ -29,7 +29,10 @@ import { resolveGitProjectAnchor } from "./git-project.js";
 import {
   foldProjectMapEntriesLocked,
   hashProjectPath,
+  isRetiredProjectIdentitySuccessor,
   listProjectMapEntries,
+  normalizeProjectIdentityPath,
+  normalizeProjectPath,
   projectMapPath,
   readProjectMapSnapshot,
   resolveExistingProjectIdentity,
@@ -2540,6 +2543,59 @@ function resultFromJournal(journal: ReconciliationJournal, path: string): Worktr
   };
 }
 
+/**
+ * Require the retained predecessor fence of an already-renewed identity.
+ *
+ * A successor-shaped binding is only reachable through renewal, so its
+ * presence is proof the project was already renewed. Without a fence to
+ * reverify that renewal, ordinary reconciliation targets the retired hash,
+ * recreates the retired directory, and folds the live successor database and
+ * event sidecar backwards into it as a legacy source. Fail closed instead of
+ * letting a missing or tampered fence silently undo a renewal.
+ */
+function assertRenewedProjectIdentityFence(retiredId: string, homeDir?: string): void {
+  if (isAuthenticatedRetiredProjectIdentityFence(projectStateDir(retiredId, homeDir), retiredId)) {
+    return;
+  }
+  throw new Error(
+    "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile",
+  );
+}
+
+/**
+ * Resolve the reconciliation target hash for a persisted renewed identity.
+ *
+ * `ensureWorktreeProjectReconciled` authenticates a renewed successor before
+ * it delegates, but `lcm project reconcile-worktrees`, `createProject`, and
+ * `showReconciledLocalProject` call `reconcileWorktrees` directly. Those
+ * callers otherwise target the retired hash, `discoverSources` classifies the
+ * live successor entry as a legacy source because it belongs to the same
+ * repository, and the fold merges the successor's database and sidecar into
+ * the retired id, archives the successor, and rekeys the map backwards.
+ * Authenticating here, before any discovery or fold, covers every entry point
+ * from one choke point instead of from each caller.
+ *
+ * The successor id is derived from the retired id and this exact canonical
+ * path, so a map entry under that id is already the binding for this project
+ * and needs no further path comparison. Looking the id up directly also keeps
+ * the multi-owner refusal of `resolveExistingProjectIdentity` out of
+ * reconciliation, whose whole purpose is to fold several entries of one
+ * repository together.
+ */
+function authenticatedRenewedTargetHash(
+  canonical: string,
+  homeDir: string | undefined,
+  publicationLockToken: BackendPublicationLockToken,
+): string | undefined {
+  const retiredId = hashProjectPath(canonical);
+  const successorId = retiredProjectIdentitySuccessor(retiredId, canonical);
+  if (readProjectMapSnapshot(homeDir, publicationLockToken)[successorId] === undefined) {
+    return undefined;
+  }
+  assertRenewedProjectIdentityFence(retiredId, homeDir);
+  return successorId;
+}
+
 export function reconcileWorktrees(
   path: string = process.cwd(),
   opts: {
@@ -2582,15 +2638,27 @@ export function reconcileWorktrees(
       }));
   }
   const anchor = resolveGitProjectAnchor(path);
-  const discoveredCanonical = anchor?.canonical ?? resolve(path);
+  // Both sides of this comparison must use the same identity normalization.
+  // A supplied `_targetIdentity` carries the canonical path that renewal and
+  // `normalizeProjectIdentityPath` produced, which realpaths a directory with
+  // no Git anchor. Spelling the discovered path with `resolve` alone made a
+  // genuinely renewed, authenticated non-Git project reached through a
+  // symlinked path fail here. `anchor?.canonical ?? normalizeProjectPath(path)`
+  // is exactly `normalizeProjectIdentityPath(path)` without a second Git probe.
+  const discoveredCanonical = anchor?.canonical ?? normalizeProjectPath(path);
   if (opts._targetIdentity !== undefined
     && resolve(opts._targetIdentity.canonical) !== discoveredCanonical) {
-    throw new Error("mapped project identity does not match the current Git repository");
+    throw new Error("mapped project identity does not match the current project directory");
   }
   const canonical = opts._targetIdentity === undefined
     ? discoveredCanonical
     : resolve(opts._targetIdentity.canonical);
-  const targetHash = opts._targetIdentity?.id ?? hashProjectPath(canonical);
+  // A supplied `_targetIdentity` was already authenticated by
+  // `authenticatedRenewedReconciliationTarget`; every other caller reaches the
+  // same authentication here.
+  const targetHash = opts._targetIdentity?.id
+    ?? authenticatedRenewedTargetHash(canonical, opts.homeDir, opts._publicationLockToken)
+    ?? hashProjectPath(canonical);
   if (!anchor) {
     return {
       status: "not-needed",
@@ -3211,29 +3279,32 @@ export function reconcileWorktrees(
   }
 }
 
+/**
+ * Authenticate a persisted successor-shaped identity against the retained
+ * fence of its retired predecessor, independently of Git.
+ *
+ * `renewRetiredProjectIdentity` derives its canonical path through
+ * `normalizeProjectIdentityPath`, which falls back to `normalizeProjectPath`
+ * when there is no Git anchor, so an ordinary directory can be renewed and
+ * produce a successor-shaped map entry exactly as a repository can. Deriving
+ * the anchor here with the same function keeps this check aligned with both
+ * renewal and the hook path in `parseLocalProjectMapCompatibility`, which is
+ * already Git-independent. Requiring a Git anchor instead left a non-Git
+ * successor entry unauthenticated by construction: reconciliation reported
+ * "not-needed" without ever consulting the fence, and CLI storage then
+ * admitted writes under the unauthenticated successor.
+ */
 function authenticatedRenewedReconciliationTarget(
   cwd: string,
   identity: ProjectIdentity | undefined,
 ): ProjectIdentity | undefined {
   if (identity === undefined) return undefined;
-  const anchor = resolveGitProjectAnchor(cwd);
-  if (anchor === null || resolve(identity.canonical) !== anchor.canonical) return undefined;
-  const retiredId = hashProjectPath(anchor.canonical);
-  const successorId = retiredProjectIdentitySuccessor(retiredId, anchor.canonical);
-  if (identity.id !== successorId) return undefined;
-  if (!isAuthenticatedRetiredProjectIdentityFence(projectStateDir(retiredId), retiredId)) {
-    // The persisted id is reachable only through renewal, so this successor
-    // shape is proof the project was already renewed. Returning undefined
-    // here would fall through to ordinary reconciliation, which targets the
-    // retired hash, recreates the retired directory, and folds the live
-    // successor database backwards into it as a legacy source. Fail closed
-    // instead of letting a missing or tampered fence silently undo a
-    // renewal.
-    throw new Error(
-      "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile",
-    );
-  }
-  return { ...identity, canonical: anchor.canonical };
+  const canonical = normalizeProjectIdentityPath(cwd);
+  if (resolve(identity.canonical) !== canonical) return undefined;
+  const retiredId = hashProjectPath(canonical);
+  if (!isRetiredProjectIdentitySuccessor(identity.id, retiredId, canonical)) return undefined;
+  assertRenewedProjectIdentityFence(retiredId);
+  return { ...identity, canonical };
 }
 
 export function ensureWorktreeProjectReconciled(
