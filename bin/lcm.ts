@@ -1658,7 +1658,7 @@ export function registerProjectCommand(
       const { printHelp } = await import("../src/cli-help.js");
       printHelp("project"); exit(0);
     }
-    console.error("Usage: lcm project <create|link|unlink|list|show|reconcile-worktrees> [options]");
+    console.error("Usage: lcm project <create|link|unlink|list|show|reconcile-worktrees|renew-retired-identity> [options]");
     exit(1);
   });
 
@@ -1692,6 +1692,39 @@ export function registerProjectCommand(
           console.log(`  backup: ${sanitizeTerminalText(backup)}`);
         }
         if (result.reason) console.log(`  reason: ${sanitizeTerminalText(result.reason)}`);
+      } catch (err) {
+        projectError(err, opts);
+      }
+    });
+
+  projectCmd
+    .command("renew-retired-identity [path]")
+    .description("Renew one exact retired local project identity without removing its fence")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (path: string | undefined, opts: ProjectOptions) => {
+      if (projectHelpRequested(opts)) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("project"); exit(0);
+      }
+      try {
+        const { renewRetiredProjectIdentity } = await import("../src/project-map.js");
+        const result = renewRetiredProjectIdentity(path ?? process.cwd());
+        if (opts.json) {
+          printJson({
+            oldId: result.oldId,
+            newId: result.newId,
+            changed: result.changed,
+          });
+          return;
+        }
+        console.log(result.changed
+          ? "Renewed retired local project identity."
+          : "Retired local project identity was already renewed.");
+        console.log(`  old: ${result.oldId}`);
+        console.log(`  new: ${result.newId}`);
+        console.log("  Retry the original command; the reconciliation fence was preserved.");
       } catch (err) {
         projectError(err, opts);
       }
@@ -2820,8 +2853,8 @@ export async function runCli(
             },
             onProgress: (patch: Partial<ProgressState>): void => {
               Object.assign(compactState, patch);
-              if (patch.lastResult) compactRenderer.sessionDone();
             },
+            onEvent: event => compactRenderer.handleEvent(event),
           });
 
           compactState.phases[0].status = "done";
@@ -2833,7 +2866,6 @@ export async function runCli(
             for (const promoteCwd of compactedProjects) {
               if (signalHandlers.draining) break;
               compactState.currentProject = sanitizeTerminalText(promoteCwd);
-              if (!isTTY || verbose) console.error(`  promoting: ${sanitizeTerminalText(promoteCwd)}...`);
               try {
                 const promotionBody = {
                   cwd: promoteCwd,
@@ -2871,14 +2903,12 @@ export async function runCli(
               } catch (error) {
                 promotionFailures++;
                 const message = error instanceof Error ? error.message : "request failed";
-                compactState.phaseErrors.push({
+                compactRenderer.handleEvent({
+                  type: "phase-failure",
                   phase: "Promote",
-                  target: sanitizeTerminalText(promoteCwd),
-                  message: sanitizeTerminalText(message),
+                  project: promoteCwd,
+                  message,
                 });
-                console.error(
-                  `  promotion failed for ${sanitizeTerminalText(promoteCwd)}: ${sanitizeTerminalText(message)}`,
-                );
               }
             }
             compactState.currentProject = undefined;
@@ -2934,7 +2964,8 @@ export async function runCli(
             }
           }
         }
-        if (isTTY) compactRenderer.printSummary();
+        compactRenderer.stop();
+        compactRenderer.printSummary();
         if (totalPromoted > 0) {
           console.log(`  → ${totalPromoted} insight${totalPromoted !== 1 ? "s" : ""} promoted`);
         }

@@ -190,6 +190,18 @@ Invoked on each user prompt. lcm searches memory for relevant hints and injects 
 
 **Response:** Exit code `0`. Hints are injected via stdout when relevant matches are found.
 
+Before persisting extracted passive events, the hook checks whether the mapped
+local project storage is the exact authenticated retired-identity fence
+described in [Project identity](project-identity.md#retired-local-identities).
+For that one condition it intentionally skips the prompt's passive events,
+writes one fixed bounded terminal diagnostic directing the user to
+`lcm project renew-retired-identity`, and continues prompt search. It does not
+append a generic `ENOTDIR` row to the sidecar or `~/.lcm/logs/events.log`, does
+not open the normal hook-error circuit, and never renews identity implicitly.
+If stderr is unavailable, the diagnostic is best effort and hook exit remains
+successful. Malformed or uncertain fence topology keeps the ordinary strict
+error path.
+
 ## PostToolUse Hook
 
 **Command:** `lcm post-tool`

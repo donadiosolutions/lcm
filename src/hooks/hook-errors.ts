@@ -15,6 +15,10 @@ import {
   type PrivateDirectoryWitness,
 } from "../security-files.js";
 import { sanitizeHookErrorDiagnostic } from "./hook-error-diagnostic.js";
+import {
+  RETIRED_PROJECT_IDENTITY_DIAGNOSTIC,
+  RetiredProjectIdentityError,
+} from "../worktree-reconciliation-fence.js";
 
 function assertStableRoot(
   handle: PrivateDirectoryHandle,
@@ -43,9 +47,19 @@ function isUnderDir(candidate: string, base: string): boolean {
 }
 
 let testLogPath: string | undefined;
+type RetiredProjectDiagnosticWriter = (message: string) => unknown;
+const defaultRetiredProjectDiagnosticWriter: RetiredProjectDiagnosticWriter =
+  (message) => process.stderr.write(message);
+let retiredProjectDiagnosticWriter = defaultRetiredProjectDiagnosticWriter;
 
 export function _setLogPathForTesting(path: string | undefined): void {
   testLogPath = path;
+}
+
+export function _setRetiredProjectDiagnosticWriterForTesting(
+  writer: RetiredProjectDiagnosticWriter | undefined,
+): void {
+  retiredProjectDiagnosticWriter = writer ?? defaultRetiredProjectDiagnosticWriter;
 }
 
 /** Returns the log path. */
@@ -82,6 +96,15 @@ export async function safeLogError(
   error: unknown,
   opts: { cwd?: string; sessionId?: string },
 ): Promise<void> {
+  if (error instanceof RetiredProjectIdentityError) {
+    try {
+      retiredProjectDiagnosticWriter(`${RETIRED_PROJECT_IDENTITY_DIAGNOSTIC}\n`);
+    } catch {
+      // Hook diagnostics are best effort and must never affect hook exit.
+    }
+    return;
+  }
+
   // Error reporting must not become another hook-side root bootstrap path.
   // If bootstrap/install has not established ~/.lcm, there is nowhere safe
   // to persist a diagnostic and the fail-safe outcome is to return silently.

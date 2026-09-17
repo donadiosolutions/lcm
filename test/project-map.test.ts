@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ESLint } from "eslint";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, fstatSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -20,6 +20,8 @@ import {
   projectMapEntryHasStoredData,
   isProjectHash,
   readProjectMapSnapshot,
+  renewRetiredProjectIdentity,
+  retiredProjectIdentitySuccessor,
   reloadProjectMapCache,
   removeProjectAlias,
   resolveProjectIdentity,
@@ -31,6 +33,10 @@ import {
 import { eventsDbPath } from "../src/db/events-path.js";
 import { projectDbPath, projectId, projectMetaPath } from "../src/daemon/project.js";
 import { clearGitProjectAnchorCache } from "../src/git-project.js";
+import {
+  isAuthenticatedRetiredProjectIdentityFence,
+  serializeWorktreeReconciliationFence,
+} from "../src/worktree-reconciliation-fence.js";
 import {
   BackendPublicationJournalError,
   backendPublicationDirectory,
@@ -75,6 +81,42 @@ function writeLiveProjectMapLock(nonce: string): string {
 
 function writeProjectMap(content: string): void {
   writeFileSync(projectMapPath(), content, { mode: 0o600 });
+}
+
+function writeRetiredProjectFixture(canonical: string): string {
+  const id = hashProjectPath(normalizeProjectPath(canonical));
+  const projects = join(homedir(), ".lcm", "projects");
+  mkdirSync(projects, { recursive: true, mode: 0o700 });
+  chmodSync(projects, 0o700);
+  writeProjectMap(`${JSON.stringify({ [id]: { canonical, aliases: [] } })}\n`);
+  writeFileSync(
+    join(projects, id),
+    serializeWorktreeReconciliationFence(id, "project"),
+    { mode: 0o600 },
+  );
+  clearProjectMapCache();
+  return id;
+}
+
+function makeGitProjectFixture(prefix: string): {
+  primary: string;
+  linked: string;
+  nested: string;
+} {
+  const primary = makeDir(`${prefix}-primary`);
+  const admin = join(primary, ".git", "worktrees", "linked");
+  mkdirSync(join(primary, ".git", "objects"), { recursive: true });
+  mkdirSync(admin, { recursive: true });
+  writeFileSync(join(primary, ".git", "HEAD"), "ref: refs/heads/main\n");
+  writeFileSync(join(primary, ".git", "config"), "[core]\nrepositoryformatversion = 0\n");
+  writeFileSync(join(admin, "HEAD"), "ref: refs/heads/linked\n");
+  writeFileSync(join(admin, "commondir"), "../..\n");
+  const linked = makeDir(`${prefix}-linked`);
+  writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`);
+  writeFileSync(join(admin, "gitdir"), `${join(linked, ".git")}\n`);
+  const nested = join(primary, "src", "deep");
+  mkdirSync(nested, { recursive: true });
+  return { primary, linked, nested };
 }
 
 function finishFakeTimerWatcherTest(
@@ -122,6 +164,865 @@ describe("project map", () => {
     process.env.USERPROFILE = tempHome;
     resetLcmHome();
   });
+
+  it("derives a versioned deterministic retired-identity successor", () => {
+    expect(retiredProjectIdentitySuccessor("a".repeat(64), "/example/project")).toBe(
+      "662e57ffe02db212b732069b1c5914cdb85b29b593023f7024fc0f5cbe593ade",
+    );
+  });
+
+  it("atomically renews an exact local retired identity and retries idempotently", () => {
+    const canonical = makeDir("retired-renewal");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const expectedNewId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+
+    expect(renewRetiredProjectIdentity(canonical)).toEqual({
+      oldId,
+      newId: expectedNewId,
+      canonical: normalizeProjectPath(canonical),
+      changed: true,
+    });
+    expect(readProjectMapSnapshot()).toEqual({
+      [expectedNewId]: { canonical: normalizeProjectPath(canonical), aliases: [] },
+    });
+    expect(isAuthenticatedRetiredProjectIdentityFence(
+      join(homedir(), ".lcm", "projects", oldId),
+      oldId,
+    )).toBe(true);
+
+    expect(renewRetiredProjectIdentity(canonical)).toEqual({
+      oldId,
+      newId: expectedNewId,
+      canonical: normalizeProjectPath(canonical),
+      changed: false,
+    });
+  });
+
+  it.each<[string, (fixture: ReturnType<typeof makeGitProjectFixture>) => string]>([
+    ["nested directory", (fixture) => fixture.nested],
+    ["linked worktree", (fixture) => fixture.linked],
+  ])("renews a retired Git project identity invoked from a %s", (label, pick) => {
+    const fixture = makeGitProjectFixture(`retired-anchor-${label.replaceAll(" ", "-")}`);
+    const canonical = normalizeProjectIdentityPath(fixture.primary);
+    const oldId = writeRetiredProjectFixture(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    const invocationPath = pick(fixture);
+    expect(normalizeProjectPath(invocationPath)).not.toBe(canonical);
+
+    expect(renewRetiredProjectIdentity(invocationPath)).toEqual({
+      oldId,
+      newId,
+      canonical,
+      changed: true,
+    });
+    expect(readProjectMapSnapshot()).toEqual({
+      [newId]: { canonical, aliases: [] },
+    });
+    expect(isAuthenticatedRetiredProjectIdentityFence(
+      join(homedir(), ".lcm", "projects", oldId),
+      oldId,
+    )).toBe(true);
+
+    expect(renewRetiredProjectIdentity(invocationPath)).toEqual({
+      oldId,
+      newId,
+      canonical,
+      changed: false,
+    });
+  });
+
+  it.each([
+    ["alias", (canonical: string, oldId: string) => ({
+      [oldId]: { canonical, aliases: [makeDir("retired-alias")] },
+    })],
+    ["remote binding", (canonical: string, oldId: string) => ({
+      [oldId]: { canonical, aliases: [], remoteProjectId },
+    })],
+    ["non-path hash", (canonical: string) => ({
+      ["f".repeat(64)]: { canonical, aliases: [] },
+    })],
+  ] as const)("refuses retired identity renewal with a %s", (_label, mapFactory) => {
+    const canonical = makeDir(`retired-refusal-${_label.replaceAll(" ", "-")}`);
+    const oldId = writeRetiredProjectFixture(canonical);
+    writeProjectMap(`${JSON.stringify(mapFactory(canonical, oldId))}\n`);
+    clearProjectMapCache();
+    expect(() => renewRetiredProjectIdentity(canonical)).toThrow();
+  });
+
+  it.each(["map", "project", "events"] as const)(
+    "refuses an occupied successor %s location without changing the retired binding",
+    (occupied) => {
+      const canonical = makeDir(`retired-occupied-${occupied}`);
+      const oldId = writeRetiredProjectFixture(canonical);
+      const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+      if (occupied === "map") {
+        writeProjectMap(`${JSON.stringify({
+          [oldId]: { canonical, aliases: [] },
+          [newId]: { canonical: makeDir("retired-successor-owner"), aliases: [] },
+        })}\n`);
+      } else if (occupied === "project") {
+        mkdirSync(join(homedir(), ".lcm", "projects", newId));
+      } else {
+        mkdirSync(join(homedir(), ".lcm", "events"), { recursive: true });
+        writeFileSync(join(homedir(), ".lcm", "events", `${newId}.db`), "occupied");
+      }
+      clearProjectMapCache();
+
+      expect(() => renewRetiredProjectIdentity(canonical)).toThrow();
+      expect(readProjectMapSnapshot()[oldId]).toMatchObject({ canonical });
+    },
+  );
+
+  it.each([
+    ["target replacement", ({ canonical }: { canonical: string; oldId: string; newId: string }) => {
+      renameSync(canonical, `${canonical}-old`);
+      mkdirSync(canonical);
+    }],
+    ["projects parent rebind", ({ projects }: { projects: string }) => {
+      renameSync(projects, `${projects}-old`);
+      mkdirSync(projects, { mode: 0o700 });
+    }],
+    ["events parent rebind", ({ events }: { events: string }) => {
+      renameSync(events, `${events}-old`);
+      mkdirSync(events, { mode: 0o700 });
+    }],
+    ["fence replacement", ({ fence, oldId }: { fence: string; oldId: string }) => {
+      renameSync(fence, `${fence}-old`);
+      writeFileSync(fence, serializeWorktreeReconciliationFence(oldId, "project"), { mode: 0o600 });
+    }],
+    ["fence content mutation", ({ fence }: { fence: string }) => {
+      writeFileSync(fence, "changed", { mode: 0o600 });
+    }],
+    ["successor project creation", ({ projects, newId }: { projects: string; newId: string }) => {
+      mkdirSync(join(projects, newId));
+    }],
+    ["successor event creation", ({ events, newId }: { events: string; newId: string }) => {
+      writeFileSync(join(events, `${newId}.db`), "occupied", { mode: 0o600 });
+    }],
+  ] as const)("preserves the retired map across the post-validation %s race", (_label, race) => {
+    const canonical = makeDir(`retired-publication-${_label.replaceAll(" ", "-")}`);
+    const oldId = writeRetiredProjectFixture(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+    const projects = join(homedir(), ".lcm", "projects");
+    const events = join(homedir(), ".lcm", "events");
+    mkdirSync(events, { recursive: true, mode: 0o700 });
+    chmodSync(events, 0o700);
+    const fence = join(projects, oldId);
+    const beforeMap = readFileSync(projectMapPath(), "utf8");
+
+    expect(() => renewRetiredProjectIdentity(canonical, {
+      _afterValidationBeforePublicationForTesting: () => {
+        race({ canonical, oldId, newId, projects, events, fence } as never);
+      },
+    })).toThrow();
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(beforeMap);
+  });
+
+  it("reports an evidence cleanup failure without disturbing the renewed map", () => {
+    const canonical = makeDir("retired-publication-cleanup");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+    mkdirSync(join(homedir(), ".lcm", "events"), { recursive: true, mode: 0o700 });
+    const fence = join(homedir(), ".lcm", "projects", oldId);
+    const beforeFence = readFileSync(fence);
+    const phases: string[] = [];
+
+    expect(() => renewRetiredProjectIdentity(canonical, {
+      _beforeMapReplaceForTesting: phase => phases.push(phase),
+      _closeEvidenceForTesting: (kind, close) => {
+        close();
+        if (kind === "fence") throw new Error("retained fence cleanup failed");
+      },
+    })).toThrow("retained fence cleanup failed");
+    // The publication passed its own readback, so the renewed binding is
+    // authoritative and no rollback is attempted for a descriptor that
+    // failed to close.
+    expect(phases).toEqual(["publish"]);
+    expect(readProjectMapSnapshot()).toEqual({
+      [newId]: { canonical: normalizeProjectPath(canonical), aliases: [] },
+    });
+    expect(readFileSync(fence)).toEqual(beforeFence);
+    expect(isAuthenticatedRetiredProjectIdentityFence(fence, oldId)).toBe(true);
+  });
+
+  it("closes every renewal descriptor when the initial rollback snapshot read fails", () => {
+    const canonical = makeDir("retired-map-read-cleanup");
+    writeRetiredProjectFixture(canonical);
+    mkdirSync(join(homedir(), ".lcm", "events"), { recursive: true, mode: 0o700 });
+    const primary = new Error("injected renewal map read failure");
+    const closed: string[] = [];
+
+    expect(() => renewRetiredProjectIdentity(canonical, {
+      _readMapFileForTesting: () => { throw primary; },
+      _closeEvidenceForTesting: (kind, close) => {
+        close();
+        closed.push(kind);
+      },
+    })).toThrow(primary);
+    expect(closed).toEqual(["fence", "events", "projects", "target", "root"]);
+  });
+
+  it("orders renewal map read and evidence cleanup failures", () => {
+    const canonical = makeDir("retired-map-read-cleanup-aggregate");
+    writeRetiredProjectFixture(canonical);
+    mkdirSync(join(homedir(), ".lcm", "events"), { recursive: true, mode: 0o700 });
+    const primary = new Error("injected renewal map read failure");
+    const cleanup = new Error("injected renewal fence close failure");
+    const closed: string[] = [];
+    let thrown: unknown;
+
+    try {
+      renewRetiredProjectIdentity(canonical, {
+        _readMapFileForTesting: () => { throw primary; },
+        _closeEvidenceForTesting: (kind, close) => {
+          close();
+          closed.push(kind);
+          if (kind === "fence") throw cleanup;
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(AggregateError);
+    expect((thrown as AggregateError).errors).toEqual([primary, cleanup]);
+    expect((thrown as Error & { cause: unknown }).cause).toBe(primary);
+    expect(closed).toEqual(["fence", "events", "projects", "target", "root"]);
+  });
+
+  it("keeps the renewal authoritative after a post-publication failure", () => {
+    const canonical = makeDir("retired-retained-root-post-publication");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const normalized = normalizeProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalized);
+    const fence = join(homedir(), ".lcm", "projects", oldId);
+    const beforeFence = readFileSync(fence);
+    const primary = new Error("injected post-publication renewal failure");
+    const phases: string[] = [];
+
+    expect(() => renewRetiredProjectIdentity(canonical, {
+      _beforeMapReplaceForTesting: phase => phases.push(phase),
+      _afterMapPublicationForTesting: () => { throw primary; },
+    })).toThrow(primary);
+    expect(phases).toEqual(["publish"]);
+    expect(readProjectMapSnapshot()).toEqual({
+      [newId]: { canonical: normalized, aliases: [] },
+    });
+    expect(readFileSync(fence)).toEqual(beforeFence);
+  });
+
+  it.each([
+    ["an admitted", true],
+    ["an unadmitted", false],
+  ] as const)(
+    "accepts hook successor state created after publication with %s events directory",
+    (_label, admitEvents) => {
+      const canonical = makeDir(`retired-successor-after-publication-${String(admitEvents)}`);
+      const oldId = writeRetiredProjectFixture(canonical);
+      const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+      const projects = join(homedir(), ".lcm", "projects");
+      const events = join(homedir(), ".lcm", "events");
+      const fence = join(projects, oldId);
+      const beforeFence = readFileSync(fence);
+      if (admitEvents) {
+        mkdirSync(events, { recursive: true, mode: 0o700 });
+        chmodSync(events, 0o700);
+      }
+      const phases: string[] = [];
+
+      expect(renewRetiredProjectIdentity(canonical, {
+        _beforeMapReplaceForTesting: phase => phases.push(phase),
+        _afterMapPublicationForTesting: () => {
+          // A concurrent hook resolves the already authoritative successor
+          // without the publication lock and materializes its storage.
+          mkdirSync(join(projects, newId), { recursive: true, mode: 0o700 });
+          mkdirSync(events, { recursive: true, mode: 0o700 });
+          chmodSync(events, 0o700);
+          writeFileSync(join(events, `${newId}.db`), "hook sidecar", { mode: 0o600 });
+        },
+      })).toEqual({
+        oldId,
+        newId,
+        canonical: normalizeProjectPath(canonical),
+        changed: true,
+      });
+      expect(phases).toEqual(["publish"]);
+      expect(readProjectMapSnapshot()).toEqual({
+        [newId]: { canonical: normalizeProjectPath(canonical), aliases: [] },
+      });
+      expect(readFileSync(projectMapPath(), "utf8")).toContain(newId);
+      expect(readFileSync(projectMapPath(), "utf8")).not.toContain(oldId);
+      expect(readFileSync(join(events, `${newId}.db`), "utf8")).toBe("hook sidecar");
+      expect(readFileSync(fence)).toEqual(beforeFence);
+      expect(isAuthenticatedRetiredProjectIdentityFence(fence, oldId)).toBe(true);
+    },
+  );
+
+  it("keeps a published successor authoritative when a hook creates storage before a later failure", () => {
+    const canonical = makeDir("retired-successor-post-publication-failure");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const normalized = normalizeProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalized);
+    const projects = join(homedir(), ".lcm", "projects");
+    const primary = new Error("injected post-publication validation failure");
+    const phases: string[] = [];
+
+    expect(() => renewRetiredProjectIdentity(canonical, {
+      _beforeMapReplaceForTesting: phase => phases.push(phase),
+      _afterMapPublicationForTesting: () => {
+        // Hooks resolve without the publication lock. Once the new map is
+        // visible they may materialize successor state before this process
+        // finishes its remaining validation and readback.
+        mkdirSync(join(projects, newId), { recursive: true, mode: 0o700 });
+        throw primary;
+      },
+    })).toThrow(primary);
+
+    expect(phases).toEqual(["publish"]);
+    expect(readProjectMapSnapshot()).toEqual({
+      [newId]: { canonical: normalized, aliases: [] },
+    });
+    expect(existsSync(join(projects, newId))).toBe(true);
+    expect(renewRetiredProjectIdentity(canonical)).toEqual({
+      oldId,
+      newId,
+      canonical: normalized,
+      changed: false,
+    });
+  });
+
+  it.each([
+    ["successor project directory", ({ projects, newId }: { projects: string; newId: string }) => {
+      mkdirSync(join(projects, newId), { recursive: true, mode: 0o700 });
+    }],
+    ["successor event sidecar", ({ events, newId }: { events: string; newId: string }) => {
+      writeFileSync(join(events, `${newId}.db`), "occupied", { mode: 0o600 });
+    }],
+  ] as const)(
+    "still refuses a %s occupied at the publishing replace boundary",
+    (_label, occupy) => {
+      const canonical = makeDir(`retired-publish-boundary-${_label.replaceAll(" ", "-")}`);
+      const oldId = writeRetiredProjectFixture(canonical);
+      const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+      const projects = join(homedir(), ".lcm", "projects");
+      const events = join(homedir(), ".lcm", "events");
+      mkdirSync(events, { recursive: true, mode: 0o700 });
+      chmodSync(events, 0o700);
+      const beforeMap = readFileSync(projectMapPath(), "utf8");
+      const phases: string[] = [];
+
+      expect(() => renewRetiredProjectIdentity(canonical, {
+        _beforeMapReplaceForTesting: (phase) => {
+          phases.push(phase);
+          if (phase === "publish") occupy({ projects, events, newId } as never);
+        },
+      })).toThrow("retired project successor storage is occupied");
+      expect(phases).toEqual(["publish"]);
+      expect(readFileSync(projectMapPath(), "utf8")).toBe(beforeMap);
+      expect(readProjectMapSnapshot()[oldId]).toMatchObject({ canonical });
+      expect(readProjectMapSnapshot()[newId]).toBeUndefined();
+    },
+  );
+
+  it.each([
+    [
+      "projects parent rebind",
+      "private directory changed during validation",
+      ({ projects, displaced }: { projects: string; displaced: string }) => {
+        // Move the retained directory out of `.lcm` and replace it in place so
+        // the root's own nlink witness is unchanged and only the rebinding of
+        // `projects` can explain a failure.
+        renameSync(projects, displaced);
+        mkdirSync(projects, { mode: 0o700 });
+        chmodSync(projects, 0o700);
+      },
+    ],
+    [
+      "events parent rebind",
+      "private directory changed during validation",
+      ({ events, displaced }: { events: string; displaced: string }) => {
+        renameSync(events, displaced);
+        mkdirSync(events, { mode: 0o700 });
+        chmodSync(events, 0o700);
+      },
+    ],
+    [
+      "retired fence mutation",
+      "retired project fence changed before renewal",
+      ({ fence }: { fence: string }) => {
+        writeFileSync(fence, "tampered", { mode: 0o600 });
+      },
+    ],
+  ] as const)(
+    "keeps the published successor after a post-publication %s",
+    (_label, expectedMessage, tamper) => {
+      const canonical = makeDir(`retired-post-publication-${_label.replaceAll(" ", "-")}`);
+      const oldId = writeRetiredProjectFixture(canonical);
+      const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+      const projects = join(homedir(), ".lcm", "projects");
+      const events = join(homedir(), ".lcm", "events");
+      mkdirSync(events, { recursive: true, mode: 0o700 });
+      chmodSync(events, 0o700);
+      const fence = join(projects, oldId);
+      const displaced = join(homedir(), `displaced-${_label.replaceAll(" ", "-")}`);
+      const phases: string[] = [];
+
+      expect(() => renewRetiredProjectIdentity(canonical, {
+        _beforeMapReplaceForTesting: phase => phases.push(phase),
+        _afterMapPublicationForTesting: () => {
+          tamper({ projects, events, fence, displaced, newId } as never);
+        },
+      })).toThrow(expectedMessage);
+      expect(phases).toEqual(["publish"]);
+      expect(readProjectMapSnapshot()).toEqual({
+        [newId]: { canonical: normalizeProjectPath(canonical), aliases: [] },
+      });
+    },
+  );
+
+  it("keeps the published successor without attempting rollback after a root rebind", () => {
+    const canonical = makeDir("retired-post-publication-root-rebind");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+    const root = join(homedir(), ".lcm");
+    const displaced = join(homedir(), ".lcm-displaced-post-publication");
+    const phases: string[] = [];
+    let thrown: unknown;
+
+    try {
+      renewRetiredProjectIdentity(canonical, {
+        _beforeMapReplaceForTesting: phase => phases.push(phase),
+        _afterMapPublicationForTesting: () => {
+          renameSync(root, displaced);
+          mkdirSync(root, { mode: 0o700 });
+          chmodSync(root, 0o700);
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe("private directory changed during validation");
+    expect(phases).toEqual(["publish"]);
+    // The publication remains authoritative in the displaced retained root;
+    // no rollback is attempted after hooks could have observed it.
+    const displacedMap = readFileSync(join(displaced, "map.json"), "utf8");
+    expect(displacedMap).toContain(newId);
+    expect(displacedMap).not.toContain(oldId);
+  });
+
+  it.each([
+    ["the retired identity reappearing", (
+      { canonical, oldId }: { canonical: string; oldId: string },
+    ) => {
+      writeProjectMap(`${JSON.stringify({ [oldId]: { canonical, aliases: [] } })}\n`);
+    }],
+    ["the successor binding missing", (
+      { foreign, foreignId }: { foreign: string; foreignId: string },
+    ) => {
+      writeProjectMap(`${JSON.stringify({ [foreignId]: { canonical: foreign, aliases: [] } })}\n`);
+    }],
+    ["an extra concurrent binding", (
+      { canonical, newId, foreign, foreignId }:
+        { canonical: string; newId: string; foreign: string; foreignId: string },
+    ) => {
+      writeProjectMap(`${JSON.stringify({
+        [newId]: { canonical, aliases: [] },
+        [foreignId]: { canonical: foreign, aliases: [] },
+      })}\n`);
+    }],
+    ["a rewritten successor entry", (
+      { newId, foreign }: { newId: string; foreign: string },
+    ) => {
+      writeProjectMap(`${JSON.stringify({ [newId]: { canonical: foreign, aliases: [] } })}\n`);
+    }],
+  ] as const)(
+    "reports when post-publication readback shows %s without rolling back",
+    (_label, corrupt) => {
+      const slug = _label.replaceAll(" ", "-");
+      const canonical = makeDir(`retired-readback-${slug}`);
+      const oldId = writeRetiredProjectFixture(canonical);
+      const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+      const foreign = makeDir(`retired-readback-foreign-${slug}`);
+      const foreignId = hashProjectPath(normalizeProjectPath(foreign));
+      const fence = join(homedir(), ".lcm", "projects", oldId);
+      const beforeFence = readFileSync(fence);
+      const phases: string[] = [];
+
+      expect(() => renewRetiredProjectIdentity(canonical, {
+        _beforeMapReplaceForTesting: phase => phases.push(phase),
+        _afterMapPublicationForTesting: () => {
+          corrupt({ canonical, oldId, newId, foreign, foreignId } as never);
+        },
+      })).toThrow("retired project identity renewal readback failed");
+      expect(phases).toEqual(["publish"]);
+      const after = readProjectMapSnapshot();
+      if (_label === "the retired identity reappearing") {
+        expect(after).toEqual({
+          [oldId]: { canonical, aliases: [] },
+        });
+      } else if (_label === "the successor binding missing") {
+        expect(after).toEqual({
+          [foreignId]: { canonical: foreign, aliases: [] },
+        });
+      } else if (_label === "an extra concurrent binding") {
+        expect(after).toEqual({
+          [newId]: { canonical, aliases: [] },
+          [foreignId]: { canonical: foreign, aliases: [] },
+        });
+      } else {
+        expect(after).toEqual({
+          [newId]: { canonical: foreign, aliases: [] },
+        });
+      }
+      expect(readFileSync(fence)).toEqual(beforeFence);
+      expect(isAuthenticatedRetiredProjectIdentityFence(fence, oldId)).toBe(true);
+    },
+  );
+
+  it("aggregates independent evidence cleanup failures around a renewed map", () => {
+    const canonical = makeDir("retired-cleanup-aggregate");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+    const fence = join(homedir(), ".lcm", "projects", oldId);
+    const beforeFence = readFileSync(fence);
+    const projectsFailure = new Error("injected projects cleanup failure");
+    const rootFailure = new Error("injected root cleanup failure");
+    const phases: string[] = [];
+    let thrown: unknown;
+
+    try {
+      renewRetiredProjectIdentity(canonical, {
+        _closeEvidenceForTesting: (kind, close) => {
+          close();
+          if (kind === "projects") throw projectsFailure;
+          if (kind === "root") throw rootFailure;
+        },
+        _beforeMapReplaceForTesting: phase => phases.push(phase),
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(AggregateError);
+    expect((thrown as AggregateError).message).toBe(
+      "retired project identity evidence cleanup failed",
+    );
+    expect((thrown as AggregateError).errors).toEqual([projectsFailure, rootFailure]);
+    expect((thrown as Error & { cause?: unknown }).cause).toBeUndefined();
+    // Cleanup failures never reopen the publication boundary, so the renewed
+    // binding and the untouched fence both survive.
+    expect(phases).toEqual(["publish"]);
+    expect(readProjectMapSnapshot()).toEqual({
+      [newId]: { canonical: normalizeProjectPath(canonical), aliases: [] },
+    });
+    expect(readFileSync(projectMapPath(), "utf8")).toContain(newId);
+    expect(readFileSync(projectMapPath(), "utf8")).not.toContain(oldId);
+    expect(readFileSync(fence)).toEqual(beforeFence);
+  });
+
+  it("keeps the renewed map when the publishing writer fails after its rename", () => {
+    const canonical = makeDir("retired-post-rename-writer-failure");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+    const fence = join(homedir(), ".lcm", "projects", oldId);
+    const beforeFence = readFileSync(fence);
+    const primary = new Error("injected post-rename publication failure");
+    const phases: string[] = [];
+
+    // The callback runs after the rename is visible. Hooks may observe the
+    // successor before a later cache or topology failure, so it remains
+    // authoritative.
+    expect(() => renewRetiredProjectIdentity(canonical, {
+      _beforeMapReplaceForTesting: phase => phases.push(phase),
+      _afterMapReplaceForTesting: () => { throw primary; },
+    })).toThrow(primary);
+    expect(phases).toEqual(["publish"]);
+    expect(readProjectMapSnapshot()).toEqual({
+      [newId]: { canonical: normalizeProjectPath(canonical), aliases: [] },
+    });
+    expect(readFileSync(fence)).toEqual(beforeFence);
+    expect(isAuthenticatedRetiredProjectIdentityFence(fence, oldId)).toBe(true);
+  });
+
+  it.each(["published", "unknown"] as const)(
+    "keeps a writer-reported %s publication authoritative after the visible rename",
+    (outcome) => {
+      const canonical = makeDir(`retired-publication-outcome-${outcome}`);
+      const oldId = writeRetiredProjectFixture(canonical);
+      const normalized = normalizeProjectPath(canonical);
+      const newId = retiredProjectIdentitySuccessor(oldId, normalized);
+      const projects = join(homedir(), ".lcm", "projects");
+      const root = join(homedir(), ".lcm");
+      const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+      const originalRename = nodeFs.renameSync as (...args: unknown[]) => void;
+      const originalLstat = nodeFs.lstatSync as (...args: unknown[]) => unknown;
+      let renamed = false;
+      let topologyFailureInjected = false;
+      try {
+        nodeFs.renameSync = ((...args: unknown[]) => {
+          originalRename(...args);
+          if (String(args[1]) !== projectMapPath()) return;
+          renamed = true;
+          // The renamed successor map is now visible to hooks before the
+          // writer completes its retained-parent post-check.
+          mkdirSync(join(projects, newId), { recursive: true, mode: 0o700 });
+          if (outcome === "unknown") {
+            throw new Error("injected ambiguous rename response");
+          }
+        });
+        nodeFs.lstatSync = ((...args: unknown[]) => {
+          if (renamed && !topologyFailureInjected && String(args[0]) === root) {
+            topologyFailureInjected = true;
+            throw new Error("injected post-rename retained-parent failure");
+          }
+          return originalLstat(...args);
+        });
+        syncBuiltinESMExports();
+
+        expect(() => renewRetiredProjectIdentity(canonical)).toThrow(
+          outcome === "published"
+            ? "private file rename completed, but retained parent topology is not trusted"
+            : "private file publication outcome is unknown",
+        );
+      } finally {
+        nodeFs.renameSync = originalRename;
+        nodeFs.lstatSync = originalLstat;
+        syncBuiltinESMExports();
+      }
+
+      expect(renamed).toBe(true);
+      expect(topologyFailureInjected).toBe(true);
+      expect(readProjectMapSnapshot()).toEqual({
+        [newId]: { canonical: normalized, aliases: [] },
+      });
+      expect(existsSync(join(projects, newId))).toBe(true);
+      expect(renewRetiredProjectIdentity(canonical)).toEqual({
+        oldId,
+        newId,
+        canonical: normalized,
+        changed: false,
+      });
+    },
+  );
+
+  it("does not attempt rollback after a post-rename writer failure", () => {
+    const canonical = makeDir("retired-post-rename-rollback-failure");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+    const fence = join(homedir(), ".lcm", "projects", oldId);
+    const beforeFence = readFileSync(fence);
+    const primary = new Error("injected post-rename publication failure");
+    const phases: string[] = [];
+    let thrown: unknown;
+
+    try {
+      renewRetiredProjectIdentity(canonical, {
+        _beforeMapReplaceForTesting: phase => phases.push(phase),
+        _afterMapReplaceForTesting: () => { throw primary; },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBe(primary);
+    expect(phases).toEqual(["publish"]);
+    // No rollback is attempted, so the published renewal and fence survive.
+    expect(readProjectMapSnapshot()).toEqual({
+      [newId]: { canonical: normalizeProjectPath(canonical), aliases: [] },
+    });
+    expect(readFileSync(fence)).toEqual(beforeFence);
+  });
+
+  it("reports a falsy post-publication failure that produced no renewal result", () => {
+    const canonical = makeDir("retired-falsy-post-publication");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+    const fence = join(homedir(), ".lcm", "projects", oldId);
+    const beforeFence = readFileSync(fence);
+    const phases: string[] = [];
+
+    expect(() => renewRetiredProjectIdentity(canonical, {
+      _beforeMapReplaceForTesting: phase => phases.push(phase),
+      // A seam that fails with a falsy value must still report a failure
+      // without reopening an already observable publication boundary.
+      _afterMapPublicationForTesting: () => { throw undefined; },
+    })).toThrow("retired project identity renewal produced no result");
+    expect(phases).toEqual(["publish"]);
+    expect(readProjectMapSnapshot()).toEqual({
+      [newId]: { canonical: normalizeProjectPath(canonical), aliases: [] },
+    });
+    expect(readFileSync(fence)).toEqual(beforeFence);
+    expect(isAuthenticatedRetiredProjectIdentityFence(fence, oldId)).toBe(true);
+  });
+
+  it("refuses a root rebind after final evidence validation before map replacement", () => {
+    const canonical = makeDir("retired-retained-root-rebind");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const root = join(homedir(), ".lcm");
+    const displaced = join(homedir(), ".lcm-displaced");
+    const beforeMap = readFileSync(projectMapPath(), "utf8");
+    const beforeFence = readFileSync(join(root, "projects", oldId));
+    const replacementMap = "{}\n";
+
+    expect(() => renewRetiredProjectIdentity(canonical, {
+      _beforeMapReplaceForTesting: (phase) => {
+        if (phase !== "publish") return;
+        renameSync(root, displaced);
+        mkdirSync(root, { mode: 0o700 });
+        writeFileSync(join(root, "map.json"), replacementMap, { mode: 0o600 });
+      },
+    })).toThrow();
+    expect(readFileSync(join(displaced, "map.json"), "utf8")).toBe(beforeMap);
+    expect(readFileSync(join(root, "map.json"), "utf8")).toBe(replacementMap);
+    expect(readFileSync(join(displaced, "projects", oldId))).toEqual(beforeFence);
+  });
+
+  it("reconstructs an exact retained fence across injected short reads", () => {
+    const canonical = makeDir("retired-fence-short-reads");
+    writeRetiredProjectFixture(canonical);
+    let reads = 0;
+
+    expect(renewRetiredProjectIdentity(canonical, {
+      _fenceReadForTesting: (fd, buffer, offset, length, position) => {
+        reads += 1;
+        return readSync(fd, buffer, offset, Math.min(length, 3), position);
+      },
+    })).toMatchObject({ changed: true });
+    expect(reads).toBeGreaterThan(2);
+  });
+
+  it("rejects premature EOF from the retained fence reader and preserves the map", () => {
+    const canonical = makeDir("retired-fence-premature-eof");
+    writeRetiredProjectFixture(canonical);
+    const beforeMap = readFileSync(projectMapPath(), "utf8");
+
+    expect(() => renewRetiredProjectIdentity(canonical, {
+      _fenceReadForTesting: (fd, buffer, offset, length, position) => {
+        if ((position ?? 0) >= 3) return 0;
+        return readSync(fd, buffer, offset, Math.min(length, 3), position);
+      },
+    })).toThrow();
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(beforeMap);
+  });
+
+  it.each([
+    ["NaN", (_length: number) => Number.NaN],
+    ["noninteger", (_length: number) => 0.5],
+    ["negative", (_length: number) => -1],
+    ["over-reported", (length: number) => length + 1],
+  ] as const)(
+    "rejects an injected %s retained-fence read count without publishing a successor",
+    (_label, invalidCount) => {
+      const canonical = makeDir(`retired-fence-invalid-count-${_label}`);
+      const oldId = writeRetiredProjectFixture(canonical);
+      const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+      const beforeMap = readFileSync(projectMapPath());
+      let fenceFd: number | undefined;
+
+      expect(() => renewRetiredProjectIdentity(canonical, {
+        _fenceReadForTesting: (fd, _buffer, _offset, length) => {
+          fenceFd = fd;
+          return invalidCount(length);
+        },
+      })).toThrow();
+
+      expect(readFileSync(projectMapPath())).toEqual(beforeMap);
+      expect(readProjectMapSnapshot()).toEqual({
+        [oldId]: { canonical: normalizeProjectPath(canonical), aliases: [] },
+      });
+      expect(existsSync(join(homedir(), ".lcm", "projects", newId))).toBe(false);
+      expect(existsSync(join(homedir(), ".lcm", "events", `${newId}.db`))).toBe(false);
+      expect(fenceFd).toBeTypeOf("number");
+      expect(() => fstatSync(fenceFd!)).toThrow(expect.objectContaining({ code: "EBADF" }));
+    },
+  );
+
+  it("rejects an injected nonzero extra-byte probe without publishing a successor", () => {
+    const canonical = makeDir("retired-fence-extra-byte-probe");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+    const expectedBytes = Buffer.byteLength(
+      `${JSON.stringify({ version: 1, hash: oldId, kind: "project" })}\n`,
+      "utf8",
+    );
+    const beforeMap = readFileSync(projectMapPath());
+    let fenceFd: number | undefined;
+
+    expect(() => renewRetiredProjectIdentity(canonical, {
+      _fenceReadForTesting: (fd, buffer, offset, length, position) => {
+        fenceFd = fd;
+        if (position === expectedBytes) {
+          buffer[offset] = 0x78;
+          return 1;
+        }
+        return readSync(fd, buffer, offset, length, position);
+      },
+    })).toThrow("retired project fence has trailing content");
+
+    expect(readFileSync(projectMapPath())).toEqual(beforeMap);
+    expect(readProjectMapSnapshot()).toEqual({
+      [oldId]: { canonical: normalizeProjectPath(canonical), aliases: [] },
+    });
+    expect(existsSync(join(homedir(), ".lcm", "projects", newId))).toBe(false);
+    expect(existsSync(join(homedir(), ".lcm", "events", `${newId}.db`))).toBe(false);
+    expect(fenceFd).toBeTypeOf("number");
+    expect(() => fstatSync(fenceFd!)).toThrow(expect.objectContaining({ code: "EBADF" }));
+  });
+
+  it("rejects a valid retained-fence prefix with trailing bytes", () => {
+    const canonical = makeDir("retired-fence-trailing-byte");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const beforeMap = readFileSync(projectMapPath(), "utf8");
+    appendFileSync(join(homedir(), ".lcm", "projects", oldId), "x");
+
+    expect(() => renewRetiredProjectIdentity(canonical)).toThrow();
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(beforeMap);
+  });
+
+  it.each(["descriptor", "path"] as const)(
+    "rejects a retained fence %s size mismatch",
+    (kind) => {
+      const canonical = makeDir(`retired-fence-${kind}-size`);
+      writeRetiredProjectFixture(canonical);
+      const beforeMap = readFileSync(projectMapPath(), "utf8");
+
+      expect(() => renewRetiredProjectIdentity(canonical, {
+        _fenceStatForTesting: (actualKind, _phase, stat) => {
+          if (actualKind !== kind) return stat;
+          return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
+            size: stat.size + 1n,
+          });
+        },
+      })).toThrow();
+      expect(readFileSync(projectMapPath(), "utf8")).toBe(beforeMap);
+    },
+  );
+
+  it.each(["growth", "shrink", "content mutation", "replacement"] as const)(
+    "rejects retained fence %s between read and post-stat",
+    (mutation) => {
+      const canonical = makeDir(`retired-fence-${mutation.replaceAll(" ", "-")}`);
+      const oldId = writeRetiredProjectFixture(canonical);
+      const fence = join(homedir(), ".lcm", "projects", oldId);
+      const beforeMap = readFileSync(projectMapPath(), "utf8");
+      let injected = false;
+
+      expect(() => renewRetiredProjectIdentity(canonical, {
+        _afterFenceReadForTesting: () => {
+          if (injected) return;
+          injected = true;
+          if (mutation === "growth") appendFileSync(fence, "x");
+          else if (mutation === "shrink") truncateSync(fence, 1);
+          else if (mutation === "content mutation") {
+            const content = serializeWorktreeReconciliationFence(oldId, "project");
+            writeFileSync(fence, content.replace('"version":1', '"version":2'), { mode: 0o600 });
+          } else {
+            renameSync(fence, `${fence}-old`);
+            writeFileSync(fence, serializeWorktreeReconciliationFence(oldId, "project"), { mode: 0o600 });
+          }
+        },
+      })).toThrow();
+      expect(readFileSync(projectMapPath(), "utf8")).toBe(beforeMap);
+    },
+  );
 
   it("keeps project-map publication lock scopes free of shadowed token parameters", async () => {
     const results = await projectMapEslint.lintFiles("src/project-map.ts");

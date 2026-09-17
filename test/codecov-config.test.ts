@@ -41,6 +41,7 @@ const expectedComponents = [
   {
     component_id: "unit-cli",
     name: "Unit - CLI",
+    // #1283 keeps renewal admission and bounded compact rendering CLI-owned.
     // #1132 keeps foreground PID publication at the CLI boundary.
     // #1233 keeps publication-contention restart recovery at the CLI boundary.
     paths: ["bin/", "src/cli/", "^src/cli-help\\.ts$", "^src/cli-storage\\.ts$"],
@@ -85,6 +86,7 @@ const expectedComponents = [
       // single-snapshot scrubbing in this existing configuration-security owner.
       "^src/sensitive\\.ts$",
       "^src/shell-quote\\.ts$",
+      // #1283 keeps sanitize-then-bound terminal fields in this owner.
       "^src/terminal-sanitize\\.ts$",
       "^src/types\\.ts$",
       "^src/url-display\\.ts$",
@@ -98,6 +100,7 @@ const expectedComponents = [
   {
     component_id: "unit-hooks",
     name: "Unit - Hooks",
+    // #1270 keeps retired-fence scrubbing and diagnostics hook-owned.
     // #1225 composes SessionStart pruning with append admission in this owner.
     // #1197 keeps independent SessionEnd background failure containment hook-owned.
     // #1259 keeps publication-fence error classification and ordered final
@@ -121,6 +124,7 @@ const expectedComponents = [
       "^src/daemon/orientation\\.ts$",
       "^src/daemon/project-queue\\.ts$",
       "^src/daemon/publication-queue\\.ts$",
+      // #1270/#1283 keep renewed hook identity selection daemon-core-owned.
       "^src/daemon/project\\.ts$",
       // #1106 keeps periodic transcript metadata admission daemon-core-owned.
       // Monotonic proxy startup polling remains daemon-core-owned.
@@ -272,6 +276,7 @@ const expectedComponents = [
   {
     component_id: "unit-compaction-summarization",
     name: "Unit - Compaction and Summarization",
+    // #1283 keeps structured retired-fence discovery in this component.
     paths: [
       // #618 authenticated batch discovery remains within this compaction owner.
       "^src/batch-compact\\.ts$",
@@ -301,6 +306,8 @@ const expectedComponents = [
       "^src/portable-knowledge\\.ts$",
       // #1049 keeps project metadata owner and single-link admission in this
       // existing component; no taxonomy, status, or policy change.
+      // #1270/#1283 retain exact fence classification and local successor
+      // renewal in this existing project/worktree owner.
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
       // #1044 keeps the existing owner; no taxonomy, status, or policy change.
@@ -320,6 +327,8 @@ const expectedComponents = [
       // witness stay in this existing unit-project-worktrees owner.
       // #1316 keeps SQLite message-byte admission in this existing
       // unit-project-worktrees owner; no taxonomy or topology change.
+      // #1270/#1283 keep renewed-successor targeting and its fail-closed
+      // fence authentication in this existing unit-project-worktrees owner.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },

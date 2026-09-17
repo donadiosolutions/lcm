@@ -27,13 +27,22 @@ vi.mock("../../src/db/events-path.js", async () => {
 });
 
 // Import after mocks
-import { safeLogError, _resetCircuitBreaker, _setLogPathForTesting } from "../../src/hooks/hook-errors.js";
+import {
+  safeLogError,
+  _resetCircuitBreaker,
+  _setLogPathForTesting,
+  _setRetiredProjectDiagnosticWriterForTesting,
+} from "../../src/hooks/hook-errors.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
 import { eventsDbPath } from "../../src/db/events-path.js";
 import { MAX_HOOK_ERROR_DIAGNOSTIC_LENGTH } from "../../src/hooks/hook-error-diagnostic.js";
 import { lcmPath } from "../../src/runtime-paths.js";
 import { SQLiteLocalHookOutboxFactory } from "../../src/storage/local-hook-outbox.js";
 import * as securityFiles from "../../src/security-files.js";
+import {
+  RETIRED_PROJECT_IDENTITY_DIAGNOSTIC,
+  RetiredProjectIdentityError,
+} from "../../src/worktree-reconciliation-fence.js";
 
 describe("safeLogError", () => {
   let tempDir: string;
@@ -44,12 +53,46 @@ describe("safeLogError", () => {
     chmodSync(join(homedir(), ".lcm"), 0o700);
     mockEventsDir = join(tempDir, "events");
     _setLogPathForTesting(join(tempDir, "events.log"));
+    _setRetiredProjectDiagnosticWriterForTesting(undefined);
     _resetCircuitBreaker();
   });
 
   afterEach(() => {
     _setLogPathForTesting(undefined);
+    _setRetiredProjectDiagnosticWriterForTesting(undefined);
     rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("emits only the fixed retired-identity diagnostic before persistence", async () => {
+    const cwd = join(tempDir, "retired-project");
+    mkdirSync(cwd);
+    const writes: string[] = [];
+    const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open");
+    _setRetiredProjectDiagnosticWriterForTesting((message) => {
+      writes.push(message);
+      return true;
+    });
+    rmSync(join(homedir(), ".lcm"), { recursive: true, force: true });
+
+    await expect(safeLogError(
+      "UserPromptSubmit",
+      new RetiredProjectIdentityError(),
+      { cwd, sessionId: "session-secret" },
+    )).resolves.toBeUndefined();
+
+    expect(writes).toEqual([`${RETIRED_PROJECT_IDENTITY_DIAGNOSTIC}\n`]);
+    expect(open).not.toHaveBeenCalled();
+    expect(existsSync(join(tempDir, "events.log"))).toBe(false);
+
+    _setRetiredProjectDiagnosticWriterForTesting(() => {
+      throw new Error("closed stderr");
+    });
+    await expect(safeLogError(
+      "UserPromptSubmit",
+      new RetiredProjectIdentityError(),
+      { cwd },
+    )).resolves.toBeUndefined();
+    expect(open).not.toHaveBeenCalled();
   });
 
   it("Layer 1: writes to sidecar DB when cwd is valid", async () => {

@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { closeLcmConnection, getExistingLcmConnection } from "./db/connection.js";
+import { captureExistingLcmSnapshot } from "./db/connection.js";
 import {
   progressCurrentSession,
   type ProgressCurrentSession,
@@ -18,6 +18,11 @@ import { projectPathsForIdentity } from "./daemon/project.js";
 import { CliProjectStorageMissingError, listCliProjects, withCliProjectStorage } from "./cli-storage.js";
 import type { ProjectRepositories } from "./storage/contracts.js";
 import { createSqliteRepositories, createSqliteRepositoryStores } from "./storage/sqlite/repositories.js";
+import {
+  RetiredProjectIdentityError,
+  assertProjectStorageIdentityActive,
+} from "./worktree-reconciliation-fence.js";
+import type { ProjectStorage } from "./storage/contracts.js";
 
 export interface UncompactedConversation {
   projectDir: string;
@@ -26,7 +31,36 @@ export interface UncompactedConversation {
   sessionId: string;
   messages: number;
   tokens: number;
+  sourceLocator?: string;
 }
+
+export type CompactItemOutcome = "done" | "unchanged" | "skipped" | "failed" | "dry-run";
+
+export type CompactItemIdentity = Readonly<{
+  project: string;
+  sessionId: string;
+  conversationId: number;
+  sourceLocator?: string;
+}>;
+
+export type CompactProgressEvent =
+  | Readonly<{ type: "discovery-start"; total: number }>
+  | Readonly<{ type: "discovery-item-start"; index: number; total: number; projectId: string; project: string }>
+  | Readonly<{ type: "discovery-item-terminal"; index: number; total: number; projectId: string; project: string; outcome: "done" | "failed" }>
+  | Readonly<{ type: "discovery-clear" }>
+  | Readonly<{ type: "session-start"; identity: CompactItemIdentity; messages: number; tokens: number; startedAt: number }>
+  | Readonly<{
+    type: "session-terminal";
+    identity: CompactItemIdentity;
+    outcome: CompactItemOutcome;
+    messages: number;
+    tokensBefore: number;
+    tokensAfter?: number;
+    provider?: string;
+    message?: string;
+    elapsed: number;
+  }>
+  | Readonly<{ type: "phase-failure"; phase: string; project?: string; message: string }>;
 
 export interface BatchCompactResult {
   compacted: number;
@@ -196,13 +230,16 @@ function hasReplayCondensationCandidate(items: readonly ReplayContextRow[]): boo
   return false;
 }
 
-type CompactRepositories = Pick<ProjectRepositories, "conversations" | "summaries" | "context">;
+type CompactRepositories = Pick<ProjectRepositories, "conversations" | "summaries" | "context"> & {
+  readonly nativeTranscripts?: ProjectStorage["nativeTranscripts"];
+};
 
 async function discoverProject(
   storage: CompactRepositories,
   project: { canonical: string; dir: string },
   minTokens: number,
   replay: boolean,
+  sourceLocatorForSession?: (sessionId: string) => Promise<string | undefined>,
 ): Promise<UncompactedConversation[]> {
   const candidates: UncompactedConversation[] = [];
   for (const conversation of await storage.conversations.listConversations()) {
@@ -239,6 +276,20 @@ async function discoverProject(
       });
       if (!hasReplayCondensationCandidate(items)) continue;
     }
+    let sourceLocator: string | undefined;
+    try {
+      if (sourceLocatorForSession !== undefined) {
+        sourceLocator = await sourceLocatorForSession(conversation.sessionId);
+      } else {
+        const transcripts = await storage.nativeTranscripts?.repository.listByNativeSession({
+          nativeSessionId: conversation.sessionId,
+        });
+        const locators = [...new Set(transcripts?.map(transcript => transcript.sourceLocator) ?? [])];
+        if (locators.length === 1) sourceLocator = locators[0];
+      }
+    } catch {
+      // Optional provenance is omitted when it cannot be read unambiguously.
+    }
     candidates.push({
       projectDir: project.dir,
       cwd: project.canonical,
@@ -246,6 +297,7 @@ async function discoverProject(
       sessionId: conversation.sessionId,
       messages,
       tokens,
+      ...(sourceLocator === undefined ? {} : { sourceLocator }),
     });
   }
   return candidates.sort((left, right) => right.tokens - left.tokens || left.conversationId - right.conversationId);
@@ -264,22 +316,51 @@ async function discoverSqlitePreview(
     const identity = resolveExistingProjectIdentity(project.canonical, token);
     if (identity === null || identity.id !== project.id) throw new Error("project binding changed");
     const paths = projectPathsForIdentity(identity);
-    const db = getExistingLcmConnection(paths.dbPath);
-    if (db === null) return [];
+    assertProjectStorageIdentityActive(paths.dir, identity.id);
+    const snapshot = captureExistingLcmSnapshot(paths.dbPath);
+    if (snapshot === null) return [];
+    const db = snapshot.db;
     try {
       const repositories = createSqliteRepositories(
         createSqliteRepositoryStores(db),
         identity.id,
         async (_domain, _operation, callback) => callback(),
       );
-      return await discoverProject(repositories, paths, minTokens, replay);
+      return await discoverProject(
+        repositories,
+        paths,
+        minTokens,
+        replay,
+        async (sessionId) => {
+          try {
+            const rows = db.prepare(
+              `SELECT DISTINCT source_locator
+                 FROM runtime_native_transcripts
+                WHERE project_id = ? AND native_session_id = ?
+                ORDER BY source_locator
+                LIMIT 2`,
+            ).all(identity.id, sessionId) as Array<{ source_locator: unknown }>;
+            return rows.length === 1 && typeof rows[0]?.source_locator === "string"
+              ? rows[0].source_locator
+              : undefined;
+          } catch {
+            return undefined;
+          }
+        },
+      );
     } finally {
-      closeLcmConnection(paths.dbPath, db);
+      snapshot.close();
     }
   });
 }
 
-async function discoverUncompacted(minTokens: number, readOnly = false, cwdFilter?: string, replay = false): Promise<UncompactedDiscovery> {
+async function discoverUncompacted(
+  minTokens: number,
+  readOnly = false,
+  cwdFilter?: string,
+  replay = false,
+  onEvent?: (event: CompactProgressEvent) => void,
+): Promise<UncompactedDiscovery> {
   const conversations: UncompactedConversation[] = [];
   const failures: ProjectScanFailure[] = [];
   let projects: Awaited<ReturnType<typeof listCliProjects>>;
@@ -289,24 +370,74 @@ async function discoverUncompacted(minTokens: number, readOnly = false, cwdFilte
     filterCanonical = cwdFilter === undefined ? undefined
       : resolveExistingProjectIdentity(cwdFilter)?.canonical ?? normalizeProjectPath(cwdFilter);
   } catch {
+    onEvent?.({ type: "phase-failure", phase: "Compact", project: cwdFilter, message: "project discovery failed" });
+    onEvent?.({ type: "discovery-clear" });
     return { conversations, failures: [{ target: cwdFilter ?? "projects", message: "project discovery failed" }] };
   }
-  for (const project of projects) {
-    if (cwdFilter !== undefined
-      && project.canonical !== filterCanonical
-      && !project.aliases.includes(resolve(cwdFilter))) continue;
-    try {
-      const config = loadDaemonConfig(configPath());
-      const selected = selectStorageBackendForConfig(configPath(), config.storage);
-      const found = readOnly && selected.backend === "sqlite"
-        ? await discoverSqlitePreview(project, minTokens, replay)
-        : await withCliProjectStorage(project.canonical, {}, async ({ storage, project: opened }) =>
-          discoverProject(storage, opened, minTokens, replay));
-      conversations.push(...found);
-    } catch (error) {
-      if (error instanceof CliProjectStorageMissingError) continue;
-      failures.push({ target: project.canonical, message: "project storage discovery failed" });
+  const selectedProjects = projects.filter(project => cwdFilter === undefined
+    || project.canonical === filterCanonical
+    || project.aliases.includes(resolve(cwdFilter)));
+  onEvent?.({ type: "discovery-start", total: selectedProjects.length });
+  try {
+    for (const [offset, project] of selectedProjects.entries()) {
+      const index = offset + 1;
+      onEvent?.({
+        type: "discovery-item-start",
+        index,
+        total: selectedProjects.length,
+        projectId: project.id,
+        project: project.canonical,
+      });
+      try {
+        const config = loadDaemonConfig(configPath());
+        const selected = selectStorageBackendForConfig(configPath(), config.storage);
+        const found = readOnly && selected.backend === "sqlite"
+          ? await discoverSqlitePreview(project, minTokens, replay)
+          : await withCliProjectStorage(project.canonical, {}, async ({ storage, project: opened }) =>
+            discoverProject(storage, opened, minTokens, replay));
+        conversations.push(...found);
+        onEvent?.({
+          type: "discovery-item-terminal",
+          index,
+          total: selectedProjects.length,
+          projectId: project.id,
+          project: project.canonical,
+          outcome: "done",
+        });
+      } catch (error) {
+        if (error instanceof CliProjectStorageMissingError) {
+          onEvent?.({
+            type: "discovery-item-terminal",
+            index,
+            total: selectedProjects.length,
+            projectId: project.id,
+            project: project.canonical,
+            outcome: "done",
+          });
+          continue;
+        }
+        const message = error instanceof RetiredProjectIdentityError
+          ? error.message
+          : "project storage discovery failed";
+        failures.push({ target: project.canonical, message });
+        onEvent?.({
+          type: "phase-failure",
+          phase: "Compact",
+          project: project.canonical,
+          message,
+        });
+        onEvent?.({
+          type: "discovery-item-terminal",
+          index,
+          total: selectedProjects.length,
+          projectId: project.id,
+          project: project.canonical,
+          outcome: "failed",
+        });
+      }
     }
+  } finally {
+    onEvent?.({ type: "discovery-clear" });
   }
   return { conversations, failures };
 }
@@ -340,12 +471,20 @@ export async function batchCompact(opts: {
   onTransportFailure?: (error: unknown) => void;
   /** Called with state patches as each session is processed — used by the ninja renderer */
   onProgress?: (patch: Partial<ProgressState>) => void;
+  /** Synchronous identity-preserving discovery and session lifecycle events. */
+  onEvent?: (event: CompactProgressEvent) => void;
 }): Promise<BatchCompactResult> {
   const configFile = configPath();
   const config = loadDaemonConfig(configFile);
   selectStorageBackendForConfig(configFile, config.storage);
   const maxConcurrency = opts.replay ? 1 : opts.maxConcurrency ?? config.llm.maxConcurrency;
-  const discovery = await discoverUncompacted(opts.minTokens, opts.dryRun, opts.cwd, opts.replay);
+  const discovery = await discoverUncompacted(
+    opts.minTokens,
+    opts.dryRun,
+    opts.cwd,
+    opts.replay,
+    opts.onEvent,
+  );
   const conversations = discovery.conversations;
   const onProgress = opts.onProgress;
   const phaseErrors: ProgressPhaseError[] = discovery.failures.map(failure => ({
@@ -353,12 +492,6 @@ export async function batchCompact(opts: {
     target: failure.target,
     message: failure.message,
   }));
-
-  if (phaseErrors.length > 0) {
-    for (const failure of phaseErrors) {
-      console.error(`  compact scan failed for ${failure.target}: ${failure.message}`);
-    }
-  }
 
   if (conversations.length === 0 && phaseErrors.length === 0) {
     console.error("Nothing to compact — no sessions are currently eligible.");
@@ -390,9 +523,10 @@ export async function batchCompact(opts: {
   let messagesIn = 0;
   let tokensIn = 0;
   let tokensOut = 0;
-  const progressErrors: { sessionId: string; message: string }[] = [];
+  const progressErrors: ProgressState["errors"] = [];
   const compactedProjectIndexes = new Map<string, number>();
   const activeSessions = new Map<number, ProgressCurrentSession>();
+  const claimedAt = new Map<number, number>();
   const client = new DaemonClient(`http://127.0.0.1:${opts.port}`, opts.tokenPath);
   type CompactResponse = {
     summary?: string;
@@ -430,14 +564,31 @@ export async function batchCompact(opts: {
     items: conversations,
     maxConcurrency,
     signal: opts.signal,
-    onClaim: opts.dryRun
-      ? undefined
-      : (conv, index) => {
-        activeSessions.set(index, {
+    onClaim: (conv, index) => {
+        const startedAt = Date.now();
+        claimedAt.set(index, startedAt);
+        const identity: CompactItemIdentity = {
+          project: conv.cwd,
           sessionId: conv.sessionId,
+          conversationId: conv.conversationId,
+          ...(conv.sourceLocator === undefined ? {} : { sourceLocator: conv.sourceLocator }),
+        };
+        opts.onEvent?.({
+          type: "session-start",
+          identity,
           messages: conv.messages,
           tokens: conv.tokens,
-          startedAt: Date.now(),
+          startedAt,
+        });
+        if (opts.dryRun) return;
+        activeSessions.set(index, {
+          sessionId: conv.sessionId,
+          project: conv.cwd,
+          conversationId: conv.conversationId,
+          ...(conv.sourceLocator === undefined ? {} : { sourceLocator: conv.sourceLocator }),
+          messages: conv.messages,
+          tokens: conv.tokens,
+          startedAt,
         });
         onProgress?.(progressActivePatch());
       },
@@ -465,21 +616,49 @@ export async function batchCompact(opts: {
     },
     onResult: (result) => {
       const conv = result.item;
-      const label = `${conv.cwd} conv #${conv.conversationId} (${conv.messages} msgs, ${(conv.tokens / 1000).toFixed(1)}k tokens)`;
-      const sessionStart = activeSessions.get(result.index)?.startedAt ?? Date.now();
+      const identity: CompactItemIdentity = {
+        project: conv.cwd,
+        sessionId: conv.sessionId,
+        conversationId: conv.conversationId,
+        ...(conv.sourceLocator === undefined ? {} : { sourceLocator: conv.sourceLocator }),
+      };
+      // claimedAt is set synchronously by onClaim before this index's task is
+      // scheduled, so the entry is always present by the time onResult runs.
+      const sessionStart = claimedAt.get(result.index)!;
+      claimedAt.delete(result.index);
       activeSessions.delete(result.index);
       const activePatch = progressActivePatch();
 
       if ("error" in result) {
         const errMsg = result.error instanceof Error ? "compaction request failed" : "unknown error";
         if (isDaemonTransportFailure(result.error)) opts.onTransportFailure?.(result.error);
-        console.error(`${label} FAILED (${errMsg})`);
-        progressErrors.push({ sessionId: conv.sessionId, message: errMsg });
+        progressErrors.push({
+          project: conv.cwd,
+          sessionId: conv.sessionId,
+          conversationId: conv.conversationId,
+          ...(conv.sourceLocator === undefined ? {} : { sourceLocator: conv.sourceLocator }),
+          message: errMsg,
+        });
+        opts.onEvent?.({
+          type: "session-terminal",
+          identity,
+          outcome: "failed",
+          messages: conv.messages,
+          tokensBefore: conv.tokens,
+          message: errMsg,
+          elapsed: Date.now() - sessionStart,
+        });
         onProgress?.({
           ...activePatch,
           completed: completedCount,
-          errors: progressErrors,
-          lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore: conv.tokens, elapsed: Date.now() - sessionStart },
+          errors: [...progressErrors],
+          lastResult: {
+            ...identity,
+            outcome: "failed",
+            messages: conv.messages,
+            tokensBefore: conv.tokens,
+            elapsed: Date.now() - sessionStart,
+          },
         });
         return;
       }
@@ -487,28 +666,75 @@ export async function batchCompact(opts: {
       const data = result.value;
       if (!opts.dryRun && !isCompactResponse(data)) {
         const errMsg = "malformed compact response";
-        console.error(`${label} FAILED (${errMsg})`);
-        progressErrors.push({ sessionId: conv.sessionId, message: errMsg });
+        progressErrors.push({
+          ...identity,
+          message: errMsg,
+        });
+        opts.onEvent?.({
+          type: "session-terminal",
+          identity,
+          outcome: "failed",
+          messages: conv.messages,
+          tokensBefore: conv.tokens,
+          message: errMsg,
+          elapsed: Date.now() - sessionStart,
+        });
         onProgress?.({
           ...activePatch,
           completed: completedCount,
-          errors: progressErrors,
-          lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore: conv.tokens, elapsed: Date.now() - sessionStart },
+          errors: [...progressErrors],
+          lastResult: {
+            ...identity,
+            outcome: "failed",
+            messages: conv.messages,
+            tokensBefore: conv.tokens,
+            elapsed: Date.now() - sessionStart,
+          },
         });
         return;
       }
       if (opts.dryRun) {
-        console.error(`  [dry-run] would compact: ${label}`);
         completedCount++;
-        onProgress?.({ ...activePatch, completed: completedCount });
-      } else if (data?.skipped) {
-        skipped++;
-        completedCount++;
-        console.error(`${label} skipped (already in progress)`);
+        opts.onEvent?.({
+          type: "session-terminal",
+          identity,
+          outcome: "dry-run",
+          messages: conv.messages,
+          tokensBefore: conv.tokens,
+          elapsed: Date.now() - sessionStart,
+        });
         onProgress?.({
           ...activePatch,
           completed: completedCount,
-          lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore: conv.tokens, elapsed: Date.now() - sessionStart },
+          lastResult: {
+            ...identity,
+            outcome: "dry-run",
+            messages: conv.messages,
+            tokensBefore: conv.tokens,
+            elapsed: Date.now() - sessionStart,
+          },
+        });
+      } else if (data?.skipped) {
+        skipped++;
+        completedCount++;
+        opts.onEvent?.({
+          type: "session-terminal",
+          identity,
+          outcome: "skipped",
+          messages: conv.messages,
+          tokensBefore: conv.tokens,
+          elapsed: Date.now() - sessionStart,
+        });
+        onProgress?.({
+          ...activePatch,
+          completed: completedCount,
+          lastResult: {
+            ...identity,
+            outcome: "skipped",
+            messages: conv.messages,
+            tokensBefore: conv.tokens,
+            elapsed: Date.now() - sessionStart,
+          },
         });
       } else if (data?.actionTaken === false) {
         unchanged++;
@@ -516,21 +742,33 @@ export async function batchCompact(opts: {
         const tokensBefore = data.tokensBefore ?? conv.tokens;
         const tokensAfter = data.tokensAfter ?? tokensBefore;
         const summary = data.summary?.trim() || "No compaction needed.";
-        console.error(`${label} unchanged (${summary})`);
+        opts.onEvent?.({
+          type: "session-terminal",
+          identity,
+          outcome: "unchanged",
+          messages: conv.messages,
+          tokensBefore,
+          tokensAfter,
+          provider: formatLlmDiagnostic(data),
+          message: summary,
+          elapsed: Date.now() - sessionStart,
+        });
         onProgress?.({
           ...activePatch,
           completed: completedCount,
-          lastResult: { sessionId: conv.sessionId, messages: conv.messages, tokensBefore, tokensAfter, provider: formatLlmDiagnostic(data), elapsed: Date.now() - sessionStart },
+          lastResult: {
+            ...identity,
+            outcome: "unchanged",
+            messages: conv.messages,
+            tokensBefore,
+            tokensAfter,
+            provider: formatLlmDiagnostic(data),
+            elapsed: Date.now() - sessionStart,
+          },
         });
       } else {
         const tokensBefore = data.tokensBefore ?? conv.tokens;
         const tokensAfter = data.tokensAfter ?? tokensBefore;
-        if (opts.verbose && tokensBefore > 0) {
-          const pct = Math.round((1 - tokensAfter / tokensBefore) * 100);
-          console.error(`${label} done  (${(tokensBefore / 1000).toFixed(1)}k → ${(tokensAfter / 1000).toFixed(1)}k tokens, ${pct}% reduction)`);
-        } else {
-          console.error(`${label} done`);
-        }
         compacted++;
         completedCount++;
         const project = normalizeProjectPath(conv.cwd);
@@ -541,6 +779,16 @@ export async function batchCompact(opts: {
         messagesIn += conv.messages;
         tokensIn += tokensBefore;
         tokensOut += tokensAfter;
+        opts.onEvent?.({
+          type: "session-terminal",
+          identity,
+          outcome: "done",
+          messages: conv.messages,
+          tokensBefore,
+          tokensAfter,
+          provider: formatLlmDiagnostic(data),
+          elapsed: Date.now() - sessionStart,
+        });
         onProgress?.({
           ...activePatch,
           completed: completedCount,
@@ -548,7 +796,8 @@ export async function batchCompact(opts: {
           tokensIn,
           tokensOut,
           lastResult: {
-            sessionId: conv.sessionId,
+            ...identity,
+            outcome: "done",
             messages: conv.messages,
             tokensBefore,
             tokensAfter,

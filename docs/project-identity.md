@@ -117,6 +117,89 @@ Git remote, repository name, directory contents, or matching display names.
 
 ## Linked worktrees and reconciliation
 
+### Retired local identities
+
+Worktree reconciliation can intentionally leave
+`~/.lcm/projects/<old-local-id>` as a regular-file fence. The fence records
+that the old local identity was retired; it is ownership evidence and must not
+be deleted, moved, or replaced. If the same canonical path later becomes an
+independent project, an older path-derived map key can collide with that fence.
+LCM then reports a retired local project identity instead of a generic
+`ENOTDIR` or storage-discovery failure.
+
+Recover from that exact diagnosis in the affected project:
+
+```bash
+lcm project renew-retired-identity
+# or select the canonical project explicitly
+lcm project renew-retired-identity /work/project
+```
+
+Renewal is deliberately narrow. It accepts one current, canonical, local
+binding whose key is the original path hash, with no aliases or PostgreSQL
+identity. The `projects/` parent must remain private and stable, and the fence
+must be a current-user-owned, owner-only, single-link regular file with the
+exact version, old hash, project kind, and bytes produced by reconciliation.
+The deterministic versioned successor map key, its project storage, and its
+event sidecar must all be unoccupied. LCM revalidates those facts immediately
+before atomically rekeying and reading back `map.json`; it never moves or
+deletes the fence and never moves a database.
+
+Once the atomic rekey exposes the successor, or the writer cannot prove that
+it did not, that binding remains authoritative even if a later evidence check
+or publication readback reports an error. Prompt hooks read the map without
+taking the publication lock and may create successor storage as soon as the
+new binding is visible; restoring the retired map after that point would
+strand the project behind the occupied successor. Inspect the reported error
+and retry the renewal idempotently.
+
+The command is safe to retry. If the same authenticated predecessor fence and
+successor binding are already present, it reports an idempotent no-op. After a
+successful or already-completed renewal, retry the original hook or compact
+command. Any alias, remote binding, ambiguous owner, occupied successor,
+malformed fence, unsafe mode/owner/link count, or race remains a strict refusal
+that requires inspection rather than automatic repair.
+
+A completed renewal is then enforced wherever LCM reconciles or admits writes.
+Only renewal can create a successor-shaped map key, so LCM treats that key as
+proof the project was already renewed and requires the retained predecessor
+fence before acting on it. When the fence is absent or no longer authenticates,
+reconciliation refuses with `renewed project identity is missing its
+predecessor reconciliation fence; refusing to reconcile` instead of falling
+back to the retired path hash, which would treat the renewed project's live
+database and event sidecar as a legacy source, fold them into the retired
+identity, archive the successor, and rekey `map.json` backwards. The refusal
+reaches `lcm project reconcile-worktrees`, `lcm project create`,
+`lcm project link`, `lcm project unlink`, and the storage admission a mutating
+compact run performs, because each of them reconciles before it touches project
+state. It happens before any source discovery or merge, so nothing is copied,
+archived, or moved.
+
+Prompt hooks do not fail on such a binding. They resolve the project under the
+retired path hash rather than the unauthenticated successor, and sidecar
+recovery reports no existing sidecar instead of one that writes would not use,
+so a hook keeps writing under a single consistent identity. Restore the fence
+from backup and retry; do not delete the successor binding to work around the
+refusal.
+
+These checks never require a Git anchor, because an ordinary directory renews
+exactly as a repository does. A renewed project reached through a symlinked
+path therefore reconciles normally: the mapped identity and the discovered
+directory are normalized the same way before they are compared. A genuine
+mismatch reports `mapped project identity does not match the current project
+directory`.
+
+A renewed project may later gain a distinct local alias through `lcm project
+link`. LCM authenticates that binding against the predecessor fence derived
+from the map entry's canonical path, then keeps storage and reconciliation on
+the renewed successor identity. It refuses an alias that is also the Git anchor
+of a different repository, because reconciling that path could otherwise fold
+the other repository's worktree entries into the renewed project. A path bound
+as an alias by more than one renewed identity is also refused rather than
+choosing a project arbitrarily. LCM likewise refuses a successor-shaped map key
+whose entry is bound to a different canonical project, even when the retained
+fence for the entered project is valid.
+
 On first local storage access after upgrade, LCM checks the current checkout's
 verified Git common directory. If older `map.json` entries treated linked
 worktrees as separate projects, LCM acquires a private cross-process lock and
