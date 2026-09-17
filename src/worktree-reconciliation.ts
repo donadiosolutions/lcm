@@ -3222,7 +3222,16 @@ function authenticatedRenewedReconciliationTarget(
   const successorId = retiredProjectIdentitySuccessor(retiredId, anchor.canonical);
   if (identity.id !== successorId) return undefined;
   if (!isAuthenticatedRetiredProjectIdentityFence(projectStateDir(retiredId), retiredId)) {
-    return undefined;
+    // The persisted id is reachable only through renewal, so this successor
+    // shape is proof the project was already renewed. Returning undefined
+    // here would fall through to ordinary reconciliation, which targets the
+    // retired hash, recreates the retired directory, and folds the live
+    // successor database backwards into it as a legacy source. Fail closed
+    // instead of letting a missing or tampered fence silently undo a
+    // renewal.
+    throw new Error(
+      "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile",
+    );
   }
   return { ...identity, canonical: anchor.canonical };
 }

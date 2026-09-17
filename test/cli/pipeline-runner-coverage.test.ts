@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NinjaRenderer } from "../../src/cli/pipeline-runner.js";
 import { makeProgressState } from "../../src/cli/progress-state.js";
 import { renderFrame, type RenderOpts } from "../../src/cli/render-frame.js";
-import { printSummary } from "../../src/cli/render-summary.js";
 import type { CompactItemOutcome, CompactProgressEvent } from "../../src/batch-compact.js";
 
 const NOW = new Date("2026-01-01T00:00:00.000Z");

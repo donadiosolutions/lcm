@@ -323,6 +323,8 @@ const expectedComponents = [
       // witness stay in this existing unit-project-worktrees owner.
       // #1316 keeps SQLite message-byte admission in this existing
       // unit-project-worktrees owner; no taxonomy or topology change.
+      // #1270/#1283 keep renewed-successor targeting and its fail-closed
+      // fence authentication in this existing unit-project-worktrees owner.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },

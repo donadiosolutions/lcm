@@ -38,6 +38,10 @@ import {
   serializeWorktreeReconciliationFence,
 } from "../src/worktree-reconciliation-fence.js";
 import {
+  PrivateDirectoryTopologyError,
+  PrivateFilePublicationTopologyError,
+} from "../src/security-files.js";
+import {
   BackendPublicationJournalError,
   backendPublicationDirectory,
   backendPublicationJournalPath,
@@ -318,19 +322,31 @@ describe("project map", () => {
     expect(readFileSync(projectMapPath(), "utf8")).toBe(beforeMap);
   });
 
-  it("retains evidence cleanup failure and restores the retired map", () => {
+  it("reports an evidence cleanup failure without disturbing the renewed map", () => {
     const canonical = makeDir("retired-publication-cleanup");
-    writeRetiredProjectFixture(canonical);
+    const oldId = writeRetiredProjectFixture(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
     mkdirSync(join(homedir(), ".lcm", "events"), { recursive: true, mode: 0o700 });
-    const beforeMap = readFileSync(projectMapPath(), "utf8");
+    const fence = join(homedir(), ".lcm", "projects", oldId);
+    const beforeFence = readFileSync(fence);
+    const phases: string[] = [];
 
     expect(() => renewRetiredProjectIdentity(canonical, {
+      _beforeMapReplaceForTesting: phase => phases.push(phase),
       _closeEvidenceForTesting: (kind, close) => {
         close();
         if (kind === "fence") throw new Error("retained fence cleanup failed");
       },
     })).toThrow("retained fence cleanup failed");
-    expect(readFileSync(projectMapPath(), "utf8")).toBe(beforeMap);
+    // The publication passed its own readback, so the renewed binding is
+    // authoritative and no rollback is attempted for a descriptor that
+    // failed to close.
+    expect(phases).toEqual(["publish"]);
+    expect(readProjectMapSnapshot()).toEqual({
+      [newId]: { canonical: normalizeProjectPath(canonical), aliases: [] },
+    });
+    expect(readFileSync(fence)).toEqual(beforeFence);
+    expect(isAuthenticatedRetiredProjectIdentityFence(fence, oldId)).toBe(true);
   });
 
   it("closes every renewal descriptor when the initial rollback snapshot read fails", () => {
@@ -623,14 +639,14 @@ describe("project map", () => {
     },
   );
 
-  it("aggregates an evidence cleanup failure with its failed post-cleanup rollback", () => {
-    const canonical = makeDir("retired-cleanup-rollback-failure");
+  it("aggregates independent evidence cleanup failures around a renewed map", () => {
+    const canonical = makeDir("retired-cleanup-aggregate");
     const oldId = writeRetiredProjectFixture(canonical);
     const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
     const fence = join(homedir(), ".lcm", "projects", oldId);
     const beforeFence = readFileSync(fence);
-    const cleanup = new Error("injected projects cleanup failure");
-    const rollback = new Error("injected rollback replace failure");
+    const projectsFailure = new Error("injected projects cleanup failure");
+    const rootFailure = new Error("injected root cleanup failure");
     const phases: string[] = [];
     let thrown: unknown;
 
@@ -638,12 +654,10 @@ describe("project map", () => {
       renewRetiredProjectIdentity(canonical, {
         _closeEvidenceForTesting: (kind, close) => {
           close();
-          if (kind === "projects") throw cleanup;
+          if (kind === "projects") throw projectsFailure;
+          if (kind === "root") throw rootFailure;
         },
-        _beforeMapReplaceForTesting: (phase) => {
-          phases.push(phase);
-          if (phase === "rollback") throw rollback;
-        },
+        _beforeMapReplaceForTesting: phase => phases.push(phase),
       });
     } catch (error) {
       thrown = error;
@@ -652,15 +666,101 @@ describe("project map", () => {
     expect((thrown as AggregateError).message).toBe(
       "retired project identity evidence cleanup failed",
     );
-    expect((thrown as AggregateError).errors).toEqual([cleanup, rollback]);
+    expect((thrown as AggregateError).errors).toEqual([projectsFailure, rootFailure]);
     expect((thrown as Error & { cause?: unknown }).cause).toBeUndefined();
-    expect(phases).toEqual(["publish", "rollback"]);
-    // The rollback could not land, so the successful publication survives.
+    // Cleanup failures never reopen the publication boundary, so the renewed
+    // binding and the untouched fence both survive.
+    expect(phases).toEqual(["publish"]);
     expect(readProjectMapSnapshot()).toEqual({
       [newId]: { canonical: normalizeProjectPath(canonical), aliases: [] },
     });
     expect(readFileSync(projectMapPath(), "utf8")).toContain(newId);
     expect(readFileSync(projectMapPath(), "utf8")).not.toContain(oldId);
+    expect(readFileSync(fence)).toEqual(beforeFence);
+  });
+
+  it("restores the retired map when the publishing writer fails after its rename", () => {
+    const canonical = makeDir("retired-post-rename-writer-failure");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+    const fence = join(homedir(), ".lcm", "projects", oldId);
+    const beforeFence = readFileSync(fence);
+    const beforeMap = readFileSync(projectMapPath(), "utf8");
+    const primary = new Error("injected post-rename publication failure");
+    const phases: string[] = [];
+
+    // The writer's post-replacement topology check and its cache refresh both
+    // run after the rename has landed, so a failure there leaves the renewed
+    // map on disk and must still be rolled back.
+    expect(() => renewRetiredProjectIdentity(canonical, {
+      _beforeMapReplaceForTesting: phase => phases.push(phase),
+      _afterMapReplaceForTesting: () => { throw primary; },
+    })).toThrow(primary);
+    expect(phases).toEqual(["publish", "rollback"]);
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(beforeMap);
+    expect(readProjectMapSnapshot()[oldId]).toMatchObject({ canonical });
+    expect(readProjectMapSnapshot()[newId]).toBeUndefined();
+    expect(readFileSync(fence)).toEqual(beforeFence);
+    expect(isAuthenticatedRetiredProjectIdentityFence(fence, oldId)).toBe(true);
+  });
+
+  it("restores the retired map when the writer reports a completed publication", () => {
+    const canonical = makeDir("retired-publication-outcome-rollback");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+    const fence = join(homedir(), ".lcm", "projects", oldId);
+    const beforeFence = readFileSync(fence);
+    const beforeMap = readFileSync(projectMapPath(), "utf8");
+    const phases: string[] = [];
+    // A writer that reports a completed or indeterminate publication is
+    // restored even when this process never observed the replacement.
+    const reported = new PrivateFilePublicationTopologyError(
+      "published",
+      new PrivateDirectoryTopologyError("injected retained parent rebind"),
+      undefined,
+    );
+
+    expect(() => renewRetiredProjectIdentity(canonical, {
+      _beforeMapReplaceForTesting: (phase) => {
+        phases.push(phase);
+        if (phase === "publish") throw reported;
+      },
+    })).toThrow(reported);
+    expect(phases).toEqual(["publish", "rollback"]);
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(beforeMap);
+    expect(readProjectMapSnapshot()[oldId]).toMatchObject({ canonical });
+    expect(readProjectMapSnapshot()[newId]).toBeUndefined();
+    expect(readFileSync(fence)).toEqual(beforeFence);
+  });
+
+  it("aggregates a post-rename writer failure with its failed rollback", () => {
+    const canonical = makeDir("retired-post-rename-rollback-failure");
+    const oldId = writeRetiredProjectFixture(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectPath(canonical));
+    const fence = join(homedir(), ".lcm", "projects", oldId);
+    const beforeFence = readFileSync(fence);
+    const primary = new Error("injected post-rename publication failure");
+    const rollbackFailure = new Error("injected rollback replace failure");
+    let thrown: unknown;
+
+    try {
+      renewRetiredProjectIdentity(canonical, {
+        _beforeMapReplaceForTesting: (phase) => {
+          if (phase === "rollback") throw rollbackFailure;
+        },
+        _afterMapReplaceForTesting: () => { throw primary; },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(AggregateError);
+    expect((thrown as AggregateError).errors).toContain(primary);
+    expect((thrown as AggregateError).errors).toContain(rollbackFailure);
+    // The rollback could not land, so the renamed publication survives and
+    // the fence is still untouched.
+    expect(readProjectMapSnapshot()).toEqual({
+      [newId]: { canonical: normalizeProjectPath(canonical), aliases: [] },
+    });
     expect(readFileSync(fence)).toEqual(beforeFence);
   });
 

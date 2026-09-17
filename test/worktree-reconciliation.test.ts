@@ -5231,7 +5231,7 @@ describe("worktree reconciliation", () => {
     })).toThrow("mapped project identity does not match the current Git repository");
   });
 
-  it("does not accept a successor-shaped identity as renewed when its retired fence is absent", () => {
+  it("fails closed when a successor-shaped identity's retired fence is absent", () => {
     const { main, linked } = makeRepository(home);
     const canonical = resolveGitProjectAnchor(main)!.canonical;
     const oldId = hashProjectPath(canonical);
@@ -5243,23 +5243,28 @@ describe("worktree reconciliation", () => {
     writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [newId]: { canonical, aliases: [] },
     }, null, 2)}\n`);
+    const successorDb = join(home, ".lcm", "projects", newId, "db.sqlite");
+    makeDatabase(successorDb, "renewed-session", "renewed content", newId);
     clearProjectMapCache();
 
-    const result = ensureWorktreeProjectReconciled(linked);
-    expect(result.targetHash).toBe(oldId);
-    expect(result.canonical).toBe(canonical);
-    // Without an authenticated retired fence, the successor entry is not
-    // treated as a renewal target at all: ordinary reconciliation reclaims
-    // the unauthenticated successor map entry as a same-repository source
-    // and folds it back under the plain path hash, exactly as it would for
-    // any other legacy alias of the same canonical path.
-    expect(projectIdentity(linked, SQLITE_STORAGE)).toMatchObject({
-      id: oldId,
-      localProjectId: oldId,
-      canonical,
-    });
+    const mapBefore = readFileSync(projectMapPath(), "utf8");
+    const dbBefore = readFileSync(successorDb);
+    // The persisted id is reachable only through renewal, so this shape is
+    // proof the project was already renewed. Without a fence to reverify
+    // that renewal, ordinary reconciliation would target the plain path
+    // hash, recreate the retired directory, and fold the successor's live
+    // database backwards into it as a legacy source. Fail closed instead of
+    // silently undoing the renewal.
+    expect(() => ensureWorktreeProjectReconciled(linked)).toThrow(
+      "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile",
+    );
+    // Nothing was mutated: no retired directory was recreated, the map
+    // still points only at the successor id, and its database is untouched.
+    expect(existsSync(join(home, ".lcm", "projects", oldId))).toBe(false);
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(mapBefore);
+    expect(readFileSync(successorDb)).toEqual(dbBefore);
     expect(listProjectMapEntries()).toEqual({
-      [oldId]: expect.objectContaining({ canonical }),
+      [newId]: expect.objectContaining({ canonical }),
     });
   });
 
@@ -5281,7 +5286,9 @@ describe("worktree reconciliation", () => {
     );
     clearProjectMapCache();
 
-    expect(() => ensureWorktreeProjectReconciled(linked)).toThrow();
+    expect(() => ensureWorktreeProjectReconciled(linked)).toThrow(
+      "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile",
+    );
   });
 
   it("rejects conflicting legacy bindings before PostgreSQL admission mutates project state", () => {

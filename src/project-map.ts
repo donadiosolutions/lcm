@@ -25,6 +25,7 @@ import {
   ensurePrivateDirectory,
   openPrivateDirectory,
   openPrivateDirectoryIfExists,
+  PrivateFilePublicationTopologyError,
   OWNER_ONLY_FILE_MODES,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
@@ -247,6 +248,8 @@ type RetiredProjectIdentityRenewalOptions = Readonly<{
   _readMapFileForTesting?: typeof readMapFile;
   /** @internal Observe or race the retained-root replacement boundary. */
   _beforeMapReplaceForTesting?: (phase: "publish" | "rollback") => void;
+  /** @internal Deterministic writer failure after the publishing rename landed. */
+  _afterMapReplaceForTesting?: () => void;
   /** @internal Deterministic failure after map publication and before readback. */
   _afterMapPublicationForTesting?: () => void;
 }>;
@@ -739,10 +742,6 @@ export function renewRetiredProjectIdentity(
     );
     let primaryError: unknown;
     let result: RetiredProjectIdentityRenewal | undefined;
-    // A rollback target exists exactly when a publication happened, so the
-    // snapshot travels with that fact instead of being reconstructed from
-    // separate flags that the type system cannot relate.
-    let publishedRollback: { content: string; map: ProjectMap } | undefined;
     const readRenewalMap = options._readMapFileForTesting ?? readMapFile;
     const assertRetainedRoot = (): void => {
       assertStableRetainedPrivateDirectory(
@@ -793,15 +792,27 @@ export function renewRetiredProjectIdentity(
         const renewed = cloneMap(map);
         delete renewed[oldId];
         renewed[newId] = { canonical, aliases: [] };
-        writeProjectMap(renewed, undefined, {
-          retainedWrite: retainedMapWrite(
-            "publish",
-            () => assertRetiredIdentityRenewalEvidence(evidence, true),
-          ),
-        });
-        publishedRollback = rollback;
-
+        // The publishing writer can fail after its rename already replaced
+        // the map, because the post-replacement topology check and the
+        // writer's cache refresh both run afterwards. The rollback snapshot
+        // is therefore reachable before the write starts instead of only
+        // after it returns, and the writer's own reported outcome decides
+        // whether a restore is owed: the publication callback proves the
+        // rename landed, and a publication topology failure either published
+        // or cannot prove that it did not. Every earlier refusal leaves the
+        // retired map already in place and must not be rewritten.
+        let published = false;
         try {
+          writeProjectMap(renewed, undefined, {
+            retainedWrite: retainedMapWrite(
+              "publish",
+              () => assertRetiredIdentityRenewalEvidence(evidence, true),
+            ),
+            onMapPublished: () => {
+              published = true;
+              options._afterMapReplaceForTesting?.();
+            },
+          });
           options._afterMapPublicationForTesting?.();
           // The atomic replace above already made `newId` the authoritative
           // binding. Hook-side identity resolution deliberately resolves
@@ -832,10 +843,13 @@ export function renewRetiredProjectIdentity(
             throw new Error("retired project identity renewal readback failed");
           }
         } catch (error) {
+          if (!published && !(error instanceof PrivateFilePublicationTopologyError)) {
+            throw error;
+          }
           try {
             restoreProjectMapSnapshot(
-              publishedRollback.content,
-              publishedRollback.map,
+              rollback.content,
+              rollback.map,
               retainedMapWrite("rollback", assertRetainedRoot),
             );
           } catch (rollbackError) {
@@ -845,7 +859,6 @@ export function renewRetiredProjectIdentity(
               { cause: error },
             );
           }
-          publishedRollback = undefined;
           throw error;
         }
         result = { oldId, newId, canonical, changed: true };
@@ -859,17 +872,12 @@ export function renewRetiredProjectIdentity(
       options._closeEvidenceForTesting,
       ["fence", "events", "projects", "target"],
     );
-    if (cleanupErrors.length > 0 && publishedRollback !== undefined) {
-      try {
-        restoreProjectMapSnapshot(
-          publishedRollback.content,
-          publishedRollback.map,
-          retainedMapWrite("rollback", assertRetainedRoot),
-        );
-      } catch (rollbackError) {
-        cleanupErrors.push(rollbackError);
-      }
-    }
+    // A publication that passed its own readback is the authoritative
+    // binding, and a hook resolving without the publication lock may already
+    // have created the successor sidecar. Restoring the retired id because a
+    // descriptor failed to close would fence the project behind an occupied
+    // successor that every retry then refuses, so the cleanup failure is
+    // reported on its own and the renewed binding stands.
     cleanupErrors.push(...closeRetiredIdentityRenewalEvidence(
       evidence,
       options._closeEvidenceForTesting,

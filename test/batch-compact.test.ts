@@ -16,6 +16,8 @@ import {
 } from "../src/batch-compact.js";
 import * as cliStorage from "../src/cli-storage.js";
 import * as daemonConfig from "../src/daemon/config.js";
+import * as publicationModule from "../src/storage/backend-publication.js";
+import * as factoryModule from "../src/storage/factory.js";
 import { DaemonClient } from "../src/daemon/client.js";
 import {
   captureExistingLcmSnapshot,
@@ -30,12 +32,14 @@ import {
   clearProjectMapCache,
   projectMapPath,
   renewRetiredProjectIdentity,
+  setRemoteProjectBinding,
 } from "../src/project-map.js";
 import {
   ensureProjectDir,
   MAX_PROJECT_METADATA_BYTES,
   projectPaths,
 } from "../src/daemon/project.js";
+import { recoverMachineIdentity } from "../src/machine-identity.js";
 import {
   RETIRED_PROJECT_IDENTITY_DIAGNOSTIC,
   serializeWorktreeReconciliationFence,
@@ -44,6 +48,7 @@ import { NinjaRenderer } from "../src/cli/pipeline-runner.js";
 import { makeProgressState } from "../src/cli/progress-state.js";
 
 const FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS = 15_000;
+const BATCH_COMPACT_TEST_MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const mutableFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
 
 function withBuiltinFsOverride<T>(
@@ -276,7 +281,7 @@ describe("batch compaction discovery", () => {
           total: 1,
           project: paths.canonical,
         }),
-        expect.objectContaining({
+      expect.objectContaining({
           type: "phase-failure",
           phase: "Compact",
           project: paths.canonical,
@@ -286,6 +291,85 @@ describe("batch compaction discovery", () => {
       ]));
     },
   );
+
+  it("classifies a retired local fence under PostgreSQL discovery without aborting enumeration of other projects", async () => {
+    // Finding 2 reproduction: listCliProjects() used to resolve a
+    // PostgreSQL identity for every map entry, including a fenced one with
+    // no remote binding. That threw the generic unbound-project message,
+    // which escaped listCliProjects entirely and made discoverUncompacted
+    // report one global "project discovery failed" failure for the whole
+    // run — the fenced project never reached withCliProjectStorage's
+    // RetiredProjectIdentityError branch, and no other project enumerated.
+    const fencedCwd = makeDir("compact-postgresql-retired-fenced");
+    const fencedPaths = projectPaths(fencedCwd);
+    ensureProjectDir(fencedCwd);
+    rmSync(fencedPaths.dir, { recursive: true });
+    writeFileSync(
+      fencedPaths.dir,
+      serializeWorktreeReconciliationFence(fencedPaths.id, "project"),
+      { mode: 0o600 },
+    );
+
+    const boundCwd = makeDir("compact-postgresql-retired-bound");
+    recoverMachineIdentity({
+      version: 1,
+      identityKey: `machine:${"a".repeat(64)}`,
+      machineId: BATCH_COMPACT_TEST_MACHINE_ID,
+      displayName: "Test machine",
+    });
+    setRemoteProjectBinding("018f22c4-6d2a-7f10-8a4c-6b8d3e5f9013", { canonical: boundCwd });
+
+    const config = daemonConfig.loadDaemonConfig(join(tempHome!, ".lcm", "config.json"));
+    vi.spyOn(daemonConfig, "loadDaemonConfig").mockReturnValue({
+      ...config,
+      storage: { ...config.storage, backend: "postgresql" },
+    });
+    // Bypass real PostgreSQL publication-journal verification and the real
+    // network connection; only the fence-classification ordering is under
+    // test here, not PostgreSQL storage itself.
+    vi.spyOn(publicationModule, "assertBackendPublicationConsumerAccess").mockReturnValue(undefined);
+    const realCreateStorageBackendFactory = factoryModule.createStorageBackendFactory;
+    vi.spyOn(factoryModule, "createStorageBackendFactory").mockImplementation(async (...args) => {
+      if (args[0].backend !== "postgresql") return realCreateStorageBackendFactory(...args);
+      return {
+        backend: "postgresql",
+        capabilities: {},
+        projectExists: async () => false,
+        openExistingProject: async () => { throw new Error("postgresql storage unavailable in test"); },
+        openProject: async () => { throw new Error("postgresql storage unavailable in test"); },
+        health: async () => ({ ok: false }),
+        close: async () => undefined,
+      } as unknown as Awaited<ReturnType<typeof realCreateStorageBackendFactory>>;
+    });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const events: CompactProgressEvent[] = [];
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: true,
+      port: 3737,
+      onEvent: event => events.push(event),
+    });
+
+    // Both projects still reach the per-project loop instead of the whole
+    // run aborting on the fenced entry's identity resolution.
+    expect(events.filter(event => event.type === "discovery-item-start")
+      .map(event => (event as { project: string }).project).sort())
+      .toEqual([boundCwd, fencedCwd].sort());
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "phase-failure",
+      phase: "Compact",
+      project: fencedCwd,
+      message: RETIRED_PROJECT_IDENTITY_DIAGNOSTIC,
+    }));
+    expect(events).not.toContainEqual(expect.objectContaining({
+      message: "project discovery failed",
+    }));
+    const boundFailure = events.find(event => event.type === "phase-failure" && event.project === boundCwd);
+    expect(boundFailure).toBeDefined();
+    expect((boundFailure as { message: string }).message).not.toBe(RETIRED_PROJECT_IDENTITY_DIAGNOSTIC);
+    expect(result.failures).toBe(2);
+  });
 
   it("stops enumerating the retired identity after supported renewal", async () => {
     const cwd = makeDir("compact-retired-renewed");
