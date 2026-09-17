@@ -666,6 +666,9 @@ describe("Codecov configuration", () => {
       // #1049 keeps project metadata owner and single-link admission here.
       ["src/project-map.ts", "unit-project-worktrees"],
       // #889 keeps private import metadata publication in this owner.
+      // #1308 keeps import metadata convergence in this existing owner;
+      // canonical and collapsed metadata are now read live after the write
+      // that changes each row, not from a scan-time snapshot.
       ["src/portable-knowledge.ts", "unit-project-worktrees"],
       // #866 stats config retries and journal failures, plus #973 project
       // database admission, retain this owner.

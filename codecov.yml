@@ -356,6 +356,9 @@ component_management:
         - "^src/machine-identity\\.ts$"
         # #889 keeps private import metadata publication in this owner.
         # #618 knowledge provenance scoping remains owned by project/worktree operations.
+        # #1308 keeps import metadata convergence in this existing owner;
+        # canonical and collapsed metadata are now read live after the write
+        # that changes each row, not from a scan-time snapshot.
         - "^src/portable-knowledge\\.ts$"
         # #1049 keeps project metadata owner and single-link admission in this
         # existing component; no taxonomy, status, or policy change.

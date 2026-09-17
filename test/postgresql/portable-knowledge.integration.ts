@@ -1,9 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  EXPORT_VERSION,
   exportKnowledge,
   importKnowledge,
   type ExportDocument,
@@ -54,6 +55,15 @@ function document(entries: ExportEntry[]): ExportDocument {
     projectCwd: "/portable/source-project",
     entries,
   };
+}
+
+/** Mirrors importKnowledge's retry-identity digest formula for assertions. */
+function computeEntryDigest(doc: ExportDocument, ordinal: number): string {
+  const source = doc.entries[ordinal];
+  return createHash("sha256").update(JSON.stringify([
+    EXPORT_VERSION, doc.projectCwd, ordinal, source.content, source.tags,
+    source.confidence, source.createdAt, source.sessionId,
+  ])).digest("hex");
 }
 
 async function persistedRowsFor(administrator: PostgreSqlRuntime, projectId: string) {
@@ -472,6 +482,144 @@ describe("PostgreSQL 18 portable knowledge v1", { timeout: 120_000 }, () => {
         _globalPatterns: ["RETRYPRIVATE"],
       })).resolves.toEqual({ total: 2, imported: 0, skipped: 2, dryRun: false });
       expect(await persistedRows(fixture)).toEqual(committed);
+    });
+  });
+
+  it("merges canonical metadata a second connection commits after the import scan", async () => {
+    // Proves the invariant on a real database: the import's own scan
+    // statement takes an earlier READ COMMITTED snapshot, a genuinely
+    // separate connection commits a concurrent write in between, and the
+    // import's live getById read (after its own lock-taking UPDATE) must
+    // still observe that committed write. This cannot be modeled by the
+    // SQLite-backed unit tests, which have only one physical connection.
+    await withSelectedPostgreSqlProject("knowledge-live-canonical-race", async (fixture) => {
+      const repository = new PostgreSqlPromotedMemoryRepository(fixture.database.runtime, fixture.project.projectId);
+      const content = "Live PostgreSQL canonical metadata race content";
+      const rowId = await repository.insert({ content, tags: ["pre-race"], confidence: 0.5 });
+
+      const originalGetAll = PostgreSqlPromotedMemoryRepository.prototype.getAll;
+      let release: () => void;
+      const blocked = new Promise<void>((resolve) => { release = resolve; });
+      let scanHappened = false;
+      const getAllSpy = vi.spyOn(PostgreSqlPromotedMemoryRepository.prototype, "getAll")
+        .mockImplementationOnce(async function (this: PostgreSqlPromotedMemoryRepository, options) {
+          // Drives the real import scan SQL on the import's own held
+          // connection and transaction, then pauses before returning so a
+          // genuinely independent second connection can commit meanwhile.
+          const rows = await originalGetAll.call(this, options);
+          scanHappened = true;
+          await blocked;
+          return rows;
+        });
+
+      const source = document([entry(content, ["imported"])]);
+      const importPromise = importKnowledge(fixture.projectPath, source);
+      try {
+        await vi.waitFor(() => { if (!scanHappened) throw new Error("import scan not yet observed"); }, { timeout: 10_000, interval: 10 });
+        // A second, fully independent connection (fixture.database.runtime is
+        // its own pool, distinct from the import's held connection) commits a
+        // concurrent write on the already-scanned row before the import's
+        // later dedup and merge statements run.
+        await repository.update(rowId, {
+          metadata: { concurrentNote: "committed by a second connection", [DIGEST_KEY]: ["c".repeat(64)] },
+        });
+        release!();
+        await expect(importPromise).resolves.toMatchObject({ imported: 1, skipped: 0 });
+        getAllSpy.mockRestore();
+        const rows = await persistedRows(fixture);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+          memory_id: rowId,
+          metadata: { concurrentNote: "committed by a second connection" },
+        });
+        const digestSet = new Set(rows[0].metadata[DIGEST_KEY] as string[]);
+        const newDigest = computeEntryDigest(source, 0);
+        expect([...digestSet].sort()).toEqual(["c".repeat(64), newDigest].sort());
+      } finally {
+        // Release the barrier on every path, including a failed wait or a
+        // failed concurrent write, so the import's paused transaction and
+        // connection never survive until the suite timeout. Resolving an
+        // already-resolved promise is a no-op, so this is safe to call again
+        // after the success path already released it above. Await the
+        // import to full settlement before the fixture tears down so no
+        // in-flight query overlaps that teardown.
+        release!();
+        await importPromise.catch(() => undefined);
+        getAllSpy.mockRestore();
+      }
+    });
+  });
+
+  it("keeps a second connection's metadata on the archived duplicate after the import scan", async () => {
+    // Proves the collapse half of the same invariant against a real
+    // database: the archive-then-getById ordering must read the archived
+    // row's current committed metadata, including a write a genuinely
+    // separate connection made after the import's scan but before its
+    // archive statement runs. SQLite cannot model this because it has only
+    // one physical writer connection; this is the half a live database is
+    // required to prove.
+    await withSelectedPostgreSqlProject("knowledge-live-collapse-race", async (fixture) => {
+      const repository = new PostgreSqlPromotedMemoryRepository(fixture.database.runtime, fixture.project.projectId);
+      const content = "Live PostgreSQL collapse race content";
+      const idA = await repository.insert({ content, tags: ["variant-a"], confidence: 0.4 });
+      const idB = await repository.insert({ content, tags: ["variant-b"], confidence: 0.5 });
+      const [rowA, rowB] = [await repository.getById(idA), await repository.getById(idB)];
+      // Compute which row real dedup will select as canonical without
+      // assuming timing: findExactContent and the fuzzy search both order
+      // ties by created_at DESC, memory_id DESC, so mirror that here from
+      // the rows' actual persisted timestamps rather than insertion order.
+      const canonicalFirst = rowA!.createdAt !== rowB!.createdAt
+        ? rowA!.createdAt > rowB!.createdAt
+        : idA > idB;
+      const canonicalId = canonicalFirst ? idA : idB;
+      const archivedId = canonicalFirst ? idB : idA;
+
+      const originalGetAll = PostgreSqlPromotedMemoryRepository.prototype.getAll;
+      let release: () => void;
+      const blocked = new Promise<void>((resolve) => { release = resolve; });
+      let scanHappened = false;
+      const getAllSpy = vi.spyOn(PostgreSqlPromotedMemoryRepository.prototype, "getAll")
+        .mockImplementationOnce(async function (this: PostgreSqlPromotedMemoryRepository, options) {
+          const rows = await originalGetAll.call(this, options);
+          scanHappened = true;
+          await blocked;
+          return rows;
+        });
+
+      const source = document([entry(content, ["imported"])]);
+      const importPromise = importKnowledge(fixture.projectPath, source);
+      try {
+        await vi.waitFor(() => { if (!scanHappened) throw new Error("import scan not yet observed"); }, { timeout: 10_000, interval: 10 });
+        // The second connection commits new metadata on the row that will be
+        // archived as a duplicate, before the import's own archive-then-
+        // getById sequence reads it.
+        await repository.update(archivedId, {
+          metadata: { concurrentNote: "committed by a second connection", [DIGEST_KEY]: ["d".repeat(64)] },
+        });
+        release!();
+        await expect(importPromise).resolves.toMatchObject({ imported: 1, skipped: 0 });
+        getAllSpy.mockRestore();
+        const rows = await persistedRows(fixture);
+        const archived = rows.find(row => row.memory_id === archivedId)!;
+        const canonical = rows.find(row => row.memory_id === canonicalId)!;
+        expect(archived.archived_at).not.toBeNull();
+        expect(canonical.archived_at).toBeNull();
+        expect(canonical.metadata).toMatchObject({ concurrentNote: "committed by a second connection" });
+        const digestSet = new Set(canonical.metadata[DIGEST_KEY] as string[]);
+        const newDigest = computeEntryDigest(source, 0);
+        expect([...digestSet].sort()).toEqual(["d".repeat(64), newDigest].sort());
+      } finally {
+        // Release the barrier on every path, including a failed wait or a
+        // failed concurrent write, so the import's paused transaction and
+        // connection never survive until the suite timeout. Resolving an
+        // already-resolved promise is a no-op, so this is safe to call again
+        // after the success path already released it above. Await the
+        // import to full settlement before the fixture tears down so no
+        // in-flight query overlaps that teardown.
+        release!();
+        await importPromise.catch(() => undefined);
+        getAllSpy.mockRestore();
+      }
     });
   });
 });
