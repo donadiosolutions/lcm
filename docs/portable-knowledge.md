@@ -93,6 +93,14 @@ source project makes a different import identity and invokes normal content
 deduplication. Duplicate collapse retains retry identities and existing metadata;
 canonical metadata values win conflicting keys.
 
+If another import or promotion commits a matching memory for the same project
+while an import is running, the import merges into that memory's current
+stored metadata instead of replacing it, so its notes and retry identities
+survive. Both memories' retry identities are then recognized by later
+replays. An entry that another import already committed just before this run
+observed it may still be reported as imported by this run; that produces one
+memory, not two, and no data is lost.
+
 Successful commands exit zero. Operational failures, including failed projects
 in `export --all`, exit one. JSON output contains the requested payload; progress
 and warnings go to stderr. A failed export does not emit a partial JSON document
