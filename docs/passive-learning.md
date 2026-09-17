@@ -330,6 +330,9 @@ prune decision. Cancellation and the scan deadline are both honored before the
 scan opens anything, in which case the sidecar is reported as skipped and is
 never opened, closed, or pruned. Contention with an unrelated publication
 remains a per-sidecar error, and the sweep continues with the next sidecar.
+A sweep that owns no caller admission still refuses to run while a backend
+migration holds publication, so maintenance keeps its existing protection and
+no sidecar is deleted underneath it.
 
 - **Promoted store**: Events promoted via `deduplicateAndInsert()` into the main LCM database
   - Tagged with `source:passive-capture` and `hook:<PostToolUse|UserPromptSubmit>`

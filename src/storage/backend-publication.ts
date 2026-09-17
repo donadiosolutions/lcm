@@ -2027,12 +2027,19 @@ function assertRetainedAppendAdmissionActive(
   }
 }
 
+type AppendAdmissionMode = Readonly<{
+  /** Retained participants grant append authority to the explicit token only. */
+  explicitOnly: boolean;
+  /** Only the append barrier itself writes while publication stays unresolved. */
+  allowUnresolved: boolean;
+}>;
+
 async function runAppendAdmissionAttempt<T>(
   homeDir: string | undefined,
   callback: (token: BackendPublicationLockToken) => Promise<T> | T,
   lockToken: BackendPublicationLockToken | undefined,
   options: BackendPublicationAppendBarrierOptions,
-  explicitOnly: boolean,
+  mode: AppendAdmissionMode,
   assertBeforeEffects?: () => void,
   markCallerEffectsStarted?: () => void,
 ): Promise<T> {
@@ -2057,29 +2064,28 @@ async function runAppendAdmissionAttempt<T>(
         join(rootPath(homeDir), ".local-hook-append.lock"),
         "local hook append barrier",
         async () => {
-          const ownsActiveMarker = !activeAppendBarrierTokens.has(token);
-          if (ownsActiveMarker) activeAppendBarrierTokens.add(token);
+          activeAppendBarrierTokens.add(token);
           try {
             assertBeforeEffects?.();
             markCallerEffectsStarted?.();
             const invoke = (): Promise<T> | T => callback(token);
-            return explicitOnly
+            return mode.explicitOnly
               ? await activeAppendBarrierContext.run(null, invoke)
               : await activeAppendBarrierContext.run(
                 { rootPath: rootPath(homeDir), token },
                 invoke,
               );
           } finally {
-            if (ownsActiveMarker) activeAppendBarrierTokens.delete(token);
+            activeAppendBarrierTokens.delete(token);
           }
         },
         options._appendLockObserver,
         options._appendLockOperations,
       );
     },
-    { allowUnresolved: true, lockToken },
+    { allowUnresolved: mode.allowUnresolved, lockToken },
   );
-  return explicitOnly
+  return mode.explicitOnly
     ? activeAppendBarrierContext.run(null, acquire)
     : acquire();
 }
@@ -2138,7 +2144,7 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
           callback,
           contextualToken,
           options,
-          false,
+          { explicitOnly: false, allowUnresolved: true },
           undefined,
           () => { callerEffectsStarted = true; },
         );
@@ -2229,7 +2235,7 @@ export async function withBackendPublicationRetainedAppendAdmissionAsync<T>(
       callback,
       lockToken,
       options,
-      true,
+      { explicitOnly: true, allowUnresolved: false },
       assertActive,
     );
   } finally {

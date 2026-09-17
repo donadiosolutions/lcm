@@ -10,8 +10,10 @@ import { EventsDb } from "../../src/hooks/events-db.js";
 import { SQLiteLocalHookOutboxFactory, type LocalHookOutboxRepository } from "../../src/storage/local-hook-outbox.js";
 import {
   BackendPublicationAppendBarrierTimeoutError,
+  BackendPublicationCoordinator,
   withBackendPublicationAppendBarrierAsync,
   withBackendPublicationConsumerLockAsync,
+  type BackendPublicationDriver,
 } from "../../src/storage/backend-publication.js";
 import { isLcmConnectionOpen } from "../../src/db/connection.js";
 
@@ -585,6 +587,39 @@ describe("configured-home sidecar observation", () => {
       summary.scanError?.includes("backend publication mutation is already in progress")
       && summary.pruned === undefined)).toBe(true);
     expect([path, second, third].every(sidecar => existsSync(sidecar))).toBe(true);
+  });
+
+  it("refuses to prune a sidecar while maintenance holds publication", async () => {
+    const forbidden = async (): Promise<never> => {
+      throw new Error("publication driver must not run");
+    };
+    const driver: BackendPublicationDriver = {
+      observeLocalState: forbidden,
+      publishProjectMap: forbidden,
+      publishConfig: forbidden,
+      restoreConfig: forbidden,
+      restoreProjectMap: forbidden,
+    };
+    await new BackendPublicationCoordinator({ homeDir, driver }).enterMaintenance({
+      publicationId: "sidecar-maintenance-publication",
+      generationId: "sidecar-maintenance-generation",
+      sourceSelectionSha256: "a".repeat(64),
+      queueEvidenceSha256: "b".repeat(64),
+      roster: [{
+        machineId: "0195d250-0000-7000-8000-000000000091",
+        queueCutoff: null,
+        evidenceSha256: "a".repeat(64),
+      }],
+    });
+
+    const [summary] = await collectEventSidecars({ homeDir, timeoutMs: 2_000 });
+
+    expect(summary).toMatchObject({
+      path,
+      scanError: "backend publication is held for migration maintenance",
+    });
+    expect(summary?.pruned).toBeUndefined();
+    expect(existsSync(path)).toBe(true);
   });
 
   it("refuses an append between the health snapshot and stale-orphan deletion", async () => {

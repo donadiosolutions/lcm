@@ -13,3 +13,6 @@ during close cannot write between the snapshot and the prune decision.
 Cancellation and the scan deadline are honored before the scan opens anything,
 reporting the sidecar as skipped, while unrelated publication contention
 remains a per-sidecar error that lets scanning continue.
+
+The sweep also keeps refusing to run while a backend migration holds
+publication, so it cannot delete a sidecar during maintenance.

@@ -6262,6 +6262,50 @@ describe("revocable mutation permits", () => {
       expect(withBackendPublicationConsumerLock(home, nested => nested)).toBe(token);
     });
   });
+
+  it("waits for an unbounded retained predecessor until it settles", async () => {
+    const home = makeHome();
+    const order: string[] = [];
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      order.push("owner");
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+
+    let retainedSettled = false;
+    const retained = withBackendPublicationRetainedAppendAdmissionAsync(home, () => {
+      order.push("retained");
+    }).then(() => { retainedSettled = true; });
+    for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+
+    expect(retainedSettled).toBe(false);
+    expect(order).toEqual(["owner"]);
+
+    releaseOwner();
+    await Promise.all([owner, retained]);
+    expect(order).toEqual(["owner", "retained"]);
+  });
+
+  it("keeps consumer gating while maintenance holds publication", async () => {
+    const home = makeHome();
+    await createMaintenanceState(home, makeDriver(material()).driver, "maintenance-held");
+    const retained = vi.fn();
+
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      retained,
+      undefined,
+      { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+    )).rejects.toMatchObject({ reason: "unresolved-publication" });
+    expect(retained).not.toHaveBeenCalled();
+
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => "appended"))
+      .resolves.toBe("appended");
+  });
 });
 
 describe("backend publication directory link-count policy", () => {
