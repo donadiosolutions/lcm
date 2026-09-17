@@ -2803,6 +2803,294 @@ describe("PostgreSQL migrations and database isolation", () => {
     });
   });
 
+
+  it("rejects readmission after promoted_memories.content collation is recreated nondeterministic under the same name", async () => {
+    await withPostgreSqlTestDatabase("content-collation-same-name-recreation", async (database) => {
+      await runPostgreSqlMigrations(database.migrator);
+      await applyRuntimeGrantScripts(database);
+
+      // An administrator legitimately accepts a deterministic custom
+      // collation under a name they intend to keep using.
+      await database.migrator.query({
+        text: `CREATE COLLATION public.lcm_recreatable_ci (
+                 provider = icu, locale = 'und-u-ks-level2', deterministic = true
+               )`,
+      }, { domain: "factory", operation: "createDeterministicCollationFixture" });
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.promoted_memories DROP COLUMN search_document",
+      }, { domain: "factory", operation: "dropSearchDocumentForRecreationFixture" });
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.promoted_memories DROP COLUMN content_sha256",
+      }, { domain: "factory", operation: "dropContentDigestForRecreationFixture" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ALTER COLUMN content TYPE text COLLATE public.lcm_recreatable_ci`,
+      }, { domain: "factory", operation: "alterContentToNamedDeterministicCollation" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ADD COLUMN search_document tsvector GENERATED ALWAYS AS (
+                 to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content))
+               ) STORED`,
+      }, { domain: "factory", operation: "restoreSearchDocumentForRecreationFixture" });
+      await database.migrator.query({
+        text: `CREATE INDEX promoted_memories_search_document_idx
+               ON lcm.promoted_memories USING gin (search_document)`,
+      }, { domain: "factory", operation: "restoreSearchDocumentIndexForRecreationFixture" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ADD COLUMN content_sha256 bytea GENERATED ALWAYS AS (
+                 public.digest(content, 'sha256')
+               ) STORED`,
+      }, { domain: "factory", operation: "restoreContentDigestForRecreationFixture" });
+      await database.migrator.query({
+        text: `CREATE INDEX promoted_memories_content_sha256_idx
+               ON lcm.promoted_memories (
+                 project_id, content_sha256, created_at DESC, memory_id DESC
+               )
+               WHERE archived_at IS NULL`,
+      }, { domain: "factory", operation: "restoreContentDigestIndexForRecreationFixture" });
+
+      // Reproduce the reviewer's exact hazard: detach content from the
+      // collation, drop and recreate the SAME qualified name as
+      // nondeterministic, and reattach content to it. A fingerprint
+      // keyed only on collation_name would see "public.lcm_recreatable_ci"
+      // both before and after and notice nothing.
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.promoted_memories DROP COLUMN search_document",
+      }, { domain: "factory", operation: "dropSearchDocumentForCollationSwap" });
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.promoted_memories DROP COLUMN content_sha256",
+      }, { domain: "factory", operation: "dropContentDigestForCollationSwap" });
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.promoted_memories ALTER COLUMN content TYPE text COLLATE pg_catalog.\"default\"",
+      }, { domain: "factory", operation: "detachContentFromNamedCollation" });
+      await database.migrator.query({
+        text: "DROP COLLATION public.lcm_recreatable_ci",
+      }, { domain: "factory", operation: "dropRecreatableCollationFixture" });
+      await database.migrator.query({
+        text: `CREATE COLLATION public.lcm_recreatable_ci (
+                 provider = icu, locale = 'und-u-ks-level2', deterministic = false
+               )`,
+      }, { domain: "factory", operation: "recreateCollationAsNondeterministic" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ALTER COLUMN content TYPE text COLLATE public.lcm_recreatable_ci`,
+      }, { domain: "factory", operation: "reattachContentToRecreatedCollation" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ADD COLUMN search_document tsvector GENERATED ALWAYS AS (
+                 to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content))
+               ) STORED`,
+      }, { domain: "factory", operation: "restoreSearchDocumentAfterCollationSwap" });
+      await database.migrator.query({
+        text: `CREATE INDEX promoted_memories_search_document_idx
+               ON lcm.promoted_memories USING gin (search_document)`,
+      }, { domain: "factory", operation: "restoreSearchDocumentIndexAfterCollationSwap" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ADD COLUMN content_sha256 bytea GENERATED ALWAYS AS (
+                 public.digest(content, 'sha256')
+               ) STORED`,
+      }, { domain: "factory", operation: "restoreContentDigestAfterCollationSwap" });
+      await database.migrator.query({
+        text: `CREATE INDEX promoted_memories_content_sha256_idx
+               ON lcm.promoted_memories (
+                 project_id, content_sha256, created_at DESC, memory_id DESC
+               )
+               WHERE archived_at IS NULL`,
+      }, { domain: "factory", operation: "restoreContentDigestIndexAfterCollationSwap" });
+
+      // Prove the reproduction directly: same qualified name, now
+      // nondeterministic.
+      const recreated = await database.migrator.query<{
+        collation_name: string;
+        collation_is_deterministic: boolean;
+      }>({
+        text: `SELECT pg_catalog.concat_ws('.', collns.nspname, coll.collname)
+                 AS collation_name,
+               coll.collisdeterministic AS collation_is_deterministic
+               FROM pg_catalog.pg_attribute attr
+               JOIN pg_catalog.pg_class rel ON rel.oid = attr.attrelid
+               JOIN pg_catalog.pg_namespace ns ON ns.oid = rel.relnamespace
+               JOIN pg_catalog.pg_collation coll ON coll.oid = attr.attcollation
+               JOIN pg_catalog.pg_namespace collns ON collns.oid = coll.collnamespace
+               WHERE ns.nspname = 'lcm' AND rel.relname = 'promoted_memories'
+                 AND attr.attname = 'content'`,
+      }, { domain: "factory", operation: "verifyRecreatedCollationName" });
+      expect(recreated.rows[0]).toMatchObject({
+        collation_name: "public.lcm_recreatable_ci",
+        collation_is_deterministic: false,
+      });
+
+      // Admission now refuses, closing the reviewer's hazard: a
+      // same-name recreation is caught because this check reads live
+      // catalog state on every call instead of comparing against a
+      // recorded baseline fingerprint.
+      const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+        expectedOwner: "lcm_test_migrator",
+      }).catch((error: unknown) => error);
+      expect(readinessFailure).toMatchObject({
+        reason: "content-collation-preflight",
+        operation: "runtimeReadinessContentCollation",
+      });
+      const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+        .catch((error: unknown) => error);
+      expect(migrationFailure).toBeInstanceOf(PostgreSqlContentCollationPreflightError);
+      expect(migrationFailure).toMatchObject({
+        collationName: "public.lcm_recreatable_ci",
+        collationIsDeterministic: false,
+      });
+    }, { runMigrations: false });
+  });
+
+
+  it("recovers promoted_memories.content from a nondeterministic collation using the documented procedure", async () => {
+    await withPostgreSqlTestDatabase("content-collation-documented-recovery", async (database) => {
+      await applyRuntimeGrantScripts(database);
+      const projectRow = await database.migrator.query<{ project_id: string }>({
+        text: `INSERT INTO lcm.projects (identity_key, display_name)
+               VALUES ($1, $2) RETURNING project_id`,
+        values: [
+          createHash("sha256").update("collation-recovery owner").digest("hex"),
+          "collation-recovery owner",
+        ],
+      }, { domain: "identity", operation: "createCollationRecoveryProject" });
+      const projectId = projectRow.rows[0]!.project_id;
+      const content = "documented collation recovery procedure content";
+      const seeded = await database.migrator.query<{ memory_id: string }>({
+        text: `INSERT INTO lcm.promoted_memories (project_id, content)
+               VALUES ($1, $2) RETURNING memory_id`,
+        values: [projectId, content],
+      }, { domain: "factory", operation: "seedCollationRecoveryRow" });
+      const memoryId = seeded.rows[0]!.memory_id;
+      const repository = new PostgreSqlPromotedMemoryRepository(database.migrator, projectId);
+      await expect(repository.findExactContent(content)).resolves.toMatchObject({
+        id: memoryId,
+        content,
+      });
+
+      // Break it, reproducing the same nondeterministic-collation fixture
+      // proven elsewhere in this file.
+      await database.migrator.query({
+        text: `CREATE COLLATION public.lcm_recovery_nondeterministic_ci (
+                 provider = icu, locale = 'und-u-ks-level2', deterministic = false
+               )`,
+      }, { domain: "factory", operation: "createRecoveryNondeterministicCollationFixture" });
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.promoted_memories DROP COLUMN search_document",
+      }, { domain: "factory", operation: "dropSearchDocumentForRecoveryFixture" });
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.promoted_memories DROP COLUMN content_sha256",
+      }, { domain: "factory", operation: "dropContentDigestForRecoveryFixture" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ALTER COLUMN content TYPE text
+               COLLATE public.lcm_recovery_nondeterministic_ci`,
+      }, { domain: "factory", operation: "alterContentToNondeterministicForRecoveryFixture" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ADD COLUMN search_document tsvector GENERATED ALWAYS AS (
+                 to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content))
+               ) STORED`,
+      }, { domain: "factory", operation: "restoreSearchDocumentBrokenForRecoveryFixture" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ADD COLUMN content_sha256 bytea GENERATED ALWAYS AS (
+                 public.digest(content, 'sha256')
+               ) STORED`,
+      }, { domain: "factory", operation: "restoreContentDigestBrokenForRecoveryFixture" });
+      // Note: the two indexes are deliberately left unrestored here,
+      // since the preflight is expected to reject before either
+      // "rerun migrations" step in the documented procedure would
+      // otherwise recreate them.
+      await expect(runPostgreSqlMigrations(database.migrator))
+        .rejects.toBeInstanceOf(PostgreSqlContentCollationPreflightError);
+
+      // Apply exactly the ordered recovery procedure documented in
+      // docs/configuration.md, in the same statement order.
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.promoted_memories DROP COLUMN search_document",
+      }, { domain: "factory", operation: "recoveryDropSearchDocument" });
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.promoted_memories DROP COLUMN content_sha256",
+      }, { domain: "factory", operation: "recoveryDropContentDigest" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ALTER COLUMN content TYPE text COLLATE pg_catalog."default"`,
+      }, { domain: "factory", operation: "recoveryRestoreDeterministicCollation" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ADD COLUMN search_document tsvector GENERATED ALWAYS AS (
+                 to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content))
+               ) STORED`,
+      }, { domain: "factory", operation: "recoveryRestoreSearchDocument" });
+      await database.migrator.query({
+        text: `CREATE INDEX promoted_memories_search_document_idx
+               ON lcm.promoted_memories USING gin (search_document)`,
+      }, { domain: "factory", operation: "recoveryRestoreSearchDocumentIndex" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ADD COLUMN content_sha256 bytea GENERATED ALWAYS AS (
+                 public.digest(content, 'sha256')
+               ) STORED`,
+      }, { domain: "factory", operation: "recoveryRestoreContentDigest" });
+      await database.migrator.query({
+        text: `CREATE INDEX promoted_memories_content_sha256_idx
+               ON lcm.promoted_memories (
+                 project_id, content_sha256, created_at DESC, memory_id DESC
+               )
+               WHERE archived_at IS NULL`,
+      }, { domain: "factory", operation: "recoveryRestoreContentDigestIndex" });
+
+      // The documented "then rerun migrations" step now succeeds and
+      // recurring readiness admits the database again.
+      await expect(runPostgreSqlMigrations(database.migrator)).resolves.toEqual({
+        applied: [],
+        current: loadPostgreSqlMigrations().map(({ id }) => id),
+      });
+      await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
+        expectedOwner: "lcm_test_migrator",
+      })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+
+      // The generated digest recomputed correctly for the row that
+      // survived the whole drop/alter/recreate cycle, and both
+      // recreated indexes are in place.
+      const recomputedDigest = await database.migrator.query<{
+        content_sha256: string | null;
+      }>({
+        text: `SELECT pg_catalog.encode(content_sha256, 'hex') AS content_sha256
+               FROM lcm.promoted_memories
+               WHERE project_id = $1 AND memory_id = $2`,
+        values: [projectId, memoryId],
+      }, { domain: "factory", operation: "verifyRecoveredDigestBackfill" });
+      expect(recomputedDigest.rows[0]?.content_sha256).toBe(
+        createHash("sha256").update(content).digest("hex"),
+      );
+      const recreatedIndexes = await database.migrator.query<{ indexname: string }>({
+        text: `SELECT indexname FROM pg_catalog.pg_indexes
+               WHERE schemaname = 'lcm' AND tablename = 'promoted_memories'
+                 AND indexname = ANY($1::text[])`,
+        values: [[
+          "promoted_memories_search_document_idx",
+          "promoted_memories_content_sha256_idx",
+        ]],
+      }, { domain: "factory", operation: "verifyRecoveredIndexes" });
+      expect(recreatedIndexes.rows.map((row) => row.indexname).sort()).toEqual([
+        "promoted_memories_content_sha256_idx",
+        "promoted_memories_search_document_idx",
+      ]);
+      const recoveredRepository = new PostgreSqlPromotedMemoryRepository(
+        database.migrator,
+        projectId,
+      );
+      await expect(recoveredRepository.findExactContent(content)).resolves.toMatchObject({
+        id: memoryId,
+        content,
+      });
+    });
+  });
+
+
   it("rejects table persistence drift", async () => {
     await withPostgreSqlTestDatabase("table-persistence-drift", async (database) => {
       await database.migrator.query({

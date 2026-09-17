@@ -595,8 +595,65 @@ explicitly attached case- or accent-insensitive collation. A nondeterministic
 collation can make two byte-different rows compare equal even though their
 generated digests differ, which would let exact-content lookups silently
 miss an existing duplicate. Leave `content` on its default deterministic
-collation; migration and later readiness checks fail closed with a clear,
-actionable error if that is ever changed.
+collation. `lcm postgres migrate` reports a specific, actionable error
+naming the offending collation if that is ever changed. Recurring runtime
+readiness (checked at every daemon and MCP factory boot, and by `lcm
+doctor`) also fails closed on the same condition, consistent with how it
+already handles a missing required extension or a misconfigured search
+configuration: it reports a generic readiness failure and directs the
+operator back to `lcm postgres migrate` for the specific diagnosis. Both
+checks read the live collation determinism from the PostgreSQL catalog on
+every call rather than a recorded baseline, so admission keeps failing
+closed even if the collation object is later dropped and recreated under
+the exact same qualified name as nondeterministic.
+
+#### Recovering from a nondeterministic promoted_memories.content collation
+
+`search_document` and, since migration `0007_promoted_content_digest`,
+`content_sha256` are `STORED` generated columns that depend on
+`content`, so PostgreSQL refuses a plain `ALTER COLUMN content TYPE ...`
+outright. Recover with this ordered, dependency-safe procedure, run as the
+migration role in one transaction:
+
+```sql
+BEGIN;
+
+ALTER TABLE lcm.promoted_memories DROP COLUMN search_document;
+ALTER TABLE lcm.promoted_memories DROP COLUMN content_sha256;
+
+ALTER TABLE lcm.promoted_memories
+  ALTER COLUMN content TYPE text COLLATE pg_catalog."default";
+
+ALTER TABLE lcm.promoted_memories
+  ADD COLUMN search_document tsvector GENERATED ALWAYS AS (
+    to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content))
+  ) STORED;
+CREATE INDEX promoted_memories_search_document_idx
+  ON lcm.promoted_memories USING gin (search_document);
+
+ALTER TABLE lcm.promoted_memories
+  ADD COLUMN content_sha256 bytea GENERATED ALWAYS AS (
+    public.digest(content, 'sha256')
+  ) STORED;
+CREATE INDEX promoted_memories_content_sha256_idx
+  ON lcm.promoted_memories (
+    project_id, content_sha256, created_at DESC, memory_id DESC
+  )
+  WHERE archived_at IS NULL;
+
+COMMIT;
+```
+
+Dropping `search_document` and `content_sha256` also drops the two
+indexes built on them (`promoted_memories_search_document_idx` and
+`promoted_memories_content_sha256_idx`); recreating the generated columns
+does not automatically recreate those indexes, so the `CREATE INDEX`
+statements above are required, not optional. `pg_catalog."default"`
+restores the server's default deterministic collation; substitute another
+explicitly deterministic collation if the deployment requires one. Then run
+`lcm postgres migrate` to confirm the collation preflight now passes; it
+performs no further DDL here because migration `0007` is already recorded
+as applied.
 
 After migration, apply only the reviewed scripts required by the repositories
 that this runtime role will use. The project-storage factory requires the

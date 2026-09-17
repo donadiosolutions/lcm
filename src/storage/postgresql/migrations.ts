@@ -806,12 +806,15 @@ export class PostgreSqlContentCollationPreflightError extends StorageOperationEr
   readonly tableName = "promoted_memories";
   readonly columnName = "content";
   readonly remediation =
-    "Restore a deterministic collation on lcm.promoted_memories.content, "
-    + "for example ALTER TABLE lcm.promoted_memories ALTER COLUMN content "
-    + "TYPE text COLLATE pg_catalog.\"default\", then rerun migrations. A "
-    + "nondeterministic collation lets raw content equality match rows "
-    + "whose generated content_sha256 digest differs, which would make "
-    + "findExactContent miss an existing duplicate.";
+    "Restore a deterministic collation on lcm.promoted_memories.content. "
+    + "A plain ALTER COLUMN cannot run directly because search_document "
+    + "and content_sha256 are generated columns that depend on content; "
+    + "follow the ordered \"Recovering from a nondeterministic "
+    + "promoted_memories.content collation\" procedure in "
+    + "docs/configuration.md, then rerun migrations. A nondeterministic "
+    + "collation lets raw content equality match rows whose generated "
+    + "content_sha256 digest differs, which would make findExactContent "
+    + "miss an existing duplicate.";
 
   override toJSON(): Record<string, unknown> {
     return {
@@ -823,6 +826,61 @@ export class PostgreSqlContentCollationPreflightError extends StorageOperationEr
       collationIsDeterministic: this.collationIsDeterministic,
       remediation: this.remediation,
     };
+  }
+}
+
+/**
+ * Fails closed when lcm.promoted_memories.content carries a
+ * nondeterministic collation. Reads pg_attribute/pg_collation live on
+ * every call rather than comparing against a recorded baseline, so a
+ * collation later dropped and recreated under the same qualified name
+ * (which changes its OID and determinism but not its display name) is
+ * still caught the next time this runs, whether at migration time or
+ * at recurring runtime-readiness admission. A no-op when the table or
+ * column does not exist yet, since migration 0002 has not necessarily
+ * run.
+ */
+export async function assertPromotedMemoriesContentCollationReady(
+  executor: PostgreSqlQueryExecutor,
+  options: { readonly operation?: string; readonly signal?: AbortSignal } = {},
+): Promise<void> {
+  const operation = options.operation ?? "preflightContentCollation";
+  const contentCollationResult = await executor.query<ContentCollationRow>({
+    text: `SELECT
+             pg_catalog.concat_ws(
+               '.', collation_namespace.nspname, collation_metadata.collname
+             ) AS collation_name,
+             collation_metadata.collisdeterministic
+               AS collation_is_deterministic
+           FROM pg_catalog.pg_attribute AS attribute
+           JOIN pg_catalog.pg_class AS relation
+             ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
+           JOIN pg_catalog.pg_namespace AS namespace
+             ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+           LEFT JOIN pg_catalog.pg_collation AS collation_metadata
+             ON collation_metadata.oid OPERATOR(pg_catalog.=)
+               attribute.attcollation
+           LEFT JOIN pg_catalog.pg_namespace AS collation_namespace
+             ON collation_namespace.oid OPERATOR(pg_catalog.=)
+               collation_metadata.collnamespace
+           WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+             AND relation.relname OPERATOR(pg_catalog.=) 'promoted_memories'
+             AND attribute.attname OPERATOR(pg_catalog.=) 'content'`,
+  }, { domain: "factory", operation, signal: options.signal });
+  const contentCollationRow = contentCollationResult.rows[0];
+  if (contentCollationRow) {
+    const collationIsDeterministic = sanitizeBoolean(
+      contentCollationRow.collation_is_deterministic,
+    );
+    const collationName = typeof contentCollationRow.collation_name === "string"
+      ? contentCollationRow.collation_name
+      : null;
+    if (collationIsDeterministic !== true) {
+      throw new PostgreSqlContentCollationPreflightError(
+        collationName,
+        collationIsDeterministic,
+      );
+    }
   }
 }
 
@@ -1311,43 +1369,7 @@ export async function runPostgreSqlMigrations(
   // first and this check never runs, because there is no point
   // reporting a column-level collation defect on a database that cannot
   // run the digest-backed migration at all.
-  const contentCollationResult = await executor.query<ContentCollationRow>({
-    text: `SELECT
-             pg_catalog.concat_ws(
-               '.', collation_namespace.nspname, collation_metadata.collname
-             ) AS collation_name,
-             collation_metadata.collisdeterministic
-               AS collation_is_deterministic
-           FROM pg_catalog.pg_attribute AS attribute
-           JOIN pg_catalog.pg_class AS relation
-             ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
-           JOIN pg_catalog.pg_namespace AS namespace
-             ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
-           LEFT JOIN pg_catalog.pg_collation AS collation_metadata
-             ON collation_metadata.oid OPERATOR(pg_catalog.=)
-               attribute.attcollation
-           LEFT JOIN pg_catalog.pg_namespace AS collation_namespace
-             ON collation_namespace.oid OPERATOR(pg_catalog.=)
-               collation_metadata.collnamespace
-           WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
-             AND relation.relname OPERATOR(pg_catalog.=) 'promoted_memories'
-             AND attribute.attname OPERATOR(pg_catalog.=) 'content'`,
-  }, { domain: "factory", operation: "preflightContentCollation", signal: options.signal });
-  const contentCollationRow = contentCollationResult.rows[0];
-  if (contentCollationRow) {
-    const collationIsDeterministic = sanitizeBoolean(
-      contentCollationRow.collation_is_deterministic,
-    );
-    const collationName = typeof contentCollationRow.collation_name === "string"
-      ? contentCollationRow.collation_name
-      : null;
-    if (collationIsDeterministic !== true) {
-      throw new PostgreSqlContentCollationPreflightError(
-        collationName,
-        collationIsDeterministic,
-      );
-    }
-  }
+  await assertPromotedMemoriesContentCollationReady(executor, { signal: options.signal });
   return executor.transaction(async (transaction) => {
     await transaction.query({
       text: "SET LOCAL search_path = pg_catalog, public",
