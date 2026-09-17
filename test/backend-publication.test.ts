@@ -4004,6 +4004,106 @@ describe("BackendPublicationCoordinator", () => {
     expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
   });
 
+  it("rejects a same-UID history directory substituted immediately after creation", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    const attempt = countingDriver(material());
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalLstat = nodeFs.lstatSync as (...args: unknown[]) => unknown;
+    let injected = false;
+
+    // "history" is absent, so the coordinator takes the mkdirSync-then-open
+    // creation branch. There is no public seam between mkdirSync returning
+    // and the following openPrivateDirectory call, so this test injects the
+    // closest reachable equivalent: a same-UID, same-mode real-directory
+    // substitution observed at the very first lstat the new post-open entry
+    // binding performs, which is the earliest point after open where a
+    // substitution can possibly be detected.
+    await expect(withPatchedFsAsync("lstatSync", ((path: string, ...args: unknown[]) => {
+      if (!injected && path === history) {
+        injected = true;
+        rmSync(history, { recursive: true });
+        mkdirSync(history, { mode: 0o700 });
+      }
+      return originalLstat(path, ...args);
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    }))).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+    expect(injected).toBe(true);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(existsSync(join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    ))).toBe(false);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("rejects a history directory turned into a self-resolving symlink mid-archive", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const elsewhere = `${history}.elsewhere`;
+    const attempt = countingDriver(material());
+    let injected = false;
+
+    // Renaming the retained directory to a new name and replacing "history"
+    // with a symlink back to it leaves the retained descriptor's dev/ino
+    // reachable again through realpath resolution: the prior
+    // realpathSync-based comparison in assertPrivateDirectory alone would
+    // accept this, since it only compares resolved identity, not entry type.
+    // The added assertPrivateDirectoryEntry check lstat's the exact "history"
+    // component without following symlinks and rejects it immediately.
+    await expect(coordinator(home, attempt.driver, (event) => {
+      if (!injected && event === "before-terminal-journal-archive-publication") {
+        injected = true;
+        renameSync(history, elsewhere);
+        symlinkSync(elsewhere, history, "dir");
+      }
+    }).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+    expect(injected).toBe(true);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(readdirSync(elsewhere)).toEqual([]);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("archives across a create-then-reuse history sequence on the ordinary happy path", async () => {
+    const home = makeHome();
+    const gen1 = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+
+    const gen2Driver = makeDriver(material());
+    await coordinator(home, gen2Driver.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    });
+    const gen2 = await coordinator(home, gen2Driver.driver).resume();
+
+    const gen3Driver = makeDriver(material());
+    const prepared3 = await coordinator(home, gen3Driver.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-3",
+    });
+
+    expect(prepared3).toMatchObject({ publicationId: "publication-3", phase: "prepared" });
+    expect(statSync(history).mode & 0o777).toBe(0o700);
+    expect(existsSync(join(
+      history,
+      `${gen1.journal.publicationId}.${gen1.journal.checksumSha256}.json`,
+    ))).toBe(true);
+    expect(existsSync(join(
+      history,
+      `${gen2.publicationId}.${gen2.checksumSha256}.json`,
+    ))).toBe(true);
+  });
+
   it.each([2, 3] as const)(
     "retains one history descriptor and syncs the v%s archive in fd order",
     async (version) => {
@@ -4042,7 +4142,9 @@ describe("BackendPublicationCoordinator", () => {
       expect(historyRecords[0]?.closed).toBe(1);
       const expectedEvents = [
         expectedArchiveDirectoryEvent("assert", observed.admitted.history),
+        expectedArchiveDirectoryEvent("assert", observed.admitted.history),
         expectedArchiveDirectoryEvent("fsync", observed.admitted.history),
+        expectedArchiveDirectoryEvent("assert", observed.admitted.history),
         expectedArchiveDirectoryEvent("assert", observed.admitted.history),
         expectedArchiveDirectoryEvent("assert", observed.admitted.outer),
         expectedArchiveDirectoryEvent("fsync", observed.admitted.outer),
@@ -4079,7 +4181,9 @@ describe("BackendPublicationCoordinator", () => {
     });
     const expectedEvents = [
       expectedArchiveDirectoryEvent("assert", observed.admitted.history),
+      expectedArchiveDirectoryEvent("assert", observed.admitted.history),
       expectedArchiveDirectoryEvent("fsync", observed.admitted.history),
+      expectedArchiveDirectoryEvent("assert", observed.admitted.history),
       expectedArchiveDirectoryEvent("assert", observed.admitted.history),
       expectedArchiveDirectoryEvent("assert", observed.admitted.outer),
       expectedArchiveDirectoryEvent("fsync", observed.admitted.outer),

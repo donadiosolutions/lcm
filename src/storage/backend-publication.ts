@@ -22,6 +22,7 @@ import {
   atomicWritePrivateFileDurable,
   consumeBoundedRegularFile,
   assertPrivateDirectory,
+  assertPrivateDirectoryEntry,
   OWNER_ONLY_FILE_MODES,
   openPrivateDirectory,
   readBoundedRegularFileWithStat,
@@ -2775,6 +2776,13 @@ function assertRetainedArchiveHistoryDirectory(
   historyHandle: ReturnType<typeof openPrivateDirectory>,
 ): void {
   try {
+    // The realpath-based comparison below only proves the retained
+    // descriptor and the resolved pathname currently agree; it also follows
+    // any symlink placed at the final path component. Bind the descriptor to
+    // the exact, non-symlink directory entry first so a same-UID final
+    // component substitution cannot hide behind symlink resolution or a
+    // reused dev/ino pair.
+    assertPrivateDirectoryEntry(historyHandle, history);
     const observed = assertPrivateDirectory(historyHandle, history);
     if (
       observed.dev !== historyHandle.witness.dev
@@ -2788,6 +2796,30 @@ function assertRetainedArchiveHistoryDirectory(
       "backend publication history directory changed during terminal journal archive",
       error,
     );
+  }
+}
+
+/**
+ * Bind a freshly retained history-directory descriptor to its pathname
+ * immediately after open. This proves the descriptor that will be used for
+ * the remainder of the archive operation is, right now, the non-symlink
+ * `history` entry with exact 0700 mode and our UID. It does not retroactively
+ * verify the identity `mkdirSync` created a moment earlier -- POSIX has no
+ * atomic create-and-open for directories, so a same-UID entry substitution in
+ * that single window cannot be detected after the fact. This binding closes
+ * every subsequent window: nothing later in the operation can rely on a
+ * descriptor that silently drifted from the pathname without this check
+ * failing closed first.
+ */
+function bindRetainedArchiveHistoryDirectoryEntry(
+  history: string,
+  historyHandle: ReturnType<typeof openPrivateDirectory>,
+  message: string,
+): void {
+  try {
+    assertPrivateDirectoryEntry(historyHandle, history);
+  } catch (error) {
+    archiveUnsafeStorage(message, error);
   }
 }
 
@@ -2844,6 +2876,13 @@ function withRetainedArchiveHistoryDirectory<T>(
     } catch (error) {
       return archiveUnsafeStorage("backend publication history directory cannot be opened", error);
     }
+    if (historyHandle !== undefined) {
+      bindRetainedArchiveHistoryDirectoryEntry(
+        history,
+        historyHandle,
+        "backend publication history directory cannot be opened",
+      );
+    }
     if (historyHandle === undefined) {
       observer("before-terminal-journal-history-create", history);
       assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
@@ -2857,6 +2896,11 @@ function withRetainedArchiveHistoryDirectory<T>(
       } catch (error) {
         return archiveUnsafeStorage("created backend publication history directory is unsafe", error);
       }
+      bindRetainedArchiveHistoryDirectoryEntry(
+        history,
+        historyHandle,
+        "created backend publication history directory is unsafe",
+      );
     }
     assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
     assertRetainedArchiveHistoryDirectory(history, historyHandle);
