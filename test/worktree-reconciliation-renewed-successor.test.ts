@@ -16,11 +16,14 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ResolvedStorageConfig } from "../src/daemon/config.js";
+import { linkProject, type IdentityServiceDependencies } from "../src/identity-service.js";
 import {
   clearProjectMapCache,
   hashProjectPath,
@@ -244,5 +247,373 @@ describe("Git-independent renewed project successor authentication", () => {
       return true;
     });
     expect(seenIds).toEqual([hashProjectPath(cwd)]);
+  });
+});
+
+/**
+ * A renewed entry may also carry a distinct local alias. `renewRetiredProjectIdentity`
+ * refuses aliases, but `linkProject` reaches `linkLocalAlias` for a non-UUID
+ * target and adds one without PostgreSQL, so this is an ordinary SQLite-backend
+ * shape rather than a hand-edited curiosity.
+ *
+ * Both reconciliation helpers used to derive the expected successor from the
+ * ENTERED path. Through an alias that derives an unrelated id, so the fence was
+ * never consulted: reconciliation accepted the binding, returned a third
+ * unrelated path hash as its target, and CLI storage admitted writes under the
+ * unauthenticated successor while hooks kept using the retired id. These tests
+ * pin authentication against the MATCHED ENTRY's own canonical path, which is
+ * the path renewal hashed to mint the successor id.
+ */
+describe("Renewed project successor authentication through a local alias", () => {
+  const SQLITE_CONFIG: ResolvedStorageConfig = { backend: "sqlite" };
+  const DIFFERENT_REPOSITORY_REFUSAL =
+    "renewed project identity alias belongs to a different repository; refusing to reconcile";
+  const AMBIGUOUS_ALIAS_REFUSAL =
+    "project path is an alias of multiple renewed project identities; refusing to reconcile";
+
+  let home: string;
+  let canonical: string;
+  let aliasPath: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "lcm-renewed-alias-"));
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home);
+    mkPrivateDir(join(home, ".lcm"));
+    canonical = join(home, "nongit-project");
+    aliasPath = join(home, "nongit-alias");
+    mkPrivateDir(canonical);
+    mkPrivateDir(aliasPath);
+    clearProjectMapCache();
+    clearWorktreeReconciliationCache();
+    clearGitProjectAnchorCache();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+    clearProjectMapCache();
+    clearWorktreeReconciliationCache();
+    clearGitProjectAnchorCache();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  function identityDependencies(): Partial<IdentityServiceDependencies> {
+    return {
+      homeDir: home,
+      openSession: () => Promise.reject(
+        new Error("local alias linking must not open a remote identity session"),
+      ),
+      _assertBackendPublication: () => undefined,
+    };
+  }
+
+  type PlantedAlias = {
+    readonly retiredId: string;
+    readonly successorId: string;
+    readonly successorDb: string;
+    readonly successorEvents: string;
+  };
+
+  /** Successor-keyed entry carrying a distinct alias, with live project data. */
+  function plantAliasedSuccessor(entryCanonical: string, alias: string): PlantedAlias {
+    const retiredId = hashProjectPath(entryCanonical);
+    const successorId = retiredProjectIdentitySuccessor(retiredId, entryCanonical);
+    writePrivateFile(
+      projectMapPath(),
+      `${JSON.stringify({ [successorId]: { canonical: entryCanonical, aliases: [alias] } }, null, 2)}\n`,
+    );
+    mkPrivateDir(join(home, ".lcm", "projects", successorId), { recursive: true });
+    mkPrivateDir(join(home, ".lcm", "events"), { recursive: true });
+    const successorDb = join(home, ".lcm", "projects", successorId, "db.sqlite");
+    const successorEvents = join(home, ".lcm", "events", `${successorId}.db`);
+    writePrivateFile(successorDb, "renewed-project-database");
+    writePrivateFile(successorEvents, "renewed-project-sidecar");
+    clearProjectMapCache();
+    clearWorktreeReconciliationCache();
+    return { retiredId, successorId, successorDb, successorEvents };
+  }
+
+  function writeFence(retiredId: string, recordedId: string): void {
+    mkPrivateDir(join(home, ".lcm", "projects"), { recursive: true });
+    writePrivateFile(
+      join(home, ".lcm", "projects", retiredId),
+      serializeWorktreeReconciliationFence(recordedId, "project"),
+    );
+    clearWorktreeReconciliationCache();
+  }
+
+  function successorBytes(planted: PlantedAlias): {
+    readonly map: string;
+    readonly db: Buffer;
+    readonly events: Buffer;
+    readonly fence: string | null;
+  } {
+    const fencePath = join(home, ".lcm", "projects", planted.retiredId);
+    return {
+      map: readFileSync(projectMapPath(), "utf8"),
+      db: readFileSync(planted.successorDb),
+      events: readFileSync(planted.successorEvents),
+      fence: existsSync(fencePath) ? readFileSync(fencePath, "utf8") : null,
+    };
+  }
+
+  function expectNothingFolded(
+    planted: PlantedAlias,
+    before: ReturnType<typeof successorBytes>,
+  ): void {
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(before.map);
+    expect(readFileSync(planted.successorDb)).toEqual(before.db);
+    expect(readFileSync(planted.successorEvents)).toEqual(before.events);
+    expect(readProjectMapSnapshot()).toEqual({
+      [planted.successorId]: { canonical, aliases: [aliasPath] },
+    });
+    // The retired id never becomes a project directory again, and a retained
+    // fence file is neither repaired nor removed by the refusal.
+    const fencePath = join(home, ".lcm", "projects", planted.retiredId);
+    if (before.fence === null) {
+      expect(existsSync(fencePath)).toBe(false);
+    } else {
+      expect(statSync(fencePath).isFile()).toBe(true);
+      expect(readFileSync(fencePath, "utf8")).toBe(before.fence);
+    }
+    expect(existsSync(join(home, ".lcm", "events", `${planted.retiredId}.db`))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
+  }
+
+  /** Renew for real, then add the alias through the real link command. */
+  async function renewAndLinkAlias(alias: string): Promise<string> {
+    const oldId = hashProjectPath(canonical);
+    writeFence(oldId, oldId);
+    writePrivateFile(
+      projectMapPath(),
+      `${JSON.stringify({ [oldId]: { canonical, aliases: [] } }, null, 2)}\n`,
+    );
+    clearProjectMapCache();
+    const { newId } = renewRetiredProjectIdentity(canonical);
+    clearProjectMapCache();
+    clearWorktreeReconciliationCache();
+    await linkProject(SQLITE_CONFIG, newId, alias, {}, identityDependencies());
+    clearProjectMapCache();
+    clearWorktreeReconciliationCache();
+    return newId;
+  }
+
+  it("refuses ensureWorktreeProjectReconciled through an alias when the predecessor fence is absent", () => {
+    const planted = plantAliasedSuccessor(canonical, aliasPath);
+    const before = successorBytes(planted);
+
+    expect(() => ensureWorktreeProjectReconciled(aliasPath)).toThrow(MISSING_FENCE_REFUSAL);
+
+    // The hook path already authenticated this binding through the matched
+    // entry's own canonical path and fell back to the retired id. Reconciliation
+    // silently disagreed with it, which is what split the identity.
+    expect(localProjectIdentity(aliasPath)).toEqual({ id: planted.retiredId, canonical });
+    expectNothingFolded(planted, before);
+  });
+
+  it("refuses ensureWorktreeProjectReconciled through an alias when the predecessor fence is tampered", () => {
+    const planted = plantAliasedSuccessor(canonical, aliasPath);
+    writeFence(planted.retiredId, "0".repeat(64));
+    const before = successorBytes(planted);
+
+    expect(() => ensureWorktreeProjectReconciled(aliasPath)).toThrow(MISSING_FENCE_REFUSAL);
+
+    expectNothingFolded(planted, before);
+  });
+
+  // `lcm project reconcile-worktrees /alias` reaches this directly and supplies
+  // no authenticated target identity, so the choke point has to refuse too.
+  it("refuses a direct reconcileWorktrees through an alias when the predecessor fence is absent", () => {
+    const planted = plantAliasedSuccessor(canonical, aliasPath);
+    const before = successorBytes(planted);
+
+    expect(() => reconcileWorktrees(aliasPath)).toThrow(MISSING_FENCE_REFUSAL);
+
+    expectNothingFolded(planted, before);
+  });
+
+  it("refuses a direct reconcileWorktrees through an alias when the predecessor fence is tampered", () => {
+    const planted = plantAliasedSuccessor(canonical, aliasPath);
+    writeFence(planted.retiredId, "0".repeat(64));
+    const before = successorBytes(planted);
+
+    expect(() => reconcileWorktrees(aliasPath)).toThrow(MISSING_FENCE_REFUSAL);
+
+    expectNothingFolded(planted, before);
+  });
+
+  it("refuses CLI storage admission through an alias when the predecessor fence is absent", async () => {
+    const planted = plantAliasedSuccessor(canonical, aliasPath);
+    const before = successorBytes(planted);
+
+    await expect(withCliProjectStorage(aliasPath, { create: true }, async () => true))
+      .rejects.toThrow(MISSING_FENCE_REFUSAL);
+
+    expectNothingFolded(planted, before);
+  });
+
+  it("refuses CLI storage admission through an alias when the predecessor fence is tampered", async () => {
+    const planted = plantAliasedSuccessor(canonical, aliasPath);
+    writeFence(planted.retiredId, "0".repeat(64));
+    const before = successorBytes(planted);
+
+    await expect(withCliProjectStorage(aliasPath, { create: true }, async () => true))
+      .rejects.toThrow(MISSING_FENCE_REFUSAL);
+
+    expectNothingFolded(planted, before);
+  });
+
+  // An authenticated alias may adopt the successor only because a path with no
+  // Git anchor returns before any discovery. `discoverSources` classifies
+  // candidates by common directory, so adopting it for an alias that anchors
+  // its own repository would fold that repository's worktree entries into this
+  // renewed project.
+  it("refuses an authenticated renewed alias that anchors a different repository", async () => {
+    const aliasRepository = join(home, "alias-repository");
+    mkPrivateDir(aliasRepository);
+    git(aliasRepository, "init", "-q");
+    git(aliasRepository, "config", "user.email", "test@example.invalid");
+    git(aliasRepository, "config", "user.name", "LCM Test");
+    writeFileSync(join(aliasRepository, "README.md"), "test\n", { mode: PRIVATE_FILE_MODE });
+    git(aliasRepository, "add", "README.md");
+    git(aliasRepository, "commit", "-qm", "initial");
+    clearGitProjectAnchorCache();
+
+    const newId = await renewAndLinkAlias(aliasRepository);
+    const mapBefore = readFileSync(projectMapPath(), "utf8");
+
+    expect(() => reconcileWorktrees(aliasRepository)).toThrow(DIFFERENT_REPOSITORY_REFUSAL);
+    expect(() => ensureWorktreeProjectReconciled(aliasRepository))
+      .toThrow(DIFFERENT_REPOSITORY_REFUSAL);
+
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(mapBefore);
+    expect(readProjectMapSnapshot()).toEqual({
+      [newId]: { canonical, aliases: [aliasRepository] },
+    });
+    // The project's own canonical path keeps reconciling normally.
+    expect(ensureWorktreeProjectReconciled(canonical).targetHash).toBe(newId);
+  });
+
+  // A hand-edited map can bind one path as an alias of two renewed entries.
+  // Choosing either one would pick a project arbitrarily, so refuse.
+  it("refuses a path bound as an alias by multiple renewed identities", () => {
+    const second = join(home, "nongit-project-two");
+    mkPrivateDir(second);
+    const firstRetired = hashProjectPath(canonical);
+    const secondRetired = hashProjectPath(second);
+    const firstSuccessor = retiredProjectIdentitySuccessor(firstRetired, canonical);
+    const secondSuccessor = retiredProjectIdentitySuccessor(secondRetired, second);
+    writePrivateFile(
+      projectMapPath(),
+      `${JSON.stringify({
+        [firstSuccessor]: { canonical, aliases: [aliasPath] },
+        [secondSuccessor]: { canonical: second, aliases: [aliasPath] },
+      }, null, 2)}\n`,
+    );
+    writeFence(firstRetired, firstRetired);
+    writeFence(secondRetired, secondRetired);
+    clearProjectMapCache();
+    const mapBefore = readFileSync(projectMapPath(), "utf8");
+
+    expect(() => reconcileWorktrees(aliasPath)).toThrow(AMBIGUOUS_ALIAS_REFUSAL);
+
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(mapBefore);
+    expect(readProjectMapSnapshot()).toEqual({
+      [firstSuccessor]: { canonical, aliases: [aliasPath] },
+      [secondSuccessor]: { canonical: second, aliases: [aliasPath] },
+    });
+  });
+
+  it("keeps a genuinely renewed project usable through an alias added by lcm project link", async () => {
+    const newId = await renewAndLinkAlias(aliasPath);
+
+    expect(readProjectMapSnapshot()).toEqual({
+      [newId]: { canonical, aliases: [aliasPath] },
+    });
+
+    // The alias authenticates and reconciles to the renewed project itself,
+    // never to its own path hash.
+    expect(ensureWorktreeProjectReconciled(aliasPath)).toEqual({
+      status: "not-needed",
+      targetHash: newId,
+      canonical: aliasPath,
+      sourceHashes: [],
+      aliases: [aliasPath],
+      backupPaths: [],
+    });
+    clearWorktreeReconciliationCache();
+    expect(reconcileWorktrees(aliasPath)).toEqual({
+      status: "not-needed",
+      targetHash: newId,
+      canonical: aliasPath,
+      sourceHashes: [],
+      aliases: [aliasPath],
+      backupPaths: [],
+    });
+
+    // Entering by the project's own canonical path is unchanged.
+    clearWorktreeReconciliationCache();
+    expect(ensureWorktreeProjectReconciled(canonical)).toEqual({
+      status: "not-needed",
+      targetHash: newId,
+      canonical,
+      sourceHashes: [],
+      aliases: [canonical],
+      backupPaths: [],
+    });
+
+    expect(resolveProjectIdentity(aliasPath)).toEqual({ id: newId, canonical });
+    expect(localProjectIdentity(aliasPath)).toEqual({ id: newId, canonical });
+
+    const seenIds: string[] = [];
+    await withCliProjectStorage(aliasPath, { create: true }, async (context) => {
+      seenIds.push(context.project.id);
+      return true;
+    });
+    expect(seenIds).toEqual([newId]);
+  });
+
+  it("leaves an ordinary never-renewed project reached through its alias unaffected", async () => {
+    const ordinaryId = resolveProjectIdentity(canonical).id;
+    expect(ordinaryId).toBe(hashProjectPath(canonical));
+    await linkProject(SQLITE_CONFIG, ordinaryId, aliasPath, {}, identityDependencies());
+    clearProjectMapCache();
+    clearWorktreeReconciliationCache();
+
+    expect(ensureWorktreeProjectReconciled(aliasPath)).toEqual({
+      status: "not-needed",
+      targetHash: hashProjectPath(aliasPath),
+      canonical: aliasPath,
+      sourceHashes: [],
+      aliases: [aliasPath],
+      backupPaths: [],
+    });
+
+    const seenIds: string[] = [];
+    await withCliProjectStorage(aliasPath, { create: true }, async (context) => {
+      seenIds.push(context.project.id);
+      return true;
+    });
+    expect(seenIds).toEqual([ordinaryId]);
+  });
+
+  it("leaves an unmapped path unaffected while an unauthenticated successor is mapped elsewhere", () => {
+    const planted = plantAliasedSuccessor(canonical, aliasPath);
+    const before = successorBytes(planted);
+    const unmapped = join(home, "unmapped-project");
+    mkPrivateDir(unmapped);
+
+    expect(ensureWorktreeProjectReconciled(unmapped)).toEqual({
+      status: "not-needed",
+      targetHash: hashProjectPath(unmapped),
+      canonical: unmapped,
+      sourceHashes: [],
+      aliases: [unmapped],
+      backupPaths: [],
+    });
+
+    expectNothingFolded(planted, before);
   });
 });

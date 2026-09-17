@@ -526,6 +526,7 @@ describe("identity service", () => {
   function expectSuccessorUntouched(
     planted: UnauthenticatedSuccessor,
     before: ReturnType<typeof successorBytes>,
+    aliases: readonly string[] = [],
   ): void {
     expect(readFileSync(projectMapPath(), "utf8")).toBe(before.map);
     expect(readFileSync(planted.successorDb)).toEqual(before.db);
@@ -535,7 +536,7 @@ describe("identity service", () => {
     expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
     expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
     expect(listProjectMapEntries()).toEqual({
-      [planted.successorId]: { canonical: planted.canonical, aliases: [] },
+      [planted.successorId]: { canonical: planted.canonical, aliases: [...aliases] },
     });
   }
 
@@ -2069,6 +2070,30 @@ describe("identity service", () => {
     expect(deps.openSession).not.toHaveBeenCalled();
     expect(repository.createProject).not.toHaveBeenCalled();
     expectSuccessorUntouched(planted, before);
+  });
+
+  it("refuses remote project creation through a successor alias with no predecessor fence", async () => {
+    await register();
+    const planted = plantUnauthenticatedSuccessor("unauthenticated-create-alias");
+    const aliasPath = makeProject("unauthenticated-create-distinct-alias");
+    writeFileSync(projectMapPath(), `${JSON.stringify({
+      [planted.successorId]: {
+        canonical: planted.canonical,
+        aliases: [aliasPath],
+      },
+    }, null, 2)}\n`, { mode: 0o600 });
+    clearProjectMapCache();
+    clearWorktreeReconciliationCache();
+    const before = successorBytes(planted);
+    repository.createProject.mockClear();
+    vi.mocked(deps.openSession!).mockClear();
+
+    await expect(createProject(POSTGRESQL_CONFIG, aliasPath, {}, deps))
+      .rejects.toThrow(MISSING_FENCE_REFUSAL);
+
+    expect(deps.openSession).not.toHaveBeenCalled();
+    expect(repository.createProject).not.toHaveBeenCalled();
+    expectSuccessorUntouched(planted, before, [aliasPath]);
   });
 
   // `showReconciledLocalProject` is the other direct `reconcileWorktrees`

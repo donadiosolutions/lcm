@@ -237,6 +237,45 @@ export function isAuthenticatedRetiredProjectIdentitySuccessor(
     );
 }
 
+export type PersistedRetiredProjectIdentitySuccessor = Readonly<{
+  id: string;
+  retiredId: string;
+  canonical: string;
+}>;
+
+/**
+ * Report every persisted successor-shaped identity that one entry path reaches.
+ *
+ * Renewal itself refuses aliases, but `linkLocalAlias` may add one afterwards
+ * without PostgreSQL, so a renewed entry is legitimately reachable both by its
+ * own canonical path and by a distinct alias directory. A caller that derives
+ * the expected successor from the ENTERED path recognizes only the canonical
+ * case: for an alias it derives an unrelated id, concludes the project was
+ * never renewed, and acts on the entry with no proof of renewal at all.
+ *
+ * Matching the map instead reports the entries that are actually bound to this
+ * path, each keyed by its own canonical path — the only path that can
+ * authenticate it, because that is the path renewal hashed to mint the id.
+ * `existingEventsDbPath` and `parseLocalProjectMapCompatibility` already
+ * authenticate a matched entry this way; this keeps reconciliation consistent
+ * with them.
+ */
+export function persistedRetiredProjectIdentitySuccessors(
+  map: ProjectMap,
+  path: string,
+): readonly PersistedRetiredProjectIdentitySuccessor[] {
+  const reached: PersistedRetiredProjectIdentitySuccessor[] = [];
+  for (const id of findPathMatches(map, path)) {
+    // `resolve` always yields an absolute path, so successor derivation cannot
+    // reject the entry and this stays a total, side-effect-free query.
+    const canonical = resolve(map[id].canonical);
+    const retiredId = hashProjectPath(canonical);
+    if (!isRetiredProjectIdentitySuccessor(id, retiredId, canonical)) continue;
+    reached.push({ id, retiredId, canonical });
+  }
+  return reached;
+}
+
 export type RetiredProjectIdentityRenewal = Readonly<{
   oldId: string;
   newId: string;

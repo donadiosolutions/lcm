@@ -181,6 +181,15 @@ directory are normalized the same way before they are compared. A genuine
 mismatch reports `mapped project identity does not match the current project
 directory`.
 
+A renewed project may later gain a distinct local alias through `lcm project
+link`. LCM authenticates that binding against the predecessor fence derived
+from the map entry's canonical path, then keeps storage and reconciliation on
+the renewed successor identity. It refuses an alias that is also the Git anchor
+of a different repository, because reconciling that path could otherwise fold
+the other repository's worktree entries into the renewed project. A path bound
+as an alias by more than one renewed identity is also refused rather than
+choosing a project arbitrarily.
+
 On first local storage access after upgrade, LCM checks the current checkout's
 verified Git common directory. If older `map.json` entries treated linked
 worktrees as separate projects, LCM acquires a private cross-process lock and

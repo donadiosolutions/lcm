@@ -33,6 +33,7 @@ import {
   listProjectMapEntries,
   normalizeProjectIdentityPath,
   normalizeProjectPath,
+  persistedRetiredProjectIdentitySuccessors,
   projectMapPath,
   readProjectMapSnapshot,
   resolveExistingProjectIdentity,
@@ -2581,19 +2582,59 @@ function assertRenewedProjectIdentityFence(retiredId: string, homeDir?: string):
  * the multi-owner refusal of `resolveExistingProjectIdentity` out of
  * reconciliation, whose whole purpose is to fold several entries of one
  * repository together.
+ *
+ * That derivation alone is not the whole authentication, because a renewed
+ * entry may also carry local aliases: `linkLocalAlias` adds one on the SQLite
+ * backend, and an alias derives a different, absent successor id. Reaching a
+ * renewed entry through its alias therefore consulted no fence at all and
+ * returned a third, unrelated path hash as the target, while CLI storage kept
+ * resolving the successor. Authenticate every entry the map actually binds to
+ * this path, each against its own canonical path — the path renewal hashed to
+ * mint its id — and never hand back the alias-derived hash: an alias
+ * reconciles to the authenticated successor or not at all.
+ *
+ * An alias may only be adopted when the entered path has no Git anchor, which
+ * is the case that returns "not-needed" before any discovery runs. With an
+ * anchor, `discoverSources` classifies candidates by common directory, so
+ * adopting the successor would fold the alias repository's own worktree
+ * entries into the renewed project of a different repository. Refuse that, and
+ * refuse an ambiguous path bound as an alias by several renewed entries,
+ * rather than choosing one of them.
  */
 function authenticatedRenewedTargetHash(
   canonical: string,
+  anchored: boolean,
   homeDir: string | undefined,
   publicationLockToken: BackendPublicationLockToken,
 ): string | undefined {
+  const map = readProjectMapSnapshot(homeDir, publicationLockToken);
+  const reached = persistedRetiredProjectIdentitySuccessors(map, canonical);
+  for (const successor of reached) {
+    assertRenewedProjectIdentityFence(successor.retiredId, homeDir);
+  }
   const retiredId = hashProjectPath(canonical);
   const successorId = retiredProjectIdentitySuccessor(retiredId, canonical);
-  if (readProjectMapSnapshot(homeDir, publicationLockToken)[successorId] === undefined) {
-    return undefined;
+  if (map[successorId] !== undefined) {
+    // A hand-edited map can key an entry under this successor id while binding
+    // a different path, which the matches above do not reach. This id is
+    // adopted regardless, so authenticate it before returning it.
+    assertRenewedProjectIdentityFence(retiredId, homeDir);
+    return successorId;
   }
-  assertRenewedProjectIdentityFence(retiredId, homeDir);
-  return successorId;
+  // No entry is keyed by this path's own successor, so every remaining match
+  // binds this path as one of its aliases.
+  if (reached.length === 0) return undefined;
+  if (reached.length > 1) {
+    throw new Error(
+      "project path is an alias of multiple renewed project identities; refusing to reconcile",
+    );
+  }
+  if (anchored) {
+    throw new Error(
+      "renewed project identity alias belongs to a different repository; refusing to reconcile",
+    );
+  }
+  return reached[0].id;
 }
 
 export function reconcileWorktrees(
@@ -2657,7 +2698,12 @@ export function reconcileWorktrees(
   // `authenticatedRenewedReconciliationTarget`; every other caller reaches the
   // same authentication here.
   const targetHash = opts._targetIdentity?.id
-    ?? authenticatedRenewedTargetHash(canonical, opts.homeDir, opts._publicationLockToken)
+    ?? authenticatedRenewedTargetHash(
+      canonical,
+      anchor !== null,
+      opts.homeDir,
+      opts._publicationLockToken,
+    )
     ?? hashProjectPath(canonical);
   if (!anchor) {
     return {
@@ -3293,18 +3339,34 @@ export function reconcileWorktrees(
  * successor entry unauthenticated by construction: reconciliation reported
  * "not-needed" without ever consulting the fence, and CLI storage then
  * admitted writes under the unauthenticated successor.
+ *
+ * Authenticate against the matched entry's OWN canonical path rather than the
+ * entered path. Renewal minted the successor id by hashing that canonical
+ * path, so it is the only path that can authenticate the entry, and it is not
+ * necessarily the path the caller entered: a renewed entry may also carry
+ * local aliases. Deriving the expected successor from the entered path made an
+ * alias fail the shape test and return before the fence was ever consulted,
+ * which is exactly the proof this function exists to demand.
  */
 function authenticatedRenewedReconciliationTarget(
   cwd: string,
   identity: ProjectIdentity | undefined,
 ): ProjectIdentity | undefined {
   if (identity === undefined) return undefined;
-  const canonical = normalizeProjectIdentityPath(cwd);
-  if (resolve(identity.canonical) !== canonical) return undefined;
+  const canonical = resolve(identity.canonical);
   const retiredId = hashProjectPath(canonical);
   if (!isRetiredProjectIdentitySuccessor(identity.id, retiredId, canonical)) return undefined;
   assertRenewedProjectIdentityFence(retiredId);
-  return { ...identity, canonical };
+  // Only the entry's own canonical path may be SUPPLIED as the reconciliation
+  // target. `reconcileWorktrees` compares a supplied `_targetIdentity.canonical`
+  // against the path it discovers, so handing it a non-matching alias would
+  // reject a supported alias as "does not match the current project
+  // directory". The alias is authenticated above and then picks its target at
+  // the `authenticatedRenewedTargetHash` choke point, so one rule decides
+  // which hash an alias reconciles to.
+  return normalizeProjectIdentityPath(cwd) === canonical
+    ? { ...identity, canonical }
+    : undefined;
 }
 
 export function ensureWorktreeProjectReconciled(
