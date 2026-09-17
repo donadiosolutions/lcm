@@ -812,8 +812,9 @@ export class PostgreSqlContentCollationPreflightError extends StorageOperationEr
     + "always, and content_sha256 once migration 0007 has applied. "
     + "Follow the \"Recovering from a nondeterministic "
     + "promoted_memories.content collation\" procedure in "
-    + "docs/configuration.md, which selects between a pre-0007 and a "
-    + "post-0007 recovery path, then rerun migrations. A "
+    + "docs/configuration.md, which selects the applicable recovery "
+    + "path from both the migration ledger and content_sha256's live "
+    + "existence, then rerun migrations. A "
     + "nondeterministic collation lets raw content equality match rows "
     + "whose generated content_sha256 digest differs, which would make "
     + "findExactContent miss an existing duplicate.";
