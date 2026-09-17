@@ -403,6 +403,7 @@ LCM revalidates the snapshot before storing messages and preserves exact source
 and message link checks. If a fully read and validated source changes during ingestion, LCM
 makes one fresh attempt only when the original byte prefix remains identical;
 appended bytes are allowed. Shrink or rewrite of that prefix fails the request.
+
 Mutation before the first complete validated snapshot is available also fails
 without an internal retry. A failure closing the source or quarantine after an
 otherwise retryable source change also fails the request without retrying; the
@@ -421,6 +422,13 @@ A source that disappears after path validation, or fails snapshot validation,
 fails closed. Validation now precedes parsed-message persistence for native paths,
 so an invalid source cannot first commit its parsed projection. Existing explicit
 `messages` requests retain their input behavior.
+
+At parse time, independent of the snapshot retry policy above, LCM ignores null,
+primitive, array, and unsupported record siblings in Claude message content
+arrays, at the top level and at every existing nested `tool_result` level. Valid
+text siblings remain in their original order and are joined with newlines, so a
+malformed sibling no longer discards the valid text around it. A message with no
+retained text is still omitted.
 
 Intentional request cancellation returns HTTP 499 with
 `{"status":"cancelled","error":"ingest cancelled"}` when the connection is still

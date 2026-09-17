@@ -24,9 +24,15 @@ function extractText(content: string | ContentBlock[] | unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
-      .map((b: ContentBlock) => {
-        if (b.type === "text" && typeof b.text === "string") return b.text;
-        if (b.type === "tool_result") return extractText(b.content);
+      .map((member: unknown) => {
+        if (
+          member === null
+          || typeof member !== "object"
+          || Array.isArray(member)
+        ) return "";
+        const block = member as Record<string, unknown>;
+        if (block.type === "text" && typeof block.text === "string") return block.text;
+        if (block.type === "tool_result") return extractText(block.content);
         return "";
       })
       .filter(Boolean)

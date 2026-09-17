@@ -235,7 +235,8 @@ const expectedComponents = [
     component_id: "unit-transcripts-import",
     name: "Unit - Transcripts and Import",
     paths: [
-      // #1106 bounded custom-directory metadata stays within this import owner.
+      // #1106 bounded custom-directory metadata and #1286 Claude block
+      // admission stay within this import owner.
       "^src/codex-transcript\\.ts$",
       "^src/import-summary\\.ts$",
       "^src/import\\.ts$",
