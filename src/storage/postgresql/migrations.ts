@@ -75,6 +75,10 @@ type SchemaAclRow = QueryResultRow & {
   public_create: unknown;
 };
 type ServerEncodingRow = QueryResultRow & { server_encoding: unknown };
+type ContentCollationRow = QueryResultRow & {
+  collation_name: unknown;
+  collation_is_deterministic: unknown;
+};
 type ManagedObjectOwnershipRow = QueryResultRow & {
   current_user_name: unknown;
   expected_object_count: unknown;
@@ -784,6 +788,44 @@ export class PostgreSqlServerEncodingPreflightError extends StorageOperationErro
   }
 }
 
+export class PostgreSqlContentCollationPreflightError extends StorageOperationError {
+  constructor(
+    readonly collationName: string | null,
+    readonly collationIsDeterministic: boolean | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightContentCollation",
+    );
+  }
+
+  readonly schemaName = "lcm";
+  readonly tableName = "promoted_memories";
+  readonly columnName = "content";
+  readonly remediation =
+    "Restore a deterministic collation on lcm.promoted_memories.content, "
+    + "for example ALTER TABLE lcm.promoted_memories ALTER COLUMN content "
+    + "TYPE text COLLATE pg_catalog.\"default\", then rerun migrations. A "
+    + "nondeterministic collation lets raw content equality match rows "
+    + "whose generated content_sha256 digest differs, which would make "
+    + "findExactContent miss an existing duplicate.";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      schemaName: this.schemaName,
+      tableName: this.tableName,
+      columnName: this.columnName,
+      collationName: this.collationName,
+      collationIsDeterministic: this.collationIsDeterministic,
+      remediation: this.remediation,
+    };
+  }
+}
+
 export class PostgreSqlSchemaOwnershipPreflightError extends StorageOperationError {
   constructor(
     readonly schemaExists: boolean | null,
@@ -1254,6 +1296,43 @@ export async function runPostgreSqlMigrations(
   );
   if (serverEncoding !== REQUIRED_POSTGRESQL_SERVER_ENCODING) {
     throw new PostgreSqlServerEncodingPreflightError(serverEncoding);
+  }
+  const contentCollationResult = await executor.query<ContentCollationRow>({
+    text: `SELECT
+             pg_catalog.concat_ws(
+               '.', collation_namespace.nspname, collation_metadata.collname
+             ) AS collation_name,
+             collation_metadata.collisdeterministic
+               AS collation_is_deterministic
+           FROM pg_catalog.pg_attribute AS attribute
+           JOIN pg_catalog.pg_class AS relation
+             ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
+           JOIN pg_catalog.pg_namespace AS namespace
+             ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+           LEFT JOIN pg_catalog.pg_collation AS collation_metadata
+             ON collation_metadata.oid OPERATOR(pg_catalog.=)
+               attribute.attcollation
+           LEFT JOIN pg_catalog.pg_namespace AS collation_namespace
+             ON collation_namespace.oid OPERATOR(pg_catalog.=)
+               collation_metadata.collnamespace
+           WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+             AND relation.relname OPERATOR(pg_catalog.=) 'promoted_memories'
+             AND attribute.attname OPERATOR(pg_catalog.=) 'content'`,
+  }, { domain: "factory", operation: "preflightContentCollation", signal: options.signal });
+  const contentCollationRow = contentCollationResult.rows[0];
+  if (contentCollationRow) {
+    const collationIsDeterministic = sanitizeBoolean(
+      contentCollationRow.collation_is_deterministic,
+    );
+    const collationName = typeof contentCollationRow.collation_name === "string"
+      ? contentCollationRow.collation_name
+      : null;
+    if (collationIsDeterministic !== true) {
+      throw new PostgreSqlContentCollationPreflightError(
+        collationName,
+        collationIsDeterministic,
+      );
+    }
   }
   await assertRequiredPostgreSqlExtensionsReady(executor, { signal: options.signal });
   return executor.transaction(async (transaction) => {

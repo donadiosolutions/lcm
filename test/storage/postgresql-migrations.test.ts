@@ -14,6 +14,7 @@ import {
   validatePostgreSqlMigrations,
   validatePostgreSqlSchemaSnapshotRegistry,
   PostgreSqlBaselineDefinitionPreflightError,
+  PostgreSqlContentCollationPreflightError,
   PostgreSqlIdentityFunctionPreflightError,
   PostgreSqlMigrationLedgerRelationPreflightError,
   PostgreSqlManagedObjectOwnershipPreflightError,
@@ -58,6 +59,7 @@ function executor(options: {
     | "quoted-user";
   serverVersion?: number | "missing";
   serverEncoding?: unknown;
+  contentCollation?: "missing" | "deterministic" | "nondeterministic" | "invalid";
   postmasterEpoch?: unknown;
   postmasterContinuity?: boolean | "missing";
   sessionReplicationRole?: "origin" | "replica" | "local" | "missing" | "invalid";
@@ -94,6 +96,21 @@ function executor(options: {
         : result([{
           server_encoding: options.serverEncoding ?? REQUIRED_POSTGRESQL_SERVER_ENCODING,
         }] as unknown as R[]);
+    }
+    if (context.operation === "preflightContentCollation") {
+      if (options.contentCollation === undefined || options.contentCollation === "missing") {
+        return result([] as R[]);
+      }
+      return result([{
+        collation_name: options.contentCollation === "nondeterministic"
+          ? "public.ci_test"
+          : options.contentCollation === "invalid"
+            ? 7
+            : "pg_catalog.default",
+        collation_is_deterministic: options.contentCollation === "invalid"
+          ? 7
+          : options.contentCollation !== "nondeterministic",
+      }] as unknown as R[]);
     }
     if (context.operation.endsWith("probePgStatStatements")) {
       return result([{ stats_reset: new Date() }] as unknown as R[]);
@@ -626,6 +643,7 @@ describe("PostgreSQL migration runner", () => {
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
       "preflightServerEncoding",
+      "preflightContentCollation",
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
@@ -645,14 +663,14 @@ describe("PostgreSQL migration runner", () => {
       "recordMigration",
       "preflightSearchConfiguration",
     ]);
-    expect(fake.seam.query).toHaveBeenNthCalledWith(5, {
+    expect(fake.seam.query).toHaveBeenNthCalledWith(6, {
       text: "SET LOCAL search_path = pg_catalog, public",
     }, {
       domain: "factory",
       operation: "pinMigrationSearchPath",
       signal,
     });
-    expect(fake.seam.query).toHaveBeenNthCalledWith(6, {
+    expect(fake.seam.query).toHaveBeenNthCalledWith(7, {
       text: "SET LOCAL quote_all_identifiers = off",
     }, {
       domain: "factory",
@@ -960,6 +978,7 @@ describe("PostgreSQL migration runner", () => {
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
       "preflightServerEncoding",
+      "preflightContentCollation",
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
@@ -985,6 +1004,7 @@ describe("PostgreSQL migration runner", () => {
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
       "preflightServerEncoding",
+      "preflightContentCollation",
       "preflightRequiredExtensions",
     ]);
   });
@@ -1034,6 +1054,62 @@ describe("PostgreSQL migration runner", () => {
       "SELECT pg_catalog.current_setting('server_encoding') AS server_encoding",
     );
     expect(fake.seam.transaction).not.toHaveBeenCalled();
+  });
+
+  it("rejects a nondeterministic promoted_memories.content collation before extension inspection or DDL", async () => {
+    const fake = executor({ contentCollation: "nondeterministic" });
+    const failure = await runPostgreSqlMigrations(fake.seam, {
+      migrations: loadPostgreSqlMigrations(),
+    })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PostgreSqlContentCollationPreflightError);
+    expect(failure).toMatchObject({
+      operation: "preflightContentCollation",
+      schemaName: "lcm",
+      tableName: "promoted_memories",
+      columnName: "content",
+      collationName: "public.ci_test",
+      collationIsDeterministic: false,
+    });
+    expect((failure as PostgreSqlContentCollationPreflightError).remediation).toContain(
+      "deterministic collation",
+    );
+    expect((failure as PostgreSqlContentCollationPreflightError).toJSON()).toMatchObject({
+      collationName: "public.ci_test",
+      collationIsDeterministic: false,
+    });
+    expect(fake.operations).toEqual([
+      "capturePostmasterEpoch",
+      "preflightServerEncoding",
+      "preflightContentCollation",
+    ]);
+    const collationSql = (fake.seam.query.mock.calls[2]?.[0] as { text?: string }).text ?? "";
+    expect(collationSql).toContain("pg_catalog.pg_collation");
+    expect(collationSql).toContain("promoted_memories");
+    expect(collationSql).toContain("'content'");
+    expect(fake.seam.transaction).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: "malformed", contentCollation: "invalid" as const },
+    { label: "not yet created", contentCollation: "missing" as const },
+    { label: "deterministic", contentCollation: "deterministic" as const },
+  ])("tolerates $label promoted_memories.content collation metadata", async ({
+    contentCollation,
+  }) => {
+    const fake = executor({ contentCollation, postmasterEpoch: new Date("2026-01-01T00:00:00Z") });
+    if (contentCollation === "invalid") {
+      const failure = await runPostgreSqlMigrations(fake.seam, {
+        migrations: loadPostgreSqlMigrations(),
+      }).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(PostgreSqlContentCollationPreflightError);
+      expect(failure).toMatchObject({ collationIsDeterministic: null });
+      return;
+    }
+    await expect(runPostgreSqlMigrations(fake.seam, {
+      migrations: [migration("0001_first")],
+      schemaSnapshots: [],
+    })).resolves.toEqual({ applied: ["0001_first"], current: ["0001_first"] });
   });
 
   it.each([
@@ -1151,6 +1227,7 @@ describe("PostgreSQL migration runner", () => {
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
       "preflightServerEncoding",
+      "preflightContentCollation",
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
@@ -1215,6 +1292,7 @@ describe("PostgreSQL migration runner", () => {
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
       "preflightServerEncoding",
+      "preflightContentCollation",
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
@@ -1298,6 +1376,7 @@ describe("PostgreSQL migration runner", () => {
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
       "preflightServerEncoding",
+      "preflightContentCollation",
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",
@@ -1858,6 +1937,7 @@ describe("PostgreSQL migration runner", () => {
     expect(fake.operations).toEqual([
       "capturePostmasterEpoch",
       "preflightServerEncoding",
+      "preflightContentCollation",
       "preflightRequiredExtensions",
       "preflightRequiredExtensions:probePgStatStatements",
       "pinMigrationSearchPath",

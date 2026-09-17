@@ -440,6 +440,8 @@ component_management:
         - "^src/storage/postgresql/extensions\\.ts$"
         # #1195 keeps packaged SQL loading and checksum verification in
         # the existing PostgreSQL schema owner.
+        # #1306 adds the 0007 promoted-content digest migration and its
+        # schema snapshot, keeping the packaged migration manifest here.
         - "^src/storage/postgresql/migrations\\.ts$"
         - "^src/storage/postgresql/provisioning\\.ts$"
         - "^src/storage/postgresql/runtime-readiness\\.ts$"
@@ -461,6 +463,8 @@ component_management:
       name: "Integration - PostgreSQL Memory"
       paths:
         # The #760/#805 repository machine-identity context remains memory-owned.
+        # #1306 indexes owner exact-content lookup by a generated SHA-256
+        # digest, retaining the raw-equality residual it always used.
         - "^src/storage/postgresql/memory-repositories\\.ts$"
         - "^src/storage/postgresql/summary-context-repositories\\.ts$"
     - component_id: "integration-postgresql-search"

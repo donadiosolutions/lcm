@@ -13,6 +13,7 @@ import {
   loadPostgreSqlMigrations,
   loadPostgreSqlSchemaSnapshots,
   PostgreSqlBaselineDefinitionPreflightError,
+  PostgreSqlContentCollationPreflightError,
   runPostgreSqlMigrations,
 } from "../../src/storage/postgresql/migrations.js";
 import type {
@@ -2721,6 +2722,84 @@ describe("PostgreSQL migrations and database isolation", () => {
           missingObjectCount: 0,
           operation: "preflightBaselineDefinitions",
         });
+    });
+  });
+
+  it("rejects a nondeterministic collation on promoted_memories.content before DDL", async () => {
+    await withPostgreSqlTestDatabase("content-collation-nondeterministic", async (database) => {
+      // Prove the underlying claim first: under this nondeterministic ICU
+      // collation, byte-different strings compare equal while their
+      // SHA-256 digests differ, which is exactly why raw content equality
+      // can no longer imply digest equality once this collation governs
+      // promoted_memories.content.
+      await database.migrator.query({
+        text: `CREATE COLLATION public.lcm_nondeterministic_ci (
+                 provider = icu, locale = 'und-u-ks-level2', deterministic = false
+               )`,
+      }, { domain: "factory", operation: "createNondeterministicCollationFixture" });
+      const equalityProbe = await database.migrator.query<{ equal: boolean }>({
+        text: "SELECT ('resume' = 'RESUME' COLLATE public.lcm_nondeterministic_ci) AS equal",
+      }, { domain: "factory", operation: "probeNondeterministicEquality" });
+      expect(equalityProbe.rows[0]?.equal).toBe(true);
+      expect(createHash("sha256").update("resume").digest("hex"))
+        .not.toBe(createHash("sha256").update("RESUME").digest("hex"));
+
+      // PostgreSQL's own generated-column dependency tracking refuses to
+      // change content's type/collation while search_document or
+      // content_sha256 (both STORED generated columns derived from
+      // content) still depend on it, so a full reproduction must drop and
+      // later restore both dependent columns around the collation change,
+      // exactly as a determined operator would have to.
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.promoted_memories DROP COLUMN search_document",
+      }, { domain: "factory", operation: "dropSearchDocumentForCollationChange" });
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.promoted_memories DROP COLUMN content_sha256",
+      }, { domain: "factory", operation: "dropContentDigestForCollationChange" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ALTER COLUMN content TYPE text COLLATE public.lcm_nondeterministic_ci`,
+      }, { domain: "factory", operation: "alterPromotedMemoriesContentCollation" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ADD COLUMN search_document tsvector GENERATED ALWAYS AS (
+                 to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content))
+               ) STORED`,
+      }, { domain: "factory", operation: "restoreSearchDocumentAfterCollationChange" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ADD COLUMN content_sha256 bytea GENERATED ALWAYS AS (
+                 public.digest(content, 'sha256')
+               ) STORED`,
+      }, { domain: "factory", operation: "restoreContentDigestAfterCollationChange" });
+      const failure = await runPostgreSqlMigrations(database.migrator)
+        .catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(PostgreSqlContentCollationPreflightError);
+      expect(failure).toMatchObject({
+        operation: "preflightContentCollation",
+        schemaName: "lcm",
+        tableName: "promoted_memories",
+        columnName: "content",
+        collationName: "public.lcm_nondeterministic_ci",
+        collationIsDeterministic: false,
+      });
+      expect((failure as PostgreSqlContentCollationPreflightError).remediation).toContain(
+        "deterministic collation",
+      );
+      // The rejection happens before DDL: promoted_memories keeps the
+      // nondeterministic collation because migrations never applied.
+      const stillNondeterministic = await database.migrator.query<{
+        collation_is_deterministic: boolean;
+      }>({
+        text: `SELECT coll.collisdeterministic AS collation_is_deterministic
+               FROM pg_catalog.pg_attribute attr
+               JOIN pg_catalog.pg_class rel ON rel.oid = attr.attrelid
+               JOIN pg_catalog.pg_namespace ns ON ns.oid = rel.relnamespace
+               JOIN pg_catalog.pg_collation coll ON coll.oid = attr.attcollation
+               WHERE ns.nspname = 'lcm' AND rel.relname = 'promoted_memories'
+                 AND attr.attname = 'content'`,
+      }, { domain: "factory", operation: "verifyContentCollationUnchanged" });
+      expect(stillNondeterministic.rows[0]?.collation_is_deterministic).toBe(false);
     });
   });
 

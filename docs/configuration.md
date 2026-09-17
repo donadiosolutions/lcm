@@ -578,6 +578,26 @@ migrations transactionally, and closes its pool before returning. Repeated and
 concurrent invocations converge. It never installs extensions, repairs drift,
 changes ownership, or grants application privileges.
 
+Upgrading through migration `0007_promoted_content_digest` (the owner
+exact-content index) takes an exclusive lock on `promoted_memories` while
+PostgreSQL backfills a generated digest column for every existing row and
+builds its supporting index in the same transaction. The lock duration
+scales with that table's size: an empty or small deployment finishes almost
+instantly, while a large promoted-memory table can hold readers and writers
+of that table for a noticeable window. Schedule the upgrade for a
+maintenance window sized to the table's row count; the migration still runs
+as one transaction, so an interrupted run leaves the prior schema in place
+rather than a partially built index.
+
+`lcm postgres migrate` also refuses to proceed if
+`promoted_memories.content` has a nondeterministic collation, such as an
+explicitly attached case- or accent-insensitive collation. A nondeterministic
+collation can make two byte-different rows compare equal even though their
+generated digests differ, which would let exact-content lookups silently
+miss an existing duplicate. Leave `content` on its default deterministic
+collation; migration and later readiness checks fail closed with a clear,
+actionable error if that is ever changed.
+
 After migration, apply only the reviewed scripts required by the repositories
 that this runtime role will use. The project-storage factory requires the
 readiness script and all six repository-domain scripts:
