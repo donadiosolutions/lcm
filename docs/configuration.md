@@ -595,17 +595,16 @@ explicitly attached case- or accent-insensitive collation. A nondeterministic
 collation can make two byte-different rows compare equal even though their
 generated digests differ, which would let exact-content lookups silently
 miss an existing duplicate. Leave `content` on its default deterministic
-collation. `lcm postgres migrate` reports a specific, actionable error
-naming the offending collation if that is ever changed. Recurring runtime
+collation. `lcm postgres migrate` fails before applying any migration DDL
+when `content` has a nondeterministic collation. Recurring runtime
 readiness (checked at every daemon and MCP factory boot, and by `lcm
 doctor`) also fails closed on the same condition, consistent with how it
 already handles a missing required extension or a misconfigured search
-configuration: it reports a generic readiness failure and directs the
-operator back to `lcm postgres migrate` for the specific diagnosis. Both
-checks read the live collation determinism from the PostgreSQL catalog on
-every call rather than a recorded baseline, so admission keeps failing
-closed even if the collation object is later dropped and recreated under
-the exact same qualified name as nondeterministic.
+configuration. Both checks read the live collation determinism from the
+PostgreSQL catalog on every call rather than a recorded baseline, so
+admission keeps failing closed even if the collation object is later
+dropped and recreated under the exact same qualified name as
+nondeterministic.
 
 #### Recovering from a nondeterministic promoted_memories.content collation
 
@@ -692,14 +691,18 @@ COMMIT;
 ```
 
 Dropping `search_document` also drops
-`promoted_memories_search_document_idx`; recreating the generated column
-does not automatically recreate that index, so the `CREATE INDEX`
-statement above is required, not optional. `pg_catalog."default"`
-restores the server's default deterministic collation; substitute another
-explicitly deterministic collation if the deployment requires one. Then
-run `lcm postgres migrate`: the collation preflight now passes, and
-migration `0007` applies, creating `content_sha256` and
-`promoted_memories_content_sha256_idx` over the restored content.
+`promoted_memories_search_document_idx`; recreating the generated
+column does not automatically recreate that index, so the
+`CREATE INDEX` statement above is required, not optional.
+`pg_catalog."default"` is the only collation target this recovery
+accepts. The packaged schema snapshots pin the qualified collation
+name of `promoted_memories.content`, so substituting any other
+collation here, even one that is fully deterministic, passes the
+collation preflight but is then rejected as schema drift by both
+`lcm postgres migrate` and recurring runtime readiness. Then run
+`lcm postgres migrate` to apply migration `0007`, creating
+`content_sha256` and `promoted_memories_content_sha256_idx` over
+the restored content.
 
 ##### Recovering after migration 0007
 
@@ -739,14 +742,17 @@ COMMIT;
 
 Dropping `search_document` and `content_sha256` also drops the two
 indexes built on them (`promoted_memories_search_document_idx` and
-`promoted_memories_content_sha256_idx`); recreating the generated columns
-does not automatically recreate those indexes, so the `CREATE INDEX`
-statements above are required, not optional. `pg_catalog."default"`
-restores the server's default deterministic collation; substitute another
-explicitly deterministic collation if the deployment requires one. Then run
-`lcm postgres migrate` to confirm the collation preflight now passes; it
-performs no further DDL here because migration `0007` is already recorded
-as applied.
+`promoted_memories_content_sha256_idx`); recreating the generated
+columns does not automatically recreate those indexes, so the
+`CREATE INDEX` statements above are required, not optional.
+`pg_catalog."default"` is the only collation target this recovery
+accepts. The packaged schema snapshots pin the qualified collation
+name of `promoted_memories.content`, so substituting any other
+collation here, even one that is fully deterministic, passes the
+collation preflight but is then rejected as schema drift by both
+`lcm postgres migrate` and recurring runtime readiness. Then run
+`lcm postgres migrate`; it performs no further DDL here because
+migration `0007` is already recorded as applied.
 
 ##### Recovering when the ledger records migration 0007 but content_sha256 is missing
 

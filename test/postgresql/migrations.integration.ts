@@ -10,6 +10,7 @@ import {
 } from "pg";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
+  assertPromotedMemoriesContentCollationReady,
   loadPostgreSqlMigrations,
   loadPostgreSqlSchemaSnapshots,
   PostgreSqlBaselineDefinitionPreflightError,
@@ -2941,6 +2942,95 @@ describe("PostgreSQL migrations and database isolation", () => {
         collationIsDeterministic: false,
       });
     }, { runMigrations: false });
+  });
+
+
+  it("admits a custom deterministic collation into the preflight but rejects it as schema drift", async () => {
+    await withPostgreSqlTestDatabase("content-collation-custom-deterministic-drift", async (database) => {
+      await runPostgreSqlMigrations(database.migrator);
+      await applyRuntimeGrantScripts(database);
+
+      // An operator who read only the (pre-fix) documentation's
+      // "substitute another explicitly deterministic collation" sentence
+      // attaches a custom collation that is genuinely deterministic, not
+      // the nondeterministic fixture used by the tests above.
+      await database.migrator.query({
+        text: `CREATE COLLATION public.lcm_recovery_alt_det (
+                 provider = icu, locale = 'und', deterministic = true
+               )`,
+      }, { domain: "factory", operation: "createCustomDeterministicCollationFixture" });
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.promoted_memories DROP COLUMN search_document",
+      }, { domain: "factory", operation: "dropSearchDocumentForCustomDeterministicFixture" });
+      await database.migrator.query({
+        text: "ALTER TABLE lcm.promoted_memories DROP COLUMN content_sha256",
+      }, { domain: "factory", operation: "dropContentDigestForCustomDeterministicFixture" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ALTER COLUMN content TYPE text COLLATE public.lcm_recovery_alt_det`,
+      }, { domain: "factory", operation: "alterContentToCustomDeterministicCollation" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ADD COLUMN search_document tsvector GENERATED ALWAYS AS (
+                 to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content))
+               ) STORED`,
+      }, { domain: "factory", operation: "restoreSearchDocumentForCustomDeterministicFixture" });
+      await database.migrator.query({
+        text: `CREATE INDEX promoted_memories_search_document_idx
+               ON lcm.promoted_memories USING gin (search_document)`,
+      }, { domain: "factory", operation: "restoreSearchDocumentIndexForCustomDeterministicFixture" });
+      await database.migrator.query({
+        text: `ALTER TABLE lcm.promoted_memories
+               ADD COLUMN content_sha256 bytea GENERATED ALWAYS AS (
+                 public.digest(content, 'sha256')
+               ) STORED`,
+      }, { domain: "factory", operation: "restoreContentDigestForCustomDeterministicFixture" });
+      await database.migrator.query({
+        text: `CREATE INDEX promoted_memories_content_sha256_idx
+               ON lcm.promoted_memories (
+                 project_id, content_sha256, created_at DESC, memory_id DESC
+               )
+               WHERE archived_at IS NULL`,
+      }, { domain: "factory", operation: "restoreContentDigestIndexForCustomDeterministicFixture" });
+
+      // Directly prove the reviewer's first claim: the collation
+      // preflight admits this collation on its own terms, because it is
+      // genuinely deterministic, not nondeterministic like the fixture
+      // above.
+      await expect(
+        assertPromotedMemoriesContentCollationReady(database.migrator),
+      ).resolves.toBeUndefined();
+
+      // Directly prove the reviewer's second claim: the same database is
+      // then rejected as schema drift, not by the collation preflight.
+      // The fingerprint pins promoted_memories.content's qualified
+      // collation_name against the packaged pg_catalog."default"
+      // snapshot, so any other collation -- deterministic or not --
+      // shows up as one drifted "ordinary_column" definition group.
+      const migrationFailure = await runPostgreSqlMigrations(database.migrator)
+        .catch((error: unknown) => error);
+      expect(migrationFailure).not.toBeInstanceOf(PostgreSqlContentCollationPreflightError);
+      expect(migrationFailure).toBeInstanceOf(PostgreSqlBaselineDefinitionPreflightError);
+      expect(migrationFailure).toMatchObject({
+        baselineApplied: true,
+        driftedDefinitionGroupCount: 1,
+        expectedObjectCount: 883,
+        existingObjectCount: 883,
+        missingObjectCount: 0,
+        operation: "preflightBaselineDefinitions",
+      });
+
+      // Recurring runtime readiness reaches the same content-collation
+      // preflight first (it also admits this collation) and only then
+      // hits the identical fingerprint drift, under its own error shape.
+      const readinessFailure = await verifyPostgreSqlRuntimeSchema(database.runtime, {
+        expectedOwner: "lcm_test_migrator",
+      }).catch((error: unknown) => error);
+      expect(readinessFailure).toMatchObject({
+        reason: "schema-fingerprint",
+        operation: "inspectSchemaDefinitions",
+      });
+    });
   });
 
 
