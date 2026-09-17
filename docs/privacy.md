@@ -552,8 +552,11 @@ The `Security` section of the doctor output shows:
   slash paths in later ampersand-separated parameters remain covered by the
   same handoff. When an ampersand is immediately followed by an ordinary
   public `scheme://` URL, the quoted-query handoff expires before that URL, so
-  its scheme, authority, and path remain byte-identical. A nested exact
-  `file://` literal still starts its own bounded file-path classification.
+  its scheme, authority, and path remain byte-identical. A later
+  ampersand-separated word-bearing private path resumes the surrounding quoted
+  file query's handoff. Named public URL parameters such as `&next=/public`
+  remain part of that public URL. A nested exact `file://` literal still starts
+  its own bounded file-path classification.
   Classification state from an earlier quoted file URL does not carry into a
   later unquoted file URL's query tail. A public URL glued directly after the
   closing quote or bracket without whitespace may be conservatively redacted:
@@ -606,7 +609,51 @@ The `Security` section of the doctor output shows:
   bracket. A balanced outer bracket may have only spaces or tabs before the
   backslash. This handoff is consumed once. Prose, newlines, carriage returns,
   and other whitespace end it; ordinary text and non-file URLs do not make a
-  single backslash a global path start.
+  single backslash a global path start. Within a bracketed pathless file query,
+  a nested public URL keeps its ordinary path and slash-bearing named query
+  values. An ampersand or pipe immediately followed by a supported POSIX or
+  Windows root returns to the enclosing private-path grammar. That owner remains
+  active through repeated immediate paths in the same wrapper, including a
+  POSIX component beginning with a Unicode symbol. An ampersand absolute-path
+  handoff also ends the nested URL substate, so later private values in the same
+  wrapper use the enclosing owner, including after another explicit public URL.
+  Pipe absolute-path handoffs are retained independently at each originating
+  wrapper depth, so closing an inner wrapper consumes only its own one-use tail
+  while outer handoffs remain pending. Repeated handoffs at the same depth stay
+  bounded by that depth, and resets clear all pending depths. Quoted-file query
+  ownership remains independent from a nested public-URL child, allowing every
+  immediate bare path and later word-bearing private parameter to redact on the
+  same pass. A nested exact file URL retains its own path/query classification
+  while bound to the observable enclosing owner; after the child span ends, a
+  depth-keyed returned-parent set classifies every later same-wrapper bare or
+  word-bearing private value. Closing an inner wrapper removes only that depth,
+  preserving still-open outer owners until their matching close or a hard
+  reset. Within a child query or fragment, an ampersand word-bearing `Users`
+  root returns to the retained parent and redacts on the same pass. The same
+  narrow handoff remains available after an intervening public URL child while
+  that wrapper depth is retained, including a named root-relative Windows
+  value. Quoted public URLs keep ordinary relative and named slash-bearing
+  parameters inside their own query or fragment. A bare absolute path, complete
+  word-bearing `Users` root, or named Windows/drive/UNC value returns to the
+  quoted-file parent and restores that parent for later children. This does not
+  trust marker text, classify ordinary relative values as private on the
+  returned-parent transition, or make backslashes global. The direct-relative
+  nested-file query/fragment family remains deferred: its first pass preserves
+  the relative bytes and its next stable pass conservatively redacts them.
+  An unquoted exact file wrapper immediately followed by an ampersand-separated
+  public URL is recognized from that observable syntax on every pass. The
+  doubled-bracket pathless policy retains the observable scheme, authority, and
+  path of a slash-prefixed nested public URL when it has a query or fragment.
+  Later passes therefore derive ownership of named slash-bearing values from the
+  retained URL syntax. A literal `<path>` followed directly by `?` or `#` carries
+  no provenance; slash-bearing values in that ambiguous form are conservatively
+  redacted. The observable outer brackets of a pathless file query or fragment
+  remain the owner across arbitrary literal text, so a query or fragment value
+  beginning with a root-relative Windows backslash is also redacted while that
+  wrapper remains open. This does not make a single backslash a path start in
+  ordinary prose or non-file URLs. Separately quoted wrappers retain their
+  conservative unspaced-URL behavior. These boundaries make the first sanitized
+  result stable without treating an arbitrary `<path>` marker as trusted context.
   When an unquoted local-path span contains a scheme-shaped `scheme://`
   component, the bounded span-local scheme colon and the component that follows
   it are replaced within the same `<path>` marker on the first pass. This also
