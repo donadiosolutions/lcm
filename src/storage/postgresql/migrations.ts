@@ -807,14 +807,16 @@ export class PostgreSqlContentCollationPreflightError extends StorageOperationEr
   readonly columnName = "content";
   readonly remediation =
     "Restore a deterministic collation on lcm.promoted_memories.content. "
-    + "A plain ALTER COLUMN cannot run directly because search_document "
-    + "and content_sha256 are generated columns that depend on content; "
-    + "follow the ordered \"Recovering from a nondeterministic "
+    + "A plain ALTER COLUMN cannot run directly because content has "
+    + "STORED generated columns depending on it: search_document "
+    + "always, and content_sha256 once migration 0007 has applied. "
+    + "Follow the \"Recovering from a nondeterministic "
     + "promoted_memories.content collation\" procedure in "
-    + "docs/configuration.md, then rerun migrations. A nondeterministic "
-    + "collation lets raw content equality match rows whose generated "
-    + "content_sha256 digest differs, which would make findExactContent "
-    + "miss an existing duplicate.";
+    + "docs/configuration.md, which selects between a pre-0007 and a "
+    + "post-0007 recovery path, then rerun migrations. A "
+    + "nondeterministic collation lets raw content equality match rows "
+    + "whose generated content_sha256 digest differs, which would make "
+    + "findExactContent miss an existing duplicate.";
 
   override toJSON(): Record<string, unknown> {
     return {

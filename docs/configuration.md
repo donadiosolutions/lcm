@@ -612,8 +612,76 @@ the exact same qualified name as nondeterministic.
 `search_document` and, since migration `0007_promoted_content_digest`,
 `content_sha256` are `STORED` generated columns that depend on
 `content`, so PostgreSQL refuses a plain `ALTER COLUMN content TYPE ...`
-outright. Recover with this ordered, dependency-safe procedure, run as the
-migration role in one transaction:
+outright. The collation preflight runs before any migration DDL, so it
+also rejects an installation that has not yet reached migration `0007`;
+on that schema `content_sha256` does not exist, and the two recovery
+procedures differ because there is nothing to drop there. Determine which
+procedure applies before proceeding, run as the migration role:
+
+```sql
+SELECT EXISTS (
+  SELECT 1 FROM pg_catalog.pg_attribute
+  WHERE attrelid = 'lcm.promoted_memories'::regclass
+    AND attname = 'content_sha256'
+    AND NOT attisdropped
+) AS migration_0007_applied;
+```
+
+If this returns `true`, migration `0007` has already run and
+`content_sha256` exists; follow "Recovering after migration 0007" below.
+If it returns `false`, the installation is still on migration `0006` or
+earlier; follow "Recovering before migration 0007" instead. Do not infer
+this from the migration ledger alone: migration DDL and its ledger row
+commit together in the same transaction, so the schema and the ledger
+never disagree, but checking the schema directly is what the procedures
+below actually depend on.
+
+##### Recovering before migration 0007
+
+On this schema, only `search_document` depends on `content`;
+`content_sha256` does not exist yet. Drop only the existing dependency,
+restore the deterministic collation, and recreate `search_document` and
+its index. Do not create `content_sha256` or its index here: leave that
+to migration `0007`, which creates both itself, computing the digest
+over the now-correctly-collated `content`. Creating them by hand here
+would leave migration `0007` unrecorded while its objects already
+exist, and the next `lcm postgres migrate` run would then reject the
+resulting schema drift or attempt to add the column again.
+
+```sql
+BEGIN;
+
+ALTER TABLE lcm.promoted_memories DROP COLUMN search_document;
+
+ALTER TABLE lcm.promoted_memories
+  ALTER COLUMN content TYPE text COLLATE pg_catalog."default";
+
+ALTER TABLE lcm.promoted_memories
+  ADD COLUMN search_document tsvector GENERATED ALWAYS AS (
+    to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content))
+  ) STORED;
+CREATE INDEX promoted_memories_search_document_idx
+  ON lcm.promoted_memories USING gin (search_document);
+
+COMMIT;
+```
+
+Dropping `search_document` also drops
+`promoted_memories_search_document_idx`; recreating the generated column
+does not automatically recreate that index, so the `CREATE INDEX`
+statement above is required, not optional. `pg_catalog."default"`
+restores the server's default deterministic collation; substitute another
+explicitly deterministic collation if the deployment requires one. Then
+run `lcm postgres migrate`: the collation preflight now passes, and
+migration `0007` applies, creating `content_sha256` and
+`promoted_memories_content_sha256_idx` over the restored content.
+
+##### Recovering after migration 0007
+
+On this schema, both `search_document` and `content_sha256` depend on
+`content`. Drop both existing dependencies, restore the deterministic
+collation, and recreate both generated columns and both indexes in the
+same transaction:
 
 ```sql
 BEGIN;
@@ -654,6 +722,13 @@ explicitly deterministic collation if the deployment requires one. Then run
 `lcm postgres migrate` to confirm the collation preflight now passes; it
 performs no further DDL here because migration `0007` is already recorded
 as applied.
+
+Both procedures leave the other `promoted_memories` objects that do not
+depend on `content`'s STORED generated columns untouched:
+`ALTER COLUMN ... TYPE` rebuilds the `promoted_memories_content_trgm_idx`
+expression index and re-validates the `CHECK (content <> '')` constraint
+automatically, so neither needs to be dropped or recreated by either
+procedure.
 
 After migration, apply only the reviewed scripts required by the repositories
 that this runtime role will use. The project-storage factory requires the
