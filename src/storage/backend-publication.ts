@@ -2801,13 +2801,19 @@ function assertRetainedArchiveHistoryDirectory(
 
 /**
  * Bind a freshly retained history-directory descriptor to its pathname
- * immediately after open. This proves the descriptor that will be used for
- * the remainder of the archive operation is, right now, the non-symlink
- * `history` entry with exact 0700 mode and our UID. It does not retroactively
- * verify the identity `mkdirSync` created a moment earlier -- POSIX has no
- * atomic create-and-open for directories, so a same-UID entry substitution in
- * that single window cannot be detected after the fact. This binding closes
- * every subsequent window: nothing later in the operation can rely on a
+ * immediately after it is created. This proves the descriptor that will be
+ * used for the remainder of the archive operation is, right now, the
+ * non-symlink `history` entry with exact 0700 mode and our UID.
+ *
+ * It does not retroactively verify the identity `mkdirSync` created a moment
+ * earlier. POSIX has no atomic create-and-open for directories, and the
+ * obvious alternative -- create under an unguessable staging name and rename
+ * it onto `history` -- is not available here: rename replaces an empty
+ * directory, so it would silently adopt and clobber a concurrent creator's
+ * directory, which "refuses a history create race without adopting the
+ * entrant" forbids. Failing closed on a racing entrant is the stronger
+ * property, so the mkdir-then-open shape is kept and every window after the
+ * open is closed instead: nothing later in the operation can rely on a
  * descriptor that silently drifted from the pathname without this check
  * failing closed first.
  */
@@ -2875,13 +2881,6 @@ function withRetainedArchiveHistoryDirectory<T>(
       historyHandle = openPrivateDirectoryIfExists(history);
     } catch (error) {
       return archiveUnsafeStorage("backend publication history directory cannot be opened", error);
-    }
-    if (historyHandle !== undefined) {
-      bindRetainedArchiveHistoryDirectoryEntry(
-        history,
-        historyHandle,
-        "backend publication history directory cannot be opened",
-      );
     }
     if (historyHandle === undefined) {
       observer("before-terminal-journal-history-create", history);

@@ -4030,7 +4030,13 @@ describe("BackendPublicationCoordinator", () => {
     }) as never, async () => coordinator(home, attempt.driver).prepare({
       ...inputFor(material()),
       publicationId: "publication-2",
-    }))).rejects.toMatchObject({ reason: "unsafe-storage" });
+    }))).rejects.toMatchObject({
+      reason: "unsafe-storage",
+      // Pins the post-create binding specifically. Without it the substitution
+      // is only caught later, by the archive write's own parent-entry check,
+      // under a different message.
+      message: "created backend publication history directory is unsafe",
+    });
 
     expect(injected).toBe(true);
     expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
@@ -4052,11 +4058,14 @@ describe("BackendPublicationCoordinator", () => {
 
     // Renaming the retained directory to a new name and replacing "history"
     // with a symlink back to it leaves the retained descriptor's dev/ino
-    // reachable again through realpath resolution: the prior
-    // realpathSync-based comparison in assertPrivateDirectory alone would
-    // accept this, since it only compares resolved identity, not entry type.
-    // The added assertPrivateDirectoryEntry check lstat's the exact "history"
-    // component without following symlinks and rejects it immediately.
+    // reachable again through realpath resolution, so the realpathSync-based
+    // comparison in assertPrivateDirectory accepts it: that comparison only
+    // checks resolved identity, not entry type. Before this change the
+    // substitution was still refused, but later and by a different guard --
+    // the retained-parent entry check inside the archive write. The added
+    // assertPrivateDirectoryEntry lstat's the exact "history" component
+    // without following symlinks and rejects it here instead, which is what
+    // the asserted message pins.
     await expect(coordinator(home, attempt.driver, (event) => {
       if (!injected && event === "before-terminal-journal-archive-publication") {
         injected = true;
@@ -4066,7 +4075,10 @@ describe("BackendPublicationCoordinator", () => {
     }).prepare({
       ...inputFor(material()),
       publicationId: "publication-2",
-    })).rejects.toMatchObject({ reason: "unsafe-storage" });
+    })).rejects.toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication history directory changed during terminal journal archive",
+    });
 
     expect(injected).toBe(true);
     expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
