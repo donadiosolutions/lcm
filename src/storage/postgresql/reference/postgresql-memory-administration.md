@@ -64,6 +64,20 @@ one explicit project UUID.
   their identity.
 - Returned timestamps are canonical UTC ISO 8601 strings on both backends.
 
+- `findExactContent` uses an owner-scoped, fixed-size SHA-256 candidate
+  index (`promoted_memories_content_sha256_idx` on the generated
+  `content_sha256` column) to bound the exact-content lookup instead of
+  scanning every active row for the owner. Raw byte-equal content remains a
+  residual filter after the indexed candidate, so the lookup is exactly raw
+  content equality with no risk from a theoretical SHA-256 collision.
+  Applying migration `0007_promoted_content_digest` rewrites the table to
+  populate the generated column and builds the new index in the same
+  transaction, so it takes an exclusive schema rewrite and index-build
+  window proportional to the existing promoted-memory row count. Plan
+  maintenance windows accordingly on databases with a large promoted-memory
+  table. SQLite already performs direct raw-content equality and required no
+  change.
+
 An omitted or negative content-prefix limit is unbounded, zero returns no rows,
 and a positive safe integer applies the bound. Stale selection preserves the
 existing policy: only sufficiently old active memories with no recorded use

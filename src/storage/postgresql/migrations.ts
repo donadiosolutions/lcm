@@ -45,6 +45,11 @@ const MIGRATION_MANIFEST = [
     filename: "0006_transfer_ledger.sql",
     sha256: "81fed3ac0a6059b6e2a536647a5ab5d8673322b7ba5804a60b068b927367983a",
   },
+  {
+    id: "0007_promoted_content_digest",
+    filename: "0007_promoted_content_digest.sql",
+    sha256: "13d5c5ced7aacb2ac8f474ba63d576541d24d9907f69015c6cefa053b7cf0dd7",
+  },
 ] as const;
 
 type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
@@ -630,12 +635,35 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       rewriteRule: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     },
   };
+  const promotedContentDigest: PostgreSqlSchemaSnapshot = {
+    ...transferLedger,
+    migrationId: "0007_promoted_content_digest",
+    generatedColumnIdentities: [
+      ...transferLedger.generatedColumnIdentities,
+      "promoted_memories|content_sha256",
+    ],
+    columnAclIdentities: [
+      ...transferLedger.columnAclIdentities,
+      "promoted_memories|content_sha256",
+    ],
+    indexNames: [
+      ...transferLedger.indexNames,
+      "promoted_memories_content_sha256_idx",
+    ],
+    definitionHashes: {
+      ...transferLedger.definitionHashes,
+      index: "0f99600ba91811264e144a2cf345fbfb3dc82b325242509d9c6ec88ca21580ca",
+      generatedColumn: "94e52664f5fc04804494538ef5215268d80f566cdc25a96b24df67c227ea350c",
+      columnAcl: "ceca33cadbfe1d2bbc51ba0ace9ed164e25ff334ae720ba41b80e6097e8fa771",
+    },
+  };
   return [
     baseline,
     machineIdentity,
     machineDisplayName,
     summaryContextIntegrity,
     transferLedger,
+    promotedContentDigest,
   ];
 }
 
