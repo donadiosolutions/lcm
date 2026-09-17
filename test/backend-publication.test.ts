@@ -4661,6 +4661,208 @@ describe("BackendPublicationCoordinator", () => {
     expect(attempt.calls).toEqual([]);
   });
 
+  /**
+   * Report a drifted gid for one retained directory descriptor, leaving every
+   * other field untouched. A live descriptor's dev and ino cannot change, and
+   * its uid and mode are already refused inside assertPrivateDirectory, so a
+   * gid change is the one way the retained witness and the descriptor's
+   * current identity observably diverge.
+   *
+   * The drift follows the most recent open of trackedPath, which is the
+   * descriptor the archive retains at the point each test arms it. A future
+   * reopen after the arming event would drift the wrong descriptor, and the
+   * guard would then see no drift and the test would fail loudly rather than
+   * pass for the wrong reason.
+   */
+  async function withRetainedDirectoryGidDrift<T>(
+    trackedPath: string,
+    drifting: () => boolean,
+    callback: () => Promise<T>,
+  ): Promise<T> {
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalFstat = nodeFs.fstatSync as (...args: unknown[]) => unknown;
+    let trackedFd: number | undefined;
+
+    return withPatchedFsAsync("openSync", ((path: unknown, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === trackedPath) trackedFd = fd;
+      return fd;
+    }) as never, async () => withPatchedFsAsync("fstatSync", ((fd: number, ...args: unknown[]) => {
+      const stat = originalFstat(fd, ...args) as { gid: unknown };
+      if (fd !== trackedFd || !drifting() || typeof stat.gid !== "bigint") return stat;
+      return Object.create(stat as object, {
+        gid: { value: stat.gid + 1n, enumerable: true },
+      }) as unknown;
+    }) as never, callback));
+  }
+
+  it("refuses a retained publication directory whose gid drifted mid-archive", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const directory = backendPublicationDirectory(home);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    const attempt = countingDriver(material());
+    let drifting = false;
+
+    await expect(withRetainedDirectoryGidDrift(
+      directory,
+      () => drifting,
+      async () => coordinator(home, attempt.driver, (event) => {
+        if (event === "before-terminal-journal-history-open") drifting = true;
+      }).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      }),
+    )).rejects.toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication directory changed during terminal journal archive",
+      cause: expect.objectContaining({ message: "private directory identity changed" }),
+    });
+
+    expect(drifting).toBe(true);
+    expect(existsSync(archivePath)).toBe(false);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("refuses a retained history directory whose gid drifted mid-archive", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    const attempt = countingDriver(material());
+    let drifting = false;
+
+    await expect(withRetainedDirectoryGidDrift(
+      history,
+      () => drifting,
+      async () => coordinator(home, attempt.driver, (event) => {
+        if (event === "before-terminal-journal-archive-publication") drifting = true;
+      }).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      }),
+    )).rejects.toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication history directory changed during terminal journal archive",
+      cause: expect.objectContaining({ message: "private directory identity changed" }),
+    });
+
+    expect(drifting).toBe(true);
+    expect(existsSync(archivePath)).toBe(false);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("aggregates an unstructured archive failure with a history close failure", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    const attempt = countingDriver(material());
+    const syncFailure = new Error("history fsync failed");
+    const cleanupFailure = new Error("history close failed after fsync");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalFsync = nodeFs.fsyncSync as (fd: number) => void;
+    const originalClose = nodeFs.closeSync as (fd: number) => void;
+    let historyFd: number | undefined;
+    let historyCloseCalls = 0;
+    let caught: unknown;
+
+    try {
+      await withPatchedFsAsync("openSync", ((path: unknown, ...args: unknown[]) => {
+        const fd = originalOpen(path, ...args);
+        if (path === history) historyFd = fd;
+        return fd;
+      }) as never, async () => withPatchedFsAsync("fsyncSync", ((fd: number) => {
+        if (fd === historyFd) throw syncFailure;
+        originalFsync(fd);
+      }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+        originalClose(fd);
+        if (fd === historyFd) {
+          historyCloseCalls += 1;
+          throw cleanupFailure;
+        }
+      }) as never, async () => coordinator(home, attempt.driver).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      }))));
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect(caught).not.toBeInstanceOf(BackendPublicationJournalError);
+    expect((caught as AggregateError).message).toBe(
+      "backend publication archive operation and history cleanup failed",
+    );
+    expect((caught as AggregateError).errors).toHaveLength(2);
+    expect((caught as AggregateError).errors[0]).toBe(syncFailure);
+    expect((caught as AggregateError).errors[1]).toBe(cleanupFailure);
+    expect((caught as AggregateError).cause).toBe(syncFailure);
+    expect(historyCloseCalls).toBe(1);
+    expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("refuses a created history directory widened before it is opened", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    const attempt = countingDriver(material());
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalMkdir = nodeFs.mkdirSync as (...args: unknown[]) => unknown;
+    let widened = false;
+
+    // mkdir(2) returns no descriptor, so the archive has to open the
+    // directory it just created as a separate step. This drives the exact
+    // window that gap leaves open: another actor with write access to the
+    // parent widens the new directory before the open lands. The open must
+    // refuse the widened directory instead of retaining a descriptor to it,
+    // and must leave the directory exactly as it found it.
+    await expect(withPatchedFsAsync("mkdirSync", ((path: unknown, ...args: unknown[]) => {
+      const created = originalMkdir(path, ...args);
+      if (path === history) {
+        widened = true;
+        chmodSync(history, 0o755);
+      }
+      return created;
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    }))).rejects.toMatchObject({
+      reason: "unsafe-storage",
+      message: "created backend publication history directory is unsafe",
+    });
+
+    expect(widened).toBe(true);
+    expect(statSync(history).mode & 0o777).toBe(0o755);
+    expect(readdirSync(history)).toEqual([]);
+    expect(existsSync(archivePath)).toBe(false);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
   it("cleans its known unpublished archive temp after exclusive link failure", async () => {
     const home = makeHome();
     const fixture = await terminalArchiveFixture(home, 2);

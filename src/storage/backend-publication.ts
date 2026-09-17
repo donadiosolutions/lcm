@@ -2865,6 +2865,50 @@ function completeArchiveHistoryOperation<T>(
   throw aggregate;
 }
 
+type RetainedArchiveHistoryDirectory = Readonly<{
+  historyHandle: ReturnType<typeof openPrivateDirectory>;
+  created: boolean;
+}>;
+
+/**
+ * Acquire the retained history directory, creating it when absent. Every
+ * failure here throws before a descriptor exists, so the caller never has to
+ * reason about an unacquired handle: this returns a live descriptor or throws.
+ *
+ * Binding a freshly created descriptor to its entry is deliberately left to
+ * the caller. That check can fail, and a failure after acquisition must still
+ * close the descriptor and aggregate any close failure with it, which only
+ * the caller's completion path does.
+ */
+function openRetainedArchiveHistoryDirectory(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+  observer: BackendPublicationObserver,
+  history: string,
+): RetainedArchiveHistoryDirectory {
+  assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+  observer("before-terminal-journal-history-open", history);
+  let existingHandle;
+  try {
+    existingHandle = openPrivateDirectoryIfExists(history);
+  } catch (error) {
+    return archiveUnsafeStorage("backend publication history directory cannot be opened", error);
+  }
+  if (existingHandle !== undefined) return { historyHandle: existingHandle, created: false };
+  observer("before-terminal-journal-history-create", history);
+  assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+  try {
+    mkdirSync(history, { mode: 0o700 });
+  } catch (error) {
+    return archiveUnsafeStorage("backend publication history directory cannot be created", error);
+  }
+  try {
+    return { historyHandle: openPrivateDirectory(history), created: true };
+  } catch (error) {
+    return archiveUnsafeStorage("created backend publication history directory is unsafe", error);
+  }
+}
+
 function withRetainedArchiveHistoryDirectory<T>(
   homeDir: string | undefined,
   directoryHandle: BackendPublicationDirectoryHandle,
@@ -2872,29 +2916,15 @@ function withRetainedArchiveHistoryDirectory<T>(
   callback: (historyHandle: ReturnType<typeof openPrivateDirectory>) => T,
 ): T {
   const history = backendPublicationHistoryDirectory(homeDir);
-  let historyHandle: ReturnType<typeof openPrivateDirectory> | undefined;
+  const { historyHandle, created } = openRetainedArchiveHistoryDirectory(
+    homeDir,
+    directoryHandle,
+    observer,
+    history,
+  );
   let outcome: ArchiveHistoryOperationOutcome<T>;
   try {
-    assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
-    observer("before-terminal-journal-history-open", history);
-    try {
-      historyHandle = openPrivateDirectoryIfExists(history);
-    } catch (error) {
-      return archiveUnsafeStorage("backend publication history directory cannot be opened", error);
-    }
-    if (historyHandle === undefined) {
-      observer("before-terminal-journal-history-create", history);
-      assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
-      try {
-        mkdirSync(history, { mode: 0o700 });
-      } catch (error) {
-        return archiveUnsafeStorage("backend publication history directory cannot be created", error);
-      }
-      try {
-        historyHandle = openPrivateDirectory(history);
-      } catch (error) {
-        return archiveUnsafeStorage("created backend publication history directory is unsafe", error);
-      }
+    if (created) {
       bindRetainedArchiveHistoryDirectoryEntry(
         history,
         historyHandle,
@@ -2906,12 +2936,6 @@ function withRetainedArchiveHistoryDirectory<T>(
     outcome = { succeeded: true, value: callback(historyHandle) };
   } catch (error) {
     outcome = { succeeded: false, error };
-  }
-  if (historyHandle === undefined) {
-    if (outcome.succeeded) {
-      throw new Error("backend publication history operation completed without a retained directory");
-    }
-    throw outcome.error;
   }
   return completeArchiveHistoryOperation(historyHandle, outcome);
 }
