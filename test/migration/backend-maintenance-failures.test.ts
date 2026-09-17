@@ -11,7 +11,10 @@ import { BackendPublicationCoordinator, assertBackendPublicationConsumerAccess, 
 const interception = vi.hoisted(() => ({ write: undefined as ((content: string) => void) | undefined, read: undefined as ((path: string, observed: Record<string, unknown>) => Record<string, unknown>) | undefined }));
 vi.mock("../../src/security-files.js", async (original) => {
   const actual = await original<typeof import("../../src/security-files.js")>();
-  return { ...actual, atomicWritePrivateFileDurable: (...args: Parameters<typeof actual.atomicWritePrivateFileDurable>) => {
+  return { ...actual, atomicWritePrivateFile: (...args: Parameters<typeof actual.atomicWritePrivateFile>) => {
+    interception.write?.(String(args[1]));
+    return actual.atomicWritePrivateFile(...args);
+  }, atomicWritePrivateFileDurable: (...args: Parameters<typeof actual.atomicWritePrivateFileDurable>) => {
     interception.write?.(String(args[1]));
     return actual.atomicWritePrivateFileDurable(...args);
   }, readBoundedRegularFileWithStat: (...args: Parameters<typeof actual.readBoundedRegularFileWithStat>) => {

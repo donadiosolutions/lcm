@@ -50,6 +50,7 @@ import {
   openPrivateDirectoryIfExists,
   privateFileAbsentAtRetainedParent,
   PrivateDirectoryTopologyError,
+  PrivateFileCollisionCleanupError,
   PrivateFileCollisionError,
   PrivateFilePublicationTopologyError,
   readBoundedRegularFile,
@@ -493,6 +494,7 @@ describe("private filesystem primitives", () => {
       }
       expect(observed).toBeInstanceOf(PrivateDirectoryTopologyError);
       expect(observed).not.toBeInstanceOf(PrivateFileCollisionError);
+      expect(observed).toBeInstanceOf(PrivateFileCollisionCleanupError);
       const aggregate = (observed as Error).cause as AggregateError & { cause?: unknown };
       expect(aggregate).toBeInstanceOf(AggregateError);
       expect(aggregate.message).toBe("private file publication and temporary cleanup failed");
@@ -534,6 +536,7 @@ describe("private filesystem primitives", () => {
 
       expect(observed).toBeInstanceOf(PrivateDirectoryTopologyError);
       expect(observed).not.toBeInstanceOf(PrivateFileCollisionError);
+      expect(observed).toBeInstanceOf(PrivateFileCollisionCleanupError);
       const aggregate = (observed as Error).cause as AggregateError & { cause?: unknown };
       expect(aggregate).toBeInstanceOf(AggregateError);
       expect(aggregate.errors[0]).toBeInstanceOf(PrivateFileCollisionError);
@@ -557,13 +560,23 @@ describe("private filesystem primitives", () => {
     const collision = Object.assign(new Error("destination exists"), { code: "EEXIST" });
     writeFileSync(target, "winner", { mode: 0o600 });
     let observed: unknown;
+    let preparedIno: bigint | undefined;
+    let replacementIno: bigint | undefined;
     try {
       try {
         atomicWritePrivateFile(target, "loser", {
           random: () => Buffer.alloc(12, 0x77),
           link: (source) => {
-            rmSync(source);
-            writeFileSync(source, "untrusted replacement", { mode: 0o600 });
+            // Allocate the replacement inode while the prepared temporary is
+            // still linked, then rename it over the prepared pathname.  A
+            // remove-then-create sequence lets a filesystem reuse the just
+            // freed inode, which would make identity-bound cleanup succeed and
+            // silently defeat this regression on some runners.
+            const replacement = `${source}.untrusted`;
+            preparedIno = (statSync(source, { bigint: true })).ino;
+            writeFileSync(replacement, "untrusted replacement", { mode: 0o600 });
+            replacementIno = (statSync(replacement, { bigint: true })).ino;
+            renameSync(replacement, source);
             throw collision;
           },
         }, parent, { requireAbsent: true });
@@ -571,8 +584,10 @@ describe("private filesystem primitives", () => {
         observed = error;
       }
 
+      expect(replacementIno).not.toBe(preparedIno);
       expect(observed).toBeInstanceOf(PrivateDirectoryTopologyError);
       expect(observed).not.toBeInstanceOf(PrivateFileCollisionError);
+      expect(observed).toBeInstanceOf(PrivateFileCollisionCleanupError);
       const aggregate = (observed as Error).cause as AggregateError & { cause?: unknown };
       expect(aggregate).toBeInstanceOf(AggregateError);
       expect(aggregate.errors[0]).toBeInstanceOf(PrivateFileCollisionError);
@@ -613,6 +628,7 @@ describe("private filesystem primitives", () => {
       }
       expect(thrown).toBeInstanceOf(PrivateDirectoryTopologyError);
       expect(thrown).not.toBeInstanceOf(PrivateFileCollisionError);
+      expect(thrown).toBeInstanceOf(PrivateFileCollisionCleanupError);
       expect(thrown).not.toBeInstanceOf(PrivateFilePublicationTopologyError);
       const aggregate = (thrown as Error).cause as AggregateError & { cause?: unknown };
       expect(aggregate).toBeInstanceOf(AggregateError);

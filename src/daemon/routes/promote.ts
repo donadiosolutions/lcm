@@ -11,6 +11,7 @@ import {
   atomicWritePrivateFile,
   openPrivateDirectory,
   PrivateDirectoryTopologyError,
+  PrivateFileCollisionCleanupError,
   PrivateFileCollisionError,
   readBoundedRegularFileWithStat,
   type PrivateDirectoryHandle,
@@ -498,7 +499,10 @@ export function createPromoteHandler(
                       atomicWritePrivateFile(paths.metaPath, serialized, {}, parent);
                     }
                   } catch (error) {
-                    if (error instanceof PrivateFileCollisionError) {
+                    if (
+                      error instanceof PrivateFileCollisionError
+                      || error instanceof PrivateFileCollisionCleanupError
+                    ) {
                       throw metadataTopologyError(error);
                     }
                     throw error;

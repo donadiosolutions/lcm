@@ -85,6 +85,20 @@ export class PrivateFileCollisionError extends PrivateDirectoryTopologyError {
   }
 }
 
+/**
+ * A create-if-absent private publication collided and its task-owned temporary
+ * inode could not be proven removed.  This deliberately is not a
+ * PrivateFileCollisionError, so a caller that accepts an ordinary replay
+ * collision cannot silently accept incomplete cleanup.  A caller that must
+ * still classify the primary failure as a collision opts in through this type.
+ */
+export class PrivateFileCollisionCleanupError extends PrivateDirectoryTopologyError {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super(message, options);
+    this.name = "PrivateFileCollisionCleanupError";
+  }
+}
+
 /** A retained bounded-file descriptor no longer matches its pathname witness. */
 export type BoundedFileParentIdentity = Readonly<{
   mode: number;
@@ -790,6 +804,9 @@ function privateFilePublicationCleanupFailure(
       primaryError.operation,
     );
   }
+  if (primaryError instanceof PrivateFileCollisionError) {
+    return new PrivateFileCollisionCleanupError(primaryError.message, { cause: aggregate });
+  }
   if (primaryError instanceof PrivateDirectoryTopologyError) {
     return new PrivateDirectoryTopologyError(primaryError.message, { cause: aggregate });
   }
@@ -1381,8 +1398,6 @@ export function atomicWritePrivateFile(
               );
             }
             primaryError = privateFilePublicationCleanupFailure(primaryError, cleanupError);
-          } else {
-            ownsTempPath = false;
           }
         } else {
           try {
