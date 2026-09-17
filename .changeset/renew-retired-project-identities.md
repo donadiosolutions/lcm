@@ -11,6 +11,9 @@ renewal: worktree reconciliation treats an authenticated successor as the
 target instead of folding it back into the retired hash, and identity evidence
 authenticates a successor id against the retained predecessor fence so a
 renewed project can still recover its sidecar when the map is unavailable.
+Reconciliation authenticates renewed bindings reached through distinct local
+aliases, preserves valid aliases on the successor, and refuses ambiguous or
+foreign canonical bindings before source discovery.
 Preserve bounded per-item identity and outcomes throughout compact progress and
 summaries, keeping invocation-wide failure totals in the live header, the
 failure event, and the final summary instead of repeating them on later

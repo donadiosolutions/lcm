@@ -188,7 +188,9 @@ the renewed successor identity. It refuses an alias that is also the Git anchor
 of a different repository, because reconciling that path could otherwise fold
 the other repository's worktree entries into the renewed project. A path bound
 as an alias by more than one renewed identity is also refused rather than
-choosing a project arbitrarily.
+choosing a project arbitrarily. LCM likewise refuses a successor-shaped map key
+whose entry is bound to a different canonical project, even when the retained
+fence for the entered project is valid.
 
 On first local storage access after upgrade, LCM checks the current checkout's
 verified Git common directory. If older `map.json` entries treated linked

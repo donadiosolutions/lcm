@@ -27,6 +27,7 @@ import { linkProject, type IdentityServiceDependencies } from "../src/identity-s
 import {
   clearProjectMapCache,
   hashProjectPath,
+  normalizeProjectIdentityPath,
   projectMapPath,
   readProjectMapSnapshot,
   renewRetiredProjectIdentity,
@@ -270,6 +271,8 @@ describe("Renewed project successor authentication through a local alias", () =>
     "renewed project identity alias belongs to a different repository; refusing to reconcile";
   const AMBIGUOUS_ALIAS_REFUSAL =
     "project path is an alias of multiple renewed project identities; refusing to reconcile";
+  const MISMATCHED_SUCCESSOR_REFUSAL =
+    "renewed project identity target is bound to a different project; refusing to reconcile";
 
   let home: string;
   let canonical: string;
@@ -524,6 +527,69 @@ describe("Renewed project successor authentication through a local alias", () =>
       [firstSuccessor]: { canonical, aliases: [aliasPath] },
       [secondSuccessor]: { canonical: second, aliases: [aliasPath] },
     });
+  });
+
+  it("refuses a path that is canonical for one renewed identity and an alias of another", () => {
+    const second = join(home, "nongit-project-two");
+    mkPrivateDir(second);
+    const firstRetired = hashProjectPath(canonical);
+    const secondRetired = hashProjectPath(second);
+    const firstSuccessor = retiredProjectIdentitySuccessor(firstRetired, canonical);
+    const secondSuccessor = retiredProjectIdentitySuccessor(secondRetired, second);
+    writePrivateFile(
+      projectMapPath(),
+      `${JSON.stringify({
+        [firstSuccessor]: { canonical, aliases: [] },
+        [secondSuccessor]: { canonical: second, aliases: [canonical] },
+      }, null, 2)}\n`,
+    );
+    writeFence(firstRetired, firstRetired);
+    writeFence(secondRetired, secondRetired);
+    clearProjectMapCache();
+    const mapBefore = readFileSync(projectMapPath(), "utf8");
+
+    expect(() => reconcileWorktrees(canonical)).toThrow(AMBIGUOUS_ALIAS_REFUSAL);
+
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(mapBefore);
+    expect(readProjectMapSnapshot()).toEqual({
+      [firstSuccessor]: { canonical, aliases: [] },
+      [secondSuccessor]: { canonical: second, aliases: [canonical] },
+    });
+  });
+
+  it("refuses a path-derived successor key bound to a different project", () => {
+    git(canonical, "init", "-q");
+    git(canonical, "config", "user.email", "test@example.invalid");
+    git(canonical, "config", "user.name", "LCM Test");
+    writeFileSync(join(canonical, "README.md"), "test\n", { mode: PRIVATE_FILE_MODE });
+    git(canonical, "add", "README.md");
+    git(canonical, "commit", "-qm", "initial");
+    clearGitProjectAnchorCache();
+
+    const enteredCanonical = normalizeProjectIdentityPath(canonical);
+    const foreign = join(home, "foreign-project");
+    mkPrivateDir(foreign);
+    const retiredId = hashProjectPath(enteredCanonical);
+    const successorId = retiredProjectIdentitySuccessor(retiredId, enteredCanonical);
+    writePrivateFile(
+      projectMapPath(),
+      `${JSON.stringify({
+        [successorId]: { canonical: foreign, aliases: [] },
+      }, null, 2)}\n`,
+    );
+    writeFence(retiredId, retiredId);
+    clearProjectMapCache();
+    clearWorktreeReconciliationCache();
+    const mapBefore = readFileSync(projectMapPath(), "utf8");
+
+    expect(() => reconcileWorktrees(canonical)).toThrow(MISMATCHED_SUCCESSOR_REFUSAL);
+
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(mapBefore);
+    expect(readProjectMapSnapshot()).toEqual({
+      [successorId]: { canonical: foreign, aliases: [] },
+    });
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
   });
 
   it("keeps a genuinely renewed project usable through an alias added by lcm project link", async () => {

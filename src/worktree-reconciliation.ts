@@ -2612,23 +2612,29 @@ function authenticatedRenewedTargetHash(
   for (const successor of reached) {
     assertRenewedProjectIdentityFence(successor.retiredId, homeDir);
   }
+  if (reached.length > 1) {
+    throw new Error(
+      "project path is an alias of multiple renewed project identities; refusing to reconcile",
+    );
+  }
   const retiredId = hashProjectPath(canonical);
   const successorId = retiredProjectIdentitySuccessor(retiredId, canonical);
-  if (map[successorId] !== undefined) {
-    // A hand-edited map can key an entry under this successor id while binding
-    // a different path, which the matches above do not reach. This id is
-    // adopted regardless, so authenticate it before returning it.
+  const successorEntry = map[successorId];
+  if (successorEntry !== undefined) {
+    // A successor id proves which canonical path renewal hashed, but a
+    // hand-edited map can bind that key to another project. Never let the key
+    // alone make that foreign entry reconciliation's target.
+    if (resolve(successorEntry.canonical) !== resolve(canonical)) {
+      throw new Error(
+        "renewed project identity target is bound to a different project; refusing to reconcile",
+      );
+    }
     assertRenewedProjectIdentityFence(retiredId, homeDir);
     return successorId;
   }
   // No entry is keyed by this path's own successor, so every remaining match
   // binds this path as one of its aliases.
   if (reached.length === 0) return undefined;
-  if (reached.length > 1) {
-    throw new Error(
-      "project path is an alias of multiple renewed project identities; refusing to reconcile",
-    );
-  }
   if (anchored) {
     throw new Error(
       "renewed project identity alias belongs to a different repository; refusing to reconcile",
