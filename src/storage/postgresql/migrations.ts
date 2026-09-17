@@ -1297,6 +1297,20 @@ export async function runPostgreSqlMigrations(
   if (serverEncoding !== REQUIRED_POSTGRESQL_SERVER_ENCODING) {
     throw new PostgreSqlServerEncodingPreflightError(serverEncoding);
   }
+  await assertRequiredPostgreSqlExtensionsReady(executor, { signal: options.signal });
+  // Content-collation is a managed-table-specific precondition, not a
+  // database-wide environment property like postmaster identity, server
+  // encoding, or extension availability, so it runs after those checks
+  // rather than among them. It also reads pg_attribute/pg_collation,
+  // which is itself catalog inspection, but it must still fail closed
+  // before any DDL runs, so it stays here: after every environment-level
+  // precondition (including required extensions, since pgcrypto backs
+  // the digest() this constraint protects) and before the transaction
+  // that performs real schema inspection and migration DDL. If a
+  // required extension is missing or broken, that failure is reported
+  // first and this check never runs, because there is no point
+  // reporting a column-level collation defect on a database that cannot
+  // run the digest-backed migration at all.
   const contentCollationResult = await executor.query<ContentCollationRow>({
     text: `SELECT
              pg_catalog.concat_ws(
@@ -1334,7 +1348,6 @@ export async function runPostgreSqlMigrations(
       );
     }
   }
-  await assertRequiredPostgreSqlExtensionsReady(executor, { signal: options.signal });
   return executor.transaction(async (transaction) => {
     await transaction.query({
       text: "SET LOCAL search_path = pg_catalog, public",
