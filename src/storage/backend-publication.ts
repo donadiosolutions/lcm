@@ -391,7 +391,7 @@ const activeAppendBarrierTokens = new WeakSet<BackendPublicationLockToken>();
 const activeAppendBarrierContext = new AsyncLocalStorage<Readonly<{
   rootPath: string;
   token: BackendPublicationLockToken;
-}>>();
+}> | null>();
 const appendBarrierTails = new Map<string, Promise<void>>();
 
 export class BackendPublicationAppendBarrierTimeoutError
@@ -401,6 +401,17 @@ export class BackendPublicationAppendBarrierTimeoutError
   constructor(cause: PrivateMutationLockContentionError) {
     super("local hook append barrier remained busy until its admission deadline", { cause });
     this.name = "BackendPublicationAppendBarrierTimeoutError";
+  }
+}
+
+export class BackendPublicationRetainedAppendAdmissionStoppedError extends Error {
+  constructor(
+    readonly reason: "aborted" | "deadline",
+  ) {
+    super(reason === "aborted"
+      ? "retained append admission cancelled"
+      : "retained append admission exceeded its predecessor deadline");
+    this.name = "BackendPublicationRetainedAppendAdmissionStoppedError";
   }
 }
 
@@ -419,13 +430,21 @@ export type BackendPublicationAppendBarrierOptions = Readonly<{
   _appendLockOperations?: PrivateMutationLockOperations;
 }>;
 
+export type BackendPublicationRetainedAppendAdmissionOptions =
+  BackendPublicationAppendBarrierOptions & Readonly<{
+    /** Cancel admission before callback effects begin. */
+    signal?: AbortSignal;
+    /** Retained scan admission makes exactly one external-lock attempt. */
+    externalLockAttempts?: 1;
+  }>;
+
 function appendBarrierTiming(options: BackendPublicationAppendBarrierOptions): Readonly<{
   bounded: boolean;
   contentionWaitMs: number;
   retryDelayMs: number;
   now: () => number;
   wait: (milliseconds: number) => Promise<void>;
-  waitForTail: (tail: Promise<void>, milliseconds: number) => Promise<boolean>;
+  injectedWait: boolean;
 }> {
   const bounded = options.contentionWaitMs !== undefined;
   const contentionWaitMs = options.contentionWaitMs ?? 0;
@@ -439,26 +458,53 @@ function appendBarrierTiming(options: BackendPublicationAppendBarrierOptions): R
   const injectedWait = options._wait;
   const wait = injectedWait
     ?? ((milliseconds: number) => new Promise<void>(resolve => setTimeout(resolve, milliseconds)));
-  const waitForTail = injectedWait === undefined
-    ? (tail: Promise<void>, milliseconds: number): Promise<boolean> => new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(false), milliseconds);
-      void tail.then(() => {
-        clearTimeout(timer);
-        resolve(true);
-      });
-    })
-    : (tail: Promise<void>, milliseconds: number): Promise<boolean> => Promise.race([
-      tail.then(() => true),
-      injectedWait(milliseconds).then(() => false),
-    ]);
   return {
     bounded,
     contentionWaitMs,
     retryDelayMs,
     now: options._now ?? performance.now.bind(performance),
     wait,
-    waitForTail,
+    injectedWait: injectedWait !== undefined,
   };
+}
+
+type AppendBarrierTiming = ReturnType<typeof appendBarrierTiming>;
+
+async function waitForAppendPredecessor(
+  predecessor: Promise<void>,
+  timing: AppendBarrierTiming,
+  deadline: number,
+  signal?: AbortSignal,
+): Promise<"settled" | "aborted" | "deadline"> {
+  if (signal?.aborted) return "aborted";
+  const remaining = deadline - timing.now();
+  if (timing.bounded && remaining <= 0) return "deadline";
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    const candidates: Array<Promise<"settled" | "aborted" | "deadline">> = [
+      predecessor.then(() => "settled" as const),
+    ];
+    if (timing.bounded) {
+      candidates.push(timing.injectedWait
+        ? timing.wait(remaining).then(() => "deadline" as const)
+        : new Promise(resolve => {
+          timer = setTimeout(() => resolve("deadline"), remaining);
+        }));
+    }
+    if (signal !== undefined) {
+      candidates.push(new Promise(resolve => {
+        onAbort = () => resolve("aborted");
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      }));
+    }
+    const winner = await Promise.race(candidates);
+    return signal?.aborted ? "aborted" : winner;
+  } finally {
+    clearTimeout(timer);
+    if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
+  }
 }
 
 function fail(reason: BackendPublicationJournalError["reason"], message: string): never {
@@ -1622,7 +1668,7 @@ function contextualAppendLockToken(
   explicit: BackendPublicationLockToken | undefined,
 ): BackendPublicationLockToken | undefined {
   const inherited = activeAppendBarrierContext.getStore();
-  if (inherited === undefined) return explicit;
+  if (inherited === undefined || inherited === null) return explicit;
   if (
     inherited.rootPath !== rootPath(homeDir)
     || (explicit !== undefined && explicit !== inherited.token)
@@ -1968,6 +2014,82 @@ export function withBackendPublicationAppendBarrier<T>(
   }, { allowUnresolved: true, lockToken: contextualToken });
 }
 
+function assertRetainedAppendAdmissionActive(
+  timing: AppendBarrierTiming,
+  deadline: number,
+  signal?: AbortSignal,
+): void {
+  if (signal?.aborted) {
+    throw new BackendPublicationRetainedAppendAdmissionStoppedError("aborted");
+  }
+  if (timing.bounded && timing.now() >= deadline) {
+    throw new BackendPublicationRetainedAppendAdmissionStoppedError("deadline");
+  }
+}
+
+type AppendAdmissionMode = Readonly<{
+  /** Retained participants grant append authority to the explicit token only. */
+  explicitOnly: boolean;
+  /** Only the append barrier itself writes while publication stays unresolved. */
+  allowUnresolved: boolean;
+}>;
+
+async function runAppendAdmissionAttempt<T>(
+  homeDir: string | undefined,
+  callback: (token: BackendPublicationLockToken) => Promise<T> | T,
+  lockToken: BackendPublicationLockToken | undefined,
+  options: BackendPublicationAppendBarrierOptions,
+  mode: AppendAdmissionMode,
+  assertBeforeEffects?: () => void,
+  markCallerEffectsStarted?: () => void,
+): Promise<T> {
+  assertBeforeEffects?.();
+  const acquire = (): Promise<T> => withBackendPublicationConsumerLockAsync(
+    homeDir,
+    async (token) => {
+      const maintenance = withBackendPublicationDirectoryRead(
+        homeDir,
+        (directoryHandle) => readMaintenanceJournalFromDirectory(homeDir, directoryHandle),
+      );
+      if (maintenance !== null && (
+        maintenance.phase !== "maintenance-held"
+        && maintenance.phase !== "selection-prepared"
+        && maintenance.phase !== "selection-completed"
+        && maintenance.phase !== "maintenance-aborted"
+      )) {
+        return fail("unresolved-publication", "backend maintenance is not ready for local append");
+      }
+      assertBeforeEffects?.();
+      return withPrivateMutationLockAsync(
+        join(rootPath(homeDir), ".local-hook-append.lock"),
+        "local hook append barrier",
+        async () => {
+          activeAppendBarrierTokens.add(token);
+          try {
+            assertBeforeEffects?.();
+            markCallerEffectsStarted?.();
+            const invoke = (): Promise<T> | T => callback(token);
+            return mode.explicitOnly
+              ? await activeAppendBarrierContext.run(null, invoke)
+              : await activeAppendBarrierContext.run(
+                { rootPath: rootPath(homeDir), token },
+                invoke,
+              );
+          } finally {
+            activeAppendBarrierTokens.delete(token);
+          }
+        },
+        options._appendLockObserver,
+        options._appendLockOperations,
+      );
+    },
+    { allowUnresolved: mode.allowUnresolved, lockToken },
+  );
+  return mode.explicitOnly
+    ? activeAppendBarrierContext.run(null, acquire)
+    : acquire();
+}
+
 /** Async local-append barrier with the same exact authority as the sync form. */
 export async function withBackendPublicationAppendBarrierAsync<T>(
   homeDir: string | undefined,
@@ -2003,7 +2125,10 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
         const queued = new PrivateMutationLockContentionError(
           "local append admission is queued in this process",
         );
-        if (remaining <= 0 || !await timing.waitForTail(previous, remaining)) {
+        const predecessor = remaining <= 0
+          ? "deadline"
+          : await waitForAppendPredecessor(previous, timing, deadline);
+        if (predecessor !== "settled") {
           throw new BackendPublicationAppendBarrierTimeoutError(queued);
         }
         if (timing.now() >= deadline) {
@@ -2014,38 +2139,15 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
     while (true) {
       let callerEffectsStarted = false;
       try {
-        return await withBackendPublicationConsumerLockAsync(homeDir, async (token) => {
-          const maintenance = withBackendPublicationDirectoryRead(
-            homeDir,
-            (directoryHandle) => readMaintenanceJournalFromDirectory(homeDir, directoryHandle),
-          );
-          if (maintenance !== null && (
-            maintenance.phase !== "maintenance-held"
-            && maintenance.phase !== "selection-prepared"
-            && maintenance.phase !== "selection-completed"
-            && maintenance.phase !== "maintenance-aborted"
-          )) {
-            return fail("unresolved-publication", "backend maintenance is not ready for local append");
-          }
-          return withPrivateMutationLockAsync(
-            join(rootPath(homeDir), ".local-hook-append.lock"),
-            "local hook append barrier",
-            async () => {
-              activeAppendBarrierTokens.add(token);
-              try {
-                callerEffectsStarted = true;
-                return await activeAppendBarrierContext.run(
-                  { rootPath: key, token },
-                  () => callback(token),
-                );
-              } finally {
-                activeAppendBarrierTokens.delete(token);
-              }
-            },
-            options._appendLockObserver,
-            options._appendLockOperations,
-          );
-        }, { allowUnresolved: true, lockToken: contextualToken });
+        return await runAppendAdmissionAttempt(
+          homeDir,
+          callback,
+          contextualToken,
+          options,
+          { explicitOnly: false, allowUnresolved: true },
+          undefined,
+          () => { callerEffectsStarted = true; },
+        );
       } catch (error) {
         const remaining = deadline - timing.now();
         if (
@@ -2064,6 +2166,78 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
         }
       }
     }
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Retain append-order admission for a non-append mutation participant.
+ * Only the exact token passed by the caller can reuse this authority.
+ */
+export async function withBackendPublicationRetainedAppendAdmissionAsync<T>(
+  homeDir: string | undefined,
+  callback: (token: BackendPublicationLockToken) => Promise<T> | T,
+  lockToken?: BackendPublicationLockToken,
+  options: BackendPublicationRetainedAppendAdmissionOptions = {},
+): Promise<T> {
+  if (
+    options.externalLockAttempts !== undefined
+    && options.externalLockAttempts !== 1
+  ) {
+    throw new Error("retained append admission requires one external lock attempt");
+  }
+  const timing = appendBarrierTiming(options);
+  const deadline = timing.now() + timing.contentionWaitMs;
+  const assertActive = (): void => assertRetainedAppendAdmissionActive(
+    timing,
+    deadline,
+    options.signal,
+  );
+  assertActive();
+  if (lockToken !== undefined) {
+    assertLockToken(lockToken, homeDir);
+    if (activeAppendBarrierTokens.has(lockToken)) {
+      return activeAppendBarrierContext.run(null, async () => {
+        assertActive();
+        return callback(lockToken);
+      });
+    }
+  }
+
+  const key = rootPath(homeDir);
+  const previous = appendBarrierTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve): void => { release = resolve; });
+  const tail = previous.then(() => current);
+  appendBarrierTails.set(key, tail);
+  void tail.then(() => {
+    if (appendBarrierTails.get(key) === tail) appendBarrierTails.delete(key);
+  });
+  try {
+    let previousSettled = false;
+    void previous.then(() => { previousSettled = true; });
+    await Promise.resolve();
+    if (!previousSettled) {
+      const predecessor = await waitForAppendPredecessor(
+        previous,
+        timing,
+        deadline,
+        options.signal,
+      );
+      if (predecessor !== "settled") {
+        throw new BackendPublicationRetainedAppendAdmissionStoppedError(predecessor);
+      }
+    }
+    assertActive();
+    return await runAppendAdmissionAttempt(
+      homeDir,
+      callback,
+      lockToken,
+      options,
+      { explicitOnly: true, allowUnresolved: false },
+      assertActive,
+    );
   } finally {
     release();
   }

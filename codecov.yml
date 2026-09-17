@@ -218,6 +218,8 @@ component_management:
         # #1101 retains numeric skipped-sidecar counts in this owner.
         # #1191 retains publication admission through mutating sidecar reads,
         # close, stop rechecks, eligibility, and orphan pruning in this owner.
+        # #1307 makes that mutating scan enter local append order before
+        # consumer admission, keeping the ordering fix in this owner.
         # #992 keeps pre-initialization SQLite leaf admission and final
         # opened-identity fencing local-persistence-owned.
         # #1020 keeps UTC message timestamp mapping in conversation-store-owned
@@ -256,6 +258,8 @@ component_management:
         # #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
         # #906 keeps bounded publication-convergence probe expiry and error
         # selection in this storage-abstractions owner.
+        # #1307 adds explicit-only retained append admission for non-append
+        # mutation participants in this same storage-abstractions owner.
         - "^src/storage/backend\\.ts$"
         - "^src/storage/backend-publication\\.ts$"
         # #910 keeps shared publication retry deadlines monotonic in this owner.

@@ -318,6 +318,22 @@ preserves the sidecar and reports it as skipped or failed. A caller that already
 owns publication admission can pass its live token through these diagnostic
 reads and cleanup without contending with itself.
 
+That orphan cleanup also enters the local append order before it takes
+publication admission. If another local append has already started, the sweep
+waits for it to finish and then scans, so a queued append completes and its
+events stay durable instead of timing out behind the sweep. The sweep holds one
+retained admission from the diagnostic snapshot through the real close, the
+final eligibility check, and deletion. That admission grants no implicit append
+authority: an append started underneath the scan, such as one triggered during
+close, still queues normally and cannot write between the snapshot and the
+prune decision. Cancellation and the scan deadline are both honored before the
+scan opens anything, in which case the sidecar is reported as skipped and is
+never opened, closed, or pruned. Contention with an unrelated publication
+remains a per-sidecar error, and the sweep continues with the next sidecar.
+A sweep that owns no caller admission still refuses to run while a backend
+migration holds publication, so maintenance keeps its existing protection and
+no sidecar is deleted underneath it.
+
 - **Promoted store**: Events promoted via `deduplicateAndInsert()` into the main LCM database
   - Tagged with `source:passive-capture` and `hook:<PostToolUse|UserPromptSubmit>`
   - Searchable via `lcm search` and `lcm grep`

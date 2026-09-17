@@ -10,8 +10,10 @@ import { EventsDb } from "../../src/hooks/events-db.js";
 import { SQLiteLocalHookOutboxFactory, type LocalHookOutboxRepository } from "../../src/storage/local-hook-outbox.js";
 import {
   BackendPublicationAppendBarrierTimeoutError,
+  BackendPublicationCoordinator,
   withBackendPublicationAppendBarrierAsync,
   withBackendPublicationConsumerLockAsync,
+  type BackendPublicationDriver,
 } from "../../src/storage/backend-publication.js";
 import { isLcmConnectionOpen } from "../../src/db/connection.js";
 
@@ -416,6 +418,144 @@ describe("configured-home sidecar observation", () => {
     expect(existsSync(path)).toBe(true);
   });
 
+  it("queues a mutating scan behind an already-started append", async () => {
+    const order: string[] = [];
+    let now = 0;
+    const realOpen = SQLiteLocalHookOutboxFactory.prototype.open;
+    vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open")
+      .mockImplementationOnce(async function (sidecarPath, options, token) {
+        order.push("scan-open");
+        return realOpen.call(this, sidecarPath, options, token);
+      });
+
+    const append = withBackendPublicationAppendBarrierAsync(homeDir, () => {
+      order.push("append-enter");
+      const writer = new EventsDb(path);
+      try {
+        writer.insertEvent(
+          "queued-session",
+          { type: "decision", category: "decision", data: "queued", priority: 1 },
+          "PostToolUse",
+        );
+      } finally {
+        writer.close();
+      }
+      order.push("append-close");
+    }, undefined, {
+      contentionWaitMs: 10,
+      retryDelayMs: 10,
+      _now: () => now,
+      _wait: async milliseconds => {
+        order.push("append-wait");
+        now += milliseconds;
+      },
+    });
+    const scan = collectEventSidecars({ homeDir, timeoutMs: 1_000 });
+
+    const [appendResult, scanResult] = await Promise.allSettled([append, scan]);
+
+    expect(order).toEqual(["append-enter", "append-close", "scan-open"]);
+    expect(appendResult).toEqual({ status: "fulfilled", value: undefined });
+    expect(scanResult.status).toBe("fulfilled");
+    if (scanResult.status !== "fulfilled") throw scanResult.reason;
+    expect(scanResult.value).toMatchObject([{
+      path,
+      captured: 1,
+      unprocessed: 1,
+      deliveryPending: 1,
+    }]);
+    expect(scanResult.value[0]?.pruned).toBeUndefined();
+    expect(existsSync(path)).toBe(true);
+    const reader = new EventsDb(path);
+    try {
+      expect(reader.getHealthStats()).toMatchObject({
+        totalEvents: 1,
+        unprocessed: 1,
+        deliveryPending: 1,
+      });
+    } finally {
+      reader.close();
+    }
+  });
+
+  it("skips a queued mutating scan when its admission deadline expires", async () => {
+    vi.useFakeTimers();
+    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open");
+    let releaseAppend!: () => void;
+    const appendBlocked = new Promise<void>(resolve => { releaseAppend = resolve; });
+    const append = withBackendPublicationAppendBarrierAsync(homeDir, async () => {
+      await appendBlocked;
+      const writer = new EventsDb(path);
+      try {
+        writer.insertEvent(
+          "deadline-session",
+          { type: "decision", category: "decision", data: "deadline", priority: 1 },
+          "PostToolUse",
+        );
+      } finally {
+        writer.close();
+      }
+    });
+    const scanPromise = collectEventSidecars({ homeDir, timeoutMs: 25 });
+    await vi.advanceTimersByTimeAsync(25);
+    const result = await scanPromise;
+
+    expect(result).toHaveLength(1);
+    expect(result[0]?.scanSkipped).toContain("timeout");
+    expect(result[0]?.pruned).toBeUndefined();
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(existsSync(path)).toBe(true);
+
+    releaseAppend();
+    await expect(append).resolves.toBeUndefined();
+    const reader = new EventsDb(path);
+    try {
+      expect(reader.getHealthStats()).toMatchObject({ totalEvents: 1, unprocessed: 1 });
+    } finally {
+      reader.close();
+    }
+  });
+
+  it("skips a queued mutating scan cancelled before it opens anything", async () => {
+    const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open");
+    const controller = new AbortController();
+    let releaseAppend!: () => void;
+    const appendBlocked = new Promise<void>(resolve => { releaseAppend = resolve; });
+    const append = withBackendPublicationAppendBarrierAsync(homeDir, async () => {
+      await appendBlocked;
+      const writer = new EventsDb(path);
+      try {
+        writer.insertEvent(
+          "cancelled-session",
+          { type: "decision", category: "decision", data: "cancelled", priority: 1 },
+          "PostToolUse",
+        );
+      } finally {
+        writer.close();
+      }
+    });
+    const scanPromise = collectEventSidecars({ homeDir, signal: controller.signal });
+    for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+    await new Promise<void>(resolve => { setTimeout(resolve, 5); });
+    controller.abort();
+    const result = await scanPromise;
+
+    expect(result).toHaveLength(1);
+    expect(result[0]?.scanSkipped).toContain("cancelled");
+    expect(result[0]?.pruned).toBeUndefined();
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(existsSync(path)).toBe(true);
+
+    releaseAppend();
+    await expect(append).resolves.toBeUndefined();
+    const reader = new EventsDb(path);
+    try {
+      expect(reader.getHealthStats()).toMatchObject({ totalEvents: 1, unprocessed: 1 });
+    } finally {
+      reader.close();
+    }
+  });
+
   it("keeps caller admission live through close and stale-orphan pruning", async () => {
     const [summary] = await withBackendPublicationConsumerLockAsync(homeDir, token =>
       collectEventSidecars({ homeDir, publicationLockToken: token }));
@@ -447,6 +587,39 @@ describe("configured-home sidecar observation", () => {
       summary.scanError?.includes("backend publication mutation is already in progress")
       && summary.pruned === undefined)).toBe(true);
     expect([path, second, third].every(sidecar => existsSync(sidecar))).toBe(true);
+  });
+
+  it("refuses to prune a sidecar while maintenance holds publication", async () => {
+    const forbidden = async (): Promise<never> => {
+      throw new Error("publication driver must not run");
+    };
+    const driver: BackendPublicationDriver = {
+      observeLocalState: forbidden,
+      publishProjectMap: forbidden,
+      publishConfig: forbidden,
+      restoreConfig: forbidden,
+      restoreProjectMap: forbidden,
+    };
+    await new BackendPublicationCoordinator({ homeDir, driver }).enterMaintenance({
+      publicationId: "sidecar-maintenance-publication",
+      generationId: "sidecar-maintenance-generation",
+      sourceSelectionSha256: "a".repeat(64),
+      queueEvidenceSha256: "b".repeat(64),
+      roster: [{
+        machineId: "0195d250-0000-7000-8000-000000000091",
+        queueCutoff: null,
+        evidenceSha256: "a".repeat(64),
+      }],
+    });
+
+    const [summary] = await collectEventSidecars({ homeDir, timeoutMs: 2_000 });
+
+    expect(summary).toMatchObject({
+      path,
+      scanError: "backend publication is held for migration maintenance",
+    });
+    expect(summary?.pruned).toBeUndefined();
+    expect(existsSync(path)).toBe(true);
   });
 
   it("refuses an append between the health snapshot and stale-orphan deletion", async () => {

@@ -16,7 +16,8 @@ import {
 } from "../security-files.js";
 import { SQLiteLocalHookOutboxFactory, type LocalHookOutboxHealth, type LocalHookErrorRecord } from "../storage/local-hook-outbox.js";
 import {
-  withBackendPublicationConsumerLockAsync,
+  BackendPublicationRetainedAppendAdmissionStoppedError,
+  withBackendPublicationRetainedAppendAdmissionAsync,
   type BackendPublicationLockToken,
 } from "../storage/backend-publication.js";
 import { isWorktreeReconciliationFence } from "../worktree-reconciliation-fence.js";
@@ -538,9 +539,8 @@ async function scanEventSidecars(options: EventSidecarScanOptions): Promise<Even
                 beforeCloseError = error;
               }
               try {
-                // Factory close is already bounded by the local append
-                // barrier. It must settle while publication admission is
-                // retained, even after the scan deadline or signal fires.
+                // Real close must settle while retained append admission is
+                // held, even after the scan deadline or signal fires.
                 await outboxFactory.close(publicationLockToken);
               } catch (error) {
                 closeFailed = true;
@@ -572,11 +572,27 @@ async function scanEventSidecars(options: EventSidecarScanOptions): Promise<Even
         };
 
         if (pruneOrphans) {
-          await withBackendPublicationConsumerLockAsync(
-            options.homeDir,
-            scanSidecar,
-            { lockToken: options.publicationLockToken },
-          );
+          try {
+            await withBackendPublicationRetainedAppendAdmissionAsync(
+              options.homeDir,
+              scanSidecar,
+              options.publicationLockToken,
+              {
+                contentionWaitMs: Math.max(0, deadline - Date.now()),
+                signal: options.signal,
+                externalLockAttempts: 1,
+              },
+            );
+          } catch (error) {
+            if (error instanceof BackendPublicationRetainedAppendAdmissionStoppedError) {
+              throw new EventSidecarScanStoppedError(
+                error.reason === "aborted"
+                  ? "sidecar scan cancelled"
+                  : "sidecar scan skipped after timeout",
+              );
+            }
+            throw error;
+          }
         } else {
           await scanSidecar();
         }
