@@ -535,7 +535,18 @@ describe("PostgreSQL 18 portable knowledge v1", { timeout: 120_000 }, () => {
         const digestSet = new Set(rows[0].metadata[DIGEST_KEY] as string[]);
         const newDigest = computeEntryDigest(source, 0);
         expect([...digestSet].sort()).toEqual(["c".repeat(64), newDigest].sort());
-      } finally { getAllSpy.mockRestore(); }
+      } finally {
+        // Release the barrier on every path, including a failed wait or a
+        // failed concurrent write, so the import's paused transaction and
+        // connection never survive until the suite timeout. Resolving an
+        // already-resolved promise is a no-op, so this is safe to call again
+        // after the success path already released it above. Await the
+        // import to full settlement before the fixture tears down so no
+        // in-flight query overlaps that teardown.
+        release!();
+        await importPromise.catch(() => undefined);
+        getAllSpy.mockRestore();
+      }
     });
   });
 
@@ -597,7 +608,18 @@ describe("PostgreSQL 18 portable knowledge v1", { timeout: 120_000 }, () => {
         const digestSet = new Set(canonical.metadata[DIGEST_KEY] as string[]);
         const newDigest = computeEntryDigest(source, 0);
         expect([...digestSet].sort()).toEqual(["d".repeat(64), newDigest].sort());
-      } finally { getAllSpy.mockRestore(); }
+      } finally {
+        // Release the barrier on every path, including a failed wait or a
+        // failed concurrent write, so the import's paused transaction and
+        // connection never survive until the suite timeout. Resolving an
+        // already-resolved promise is a no-op, so this is safe to call again
+        // after the success path already released it above. Await the
+        // import to full settlement before the fixture tears down so no
+        // in-flight query overlaps that teardown.
+        release!();
+        await importPromise.catch(() => undefined);
+        getAllSpy.mockRestore();
+      }
     });
   });
 });

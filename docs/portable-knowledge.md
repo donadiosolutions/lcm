@@ -94,12 +94,21 @@ deduplication. Duplicate collapse retains retry identities and existing metadata
 canonical metadata values win conflicting keys.
 
 If another import or promotion commits a matching memory for the same project
-while an import is running, the import merges into that memory's current
-stored metadata instead of replacing it, so its notes and retry identities
-survive. Both memories' retry identities are then recognized by later
-replays. An entry that another import already committed just before this run
-observed it may still be reported as imported by this run; that produces one
-memory, not two, and no data is lost.
+while an import is running, and this import's own deduplication has already
+matched that same memory, the import merges into its current stored metadata
+instead of replacing it, so the other writer's notes and retry identities
+survive rather than being overwritten. Both memories' retry identities are
+then recognized by later replays. An entry another import already committed
+just before this run observed it may still be reported as imported by this
+run; that costs no metadata and no retry identity.
+
+This protects a memory once two imports have matched it as the same memory.
+It does not stop two imports that each find no existing match for the same
+new content from both inserting it: nothing currently serializes that
+decision against a concurrent insert, so two imports of matching new content
+run at the same time can still create two separate active memories with
+identical content. A later replay of either source document recognizes its
+own retry identity and is skipped, but the two memories are not merged.
 
 Successful commands exit zero. Operational failures, including failed projects
 in `export --all`, exit one. JSON output contains the requested payload; progress
