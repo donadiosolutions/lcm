@@ -2577,11 +2577,11 @@ function assertRenewedProjectIdentityFence(retiredId: string, homeDir?: string):
  * from one choke point instead of from each caller.
  *
  * The successor id is derived from the retired id and this exact canonical
- * path, so a map entry under that id is already the binding for this project
- * and needs no further path comparison. Looking the id up directly also keeps
- * the multi-owner refusal of `resolveExistingProjectIdentity` out of
- * reconciliation, whose whole purpose is to fold several entries of one
- * repository together.
+ * path, but a hand-edited map can bind that key to another project. Validate
+ * the entry's canonical path before selecting it as the target. Looking the id
+ * up directly still keeps the multi-owner refusal of
+ * `resolveExistingProjectIdentity` out of reconciliation, whose whole purpose
+ * is to fold several entries of one repository together.
  *
  * That derivation alone is not the whole authentication, because a renewed
  * entry may also carry local aliases: `linkLocalAlias` adds one on the SQLite

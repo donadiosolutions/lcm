@@ -145,6 +145,13 @@ event sidecar must all be unoccupied. LCM revalidates those facts immediately
 before atomically rekeying and reading back `map.json`; it never moves or
 deletes the fence and never moves a database.
 
+Once the atomic rekey exposes the successor, that binding remains
+authoritative even if a later evidence check or publication readback reports
+an error. Prompt hooks read the map without taking the publication lock and
+may create successor storage as soon as the new binding is visible; restoring
+the retired map after that point would strand the project behind the occupied
+successor. Inspect the reported error and retry the renewal idempotently.
+
 The command is safe to retry. If the same authenticated predecessor fence and
 successor binding are already present, it reports an idempotent no-op. After a
 successful or already-completed renewal, retry the original hook or compact

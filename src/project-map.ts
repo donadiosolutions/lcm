@@ -859,11 +859,13 @@ export function renewRetiredProjectIdentity(
         // the map, because the post-replacement topology check and the
         // writer's cache refresh both run afterwards. The rollback snapshot
         // is therefore reachable before the write starts instead of only
-        // after it returns, and the writer's own reported outcome decides
-        // whether a restore is owed: the publication callback proves the
-        // rename landed, and a publication topology failure either published
-        // or cannot prove that it did not. Every earlier refusal leaves the
-        // retired map already in place and must not be rewritten.
+        // after it returns. A publication topology failure before the
+        // callback either published or cannot prove that it did not, so that
+        // uncertain outcome is restored. Once the callback exposes `newId`,
+        // hooks may materialize successor state without this lock and the
+        // publication must remain authoritative through every later failure.
+        // Every earlier refusal leaves the retired map already in place and
+        // must not be rewritten.
         let published = false;
         try {
           writeProjectMap(renewed, undefined, {
@@ -906,7 +908,7 @@ export function renewRetiredProjectIdentity(
             throw new Error("retired project identity renewal readback failed");
           }
         } catch (error) {
-          if (!published && !(error instanceof PrivateFilePublicationTopologyError)) {
+          if (published || !(error instanceof PrivateFilePublicationTopologyError)) {
             throw error;
           }
           try {
