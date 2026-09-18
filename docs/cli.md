@@ -535,7 +535,14 @@ does not renew, remove a fence, create storage, or otherwise mutate identity.
 Compact progress and final results preserve a sanitized, width-bounded project,
 session ID, and conversation ID. When exactly one native transcript matches the
 session, its source locator is included; ambiguous or unavailable provenance is
-omitted. Native TTY, verbose TTY, non-TTY, and captured ANSI output use the same
+omitted. Discovery resolves these locators for the whole project in bounded
+batches rather than one query per conversation, so a large project does not pay
+a per-conversation lookup. Provenance failures are isolated to the session that
+caused them: if one session's transcript metadata cannot be read, every other
+session in the same run still shows its own source locator, and only the
+unreadable session has its locator omitted. A corrupted locator that is not
+text is omitted the same way. Compaction itself never fails because provenance
+could not be read. Native TTY, verbose TTY, non-TTY, and captured ANSI output use the same
 identity formatter. Each append-only terminal line describes only that item's
 `done`, `unchanged`, `skipped`, `failed`, or `dry-run` outcome. Invocation-wide
 failures are labeled separately as `failure total`, and every mode prints a
