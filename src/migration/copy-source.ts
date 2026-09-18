@@ -20,8 +20,11 @@ export interface MigrationCopySourceInput {
 function refuse(): never { throw new Error("migration copy source authority does not match"); }
 /** Captures are authenticated by #622; only its validated role paths are opened. */
 export async function openMigrationCopySource(input: MigrationCopySourceInput) {
-    if (Reflect.ownKeys(input).some(key => typeof key !== 'string' || !['generationId', 'homeDir', 'expectedIdentity', 'scratchParent', 'signal'].includes(key)))
-        refuse();
+    const allowedKeys = ['generationId', 'homeDir', 'expectedIdentity', 'scratchParent', 'signal'];
+    const hasUnexpectedKey = Reflect.ownKeys(input).some(
+        key => typeof key !== 'string' || !allowedKeys.includes(key),
+    );
+    if (hasUnexpectedKey) refuse();
     const snapshot = await inspectAuthenticatedSqliteMigrationSnapshot(input.generationId, input.homeDir);
     const artifact = snapshot.artifact;
     const authority = artifact.authority;

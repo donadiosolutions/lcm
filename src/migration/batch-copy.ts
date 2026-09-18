@@ -21,20 +21,38 @@ export interface SqliteMigrationCopyInput extends MigrationCopyLimitsInput {
     readonly ownerProcessId: string;
     readonly signal?: AbortSignal;
 }
-export type MigrationCopyBoundary = 'before-source' | 'after-source' | 'before-begin' | 'after-begin' | 'before-batch' | 'after-batch-readback' | 'before-checkpoint' | 'after-checkpoint' | 'before-completion' | 'after-completion-readback';
+export type MigrationCopyBoundary =
+    | 'before-source'
+    | 'after-source'
+    | 'before-begin'
+    | 'after-begin'
+    | 'before-batch'
+    | 'after-batch-readback'
+    | 'before-checkpoint'
+    | 'after-checkpoint'
+    | 'before-completion'
+    | 'after-completion-readback';
 export interface MigrationCopyTestingDependencies {
     readonly observe?: (boundary: MigrationCopyBoundary) => Promise<void>;
 }
 export class MigrationCopyError extends Error {
-    constructor() { super('Migration copy could not prove the requested generation; retained evidence is required to resume.'); this.name = 'MigrationCopyError'; }
+    constructor() {
+        super('Migration copy could not prove the requested generation; retained evidence is required to resume.');
+        this.name = 'MigrationCopyError';
+    }
 }
 function refuse(): never { throw new MigrationCopyError(); }
 function snapshotInput(input: SqliteMigrationCopyInput): SqliteMigrationCopyInput {
-    if (Reflect.ownKeys(input).some(key => typeof key !== 'string' || !['generationId', 'homeDir', 'settings', 'expectedOwner', 'expectedIdentity', 'ownerProcessId', 'maxRecords', 'maxBytes', 'leaseTtlMs', 'maximumTransactionAttempts', 'signal', 'destinationCapturedAt'].includes(key)))
-        refuse();
+    const allowedKeys = [
+        'generationId', 'homeDir', 'settings', 'expectedOwner', 'expectedIdentity', 'ownerProcessId',
+        'maxRecords', 'maxBytes', 'leaseTtlMs', 'maximumTransactionAttempts', 'signal', 'destinationCapturedAt',
+    ];
+    const hasUnexpectedKey = Reflect.ownKeys(input).some(key => typeof key !== 'string' || !allowedKeys.includes(key));
+    if (hasUnexpectedKey) refuse();
     migrationCopyLimits(input);
-    if (typeof input.ownerProcessId !== 'string' || !input.ownerProcessId.trim() || typeof input.homeDir !== 'string' || !input.homeDir)
-        refuse();
+    const hasValidOwnerAndHome = typeof input.ownerProcessId === 'string' && input.ownerProcessId.trim()
+        && typeof input.homeDir === 'string' && input.homeDir;
+    if (!hasValidOwnerAndHome) refuse();
     return { ...input, settings: { ...input.settings }, expectedIdentity: { ...input.expectedIdentity } };
 }
 function underSource<T>(source: MigrationCopySource, operation: (reauthenticate: () => Promise<void>) => Promise<T>): Promise<T> {
@@ -60,7 +78,13 @@ export async function inspectSqliteMigrationCopy(input: SqliteMigrationCopyInput
     try {
         if (new Date(input.destinationCapturedAt).toISOString() !== input.destinationCapturedAt)
             refuse();
-        source = await openMigrationCopySource({ generationId: saved.generationId, homeDir: saved.homeDir, expectedIdentity: saved.expectedIdentity, signal: saved.signal, scratchParent: scratch });
+        source = await openMigrationCopySource({
+            generationId: saved.generationId,
+            homeDir: saved.homeDir,
+            expectedIdentity: saved.expectedIdentity,
+            signal: saved.signal,
+            scratchParent: scratch,
+        });
         const probe = await probePostgreSqlPortableDestination(saved);
         const bound = bindMigrationCopySource(source, { ...saved, destinationCapturedAt: input.destinationCapturedAt, targetProbe: probe });
         if (!probe.existingRun && !probe.nonIdentityDomainsEmpty)
@@ -105,14 +129,29 @@ export async function runSqliteMigrationCopy(rawInput: SqliteMigrationCopyInput,
         refuse(); };
     try {
         await observe('before-source');
-        source = await openMigrationCopySource({ generationId: input.generationId, homeDir: input.homeDir, expectedIdentity: input.expectedIdentity, signal: input.signal, scratchParent: scratch });
+        source = await openMigrationCopySource({
+            generationId: input.generationId,
+            homeDir: input.homeDir,
+            expectedIdentity: input.expectedIdentity,
+            signal: input.signal,
+            scratchParent: scratch,
+        });
         await observe('after-source');
         const probe = await probePostgreSqlPortableDestination(input);
-        const bound = bindMigrationCopySource(source, { ...input, destinationCapturedAt: current.destination.capturedAt, targetProbe: probe });
-        if (canonicalJson(current.source) !== canonicalJson(source.sourceWitness) || canonicalJson(current.destination) !== canonicalJson(bound.destinationWitness))
+        const bound = bindMigrationCopySource(source, {
+            ...input,
+            destinationCapturedAt: current.destination.capturedAt,
+            targetProbe: probe,
+        });
+        const sourceWitnessMatches = canonicalJson(current.source) === canonicalJson(source.sourceWitness);
+        const destinationWitnessMatches = canonicalJson(current.destination) === canonicalJson(bound.destinationWitness);
+        if (!sourceWitnessMatches || !destinationWitnessMatches)
             refuse();
         if (probe.existingRun) {
-            if (probe.existingRun.runId !== bound.runId || probe.existingRun.targetGenerationId !== bound.targetGenerationId || probe.existingRun.manifestSha256 !== source.stream.describe().manifestSha256)
+            const sameRun = probe.existingRun.runId === bound.runId
+                && probe.existingRun.targetGenerationId === bound.targetGenerationId
+                && probe.existingRun.manifestSha256 === source.stream.describe().manifestSha256;
+            if (!sameRun)
                 refuse();
         }
         else if (!probe.nonIdentityDomainsEmpty || current.phase !== 'dry-run-verified')
@@ -210,12 +249,23 @@ export async function runSqliteMigrationCopy(rawInput: SqliteMigrationCopyInput,
             await publish(completeMigrationEffect(current, { effectId, completedAt: new Date().toISOString() }));
         }
         await source.reauthenticate();
-        return { phase: 'copied' as const, generationId: input.generationId, targetGenerationId: bound.targetGenerationId, runId: bound.runId, bindingSha256: bound.bindingSha256,
-            artifactSha256: source.snapshot.artifact.artifactSha256, sourceByteWitnessSha256: source.snapshot.artifact.sourceByteWitnessSha256,
-            manifestSha256: manifest.manifestSha256, journalSha256: current.checksumSha256, snapshotSha256: source.snapshot.checksumSha256,
-            receiptSetSha256: source.snapshot.receiptReference.receiptSetSha256, queueSetSha256: source.snapshot.receiptReference.queueSetSha256,
-            maintenanceChecksumSha256: source.snapshot.artifact.maintenanceChecksumSha256, checkpoints: current.checkpoints,
-            commitRootSha256: canonicalSha256(current.checkpoints.map(checkpoint => checkpoint.destinationCommitSha256)) };
+        return {
+            phase: 'copied' as const,
+            generationId: input.generationId,
+            targetGenerationId: bound.targetGenerationId,
+            runId: bound.runId,
+            bindingSha256: bound.bindingSha256,
+            artifactSha256: source.snapshot.artifact.artifactSha256,
+            sourceByteWitnessSha256: source.snapshot.artifact.sourceByteWitnessSha256,
+            manifestSha256: manifest.manifestSha256,
+            journalSha256: current.checksumSha256,
+            snapshotSha256: source.snapshot.checksumSha256,
+            receiptSetSha256: source.snapshot.receiptReference.receiptSetSha256,
+            queueSetSha256: source.snapshot.receiptReference.queueSetSha256,
+            maintenanceChecksumSha256: source.snapshot.artifact.maintenanceChecksumSha256,
+            checkpoints: current.checkpoints,
+            commitRootSha256: canonicalSha256(current.checkpoints.map(checkpoint => checkpoint.destinationCommitSha256)),
+        };
     }
     catch (error) {
         primary = error;
