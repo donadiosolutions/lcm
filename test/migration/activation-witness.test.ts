@@ -6,6 +6,9 @@ import {
   createMigrationActivationAttempt,
   createMigrationActivationEpoch,
   createMigrationActivationWitness,
+  createMigrationIntraActivationWatermark,
+  createMigrationOpaqueEvidence,
+  createMigrationQuiescenceFence,
   deriveMigrationActivationAttemptId,
   deriveMigrationActivationEpochId,
   migrationActivationCensusMatchVerdict,
@@ -19,6 +22,7 @@ import {
   parseMigrationCensusVector,
   parseMigrationDestinationIdentity,
   parseMigrationIntraActivationWatermark,
+  parseMigrationOpaqueEvidence,
   parseMigrationQuiescenceFence,
   parseMigrationSchemaWitness,
   parseMigrationSelectionAuthority,
@@ -27,6 +31,7 @@ import {
   type MigrationCanonicalDelta,
   type MigrationCensusVector,
   type MigrationDestinationIdentity,
+  type MigrationOpaqueEvidence,
   type MigrationQuiescenceFence,
   type MigrationSchemaWitness,
   type MigrationSelectionAuthority,
@@ -105,13 +110,8 @@ function schemaWitness(overrides: Partial<MigrationSchemaWitness> = {}): Migrati
   });
 }
 
-function quiescenceFence(overrides: Partial<MigrationQuiescenceFence> = {}): MigrationQuiescenceFence {
-  return parseMigrationQuiescenceFence({
-    version: 1,
-    fenceId: "fence-1",
-    replayEvidenceSha256: HASH_A,
-    ...overrides,
-  });
+function quiescenceFence(payload: unknown = { fenceId: "fence-1" }, kind = "test-fence"): MigrationQuiescenceFence {
+  return createMigrationQuiescenceFence({ kind, payload });
 }
 
 function epoch(seed = 0, generationId = "generation-1"): MigrationActivationEpoch {
@@ -133,7 +133,7 @@ function attempt(input: {
   readonly epochId: string;
   readonly deltaSeed?: number;
   readonly censusSeed?: number;
-  readonly fenceId?: string;
+  readonly fencePayload?: unknown;
 }): MigrationActivationAttempt {
   return createMigrationActivationAttempt({
     epochId: input.epochId,
@@ -141,7 +141,7 @@ function attempt(input: {
     canonicalDeltaBaseline: canonicalDelta(input.deltaSeed ?? 0),
     activationRecomputedCensus: censusVector(input.censusSeed ?? 0),
     intraActivationWatermark: null,
-    quiescenceFence: quiescenceFence({ fenceId: input.fenceId ?? "fence-1" }),
+    quiescenceFence: quiescenceFence(input.fencePayload ?? { fenceId: "fence-1" }),
   });
 }
 
@@ -250,6 +250,16 @@ describe("MigrationCanonicalDelta", () => {
     }));
     expectWitnessError(() => parseMigrationCanonicalDelta({ version: 1, domains: raw }), "invalid-input");
   });
+  it("rejects a pseudo-domain outside the frozen 22-entry portable domain order", () => {
+    // Guards the invariant that the census/delta equality class can never
+    // vary by a reconciliation-report classification choice (e.g. the
+    // "schema"/"ledger"/"public-listing"/"public-search" pseudo-domains
+    // verification-report.ts adds for cross-cutting mismatch classes).
+    const raw = domainVector((domain, index) => ({
+      domain: index === 0 ? "schema" : domain, recordCount: index, terminalIdentitySha256: HASH_A,
+    }));
+    expectWitnessError(() => parseMigrationCanonicalDelta({ version: 1, domains: raw }), "invalid-input");
+  });
 });
 
 describe("MigrationCensusVector", () => {
@@ -272,6 +282,12 @@ describe("MigrationCensusVector", () => {
   it("rejects an entry with an invalid prefixSha256", () => {
     const raw = domainVector((domain, index) => ({
       domain, recordCount: index, prefixSha256: index === 0 ? "nope" : HASH_A,
+    }));
+    expectWitnessError(() => parseMigrationCensusVector({ version: 1, domains: raw, contentSha256: HASH_A }), "invalid-input");
+  });
+  it("rejects a pseudo-domain outside the frozen 22-entry portable domain order", () => {
+    const raw = domainVector((domain, index) => ({
+      domain: index === 0 ? "ledger" : domain, recordCount: index, prefixSha256: HASH_A,
     }));
     expectWitnessError(() => parseMigrationCensusVector({ version: 1, domains: raw, contentSha256: HASH_A }), "invalid-input");
   });
@@ -298,37 +314,58 @@ describe("MigrationSchemaWitness", () => {
   });
 });
 
+describe("MigrationOpaqueEvidence", () => {
+  it("round-trips a valid envelope and hides its payload from this schema's own validation", () => {
+    const evidence = createMigrationOpaqueEvidence({ kind: "test-fence", payload: { anything: [1, 2, "three"], nested: { ok: true } } });
+    expect(parseMigrationOpaqueEvidence(evidence)).toEqual(evidence);
+  });
+  it("rejects an invalid shape", () => {
+    expectWitnessError(() => parseMigrationOpaqueEvidence({}), "malformed-record");
+  });
+  it("rejects an invalid kind", () => {
+    expectWitnessError(() => createMigrationOpaqueEvidence({ kind: "", payload: null }), "invalid-input");
+    expectWitnessError(() => parseMigrationOpaqueEvidence({ version: 1, kind: "", payload: null, evidenceSha256: HASH_A }), "invalid-input");
+  });
+  it("rejects a payload that is not canonical JSON", () => {
+    expectWitnessError(() => createMigrationOpaqueEvidence({ kind: "test-fence", payload: Number.NaN }), "invalid-input");
+    expectWitnessError(
+      () => parseMigrationOpaqueEvidence({ version: 1, kind: "test-fence", payload: undefined, evidenceSha256: HASH_A }),
+      "invalid-input",
+    );
+  });
+  it("rejects an invalid evidenceSha256 format on parse", () => {
+    expectWitnessError(
+      () => parseMigrationOpaqueEvidence({ version: 1, kind: "test-fence", payload: null, evidenceSha256: "nope" }),
+      "invalid-input",
+    );
+  });
+  it("rejects an evidenceSha256 that does not match its content", () => {
+    const evidence = createMigrationOpaqueEvidence({ kind: "test-fence", payload: { a: 1 } });
+    expectWitnessError(
+      () => parseMigrationOpaqueEvidence({ ...evidence, evidenceSha256: HASH_A }),
+      "unexpected-state",
+    );
+  });
+  it("changes identity when only the payload changes, with kind and everything else held equal", () => {
+    const a = createMigrationOpaqueEvidence({ kind: "test-fence", payload: { value: 1 } });
+    const b = createMigrationOpaqueEvidence({ kind: "test-fence", payload: { value: 2 } });
+    expect(a.evidenceSha256).not.toBe(b.evidenceSha256);
+  });
+});
+
 describe("MigrationQuiescenceFence and MigrationIntraActivationWatermark", () => {
   it("round-trips a valid quiescence fence", () => {
-    expect(quiescenceFence().fenceId).toBe("fence-1");
+    expect(quiescenceFence().kind).toBe("test-fence");
   });
   it("rejects an invalid quiescence fence shape", () => {
     expectWitnessError(() => parseMigrationQuiescenceFence({}), "malformed-record");
   });
-  it("rejects an invalid quiescence fence id", () => {
-    expectWitnessError(() => quiescenceFence({ fenceId: "" }), "invalid-input");
-  });
-  it("rejects an invalid quiescence fence evidence digest", () => {
-    expectWitnessError(() => quiescenceFence({ replayEvidenceSha256: "nope" }), "invalid-input");
-  });
   it("round-trips a valid intra-activation watermark", () => {
-    const watermark = parseMigrationIntraActivationWatermark({ version: 1, scopeId: "scope-1", observedSha256: HASH_A });
-    expect(watermark.scopeId).toBe("scope-1");
+    const watermark = createMigrationIntraActivationWatermark({ kind: "test-watermark", payload: { scopeId: "scope-1" } });
+    expect(parseMigrationIntraActivationWatermark(watermark)).toEqual(watermark);
   });
   it("rejects an invalid watermark shape", () => {
     expectWitnessError(() => parseMigrationIntraActivationWatermark({}), "malformed-record");
-  });
-  it("rejects an invalid watermark scopeId", () => {
-    expectWitnessError(
-      () => parseMigrationIntraActivationWatermark({ version: 1, scopeId: "", observedSha256: HASH_A }),
-      "invalid-input",
-    );
-  });
-  it("rejects an invalid watermark digest", () => {
-    expectWitnessError(
-      () => parseMigrationIntraActivationWatermark({ version: 1, scopeId: "scope-1", observedSha256: "nope" }),
-      "invalid-input",
-    );
   });
 });
 
@@ -390,11 +427,20 @@ describe("MigrationActivationEpoch", () => {
 describe("MigrationActivationAttempt", () => {
   it("derives attemptId from every variable field including the full quiescence fence", () => {
     const e = epoch(0);
-    const withFenceOne = attempt({ epochId: e.epochId, fenceId: "fence-1" });
-    const withFenceTwo = attempt({ epochId: e.epochId, fenceId: "fence-2" });
+    const withFenceOne = attempt({ epochId: e.epochId, fencePayload: { fenceId: "fence-1" } });
+    const withFenceTwo = attempt({ epochId: e.epochId, fencePayload: { fenceId: "fence-2" } });
     // #624 acceptance: two attempts differing only in quiescence fence evidence
     // must produce different identities (v3.1 corrected the v3 P1 that omitted it).
     expect(withFenceOne.attemptId).not.toBe(withFenceTwo.attemptId);
+  });
+  it("derives a different attemptId from a payload change alone, with kind and shape held equal", () => {
+    // This is the test that proves opacity did not create a hole: the
+    // envelope's payload is opaque to this schema's own validation, but it
+    // must still fully participate in attemptId through evidenceSha256.
+    const e = epoch(0);
+    const withPayloadOne = attempt({ epochId: e.epochId, fencePayload: { anything: "one" } });
+    const withPayloadTwo = attempt({ epochId: e.epochId, fencePayload: { anything: "two" } });
+    expect(withPayloadOne.attemptId).not.toBe(withPayloadTwo.attemptId);
   });
   it("is deterministic for identical inputs", () => {
     const e = epoch(0);
@@ -407,7 +453,7 @@ describe("MigrationActivationAttempt", () => {
     const withWatermark = createMigrationActivationAttempt({
       epochId: e.epochId, selectionAuthority: selectionAuthority(),
       canonicalDeltaBaseline: canonicalDelta(), activationRecomputedCensus: censusVector(),
-      intraActivationWatermark: parseMigrationIntraActivationWatermark({ version: 1, scopeId: "scope-1", observedSha256: HASH_A }),
+      intraActivationWatermark: createMigrationIntraActivationWatermark({ kind: "test-watermark", payload: { scopeId: "scope-1" } }),
       quiescenceFence: quiescenceFence(),
     });
     expect(withWatermark.attemptId).not.toBe(withoutWatermark.attemptId);

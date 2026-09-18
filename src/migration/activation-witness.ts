@@ -335,49 +335,88 @@ export function parseMigrationSchemaWitness(value: unknown): MigrationSchemaWitn
   });
 }
 
-// --- v3.1 section 11 supporting records: quiescence fence and intra-activation
-//     watermark. Neither structure is fixed by the frozen schema text beyond
-//     "a record" / "a watermark record" carrying replayable evidence rather
-//     than a bare label; #624 freezes a concrete, hashable shape here so the
-//     type exists for #625/#626 to populate. #625/#626 own the live capture.
+// --- v3.1 section 11 supporting records: quiescence fence and intra-
+//     activation watermark, as opaque-but-fully-hashed envelopes.
+//
+// Neither structure is fixed by the frozen schema text beyond "a record" /
+// "a watermark record" carrying replayable evidence rather than a bare
+// label; their live construction and field needs belong entirely to
+// #625/#626. Freezing a concrete guessed shape here would recreate the
+// coupling this schema exists to avoid: any later #625/#626 field need
+// would force an amendment to a frozen contract with two live consumers.
+// Instead #624 freezes an opaque envelope. This schema validates the
+// envelope's shape, that its payload is canonical JSON, and the digest's
+// self-consistency; it validates nothing about the payload's contents, so
+// #625/#626 can put whatever fields their live construction needs into
+// payload without amending this contract.
+//
+// The property that must survive opacity: every byte still participates in
+// MigrationActivationAttempt.attemptId. evidenceSha256 covers the whole
+// envelope (version, kind, payload) and the envelope itself is hashed in
+// full by deriveMigrationActivationAttemptId, so a payload difference
+// alone -- same kind, same everything else -- still changes attemptId.
 
-export type MigrationQuiescenceFence = Readonly<{
+export type MigrationOpaqueEvidence = Readonly<{
   version: 1;
-  /** The fence identity under which no-concurrent-mutation was asserted. */
-  fenceId: string;
-  /** Canonical digest of the evidence that makes the fence replayable. */
-  replayEvidenceSha256: string;
+  /** Identifier for who produced this evidence and how to interpret it; opaque to this schema. */
+  kind: string;
+  /** Opaque to this schema; validated only as canonical JSON. */
+  payload: unknown;
+  /** Canonical digest of { version, kind, payload }. */
+  evidenceSha256: string;
 }>;
 
-export function parseMigrationQuiescenceFence(value: unknown): MigrationQuiescenceFence {
-  const record = assertExactObject(value, ["fenceId", "replayEvidenceSha256", "version"], "quiescence fence");
-  if (record.version !== 1 || !isIdentifier(record.fenceId) || !isHash(record.replayEvidenceSha256)) {
-    witnessError("invalid-input", "quiescence fence is invalid");
+function assertCanonicalJsonPayload(value: unknown, label: string): void {
+  try {
+    canonicalJson(value, new Set());
+  } catch (error) {
+    witnessError("invalid-input", `${label} payload is not canonical JSON`, { cause: error });
   }
-  return deepFreeze({
-    version: 1,
-    fenceId: record.fenceId as string,
-    replayEvidenceSha256: record.replayEvidenceSha256 as string,
-  });
 }
 
-export type MigrationIntraActivationWatermark = Readonly<{
-  version: 1;
-  /** Scoped only to concurrency within the activation transaction; never a drift gate. */
-  scopeId: string;
-  observedSha256: string;
-}>;
+export type CreateMigrationOpaqueEvidenceInput = Readonly<{ kind: string; payload: unknown }>;
+
+export function createMigrationOpaqueEvidence(
+  input: CreateMigrationOpaqueEvidenceInput,
+  label = "opaque evidence",
+): MigrationOpaqueEvidence {
+  if (!isIdentifier(input.kind)) witnessError("invalid-input", `${label} kind is invalid`);
+  assertCanonicalJsonPayload(input.payload, label);
+  const evidenceSha256 = migrationWitnessSha256({ version: 1, kind: input.kind, payload: input.payload });
+  return deepFreeze({ version: 1, kind: input.kind, payload: input.payload, evidenceSha256 });
+}
+
+export function parseMigrationOpaqueEvidence(value: unknown, label = "opaque evidence"): MigrationOpaqueEvidence {
+  const record = assertExactObject(value, ["evidenceSha256", "kind", "payload", "version"], label);
+  if (record.version !== 1 || !isIdentifier(record.kind) || !isHash(record.evidenceSha256)) {
+    witnessError("invalid-input", `${label} is invalid`);
+  }
+  assertCanonicalJsonPayload(record.payload, label);
+  const evidenceSha256 = migrationWitnessSha256({ version: 1, kind: record.kind, payload: record.payload });
+  if (evidenceSha256 !== record.evidenceSha256) witnessError("unexpected-state", `${label} digest does not match its content`);
+  return deepFreeze({ version: 1, kind: record.kind as string, payload: record.payload, evidenceSha256 });
+}
+
+export type MigrationQuiescenceFence = MigrationOpaqueEvidence;
+
+export function createMigrationQuiescenceFence(input: CreateMigrationOpaqueEvidenceInput): MigrationQuiescenceFence {
+  return createMigrationOpaqueEvidence(input, "quiescence fence");
+}
+
+export function parseMigrationQuiescenceFence(value: unknown): MigrationQuiescenceFence {
+  return parseMigrationOpaqueEvidence(value, "quiescence fence");
+}
+
+export type MigrationIntraActivationWatermark = MigrationOpaqueEvidence;
+
+export function createMigrationIntraActivationWatermark(
+  input: CreateMigrationOpaqueEvidenceInput,
+): MigrationIntraActivationWatermark {
+  return createMigrationOpaqueEvidence(input, "intra-activation watermark");
+}
 
 export function parseMigrationIntraActivationWatermark(value: unknown): MigrationIntraActivationWatermark {
-  const record = assertExactObject(value, ["observedSha256", "scopeId", "version"], "intra-activation watermark");
-  if (record.version !== 1 || !isIdentifier(record.scopeId) || !isHash(record.observedSha256)) {
-    witnessError("invalid-input", "intra-activation watermark is invalid");
-  }
-  return deepFreeze({
-    version: 1,
-    scopeId: record.scopeId as string,
-    observedSha256: record.observedSha256 as string,
-  });
+  return parseMigrationOpaqueEvidence(value, "intra-activation watermark");
 }
 
 // --- v3 section 7: MigrationActivationEpoch, deterministic only ------------
