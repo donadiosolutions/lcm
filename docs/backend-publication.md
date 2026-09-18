@@ -168,6 +168,51 @@ readers receive the journal checksum for their existing double-read check.
 Version-3 journals do not record a version-2 target configuration hash; terminal
 admission uses their selected backend and the current authenticated file witness.
 
+Ordinary backend publication also resumes after either terminal maintenance
+phase. Before preparing the next version-2 publication, the coordinator reads
+the terminal version-3 journal through its retained directory witness and
+archives those exact authenticated bytes. The terminal journal remains live if
+local-state observation or the initial compare-and-swap replacement fails, so
+the same prepare request can be retried. `resume()`, `abort()`, and
+`recoverPending()` remain version-2 recovery operations and do not advance a
+leftover maintenance journal.
+
+Immediately before creating terminal history, LCM validates the journal reread
+through the same version-2/version-3 parser used for initial admission. Malformed
+JSON, non-object data, unsupported versions, invalid shapes, and checksum failures
+retain their structured journal error reasons. An internally valid reread whose
+version or checksum differs from the initially admitted record is refused as an
+unexpected state. Refusal preserves the current journal bytes and occurs before
+history, driver, recovery-material, or successor-journal effects.
+Legacy version-2 malformed checksum syntax remains `malformed-journal`, while
+version-3 malformed checksum syntax and payload-invalid checksums in either
+version remain `checksum-mismatch`.
+
+Terminal archive publication retains one authenticated `history/` directory
+descriptor and its original device/inode identity from admission through the
+archive write or exact replay and both directory flushes. Only an initial
+no-follow descriptor open that reports absence permits LCM to create
+`history/`, non-recursively and with mode `0700`; an `EEXIST` create race or an
+unsafe file, symlink, owner, or mode is refused without repair or replacement.
+Archive creation is exclusive. If the checksum-named archive already exists,
+LCM accepts it only when its exact bytes and raw SHA-256 match the live terminal
+journal, its mode is `0600`, its owner is the expected user when the platform
+supports that check, it has one link, and its parent identity matches the
+retained history descriptor. LCM then flushes that retained history descriptor
+before the already-retained outer publication descriptor. A replacement or
+flush failure leaves the terminal journal live, and a retry may replay an
+already-complete authenticated archive.
+
+These checks revalidate both retained descriptors and their pathnames at each
+security boundary. They detect substitutions observed at those boundaries, but
+the archive mutation remains pathname-based and cannot provide a fully
+descriptor-relative guarantee against a same-UID process that can replace paths
+between checks. Keep the home and `.lcm` trees private and treat an
+`unsafe-storage` refusal as evidence to preserve and diagnose. Retry safety
+begins after exclusive archive publication returns, when its temporary alias is
+gone and the archive has one link; LCM does not claim cleanup after arbitrary
+process termination inside that generic publication helper.
+
 If maintenance entry is interrupted after its entering checkpoint, call
 `enterMaintenance` with the exact original publication, generation, selection,
 queue evidence and roster, plus the observed `expectedChecksumSha256` for
@@ -187,14 +232,18 @@ refreshed maintenance checksum for subsequent selection or exact retry.
 While maintenance is held, ordinary SQLite operations fail publication
 admission even through handles opened earlier. Local hook append has one narrow
 capability: its installation-global sequence allocation and matching outbox
-insert share a short append barrier. Existing outboxes must already have the
-current schema; hook open cannot opportunistically migrate or create an outbox
-during maintenance. Registered-project preparation creates and validates an
-empty outbox before adopting its receipt epoch, so its first held hook has a
-durable destination. Outbox opens share the append barrier with capture. During
-the hold, schema checks recover private copies of the main file and WAL, leaving
-the source and shared-memory sidecar untouched on schema refusal. The verified
-main-file identity is checked again before writable connection setup.
+insert share a short append barrier. During entering, held, or prepared
+maintenance, existing outboxes must already have the current schema; hook open
+cannot opportunistically migrate or create an outbox. Registered-project
+preparation creates and validates an empty outbox before adopting its receipt
+epoch, so its first held hook has a durable destination. Outbox opens share the
+append barrier with capture. During the hold, schema checks recover private
+copies of the main file and WAL, leaving the source and shared-memory sidecar
+untouched on schema refusal. The verified main-file identity is checked again
+before writable connection setup. After authenticated abort or selected-
+generation completion, ordinary outbox opens resume and may apply supported
+additive schema upgrades while retaining pending events. An internal caller
+that explicitly requires the current schema still receives schema refusal.
 Claims, processing marks, retries, acknowledgements,
 correlation updates, replay, missing-cwd updates, and pruning remain blocked.
 A valid version-2 publication, including an unfinished publication or the safe

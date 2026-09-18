@@ -220,6 +220,10 @@ export function createSqliteRepositories(
         const row = promoted.getById(id);
         return row ? promotedRecord(row) : null;
       }),
+      findExactContent: (content, sourceProjectId) => invoke("promoted-memory", "findExactContent", () => {
+        const row = promoted.findExactContent(content, sourceProjectId ?? projectId);
+        return row ? promotedRecord(row) : null;
+      }),
       getAll: (options) => invoke("promoted-memory", "getAll", () => {
         const { sourceProjectId, ...filters } = options ?? {};
         const since = filters.since === undefined

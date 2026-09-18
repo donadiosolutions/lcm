@@ -1,4 +1,15 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, openSync, renameSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -26,6 +37,8 @@ import {
 } from "../../src/migration/maintenance.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { localProjectIdentity } from "../../src/daemon/project.js";
+import * as configApi from "../../src/daemon/config.js";
+import * as projectApi from "../../src/daemon/project.js";
 import { writeFileSync } from "node:fs";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import * as identityApi from "../../src/machine-identity.js";
@@ -33,10 +46,12 @@ import * as publicationApi from "../../src/storage/backend-publication.js";
 import * as identityService from "../../src/identity-service.js";
 import { type IdentityRepository } from "../../src/identity-service.js";
 import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
+import * as projectMapApi from "../../src/project-map.js";
 import { closeLcmConnection } from "../../src/db/connection.js";
 import * as connectionApi from "../../src/db/connection.js";
 import { appendLocalHookEvents } from "../../src/hooks/local-enqueue.js";
 import { getMigrationReceiptEpoch } from "../../src/migration/receipts.js";
+import * as snapshotApi from "../../src/migration/sqlite-snapshot.js";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -370,7 +385,11 @@ describe("backend publication maintenance journal v3", () => {
     await append;
     expect(snapshot.receiptReference.queueCutoff).toBe("0000000000000000000");
     expect(snapshot.pages[0].records).toBe(1);
-    expect((await outbox.getHealthStats()).unprocessed).toBe(2);
+    const health = await withBackendPublicationAppendBarrierAsync(
+      fixture.homeDir,
+      token => outbox.getHealthStats(token),
+    );
+    expect(health.unprocessed).toBe(2);
     await factory.close();
   });
   it("recovers a refreshed held binding after failure before generation intent", async () => {
@@ -472,6 +491,294 @@ describe("backend publication maintenance journal v3", () => {
     await withBackendPublicationAppendBarrierAsync(fixture.homeDir, async (lockToken) => {
       await expect(authenticateSqliteMigrationSourceBytes(copy, { homeDir: fixture.homeDir, lockToken })).rejects.toThrow("not authenticated");
     });
+  });
+
+  it("validates every authenticated capture input before descriptor probing", async () => {
+    const fixture = await populatedFixture();
+    const source = await heldSource(fixture);
+    const barrier = vi.spyOn(publicationApi, "withBackendPublicationAppendBarrierAsync");
+    const journal = vi.spyOn(publicationApi, "readBackendMaintenanceJournal");
+    const lowerCapture = vi.spyOn(snapshotApi, "captureSqliteSnapshotArtifact");
+    const probe = vi.fn((): readonly string[] => {
+      throw new Error("descriptor probe must not run");
+    });
+    const observe = vi.fn();
+    const operations = { readdir: probe, observe };
+
+    const mutableIdentity = source.authority.machineIdentity as { identityKey: string };
+    const identityKey = mutableIdentity.identityKey;
+    mutableIdentity.identityKey = "";
+    await expect(captureAuthenticatedSqliteMigrationSource(source.authority, {
+      ...source.options,
+      _operationsForTesting: operations,
+    })).rejects.toMatchObject({ reason: "invalid-input" });
+    mutableIdentity.identityKey = identityKey;
+
+    const invalidCalls = [
+      () => captureAuthenticatedSqliteMigrationSource(source.authority, {
+        ...source.options,
+        expectedSourceBytes: {
+          ...source.options.expectedSourceBytes,
+          checksumSha256: HASH_A,
+        },
+        _operationsForTesting: operations,
+      }),
+      () => captureAuthenticatedSqliteMigrationSource(source.authority, {
+        ...source.options,
+        maintenanceChecksumSha256: "invalid",
+        _operationsForTesting: operations,
+      }),
+      () => captureAuthenticatedSqliteMigrationSource(source.authority, {
+        ...source.options,
+        homeDir: "relative",
+        _operationsForTesting: operations,
+      }),
+      () => captureAuthenticatedSqliteMigrationSource(source.authority, {
+        ...source.options,
+        generationId: "",
+        _operationsForTesting: operations,
+      }),
+    ];
+    for (const call of invalidCalls) {
+      await expect(call()).rejects.toMatchObject({ reason: "invalid-input" });
+    }
+
+    expect(probe).not.toHaveBeenCalled();
+    expect(barrier).not.toHaveBeenCalled();
+    expect(journal).not.toHaveBeenCalled();
+    expect(lowerCapture).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
+  });
+
+  it.each(["uid", "descriptor"] as const)(
+    "refuses capture for missing %s capability before wrapper effects",
+    async capability => {
+      const fixture = await populatedFixture();
+      const source = await heldSource(fixture);
+      const barrier = vi.spyOn(publicationApi, "withBackendPublicationAppendBarrierAsync");
+      const journal = vi.spyOn(publicationApi, "readBackendMaintenanceJournal");
+      const lowerCapture = vi.spyOn(snapshotApi, "captureSqliteSnapshotArtifact");
+      const observe = vi.fn();
+      const unavailable = Object.assign(new Error("descriptor namespace unavailable"), {
+        code: "ENOENT",
+      });
+      const operations = capability === "uid"
+        ? { getuid: () => Number.NaN, observe }
+        : {
+            readdir: (path: string) => {
+              if (path === "/proc/self/fd") throw unavailable;
+              return readdirSync(path);
+            },
+            observe,
+          };
+
+      await expect(captureAuthenticatedSqliteMigrationSource(source.authority, {
+        ...source.options,
+        _operationsForTesting: operations,
+      })).rejects.toMatchObject({ reason: "unsupported-platform" });
+
+      expect(barrier).not.toHaveBeenCalled();
+      expect(journal).not.toHaveBeenCalled();
+      expect(lowerCapture).not.toHaveBeenCalled();
+      expect(observe).not.toHaveBeenCalled();
+      expect(existsSync(join(
+        fixture.homeDir,
+        ".lcm",
+        "migration-snapshots",
+      ))).toBe(false);
+    },
+  );
+
+  it.each(["uid", "descriptor"] as const)(
+    "refuses dry-run for missing %s capability before authority reads",
+    async capability => {
+      const fixture = await populatedFixture();
+      const configuration = vi.spyOn(configApi, "readDaemonConfigSnapshot");
+      const project = vi.spyOn(projectApi, "localProjectIdentity");
+      const projectMap = vi.spyOn(projectMapApi, "readProjectMapSnapshot");
+      const machine = vi.spyOn(identityApi, "requireMachineIdentity");
+      const lowerDryRun = vi.spyOn(snapshotApi, "dryRunSqliteSnapshotArtifact");
+      const barrier = vi.spyOn(publicationApi, "withBackendPublicationAppendBarrierAsync");
+      const observe = vi.fn();
+      const unavailable = Object.assign(new Error("descriptor namespace unavailable"), {
+        code: "ENOENT",
+      });
+      const operations = capability === "uid"
+        ? { getuid: () => Number.NaN, observe }
+        : {
+            readdir: (path: string) => {
+              if (path === "/proc/self/fd") throw unavailable;
+              return readdirSync(path);
+            },
+            observe,
+          };
+
+      await expect(dryRunAuthenticatedSqliteMigrationSource(
+        fixture.cwd,
+        fixture.homeDir,
+        { _operationsForTesting: operations },
+      )).rejects.toMatchObject({ reason: "unsupported-platform" });
+
+      expect(configuration).not.toHaveBeenCalled();
+      expect(project).not.toHaveBeenCalled();
+      expect(projectMap).not.toHaveBeenCalled();
+      expect(machine).not.toHaveBeenCalled();
+      expect(lowerDryRun).not.toHaveBeenCalled();
+      expect(barrier).not.toHaveBeenCalled();
+      expect(observe).not.toHaveBeenCalled();
+      expect(existsSync(join(
+        fixture.homeDir,
+        ".lcm",
+        "migration-snapshots",
+      ))).toBe(false);
+    },
+  );
+
+  it("validates dry-run home before authority reads or descriptor probing", async () => {
+    const fixture = await populatedFixture();
+    const configuration = vi.spyOn(configApi, "readDaemonConfigSnapshot");
+    const project = vi.spyOn(projectApi, "localProjectIdentity");
+    const projectMap = vi.spyOn(projectMapApi, "readProjectMapSnapshot");
+    const machine = vi.spyOn(identityApi, "requireMachineIdentity");
+    const probe = vi.fn((): readonly string[] => {
+      throw new Error("descriptor probe must not run");
+    });
+
+    await expect(dryRunAuthenticatedSqliteMigrationSource(
+      fixture.cwd,
+      "relative",
+      { _operationsForTesting: { readdir: probe } },
+    )).rejects.toMatchObject({ reason: "invalid-input" });
+
+    expect(configuration).not.toHaveBeenCalled();
+    expect(project).not.toHaveBeenCalled();
+    expect(projectMap).not.toHaveBeenCalled();
+    expect(machine).not.toHaveBeenCalled();
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it("retains the lower-level dry-run guard for late capability loss", async () => {
+    const fixture = await populatedFixture();
+    const consumerLock = vi.spyOn(publicationApi, "withBackendPublicationConsumerLockAsync");
+    const lowerDryRun = vi.spyOn(snapshotApi, "dryRunSqliteSnapshotArtifact");
+    const observe = vi.fn();
+    let uidCalls = 0;
+    const operations = {
+      getuid: () => {
+        uidCalls += 1;
+        return uidCalls === 1 ? process.getuid!() : Number.NaN;
+      },
+      observe,
+    };
+
+    await expect(dryRunAuthenticatedSqliteMigrationSource(
+      fixture.cwd,
+      fixture.homeDir,
+      { _operationsForTesting: operations },
+    )).rejects.toMatchObject({ reason: "unsupported-platform" });
+
+    expect(lowerDryRun).toHaveBeenCalledWith(
+      expect.any(Object),
+      { homeDir: fixture.homeDir, _operationsForTesting: operations },
+    );
+    expect(uidCalls).toBe(2);
+    expect(consumerLock).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
+    expect(existsSync(join(
+      fixture.homeDir,
+      ".lcm",
+      "migration-snapshots",
+    ))).toBe(false);
+  });
+
+  it.each(["EIO", "EACCES"] as const)(
+    "maps capture descriptor probe %s to snapshot-io after cleanup",
+    async code => {
+      const fixture = await populatedFixture();
+      const source = await heldSource(fixture);
+      const failure = Object.assign(new Error(`descriptor ${code}`), { code });
+      const closed: number[] = [];
+
+      await expect(captureAuthenticatedSqliteMigrationSource(source.authority, {
+        ...source.options,
+        _operationsForTesting: {
+          readdir: (path) => {
+            if (path === "/proc/self/fd") throw failure;
+            return readdirSync(path);
+          },
+          close: (fd) => {
+            closed.push(fd);
+            closeSync(fd);
+          },
+        },
+      })).rejects.toMatchObject({ reason: "snapshot-io", cause: failure });
+
+      expect(closed).toHaveLength(1);
+      expect(existsSync(join(
+        fixture.homeDir,
+        ".lcm",
+        "migration-snapshots",
+      ))).toBe(false);
+    },
+  );
+
+  it("preserves capture probe and cleanup failures as aggregate context", async () => {
+    const fixture = await populatedFixture();
+    const source = await heldSource(fixture);
+    const probeFailure = Object.assign(new Error("descriptor EIO"), { code: "EIO" });
+    const closeFailure = new Error("probe close failed");
+    let closed = false;
+    let thrown: unknown;
+
+    try {
+      await captureAuthenticatedSqliteMigrationSource(source.authority, {
+        ...source.options,
+        _operationsForTesting: {
+          readdir: (path) => {
+            if (path === "/proc/self/fd") throw probeFailure;
+            return readdirSync(path);
+          },
+          close: (fd) => {
+            closeSync(fd);
+            closed = true;
+            throw closeFailure;
+          },
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toMatchObject({ reason: "snapshot-io" });
+    expect((thrown as Error).cause).toBeInstanceOf(AggregateError);
+    expect(((thrown as Error).cause as AggregateError).errors)
+      .toEqual([probeFailure, closeFailure]);
+    expect(closed).toBe(true);
+  });
+
+  it("maps capture probe-close failure to snapshot-io after closing the descriptor", async () => {
+    const fixture = await populatedFixture();
+    const source = await heldSource(fixture);
+    const closeFailure = new Error("probe close failed");
+    let closed = false;
+
+    await expect(captureAuthenticatedSqliteMigrationSource(source.authority, {
+      ...source.options,
+      _operationsForTesting: {
+        close: (fd) => {
+          closeSync(fd);
+          closed = true;
+          throw closeFailure;
+        },
+      },
+    })).rejects.toMatchObject({ reason: "snapshot-io", cause: closeFailure });
+
+    expect(closed).toBe(true);
+    expect(existsSync(join(
+      fixture.homeDir,
+      ".lcm",
+      "migration-snapshots",
+    ))).toBe(false);
   });
 
   it.each(["abort-absent", "abort-present", "complete"] as const)(

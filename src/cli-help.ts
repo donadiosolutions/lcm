@@ -117,7 +117,7 @@ const HELP: Record<string, CommandHelp> = {
 
   project: {
     summary: "Manage local path aliases and explicit PostgreSQL project identities.",
-    usage: "lcm project <create|link|unlink|list|show|reconcile-worktrees> [options]",
+    usage: "lcm project <create|link|unlink|list|show|reconcile-worktrees|renew-retired-identity> [options]",
     options: [
       ["create [path] [--name <name>] [--json]", "Create and bind a PostgreSQL project"],
       ["link <project-id|local-target> [path] [--allow-existing-data] [--json]", "Link a path explicitly"],
@@ -125,6 +125,7 @@ const HELP: Record<string, CommandHelp> = {
       ["list [--json]", "List local mappings and, when selected, PostgreSQL projects"],
       ["show [path|local-hash|remote-project-id] [--json]", "Show one uniquely mapped local project and its remote identity"],
       ["reconcile-worktrees [path] [--dry-run] [--json]", "Preview, retry, or report linked-worktree state consolidation"],
+      ["renew-retired-identity [path] [--json]", "Rekey an exact retired local identity without removing its fence"],
     ],
     examples: [
       ["lcm project create --name lcm", "Create a remote project for the current path"],
@@ -134,8 +135,9 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm project list --json", "Inspect local and remote identities"],
       ["lcm project show <remote-project-uuid>", "Show the unique local mapping for a remote project"],
       ["lcm project reconcile-worktrees --dry-run", "Preview local worktree state consolidation"],
+      ["lcm project renew-retired-identity", "Renew the current retired local identity, then retry the original command"],
     ],
-    notes: "Linked Git worktrees share one local project through their verified Git common directory. Reconciliation preserves source databases and event sidecars under oldprojects and oldevents. A remote UUID show target must have exactly one local binding. Git identity never creates or changes a PostgreSQL UUID; conflicting remote bindings fail closed. Repository URLs are used only as conservative evidence for deleted Codex worktree transcripts. Rebinding a data-bearing local project requires --allow-existing-data.",
+    notes: "Linked Git worktrees share one local project through their verified Git common directory. Reconciliation preserves source databases and event sidecars under oldprojects and oldevents. Retired-identity renewal accepts only one exact canonical local path-hash binding and does not remove the reconciliation fence; it is idempotent and refuses aliases, remote bindings, or occupied successor state. A remote UUID show target must have exactly one local binding. Git identity never creates or changes a PostgreSQL UUID; conflicting remote bindings fail closed. Repository URLs are used only as conservative evidence for deleted Codex worktree transcripts. Rebinding a data-bearing local project requires --allow-existing-data.",
   },
 
   postgres: {

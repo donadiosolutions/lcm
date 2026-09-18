@@ -81,17 +81,15 @@ configuration and managed daemon; repair or reinstall with `lcm install`.
 
 The published CLI contains its MCP SDK build graph in `dist/lcm.mjs`. Consumer
 installations therefore do not receive a second external SDK, Express, or AJV
-dependency path from LCM. The exact SDK, `body-parser`, and `fast-uri` versions
-used to build that runtime remain pinned with lockfile integrity in the source
-package. LCM builds with `fast-uri` 4.1.4; AJV retains its nested patched
-`fast-uri` 3.1.7 dependency path, and Express and `body-parser` resolve `qs`
-6.16.0. These releases include fixes for malformed URI authority components and
-query-string parsing advisories without exposing additional parser paths in
-consumer installations. Update LCM to receive the corrected bundled runtime.
+dependency path from LCM. The exact SDK and parser build pins are declared in
+`package.json`; their nested parser overrides are declared in
+`pnpm-workspace.yaml`, and the frozen lockfile records their integrity. This
+preserves fixes for malformed URI authority components and query-string parsing
+advisories without exposing additional parser paths in consumer installations.
+Update LCM to receive the corrected bundled runtime.
 
-LCM's optional OpenAI integration requires the OpenAI SDK 7.3.0. The SDK is
-pinned as both a development dependency and an optional peer dependency; use
-Node.js 22.12.0 or newer.
+LCM's optional OpenAI integration is pinned as both a development dependency
+and an optional peer dependency in `package.json`; use Node.js 22.12.0 or newer.
 
 When the setup wizard's **Custom server** summarizer is selected, both the
 OpenAI-compatible server URL and model name are required. The wizard retries an
@@ -579,6 +577,254 @@ and SHA-256 manifest, takes the migration advisory lock, validates PostgreSQL
 migrations transactionally, and closes its pool before returning. Repeated and
 concurrent invocations converge. It never installs extensions, repairs drift,
 changes ownership, or grants application privileges.
+
+Upgrading through migration `0007_promoted_content_digest` (the owner
+exact-content index) takes an exclusive lock on `promoted_memories` while
+PostgreSQL backfills a generated digest column for every existing row and
+builds its supporting index in the same transaction. The lock duration
+scales with that table's size: an empty or small deployment finishes almost
+instantly, while a large promoted-memory table can hold readers and writers
+of that table for a noticeable window. Schedule the upgrade for a
+maintenance window sized to the table's row count; the migration still runs
+as one transaction, so an interrupted run leaves the prior schema in place
+rather than a partially built index.
+
+`lcm postgres migrate` also refuses to proceed if
+`promoted_memories.content` has a nondeterministic collation, such as an
+explicitly attached case- or accent-insensitive collation. A nondeterministic
+collation can make two byte-different rows compare equal even though their
+generated digests differ, which would let exact-content lookups silently
+miss an existing duplicate. Leave `content` on its default deterministic
+collation. `lcm postgres migrate` fails before applying any migration DDL
+when `content` has a nondeterministic collation. Recurring runtime
+readiness (checked at every daemon and MCP factory boot, and by `lcm
+doctor`) also fails closed on the same condition, consistent with how it
+already handles a missing required extension or a misconfigured search
+configuration. Both checks read the live collation determinism from the
+PostgreSQL catalog on every call rather than a recorded baseline, so
+admission keeps failing closed even if the collation object is later
+dropped and recreated under the exact same qualified name as
+nondeterministic.
+
+#### Recovering from a nondeterministic promoted_memories.content collation
+
+`search_document` and, since migration `0007_promoted_content_digest`,
+`content_sha256` are `STORED` generated columns that depend on
+`content`, so PostgreSQL refuses a plain `ALTER COLUMN content TYPE ...`
+outright. Determine which of the four states below applies before
+proceeding. Do not infer this from either the migration ledger or
+`content_sha256`'s existence alone: migration DDL and its ledger row
+commit together in the same transaction, so the two never disagree for
+anything the migrator itself did, but an administrator can run DDL on
+`content_sha256` or its index outside `lcm postgres migrate`, for
+example while investigating this very collation problem, without
+touching the ledger, or ledger-affecting work without touching the
+column. When ledger state and column existence disagree, routing on
+only one of them sends the operator down a procedure that cannot
+succeed: the "before migration 0007" procedure never creates
+`content_sha256`, so `lcm postgres migrate` then rejects the still
+missing column as drift against an already-recorded migration `0007`;
+the "after migration 0007" procedure completes on a schema where
+`0007` is not yet recorded, because it drops `content_sha256` before
+re-adding it, but that leaves `content_sha256` present while the
+ledger still lacks `0007`, so `lcm postgres migrate` then rejects it
+as unexpected drift before reaching migration `0007`'s own DDL. Check
+both, run as the migration role:
+
+```sql
+SELECT
+  EXISTS (
+    SELECT 1 FROM lcm.schema_migrations
+    WHERE id = '0007_promoted_content_digest'
+  ) AS migration_0007_recorded,
+  EXISTS (
+    SELECT 1 FROM pg_catalog.pg_attribute
+    WHERE attrelid = 'lcm.promoted_memories'::regclass
+      AND attname = 'content_sha256'
+      AND NOT attisdropped
+  ) AS content_sha256_present;
+```
+
+| `migration_0007_recorded` | `content_sha256_present` | State | Procedure |
+| --- | --- | --- | --- |
+| `false` | `false` | Normal, pre-0007 | "Recovering before migration 0007" |
+| `true` | `true` | Normal, post-0007 | "Recovering after migration 0007" |
+| `true` | `false` | Ledger ahead of schema | "Recovering when the ledger records migration 0007 but content_sha256 is missing" |
+| `false` | `true` | Schema ahead of ledger | "Recovering when content_sha256 exists but migration 0007 is not recorded" |
+
+The two normal rows are the only states migration DDL itself ever
+leaves the database in. The two mismatched rows arise only from manual
+intervention on `content_sha256`, `promoted_memories_content_sha256_idx`,
+or `lcm.schema_migrations` outside `lcm postgres migrate`. Each
+mismatched row has its own procedure below that first restores the
+canonical schema for its ledger state and then reuses the matching
+normal procedure unchanged.
+
+##### Recovering before migration 0007
+
+On this schema, only `search_document` depends on `content`;
+`content_sha256` does not exist yet. Drop only the existing dependency,
+restore the deterministic collation, and recreate `search_document` and
+its index. Do not create `content_sha256` or its index here: leave that
+to migration `0007`, which creates both itself, computing the digest
+over the now-correctly-collated `content`. Creating them by hand here
+would leave migration `0007` unrecorded while its objects already
+exist, and the next `lcm postgres migrate` run would then reject the
+resulting schema drift or attempt to add the column again.
+
+```sql
+BEGIN;
+
+ALTER TABLE lcm.promoted_memories DROP COLUMN search_document;
+
+ALTER TABLE lcm.promoted_memories
+  ALTER COLUMN content TYPE text COLLATE pg_catalog."default";
+
+ALTER TABLE lcm.promoted_memories
+  ADD COLUMN search_document tsvector GENERATED ALWAYS AS (
+    to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content))
+  ) STORED;
+CREATE INDEX promoted_memories_search_document_idx
+  ON lcm.promoted_memories USING gin (search_document);
+
+COMMIT;
+```
+
+Dropping `search_document` also drops
+`promoted_memories_search_document_idx`; recreating the generated
+column does not automatically recreate that index, so the
+`CREATE INDEX` statement above is required, not optional.
+`pg_catalog."default"` is the only collation target this recovery
+accepts. The packaged schema snapshots pin the qualified collation
+name of `promoted_memories.content`, so substituting any other
+collation here, even one that is fully deterministic, passes the
+collation preflight but is then rejected as schema drift by both
+`lcm postgres migrate` and recurring runtime readiness. Then run
+`lcm postgres migrate` to apply migration `0007`, creating
+`content_sha256` and `promoted_memories_content_sha256_idx` over
+the restored content.
+
+##### Recovering after migration 0007
+
+On this schema, both `search_document` and `content_sha256` depend on
+`content`. Drop both existing dependencies, restore the deterministic
+collation, and recreate both generated columns and both indexes in the
+same transaction:
+
+```sql
+BEGIN;
+
+ALTER TABLE lcm.promoted_memories DROP COLUMN search_document;
+ALTER TABLE lcm.promoted_memories DROP COLUMN content_sha256;
+
+ALTER TABLE lcm.promoted_memories
+  ALTER COLUMN content TYPE text COLLATE pg_catalog."default";
+
+ALTER TABLE lcm.promoted_memories
+  ADD COLUMN search_document tsvector GENERATED ALWAYS AS (
+    to_tsvector('lcm.search_v1'::regconfig, lcm.normalize_search_text(content))
+  ) STORED;
+CREATE INDEX promoted_memories_search_document_idx
+  ON lcm.promoted_memories USING gin (search_document);
+
+ALTER TABLE lcm.promoted_memories
+  ADD COLUMN content_sha256 bytea GENERATED ALWAYS AS (
+    public.digest(content, 'sha256')
+  ) STORED;
+CREATE INDEX promoted_memories_content_sha256_idx
+  ON lcm.promoted_memories (
+    project_id, content_sha256, created_at DESC, memory_id DESC
+  )
+  WHERE archived_at IS NULL;
+
+COMMIT;
+```
+
+Dropping `search_document` and `content_sha256` also drops the two
+indexes built on them (`promoted_memories_search_document_idx` and
+`promoted_memories_content_sha256_idx`); recreating the generated
+columns does not automatically recreate those indexes, so the
+`CREATE INDEX` statements above are required, not optional.
+`pg_catalog."default"` is the only collation target this recovery
+accepts. The packaged schema snapshots pin the qualified collation
+name of `promoted_memories.content`, so substituting any other
+collation here, even one that is fully deterministic, passes the
+collation preflight but is then rejected as schema drift by both
+`lcm postgres migrate` and recurring runtime readiness. Then run
+`lcm postgres migrate`; it performs no further DDL here because
+migration `0007` is already recorded as applied.
+
+##### Recovering when the ledger records migration 0007 but content_sha256 is missing
+
+The ledger already records migration `0007_promoted_content_digest`, so
+`lcm postgres migrate` will not attempt to create `content_sha256`
+again: it only applies migrations that are not yet recorded in the
+ledger. Recreate `content_sha256` and its index exactly as migration
+`0007` defines them first, restoring the canonical post-0007 schema,
+then follow "Recovering after migration 0007" above, unchanged. This
+works even while `content` still carries the nondeterministic
+collation, because `digest()` operates on the column's bytes; it is
+equality comparisons under `content`'s collation, not digest
+computation, that a nondeterministic collation affects.
+
+```sql
+BEGIN;
+
+ALTER TABLE lcm.promoted_memories
+  ADD COLUMN content_sha256 bytea GENERATED ALWAYS AS (
+    public.digest(content, 'sha256')
+  ) STORED;
+
+CREATE INDEX promoted_memories_content_sha256_idx
+  ON lcm.promoted_memories (
+    project_id, content_sha256, created_at DESC, memory_id DESC
+  )
+  WHERE archived_at IS NULL;
+
+COMMIT;
+```
+
+Then run the "Recovering after migration 0007" procedure exactly as
+documented above: it drops and recreates both `search_document` and
+`content_sha256` in the same transaction, restoring the deterministic
+collation and recomputing `content_sha256` over the now-correctly
+collated content. `lcm postgres migrate` performs no further DDL
+afterward, because migration `0007` is already recorded.
+
+##### Recovering when content_sha256 exists but migration 0007 is not recorded
+
+The ledger does not yet record migration `0007_promoted_content_digest`,
+so `lcm postgres migrate` compares the live schema against the
+current, pre-0007 snapshot before any migration DDL runs; it rejects
+the unexpected `content_sha256` column and its index as drift against
+that snapshot, never reaching migration `0007`'s own DDL. Drop the
+unrecorded `content_sha256` first, restoring the canonical pre-0007
+schema, then follow "Recovering before migration 0007" above,
+unchanged; migration `0007` then creates `content_sha256` and its
+index fresh once it runs, recording itself in the ledger at the same
+time.
+
+```sql
+BEGIN;
+
+ALTER TABLE lcm.promoted_memories DROP COLUMN content_sha256;
+
+COMMIT;
+```
+
+Dropping `content_sha256` also drops
+`promoted_memories_content_sha256_idx`, whether that index was created
+by hand or is left over from an earlier, unsuccessful recovery attempt.
+Then run the "Recovering before migration 0007" procedure exactly as
+documented above.
+
+All four procedures leave the other `promoted_memories` objects that do
+not depend on `content`'s STORED generated columns untouched. The
+`ALTER COLUMN ... TYPE` statement, run by whichever of the two normal
+procedures a mismatched-state procedure defers to, rebuilds the
+`promoted_memories_content_trgm_idx` expression index and re-validates
+the `CHECK (content <> '')` constraint automatically, so neither needs
+to be dropped or recreated by any of them.
 
 After migration, apply only the reviewed scripts required by the repositories
 that this runtime role will use. The project-storage factory requires the

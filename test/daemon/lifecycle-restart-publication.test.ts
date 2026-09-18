@@ -244,7 +244,795 @@ function scopedOptions(f: ReturnType<typeof fixture>): RestartDaemonOptions {
   return { ...base, _testScope: scope };
 }
 
+function managedRecovery(
+  f: ReturnType<typeof fixture>,
+  overrides: Readonly<{
+    platform?: "linux" | "darwin" | "win32";
+    port?: number;
+    backend?: "sqlite" | "postgresql";
+    pidState?: string | null;
+    listenerPorts?: readonly number[];
+    observation?: (
+      spec: SupervisorSpec,
+      call: number,
+    ) => SupervisorObservation | Promise<SupervisorObservation>;
+    owner?: (
+      call: number,
+    ) => { version: 1; pid: number; processStartTime: string | null; nonce: string } | null;
+    birth?: (pid: number, call: number, timeoutMs: number | undefined) => string | null;
+    fetch?: typeof globalThis.fetch;
+    validate?: () => void | Promise<void>;
+    now?: () => number;
+    abortSignal?: AbortSignal;
+    replacementAssertion?: Error;
+  }> = {},
+) {
+  const port = overrides.port ?? 43_950;
+  const backend = overrides.backend ?? "sqlite";
+  if (overrides.pidState !== null) {
+    writeFileSync(f.pidPath, overrides.pidState ?? "111", { mode: 0o600 });
+  }
+  writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
+  f.seams.platform = overrides.platform ?? "linux";
+  f.seams.fetch = overrides.fetch ?? vi.fn(async () => {
+    throw Object.assign(new Error("daemon did not answer before headers"), {
+      code: "ECONNREFUSED",
+    });
+  }) as never;
+  f.seams.isProcessAlive = vi.fn(() => true);
+  let probeCalls = 0;
+  const probe = vi.fn(async (spec: SupervisorSpec): Promise<SupervisorObservation> => {
+    probeCalls += 1;
+    return await (overrides.observation?.(spec, probeCalls) ?? {
+      kind: "registered-running-valid",
+      name: spec.name,
+      scopeDigest: spec.scopeDigest,
+      nonce: spec.nonce,
+      managerPid: 111,
+    });
+  });
+  const stopAndStart = vi.fn(async (spec: SupervisorSpec) => {
+    writeFileSync(f.pidPath, "222", { mode: 0o600 });
+    return {
+      kind: spec.kind,
+      name: spec.name,
+      scopeDigest: spec.scopeDigest,
+      port: spec.port,
+      nonce: spec.nonce,
+      managerPid: 222,
+    };
+  });
+  const supervisor: Supervisor = {
+    probe,
+    start: vi.fn(),
+    stopAndStart,
+    stopAndAwaitAbsent: vi.fn(),
+  };
+  const ensure = vi.fn(async (ensureOptions: EnsureDaemonOptions) => ({
+    connected: true,
+    port: ensureOptions.port,
+    spawned: false,
+    pid: 222,
+  }));
+  const contention = new PrivateMutationLockContentionError("daemon-owned publication");
+  let assertions = 0;
+  let ownerReads = 0;
+  let birthReads = 0;
+  const restartOptions = options(f, {
+    port,
+    expectedStorageBackend: backend,
+    enforceUserManagerParent: true,
+    spawnTimeoutMs: 1_000,
+    _supervisorOverride: supervisor,
+    _ensureDaemonOverride: ensure,
+    _listeningPortsOverride: () => [...(overrides.listenerPorts ?? [port])],
+    _processStartTimeForTesting: (pid, _observer, birthOptions) => {
+      birthReads += 1;
+      return overrides.birth === undefined
+        ? `birth-${pid}`
+        : overrides.birth(pid, birthReads, birthOptions.timeoutMs);
+    },
+    _readPrivateMutationLockOwnerForTesting: () => {
+      ownerReads += 1;
+      return overrides.owner === undefined
+        ? {
+            version: 1,
+            pid: 111,
+            processStartTime: "birth-111",
+            nonce: "a".repeat(32),
+          }
+        : overrides.owner(ownerReads);
+    },
+    _validateBeforeManagedRestart: overrides.validate ?? (() => undefined),
+    _monotonicNowOverride: overrides.now,
+    _abortSignal: overrides.abortSignal,
+    _assertBackendPublication: (_homeDir, assertedBackend) => {
+      assertions += 1;
+      expect(assertedBackend).toBe(backend);
+      if (assertions === 1) throw contention;
+      if (assertions === 2 && overrides.replacementAssertion !== undefined) {
+        throw overrides.replacementAssertion;
+      }
+    },
+  });
+  return {
+    contention,
+    ensure,
+    probe,
+    restartOptions,
+    stopAndStart,
+    assertions: () => assertions,
+  };
+}
+
 describe("restart publication assertion convergence", () => {
+  it("recovers an exact managed no-response daemon from its own publication contention", async () => {
+    const f = fixture();
+    writeFileSync(f.pidPath, "111", { mode: 0o600 });
+    writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
+    f.seams.fetch = vi.fn(async () => {
+      throw Object.assign(new Error("daemon did not answer before headers"), {
+        code: "ECONNREFUSED",
+      });
+    }) as never;
+    f.seams.isProcessAlive = vi.fn(() => true);
+    const probe = vi.fn(async (spec: SupervisorSpec): Promise<SupervisorObservation> => ({
+      kind: "registered-running-valid",
+      name: spec.name,
+      scopeDigest: spec.scopeDigest,
+      nonce: spec.nonce,
+      managerPid: 111,
+    }));
+    const stopAndStart = vi.fn(async (spec: SupervisorSpec) => {
+      writeFileSync(f.pidPath, "222", { mode: 0o600 });
+      return {
+        kind: spec.kind,
+        name: spec.name,
+        scopeDigest: spec.scopeDigest,
+        port: spec.port,
+        nonce: spec.nonce,
+        managerPid: 222,
+      };
+    });
+    const supervisor: Supervisor = {
+      probe,
+      start: vi.fn(),
+      stopAndStart,
+      stopAndAwaitAbsent: vi.fn(),
+    };
+    const ensure = vi.fn(async (ensureOptions: EnsureDaemonOptions) => ({
+      connected: true,
+      port: ensureOptions.port,
+      spawned: false,
+      pid: 222,
+    }));
+    const contention = new PrivateMutationLockContentionError("daemon-owned publication");
+    let assertions = 0;
+
+    await expect(restartDaemon(options(f, {
+      enforceUserManagerParent: true,
+      spawnTimeoutMs: 1_000,
+      _supervisorOverride: supervisor,
+      _ensureDaemonOverride: ensure,
+      _listeningPortsOverride: () => [43_950],
+      _processStartTimeForTesting: pid => `birth-${pid}`,
+      _readPrivateMutationLockOwnerForTesting: () => ({
+        version: 1,
+        pid: 111,
+        processStartTime: "birth-111",
+        nonce: "a".repeat(32),
+      }),
+      _validateBeforeManagedRestart: vi.fn(),
+      _assertBackendPublication: () => {
+        assertions += 1;
+        if (assertions === 1) throw contention;
+      },
+    }))).resolves.toMatchObject({
+      connected: true,
+      restarted: true,
+      stoppedPid: 111,
+      pid: 222,
+    });
+
+    expect(stopAndStart).toHaveBeenCalledOnce();
+    expect(ensure).toHaveBeenCalledOnce();
+    expect(f.seams.killProcess).not.toHaveBeenCalled();
+    expect(f.seams.spawn).not.toHaveBeenCalled();
+    expect(assertions).toBe(2);
+  });
+
+  it("carries a non-default PostgreSQL configuration through launchd recovery", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f, {
+      platform: "darwin",
+      port: 45_678,
+      backend: "postgresql",
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).resolves.toMatchObject({
+      connected: true,
+      restarted: true,
+      stoppedPid: 111,
+      pid: 222,
+      port: 45_678,
+    });
+
+    expect(scenario.stopAndStart).toHaveBeenCalledOnce();
+    expect(scenario.stopAndStart.mock.calls[0]![0]).toMatchObject({
+      kind: "launchd-user",
+      port: 45_678,
+      storageBackend: "postgresql",
+    });
+    expect(scenario.assertions()).toBe(2);
+  });
+
+  it("accepts a stable existing manager nonce distinct from the replacement nonce", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f, {
+      observation: spec => ({
+        kind: "registered-running-valid",
+        name: spec.name,
+        scopeDigest: spec.scopeDigest,
+        nonce: "existing-manager-nonce",
+        managerPid: 111,
+      }),
+    });
+    scenario.restartOptions._supervisorNonceOverride = () => "replacement-nonce";
+
+    await expect(restartDaemon(scenario.restartOptions)).resolves.toMatchObject({
+      connected: true,
+      restarted: true,
+      stoppedPid: 111,
+    });
+
+    expect(scenario.stopAndStart).toHaveBeenCalledOnce();
+    expect(scenario.stopAndStart.mock.calls[0]![0].nonce).toBe("replacement-nonce");
+  });
+
+  it.each([
+    ["unavailable", (spec: SupervisorSpec): SupervisorObservation => ({
+      kind: "unavailable", reason: "manager-not-found", name: spec.name,
+    })],
+    ["absent", (spec: SupervisorSpec): SupervisorObservation => ({
+      kind: "absent", name: spec.name,
+    })],
+    ["stopped", (spec: SupervisorSpec): SupervisorObservation => ({
+      kind: "registered-not-running-valid", terminal: "inactive", name: spec.name,
+      scopeDigest: spec.scopeDigest, nonce: spec.nonce,
+    })],
+    ["legacy", (spec: SupervisorSpec): SupervisorObservation => ({
+      kind: "registered-stale-config", reason: "metadata-mismatch", name: spec.name,
+      scopeDigest: spec.scopeDigest, nonce: spec.nonce,
+    })],
+    ["collision", (spec: SupervisorSpec): SupervisorObservation => ({
+      kind: "registered-invalid-collision", reason: "foreign-job", name: spec.name,
+    })],
+    ["ambiguous", (spec: SupervisorSpec): SupervisorObservation => ({
+      kind: "ambiguous", reason: "metadata-malformed", name: spec.name,
+    })],
+    ["running job without exact nonce", (spec: SupervisorSpec): SupervisorObservation => ({
+      kind: "registered-running-valid", name: spec.name,
+      scopeDigest: spec.scopeDigest, managerPid: 111,
+    })],
+    ["running job with the wrong name", (spec: SupervisorSpec): SupervisorObservation => ({
+      kind: "registered-running-valid", name: `${spec.name}-other`,
+      scopeDigest: spec.scopeDigest, nonce: spec.nonce, managerPid: 111,
+    })],
+    ["running job with the wrong scope", (spec: SupervisorSpec): SupervisorObservation => ({
+      kind: "registered-running-valid", name: spec.name,
+      scopeDigest: "wrong-scope", nonce: spec.nonce, managerPid: 111,
+    })],
+    ["running job with an invalid PID", (spec: SupervisorSpec): SupervisorObservation => ({
+      kind: "registered-running-valid", name: spec.name,
+      scopeDigest: spec.scopeDigest, nonce: spec.nonce, managerPid: 0,
+    })],
+    ["running job with an unsafe PID", (spec: SupervisorSpec): SupervisorObservation => ({
+      kind: "registered-running-valid", name: spec.name,
+      scopeDigest: spec.scopeDigest, nonce: spec.nonce, managerPid: Number.NaN,
+    })],
+  ] as const)("preserves original contention for a %s manager observation", async (_name, observation) => {
+    const f = fixture();
+    const scenario = managedRecovery(f, { observation: spec => observation(spec) });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+    expect(scenario.ensure).not.toHaveBeenCalled();
+    expect(f.seams.killProcess).not.toHaveBeenCalled();
+    expect(f.seams.spawn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["relative executable", (f: ReturnType<typeof fixture>, scenario: ReturnType<typeof managedRecovery>) => {
+      scenario.restartOptions.spawnCommand = "relative-node";
+    }],
+    ["non-canonical state root", (f: ReturnType<typeof fixture>) => {
+      f.seams.realpath = () => { throw new Error("canonicalization failed"); };
+    }],
+    ["invalid supervisor specification", (_f: ReturnType<typeof fixture>, scenario: ReturnType<typeof managedRecovery>) => {
+      scenario.restartOptions.expectedRuntimeDigest = "invalid";
+    }],
+    ["rejected supervisor probe", (_f: ReturnType<typeof fixture>, scenario: ReturnType<typeof managedRecovery>) => {
+      scenario.probe.mockRejectedValueOnce(new Error("probe failed"));
+    }],
+  ] as const)("preserves contention for a %s", async (_name, configure) => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    configure(f, scenario);
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+    expect(scenario.ensure).not.toHaveBeenCalled();
+  });
+
+  it("uses the fail-closed default publication-owner probe", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    delete scenario.restartOptions._readPrivateMutationLockOwnerForTesting;
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("uses the fail-closed default process-birth probe", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    delete scenario.restartOptions._processStartTimeForTesting;
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["missing owner", () => null, () => "birth-111"],
+    ["wrong owner PID", () => ({ version: 1 as const, pid: 333, processStartTime: "birth-333", nonce: "a".repeat(32) }), () => "birth-111"],
+    ["null owner birth", () => ({ version: 1 as const, pid: 111, processStartTime: null, nonce: "a".repeat(32) }), () => "birth-111"],
+    ["live birth mismatch", () => ({ version: 1 as const, pid: 111, processStartTime: "birth-111", nonce: "a".repeat(32) }), () => "other-birth"],
+    ["birth timeout", () => ({ version: 1 as const, pid: 111, processStartTime: "birth-111", nonce: "a".repeat(32) }), () => null],
+  ] as const)("preserves original contention for %s", async (_name, owner, birth) => {
+    const f = fixture();
+    const scenario = managedRecovery(f, { owner, birth: () => birth() });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+    expect(scenario.ensure).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when the recovery birth probe throws", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f, {
+      birth: () => { throw new Error("birth probe failed"); },
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when recovery aborts during its birth proof", async () => {
+    const f = fixture();
+    const abort = new AbortController();
+    const scenario = managedRecovery(f, {
+      abortSignal: abort.signal,
+      owner: () => {
+        abort.abort();
+        return {
+          version: 1,
+          pid: 111,
+          processStartTime: "birth-111",
+          nonce: "a".repeat(32),
+        };
+      },
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when no birth-proof budget remains", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    scenario.restartOptions.spawnTimeoutMs = 3;
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  // The live-clock variant above can short-circuit on the remaining-time check
+  // before the quarter-budget guard is ever consulted, so it only kills the
+  // `timeoutMs < 1` mutant when the machine happens to be fast enough. A stable
+  // monotonic clock pins the total deadline at three milliseconds, which makes
+  // the quarter budget round to zero deterministically on every host.
+  it("refuses a recovery birth probe whose budget rounds to zero", async () => {
+    const f = fixture();
+    const birthBudgets: Array<number | undefined> = [];
+    const scenario = managedRecovery(f, {
+      now: () => 1_000,
+      birth: (pid, _call, timeoutMs) => {
+        birthBudgets.push(timeoutMs);
+        return `birth-${pid}`;
+      },
+    });
+    scenario.restartOptions.spawnTimeoutMs = 3;
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    // Only the earlier publication-evidence capture, which runs on its own
+    // convergence deadline, may probe. The recovery path must refuse before
+    // spending a zero-millisecond birth budget.
+    expect(birthBudgets).toEqual([100]);
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+    expect(scenario.ensure).not.toHaveBeenCalled();
+    expect(f.seams.killProcess).not.toHaveBeenCalled();
+    expect(f.seams.spawn).not.toHaveBeenCalled();
+  });
+
+  it("bounds every recovery birth proof by the remaining lifecycle deadline", async () => {
+    const f = fixture();
+    const timeouts: Array<number | undefined> = [];
+    const scenario = managedRecovery(f, {
+      birth: (pid, _call, timeoutMs) => {
+        timeouts.push(timeoutMs);
+        return `birth-${pid}`;
+      },
+    });
+
+    await restartDaemon(scenario.restartOptions);
+
+    expect(timeouts).toEqual([100, 100, 100]);
+  });
+
+  it("refuses when publication owner identity changes before managed stop", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f, {
+      owner: call => ({
+        version: 1,
+        pid: 111,
+        processStartTime: "birth-111",
+        nonce: (call === 1 ? "a" : "b").repeat(32),
+      }),
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["missing PID", null, [43_950]],
+    ["changed PID", "333", [43_950]],
+    ["missing listener", "111", []],
+  ] as const)("preserves contention for %s endpoint proof", async (_name, pidState, listenerPorts) => {
+    const f = fixture();
+    const scenario = managedRecovery(f, { pidState, listenerPorts });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it.each(["changed", "rejected"] as const)(
+    "preserves contention when the second manager probe is %s",
+    async outcome => {
+      const f = fixture();
+      const scenario = managedRecovery(f, {
+        observation: (spec, call) => {
+          if (call === 2 && outcome === "rejected") throw new Error("manager unavailable");
+          return {
+            kind: "registered-running-valid",
+            name: spec.name,
+            scopeDigest: spec.scopeDigest,
+            nonce: call === 2 && outcome === "changed" ? "b".repeat(32) : spec.nonce,
+            managerPid: 111,
+          };
+        },
+      });
+
+      await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+      expect(scenario.stopAndStart).not.toHaveBeenCalled();
+    },
+  );
+
+  it("recovers a header-timeout only after exact managed proof", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f, {
+      fetch: vi.fn(() => new Promise<Response>(() => undefined)) as never,
+    });
+    scenario.restartOptions._setTimeoutOverride = callback => {
+      callback();
+      return {} as ReturnType<typeof setTimeout>;
+    };
+    scenario.restartOptions._clearTimeoutOverride = vi.fn();
+
+    await expect(restartDaemon(scenario.restartOptions)).resolves.toMatchObject({
+      restarted: true,
+      stoppedPid: 111,
+    });
+
+    expect(scenario.stopAndStart).toHaveBeenCalledOnce();
+  });
+
+  it("reserves lifecycle deadline after a real-duration header timeout", async () => {
+    const f = fixture();
+    let now = 0;
+    const requestedTimeouts: number[] = [];
+    const scenario = managedRecovery(f, {
+      now: () => now,
+      fetch: vi.fn(() => new Promise<Response>(() => undefined)) as never,
+    });
+    scenario.restartOptions._setTimeoutOverride = (callback, delayMs) => {
+      requestedTimeouts.push(delayMs);
+      now += delayMs;
+      callback();
+      return {} as ReturnType<typeof setTimeout>;
+    };
+    scenario.restartOptions._clearTimeoutOverride = vi.fn();
+
+    await expect(restartDaemon(scenario.restartOptions)).resolves.toMatchObject({
+      connected: true,
+      restarted: true,
+      stoppedPid: 111,
+    });
+
+    expect(requestedTimeouts).toEqual([2_000, 500]);
+    expect(scenario.stopAndStart).toHaveBeenCalledOnce();
+  });
+
+  it("preserves contention when recovery is already aborted", async () => {
+    const f = fixture();
+    const abort = new AbortController();
+    abort.abort();
+    const scenario = managedRecovery(f, { abortSignal: abort.signal });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.probe).not.toHaveBeenCalled();
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when the lifecycle deadline expires before managed stop", async () => {
+    const f = fixture();
+    let now = 0;
+    const scenario = managedRecovery(f, {
+      now: () => now,
+      validate: () => { now = 1_001; },
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when the health deadline expires after manager probing", async () => {
+    const f = fixture();
+    let expired = false;
+    const scenario = managedRecovery(f, {
+      now: () => expired ? 1_001 : 0,
+      observation: spec => {
+        expired = true;
+        return {
+          kind: "registered-running-valid",
+          name: spec.name,
+          scopeDigest: spec.scopeDigest,
+          nonce: spec.nonce,
+          managerPid: 111,
+        };
+      },
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when convergence cannot reserve one health millisecond", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    scenario.restartOptions.spawnTimeoutMs = 1;
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when the publication-owner probe throws", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f, {
+      owner: () => { throw new Error("owner probe failed"); },
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("propagates an ordinary managed restart failure after contention authorization", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    const failure = new Error("managed restart failed");
+    scenario.stopAndStart.mockRejectedValueOnce(failure);
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(failure);
+
+    expect(scenario.stopAndStart).toHaveBeenCalledOnce();
+    expect(scenario.ensure).not.toHaveBeenCalled();
+  });
+
+  it("uses only the canonical backend-publication owner proof", async () => {
+    const f = fixture();
+    const owner = vi.fn(() => ({
+      version: 1 as const,
+      pid: 111,
+      processStartTime: "birth-111",
+      nonce: "a".repeat(32),
+    }));
+    const scenario = managedRecovery(f);
+    scenario.restartOptions._readPrivateMutationLockOwnerForTesting = owner;
+
+    await restartDaemon(scenario.restartOptions);
+
+    expect(owner).toHaveBeenCalledTimes(2);
+    expect(owner).toHaveBeenNthCalledWith(
+      1,
+      join(f.root, ".lcm.backend-publication.lock"),
+      "backend publication",
+    );
+    expect(owner).toHaveBeenNthCalledWith(
+      2,
+      join(f.root, ".lcm.backend-publication.lock"),
+      "backend publication",
+    );
+  });
+
+  it("lets a stale concurrent recovery lose without a second managed stop", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f, {
+      observation: (spec, call) => {
+        if (call === 2) writeFileSync(f.pidPath, "222", { mode: 0o600 });
+        return {
+          kind: "registered-running-valid",
+          name: spec.name,
+          scopeDigest: spec.scopeDigest,
+          nonce: spec.nonce,
+          managerPid: 111,
+        };
+      },
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["valid response", async () => response(health(111, "2.0.0", "sqlite"))],
+    ["invalid response", async () => response({ nope: true })],
+  ] as const)("preserves contention after a %s", async (_name, fetch) => {
+    const f = fixture();
+    const scenario = managedRecovery(f, { fetch: vi.fn(fetch) as never });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  // A generic programming TypeError is not a daemon transport failure in either
+  // delivery form. An `async` seam only ever produces the rejected-promise
+  // form, so the synchronous throw needs its own control to prove the wrapper
+  // classifies both identically and authorizes no mutation.
+  it.each([
+    [
+      "a synchronous throw",
+      (): typeof globalThis.fetch => vi.fn((): never => {
+        throw new TypeError("Cannot read properties of undefined");
+      }) as never,
+    ],
+    [
+      "a rejected promise",
+      (): typeof globalThis.fetch => vi.fn(async (): Promise<never> => {
+        throw new TypeError("Cannot read properties of undefined");
+      }) as never,
+    ],
+  ] as const)(
+    "preserves contention for a generic health-fetch TypeError from %s",
+    async (_name, makeFetch) => {
+      const f = fixture();
+      const scenario = managedRecovery(f, { fetch: makeFetch() });
+
+      await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+      expect(scenario.stopAndStart).not.toHaveBeenCalled();
+      expect(scenario.ensure).not.toHaveBeenCalled();
+      expect(f.seams.killProcess).not.toHaveBeenCalled();
+      expect(f.seams.spawn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves contention after response headers when the body times out", async () => {
+    const f = fixture();
+    let timerCalls = 0;
+    const hangingResponse = {
+      status: 200,
+      body: null,
+      json: () => new Promise<never>(() => undefined),
+    } as unknown as Response;
+    const scenario = managedRecovery(f, { fetch: vi.fn(async () => hangingResponse) as never });
+    scenario.restartOptions._setTimeoutOverride = (callback) => {
+      timerCalls += 1;
+      if (timerCalls % 2 === 0) callback();
+      return {} as ReturnType<typeof setTimeout>;
+    };
+    scenario.restartOptions._clearTimeoutOverride = vi.fn();
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when caller validation rejects before managed stop", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f, {
+      validate: () => { throw new Error("config drift"); },
+    });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves contention when no pre-stop config validator is supplied", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    delete scenario.restartOptions._validateBeforeManagedRestart;
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
+  it("preserves the replacement publication failure after an authorized restart", async () => {
+    const f = fixture();
+    const replacement = new PrivateMutationLockContentionError("replacement still busy");
+    const scenario = managedRecovery(f, { replacementAssertion: replacement });
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(replacement);
+
+    expect(scenario.stopAndStart).toHaveBeenCalledOnce();
+    expect(scenario.assertions()).toBe(2);
+  });
+
+  it("refuses recovery when the lifecycle publication home is unknown", async () => {
+    const f = fixture();
+    const scenario = managedRecovery(f);
+    delete scenario.restartOptions._hermeticTestSeams;
+    scenario.restartOptions.pidFilePath = join(f.root, "daemon.pid");
+    scenario.restartOptions._platform = "linux";
+    scenario.restartOptions._procRoot = f.seams.procRoot;
+    scenario.restartOptions._uid = f.seams.uid;
+    scenario.restartOptions._fetchOverride = f.seams.fetch;
+    scenario.restartOptions._spawnOverride = f.seams.spawn;
+    scenario.restartOptions._spawnSyncOverride = f.seams.spawnSync;
+    scenario.restartOptions._killOverride = f.seams.killProcess;
+    scenario.restartOptions._isProcessAliveOverride = f.seams.isProcessAlive;
+
+    const originalEntrypoint = process.argv[1];
+    process.argv[1] = "/opt/test-runner.mjs";
+    try {
+      await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+    } finally {
+      process.argv[1] = originalEntrypoint;
+    }
+
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+  });
+
   it("uses bounded owned-state readers for publication capture", async () => {
     const f = fixture();
     writeFileSync(f.pidPath, "111", { mode: 0o600 });

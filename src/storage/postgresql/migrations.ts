@@ -45,6 +45,11 @@ const MIGRATION_MANIFEST = [
     filename: "0006_transfer_ledger.sql",
     sha256: "81fed3ac0a6059b6e2a536647a5ab5d8673322b7ba5804a60b068b927367983a",
   },
+  {
+    id: "0007_promoted_content_digest",
+    filename: "0007_promoted_content_digest.sql",
+    sha256: "13d5c5ced7aacb2ac8f474ba63d576541d24d9907f69015c6cefa053b7cf0dd7",
+  },
 ] as const;
 
 type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
@@ -70,6 +75,10 @@ type SchemaAclRow = QueryResultRow & {
   public_create: unknown;
 };
 type ServerEncodingRow = QueryResultRow & { server_encoding: unknown };
+type ContentCollationRow = QueryResultRow & {
+  collation_name: unknown;
+  collation_is_deterministic: unknown;
+};
 type ManagedObjectOwnershipRow = QueryResultRow & {
   current_user_name: unknown;
   expected_object_count: unknown;
@@ -630,12 +639,35 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       rewriteRule: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     },
   };
+  const promotedContentDigest: PostgreSqlSchemaSnapshot = {
+    ...transferLedger,
+    migrationId: "0007_promoted_content_digest",
+    generatedColumnIdentities: [
+      ...transferLedger.generatedColumnIdentities,
+      "promoted_memories|content_sha256",
+    ],
+    columnAclIdentities: [
+      ...transferLedger.columnAclIdentities,
+      "promoted_memories|content_sha256",
+    ],
+    indexNames: [
+      ...transferLedger.indexNames,
+      "promoted_memories_content_sha256_idx",
+    ],
+    definitionHashes: {
+      ...transferLedger.definitionHashes,
+      index: "0f99600ba91811264e144a2cf345fbfb3dc82b325242509d9c6ec88ca21580ca",
+      generatedColumn: "94e52664f5fc04804494538ef5215268d80f566cdc25a96b24df67c227ea350c",
+      columnAcl: "ceca33cadbfe1d2bbc51ba0ace9ed164e25ff334ae720ba41b80e6097e8fa771",
+    },
+  };
   return [
     baseline,
     machineIdentity,
     machineDisplayName,
     summaryContextIntegrity,
     transferLedger,
+    promotedContentDigest,
   ];
 }
 
@@ -753,6 +785,105 @@ export class PostgreSqlServerEncodingPreflightError extends StorageOperationErro
       requiredServerEncoding: this.requiredServerEncoding,
       remediation: this.remediation,
     };
+  }
+}
+
+export class PostgreSqlContentCollationPreflightError extends StorageOperationError {
+  constructor(
+    readonly collationName: string | null,
+    readonly collationIsDeterministic: boolean | null,
+  ) {
+    super(
+      "STORAGE_INITIALIZATION_FAILED",
+      "postgresql",
+      undefined,
+      "factory",
+      "preflightContentCollation",
+    );
+  }
+
+  readonly schemaName = "lcm";
+  readonly tableName = "promoted_memories";
+  readonly columnName = "content";
+  readonly remediation =
+    "Restore a deterministic collation on lcm.promoted_memories.content. "
+    + "A plain ALTER COLUMN cannot run directly because content has "
+    + "STORED generated columns depending on it: search_document "
+    + "always, and content_sha256 once migration 0007 has applied. "
+    + "Follow the \"Recovering from a nondeterministic "
+    + "promoted_memories.content collation\" procedure in "
+    + "docs/configuration.md, which selects the applicable recovery "
+    + "path from both the migration ledger and content_sha256's live "
+    + "existence, then rerun migrations. A "
+    + "nondeterministic collation lets raw content equality match rows "
+    + "whose generated content_sha256 digest differs, which would make "
+    + "findExactContent miss an existing duplicate.";
+
+  override toJSON(): Record<string, unknown> {
+    return {
+      ...super.toJSON(),
+      schemaName: this.schemaName,
+      tableName: this.tableName,
+      columnName: this.columnName,
+      collationName: this.collationName,
+      collationIsDeterministic: this.collationIsDeterministic,
+      remediation: this.remediation,
+    };
+  }
+}
+
+/**
+ * Fails closed when lcm.promoted_memories.content carries a
+ * nondeterministic collation. Reads pg_attribute/pg_collation live on
+ * every call rather than comparing against a recorded baseline, so a
+ * collation later dropped and recreated under the same qualified name
+ * (which changes its OID and determinism but not its display name) is
+ * still caught the next time this runs, whether at migration time or
+ * at recurring runtime-readiness admission. A no-op when the table or
+ * column does not exist yet, since migration 0002 has not necessarily
+ * run.
+ */
+export async function assertPromotedMemoriesContentCollationReady(
+  executor: PostgreSqlQueryExecutor,
+  options: { readonly operation?: string; readonly signal?: AbortSignal } = {},
+): Promise<void> {
+  const operation = options.operation ?? "preflightContentCollation";
+  const contentCollationResult = await executor.query<ContentCollationRow>({
+    text: `SELECT
+             pg_catalog.concat_ws(
+               '.', collation_namespace.nspname, collation_metadata.collname
+             ) AS collation_name,
+             collation_metadata.collisdeterministic
+               AS collation_is_deterministic
+           FROM pg_catalog.pg_attribute AS attribute
+           JOIN pg_catalog.pg_class AS relation
+             ON relation.oid OPERATOR(pg_catalog.=) attribute.attrelid
+           JOIN pg_catalog.pg_namespace AS namespace
+             ON namespace.oid OPERATOR(pg_catalog.=) relation.relnamespace
+           LEFT JOIN pg_catalog.pg_collation AS collation_metadata
+             ON collation_metadata.oid OPERATOR(pg_catalog.=)
+               attribute.attcollation
+           LEFT JOIN pg_catalog.pg_namespace AS collation_namespace
+             ON collation_namespace.oid OPERATOR(pg_catalog.=)
+               collation_metadata.collnamespace
+           WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
+             AND relation.relname OPERATOR(pg_catalog.=) 'promoted_memories'
+             AND attribute.attname OPERATOR(pg_catalog.=) 'content'`,
+  }, { domain: "factory", operation, signal: options.signal });
+  const contentCollationRow = contentCollationResult.rows[0];
+  if (contentCollationRow) {
+    const collationIsDeterministic = sanitizeBoolean(
+      contentCollationRow.collation_is_deterministic,
+    );
+    const collationName = typeof contentCollationRow.collation_name === "string"
+      ? contentCollationRow.collation_name
+      : null;
+    if (collationIsDeterministic !== true) {
+      throw new PostgreSqlContentCollationPreflightError(
+        collationName,
+        collationIsDeterministic,
+      );
+    }
   }
 }
 
@@ -1228,6 +1359,20 @@ export async function runPostgreSqlMigrations(
     throw new PostgreSqlServerEncodingPreflightError(serverEncoding);
   }
   await assertRequiredPostgreSqlExtensionsReady(executor, { signal: options.signal });
+  // Content-collation is a managed-table-specific precondition, not a
+  // database-wide environment property like postmaster identity, server
+  // encoding, or extension availability, so it runs after those checks
+  // rather than among them. It also reads pg_attribute/pg_collation,
+  // which is itself catalog inspection, but it must still fail closed
+  // before any DDL runs, so it stays here: after every environment-level
+  // precondition (including required extensions, since pgcrypto backs
+  // the digest() this constraint protects) and before the transaction
+  // that performs real schema inspection and migration DDL. If a
+  // required extension is missing or broken, that failure is reported
+  // first and this check never runs, because there is no point
+  // reporting a column-level collation defect on a database that cannot
+  // run the digest-backed migration at all.
+  await assertPromotedMemoriesContentCollationReady(executor, { signal: options.signal });
   return executor.transaction(async (transaction) => {
     await transaction.query({
       text: "SET LOCAL search_path = pg_catalog, public",

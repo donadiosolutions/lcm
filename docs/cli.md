@@ -161,6 +161,9 @@ closing the temporary descriptor also fails. The ordinary replacement writer
 also retains temporary-file cleanup errors. Durable writes retain subsequent
 cleanup errors in descriptor, temporary-file, and parent-directory order.
 These diagnostics help distinguish the original failure from cleanup trouble.
+After an exclusive temporary file is opened, an identity-capture failure still
+receives exactly one close attempt. The identity error remains the primary cause
+if closing also fails, and the unauthenticated temporary name is left in place.
 
 Exclusive creation has distinct outcomes. The non-durable
 `atomicWritePrivateFileExclusive` helper preserves pre-publication failures
@@ -522,6 +525,23 @@ It does not read `meta.json` to select projects or trust unbound metadata
 directories. Missing or unsafe discovery metadata therefore does not override
 a valid binding or become a separate metadata-scan failure. Storage and schema
 failures for selected projects are still reported as described above.
+
+Discovery filters the selected binding list before assigning its denominator
+and reports `scanning project N/M` before opening each project. An exact retired
+project-identity fence is diagnosed in both dry-run and normal discovery with
+the supported `lcm project renew-retired-identity` recovery command. Dry-run
+does not renew, remove a fence, create storage, or otherwise mutate identity.
+
+Compact progress and final results preserve a sanitized, width-bounded project,
+session ID, and conversation ID. When exactly one native transcript matches the
+session, its source locator is included; ambiguous or unavailable provenance is
+omitted. Native TTY, verbose TTY, non-TTY, and captured ANSI output use the same
+identity formatter. Each append-only terminal line describes only that item's
+`done`, `unchanged`, `skipped`, `failed`, or `dry-run` outcome. Invocation-wide
+failures are labeled separately as `failure total`, and every mode prints a
+final summary whose Failed section lists each failed item once. A discovery
+failure contributes to the cumulative total but does not count as a processed
+session.
 
 ### Managed-daemon recovery
 

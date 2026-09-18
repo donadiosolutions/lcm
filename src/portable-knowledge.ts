@@ -234,12 +234,14 @@ export async function importKnowledge(
       }
     },
   }, async ({ storage, project }) => storage.transaction(async (repositories) => {
-    // One scan per transaction, indexed before any deduplication changes rows.
-    // SQLite retains its legacy source filter; PostgreSQL owns rows separately
-    // from provenance, so the scan and dedup must include the same owner scope.
+    // One scan per transaction, taken before deduplication changes rows. It
+    // seeds only the in-transaction retry-digest set used for skip and count;
+    // canonical and collapsed metadata are never taken from this snapshot,
+    // they are read live after the write that changes each row. SQLite
+    // retains its legacy source filter; PostgreSQL owns rows separately from
+    // provenance, so the scan and dedup must include the same owner scope.
     const sourceProjectId = storage.backend === "sqlite" ? project.id : undefined;
     const rows = await repositories.promotedMemory.getAll({ sourceProjectId });
-    const metadataById = new Map(rows.map((row) => [row.id, row.metadata]));
     const importedDigests = new Set(rows.flatMap((row) => retryDigests(row.metadata)));
     let imported = 0;
     let skipped = prepared.errors.length;
@@ -252,9 +254,13 @@ export async function importKnowledge(
         promotedMemory: new Proxy(repositories.promotedMemory, {
           get(target, property) {
             if (property === "archive") return async (id: string) => {
-              // Every active candidate came from the initial scan or this loop.
-              collapsed.push(metadataById.get(id)!);
+              // The archive write orders this read after the mutation within
+              // this transaction; under PostgreSQL it additionally holds the
+              // row lock until commit, so the read sees any concurrent
+              // writer's committed metadata for this row.
               await target.archive(id);
+              const archived = await target.getById(id);
+              collapsed.push(archived?.metadata ?? {});
             };
             const method = Reflect.get(target, property) as (...args: unknown[]) => unknown;
             return method.bind(target);
@@ -266,15 +272,20 @@ export async function importKnowledge(
         content: scrubber.scrub(entry.content),
         tags: entry.tags.map((tag) => scrubber.scrub(tag)),
         sourceProjectId,
+        candidateScope: "owner",
+        backend: storage.backend,
         sessionId: entry.sessionId ?? undefined,
         depth: 0, confidence, thresholds: DEFAULT_DEDUP_THRESHOLDS,
       });
-      const canonical = metadataById.get(id) ?? {};
+      // Live read after the write dedup already performed on this row (the
+      // canonical UPDATE or the insert) so a concurrent writer's committed
+      // metadata for this row is visible under READ COMMITTED.
+      const current = await repositories.promotedMemory.getById(id);
+      const canonical = current?.metadata ?? {};
       const digests = [...new Set([...collapsed.flatMap(retryDigests), ...retryDigests(canonical), digest])];
       // Retain metadata from collapsed rows; canonical values win key conflicts.
       const metadata: JsonObject = Object.assign(Object.create(null) as JsonObject, ...collapsed, canonical, { [IMPORT_DIGESTS]: digests });
       await repositories.promotedMemory.update(id, { metadata });
-      metadataById.set(id, metadata);
       for (const key of digests) importedDigests.add(key);
       imported++;
     }

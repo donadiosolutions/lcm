@@ -31,7 +31,10 @@ imported from elsewhere. Import compares against that same owner scope, so an
 existing normal promotion can be merged and retains its metadata and retry
 history. A memory's origin does not grant access to another remote project.
 SQLite keeps its existing project-origin filter for this version 1 format.
-Exact content matches merge regardless of search rank on either backend.
+For PostgreSQL, owner-bound exact content matches merge even when the row is
+outside the bounded fuzzy candidate page. Repeating the same document then
+uses its stored retry identities to skip already accepted entries. SQLite keeps
+its existing source-scoped search and deduplication behavior.
 Nonidentical content still requires the configured deduplication threshold.
 
 ## Version 1 format and privacy
@@ -89,6 +92,23 @@ scrub rules. Editing an entry, moving it to a different position, or changing th
 source project makes a different import identity and invokes normal content
 deduplication. Duplicate collapse retains retry identities and existing metadata;
 canonical metadata values win conflicting keys.
+
+If another import or promotion commits a matching memory for the same project
+while an import is running, and this import's own deduplication has already
+matched that same memory, the import merges into its current stored metadata
+instead of replacing it, so the other writer's notes and retry identities
+survive rather than being overwritten. Both memories' retry identities are
+then recognized by later replays. An entry another import already committed
+just before this run observed it may still be reported as imported by this
+run; that costs no metadata and no retry identity.
+
+This protects a memory once two imports have matched it as the same memory.
+It does not stop two imports that each find no existing match for the same
+new content from both inserting it: nothing currently serializes that
+decision against a concurrent insert, so two imports of matching new content
+run at the same time can still create two separate active memories with
+identical content. A later replay of either source document recognizes its
+own retry identity and is skipped, but the two memories are not merged.
 
 Successful commands exit zero. Operational failures, including failed projects
 in `export --all`, exit one. JSON output contains the requested payload; progress

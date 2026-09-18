@@ -16,6 +16,8 @@ import {
   validatePostgreSqlMigrations,
   validatePostgreSqlSchemaSnapshotRegistry,
   type PostgreSqlSchemaSnapshot,
+  assertPromotedMemoriesContentCollationReady,
+  PostgreSqlContentCollationPreflightError,
 } from "./migrations.js";
 import {
   assertPostgreSqlSearchConfigurationReady,
@@ -898,6 +900,7 @@ export type PostgreSqlRuntimeReadinessFailureReason =
   | "server-preflight"
   | "extension-preflight"
   | "search-preflight"
+  | "content-collation-preflight"
   | "schema-ownership"
   | "migration-ledger"
   | "schema-fingerprint"
@@ -3900,6 +3903,22 @@ async function verifyPostgreSqlSchema(
       operation: "runtimeReadinessExtensions",
       signal,
     });
+    // Same-position rationale as the migration-time preflight: content
+    // collation is a managed-table-specific precondition that runs
+    // after required-extension readiness (pgcrypto backs the digest()
+    // this check protects) rather than among the database-wide
+    // environment checks above it. Unlike the ordinary-column
+    // fingerprint elsewhere in this function, which only flags drift
+    // from a recorded baseline, this reads pg_collation live on every
+    // call, so it keeps failing closed even if an administrator later
+    // drops and recreates an accepted collation under the same
+    // qualified name as nondeterministic: the name in a stored
+    // fingerprint would still match, but this check does not rely on
+    // a stored fingerprint at all.
+    await assertPromotedMemoriesContentCollationReady(executor, {
+      operation: "runtimeReadinessContentCollation",
+      signal,
+    });
     await inspectRequiredExtensionFunctions(executor, signal);
     await inspectRequiredExtensionOperator(executor, signal);
     await inspectRequiredGinTrgmOperatorClass(executor, signal);
@@ -3970,6 +3989,9 @@ async function verifyPostgreSqlSchema(
     if (error instanceof PostgreSqlRuntimeReadinessError) throw error;
     if (error instanceof PostgreSqlExtensionPreflightError) {
       throw readinessError("extension-preflight", "runtimeReadinessExtensions");
+    }
+    if (error instanceof PostgreSqlContentCollationPreflightError) {
+      throw readinessError("content-collation-preflight", "runtimeReadinessContentCollation");
     }
     if (error instanceof PostgreSqlSearchConfigurationPreflightError) {
       throw readinessError("search-preflight", "runtimeReadinessSearchConfiguration");

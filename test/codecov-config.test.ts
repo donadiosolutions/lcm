@@ -41,7 +41,9 @@ const expectedComponents = [
   {
     component_id: "unit-cli",
     name: "Unit - CLI",
+    // #1283 keeps renewal admission and bounded compact rendering CLI-owned.
     // #1132 keeps foreground PID publication at the CLI boundary.
+    // #1233 keeps publication-contention restart recovery at the CLI boundary.
     paths: ["bin/", "src/cli/", "^src/cli-help\\.ts$", "^src/cli-storage\\.ts$"],
   },
   {
@@ -77,11 +79,14 @@ const expectedComponents = [
       "^src/scrub\\.ts$",
       "^src/secret-key\\.ts$",
       // #1032 keeps retained-parent atomic-write outcome hardening in this owner.
+      // #1285 preserves ordered collision and task-owned temporary cleanup
+      // evidence in the retained-parent exclusive private-file writer.
       "^src/security-files\\.ts$",
       // #1133 keeps project-pattern owner/single-link admission and authenticated
       // single-snapshot scrubbing in this existing configuration-security owner.
       "^src/sensitive\\.ts$",
       "^src/shell-quote\\.ts$",
+      // #1283 keeps sanitize-then-bound terminal fields in this owner.
       "^src/terminal-sanitize\\.ts$",
       "^src/types\\.ts$",
       "^src/url-display\\.ts$",
@@ -95,10 +100,13 @@ const expectedComponents = [
   {
     component_id: "unit-hooks",
     name: "Unit - Hooks",
+    // #1270 keeps retired-fence scrubbing and diagnostics hook-owned.
     // #1225 composes SessionStart pruning with append admission in this owner.
     // #1197 keeps independent SessionEnd background failure containment hook-owned.
     // #1259 keeps publication-fence error classification and ordered final
     // root-validation/descriptor-close evidence in the existing hooks owner.
+    // #1229 forwards local-enqueue health diagnostics through its live
+    // publication token in this existing hooks owner.
     // PreCompact initial unsafe-storage diagnostics remain in that same owner.
     paths: ["src/hooks/"],
   },
@@ -116,6 +124,7 @@ const expectedComponents = [
       "^src/daemon/orientation\\.ts$",
       "^src/daemon/project-queue\\.ts$",
       "^src/daemon/publication-queue\\.ts$",
+      // #1270/#1283 keep renewed hook identity selection daemon-core-owned.
       "^src/daemon/project\\.ts$",
       // #1106 keeps periodic transcript metadata admission daemon-core-owned.
       // Monotonic proxy startup polling remains daemon-core-owned.
@@ -126,10 +135,16 @@ const expectedComponents = [
       // quoted/root-only backslash handoff, #1010 pathless-tail brackets,
       // #1060 adjacent nested-file schemes, #1113 doubled-colon drive tails,
       // #1117 glued authorities, #1111 bracketed nested-URL idempotence,
-      // #1118 quoted query-tail handoff, #1128 active own-query and IPv6
-      // # bracket-boundary backslash paths, #1141 single-slash file tails,
-      // # and #1156 forced drive-after-content continuations remain
-      // # daemon-core-owned.
+      // #1118/#1303 quoted query-tail handoff, #1128 active own-query and
+      // IPv6 bracket-boundary backslash paths, #1294 retained-query syntax and
+      // raw-marker collision handling, contextual Windows-root ownership, and
+      // ampersand/quoted-public query/private-return lifetime, depth-bound
+      // nested-file parent/query/public return, and pipe wrapper handoffs,
+      // #1304 closed-bracket path handoff, #1312/#1313 repeated POSIX/Windows
+      // nested-public delimiter handoff,
+      // #1317 stable unquoted-wrapper public URLs, #1141 single-slash file
+      // tails, and #1156 forced drive-after-content continuations remain
+      // daemon-core-owned.
       "^src/daemon/safe-error\\.ts$",
       "^src/daemon/server\\.ts$",
       "^src/daemon/summarizer\\.ts$",
@@ -165,6 +180,8 @@ const expectedComponents = [
     // #898 applies required promoted tags before the caller result maximum while retaining local-persistence ownership.
     // #898's guarded dual-JSON eligibility keeps this search in the same owner.
     // #989 retains event-sidecar parent authentication in this owner.
+    // #1191 retains publication admission through mutating sidecar reads,
+    // close, stop rechecks, eligibility, and orphan pruning in this owner.
     // #1082 keeps SQLite promoted-content NUL admission and replay guards in
     // local persistence; this change does not alter component ownership.
     // #618 optional receipt schema admission stays local-persistence-owned.
@@ -184,6 +201,9 @@ const expectedComponents = [
       // #844 and #942 keep coordinator evidence, material, and checkpoint
       // directory-witness authentication in this owner.
       // #1240 keeps authenticated terminal-maintenance configuration admission here.
+      // #1292 preserves structured parser errors on terminal journal archive rereads.
+      // #1285 retains terminal archive history identity through exclusive
+      // publication, exact replay, and descriptor-bound durability flushes.
       "^src/storage/backend-publication\\.ts$",
       // #910 keeps shared publication retry deadlines monotonic in this owner.
       "^src/storage/publication-convergence\\.ts$",
@@ -216,6 +236,8 @@ const expectedComponents = [
     name: "Unit - Local Event Storage",
     // #622 keeps outbox connection admission and current-schema validation here.
     // #1247 keeps explicit promotion queue admission in this component.
+    // #1229 admits local outbox health, recent-error, and delivery diagnostics
+    // through an optional live publication token here.
     paths: [
       "^src/storage/local-hook-event-sequence\\.ts$",
       "^src/storage/local-hook-outbox\\.ts$",
@@ -227,7 +249,8 @@ const expectedComponents = [
     component_id: "unit-transcripts-import",
     name: "Unit - Transcripts and Import",
     paths: [
-      // #1106 bounded custom-directory metadata stays within this import owner.
+      // #1106 bounded custom-directory metadata and #1286 Claude block
+      // admission stay within this import owner.
       "^src/codex-transcript\\.ts$",
       "^src/import-summary\\.ts$",
       "^src/import\\.ts$",
@@ -253,6 +276,7 @@ const expectedComponents = [
   {
     component_id: "unit-compaction-summarization",
     name: "Unit - Compaction and Summarization",
+    // #1283 keeps structured retired-fence discovery in this component.
     paths: [
       // #618 authenticated batch discovery remains within this compaction owner.
       "^src/batch-compact\\.ts$",
@@ -282,6 +306,8 @@ const expectedComponents = [
       "^src/portable-knowledge\\.ts$",
       // #1049 keeps project metadata owner and single-link admission in this
       // existing component; no taxonomy, status, or policy change.
+      // #1270/#1283 retain exact fence classification and local successor
+      // renewal in this existing project/worktree owner.
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
       // #1044 keeps the existing owner; no taxonomy, status, or policy change.
@@ -297,6 +323,12 @@ const expectedComponents = [
       // recovery, and listing hardening in this existing worktree owner.
       // #1173 keeps promoted-content reconciliation guards in this existing
       // project/worktree ownership component; no topology change.
+      // #1178 listing-root authentication and #1245 retained journal-parent
+      // witness stay in this existing unit-project-worktrees owner.
+      // #1316 keeps SQLite message-byte admission in this existing
+      // unit-project-worktrees owner; no taxonomy or topology change.
+      // #1270/#1283 keep renewed-successor targeting and its fail-closed
+      // fence authentication in this existing unit-project-worktrees owner.
       "^src/worktree-reconciliation\\.ts$",
     ],
   },
@@ -313,6 +345,7 @@ const expectedComponents = [
       // #865/#966 convergence and birth budgeting remain lifecycle-owned;
       // #1073 bounds legacy PID/token evidence within that same owner. #1132
       // keeps unscoped detached PID publication lifecycle-owned.
+      // #1233 keeps publication-contention managed restart recovery lifecycle-owned.
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",
@@ -352,6 +385,8 @@ const expectedComponents = [
       "^src/storage/postgresql/extensions\\.ts$",
       // #1195 keeps packaged SQL loading and checksum verification in
       // the existing PostgreSQL schema owner.
+      // #1306 adds the 0007 promoted-content digest migration and its
+      // schema snapshot, keeping the packaged migration manifest here.
       "^src/storage/postgresql/migrations\\.ts$",
       "^src/storage/postgresql/provisioning\\.ts$",
       "^src/storage/postgresql/runtime-readiness\\.ts$",
@@ -382,6 +417,8 @@ const expectedComponents = [
     component_id: "integration-postgresql-memory",
     name: "Integration - PostgreSQL Memory",
     paths: [
+      // #1306 indexes owner exact-content lookup by a generated SHA-256
+      // digest, retaining the raw-equality residual it always used.
       "^src/storage/postgresql/memory-repositories\\.ts$",
       "^src/storage/postgresql/summary-context-repositories\\.ts$",
     ],
@@ -588,7 +625,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(243);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1196 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -642,6 +679,9 @@ describe("Codecov configuration", () => {
       // #1049 keeps project metadata owner and single-link admission here.
       ["src/project-map.ts", "unit-project-worktrees"],
       // #889 keeps private import metadata publication in this owner.
+      // #1308 keeps import metadata convergence in this existing owner;
+      // canonical and collapsed metadata are now read live after the write
+      // that changes each row, not from a scan-time snapshot.
       ["src/portable-knowledge.ts", "unit-project-worktrees"],
       // #866 stats config retries and journal failures, plus #973 project
       // database admission, retain this owner.
@@ -716,7 +756,11 @@ describe("Codecov configuration", () => {
       ["src/daemon/supervisor.ts", "integration-service-managers"],
       // #837 consumer-admission descriptor cleanup remains storage-owned.
       // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
+      // #1307 explicit-only retained append admission for non-append mutation
+      // participants stays storage-abstractions-owned.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
+      // #1229 local outbox diagnostic admission stays local-event-storage-owned.
+      ["src/storage/local-hook-outbox.ts", "unit-local-event-storage"],
       ["src/storage/local-hook-outbox-schema.ts", "unit-local-event-storage"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
       ["src/migration/maintenance.ts", "unit-migration-cutover"],
@@ -727,11 +771,18 @@ describe("Codecov configuration", () => {
       ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
       // #1195 checksummed packaged migration loading remains schema-owned.
+      // #1306 adds the 0007 promoted-content digest migration and its
+      // schema snapshot, keeping the packaged migration manifest here.
       ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"],
+      // #1306 indexes owner exact-content lookup by a generated SHA-256
+      // digest, retaining the raw-equality residual it always used.
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.
       // #1101 numeric skipped-sidecar counts stay local-persistence-owned.
+      // #1191 mutating sidecar scan lifetime stays local-persistence-owned.
+      // #1307 queue-before-consumer ordering for mutating sidecar scans stays
+      // local-persistence-owned.
       ["src/db/event-sidecars.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"],
       ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"],
@@ -752,6 +803,8 @@ describe("Codecov configuration", () => {
       ["src/store/conversation-store.ts", "unit-local-persistence"],
       ["src/db/stored-timestamp.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
+      // #1229 local-enqueue health-token forwarding stays hook-owned.
+      ["src/hooks/local-enqueue.ts", "unit-hooks"],
       ["src/hooks/post-tool.ts", "unit-hooks"],
       ["src/hooks/publication-fence.ts", "unit-hooks"],
       // #1155 retains SessionStart outbox pruning admission in the hook owner.

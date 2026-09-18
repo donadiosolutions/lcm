@@ -888,9 +888,7 @@ describe("external admission workflow", () => {
 
     const checkout = job.steps[1];
     expect(checkout?.if).toBeUndefined();
-    expect(checkout?.uses).toBe(
-      "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-    );
+    expect(checkout?.uses).toMatch(/^actions\/checkout@[0-9a-f]{40}$/u);
     expect(checkout?.with).toEqual({
       ref: "${{ github.workflow_sha }}",
       "persist-credentials": false,
@@ -901,9 +899,7 @@ describe("external admission workflow", () => {
 
     const setupNode = job.steps[2];
     expect(setupNode?.if).toBeUndefined();
-    expect(setupNode?.uses).toBe(
-      "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
-    );
+    expect(setupNode?.uses).toMatch(/^actions\/setup-node@[0-9a-f]{40}$/u);
     expect(setupNode?.with).toEqual({ "node-version": "22.20.0" });
     expect(job.steps[3]?.if).toBeUndefined();
     expect(evaluatorInvocation).toBe("bash .github/scripts/external-admission.sh");

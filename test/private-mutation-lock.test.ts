@@ -110,6 +110,31 @@ describe("private mutation lock release recovery", () => {
     expect(existsSync(lockPath)).toBe(false);
   });
 
+  it("does not retry when retained-parent descriptor traversal is unavailable", () => {
+    const { lockPath } = makeLock();
+    writeFileSync(lockPath, ownerContent("f".repeat(32), {
+      processStartTime: currentProcessStartTime(),
+    }), { mode: 0o600 });
+    const unsupported = new Error("descriptor traversal unsupported");
+    let callbacks = 0;
+    let publishes = 0;
+    const operations = {
+      deleteRegularFile,
+      _beforeOwnerReadPostStatForTesting: () => unlinkSync(lockPath),
+      _descriptorPathForTesting: () => {
+        throw unsupported;
+      },
+    } as unknown as Parameters<typeof withPrivateMutationLock>[4];
+
+    expect(() => withPrivateMutationLock(lockPath, "test", () => {
+      callbacks += 1;
+    }, (event) => {
+      if (event === "before-main-lock-publish") publishes += 1;
+    }, operations)).toThrow(unsupported);
+    expect(publishes).toBe(1);
+    expect(callbacks).toBe(0);
+  });
+
   it.each(["regular", "symlink", "directory"] as const)(
     "does not retry an owner identity change when a %s replacement is present",
     (kind) => {

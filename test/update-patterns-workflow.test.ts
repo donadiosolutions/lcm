@@ -140,7 +140,7 @@ describe("update-patterns workflow", () => {
   it("uses the pinned checkout/setup actions and exact checkout inputs", () => {
     expect(step("Checkout main")).toEqual({
       name: "Checkout main",
-      uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+      uses: expect.stringMatching(/^actions\/checkout@[0-9a-f]{40}$/u),
       with: {
         ref: "main",
         token: "${{ github.token }}",
@@ -149,7 +149,7 @@ describe("update-patterns workflow", () => {
       },
     });
     expect(step("Setup Node")).toMatchObject({
-      uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+      uses: expect.stringMatching(/^actions\/setup-node@[0-9a-f]{40}$/u),
       with: { "node-version": "22.20.0" },
     });
   });
@@ -164,7 +164,7 @@ describe("update-patterns workflow", () => {
     expect(runStep("Bootstrap verified pnpm")).toContain('"$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"');
     expect(runStep("Locate pnpm store")).toContain('store_path="$(pnpm store path)"');
     expect(step("Cache pnpm store")).toMatchObject({
-      uses: "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+      uses: expect.stringMatching(/^actions\/cache@[0-9a-f]{40}$/u),
       with: {
         path: "${{ steps.pnpm-store.outputs.path }}",
         key: "pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-22.20.0-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}",

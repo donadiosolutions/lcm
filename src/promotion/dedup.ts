@@ -151,7 +151,24 @@ export async function deduplicateAndInsertInRepositories(
     undefined,
     candidateSourceProjectId,
   );
-  const duplicates = candidates.filter(
+  const exact = input.candidateScope === "owner" && input.backend === "postgresql"
+    ? await repositories.promotedMemory.findExactContent(input.content, candidateSourceProjectId)
+    : null;
+  const exactCandidate = exact === null ? [] : [{
+    id: exact.id,
+    content: exact.content,
+    tags: exact.tags,
+    projectId: exact.projectId,
+    sessionId: exact.sessionId,
+    confidence: exact.confidence,
+    createdAt: exact.createdAt,
+    rank: 0,
+  }];
+  const fuzzyIds = new Set(candidates.map((candidate) => candidate.id));
+  const combinedCandidates = exact !== null && !fuzzyIds.has(exact.id)
+    ? [...exactCandidate, ...candidates]
+    : candidates;
+  const duplicates = combinedCandidates.filter(
     (candidate) => isDuplicateCandidate(candidate, input.content, input.thresholds.dedupBm25Threshold),
   );
   if (duplicates.length === 0) {

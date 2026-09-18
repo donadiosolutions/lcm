@@ -10,7 +10,10 @@ Keep full S0/denominator separate from its remediation subset. Persist T0, TF,
 freeze SHA, native types/parents/hierarchy and triage dispositions/evidence alongside
 shared candidate/review/round/PR and installed-artifact records. The root Epic records
 stable run identity, coordinator task/host and relative scratch/checkpoint location;
-keep private absolute paths and secrets out. Preserve successor recovery.
+keep private absolute paths and secrets out. Record the current verified runtime
+root separately from the logical run ID and preserve predecessor/successor handoff
+evidence. Remediation uses that current root with unchanged S0, scope, recovery
+record and spent budgets; replacement never resets triage accounting.
 
 Resume requested runs; an unrelated open Epic neither blocks authorized new work
 nor authorizes takeover. Recheck parents before attachment/dispatch and preserve

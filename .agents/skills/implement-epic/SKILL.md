@@ -16,8 +16,13 @@ These are invocation instructions, not CLI flags.
 Execution follows the existing plan, repository rules and explicit user limits.
 Reading/editing/testing skills authorizes no workers, issue changes or installation.
 Read [LCM integration](../shared/lcm-development.md), repository/local rules and
-memory, then [procedural-development](../procedural-development/SKILL.md) and both
-references. Preserve the same root/run/budgets; do not launch another coordinator.
+memory, then [procedural-development](../procedural-development/SKILL.md) and its
+coordination/delivery references. Preserve the logical run and budgets; do not launch a competing
+coordinator. Read prior records to locate work and evidence, then verify operational
+claims against their owning systems. Apply [root lifecycle](../procedural-development/references/root-lifecycle.md)
+admission before the first worker dispatch or unattended wait. Explicit replacement
+of an archived/failed root follows that reference's coordinator handoff, not a new
+campaign or a reset of historical evidence.
 
 ## Assess and freeze
 
@@ -59,7 +64,7 @@ belong with the user through the root.
 
 ## Execute and checkpoint
 
-Invoke the shared workflow with the same root/run/recovery record, remaining
+Invoke the shared workflow with the current verified root, preserved run/recovery record, remaining
 inventory, completed evidence, readiness graph, owners/budgets, resolved settings,
 target and repository delivery policy. Shared procedures own implementation,
 review, remediation, publication and recovery, including every later head change.

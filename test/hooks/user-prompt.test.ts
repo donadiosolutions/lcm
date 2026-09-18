@@ -17,6 +17,10 @@ import {
   BackendPublicationJournalError,
 } from "../../src/storage/backend-publication.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
+import {
+  RETIRED_PROJECT_IDENTITY_DIAGNOSTIC,
+  RetiredProjectIdentityError,
+} from "../../src/worktree-reconciliation-fence.js";
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn(),
@@ -475,6 +479,32 @@ describe("handleUserPromptSubmit", () => {
     } finally {
       scrub.mockRestore();
       fence.mockRestore();
+    }
+  });
+
+  it("skips passive events for a retired identity and continues prompt search", async () => {
+    const event = { type: "decision", category: "decision", data: "use SQLite", priority: 1 };
+    const scrub = vi.spyOn(eventScrubbing, "scrubExtractedEvents")
+      .mockRejectedValueOnce(new RetiredProjectIdentityError());
+    const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    mockExtractUserPromptEvents.mockReturnValueOnce([event]);
+    mockEnsureDaemon.mockResolvedValueOnce({ connected: true, port: 3737, spawned: false });
+    const post = vi.fn().mockResolvedValue({ hints: [] });
+    try {
+      await expect(handleUserPromptSubmit(
+        JSON.stringify({ prompt: "hello", cwd: "/proj", session_id: "s1", client: "codex" }),
+        asDaemonClient({ post }),
+        3737,
+        { backend: "sqlite" },
+      )).resolves.toEqual(EMPTY_HOOK_RESULT);
+      expect(post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({ query: "hello" }));
+      expect(mockEventsDbPath).not.toHaveBeenCalled();
+      expect(stderr.mock.calls.flat().join("")).toBe(`${RETIRED_PROJECT_IDENTITY_DIAGNOSTIC}\n`);
+    } finally {
+      scrub.mockRestore();
+      fence.mockRestore();
+      stderr.mockRestore();
     }
   });
 

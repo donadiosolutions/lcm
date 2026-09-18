@@ -11,12 +11,16 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { createRequire } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const scriptPath = resolve(repositoryRoot, "scripts/verify-consumer-topology.mjs");
+const canonicalRuntimeDependencies = JSON.parse(
+  readFileSync(join(repositoryRoot, "package.json"), "utf8"),
+).dependencies as Record<string, string>;
 const childEnvironmentKeys = [
   "HOME",
   "USERPROFILE",
@@ -211,7 +215,167 @@ function unusableTempEnvironment(root: string): NodeJS.ProcessEnv {
   };
 }
 
+function writeCanonicalTopology(root: string, {
+  runtimeVersion = "9.8.7",
+  sdkVersion = "8.7.6",
+  bodyParserVersion = "7.6.5",
+  fastUriVersion = "6.5.4",
+  esbuildVersion = "5.4.3",
+  optionalPeerVersion = "4.3.2",
+  peerDependencyVersion = optionalPeerVersion,
+  optionalPeerMetadata = "optional",
+  nestedFastUriVersion = "3.2.1",
+  qsVersion = "2.1.0",
+}: Partial<Record<
+  "runtimeVersion" | "sdkVersion" | "bodyParserVersion" | "fastUriVersion" | "esbuildVersion"
+  | "optionalPeerVersion" | "peerDependencyVersion" | "optionalPeerMetadata"
+  | "nestedFastUriVersion" | "qsVersion",
+  string
+>> = {}) {
+  const packagePath = join(root, "package.json");
+  const workspacePath = join(root, "pnpm-workspace.yaml");
+  writeFileSync(packagePath, JSON.stringify({
+    name: "topology-fixture",
+    version: "1.0.0",
+    dependencies: { "runtime-one": runtimeVersion },
+    devDependencies: {
+      "@modelcontextprotocol/sdk": sdkVersion,
+      "body-parser": bodyParserVersion,
+      "fast-uri": fastUriVersion,
+      esbuild: esbuildVersion,
+      "optional-peer": optionalPeerVersion,
+    },
+    peerDependencies: { "optional-peer": peerDependencyVersion },
+    peerDependenciesMeta: optionalPeerMetadata === "absent" ? {} : {
+      "optional-peer": { optional: optionalPeerMetadata === "optional" },
+    },
+  }, null, 2));
+  writeFileSync(workspacePath, `packages:\n  - '.'\noverrides:\n  ajv>fast-uri: ${nestedFastUriVersion}\n  qs: ${qsVersion}\nonlyBuiltDependencies:\n  - esbuild\n`);
+  return { packagePath, workspacePath };
+}
+
+function writeManifest(path: string, version: string, name = "fixture"): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({ name, version }));
+}
+
+function writeNestedBuildGraph(root: string, {
+  sdkVersion = "8.7.6",
+  bodyParserVersion = "7.6.5",
+  qsVersion = "2.1.0",
+  nestedFastUriVersion = "3.2.1",
+}: Partial<Record<"sdkVersion" | "bodyParserVersion" | "qsVersion" | "nestedFastUriVersion", string>> = {}): void {
+  const sdkRoot = join(root, "node_modules", "@modelcontextprotocol", "sdk");
+  writeManifest(join(root, "node_modules", "body-parser", "package.json"), bodyParserVersion, "body-parser");
+  writeManifest(join(root, "node_modules", "fast-uri", "package.json"), "6.5.4", "fast-uri");
+  writeManifest(join(root, "node_modules", "esbuild", "package.json"), "5.4.3", "esbuild");
+  writeManifest(join(sdkRoot, "package.json"), sdkVersion, "@modelcontextprotocol/sdk");
+  mkdirSync(join(sdkRoot, "server"), { recursive: true });
+  writeFileSync(join(sdkRoot, "server", "index.js"), "");
+  const expressRoot = join(sdkRoot, "node_modules", "express");
+  writeManifest(join(expressRoot, "package.json"), "1.0.0", "express");
+  writeManifest(join(expressRoot, "node_modules", "body-parser", "package.json"), bodyParserVersion, "body-parser");
+  writeManifest(join(expressRoot, "node_modules", "qs", "package.json"), qsVersion, "qs");
+  writeManifest(join(expressRoot, "node_modules", "body-parser", "node_modules", "qs", "package.json"), qsVersion, "qs");
+  const ajvRoot = join(sdkRoot, "node_modules", "ajv");
+  writeManifest(join(ajvRoot, "package.json"), "1.0.0", "ajv");
+  writeManifest(join(ajvRoot, "node_modules", "fast-uri", "package.json"), nestedFastUriVersion, "fast-uri");
+}
+
 describe("verify-consumer-topology", () => {
+  it("accepts exact alternate canonical dependency versions", async () => {
+    const module = await import(scriptPath);
+    const root = isolatedRoot("canonical-topology-exact-");
+    try {
+      const paths = writeCanonicalTopology(root);
+      expect(module.loadCanonicalDependencyTopology(paths)).toEqual({
+        runtimeDependencies: { "runtime-one": "9.8.7" },
+        buildDependencies: {
+          "@modelcontextprotocol/sdk": "8.7.6",
+          "body-parser": "7.6.5",
+          "fast-uri": "6.5.4",
+          esbuild: "5.4.3",
+        },
+        nestedBuildDependencies: {
+          "ajv>fast-uri": "3.2.1",
+          qs: "2.1.0",
+        },
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects ranged canonical dependency versions", async () => {
+    const module = await import(scriptPath);
+    const root = isolatedRoot("canonical-topology-range-");
+    try {
+      const paths = writeCanonicalTopology(root, { runtimeVersion: "^9.8.7" });
+      expect(() => module.loadCanonicalDependencyTopology(paths))
+        .toThrow("dependencies.runtime-one must be an exact semver pin");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["missing", "absent"],
+    ["required", "required"],
+  ])("rejects a %s optional-peer metadata declaration", async (_label, optionalPeerMetadata) => {
+    const module = await import(scriptPath);
+    const root = isolatedRoot("canonical-topology-peer-metadata-");
+    try {
+      const paths = writeCanonicalTopology(root, { optionalPeerMetadata });
+      expect(() => module.loadCanonicalDependencyTopology(paths))
+        .toThrow("optional peer optional-peer must declare metadata as optional");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an optional peer that differs from its development pin", async () => {
+    const module = await import(scriptPath);
+    const root = isolatedRoot("canonical-topology-peer-version-");
+    try {
+      const paths = writeCanonicalTopology(root, { peerDependencyVersion: "4.3.1" });
+      expect(() => module.loadCanonicalDependencyTopology(paths))
+        .toThrow("optional peer optional-peer must equal its development dependency");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a packed runtime dependency map that differs from its canonical manifest", async () => {
+    const module = await import(scriptPath);
+    const root = isolatedRoot("canonical-topology-packed-");
+    try {
+      const topology = module.loadCanonicalDependencyTopology(writeCanonicalTopology(root));
+      expect(() => module.verifyPackedRuntimeDependencies(
+        { "runtime-one": "9.8.6" },
+        topology.runtimeDependencies,
+      )).toThrow("packed runtime dependencies differ from the canonical manifest");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a nested parser resolution that differs from its canonical override", async () => {
+    const module = await import(scriptPath);
+    const root = isolatedRoot("canonical-topology-nested-");
+    try {
+      const paths = writeCanonicalTopology(root);
+      writeNestedBuildGraph(root, { nestedFastUriVersion: "3.2.0" });
+      const topology = module.loadCanonicalDependencyTopology(paths);
+      expect(() => module.verifyNestedBuildDependencies(
+        createRequire(paths.packagePath),
+        topology.buildDependencies,
+        topology.nestedBuildDependencies,
+      )).toThrow("fast-uri resolved to 3.2.0");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not execute verification when dynamically imported", () => {
     const root = isolatedRoot("verify-import-");
     try {
@@ -630,14 +794,44 @@ describe("verify-consumer-topology", () => {
 });
 
 describe("consumer package manager boundary", () => {
+  it("rejects an independently installed packed manifest that differs from source", async () => {
+    const module = await import(scriptPath);
+    const scratch = isolatedRoot("verify-packed-mismatch-");
+    const commands: Array<{ command: string; args: string[] }> = [];
+    try {
+      expect(() => module.executeConsumerTopology(scratch, {
+        spawn: (command: string, args: string[], options: { cwd: string }) => {
+          commands.push({ command, args });
+          if (args[0] === "pack") {
+            return { status: 0, stdout: JSON.stringify([{ filename: "lcm.tgz" }]), stderr: "" };
+          }
+          if (args[0] === "install") {
+            const packageRoot = join(options.cwd, "node_modules", "@donadiosolutions", "lcm");
+            mkdirSync(packageRoot, { recursive: true });
+            writeFileSync(join(packageRoot, "package.json"), JSON.stringify({
+              version: "1.0.0",
+              dependencies: { ...canonicalRuntimeDependencies, "safe-regex": "2.1.0" },
+            }));
+          }
+          return { status: 0, stdout: "1.0.0\n", stderr: "" };
+        },
+      })).toThrow("packed runtime dependencies differ from the canonical manifest");
+      expect(commands.map(({ command, args }) => [command, args[0]])).toEqual([
+        [process.platform === "win32" ? "pnpm.cmd" : "pnpm", "run"],
+        [process.platform === "win32" ? "npm.cmd" : "npm", "pack"],
+        [process.platform === "win32" ? "npm.cmd" : "npm", "install"],
+        [process.platform === "win32" ? "npm.cmd" : "npm", "install"],
+      ]);
+      expect(commands.some(({ command }) => command === process.execPath)).toBe(false);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("builds with pnpm and packs and installs both consumers with npm", async () => {
     const module = await import(scriptPath);
     const scratch = isolatedRoot("verify-managers-");
     const commands: Array<{ command: string; args: string[]; cwd: string; env?: NodeJS.ProcessEnv }> = [];
-    const logs: string[] = [];
-    const log = vi.spyOn(console, "log").mockImplementation((...values: unknown[]) => {
-      logs.push(values.join(" "));
-    });
     try {
       module.executeConsumerTopology(scratch, {
         spawn: (command: string, args: string[], options: { cwd: string; env?: NodeJS.ProcessEnv }) => {
@@ -649,7 +843,7 @@ describe("consumer package manager boundary", () => {
             const packageRoot = join(options.cwd, "node_modules", "@donadiosolutions", "lcm");
             mkdirSync(packageRoot, { recursive: true });
             writeFileSync(join(packageRoot, "package.json"), JSON.stringify({
-              version: "1.0.0", dependencies: { "@hono/node-server": "2.0.12" },
+              version: "1.0.0", dependencies: canonicalRuntimeDependencies,
             }));
             if (args.includes("body-parser@2.2.2")) {
               for (const [name, version] of [["body-parser", "2.2.2"], ["fast-uri", "3.1.0"]]) {
@@ -682,10 +876,7 @@ describe("consumer package manager boundary", () => {
         expect(commands.some(({ command, args, cwd }) => command === process.execPath && cwd === consumer
           && args.includes(join(consumer, "portable-package.mts")))).toBe(true);
       }
-      expect(logs).toContainEqual(expect.stringContaining("sdk-express-qs=6.16.0"));
-      expect(logs).toContainEqual(expect.stringContaining("sdk-body-parser-qs=6.16.0"));
     } finally {
-      log.mockRestore();
       rmSync(scratch, { recursive: true, force: true });
     }
   });

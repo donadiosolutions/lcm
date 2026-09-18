@@ -4,6 +4,7 @@ import { join, resolve, normalize, join as pathJoin, dirname, basename, parse } 
 import { lcmHomeDir } from "../runtime-paths.js";
 import {
   hashProjectPath,
+  isAuthenticatedRetiredProjectIdentitySuccessor,
   normalizeProjectIdentityPath,
   projectMapPath,
   resolveProjectIdentity,
@@ -16,6 +17,7 @@ import {
   openPrivateDirectory,
   openPrivateDirectoryIfExists,
   openPrivateDirectoryForCreation,
+  OWNER_ONLY_FILE_MODES,
   readBoundedRegularFile,
   type PrivateDirectoryHandle,
   type PrivateDirectoryWitness,
@@ -149,6 +151,9 @@ function parseLocalProjectMapCompatibility(
     const content = readBoundedRegularFile(path, {
       allowedRoot: lcmHomeDir(homeDir),
       maxBytes: MAX_PROJECT_MAP_COMPATIBILITY_BYTES,
+      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      allowedModes: OWNER_ONLY_FILE_MODES,
+      requireSingleLink: true,
     });
     const value: unknown = JSON.parse(content);
     if (value === null || typeof value !== "object" || Array.isArray(value)) return fallback;
@@ -178,8 +183,15 @@ function parseLocalProjectMapCompatibility(
     // Map keys are historical storage names and may be replaced atomically
     // during worktree reconciliation. Derive the hook ID from the stable
     // canonical path so an old/new map pair cannot make eventsDbPath oscillate.
+    const retiredId = hashProjectPath(normalizeProjectIdentityPath(matched.canonical));
+    const acceptsSuccessor = isAuthenticatedRetiredProjectIdentitySuccessor(
+      matched.id,
+      retiredId,
+      matched.canonical,
+      homeDir,
+    );
     return {
-      id: hashProjectPath(normalizeProjectIdentityPath(matched.canonical)),
+      id: acceptsSuccessor ? matched.id : retiredId,
       canonical: matched.canonical,
     };
   } catch {

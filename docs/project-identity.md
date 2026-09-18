@@ -117,6 +117,89 @@ Git remote, repository name, directory contents, or matching display names.
 
 ## Linked worktrees and reconciliation
 
+### Retired local identities
+
+Worktree reconciliation can intentionally leave
+`~/.lcm/projects/<old-local-id>` as a regular-file fence. The fence records
+that the old local identity was retired; it is ownership evidence and must not
+be deleted, moved, or replaced. If the same canonical path later becomes an
+independent project, an older path-derived map key can collide with that fence.
+LCM then reports a retired local project identity instead of a generic
+`ENOTDIR` or storage-discovery failure.
+
+Recover from that exact diagnosis in the affected project:
+
+```bash
+lcm project renew-retired-identity
+# or select the canonical project explicitly
+lcm project renew-retired-identity /work/project
+```
+
+Renewal is deliberately narrow. It accepts one current, canonical, local
+binding whose key is the original path hash, with no aliases or PostgreSQL
+identity. The `projects/` parent must remain private and stable, and the fence
+must be a current-user-owned, owner-only, single-link regular file with the
+exact version, old hash, project kind, and bytes produced by reconciliation.
+The deterministic versioned successor map key, its project storage, and its
+event sidecar must all be unoccupied. LCM revalidates those facts immediately
+before atomically rekeying and reading back `map.json`; it never moves or
+deletes the fence and never moves a database.
+
+Once the atomic rekey exposes the successor, or the writer cannot prove that
+it did not, that binding remains authoritative even if a later evidence check
+or publication readback reports an error. Prompt hooks read the map without
+taking the publication lock and may create successor storage as soon as the
+new binding is visible; restoring the retired map after that point would
+strand the project behind the occupied successor. Inspect the reported error
+and retry the renewal idempotently.
+
+The command is safe to retry. If the same authenticated predecessor fence and
+successor binding are already present, it reports an idempotent no-op. After a
+successful or already-completed renewal, retry the original hook or compact
+command. Any alias, remote binding, ambiguous owner, occupied successor,
+malformed fence, unsafe mode/owner/link count, or race remains a strict refusal
+that requires inspection rather than automatic repair.
+
+A completed renewal is then enforced wherever LCM reconciles or admits writes.
+Only renewal can create a successor-shaped map key, so LCM treats that key as
+proof the project was already renewed and requires the retained predecessor
+fence before acting on it. When the fence is absent or no longer authenticates,
+reconciliation refuses with `renewed project identity is missing its
+predecessor reconciliation fence; refusing to reconcile` instead of falling
+back to the retired path hash, which would treat the renewed project's live
+database and event sidecar as a legacy source, fold them into the retired
+identity, archive the successor, and rekey `map.json` backwards. The refusal
+reaches `lcm project reconcile-worktrees`, `lcm project create`,
+`lcm project link`, `lcm project unlink`, and the storage admission a mutating
+compact run performs, because each of them reconciles before it touches project
+state. It happens before any source discovery or merge, so nothing is copied,
+archived, or moved.
+
+Prompt hooks do not fail on such a binding. They resolve the project under the
+retired path hash rather than the unauthenticated successor, and sidecar
+recovery reports no existing sidecar instead of one that writes would not use,
+so a hook keeps writing under a single consistent identity. Restore the fence
+from backup and retry; do not delete the successor binding to work around the
+refusal.
+
+These checks never require a Git anchor, because an ordinary directory renews
+exactly as a repository does. A renewed project reached through a symlinked
+path therefore reconciles normally: the mapped identity and the discovered
+directory are normalized the same way before they are compared. A genuine
+mismatch reports `mapped project identity does not match the current project
+directory`.
+
+A renewed project may later gain a distinct local alias through `lcm project
+link`. LCM authenticates that binding against the predecessor fence derived
+from the map entry's canonical path, then keeps storage and reconciliation on
+the renewed successor identity. It refuses an alias that is also the Git anchor
+of a different repository, because reconciling that path could otherwise fold
+the other repository's worktree entries into the renewed project. A path bound
+as an alias by more than one renewed identity is also refused rather than
+choosing a project arbitrarily. LCM likewise refuses a successor-shaped map key
+whose entry is bound to a different canonical project, even when the retained
+fence for the entered project is valid.
+
 On first local storage access after upgrade, LCM checks the current checkout's
 verified Git common directory. If older `map.json` entries treated linked
 worktrees as separate projects, LCM acquires a private cross-process lock and
@@ -233,6 +316,31 @@ promoted content is unsupported` and does not include memory content, IDs,
 paths, or tags. See the
 [offline promoted-memory repair procedure](privacy.md#embedded-nul-in-promoted-memory).
 
+When no canonical completion marker exists for a source, legacy conversation
+messages use the same SQLite boundary check. On that merge path,
+`messages.content` must be well-formed UTF-8 SQLite `TEXT` without an embedded
+NUL. An existing marker skips the merge and this admission check, preserving the
+marker as a replay boundary rather than a retrospective content audit.
+Malformed bytes, a NUL, or non-`TEXT` storage
+are refused with `stored message content is unsupported`; the error contains
+no content, session, path, or database identifier. The source check runs before
+its fence commits, preserving the legacy database and exact bytes for offline
+inspection and repair. The target check runs inside its transaction before
+conversation comparison or copy, completion-marker insertion, and FTS rebuild;
+it rolls those changes back while the source fence may remain committed. If an
+observed completion marker disappears inside that transaction, LCM revalidates
+the normalized source bytes before copying.
+
+Take a verified backup, stop writers, and inspect the refused source or target
+offline with `typeof(content)`, `hex(content)`, and
+`instr(content, char(0))`. Correct the unsupported value in place, then rerun
+reconciliation to continue from its durable fence and marker state. See the
+[offline promoted-memory repair procedure](privacy.md#embedded-nul-in-promoted-memory)
+for promoted rows only; it is not a shipped message-repair command. Empty text,
+valid multi-byte Unicode, a genuine `U+FFFD` replacement character encoded as
+UTF-8 `EF BF BD`, and literal JSON-escaped `\\u0000` text remain valid. A
+malformed byte that a driver would display as `U+FFFD` remains unsupported.
+
 The canonical target's `meta.json` is a separate leaf-file trust boundary. LCM
 refuses to parse or reuse it when its owner differs from the admitted project
 directory owner (`file owner is not trusted`) or when it has more than one hard
@@ -254,12 +362,26 @@ durable merge markers make the explicit retry resumable.
 Reconciliation journals and project-sensitive pattern files are also
 authenticated before LCM reads their contents. A journal must be a regular
 file, have exactly one hard link, and use an
-owner-only mode (`0400`, `0500`, `0600`, or `0700`). Listing selects every
-journal-shaped name and authenticates each leaf that remains present, so a
-directory, symlink, FIFO, hard link, or otherwise unsafe present journal stops
-the listing. An entry that disappears after directory enumeration is omitted.
-The listing-root absence prefilter remains a separate
-limitation tracked by [#1178](https://github.com/donadiosolutions/lcm/issues/1178).
+owner-only mode (`0400`, `0500`, `0600`, or `0700`). The reconciliation journal
+directory must be a current-user-owned private directory with mode `0700`.
+Listing distinguishes a genuinely absent directory from an existing unsafe
+entry, refuses symlinked and non-directory roots without following them, and
+retains the authenticated directory while enumerating and reading its journals.
+It selects every journal-shaped name and authenticates each leaf that remains
+present, so a directory, symlink, FIFO, hard link, or otherwise unsafe present
+journal stops the listing. An entry that disappears after directory enumeration
+is omitted.
+
+During a mutating reconciliation, each journal read returns the parent device
+and inode observed by the bounded reader. LCM compares those canonical decimal
+witnesses with the already-retained journal directory before it parses or uses
+the journal. A differing witness blocks locked admission, prewrite,
+before-replace, publication readback, and blocked-state recovery without
+authorizing the substituted state. This check detects an observed parent
+replacement; it cannot prove uninterrupted namespace history if the same user
+fully restores the original parent before the reader samples it. The retained
+directory and existing journal-leaf identity checks continue to guard the
+surrounding mutation boundaries.
 Pattern files that LCM reads must be regular files with exactly one hard link.
 Reconciliation refuses a present non-regular source `sensitive-patterns.txt`
 path before snapshot, merge, or archive verification; it never opens a

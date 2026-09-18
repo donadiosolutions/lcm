@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   chmodSync,
+  fsyncSync,
   mkdirSync,
   readdirSync,
 } from "node:fs";
@@ -17,15 +18,19 @@ import {
   type PrivateMutationLockOperations,
 } from "../private-mutation-lock.js";
 import {
+  atomicWritePrivateFile,
   atomicWritePrivateFileDurable,
   consumeBoundedRegularFile,
   assertPrivateDirectory,
+  assertPrivateDirectoryEntry,
   OWNER_ONLY_FILE_MODES,
   openPrivateDirectory,
   readBoundedRegularFileWithStat,
   syncPrivateDirectory,
   isOwnerOnlyFileMode,
   openPrivateDirectoryIfExists,
+  PrivateDirectoryTopologyError,
+  PrivateFileCollisionError,
 } from "../security-files.js";
 import type { StorageBackendName } from "./contracts.js";
 import {
@@ -187,6 +192,13 @@ export type BackendMaintenancePhase =
   | "selection-prepared"
   | "selection-completed"
   | "maintenance-aborted";
+
+/** Whether a version-3 migration-maintenance phase is terminal. */
+export function isTerminalBackendMaintenancePhase(
+  phase: BackendMaintenancePhase,
+): boolean {
+  return phase === "selection-completed" || phase === "maintenance-aborted";
+}
 
 export type BackendMaintenanceRosterEntry = Readonly<{
   machineId: string;
@@ -379,7 +391,7 @@ const activeAppendBarrierTokens = new WeakSet<BackendPublicationLockToken>();
 const activeAppendBarrierContext = new AsyncLocalStorage<Readonly<{
   rootPath: string;
   token: BackendPublicationLockToken;
-}>>();
+}> | null>();
 const appendBarrierTails = new Map<string, Promise<void>>();
 
 export class BackendPublicationAppendBarrierTimeoutError
@@ -389,6 +401,17 @@ export class BackendPublicationAppendBarrierTimeoutError
   constructor(cause: PrivateMutationLockContentionError) {
     super("local hook append barrier remained busy until its admission deadline", { cause });
     this.name = "BackendPublicationAppendBarrierTimeoutError";
+  }
+}
+
+export class BackendPublicationRetainedAppendAdmissionStoppedError extends Error {
+  constructor(
+    readonly reason: "aborted" | "deadline",
+  ) {
+    super(reason === "aborted"
+      ? "retained append admission cancelled"
+      : "retained append admission exceeded its predecessor deadline");
+    this.name = "BackendPublicationRetainedAppendAdmissionStoppedError";
   }
 }
 
@@ -407,13 +430,21 @@ export type BackendPublicationAppendBarrierOptions = Readonly<{
   _appendLockOperations?: PrivateMutationLockOperations;
 }>;
 
+export type BackendPublicationRetainedAppendAdmissionOptions =
+  BackendPublicationAppendBarrierOptions & Readonly<{
+    /** Cancel admission before callback effects begin. */
+    signal?: AbortSignal;
+    /** Retained scan admission makes exactly one external-lock attempt. */
+    externalLockAttempts?: 1;
+  }>;
+
 function appendBarrierTiming(options: BackendPublicationAppendBarrierOptions): Readonly<{
   bounded: boolean;
   contentionWaitMs: number;
   retryDelayMs: number;
   now: () => number;
   wait: (milliseconds: number) => Promise<void>;
-  waitForTail: (tail: Promise<void>, milliseconds: number) => Promise<boolean>;
+  injectedWait: boolean;
 }> {
   const bounded = options.contentionWaitMs !== undefined;
   const contentionWaitMs = options.contentionWaitMs ?? 0;
@@ -427,26 +458,53 @@ function appendBarrierTiming(options: BackendPublicationAppendBarrierOptions): R
   const injectedWait = options._wait;
   const wait = injectedWait
     ?? ((milliseconds: number) => new Promise<void>(resolve => setTimeout(resolve, milliseconds)));
-  const waitForTail = injectedWait === undefined
-    ? (tail: Promise<void>, milliseconds: number): Promise<boolean> => new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(false), milliseconds);
-      void tail.then(() => {
-        clearTimeout(timer);
-        resolve(true);
-      });
-    })
-    : (tail: Promise<void>, milliseconds: number): Promise<boolean> => Promise.race([
-      tail.then(() => true),
-      injectedWait(milliseconds).then(() => false),
-    ]);
   return {
     bounded,
     contentionWaitMs,
     retryDelayMs,
     now: options._now ?? performance.now.bind(performance),
     wait,
-    waitForTail,
+    injectedWait: injectedWait !== undefined,
   };
+}
+
+type AppendBarrierTiming = ReturnType<typeof appendBarrierTiming>;
+
+async function waitForAppendPredecessor(
+  predecessor: Promise<void>,
+  timing: AppendBarrierTiming,
+  deadline: number,
+  signal?: AbortSignal,
+): Promise<"settled" | "aborted" | "deadline"> {
+  if (signal?.aborted) return "aborted";
+  const remaining = deadline - timing.now();
+  if (timing.bounded && remaining <= 0) return "deadline";
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    const candidates: Array<Promise<"settled" | "aborted" | "deadline">> = [
+      predecessor.then(() => "settled" as const),
+    ];
+    if (timing.bounded) {
+      candidates.push(timing.injectedWait
+        ? timing.wait(remaining).then(() => "deadline" as const)
+        : new Promise(resolve => {
+          timer = setTimeout(() => resolve("deadline"), remaining);
+        }));
+    }
+    if (signal !== undefined) {
+      candidates.push(new Promise(resolve => {
+        onAbort = () => resolve("aborted");
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      }));
+    }
+    const winner = await Promise.race(candidates);
+    return signal?.aborted ? "aborted" : winner;
+  } finally {
+    clearTimeout(timer);
+    if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
+  }
 }
 
 function fail(reason: BackendPublicationJournalError["reason"], message: string): never {
@@ -1610,7 +1668,7 @@ function contextualAppendLockToken(
   explicit: BackendPublicationLockToken | undefined,
 ): BackendPublicationLockToken | undefined {
   const inherited = activeAppendBarrierContext.getStore();
-  if (inherited === undefined) return explicit;
+  if (inherited === undefined || inherited === null) return explicit;
   if (
     inherited.rootPath !== rootPath(homeDir)
     || (explicit !== undefined && explicit !== inherited.token)
@@ -1956,6 +2014,82 @@ export function withBackendPublicationAppendBarrier<T>(
   }, { allowUnresolved: true, lockToken: contextualToken });
 }
 
+function assertRetainedAppendAdmissionActive(
+  timing: AppendBarrierTiming,
+  deadline: number,
+  signal?: AbortSignal,
+): void {
+  if (signal?.aborted) {
+    throw new BackendPublicationRetainedAppendAdmissionStoppedError("aborted");
+  }
+  if (timing.bounded && timing.now() >= deadline) {
+    throw new BackendPublicationRetainedAppendAdmissionStoppedError("deadline");
+  }
+}
+
+type AppendAdmissionMode = Readonly<{
+  /** Retained participants grant append authority to the explicit token only. */
+  explicitOnly: boolean;
+  /** Only the append barrier itself writes while publication stays unresolved. */
+  allowUnresolved: boolean;
+}>;
+
+async function runAppendAdmissionAttempt<T>(
+  homeDir: string | undefined,
+  callback: (token: BackendPublicationLockToken) => Promise<T> | T,
+  lockToken: BackendPublicationLockToken | undefined,
+  options: BackendPublicationAppendBarrierOptions,
+  mode: AppendAdmissionMode,
+  assertBeforeEffects?: () => void,
+  markCallerEffectsStarted?: () => void,
+): Promise<T> {
+  assertBeforeEffects?.();
+  const acquire = (): Promise<T> => withBackendPublicationConsumerLockAsync(
+    homeDir,
+    async (token) => {
+      const maintenance = withBackendPublicationDirectoryRead(
+        homeDir,
+        (directoryHandle) => readMaintenanceJournalFromDirectory(homeDir, directoryHandle),
+      );
+      if (maintenance !== null && (
+        maintenance.phase !== "maintenance-held"
+        && maintenance.phase !== "selection-prepared"
+        && maintenance.phase !== "selection-completed"
+        && maintenance.phase !== "maintenance-aborted"
+      )) {
+        return fail("unresolved-publication", "backend maintenance is not ready for local append");
+      }
+      assertBeforeEffects?.();
+      return withPrivateMutationLockAsync(
+        join(rootPath(homeDir), ".local-hook-append.lock"),
+        "local hook append barrier",
+        async () => {
+          activeAppendBarrierTokens.add(token);
+          try {
+            assertBeforeEffects?.();
+            markCallerEffectsStarted?.();
+            const invoke = (): Promise<T> | T => callback(token);
+            return mode.explicitOnly
+              ? await activeAppendBarrierContext.run(null, invoke)
+              : await activeAppendBarrierContext.run(
+                { rootPath: rootPath(homeDir), token },
+                invoke,
+              );
+          } finally {
+            activeAppendBarrierTokens.delete(token);
+          }
+        },
+        options._appendLockObserver,
+        options._appendLockOperations,
+      );
+    },
+    { allowUnresolved: mode.allowUnresolved, lockToken },
+  );
+  return mode.explicitOnly
+    ? activeAppendBarrierContext.run(null, acquire)
+    : acquire();
+}
+
 /** Async local-append barrier with the same exact authority as the sync form. */
 export async function withBackendPublicationAppendBarrierAsync<T>(
   homeDir: string | undefined,
@@ -1991,7 +2125,10 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
         const queued = new PrivateMutationLockContentionError(
           "local append admission is queued in this process",
         );
-        if (remaining <= 0 || !await timing.waitForTail(previous, remaining)) {
+        const predecessor = remaining <= 0
+          ? "deadline"
+          : await waitForAppendPredecessor(previous, timing, deadline);
+        if (predecessor !== "settled") {
           throw new BackendPublicationAppendBarrierTimeoutError(queued);
         }
         if (timing.now() >= deadline) {
@@ -2002,38 +2139,15 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
     while (true) {
       let callerEffectsStarted = false;
       try {
-        return await withBackendPublicationConsumerLockAsync(homeDir, async (token) => {
-          const maintenance = withBackendPublicationDirectoryRead(
-            homeDir,
-            (directoryHandle) => readMaintenanceJournalFromDirectory(homeDir, directoryHandle),
-          );
-          if (maintenance !== null && (
-            maintenance.phase !== "maintenance-held"
-            && maintenance.phase !== "selection-prepared"
-            && maintenance.phase !== "selection-completed"
-            && maintenance.phase !== "maintenance-aborted"
-          )) {
-            return fail("unresolved-publication", "backend maintenance is not ready for local append");
-          }
-          return withPrivateMutationLockAsync(
-            join(rootPath(homeDir), ".local-hook-append.lock"),
-            "local hook append barrier",
-            async () => {
-              activeAppendBarrierTokens.add(token);
-              try {
-                callerEffectsStarted = true;
-                return await activeAppendBarrierContext.run(
-                  { rootPath: key, token },
-                  () => callback(token),
-                );
-              } finally {
-                activeAppendBarrierTokens.delete(token);
-              }
-            },
-            options._appendLockObserver,
-            options._appendLockOperations,
-          );
-        }, { allowUnresolved: true, lockToken: contextualToken });
+        return await runAppendAdmissionAttempt(
+          homeDir,
+          callback,
+          contextualToken,
+          options,
+          { explicitOnly: false, allowUnresolved: true },
+          undefined,
+          () => { callerEffectsStarted = true; },
+        );
       } catch (error) {
         const remaining = deadline - timing.now();
         if (
@@ -2052,6 +2166,78 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
         }
       }
     }
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Retain append-order admission for a non-append mutation participant.
+ * Only the exact token passed by the caller can reuse this authority.
+ */
+export async function withBackendPublicationRetainedAppendAdmissionAsync<T>(
+  homeDir: string | undefined,
+  callback: (token: BackendPublicationLockToken) => Promise<T> | T,
+  lockToken?: BackendPublicationLockToken,
+  options: BackendPublicationRetainedAppendAdmissionOptions = {},
+): Promise<T> {
+  if (
+    options.externalLockAttempts !== undefined
+    && options.externalLockAttempts !== 1
+  ) {
+    throw new Error("retained append admission requires one external lock attempt");
+  }
+  const timing = appendBarrierTiming(options);
+  const deadline = timing.now() + timing.contentionWaitMs;
+  const assertActive = (): void => assertRetainedAppendAdmissionActive(
+    timing,
+    deadline,
+    options.signal,
+  );
+  assertActive();
+  if (lockToken !== undefined) {
+    assertLockToken(lockToken, homeDir);
+    if (activeAppendBarrierTokens.has(lockToken)) {
+      return activeAppendBarrierContext.run(null, async () => {
+        assertActive();
+        return callback(lockToken);
+      });
+    }
+  }
+
+  const key = rootPath(homeDir);
+  const previous = appendBarrierTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve): void => { release = resolve; });
+  const tail = previous.then(() => current);
+  appendBarrierTails.set(key, tail);
+  void tail.then(() => {
+    if (appendBarrierTails.get(key) === tail) appendBarrierTails.delete(key);
+  });
+  try {
+    let previousSettled = false;
+    void previous.then(() => { previousSettled = true; });
+    await Promise.resolve();
+    if (!previousSettled) {
+      const predecessor = await waitForAppendPredecessor(
+        previous,
+        timing,
+        deadline,
+        options.signal,
+      );
+      if (predecessor !== "settled") {
+        throw new BackendPublicationRetainedAppendAdmissionStoppedError(predecessor);
+      }
+    }
+    assertActive();
+    return await runAppendAdmissionAttempt(
+      homeDir,
+      callback,
+      lockToken,
+      options,
+      { explicitOnly: true, allowUnresolved: false },
+      assertActive,
+    );
   } finally {
     release();
   }
@@ -2307,7 +2493,9 @@ function assertCandidateWitness(
   }
 }
 
-function parseConfigPublicationJournal(content: string): BackendPublicationJournal | BackendMaintenanceJournal {
+function parsePublicationOrMaintenanceJournal(
+  content: string,
+): BackendPublicationJournal | BackendMaintenanceJournal {
   let candidate: unknown;
   try {
     candidate = JSON.parse(content);
@@ -2340,7 +2528,7 @@ function readConsumerConfigPublicationJournal(
       }
     }
     return journal;
-  }, parseConfigPublicationJournal);
+  }, parsePublicationOrMaintenanceJournal);
 }
 
 function assertBackendPublicationConfigAccessUnlocked(
@@ -2663,6 +2851,7 @@ function writeJournal(
   homeDir: string | undefined,
   observer: BackendPublicationObserver,
   expectedChecksum?: string,
+  replaceTerminalMaintenance = false,
 ): void {
   const directory = backendPublicationDirectory(homeDir);
   const path = backendPublicationJournalPath(homeDir);
@@ -2694,7 +2883,21 @@ function writeJournal(
     }
   })();
   assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
-  const parsed = current === null ? null : parseJournal(current);
+  const parsed = current === null
+    ? null
+    : replaceTerminalMaintenance
+      ? parsePublicationOrMaintenanceJournal(current)
+      : parseJournal(current);
+  if (
+    replaceTerminalMaintenance
+    && (
+      parsed === null
+      || parsed.version !== BACKEND_MAINTENANCE_VERSION
+      || !isTerminalBackendMaintenancePhase(parsed.phase)
+    )
+  ) {
+    return fail("unexpected-state", "terminal backend maintenance changed before replacement");
+  }
   if (expectedChecksum !== undefined && (parsed === null || parsed.checksumSha256 !== expectedChecksum)) {
     return fail("unexpected-state", "backend publication journal changed before update");
   }
@@ -2714,52 +2917,305 @@ function writeJournal(
   assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
 }
 
+function archiveUnsafeStorage(message: string, cause: unknown): never {
+  throw new BackendPublicationJournalError("unsafe-storage", message, { cause });
+}
+
+function assertRetainedArchivePublicationDirectory(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+): void {
+  try {
+    const observed = assertPrivateDirectory(
+      directoryHandle,
+      backendPublicationDirectory(homeDir),
+    );
+    if (
+      observed.dev !== directoryHandle.witness.dev
+      || observed.ino !== directoryHandle.witness.ino
+      || observed.gid !== directoryHandle.witness.gid
+    ) {
+      throw new Error("private directory identity changed");
+    }
+  } catch (error) {
+    return archiveUnsafeStorage(
+      "backend publication directory changed during terminal journal archive",
+      error,
+    );
+  }
+}
+
+function assertRetainedArchiveHistoryDirectory(
+  history: string,
+  historyHandle: ReturnType<typeof openPrivateDirectory>,
+): void {
+  try {
+    // The realpath-based comparison below only proves the retained
+    // descriptor and the resolved pathname currently agree; it also follows
+    // any symlink placed at the final path component. Bind the descriptor to
+    // the exact, non-symlink directory entry first so a same-UID final
+    // component substitution cannot hide behind symlink resolution or a
+    // reused dev/ino pair.
+    assertPrivateDirectoryEntry(historyHandle, history);
+    const observed = assertPrivateDirectory(historyHandle, history);
+    if (
+      observed.dev !== historyHandle.witness.dev
+      || observed.ino !== historyHandle.witness.ino
+      || observed.gid !== historyHandle.witness.gid
+    ) {
+      throw new Error("private directory identity changed");
+    }
+  } catch (error) {
+    return archiveUnsafeStorage(
+      "backend publication history directory changed during terminal journal archive",
+      error,
+    );
+  }
+}
+
+/**
+ * Bind a freshly retained history-directory descriptor to its pathname
+ * immediately after it is created. This proves the descriptor that will be
+ * used for the remainder of the archive operation is, right now, the
+ * non-symlink `history` entry with exact 0700 mode and our UID.
+ *
+ * It does not retroactively verify the identity `mkdirSync` created a moment
+ * earlier. POSIX has no atomic create-and-open for directories, and the
+ * obvious alternative -- create under an unguessable staging name and rename
+ * it onto `history` -- is not available here: rename replaces an empty
+ * directory, so it would silently adopt and clobber a concurrent creator's
+ * directory, which "refuses a history create race without adopting the
+ * entrant" forbids. Failing closed on a racing entrant is the stronger
+ * property, so the mkdir-then-open shape is kept and every window after the
+ * open is closed instead: nothing later in the operation can rely on a
+ * descriptor that silently drifted from the pathname without this check
+ * failing closed first.
+ */
+function bindRetainedArchiveHistoryDirectoryEntry(
+  history: string,
+  historyHandle: ReturnType<typeof openPrivateDirectory>,
+  message: string,
+): void {
+  try {
+    assertPrivateDirectoryEntry(historyHandle, history);
+  } catch (error) {
+    archiveUnsafeStorage(message, error);
+  }
+}
+
+type ArchiveHistoryOperationOutcome<T> =
+  | Readonly<{ succeeded: true; value: T }>
+  | Readonly<{ succeeded: false; error: unknown }>;
+
+function completeArchiveHistoryOperation<T>(
+  historyHandle: ReturnType<typeof openPrivateDirectory>,
+  outcome: ArchiveHistoryOperationOutcome<T>,
+): T {
+  let closeErrorPresent = false;
+  let closeError: unknown;
+  try {
+    historyHandle.close();
+  } catch (error) {
+    closeErrorPresent = true;
+    closeError = error;
+  }
+  if (!closeErrorPresent) {
+    if (outcome.succeeded) return outcome.value;
+    throw outcome.error;
+  }
+  if (outcome.succeeded) throw closeError;
+  const aggregate = new AggregateError(
+    [outcome.error, closeError],
+    "backend publication archive operation and history cleanup failed",
+    { cause: outcome.error },
+  );
+  if (outcome.error instanceof BackendPublicationJournalError) {
+    throw new BackendPublicationJournalError(
+      outcome.error.reason,
+      outcome.error.message,
+      { cause: aggregate },
+    );
+  }
+  throw aggregate;
+}
+
+type RetainedArchiveHistoryDirectory = Readonly<{
+  historyHandle: ReturnType<typeof openPrivateDirectory>;
+  created: boolean;
+}>;
+
+/**
+ * Acquire the retained history directory, creating it when absent. Every
+ * failure here throws before a descriptor exists, so the caller never has to
+ * reason about an unacquired handle: this returns a live descriptor or throws.
+ *
+ * Binding a freshly created descriptor to its entry is deliberately left to
+ * the caller. That check can fail, and a failure after acquisition must still
+ * close the descriptor and aggregate any close failure with it, which only
+ * the caller's completion path does.
+ */
+function openRetainedArchiveHistoryDirectory(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+  observer: BackendPublicationObserver,
+  history: string,
+): RetainedArchiveHistoryDirectory {
+  assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+  observer("before-terminal-journal-history-open", history);
+  let existingHandle;
+  try {
+    existingHandle = openPrivateDirectoryIfExists(history);
+  } catch (error) {
+    return archiveUnsafeStorage("backend publication history directory cannot be opened", error);
+  }
+  if (existingHandle !== undefined) return { historyHandle: existingHandle, created: false };
+  observer("before-terminal-journal-history-create", history);
+  assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+  try {
+    mkdirSync(history, { mode: 0o700 });
+  } catch (error) {
+    return archiveUnsafeStorage("backend publication history directory cannot be created", error);
+  }
+  try {
+    return { historyHandle: openPrivateDirectory(history), created: true };
+  } catch (error) {
+    return archiveUnsafeStorage("created backend publication history directory is unsafe", error);
+  }
+}
+
+function withRetainedArchiveHistoryDirectory<T>(
+  homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
+  observer: BackendPublicationObserver,
+  callback: (historyHandle: ReturnType<typeof openPrivateDirectory>) => T,
+): T {
+  const history = backendPublicationHistoryDirectory(homeDir);
+  const { historyHandle, created } = openRetainedArchiveHistoryDirectory(
+    homeDir,
+    directoryHandle,
+    observer,
+    history,
+  );
+  let outcome: ArchiveHistoryOperationOutcome<T>;
+  try {
+    if (created) {
+      bindRetainedArchiveHistoryDirectoryEntry(
+        history,
+        historyHandle,
+        "created backend publication history directory is unsafe",
+      );
+    }
+    assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+    assertRetainedArchiveHistoryDirectory(history, historyHandle);
+    outcome = { succeeded: true, value: callback(historyHandle) };
+  } catch (error) {
+    outcome = { succeeded: false, error };
+  }
+  return completeArchiveHistoryOperation(historyHandle, outcome);
+}
+
 function archiveTerminalJournal(
   homeDir: string | undefined,
+  directoryHandle: BackendPublicationDirectoryHandle,
   journal: BackendPublicationJournal | BackendMaintenanceJournal,
+  observer: BackendPublicationObserver,
 ): void {
   const directory = backendPublicationDirectory(homeDir);
   const history = backendPublicationHistoryDirectory(homeDir);
-  const current = readBoundedRegularFileWithStat(backendPublicationJournalPath(homeDir), {
+  const journalPath = backendPublicationJournalPath(homeDir);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
+  observer("before-terminal-journal-archive-read", journalPath);
+  assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
+  const observed = readBoundedRegularFileWithStat(journalPath, {
     allowedRoot: directory,
     maxBytes: MAX_JOURNAL_BYTES,
     expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
     allowedModes: [0o600],
     requireSingleLink: true,
-  }).content;
-  const archived = journal.version === BACKEND_MAINTENANCE_VERSION
-    ? parseMaintenanceJournal(JSON.parse(current)) : parseJournal(current);
-  if (archived.checksumSha256 !== journal.checksumSha256) {
+  });
+  if (
+    observed.parentDev !== directoryHandle.witness.dev
+    || observed.parentIno !== directoryHandle.witness.ino
+  ) {
+    return fail(
+      "unsafe-storage",
+      "backend publication archive source parent does not match the retained checkpoint directory",
+    );
+  }
+  const current = observed.content;
+  const archived = parsePublicationOrMaintenanceJournal(current);
+  if (
+    archived.version !== journal.version
+    || archived.checksumSha256 !== journal.checksumSha256
+  ) {
     return fail("unexpected-state", "backend publication journal changed before archive");
   }
-  let historyHandle;
-  try {
-    historyHandle = openPrivateDirectory(history);
-  } catch (error) {
-    if (!isMissing(error)) throw error;
-    mkdirSync(history, { mode: 0o700 });
-    historyHandle = openPrivateDirectory(history);
-  }
-  historyHandle.close();
   const archivePath = join(history, journal.publicationId + "." + journal.checksumSha256 + ".json");
-  try {
-    atomicWritePrivateFileDurable(archivePath, current, {
-      requireAbsent: true,
-      maxExistingBytes: MAX_JOURNAL_BYTES,
-    });
-  } catch (error) {
-    if (!(error instanceof Error) || error.message !== "private file already exists") throw error;
-    readBoundedRegularFileWithStat(archivePath, {
-      allowedRoot: history,
-      maxBytes: MAX_JOURNAL_BYTES,
-      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
-      allowedModes: [0o600],
-      requireSingleLink: true,
-      expectedRawSha256: sha256(current),
-    });
-  }
-  syncPrivateDirectory(history);
-  syncPrivateDirectory(directory);
+  withRetainedArchiveHistoryDirectory(
+    homeDir,
+    directoryHandle,
+    observer,
+    (historyHandle) => {
+      observer("before-terminal-journal-archive-publication", archivePath);
+      assertRetainedArchiveHistoryDirectory(history, historyHandle);
+      try {
+        atomicWritePrivateFile(
+          archivePath,
+          current,
+          {},
+          historyHandle,
+          { requireAbsent: true },
+        );
+      } catch (error) {
+        if (!(error instanceof PrivateFileCollisionError)) {
+          if (error instanceof PrivateDirectoryTopologyError) {
+            return archiveUnsafeStorage(
+              "backend publication archive publication topology is unsafe",
+              error,
+            );
+          }
+          throw error;
+        }
+        assertRetainedArchiveHistoryDirectory(history, historyHandle);
+        observer("before-terminal-journal-archive-replay", archivePath);
+        assertRetainedArchiveHistoryDirectory(history, historyHandle);
+        let replay;
+        try {
+          replay = readBoundedRegularFileWithStat(archivePath, {
+            allowedRoot: history,
+            maxBytes: MAX_JOURNAL_BYTES,
+            expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+            allowedModes: [0o600],
+            requireSingleLink: true,
+            expectedRawSha256: sha256(current),
+          });
+        } catch (replayError) {
+          return archiveUnsafeStorage("backend publication archive replay is unsafe", replayError);
+        }
+        if (
+          replay.content !== current
+          || replay.parentDev !== historyHandle.witness.dev
+          || replay.parentIno !== historyHandle.witness.ino
+        ) {
+          return archiveUnsafeStorage(
+            "backend publication archive replay does not match the retained history directory",
+            new Error("archive replay identity or bytes changed"),
+          );
+        }
+        assertRetainedArchiveHistoryDirectory(history, historyHandle);
+      }
+
+      observer("after-terminal-journal-archive-publication", archivePath);
+      observer("before-terminal-journal-history-sync", history);
+      assertRetainedArchiveHistoryDirectory(history, historyHandle);
+      fsyncSync(historyHandle.fd);
+      assertRetainedArchiveHistoryDirectory(history, historyHandle);
+      assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+      fsyncSync(directoryHandle.fd);
+      assertRetainedArchivePublicationDirectory(homeDir, directoryHandle);
+    },
+  );
+  observer("after-terminal-journal-history-operation", history);
 }
 
 function materialToJson(file: BackendPublicationRecoveryFile): Record<string, unknown> {
@@ -3145,7 +3601,7 @@ export class BackendPublicationCoordinator {
           && existing.phase !== "selection-completed" && existing.phase !== "maintenance-aborted") {
           return fail("unresolved-publication", "backend publication journal already exists");
         }
-        archiveTerminalJournal(this.#homeDir, existing);
+        archiveTerminalJournal(this.#homeDir, directoryHandle, existing, this.#observer);
       }
       const now = (input.now ?? new Date()).toISOString();
       const entering = withMaintenanceChecksum({
@@ -3280,12 +3736,20 @@ export class BackendPublicationCoordinator {
   async prepare(input: PrepareBackendPublicationInput): Promise<BackendPublicationJournal> {
     return this.#locked(async (directoryHandle) => {
       const validated = validateInput(input);
-      const existing = readJournalFromDirectory(this.#homeDir, directoryHandle);
+      const existing = readParsedJournalFromDirectory(
+        this.#homeDir,
+        directoryHandle,
+        parsePublicationOrMaintenanceJournal,
+      );
       if (existing !== null) {
-        if (existing.phase !== "completed" && existing.phase !== "aborted") {
+        if (existing.version === BACKEND_MAINTENANCE_VERSION) {
+          if (!isTerminalBackendMaintenancePhase(existing.phase)) {
+            return fail("unresolved-publication", "backend publication journal already exists");
+          }
+        } else if (existing.phase !== "completed" && existing.phase !== "aborted") {
           return fail("unresolved-publication", "backend publication journal already exists");
         }
-        archiveTerminalJournal(this.#homeDir, existing);
+        archiveTerminalJournal(this.#homeDir, directoryHandle, existing, this.#observer);
       }
       const targetState = materialTargetWitness(validated.material);
       const initial = prospectiveJournal(validated, targetState, targetState, "preparing", null);
@@ -3301,7 +3765,14 @@ export class BackendPublicationCoordinator {
       });
       assertStateShape(observed, "observed");
       const preparing = prospectiveJournal(validated, observed, targetState, "preparing", null);
-      writeJournal(preparing, directoryHandle, this.#homeDir, this.#observer, existing?.checksumSha256);
+      writeJournal(
+        preparing,
+        directoryHandle,
+        this.#homeDir,
+        this.#observer,
+        existing?.checksumSha256,
+        existing?.version === BACKEND_MAINTENANCE_VERSION,
+      );
       this.#observer("before-material-seal", materialPath(this.#homeDir, validated.publicationId));
       const reference = sealMaterial(this.#homeDir, validated.publicationId, validated.material);
       this.#observer("after-material-seal", materialPath(this.#homeDir, validated.publicationId));

@@ -3,6 +3,7 @@ import { basename, dirname, resolve } from "node:path";
 import {
   withBackendPublicationAppendBarrierAsync,
   withBackendPublicationConsumerLock,
+  isTerminalBackendMaintenancePhase,
   readBackendMaintenanceJournal,
   type BackendPublicationAppendBarrierOptions,
   type BackendPublicationLockToken,
@@ -137,10 +138,15 @@ export interface LocalHookOutboxRepository {
     observedAtMs: number,
     minimumIntervalMs: number,
     requiredObservations: number,
+    publicationLockToken?: BackendPublicationLockToken,
   ): Promise<LocalHookMissingCwdState>;
   clearMissingCwd(publicationLockToken?: BackendPublicationLockToken): Promise<void>;
   pruneProcessed(olderThanDays: number): Promise<number>;
-  setPrevEventId(eventId: number, prevEventId: number): Promise<void>;
+  setPrevEventId(
+    eventId: number,
+    prevEventId: number,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<void>;
   getPatternReinforcement(
     type: string,
     category: string,
@@ -149,8 +155,11 @@ export interface LocalHookOutboxRepository {
     publicationLockToken?: BackendPublicationLockToken,
   ): Promise<PatternReinforcementStats>;
   logHookError(hook: string, error: unknown, sessionId?: string): Promise<void>;
-  getHealthStats(): Promise<LocalHookOutboxHealth>;
-  getRecentErrors(options?: LocalHookErrorQuery): Promise<LocalHookErrorRecord[]>;
+  getHealthStats(publicationLockToken?: BackendPublicationLockToken): Promise<LocalHookOutboxHealth>;
+  getRecentErrors(
+    options?: LocalHookErrorQuery,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<LocalHookErrorRecord[]>;
   pruneUnprocessed(maxRows?: number, maxAgeDays?: number): Promise<{ pruned: number }>;
   pruneErrorLog(olderThanDays?: number): Promise<number>;
   claimDeliveries(input: LocalHookDeliveryClaimInput): Promise<LocalHookEventRow[]>;
@@ -184,7 +193,7 @@ export interface LocalHookOutboxRepository {
   replayQuarantined(eventUuid: string): Promise<boolean>;
   listAcknowledgedForRemotePrune(limit?: number): Promise<LocalHookEventRow[]>;
   markRemotePruned(eventUuid: string): Promise<boolean>;
-  getDeliveryDiagnostics(): Promise<LocalHookDeliveryDiagnostics>;
+  getDeliveryDiagnostics(publicationLockToken?: BackendPublicationLockToken): Promise<LocalHookDeliveryDiagnostics>;
   close(publicationLockToken?: BackendPublicationLockToken): Promise<void>;
 }
 
@@ -230,7 +239,7 @@ export class SQLiteLocalHookOutboxFactory {
 
       const homeDir = localOutboxHomeDir(dbPath);
       const maintenance = homeDir === undefined ? null : readBackendMaintenanceJournal(homeDir);
-      if (maintenance !== null && maintenance.phase !== "maintenance-aborted") {
+      if (maintenance !== null && !isTerminalBackendMaintenancePhase(maintenance.phase)) {
         const database = this.openCurrentSchema(dbPath, options);
         if (database === null) {
           throw new StorageOperationError(
@@ -266,7 +275,7 @@ export class SQLiteLocalHookOutboxFactory {
 
       const homeDir = localOutboxHomeDir(dbPath);
       const maintenance = homeDir === undefined ? null : readBackendMaintenanceJournal(homeDir);
-      const database = maintenance !== null && maintenance.phase !== "maintenance-aborted"
+      const database = maintenance !== null && !isTerminalBackendMaintenancePhase(maintenance.phase)
         ? this.openCurrentSchema(dbPath, options)
         : EventsDb.openExisting(dbPath, options);
       return database === null ? null : this.register(database, dbPath);
@@ -394,13 +403,14 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     observedAtMs: number,
     minimumIntervalMs: number,
     requiredObservations: number,
+    publicationLockToken?: BackendPublicationLockToken,
   ): Promise<LocalHookMissingCwdState> {
     this.assertOpen("observeMissingCwd");
     return this.admitted(() => this.database.observeMissingCwd(
       observedAtMs,
       minimumIntervalMs,
       requiredObservations,
-    ));
+    ), publicationLockToken);
   }
 
   async clearMissingCwd(publicationLockToken?: BackendPublicationLockToken): Promise<void> {
@@ -413,9 +423,16 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     return this.admitted(() => this.database.pruneProcessed(olderThanDays));
   }
 
-  async setPrevEventId(eventId: number, prevEventId: number): Promise<void> {
+  async setPrevEventId(
+    eventId: number,
+    prevEventId: number,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<void> {
     this.assertOpen("setPrevEventId");
-    this.admitted(() => this.database.setPrevEventId(eventId, prevEventId));
+    this.admitted(
+      () => this.database.setPrevEventId(eventId, prevEventId),
+      publicationLockToken,
+    );
   }
 
   async getPatternReinforcement(
@@ -434,14 +451,19 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     this.admitted(() => this.database.logHookError(hook, error, sessionId));
   }
 
-  async getHealthStats(): Promise<LocalHookOutboxHealth> {
+  async getHealthStats(
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<LocalHookOutboxHealth> {
     this.assertOpen("getHealthStats");
-    return this.database.getHealthStats();
+    return this.admitted(() => this.database.getHealthStats(), publicationLockToken);
   }
 
-  async getRecentErrors(options?: LocalHookErrorQuery): Promise<LocalHookErrorRecord[]> {
+  async getRecentErrors(
+    options?: LocalHookErrorQuery,
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<LocalHookErrorRecord[]> {
     this.assertOpen("getRecentErrors");
-    return this.database.getRecentErrors(options);
+    return this.admitted(() => this.database.getRecentErrors(options), publicationLockToken);
   }
 
   async pruneUnprocessed(maxRows?: number, maxAgeDays?: number): Promise<{ pruned: number }> {
@@ -529,9 +551,14 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     return this.admitted(() => this.database.markRemotePruned(eventUuid));
   }
 
-  async getDeliveryDiagnostics(): Promise<LocalHookDeliveryDiagnostics> {
+  async getDeliveryDiagnostics(
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<LocalHookDeliveryDiagnostics> {
     this.assertOpen("getDeliveryDiagnostics");
-    return this.database.getDeliveryDiagnostics();
+    return this.admitted(
+      () => this.database.getDeliveryDiagnostics(),
+      publicationLockToken,
+    );
   }
 
   close(publicationLockToken?: BackendPublicationLockToken): Promise<void> {

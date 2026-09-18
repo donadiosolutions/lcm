@@ -26,6 +26,19 @@ commit with an exact receipt. Ordinary SQLite installations without a registered
 machine continue to open and process events as before. They do not fabricate an
 identity or epoch, and snapshot admission refuses their unproven history.
 
+An ordinary SQLite open first proves that no object name or target belongs to
+the `migration_receipt_v1_` namespace. With that proof, a missing, pending, or
+damaged optional `machine.json` does not block the unenrolled project. LCM leaves
+the identity file unchanged and does not create an outbox, sequence allocator,
+or receipt epoch. Bounded-file integrity failures such as an oversized identity
+file still refuse the open. Any receipt namespace evidence requires a valid
+registered identity, including partial or malformed evidence, and explicit
+migration preparation and capture remain strict. A valid registered identity
+still enrolls a project whose receipt namespace is proven absent. Use `lcm
+machine show` to inspect identity state and the existing `lcm machine recover
+<machine-uuid> --force` flow to replace a damaged identity explicitly; do not
+delete or reset receipt evidence.
+
 Snapshot capture and dry-run are strictly read-only with respect to the source.
 LCM authenticates read-only, no-follow descriptors for the project database,
 local event outbox, machine-sequence database, and each WAL or shared-memory
@@ -34,6 +47,19 @@ SQLite recovery, `quick_check`, schema inspection, UTF-8 admission, and
 `user_version = 0` validation run only on private copied bytes. Capture never
 opens the source through SQLite, checkpoints it, changes its mode, runs a source
 migration, cleans a sidecar, or writes its directory.
+
+These snapshot and queue-evidence APIs require a callable process UID lookup
+and a descriptor namespace that supports enumeration plus authenticated
+directory traversal. LCM proves traversal through retained directory
+descriptors before using descriptor-relative paths; it does not fall back to
+ordinary pathnames. A platform without those capabilities is refused with
+`SqliteSnapshotError` reason `unsupported-platform` after input validation and
+before source opens, locks, artifact or evidence writes, queue iteration, or
+callbacks. Classification and inspection also refuse missing UID capability,
+including for an otherwise absent generation. On a supported platform, a
+missing home or generation still classifies as absent. If the descriptor
+namespace becomes unavailable while checking whether a private mutation-lock
+owner disappeared, recovery fails closed instead of consuming its retry.
 
 Private raw database/WAL copies and normalized database artifacts are sealed to
 read-only mode before their final file sync. A mode-change or final-sync failure
@@ -74,6 +100,14 @@ outbox.
 its physical artifact, exact receipt reference, bounded queue page references,
 and a checksum. It reauthenticates machine identity, project metadata, aliases,
 configuration, and the held maintenance journal before sealing and returning.
+Authenticated capture validates its authority, source-byte witness, maintenance
+checksum, home directory, and generation before checking process UID and retained
+descriptor support. Dry-run validates its home directory before the same
+capability check. Either wrapper reports an unsupported platform before capture
+enters the append barrier or dry-run reads configuration, project, machine, or
+source authority. Ordinary descriptor probe and cleanup failures remain snapshot
+I/O errors. The lower-level snapshot calls repeat capability admission so a
+capability lost after wrapper preflight is still refused before source access.
 The actual copied machine-sequence counter must equal the journal cutoff. The
 currently supported participant set is the authenticated local machine; a shared
 project or another participant without acknowledged fencing is refused.

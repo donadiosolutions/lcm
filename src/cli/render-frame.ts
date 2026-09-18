@@ -4,7 +4,7 @@
  */
 
 import type { ProgressState } from './progress-state.js';
-import { sanitizeTerminalText } from '../terminal-sanitize.js';
+import { boundedTerminalText } from '../terminal-sanitize.js';
 
 export interface RenderOpts {
   isTTY: boolean;
@@ -90,8 +90,8 @@ export function renderFrame(
       last.tokensAfter !== undefined && last.tokensAfter < last.tokensBefore
         ? `${fmtTokens(last.tokensBefore)} → ${fmtTokens(last.tokensAfter)}`
         : fmtTokens(last.tokensBefore);
-    const provider = last.provider ? ` [${sanitizeTerminalText(last.provider)}]` : '';
-    return `  ${counter} ${sanitizeTerminalText(last.sessionId)}: ${last.messages} msgs, ${tokens}${provider} ${fmtElapsed(last.elapsed)}\n`;
+    const provider = last.provider ? ` [${boundedTerminalText(last.provider, 40)}]` : '';
+    return `  ${counter} ${boundedTerminalText(last.sessionId, 32)}: ${last.messages} msgs, ${tokens}${provider} ${fmtElapsed(last.elapsed)}\n`;
   }
 
   if (opts.verbose) {
@@ -102,12 +102,12 @@ export function renderFrame(
       last.tokensAfter !== undefined && last.tokensAfter < last.tokensBefore
         ? `${fmtTokens(last.tokensBefore)} → ${fmtTokens(last.tokensAfter)}`
         : fmtTokens(last.tokensBefore);
-    const provider = last.provider ? `  [${sanitizeTerminalText(last.provider)}]` : '';
+    const provider = last.provider ? `  [${boundedTerminalText(last.provider, 40)}]` : '';
     const ratio =
       last.tokensAfter !== undefined && last.tokensAfter < last.tokensBefore
         ? `  (${fmtRatio(last.tokensBefore / last.tokensAfter, color)})`
         : '';
-    return `  ✓ ${sanitizeTerminalText(last.sessionId)}  ${last.messages} msgs  ${tokens}${ratio}${provider}  ${fmtElapsed(last.elapsed)}\n`;
+    return `  ✓ ${boundedTerminalText(last.sessionId, 32)}  ${last.messages} msgs  ${tokens}${ratio}${provider}  ${fmtElapsed(last.elapsed)}\n`;
   }
 
   // ── TTY non-verbose: 3-line ninja display ──────────────────────────────────
@@ -120,7 +120,7 @@ export function renderFrame(
   const counter = state.total > 0 ? `${processed}/${state.total}` : '';
   const failCount = state.errors.length + state.phaseErrors.length;
   const failStr = failCount > 0
-    ? (color ? `  ${RED}${failCount} failed${RESET}` : `  ${failCount} failed`)
+    ? (color ? `  ${RED}failure total ${failCount}${RESET}` : `  failure total ${failCount}`)
     : '';
   const dryRunBadge = state.dryRun ? '  [dry-run]' : '';
   const line1Parts = [phaseBar, counter, failStr, dryRunBadge].filter(Boolean);
@@ -145,19 +145,33 @@ export function renderFrame(
 
   // Line 3: current or last session detail
   let line3 = '';
-  if (state.currentProject) {
-    line3 = `  ● ${sanitizeTerminalText(state.currentProject)}  processing...`;
+  if (state.discovery) {
+    line3 = `  ● scanning project ${state.discovery.index}/${state.discovery.total} ${boundedTerminalText(state.discovery.project, Math.max(12, effectiveWidth - 30))}`;
+  } else if (state.currentProject) {
+    line3 = `  ● ${boundedTerminalText(state.currentProject, Math.max(12, effectiveWidth - 24))}  processing...`;
   } else if (state.current) {
     const elapsed = fmtElapsed(now - state.current.startedAt);
-    line3 = `  ● ${sanitizeTerminalText(state.current.sessionId)}  ${state.current.messages} msgs  processing...  ${elapsed}`;
+    const project = state.current.project
+      ? `${boundedTerminalText(state.current.project, 32)}  `
+      : '';
+    const conversation = state.current.conversationId === undefined
+      ? ''
+      : `conversation ${state.current.conversationId}  `;
+    const source = state.current.sourceLocator
+      ? `source ${boundedTerminalText(state.current.sourceLocator, 32)}  `
+      : '';
+    line3 = `  ● ${project}${boundedTerminalText(state.current.sessionId, 32)}  ${conversation}${source}${state.current.messages} msgs  processing...  ${elapsed}`;
   } else if (state.lastResult) {
     const last = state.lastResult;
     const tokens =
       last.tokensAfter !== undefined && last.tokensAfter < last.tokensBefore
         ? `${fmtTokens(last.tokensBefore)} → ${fmtTokens(last.tokensAfter)}`
         : fmtTokens(last.tokensBefore);
-    const provider = last.provider ? `  [${sanitizeTerminalText(last.provider)}]` : '';
-    line3 = `  ● ${sanitizeTerminalText(last.sessionId)}  ${last.messages} msgs  ${tokens}${provider}  ${fmtElapsed(last.elapsed)}`;
+    const provider = last.provider ? `  [${boundedTerminalText(last.provider, 40)}]` : '';
+    const project = last.project ? `${boundedTerminalText(last.project, 24)}  ` : '';
+    const conversation = last.conversationId === undefined ? '' : `conversation ${last.conversationId}  `;
+    const source = last.sourceLocator ? `source ${boundedTerminalText(last.sourceLocator, 24)}  ` : '';
+    line3 = `  ● ${project}${boundedTerminalText(last.sessionId, 24)}  ${conversation}${source}${last.messages} msgs  ${tokens}${provider}  ${fmtElapsed(last.elapsed)}`;
   } else {
     line3 = '  …';
   }

@@ -10,7 +10,9 @@ import {
   linkSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -60,11 +62,40 @@ export class PrivateDirectoryTopologyError extends Error {
   }
 }
 
+/** A required UID or authenticated descriptor namespace is unavailable. */
+export class UnsupportedPlatformCapabilityError extends Error {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super(message, options);
+    this.name = "UnsupportedPlatformCapabilityError";
+  }
+}
+
+/** Identify capability refusal even when descriptor cleanup also failed. */
+export function isUnsupportedPlatformCapabilityFailure(error: unknown): boolean {
+  if (error instanceof UnsupportedPlatformCapabilityError) return true;
+  return error instanceof AggregateError
+    && error.errors.some(isUnsupportedPlatformCapabilityFailure);
+}
+
 /** A create-if-absent private publication found an existing destination. */
 export class PrivateFileCollisionError extends PrivateDirectoryTopologyError {
   constructor(message: string, options?: { readonly cause?: unknown }) {
     super(message, options);
     this.name = "PrivateFileCollisionError";
+  }
+}
+
+/**
+ * A create-if-absent private publication collided and its task-owned temporary
+ * inode could not be proven removed.  This deliberately is not a
+ * PrivateFileCollisionError, so a caller that accepts an ordinary replay
+ * collision cannot silently accept incomplete cleanup.  A caller that must
+ * still classify the primary failure as a collision opts in through this type.
+ */
+export class PrivateFileCollisionCleanupError extends PrivateDirectoryTopologyError {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super(message, options);
+    this.name = "PrivateFileCollisionCleanupError";
   }
 }
 
@@ -159,6 +190,146 @@ function assertPrivateDirectoryStat(
 
 function currentUid(): number | undefined {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
+
+const DESCRIPTOR_NAMESPACE = "/proc/self/fd";
+
+/** @internal Deterministic descriptor-capability operations used by tests. */
+export type DescriptorCapabilityOperations = Readonly<{
+  getuid: () => number;
+  open: (path: string, flags: number) => number;
+  close: (fd: number) => void;
+  fstat: (fd: number) => BigIntDirectoryStat;
+  stat: (path: string) => BigIntDirectoryStat;
+  readlink: (path: string) => string;
+  readdir: (path: string) => readonly string[];
+}>;
+
+const DEFAULT_DESCRIPTOR_CAPABILITY_OPERATIONS: DescriptorCapabilityOperations = {
+  getuid: () => {
+    if (typeof process.getuid !== "function") {
+      throw new UnsupportedPlatformCapabilityError(
+        "process UID capability is unavailable",
+      );
+    }
+    return process.getuid();
+  },
+  open: (path, flags) => openSync(path, flags),
+  close: (fd) => closeSync(fd),
+  fstat: (fd) => directoryStat(fd),
+  stat: (path) => statSync(path, { bigint: true }) as unknown as BigIntDirectoryStat,
+  readlink: (path) => readlinkSync(path),
+  readdir: (path) => readdirSync(path),
+};
+
+function isUnavailableDescriptorNamespaceError(error: unknown): boolean {
+  return ["ENOENT", "ENOTDIR", "EINVAL"].includes(errorCode(error) ?? "");
+}
+
+function unsupportedDescriptorNamespace(error: unknown): never {
+  if (error instanceof UnsupportedPlatformCapabilityError) throw error;
+  if (isUnavailableDescriptorNamespaceError(error)) {
+    throw new UnsupportedPlatformCapabilityError(
+      "authenticated descriptor namespace is unavailable",
+      { cause: error },
+    );
+  }
+  throw error;
+}
+
+/** Require a callable process UID capability that returns a usable identity. */
+export function requireSupportedProcessUid(
+  getuid: unknown = process.getuid,
+): number {
+  if (typeof getuid !== "function") {
+    throw new UnsupportedPlatformCapabilityError(
+      "process UID capability is unavailable",
+    );
+  }
+  const uid = (getuid as () => unknown)();
+  if (!Number.isSafeInteger(uid) || Number(uid) < 0) {
+    throw new UnsupportedPlatformCapabilityError(
+      "process UID capability returned an invalid identity",
+    );
+  }
+  return Number(uid);
+}
+
+/** List the authenticated descriptor namespace or refuse unsupported traversal. */
+export function authenticatedDescriptorEntries(
+  operations: Partial<DescriptorCapabilityOperations> = {},
+): readonly string[] {
+  const ops = { ...DEFAULT_DESCRIPTOR_CAPABILITY_OPERATIONS, ...operations };
+  try {
+    return ops.readdir(DESCRIPTOR_NAMESPACE);
+  } catch (error) {
+    unsupportedDescriptorNamespace(error);
+  }
+}
+
+/**
+ * Prove that the descriptor namespace resolves a retained directory descriptor.
+ * The literal descendant `/.` is required to prove directory traversal support.
+ */
+export function retainedDirectoryDescriptorPath(
+  fd: number,
+  operations: Partial<DescriptorCapabilityOperations> = {},
+): string {
+  const ops = { ...DEFAULT_DESCRIPTOR_CAPABILITY_OPERATIONS, ...operations };
+  const expected = ops.fstat(fd);
+  const descriptorPath = `${DESCRIPTOR_NAMESPACE}/${fd}`;
+  let actual: BigIntDirectoryStat;
+  try {
+    ops.readlink(descriptorPath);
+    actual = ops.stat(`${descriptorPath}/.`);
+  } catch (error) {
+    unsupportedDescriptorNamespace(error);
+  }
+  if (
+    !expected.isDirectory()
+    || !actual.isDirectory()
+    || expected.dev !== actual.dev
+    || expected.ino !== actual.ino
+  ) {
+    throw new PrivateDirectoryTopologyError(
+      "retained descriptor namespace topology is not trusted",
+    );
+  }
+  return descriptorPath;
+}
+
+/**
+ * Admit UID, descriptor enumeration, and retained-directory traversal without
+ * creating filesystem state. The probe establishes capability only.
+ */
+export function admitDescriptorPlatformCapabilities(
+  probeDirectory: string,
+  operations: Partial<DescriptorCapabilityOperations> = {},
+): number {
+  const ops = { ...DEFAULT_DESCRIPTOR_CAPABILITY_OPERATIONS, ...operations };
+  const uid = requireSupportedProcessUid(ops.getuid);
+  const fd = ops.open(probeDirectory, PRIVATE_DIRECTORY_OPEN_FLAGS);
+  let hasPrimaryError = false;
+  let primaryError: unknown;
+  try {
+    authenticatedDescriptorEntries(ops);
+    retainedDirectoryDescriptorPath(fd, ops);
+  } catch (error) {
+    hasPrimaryError = true;
+    primaryError = error;
+  }
+  try {
+    ops.close(fd);
+  } catch (closeError) {
+    if (!hasPrimaryError) throw closeError;
+    throw new AggregateError(
+      [primaryError, closeError],
+      "descriptor capability admission and probe cleanup failed",
+      { cause: primaryError },
+    );
+  }
+  if (hasPrimaryError) throw primaryError;
+  return uid;
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -411,6 +582,8 @@ export type PrivateFileAbsenceOptions = Readonly<{
   _lstatForTesting?: typeof lstatSync;
   /** @internal Deterministic descriptor-close seam. */
   _closeParentForTesting?: (handle: PrivateDirectoryHandle) => void;
+  /** @internal Deterministic retained-descriptor namespace seam. */
+  _descriptorPathForTesting?: (fd: number) => string;
 }>;
 
 function samePrivateDirectoryIdentity(
@@ -434,7 +607,7 @@ export function privateFileAbsentAtRetainedParent(
   options: PrivateFileAbsenceOptions = {},
 ): boolean {
   const directory = dirname(path);
-  const expectedUid = options.expectedUid ?? currentUid();
+  const expectedUid = options.expectedUid ?? requireSupportedProcessUid();
   const parent = openPrivateDirectory(directory, { expectedUid });
   let hasPrimaryError = false;
   let primaryError: unknown;
@@ -446,13 +619,16 @@ export function privateFileAbsentAtRetainedParent(
         "private directory topology is not trusted",
       );
     }
+    const descriptorPath = options._descriptorPathForTesting?.(parent.fd)
+      ?? retainedDirectoryDescriptorPath(parent.fd);
     options._beforeLookupForTesting?.();
     try {
       (options._lstatForTesting ?? lstatSync)(
-        join(`/dev/fd/${parent.fd}`, basename(path)),
+        join(descriptorPath, basename(path)),
       );
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;
+      (options._descriptorPathForTesting ?? retainedDirectoryDescriptorPath)(parent.fd);
       absent = true;
     }
     const after = assertPrivateDirectoryEntry(parent, directory, expectedUid);
@@ -627,6 +803,9 @@ function privateFilePublicationCleanupFailure(
       aggregate,
       primaryError.operation,
     );
+  }
+  if (primaryError instanceof PrivateFileCollisionError) {
+    return new PrivateFileCollisionCleanupError(primaryError.message, { cause: aggregate });
   }
   if (primaryError instanceof PrivateDirectoryTopologyError) {
     return new PrivateDirectoryTopologyError(primaryError.message, { cause: aggregate });
@@ -1182,15 +1361,55 @@ export function atomicWritePrivateFile(
       }
     } finally {
       if (ownsTempPath && tempIdentity !== undefined) {
-        try {
-          unlinkPrivateFileIfIdentityMatches(
-            tempPath,
-            tempIdentity,
-            (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
-            undefined,
-            published ? 2n : 1n,
-          );
-        } catch { /* preserve the exclusive publication failure */ }
+        if (primaryError instanceof PrivateFileCollisionError) {
+          let removalErrorPresent = false;
+          let removalError: unknown;
+          let removed = false;
+          try {
+            removed = unlinkPrivateFileIfIdentityMatches(
+              tempPath,
+              tempIdentity,
+              (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+              undefined,
+              1n,
+            );
+          } catch (error) {
+            removalErrorPresent = true;
+            removalError = error;
+          }
+          if (removalErrorPresent) {
+            const cleanupErrors = [removalError];
+            try {
+              assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+            } catch (topologyError) {
+              cleanupErrors.push(topologyError);
+            }
+            primaryError = privateFilePublicationCleanupFailure(primaryError, ...cleanupErrors);
+          } else if (!removed) {
+            let cleanupError: unknown = new Error(
+              "private exclusive publication temp cleanup was not completed",
+            );
+            try {
+              assertPrivateDirectoryEntry(parent, directory, parent.witness.uid);
+            } catch (topologyError) {
+              cleanupError = new PrivateDirectoryTopologyError(
+                "private exclusive publication temp cleanup was not completed",
+                { cause: topologyError },
+              );
+            }
+            primaryError = privateFilePublicationCleanupFailure(primaryError, cleanupError);
+          }
+        } else {
+          try {
+            unlinkPrivateFileIfIdentityMatches(
+              tempPath,
+              tempIdentity,
+              (candidate) => (operations.remove ?? rmSync)(candidate, { force: true }),
+              undefined,
+              published ? 2n : 1n,
+            );
+          } catch { /* preserve the exclusive publication failure */ }
+        }
       }
     }
     if (primaryErrorPresent) throw primaryError;
@@ -1520,13 +1739,13 @@ export function atomicWritePrivateFileExclusive(
   try {
     const fd = openSync(tempPath, "wx", PRIVATE_FILE_MODE);
     ownsTempPath = true;
-    tempIdentity = privateFileIdentity(
-      fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
-      privatePathIdentity(directory),
-    );
     let descriptorErrorPresent = false;
     let descriptorError: unknown;
     try {
+      tempIdentity = privateFileIdentity(
+        fstatSync(fd, { bigint: true }) as unknown as PrivatePathIdentity,
+        privatePathIdentity(directory),
+      );
       writeFileSync(fd, content, "utf-8");
       fsyncSync(fd);
     } catch (error) {

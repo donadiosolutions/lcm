@@ -19,10 +19,15 @@ resolved settings unchanged. These are invocation instructions, not CLI flags.
 Shared route preflight and best-effort tier rules apply to every role.
 
 Read repository/local instructions and project memory, [LCM integration](../shared/lcm-development.md),
-[procedural-development](../procedural-development/SKILL.md) and both its references,
+[procedural-development](../procedural-development/SKILL.md) and its coordination/delivery references,
 then [inventory/triage](references/triage.md) and [accounting](references/coordination.md)
 in full. Apply shared root, event, recovery and route rules during triage without
-starting remediation. Workers receive self-contained issue, scope and evidence briefs.
+starting remediation. Complete [root lifecycle admission](../procedural-development/references/root-lifecycle.md)
+before triage dispatch or unattended waiting, not only at remediation handoff.
+Every triager and duplicate adjudicator receives the required [worker execution brief](../procedural-development/references/worker-execution.md),
+including local execution allocation and command-cleanup evidence. Apply its completion
+gate before accepting a terminal triage result. Explicit root replacement preserves
+the campaign and follows the shared verified handoff.
 
 ## Phase boundaries
 
@@ -49,7 +54,9 @@ application-internal locks.
 ## Remediation handoff
 
 After the complete triage barrier, update final triage counts and invoke
-`procedural-development` with the **same root, run ID and recovery record**:
+`procedural-development` with the **current verified runtime root**, preserving the
+**same logical run ID and recovery record**. An explicitly authorized successor
+uses the shared verified handoff; it retains S0, scope, spent rounds and budgets:
 
 | Input | Supply |
 | --- | --- |

@@ -29,9 +29,15 @@ import { resolveGitProjectAnchor } from "./git-project.js";
 import {
   foldProjectMapEntriesLocked,
   hashProjectPath,
+  isRetiredProjectIdentitySuccessor,
   listProjectMapEntries,
+  normalizeProjectIdentityPath,
+  normalizeProjectPath,
+  persistedRetiredProjectIdentitySuccessors,
   projectMapPath,
   readProjectMapSnapshot,
+  resolveExistingProjectIdentity,
+  retiredProjectIdentitySuccessor,
   type ProjectIdentity,
   type ProjectMapEntry,
   withProjectMapReconciliationLock,
@@ -68,6 +74,7 @@ import {
   parseLocalHookMachineSequence,
 } from "./storage/local-hook-event-sequence.js";
 import {
+  isAuthenticatedRetiredProjectIdentityFence,
   isWorktreeReconciliationFence,
   serializeWorktreeReconciliationFence,
 } from "./worktree-reconciliation-fence.js";
@@ -493,9 +500,12 @@ function isAdmittedSourcePatternsFile(path: string): boolean {
 
 type ReconciliationJournalIdentity = Readonly<{ dev: bigint; ino: bigint }>;
 
+type ReconciliationJournalParentIdentity = Readonly<{ dev: string; ino: string }>;
+
 type ReconciliationJournalAdmission = Readonly<{
   journal: ReconciliationJournal;
   identity: ReconciliationJournalIdentity;
+  parentIdentity: ReconciliationJournalParentIdentity;
   content: string;
 }>;
 
@@ -516,7 +526,32 @@ function publishedJournalIdentity(
   return { dev: identity.dev, ino: identity.ino };
 }
 
-function readJournalAdmission(path: string): ReconciliationJournalAdmission | null {
+function journalParentIdentitiesEqual(
+  left: ReconciliationJournalParentIdentity,
+  right: ReconciliationJournalParentIdentity,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function retainedJournalParentIdentity(
+  parent: PrivateDirectoryHandle,
+): ReconciliationJournalParentIdentity {
+  return { dev: parent.witness.dev, ino: parent.witness.ino };
+}
+
+function journalParentMismatchError(): BackendPublicationJournalError {
+  const cause = new Error("authenticated journal reader observed a different parent inode");
+  return new BackendPublicationJournalError(
+    "unsafe-storage",
+    "worktree reconciliation journal parent changed during admission",
+    { cause },
+  );
+}
+
+function readJournalAdmission(
+  path: string,
+  parent?: PrivateDirectoryHandle,
+): ReconciliationJournalAdmission | null {
   let observed: ReturnType<typeof readBoundedRegularFileWithStat>;
   try {
     observed = readBoundedRegularFileWithStat(path, {
@@ -529,6 +564,13 @@ function readJournalAdmission(path: string): ReconciliationJournalAdmission | nu
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
+  }
+  const parentIdentity = { dev: observed.parentDev, ino: observed.parentIno };
+  if (
+    parent !== undefined
+    && !journalParentIdentitiesEqual(parentIdentity, retainedJournalParentIdentity(parent))
+  ) {
+    throw journalParentMismatchError();
   }
   const value = JSON.parse(observed.content) as Partial<ReconciliationJournal>;
   if (
@@ -607,12 +649,16 @@ function readJournalAdmission(path: string): ReconciliationJournalAdmission | nu
   return {
     journal: value as ReconciliationJournal,
     identity: { dev: BigInt(observed.exactDev), ino: BigInt(observed.exactIno) },
+    parentIdentity,
     content: observed.content,
   };
 }
 
-function readJournal(path: string): ReconciliationJournal | null {
-  return readJournalAdmission(path)?.journal ?? null;
+function readJournal(
+  path: string,
+  parent?: PrivateDirectoryHandle,
+): ReconciliationJournal | null {
+  return readJournalAdmission(path, parent)?.journal ?? null;
 }
 
 function assertAuthorizedJournalAdmission(
@@ -648,7 +694,7 @@ function writeJournal(
   authorization: ReconciliationJournalAuthorization,
 ): void {
   assertPrivateDirectoryEntry(parent, dirname(path), parent.witness.uid);
-  const admitted = readJournalAdmission(path);
+  const admitted = readJournalAdmission(path, parent);
   assertAuthorizedJournalAdmission(admitted, authorization);
   assertCompletedJournalIsNotBlocked(admitted, journal);
   journal.updatedAt = new Date().toISOString();
@@ -662,7 +708,7 @@ function writeJournal(
       ? { requireAbsent: true }
       : {
           beforeReplace: () => {
-            const boundary = readJournalAdmission(path);
+            const boundary = readJournalAdmission(path, parent);
             assertAuthorizedJournalAdmission(boundary, authorization);
             if (boundary === null) {
               throw new Error("worktree reconciliation journal identity changed during publication");
@@ -674,7 +720,7 @@ function writeJournal(
   // Retain the identity of the inode we actually published before reopening
   // the pathname. A safe substitute must never become the next authorization.
   authorization.identity = publishedJournalIdentity(published);
-  const verified = readJournalAdmission(path);
+  const verified = readJournalAdmission(path, parent);
   if (
     verified === null
     || !journalIdentitiesEqual(verified.identity, authorization.identity)
@@ -843,6 +889,40 @@ function assertSupportedPromotedContent(db: DatabaseSync): void {
   ).get();
   if (unsupported !== undefined) {
     throw new Error("stored promoted content is unsupported");
+  }
+}
+
+const MESSAGE_CONTENT_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+function assertSupportedMessageContent(db: DatabaseSync): void {
+  if (!tableExists(db, "messages")) return;
+  const first = db.prepare(
+    `SELECT message_id, typeof(content) AS content_type,
+            CAST(content AS BLOB) AS content_bytes
+       FROM messages ORDER BY message_id LIMIT 1`,
+  );
+  const continuation = db.prepare(
+    `SELECT message_id, typeof(content) AS content_type,
+            CAST(content AS BLOB) AS content_bytes
+       FROM messages WHERE message_id > ? ORDER BY message_id LIMIT 1`,
+  );
+  first.setReadBigInts(true);
+  continuation.setReadBigInts(true);
+  let current = first.get() as {
+    message_id: bigint;
+    content_type: string;
+    content_bytes: Uint8Array;
+  } | undefined;
+  while (current !== undefined) {
+    if (current.content_type !== "text" || current.content_bytes.includes(0)) {
+      throw new Error("stored message content is unsupported");
+    }
+    try {
+      MESSAGE_CONTENT_DECODER.decode(current.content_bytes);
+    } catch {
+      throw new Error("stored message content is unsupported");
+    }
+    current = continuation.get(current.message_id) as typeof current;
   }
 }
 
@@ -1531,7 +1611,10 @@ function mergeMainDatabase(
     source,
     commitFence,
   ) => {
-    if (!sourceWasMerged) assertSupportedPromotedContent(source);
+    if (!sourceWasMerged) {
+      assertSupportedPromotedContent(source);
+      assertSupportedMessageContent(source);
+    }
     commitFence();
     assertTarget();
     return withNormalizedMainSnapshot(
@@ -1571,8 +1654,12 @@ function mergeMainDatabase(
               assertTarget();
               return;
             }
-            if (sourceWasMerged) assertSupportedPromotedContent(normalizedSource);
+            if (sourceWasMerged) {
+              assertSupportedPromotedContent(normalizedSource);
+              assertSupportedMessageContent(normalizedSource);
+            }
             assertSupportedPromotedContent(target);
+            assertSupportedMessageContent(target);
             for (const conversation of rows(
               normalizedSource,
               "SELECT * FROM conversations ORDER BY conversation_id",
@@ -2457,6 +2544,105 @@ function resultFromJournal(journal: ReconciliationJournal, path: string): Worktr
   };
 }
 
+/**
+ * Require the retained predecessor fence of an already-renewed identity.
+ *
+ * A successor-shaped binding is only reachable through renewal, so its
+ * presence is proof the project was already renewed. Without a fence to
+ * reverify that renewal, ordinary reconciliation targets the retired hash,
+ * recreates the retired directory, and folds the live successor database and
+ * event sidecar backwards into it as a legacy source. Fail closed instead of
+ * letting a missing or tampered fence silently undo a renewal.
+ */
+function assertRenewedProjectIdentityFence(retiredId: string, homeDir?: string): void {
+  if (isAuthenticatedRetiredProjectIdentityFence(projectStateDir(retiredId, homeDir), retiredId)) {
+    return;
+  }
+  throw new Error(
+    "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile",
+  );
+}
+
+/**
+ * Resolve the reconciliation target hash for a persisted renewed identity.
+ *
+ * `ensureWorktreeProjectReconciled` authenticates a renewed successor before
+ * it delegates, but `lcm project reconcile-worktrees`, `createProject`, and
+ * `showReconciledLocalProject` call `reconcileWorktrees` directly. Those
+ * callers otherwise target the retired hash, `discoverSources` classifies the
+ * live successor entry as a legacy source because it belongs to the same
+ * repository, and the fold merges the successor's database and sidecar into
+ * the retired id, archives the successor, and rekeys the map backwards.
+ * Authenticating here, before any discovery or fold, covers every entry point
+ * from one choke point instead of from each caller.
+ *
+ * The successor id is derived from the retired id and this exact canonical
+ * path, but a hand-edited map can bind that key to another project. Validate
+ * the entry's canonical path before selecting it as the target. Looking the id
+ * up directly still keeps the multi-owner refusal of
+ * `resolveExistingProjectIdentity` out of reconciliation, whose whole purpose
+ * is to fold several entries of one repository together.
+ *
+ * That derivation alone is not the whole authentication, because a renewed
+ * entry may also carry local aliases: `linkLocalAlias` adds one on the SQLite
+ * backend, and an alias derives a different, absent successor id. Reaching a
+ * renewed entry through its alias therefore consulted no fence at all and
+ * returned a third, unrelated path hash as the target, while CLI storage kept
+ * resolving the successor. Authenticate every entry the map actually binds to
+ * this path, each against its own canonical path — the path renewal hashed to
+ * mint its id — and never hand back the alias-derived hash: an alias
+ * reconciles to the authenticated successor or not at all.
+ *
+ * An alias may only be adopted when the entered path has no Git anchor, which
+ * is the case that returns "not-needed" before any discovery runs. With an
+ * anchor, `discoverSources` classifies candidates by common directory, so
+ * adopting the successor would fold the alias repository's own worktree
+ * entries into the renewed project of a different repository. Refuse that, and
+ * refuse an ambiguous path bound as an alias by several renewed entries,
+ * rather than choosing one of them.
+ */
+function authenticatedRenewedTargetHash(
+  canonical: string,
+  anchored: boolean,
+  homeDir: string | undefined,
+  publicationLockToken: BackendPublicationLockToken,
+): string | undefined {
+  const map = readProjectMapSnapshot(homeDir, publicationLockToken);
+  const reached = persistedRetiredProjectIdentitySuccessors(map, canonical);
+  for (const successor of reached) {
+    assertRenewedProjectIdentityFence(successor.retiredId, homeDir);
+  }
+  if (reached.length > 1) {
+    throw new Error(
+      "project path is an alias of multiple renewed project identities; refusing to reconcile",
+    );
+  }
+  const retiredId = hashProjectPath(canonical);
+  const successorId = retiredProjectIdentitySuccessor(retiredId, canonical);
+  const successorEntry = map[successorId];
+  if (successorEntry !== undefined) {
+    // A successor id proves which canonical path renewal hashed, but a
+    // hand-edited map can bind that key to another project. Never let the key
+    // alone make that foreign entry reconciliation's target.
+    if (resolve(successorEntry.canonical) !== resolve(canonical)) {
+      throw new Error(
+        "renewed project identity target is bound to a different project; refusing to reconcile",
+      );
+    }
+    assertRenewedProjectIdentityFence(retiredId, homeDir);
+    return successorId;
+  }
+  // No entry is keyed by this path's own successor, so every remaining match
+  // binds this path as one of its aliases.
+  if (reached.length === 0) return undefined;
+  if (anchored) {
+    throw new Error(
+      "renewed project identity alias belongs to a different repository; refusing to reconcile",
+    );
+  }
+  return reached[0].id;
+}
+
 export function reconcileWorktrees(
   path: string = process.cwd(),
   opts: {
@@ -2487,6 +2673,8 @@ export function reconcileWorktrees(
     readonly _discoveryObserver?: (path: string) => void;
     /** @internal Token held by a caller that already has publication admission. */
     readonly _publicationLockToken?: BackendPublicationLockToken;
+    /** @internal Persisted identity that must remain the reconciliation target. */
+    readonly _targetIdentity?: ProjectIdentity;
   } = {},
 ): WorktreeReconciliationResult {
   if (opts._publicationLockToken === undefined) {
@@ -2497,8 +2685,32 @@ export function reconcileWorktrees(
       }));
   }
   const anchor = resolveGitProjectAnchor(path);
-  const canonical = anchor?.canonical ?? resolve(path);
-  const targetHash = hashProjectPath(canonical);
+  // Both sides of this comparison must use the same identity normalization.
+  // A supplied `_targetIdentity` carries the canonical path that renewal and
+  // `normalizeProjectIdentityPath` produced, which realpaths a directory with
+  // no Git anchor. Spelling the discovered path with `resolve` alone made a
+  // genuinely renewed, authenticated non-Git project reached through a
+  // symlinked path fail here. `anchor?.canonical ?? normalizeProjectPath(path)`
+  // is exactly `normalizeProjectIdentityPath(path)` without a second Git probe.
+  const discoveredCanonical = anchor?.canonical ?? normalizeProjectPath(path);
+  if (opts._targetIdentity !== undefined
+    && resolve(opts._targetIdentity.canonical) !== discoveredCanonical) {
+    throw new Error("mapped project identity does not match the current project directory");
+  }
+  const canonical = opts._targetIdentity === undefined
+    ? discoveredCanonical
+    : resolve(opts._targetIdentity.canonical);
+  // A supplied `_targetIdentity` was already authenticated by
+  // `authenticatedRenewedReconciliationTarget`; every other caller reaches the
+  // same authentication here.
+  const targetHash = opts._targetIdentity?.id
+    ?? authenticatedRenewedTargetHash(
+      canonical,
+      anchor !== null,
+      opts.homeDir,
+      opts._publicationLockToken,
+    )
+    ?? hashProjectPath(canonical);
   if (!anchor) {
     return {
       status: "not-needed",
@@ -2573,8 +2785,11 @@ export function reconcileWorktrees(
     assertJournalParent();
     opts._observer?.("after-map-preflight");
     assertJournalParent();
-    const existingAdmission = readJournalAdmission(journalFile);
-    journalAuthorization.identity = existingAdmission?.identity ?? null;
+    const existingAdmission = readJournalAdmission(
+      journalFile,
+      retainedJournalParent?.directory,
+    );
+    assertAuthorizedJournalAdmission(existingAdmission, journalAuthorization);
     const existingJournal = existingAdmission?.journal ?? null;
     assertJournalParent();
     opts._observer?.("after-journal-admission");
@@ -2987,7 +3202,9 @@ export function reconcileWorktrees(
   ): WorktreeReconciliationResult => {
     const completion = { marked: false, published: false };
     const blockedRecording = { attempted: false };
-    const journalAuthorization: ReconciliationJournalAuthorization = { identity: undefined };
+    const journalAuthorization: ReconciliationJournalAuthorization = {
+      identity: undefined,
+    };
     const executeWithJournalParent = (
       retainedJournalParent: RetainedReconciliationJournalParent | undefined,
     ): WorktreeReconciliationResult => {
@@ -3007,7 +3224,10 @@ export function reconcileWorktrees(
         let current: ReconciliationJournal | null;
         try {
           assertRetainedReconciliationJournalParent(retainedJournalParent!);
-          const currentAdmission = readJournalAdmission(journalFile);
+          const currentAdmission = readJournalAdmission(
+            journalFile,
+            retainedJournalParent!.directory,
+          );
           assertAuthorizedJournalAdmission(currentAdmission, journalAuthorization);
           current = currentAdmission?.journal ?? null;
           assertRetainedReconciliationJournalParent(retainedJournalParent!);
@@ -3111,6 +3331,50 @@ export function reconcileWorktrees(
   }
 }
 
+/**
+ * Authenticate a persisted successor-shaped identity against the retained
+ * fence of its retired predecessor, independently of Git.
+ *
+ * `renewRetiredProjectIdentity` derives its canonical path through
+ * `normalizeProjectIdentityPath`, which falls back to `normalizeProjectPath`
+ * when there is no Git anchor, so an ordinary directory can be renewed and
+ * produce a successor-shaped map entry exactly as a repository can. Deriving
+ * the anchor here with the same function keeps this check aligned with both
+ * renewal and the hook path in `parseLocalProjectMapCompatibility`, which is
+ * already Git-independent. Requiring a Git anchor instead left a non-Git
+ * successor entry unauthenticated by construction: reconciliation reported
+ * "not-needed" without ever consulting the fence, and CLI storage then
+ * admitted writes under the unauthenticated successor.
+ *
+ * Authenticate against the matched entry's OWN canonical path rather than the
+ * entered path. Renewal minted the successor id by hashing that canonical
+ * path, so it is the only path that can authenticate the entry, and it is not
+ * necessarily the path the caller entered: a renewed entry may also carry
+ * local aliases. Deriving the expected successor from the entered path made an
+ * alias fail the shape test and return before the fence was ever consulted,
+ * which is exactly the proof this function exists to demand.
+ */
+function authenticatedRenewedReconciliationTarget(
+  cwd: string,
+  identity: ProjectIdentity | undefined,
+): ProjectIdentity | undefined {
+  if (identity === undefined) return undefined;
+  const canonical = resolve(identity.canonical);
+  const retiredId = hashProjectPath(canonical);
+  if (!isRetiredProjectIdentitySuccessor(identity.id, retiredId, canonical)) return undefined;
+  assertRenewedProjectIdentityFence(retiredId);
+  // Only the entry's own canonical path may be SUPPLIED as the reconciliation
+  // target. `reconcileWorktrees` compares a supplied `_targetIdentity.canonical`
+  // against the path it discovers, so handing it a non-matching alias would
+  // reject a supported alias as "does not match the current project
+  // directory". The alias is authenticated above and then picks its target at
+  // the `authenticatedRenewedTargetHash` choke point, so one rule decides
+  // which hash an alias reconciles to.
+  return normalizeProjectIdentityPath(cwd) === canonical
+    ? { ...identity, canonical }
+    : undefined;
+}
+
 export function ensureWorktreeProjectReconciled(
   cwd: string,
   identity?: ProjectIdentity,
@@ -3136,13 +3400,17 @@ export function ensureWorktreeProjectReconciled(
         _publicationLockToken: publicationLockToken,
       }));
   }
-  const anchor = identity ? undefined : resolveGitProjectAnchor(cwd);
-  if (!identity && !anchor) {
+  const persistedIdentity = identity
+    ?? resolveExistingProjectIdentity(cwd, opts._publicationLockToken)
+    ?? undefined;
+  const renewedTarget = authenticatedRenewedReconciliationTarget(cwd, persistedIdentity);
+  const anchor = identity || renewedTarget ? undefined : resolveGitProjectAnchor(cwd);
+  if (!identity && !renewedTarget && !anchor) {
     return reconcileWorktrees(cwd, {
       _publicationLockToken: opts._publicationLockToken,
     });
   }
-  const project = identity ?? {
+  const project = renewedTarget ?? identity ?? {
     id: hashProjectPath(anchor!.canonical),
     canonical: anchor!.canonical,
   };
@@ -3209,6 +3477,7 @@ export function ensureWorktreeProjectReconciled(
     _maxDiscoveryEntries: opts._maxDiscoveryEntries,
     _discoveryObserver: opts._discoveryObserver,
     _publicationLockToken: opts._publicationLockToken,
+    _targetIdentity: renewedTarget,
   });
   const publishedDiscovery = result.journalPath
     ? readJournal(result.journalPath)?.discovery
@@ -3243,10 +3512,52 @@ export function clearWorktreeReconciliationCache(): void {
 export function listWorktreeReconciliationJournals(homeDir?: string): ReconciliationJournal[] {
   return withBackendPublicationConsumerLock(homeDir, () => {
     const root = reconciliationDir(homeDir);
-    if (!existsSync(root)) return [];
-    return readdirSync(root, { withFileTypes: true })
-      .filter((entry) => /^[a-f0-9]{64}\.json$/u.test(entry.name))
-      .map((entry) => readJournal(join(root, entry.name)))
-      .filter((journal): journal is ReconciliationJournal => journal !== null);
+    let rootEntry: ReturnType<typeof lstatSync>;
+    try {
+      rootEntry = lstatSync(root);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    if (!rootEntry.isDirectory()) {
+      throw new Error(
+        `worktree reconciliation journal directory is not a private directory: ${root}`,
+      );
+    }
+
+    const retainedRoot = openPrivateDirectory(root);
+    let journals: ReconciliationJournal[] | undefined;
+    let primaryError: unknown;
+    try {
+      assertPrivateDirectoryEntry(retainedRoot, root, retainedRoot.witness.uid);
+      const entries = readdirSync(root, { withFileTypes: true });
+      assertPrivateDirectoryEntry(retainedRoot, root, retainedRoot.witness.uid);
+      journals = [];
+      for (const entry of entries) {
+        if (!/^[a-f0-9]{64}\.json$/u.test(entry.name)) continue;
+        assertPrivateDirectoryEntry(retainedRoot, root, retainedRoot.witness.uid);
+        const journal = readJournal(join(root, entry.name), retainedRoot);
+        assertPrivateDirectoryEntry(retainedRoot, root, retainedRoot.witness.uid);
+        if (journal !== null) journals.push(journal);
+      }
+    } catch (error) {
+      primaryError = error;
+    }
+    const cleanupErrors = closePrivateDirectoryHandles([retainedRoot]);
+    if (primaryError !== undefined && cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [primaryError, ...cleanupErrors],
+        `reconciliation journal listing failed: ${String(primaryError)}`,
+        { cause: primaryError },
+      );
+    }
+    if (primaryError !== undefined) throw primaryError;
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        cleanupErrors,
+        "reconciliation journal listing directory cleanup failed",
+      );
+    }
+    return journals as ReconciliationJournal[];
   });
 }

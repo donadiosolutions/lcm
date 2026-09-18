@@ -7,6 +7,9 @@ export interface ProgressPhase {
 
 export interface ProgressError {
   sessionId: string;
+  project?: string;
+  conversationId?: number;
+  sourceLocator?: string;
   message: string;
 }
 
@@ -18,6 +21,9 @@ export interface ProgressPhaseError {
 
 export interface ProgressCurrentSession {
   sessionId: string;
+  project?: string;
+  conversationId?: number;
+  sourceLocator?: string;
   messages: number;
   tokens: number;
   startedAt: number;
@@ -25,6 +31,10 @@ export interface ProgressCurrentSession {
 
 export interface ProgressLastResult {
   sessionId: string;
+  project?: string;
+  conversationId?: number;
+  sourceLocator?: string;
+  outcome?: 'done' | 'unchanged' | 'skipped' | 'failed' | 'dry-run';
   messages: number;
   tokensBefore: number;
   tokensAfter?: number;
@@ -45,6 +55,7 @@ export interface ProgressState {
 
   /** Multi-project tracking (--all mode) */
   currentProject?: string;
+  discovery?: { index: number; total: number; project: string };
 
   /** Total sessions to process */
   total: number;

@@ -8,6 +8,13 @@ import {
   scrubExtractedEvents,
 } from "../../src/hooks/event-scrubbing.js";
 import { projectDir } from "../../src/daemon/project.js";
+import {
+  hashProjectPath,
+  normalizeProjectPath,
+  renewRetiredProjectIdentity,
+  retiredProjectIdentitySuccessor,
+} from "../../src/project-map.js";
+import { serializeWorktreeReconciliationFence } from "../../src/worktree-reconciliation-fence.js";
 import { ScrubEngine } from "../../src/scrub.js";
 import * as hookConfig from "../../src/hooks/config.js";
 import * as runtimePaths from "../../src/runtime-paths.js";
@@ -36,6 +43,74 @@ describe("passive event scrubbing", () => {
       data: "always use [REDACTED]",
       tags: ["[REDACTED]"],
     });
+  });
+
+  it("classifies a mapped retired project before reading child patterns", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-event-scrub-retired-home-"));
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-event-scrub-retired-cwd-"));
+    dirs.push(home, cwd);
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    const root = join(home, ".lcm");
+    const projects = join(root, "projects");
+    mkdirSync(projects, { recursive: true, mode: 0o700 });
+    chmodSync(root, 0o700);
+    chmodSync(projects, 0o700);
+    const canonical = normalizeProjectPath(cwd);
+    const id = hashProjectPath(canonical);
+    writeFileSync(join(root, "map.json"), `${JSON.stringify({
+      [id]: { canonical, aliases: [] },
+    })}\n`, { mode: 0o600 });
+    writeFileSync(
+      join(projects, id),
+      serializeWorktreeReconciliationFence(id, "project"),
+      { mode: 0o600 },
+    );
+    try {
+      await expect(scrubExtractedEvents([{
+        type: "decision", category: "decision", data: "safe", priority: 1,
+      }], cwd, [])).rejects.toMatchObject({
+        name: "RetiredProjectIdentityError",
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
+  it("uses an authenticated renewed successor for read-only hook identity", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-event-scrub-successor-home-"));
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-event-scrub-successor-cwd-"));
+    dirs.push(home, cwd);
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    const root = join(home, ".lcm");
+    const projects = join(root, "projects");
+    mkdirSync(projects, { recursive: true, mode: 0o700 });
+    chmodSync(root, 0o700);
+    chmodSync(projects, 0o700);
+    const canonical = normalizeProjectPath(cwd);
+    const oldId = hashProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    writeFileSync(join(root, "map.json"), `${JSON.stringify({
+      [oldId]: { canonical, aliases: [] },
+    })}\n`, { mode: 0o600 });
+    writeFileSync(
+      join(projects, oldId),
+      serializeWorktreeReconciliationFence(oldId, "project"),
+      { mode: 0o600 },
+    );
+    renewRetiredProjectIdentity(cwd);
+    const forProject = vi.spyOn(ScrubEngine, "forProject");
+    try {
+      await expect(scrubExtractedEvents([{
+        type: "decision", category: "decision", data: "safe", priority: 1,
+      }], cwd, [])).resolves.toHaveLength(1);
+      expect(forProject).toHaveBeenCalledWith([], join(projects, newId));
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
   });
 
   it("reuses a project scrubber and invalidates it when project patterns change", async () => {

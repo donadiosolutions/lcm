@@ -581,6 +581,286 @@ describe("portable-knowledge — import", () => {
     };
   }
 
+  const IMPORT_DIGESTS_KEY = "lcm.portableKnowledge.v1.entryDigests";
+
+  function computeEntryDigest(doc: ExportDocument, ordinal: number): string {
+    const source = doc.entries[ordinal];
+    return createHash("sha256").update(JSON.stringify([
+      EXPORT_VERSION, doc.projectCwd, ordinal, source.content, source.tags,
+      source.confidence, source.createdAt, source.sessionId,
+    ])).digest("hex");
+  }
+
+  function overridePostgresqlBackendFlag() {
+    const original = cliStorage.withCliProjectStorage;
+    return vi.spyOn(cliStorage, "withCliProjectStorage").mockImplementation((path, options, callback) =>
+      original(path, options, context => callback({
+        ...context,
+        storage: { ...context.storage, backend: "postgresql", transaction: context.storage.transaction.bind(context.storage) },
+      })));
+  }
+
+  it("preserves canonical metadata from a row committed after the import scan (PostgreSQL READ COMMITTED)", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const projId = toProjectId(cwd);
+    seedProject(baseDir, cwd, []);
+    const dbPath = join(baseDir, "projects", projId, "db.sqlite");
+    const db = new DatabaseSync(dbPath);
+    const store = new PromotedStore(db);
+    const content = "red one canonical race content";
+    const rId = store.insert({ content, tags: ["b-tag"], projectId: projId, confidence: 0.5 });
+    store.update(rId, { metadata: { canonicalNote: "B metadata", [IMPORT_DIGESTS_KEY]: ["a".repeat(64)] } });
+    const foreignId = store.insert({
+      content: "unrelated foreign project reference zzqx", tags: ["foreign"],
+      projectId: "external-owner-red1", confidence: 0.4,
+    });
+    const foreignBefore = store.getById(foreignId);
+
+    const originalGetAll = PromotedStore.prototype.getAll;
+    let scanCalls = 0;
+    const getAllSpy = vi.spyOn(PromotedStore.prototype, "getAll").mockImplementation(function (
+      this: PromotedStore, opts?: Parameters<typeof originalGetAll>[0],
+    ) {
+      scanCalls += 1;
+      const rows = originalGetAll.call(this, opts);
+      return scanCalls === 1 ? rows.filter((row) => row.id !== rId) : rows;
+    });
+    const opened = overridePostgresqlBackendFlag();
+
+    const doc = makeDoc([{ content, tags: ["imported"], confidence: 0.9, createdAt: "2026-01-01", sessionId: null }]);
+    const newDigest = computeEntryDigest(doc, 0);
+    try {
+      const result = await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir });
+      getAllSpy.mockRestore();
+      opened.mockRestore();
+      expect(result).toMatchObject({ imported: 1, skipped: 0 });
+      const persisted = store.getById(rId)!;
+      const metadata = JSON.parse(persisted.metadata) as Record<string, unknown>;
+      // GREEN: the live read after dedup's canonical UPDATE sees B's committed
+      // metadata, which the stale scan-built index could never observe.
+      expect(metadata).toMatchObject({ canonicalNote: "B metadata" });
+      const digestSet = new Set(metadata[IMPORT_DIGESTS_KEY] as string[]);
+      expect([...digestSet].sort()).toEqual(["a".repeat(64), newDigest].sort());
+      expect(store.getAll({ projectId: projId }).filter((row) => row.content === content)).toHaveLength(1);
+      expect(store.getById(foreignId)).toEqual(foreignBefore);
+      await expect(importKnowledge(cwd, doc, { _lcmBaseDir: baseDir })).resolves.toMatchObject({ imported: 0, skipped: 1 });
+    } finally { getAllSpy.mockRestore(); opened.mockRestore(); db.close(); }
+  });
+
+  it("merges collapsed duplicate metadata for a row committed after the import scan (PostgreSQL READ COMMITTED)", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const projId = toProjectId(cwd);
+    seedProject(baseDir, cwd, []);
+    const dbPath = join(baseDir, "projects", projId, "db.sqlite");
+    const db = new DatabaseSync(dbPath);
+    const store = new PromotedStore(db);
+    const content = "red two collapse race content";
+    const r1Id = store.insert({ content, tags: ["r1-tag"], projectId: projId, confidence: 0.5 });
+    store.update(r1Id, { metadata: { r1: "keep", [IMPORT_DIGESTS_KEY]: ["b".repeat(64)] } });
+    const r2Content = "red two collapse race content variant fuzzy";
+    const r2Id = store.insert({ content: r2Content, tags: ["r2-tag"], projectId: projId, confidence: 0.4 });
+    store.update(r2Id, { metadata: { r2: "retain", r1: "loses", [IMPORT_DIGESTS_KEY]: ["c".repeat(64)] } });
+    const foreignId = store.insert({
+      content: "unrelated foreign project reference for red two", tags: ["foreign"],
+      projectId: "external-owner-red2", confidence: 0.4,
+    });
+    const foreignBefore = store.getById(foreignId);
+
+    const originalGetAll = PromotedStore.prototype.getAll;
+    let scanCalls = 0;
+    const getAllSpy = vi.spyOn(PromotedStore.prototype, "getAll").mockImplementation(function (
+      this: PromotedStore, opts?: Parameters<typeof originalGetAll>[0],
+    ) {
+      scanCalls += 1;
+      const rows = originalGetAll.call(this, opts);
+      return scanCalls === 1 ? rows.filter((row) => row.id !== r2Id) : rows;
+    });
+    const search = vi.spyOn(PromotedStore.prototype, "search").mockImplementation(() => [{
+      id: r2Id, content: r2Content, tags: ["r2-tag"], projectId: projId,
+      sessionId: null, confidence: 0.4, createdAt: "2026-01-01T00:00:00.000Z", rank: -20,
+    }]);
+    const opened = overridePostgresqlBackendFlag();
+
+    const doc = makeDoc([{ content, tags: ["imported"], confidence: 0.9, createdAt: "2026-01-01", sessionId: null }]);
+    const newDigest = computeEntryDigest(doc, 0);
+    try {
+      const result = await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir });
+      getAllSpy.mockRestore();
+      search.mockRestore();
+      opened.mockRestore();
+      // GREEN: the archive-then-getById ordering sees R2's committed metadata
+      // instead of crashing on the stale scan index's undefined lookup.
+      expect(result).toMatchObject({ imported: 1, skipped: 0 });
+      expect(store.getById(r2Id)?.archived_at).not.toBeNull();
+      const canonical = store.getById(r1Id)!;
+      const metadata = JSON.parse(canonical.metadata) as Record<string, unknown>;
+      expect(metadata).toMatchObject({ r1: "keep", r2: "retain" });
+      const digestSet = new Set(metadata[IMPORT_DIGESTS_KEY] as string[]);
+      expect([...digestSet].sort()).toEqual(["b".repeat(64), "c".repeat(64), newDigest].sort());
+      expect(store.getById(foreignId)).toEqual(foreignBefore);
+    } finally { getAllSpy.mockRestore(); search.mockRestore(); opened.mockRestore(); db.close(); }
+  });
+
+  it("keeps importing when the canonical row is absent at the live read", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const projId = toProjectId(cwd);
+    seedProject(baseDir, cwd, [{ content: "unrelated control row", tags: ["control"] }]);
+    const dbPath = join(baseDir, "projects", projId, "db.sqlite");
+    const db = new DatabaseSync(dbPath);
+    const store = new PromotedStore(db);
+    const controlBefore = store.getAll({ projectId: projId })[0]!;
+
+    const originalGetById = PromotedStore.prototype.getById;
+    let getByIdCalls = 0;
+    const getByIdSpy = vi.spyOn(PromotedStore.prototype, "getById").mockImplementation(function (
+      this: PromotedStore, id: string,
+    ) {
+      getByIdCalls += 1;
+      // Identity-keyed, not call-order-keyed: the import never reads the
+      // control row, so nulling every other id targets exactly the canonical
+      // live read regardless of how many getById calls the import makes.
+      if (id === controlBefore.id) return originalGetById.call(this, id);
+      return null;
+    });
+
+    const content = "canonical row absent at live read content";
+    const doc = makeDoc([{ content, tags: ["fresh"], confidence: 0.7, createdAt: "2026-01-01", sessionId: null }]);
+    const newDigest = computeEntryDigest(doc, 0);
+    try {
+      const result = await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir });
+      getByIdSpy.mockRestore();
+      expect(result).toMatchObject({ imported: 1, skipped: 0 });
+      expect(getByIdCalls).toBe(1);
+      const insertedRow = store.getAll({ projectId: projId }).find((row) => row.id !== controlBefore.id)!;
+      const metadata = JSON.parse(insertedRow.metadata) as Record<string, unknown>;
+      expect(metadata).toEqual({ [IMPORT_DIGESTS_KEY]: [newDigest] });
+      expect(store.getById(controlBefore.id)).toEqual(controlBefore);
+    } finally { getByIdSpy.mockRestore(); db.close(); }
+  });
+
+  it("archives the duplicate when its metadata is absent at the live read", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const projId = toProjectId(cwd);
+    seedProject(baseDir, cwd, []);
+    const dbPath = join(baseDir, "projects", projId, "db.sqlite");
+    const db = new DatabaseSync(dbPath);
+    const store = new PromotedStore(db);
+    const content = "collapsed row absent canonical content";
+    const r1Id = store.insert({ content, tags: ["r1"], projectId: projId, confidence: 0.5 });
+    store.update(r1Id, { metadata: { r1: "keep" } });
+    const r2Content = "collapsed row absent fuzzy variant content";
+    const r2Id = store.insert({ content: r2Content, tags: ["r2"], projectId: projId, confidence: 0.4 });
+    store.update(r2Id, { metadata: { r2: "would-be-lost" } });
+
+    const search = vi.spyOn(PromotedStore.prototype, "search").mockImplementation(() => [{
+      id: r1Id, content, tags: ["r1"], projectId: projId,
+      sessionId: null, confidence: 0.5, createdAt: "2026-01-01T00:00:00.000Z", rank: 0,
+    }, {
+      id: r2Id, content: r2Content, tags: ["r2"], projectId: projId,
+      sessionId: null, confidence: 0.4, createdAt: "2026-01-01T00:00:00.000Z", rank: -20,
+    }]);
+    const originalGetById = PromotedStore.prototype.getById;
+    const getByIdSpy = vi.spyOn(PromotedStore.prototype, "getById").mockImplementation(function (
+      this: PromotedStore, id: string,
+    ) {
+      if (id === r2Id) return null;
+      return originalGetById.call(this, id);
+    });
+
+    const doc = makeDoc([{ content, tags: ["imported"], confidence: 0.9, createdAt: "2026-01-01", sessionId: null }]);
+    const newDigest = computeEntryDigest(doc, 0);
+    try {
+      const result = await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir });
+      search.mockRestore();
+      getByIdSpy.mockRestore();
+      expect(result).toMatchObject({ imported: 1, skipped: 0 });
+      expect(store.getById(r2Id)?.archived_at).not.toBeNull();
+      const canonical = store.getById(r1Id)!;
+      const metadata = JSON.parse(canonical.metadata) as Record<string, unknown>;
+      expect(metadata).toMatchObject({ r1: "keep" });
+      expect(Object.hasOwn(metadata, "r2")).toBe(false);
+      expect(metadata[IMPORT_DIGESTS_KEY]).toEqual([newDigest]);
+    } finally { search.mockRestore(); getByIdSpy.mockRestore(); db.close(); }
+  });
+
+  it("keeps a concurrent metadata update to a scanned row visible in the import", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const projId = toProjectId(cwd);
+    seedProject(baseDir, cwd, []);
+    const dbPath = join(baseDir, "projects", projId, "db.sqlite");
+    const db = new DatabaseSync(dbPath);
+    const store = new PromotedStore(db);
+    const content = "indexed row concurrent update content";
+    const preDigest = "d".repeat(64);
+    const postDigest = "e".repeat(64);
+    const rId = store.insert({ content, tags: ["scanned"], projectId: projId, confidence: 0.4 });
+    const preUpdateMetadata = { note: "original", [IMPORT_DIGESTS_KEY]: [preDigest] };
+    store.update(rId, { metadata: preUpdateMetadata });
+    // A concurrent writer commits an update to this same row, which the scan
+    // (below) still reports at its pre-update snapshot even though the store
+    // already holds the post-update state by the time the merge read runs.
+    const postUpdateMetadata = { note: "updated", other: "concurrent-field", [IMPORT_DIGESTS_KEY]: [preDigest, postDigest] };
+    store.update(rId, { metadata: postUpdateMetadata });
+
+    const originalGetAll = PromotedStore.prototype.getAll;
+    let scanCalls = 0;
+    const getAllSpy = vi.spyOn(PromotedStore.prototype, "getAll").mockImplementation(function (
+      this: PromotedStore, opts?: Parameters<typeof originalGetAll>[0],
+    ) {
+      scanCalls += 1;
+      const rows = originalGetAll.call(this, opts);
+      return scanCalls === 1
+        ? rows.map((row) => (row.id === rId ? { ...row, metadata: JSON.stringify(preUpdateMetadata) } : row))
+        : rows;
+    });
+
+    const doc = makeDoc([{ content, tags: ["new"], confidence: 0.7, createdAt: "2026-01-01", sessionId: null }]);
+    const newDigest = computeEntryDigest(doc, 0);
+    try {
+      const result = await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir });
+      getAllSpy.mockRestore();
+      expect(result).toMatchObject({ imported: 1, skipped: 0 });
+      const persisted = store.getById(rId)!;
+      const metadata = JSON.parse(persisted.metadata) as Record<string, unknown>;
+      expect(metadata).toMatchObject({ note: "updated", other: "concurrent-field" });
+      const digestSet = new Set(metadata[IMPORT_DIGESTS_KEY] as string[]);
+      expect([...digestSet].sort()).toEqual([preDigest, postDigest, newDigest].sort());
+    } finally { getAllSpy.mockRestore(); db.close(); }
+  });
+
+  it("carries merged metadata across two entries converging on one row in the same document", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const projId = toProjectId(cwd);
+    seedProject(baseDir, cwd, [{ content: "multi entry canonical content", tags: ["seed"] }]);
+    const dbPath = join(baseDir, "projects", projId, "db.sqlite");
+    const db = new DatabaseSync(dbPath);
+    const store = new PromotedStore(db);
+    const rId = store.getAll({ projectId: projId })[0]!.id;
+    const existingDigest = "f".repeat(64);
+    store.update(rId, { metadata: { existingNote: "kept", [IMPORT_DIGESTS_KEY]: [existingDigest] } });
+
+    const doc = makeDoc([
+      { content: "multi entry canonical content", tags: ["first"], confidence: 0.7, createdAt: "2026-01-01", sessionId: null },
+      { content: "multi entry canonical content", tags: ["second"], confidence: 0.8, createdAt: "2026-01-01", sessionId: "session-two" },
+    ]);
+    const firstDigest = computeEntryDigest(doc, 0);
+    const secondDigest = computeEntryDigest(doc, 1);
+    const result = await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir });
+    expect(result).toMatchObject({ imported: 2, skipped: 0 });
+    const persisted = store.getById(rId)!;
+    const metadata = JSON.parse(persisted.metadata) as Record<string, unknown>;
+    expect(metadata).toMatchObject({ existingNote: "kept" });
+    const digestSet = new Set(metadata[IMPORT_DIGESTS_KEY] as string[]);
+    expect([...digestSet].sort()).toEqual([existingDigest, firstDigest, secondDigest].sort());
+    db.close();
+  });
+
   it("refuses an import before scrubber preparation when maintenance is already held", async () => {
     const cwd = makeTempDir();
     const { dbPath } = seedProject(lcmHomeDir(), cwd, [{ content: "preserve original source" }]);
@@ -738,6 +1018,66 @@ describe("portable-knowledge — import", () => {
       expect(await importKnowledge(cwd, doc, { _lcmBaseDir: baseDir, _globalPatterns: ["imported"] })).toMatchObject({ imported: 0, skipped: 2 });
       expect(await importKnowledge(cwd, merge, { _lcmBaseDir: baseDir })).toMatchObject({ imported: 0, skipped: 1 });
     } finally { db.close(); }
+  });
+
+  it("uses the PostgreSQL owner exact lookup through the import proxy", async () => {
+    const baseDir = makeTempDir();
+    const cwd = makeTempDir();
+    const { dbPath } = seedProject(baseDir, cwd, [{
+      content: "alpha beta gamma",
+      tags: ["existing"],
+      confidence: 0.6,
+    }]);
+    const db = new DatabaseSync(dbPath);
+    const store = new PromotedStore(db);
+    const exact = store.getAll()[0]!;
+    store.update(exact.id, { metadata: { canonicalNote: "retain" } });
+    for (let index = 0; index < 100; index += 1) {
+      store.insert({
+        content: `alpha beta gamma !${index}`,
+        tags: ["fuzzy"],
+        projectId: toProjectId(cwd),
+        confidence: 0.2,
+      });
+    }
+    const search = vi.spyOn(PromotedStore.prototype, "search").mockImplementation(function (query, limit, tags, projectId) {
+      return this.getAll({ projectId }).filter(row => row.content !== "alpha beta gamma").slice(0, limit).map(row => ({
+        id: row.id,
+        content: row.content,
+        tags: JSON.parse(row.tags),
+        projectId: row.project_id,
+        sessionId: row.session_id,
+        confidence: row.confidence,
+        createdAt: row.created_at,
+        rank: 0,
+      }));
+    });
+    const originalWithCliProjectStorage = cliStorage.withCliProjectStorage;
+    const opened = vi.spyOn(cliStorage, "withCliProjectStorage").mockImplementation((path, options, callback) =>
+      originalWithCliProjectStorage(path, options, context => callback({
+        ...context,
+        storage: {
+          ...context.storage,
+          backend: "postgresql",
+          transaction: context.storage.transaction.bind(context.storage),
+        },
+      })));
+    try {
+      const doc = makeDoc([{ content: "alpha beta gamma", tags: ["imported"], confidence: 0.9, createdAt: "2026-01-01", sessionId: null }]);
+      await expect(importKnowledge(cwd, doc, { _lcmBaseDir: baseDir })).resolves.toMatchObject({ imported: 1, skipped: 0 });
+      expect(store.getAll()).toHaveLength(101);
+      expect(store.getById(exact.id)).toMatchObject({
+        content: "alpha beta gamma",
+        tags: '["existing","imported"]',
+        confidence: 0.9,
+        metadata: expect.stringContaining("canonicalNote"),
+      });
+      await expect(importKnowledge(cwd, doc, { _lcmBaseDir: baseDir })).resolves.toMatchObject({ imported: 0, skipped: 1 });
+    } finally {
+      opened.mockRestore();
+      search.mockRestore();
+      db.close();
+    }
   });
 
   it("indexes many source entries deduplicated into one memory for retry", async () => {

@@ -124,5 +124,12 @@ describe("PostgreSQL migration extension preflight", () => {
         ? ["preflightRequiredExtensions:probePgStatStatements"]
         : []),
     ]);
+    // A broken required extension must block before the
+    // managed-table-specific content-collation preflight ever runs: it
+    // is an environment-wide precondition, and pgcrypto backs the
+    // digest() the collation check protects, so there is nothing useful
+    // to report about a column's collation on a database that cannot
+    // even satisfy its extension contract.
+    expect(fake.operations).not.toContain("preflightContentCollation");
   });
 });

@@ -108,6 +108,7 @@ describe("identity command registration", () => {
       "link",
       "list",
       "reconcile-worktrees",
+      "renew-retired-identity",
       "show",
       "unlink",
     ]);

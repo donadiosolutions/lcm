@@ -474,11 +474,11 @@ describe("sanitizeError", () => {
   });
 
   it.each([
-    ["'file://host'['/private']?x=[https://y.test/p]\\Users\\SECRET", "'file://host'['<path>']?x=[https:<path>]<path>"],
-    ["'file://host'['/private']#x=[http://y.test/p]\\Users\\SECRET", "'file://host'['<path>']#x=[http:<path>]<path>"],
-    ['"file://host["/private"]?x=[http://y.test/p]\\Users\\SECRET', '"file://host["<path>"]?x=[http:<path>]<path>'],
-    ['"file://host["/private"]#x=[https://y.test/p]\\Users\\SECRET', '"file://host["<path>"]#x=[https:<path>]<path>'],
-  ] as const)("redacts backslash tails after bracketed URLs in quoted file queries: %#", (input, expected) => {
+    ["'file://host'['/private']?x=[https://y.test/p]\\Users\\SECRET", "'file://host'['<path>']?x=[https://y.test/p]<path>"],
+    ["'file://host'['/private']#x=[http://y.test/p]\\Users\\SECRET", "'file://host'['<path>']#x=[http://y.test/p]<path>"],
+    ['"file://host["/private"]?x=[http://y.test/p]\\Users\\SECRET', '"file://host["<path>"]?x=[http://y.test/p]<path>'],
+    ['"file://host["/private"]#x=[https://y.test/p]\\Users\\SECRET', '"file://host["<path>"]#x=[https://y.test/p]<path>'],
+  ] as const)("preserves bracketed URLs and redacts their quoted-file tails: %#", (input, expected) => {
     const result = sanitizeError(input);
 
     expect(result).toBe(expected);
@@ -1387,14 +1387,17 @@ describe("sanitizeError", () => {
   it.each([
     [
       "https://outer.test/x?q=file://one.invalid/Users/ahttps://two.invalid/Users/b",
-      "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>",
     ],
     [
       "https://outer.test/x?q=file://one.invalid/Users/a-https://two.invalid/Users/b",
-      "https://outer.test/x?q=file://one.invalid<path>://two.invalid/Users/b",
+      "https://outer.test/x?q=file://one.invalid<path>",
     ],
-  ] as const)("preserves adjacent non-file scheme residuals: %#", (input, expected) => {
-    expect(sanitizeError(input)).toBe(expected);
+  ] as const)("absorbs adjacent non-file scheme components into active paths: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
   });
 
   it.each([
@@ -2016,34 +2019,250 @@ describe("sanitizeError", () => {
     expect(sanitizeError(firstPass)).toBe(expected);
   });
 
-  // Bug #1234 owns the deliberately excluded zero-label continuation.
-  it("preserves the empty-label forced continuation boundary for Bug #1234", () => {
+  // Bug #1234 extends the admitted continuation grammar to the zero-label form.
+  it("redacts the empty-label forced continuation for Bug #1234", () => {
     const input = "file://host.invalid?x=[a/\\:\\Users\\canary\\private.db]";
-    const expected = "file://host.invalid?x=[a<path>:\\Users\\canary\\private.db]";
+    const expected = "file://host.invalid?x=[a<path>]";
 
-    expect(sanitizeError(input)).toBe(expected);
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  // Leading file-path starts use a distinct classifier and are not fixed by
-  // Bug #1156's forced-scan-only transition.
+  // Leading file-path starts use a distinct classifier from Bug #1156's
+  // forced-scan-only transition. The S8 continuation repair covers both seams.
   it.each([
     [
       "file://host.invalid?x=[\\1:\\Users\\canary\\private.db]",
-      "file://host.invalid?x=[<path>:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[<path>]",
     ],
     [
       "file://host.invalid?x=[\\Ç:\\Users\\canary\\private.db]",
-      "file://host.invalid?x=[<path>:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[<path>]",
     ],
-  ] as const)("preserves leading drive-like classifier scope: %#", (input, expected) => {
-    expect(sanitizeError(input)).toBe(expected);
+  ] as const)("redacts leading drive-like continuations in one pass: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  // Bug #1111 owns the known repeated-pass drift for this nested HTTPS form.
-  it("preserves the nested HTTPS first-pass boundary for Bug #1111", () => {
-    expect(sanitizeError("file://host.invalid?x=[a/b/https://public.test/p]")).toBe(
-      "file://host.invalid?x=[a<path>://public.test/p]",
-    );
+  // Bug #1111's historical nested-HTTPS row now follows the same span-local
+  // scheme-colon rule as Bugs #1243 and #1246.
+  it("converges the historical nested HTTPS row for Bug #1111", () => {
+    const first = sanitizeError("file://host.invalid?x=[a/b/https://public.test/p]");
+
+    expect(first).toBe("file://host.invalid?x=[a<path>]");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  const sanitizerS8CanonicalCases = [
+    [
+      1228,
+      "'file://host'['/private']|https://[fe80::1]/x",
+      "'file://host'['<path>']|https://[fe80::1]/x",
+      ["/private"],
+    ],
+    [
+      1234,
+      "file://host.invalid?x=[a/\\:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+      ["Users", "canary", "private.db"],
+    ],
+    [
+      1234,
+      "file://host.invalid#x=[a/\\:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+      ["Users", "canary", "private.db"],
+    ],
+    [
+      1236,
+      "file://host.invalid?x=[a\\b/\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid?x=[a<path>]",
+      ["Users", "canary", "private.db"],
+    ],
+    [
+      1236,
+      "file://host.invalid#x=[a\\b/\\1:\\Users\\canary\\private.db]",
+      "file://host.invalid#x=[a<path>]",
+      ["Users", "canary", "private.db"],
+    ],
+    [
+      1239,
+      "'file://h'['/private']?a/Users/alice/notes&b/Users/bob/secret.db",
+      "'file://h'['<path>']?a<path>&b<path>",
+      ["Users", "alice", "notes", "bob", "secret.db"],
+    ],
+    [1243, "/Users/a/https://e.test/p", "<path>", ["e.test"]],
+    [1243, "/Users/a//https://e.test/p", "<path>", ["e.test"]],
+    [1243, "/1https://e.test/p", "<path>", ["e.test"]],
+    [1243, "//https://e.test/p", "<path>", ["e.test"]],
+    [
+      1246,
+      "file://host.invalid?x=[a|\\https://y.test/p\\Users\\canary\\private.db",
+      "file://host.invalid?x=[a|<path>",
+      ["y.test", "Users", "canary", "private.db"],
+    ],
+    [
+      1246,
+      "file://host.invalid?x=a\\https://y.test/p\\Users\\canary\\private.db",
+      "file://host.invalid?x=a<path>",
+      ["y.test", "Users", "canary", "private.db"],
+    ],
+    [
+      1260,
+      "file://h?x=[https://[::1]#f]\\Users\\fictional.db",
+      "file://h?x=[https://[::1]#f]<path>",
+      ["fictional.db"],
+    ],
+    [
+      1261,
+      "file://h?x=[a]\\1:\\Users\\fictional.db",
+      "file://h?x=[a]<path>",
+      ["Users", "fictional.db"],
+    ],
+    [
+      1261,
+      "file://h?x=[https://[::1]/p]\\1:\\Users\\fictional.db",
+      "file://h?x=[https://[::1]/p]<path>",
+      ["Users", "fictional.db"],
+    ],
+    [
+      1263,
+      "file://h/p?x=[[a]/b]\\Users\\fictional.db",
+      "file://h<path>?x=[[a]<path>]<path>",
+      ["fictional.db"],
+    ],
+    [
+      1263,
+      "file://h/p?x=[[a]/https://example.test/t]\\Users\\fictional.db",
+      "file://h<path>?x=[[a]<path>]<path>",
+      ["example.test", "fictional.db"],
+    ],
+    [
+      1263,
+      "file://h/p?x=[[a]/http://example.test/t]\\Users\\fictional.db",
+      "file://h<path>?x=[[a]<path>]<path>",
+      ["example.test", "fictional.db"],
+    ],
+    [
+      1263,
+      "file://h/p?x=[[[a]]/https://example.test/t]\\Users\\fictional.db",
+      "file://h<path>?x=[[[a]]<path>]<path>",
+      ["example.test", "fictional.db"],
+    ],
+  ] as const;
+
+  it.each(sanitizerS8CanonicalCases)(
+    "redacts S8 issue #%i private spans in one stable pass: %#",
+    (_issue, input, expected, absent) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected);
+      for (const privateFragment of absent) expect(first).not.toContain(privateFragment);
+      expect(second).toBe(first);
+      expect(third).toBe(first);
+    },
+  );
+
+  it.each([
+    [
+      "'file://host'['/private']|https://[fe80::1]:443/x?q=1",
+      "'file://host'['<path>']|https://[fe80::1]:443/x?q=1",
+    ],
+    [
+      "'file://host'['/private'],https://[fe80::1]:443/x?q=1",
+      "'file://host'['<path>'],https://[fe80::1]:443/x?q=1",
+    ],
+    [
+      "'file://host'['/private'];http://[2001:db8::1]:8080/public/path?q=1",
+      "'file://host'['<path>'];http://[2001:db8::1]:8080/public/path?q=1",
+    ],
+    ["http://[2001:db8::1]/public/path", "http://[2001:db8::1]/public/path"],
+    [
+      "'file://host'['/private'] https://[fe80::1]/x",
+      "'file://host'['<path>'] https://[fe80::1]/x",
+    ],
+  ] as const)("keeps S8 quoted-file public URL boundaries: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+  });
+
+  // GitHub review thread 4011654853 keeps the direct ampersand form outside
+  // the quoted-query public-URL reset introduced for Bug #1239.
+  it("keeps a direct quoted-wrapper ampersand URL conservative across passes", () => {
+    const input = "'file://host'['/private']&https://example.test/p";
+    const expected = "'file://host'['<path>']&https:<path>";
+    const first = sanitizeError(input);
+    const second = sanitizeError(first);
+    const third = sanitizeError(second);
+
+    expect(first).toBe(expected);
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+  });
+
+  it.each([
+    ["file://h?x=[a]\\C:\\Users\\fictional.db", "file://h?x=[a]<path>"],
+    ["file://h?x=[a]\\1:\\Users\\fictional.db", "file://h?x=[a]<path>"],
+    ["file://h?x=[a]\\Ç:\\Users\\fictional.db", "file://h?x=[a]<path>"],
+    ["file://h?x=[a]\\\\1:\\Users\\fictional.db", "file://h?x=[a]<path>"],
+    [
+      "file://h?x=[a]\\!:\\Users\\fictional.db",
+      "file://h?x=[a]\\!:\\Users\\fictional.db",
+    ],
+    [
+      "file://h?x=[a]\\AB:\\Users\\fictional.db",
+      "file://h?x=[a]<path>:\\Users\\fictional.db",
+    ],
+    [
+      "file://h?x=[a]\\12:\\Users\\fictional.db",
+      "file://h?x=[a]<path>:\\Users\\fictional.db",
+    ],
+    [
+      "file://h?x=[a]\\C:note\\Users\\fictional.db",
+      "file://h?x=[a]<path>:note\\Users\\fictional.db",
+    ],
+  ] as const)("keeps S8 post-wrapper drive grammar narrow: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "'file://h'['/private']?a/Users/alice&https://example.test/x",
+      "'file://h'['<path>']?a<path>&https://example.test/x",
+    ],
+    [
+      "'file://h'['/private']?a/Users/alice&file://two.invalid/Users/b",
+      "'file://h'['<path>']?a<path>&file://two.invalid<path>",
+    ],
+    ["/Users/a/https://e.test/p | https://public.test/x", "<path> | https://public.test/x"],
+    ["'/Users/a/https://e.test/p'", "'<path>'"],
+    ["/Users/a/file://nested.invalid/p", "<path>"],
+    ["/Users/a/file:/nested/p", "<path>"],
+    [
+      "file://h/p?x=[https://example.test/t]",
+      "file://h<path>?x=[https://example.test/t]",
+    ],
+    ["file://h/p?x=plain", "file://h<path>?x=plain"],
+  ] as const)("keeps S8 public and nested span boundaries: %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
   it.each([
@@ -2378,6 +2597,1276 @@ describe("sanitizeError", () => {
     expect(sanitizeError(input)).toBe(firstPass);
     expect(sanitizeError(firstPass)).toBe(secondPass);
     expect(sanitizeError(secondPass)).toBe(secondPass);
+  });
+
+  it("redacts Bug #1294 Windows tails after nested public URL brackets in one pass", () => {
+    const input = "file://h?x=[[a]/https://example.test/t]\\Users\\fictional.db";
+    const expected = "file://h?x=[[a]<path>]<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("Users");
+    expect(first).not.toContain("fictional.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts Bug #1303 later quoted-query private parameters in one pass", () => {
+    const input = "'file://h'['/private']?a/Users/alice&https://e.test/x&c/Users/bob/secret.db";
+    const expected = "'file://h'['<path>']?a<path>&https://e.test/x&c<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/private");
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("bob");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "non-word",
+      "'file://h'['/private']?a/Users/alice&https://e.test/x&=/Users/bob/secret.db",
+      "'file://h'['<path>']?a<path>&https://e.test/x&=/Users/bob/secret.db",
+    ],
+    [
+      "word-bearing",
+      "'file://h'['/private']?a/Users/alice&https://e.test/x&later/Users/bob/secret.db",
+      "'file://h'['<path>']?a<path>&https://e.test/x&later<path>",
+    ],
+  ] as const)("distinguishes %s paths after quoted-query public URLs", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts Bug #1304 paths after closed nested public URL brackets in one pass", () => {
+    const input = "file://h/p?x=[https://e.test/t]/Users/alice/secret.db";
+    const expected = "file://h<path>?x=[https://e.test/t]<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts Bug #1312 absolute paths after nested public URL ampersands in one pass", () => {
+    const input = "file://h?x=[https://example.test/t&/Users/alice/secret.db]";
+    const expected = "file://h?x=[https://example.test/t&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("preserves Bug #1313 pipe-delimited absolute-path redaction as a stable regression", () => {
+    const input = "file://h?x=[https://example.test/t|/Users/alice/secret.db]";
+    const expected = "file://h?x=[https://example.test/t|<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("keeps Bug #1317 unquoted wrapper output stable while preserving its public URL", () => {
+    const input = "file://host['/private']&https://e.test/p";
+    const expected = "file://host['<path>']&https://e.test/p";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/private");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("keeps slash-bearing values inside ordinary nested public queries", () => {
+    const input = "file://h?x=[https://example.test/t?a=/public]";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps named slash-bearing parameters inside nested public queries", () => {
+    const input = "file://h?x=[https://example.test/t?key=/public/path&next=/also/public]";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps relative ampersand continuations inside nested public URLs", () => {
+    const input = "file://h?x=[https://example.test/t&relative/path]";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps relative pipe continuations inside nested public URLs", () => {
+    const input = "file://h?x=[https://example.test/t|relative/path]";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps nested IPv6 public URL authority brackets and query syntax", () => {
+    const input = "file://h?x=[https://[fe80::1]/p?q=1]";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps ordinary public URLs in pathless file queries", () => {
+    const input = "file://h?x=https://e.test/p";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps Bug #1317 generated-marker output byte-identical", () => {
+    const input = "file://host['<path>']&https://e.test/p";
+
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps separately quoted wrappers conservatively redacted", () => {
+    const input = "'file://host'['/private']&https://example.test/p";
+    const expected = "'file://host'['<path>']&https:<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("preserves public URLs after whitespace-separated unquoted wrappers", () => {
+    const input = "file://host['/private'] https://e.test/p";
+    const expected = "file://host['<path>'] https://e.test/p";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("retains doubled-bracket public URL syntax before Bug #1294 Windows tails", () => {
+    const input =
+      "file://h?x=[[a]/https://e.test/t?key=/public&next=/also]\\Users\\alice\\secret.db";
+    const expected =
+      "file://h?x=[[a]<path>https://e.test/t?key=/public&next=/also]<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("retains doubled-bracket public URL syntax before immediate private paths", () => {
+    const input =
+      "file://h?x=[[a]/https://e.test/t?key=/public&next=/also&/Users/alice/secret.db]";
+    const expected =
+      "file://h?x=[[a]<path>https://e.test/t?key=/public&next=/also&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("conservatively redacts slash values after literal doubled-bracket path markers", () => {
+    const input = "file://h?x=[[a]<path>?key=/public&next=/also]/Users/alice/secret.db";
+    const expected = "file://h?x=[[a]<path>?key=<path>&next=<path>]<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("does not trust raw doubled-bracket path markers as public-query provenance", () => {
+    const input = "file://h?x=[[a]<path>?key=/Users/alice/secret.db]";
+    const expected = "file://h?x=[[a]<path>?key=<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "query",
+      "file://h?x=[[a]<path>?key=\\Users\\alice\\secret.db]",
+      "file://h?x=[[a]<path>?key=<path>]",
+    ],
+    [
+      "fragment",
+      "file://h?x=[[a]<path>#key=\\Users\\alice\\secret.db]",
+      "file://h?x=[[a]<path>#key=<path>]",
+    ],
+    [
+      "arbitrary literal",
+      "file://h?x=[[a]<opaque>?key=\\Users\\alice\\secret.db]",
+      "file://h?x=[[a]<opaque>?key=<path>]",
+    ],
+  ] as const)("redacts contextual Windows roots after %s text", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "ordinary <opaque>?key=\\Users\\alice\\secret.db prose",
+    "https://e.test/t?key=\\Users\\alice\\secret.db",
+  ] as const)("does not make single-root Windows paths global: %s", (input) => {
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it.each([
+    [
+      "query",
+      "file://h?x=[[a]/https://e.test/t?key=/public&next=/also]\\Users\\alice\\secret.db",
+      "file://h?x=[[a]<path>https://e.test/t?key=/public&next=/also]<path>",
+    ],
+    [
+      "fragment",
+      "file://h?x=[[a]/https://e.test/t#key=/public&next=/also]\\Users\\alice\\secret.db",
+      "file://h?x=[[a]<path>https://e.test/t#key=/public&next=/also]<path>",
+    ],
+  ] as const)("retains actual nested public URL %s syntax", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("retains bracketed public URL syntax before Bug #1294 Windows tails", () => {
+    const input =
+      "file://h?x=[[a]/https://e.test/t?key=[/public]&next=/also]\\Users\\alice\\secret.db";
+    const expected =
+      "file://h?x=[[a]<path>https://e.test/t?key=[/public]&next=/also]<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("conservatively redacts bracketed slash values after literal path markers", () => {
+    const input =
+      "file://h?x=[[a]<path>?key=[/public]&next=/also]/Users/alice/secret.db";
+    const expected = "file://h?x=[[a]<path>?key=[<path>]&next=<path>]<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("returns later Windows values to the enclosing owner after a public URL path handoff", () => {
+    const input =
+      "file://h?x=[https://e.test/t&/Users/a/one&key=\\Users\\bob\\secret.db]";
+    const expected = "file://h?x=[https://e.test/t&<path>&key=<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(first).not.toContain("bob");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("balances nested brackets after returning from a public URL path handoff", () => {
+    const input =
+      "file://h?x=[https://e.test/t&/Users/a/one&key=[/Users/b/two]]";
+    const expected = "file://h?x=[https://e.test/t&<path>&key=[<path>]]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "file://h?x=[https://e.test/t?key=/public&next=/also]",
+    "file://h?x=[https://e.test/t&relative/path]",
+  ] as const)("keeps nested public named and relative controls stable: %s", (input) => {
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it.each([
+    [
+      "Windows",
+      "file://h?x=[https://e.test/t|/Users/a/one]\\Users\\b\\two",
+      "file://h?x=[https://e.test/t|<path>]<path>",
+    ],
+    [
+      "POSIX",
+      "file://h?x=[https://e.test/t|/Users/a/one]/Users/b/two",
+      "file://h?x=[https://e.test/t|<path>]<path>",
+    ],
+  ] as const)("redacts %s paths after pipe handoff wrappers", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "file://h?x=[https://e.test/t|relative/path]",
+    "file://h?x=[https://[fe80::1]/p?q=1|relative/path]",
+  ] as const)("keeps pipe public, relative, and IPv6 controls stable: %s", (input) => {
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("preserves deferred Bug #1332 contextual over-redaction", () => {
+    const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
+    const expected = "file://h?x=[value|later=<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("keeps quoted-query ownership after an immediate public URL path handoff", () => {
+    const input =
+      "'file://h'['/private']?a/Users/alice&https://e.test/x&/Users/bob&c/Users/carol";
+    const expected =
+      "'file://h'['<path>']?a<path>&https://e.test/x&<path>&c<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("bob");
+    expect(first).not.toContain("carol");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts repeated quoted-query bare paths before a word-bearing path", () => {
+    const input =
+      "'file://h'['/private']?a/Users/alice&https://e.test/x&/PrivateOne/a&/PrivateTwo/b&d/Users/carol";
+    const expected =
+      "'file://h'['<path>']?a<path>&https://e.test/x&<path>&<path>&d<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("PrivateOne");
+    expect(first).not.toContain("PrivateTwo");
+    expect(first).not.toContain("carol");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "drive and UNC",
+      "'file://h'['/private']?a/Users/alice&https://e.test/x&/Users/bob&drive=C:\\Users\\carol\\secret.db&unc=\\\\server\\share\\secret.db",
+      "'file://h'['<path>']?a<path>&https://e.test/x&<path>&drive=<path>&unc=<path>",
+    ],
+    [
+      "later public URL",
+      "'file://h'['/private']?a/Users/alice&https://e.test/x&/Users/bob&https://p.test/y&c/Users/carol",
+      "'file://h'['<path>']?a<path>&https://e.test/x&<path>&https://p.test/y&c<path>",
+    ],
+    [
+      "named public values",
+      "'file://h'['/private']?a/Users/alice&https://e.test/x?key=/public&next=/also&/Users/bob",
+      "'file://h'['<path>']?a<path>&https://e.test/x?key=/public&next=/also&<path>",
+    ],
+  ] as const)("preserves quoted-query %s boundaries", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("consumes a nested pipe handoff at its originating wrapper close", () => {
+    const input = "file://h?x=[[https://e.test/t|/Users/a/one]\\Users\\b\\two]";
+    const expected = "file://h?x=[[https://e.test/t|<path>]<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(first).not.toContain("\\Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("retains pending pipe handoffs at two wrapper depths", () => {
+    const input =
+      "file://h?x=[https://e.test/t|/Users/a/one&/Users/b/two&[https://p.test/x|/Users/c/three]\\Users\\d\\four]\\Users\\e\\five";
+    const expected =
+      "file://h?x=[https://e.test/t|<path>&<path>&[https://p.test/x|<path>]<path>]<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(first).not.toContain("\\Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "three depths",
+      "file://h?x=[https://a.test/t|/Users/a/one&[https://b.test/t|/Users/b/two&[https://c.test/t|/Users/c/three]\\Users\\c\\tail]\\Users\\b\\tail]\\Users\\a\\tail",
+      "file://h?x=[https://a.test/t|<path>&[https://b.test/t|<path>&[https://c.test/t|<path>]<path>]<path>]<path>",
+    ],
+    [
+      "repeated same depth",
+      "file://h?x=[https://a.test/t|/Users/a/one|/Users/b/two]\\Users\\c\\tail",
+      "file://h?x=[https://a.test/t|<path>|<path>]<path>",
+    ],
+    [
+      "close without tail",
+      "file://h?x=[https://a.test/t|/Users/a/one]done",
+      "file://h?x=[https://a.test/t|<path>]done",
+    ],
+    [
+      "whitespace reset",
+      "file://h?x=[https://a.test/t|/Users/a/one \\Users\\b\\two]",
+      "file://h?x=[https://a.test/t|<path> \\Users\\b\\two]",
+    ],
+  ] as const)("keeps pipe handoffs bounded for %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("restores enclosing ownership after a later public URL", () => {
+    const input =
+      "file://h?x=[https://e.test/t&/Users/a/one&https://p.test/x&\\Users\\bob\\secret.db]";
+    const expected = "file://h?x=[https://e.test/t&<path>&https://p.test/x&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(first).not.toContain("bob");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "root-relative Windows",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>]",
+    ],
+    [
+      "POSIX",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&/TopSecret/c/three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>]",
+    ],
+  ] as const)("restores enclosing ownership after nested file URLs: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("TopSecret");
+    expect(first).not.toContain("\\Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "hosted and root-relative Windows",
+      "file://h?x=[https://e.test/t&/Users/a/one&file://host/Users/b/two&\\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://host<path>&<path>]",
+    ],
+    [
+      "UNC",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\\\server\\share\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>]",
+    ],
+    [
+      "drive",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&C:\\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>]",
+    ],
+    [
+      "later public and relative values",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&https://p.test/x&relative/path]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&https://p.test/x&relative/path]",
+    ],
+    [
+      "whitespace reset",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two \\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path> \\Users\\c\\three]",
+    ],
+    [
+      "unclosed wrapper",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>",
+    ],
+    [
+      "own query",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two?key=/public&next=/also&\\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>?key=<path>&next=<path>&<path>]",
+    ],
+    [
+      "own fragment",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two#key=/public&next=/also&\\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>#key=<path>&next=<path>&<path>]",
+    ],
+  ] as const)("keeps nested file child and parent boundaries for %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("retains nested-file parent ownership across repeated Windows roots", () => {
+    const input =
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three&\\Users\\d\\four]";
+    const expected =
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("\\Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "three pathless roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three&\\Users\\d\\four&\\Users\\e\\five]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&<path>&<path>]",
+    ],
+    [
+      "hosted roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file://host/Users/b/two&\\Users\\c\\three&\\Users\\d\\four]",
+      "file://h?x=[https://e.test/t&<path>&file://host<path>&<path>&<path>]",
+    ],
+    [
+      "child query roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two?key=/public&\\Users\\c\\three&\\Users\\d\\four]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>?key=<path>&<path>&<path>]",
+    ],
+    [
+      "child fragment roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two#key=/public&\\Users\\c\\three&\\Users\\d\\four]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>#key=<path>&<path>&<path>]",
+    ],
+    [
+      "unclosed wrapper roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three&\\Users\\d\\four",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&<path>",
+    ],
+    [
+      "repeated POSIX roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&/Private/c/three&/Private/d/four]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&<path>]",
+    ],
+    [
+      "UNC and drive roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\\\server\\share\\three&C:\\Users\\d\\four]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&<path>]",
+    ],
+    [
+      "bare and word-bearing roots",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three&later/Users/d/four]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&later<path>]",
+    ],
+    [
+      "named Windows root",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&name=\\Users\\c\\three]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&name=<path>]",
+    ],
+    [
+      "public and relative successors",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three&https://p.test/x&relative/path]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>&https://p.test/x&relative/path]",
+    ],
+  ] as const)("retains returned nested-file parent for %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "matching close",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three]\\Users\\outside",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path>]<path>",
+    ],
+    [
+      "whitespace reset",
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&\\Users\\c\\three \\Users\\outside]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>&<path> \\Users\\outside]",
+    ],
+  ] as const)("expires returned nested-file parent at %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("retains outer returned-parent ownership after an inner file child closes", () => {
+    const input =
+      "file://h?x=[https://o.test/t&/Users/o/one&file:///Users/a/two&[https://i.test/t&/Users/i/one&file:///Users/b/two&\\Users\\i\\three]&\\Users\\o\\after]";
+    const expected =
+      "file://h?x=[https://o.test/t&<path>&file://<path>&[https://i.test/t&<path>&file://<path>&<path>]&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("\\Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "hosted children",
+      "file://h?x=[https://o.test/t&/Users/o/one&file://outer/Users/a/two&[https://i.test/t&/Users/i/one&file://inner/Users/b/two&\\Users\\i\\three]&\\Users\\o\\after]",
+      "file://h?x=[https://o.test/t&<path>&file://outer<path>&[https://i.test/t&<path>&file://inner<path>&<path>]&<path>]",
+    ],
+    [
+      "inner child query",
+      "file://h?x=[https://o.test/t&/Users/o/one&file:///Users/a/two&[https://i.test/t&/Users/i/one&file:///Users/b/two?key=/public&\\Users\\i\\three]&\\Users\\o\\after]",
+      "file://h?x=[https://o.test/t&<path>&file://<path>&[https://i.test/t&<path>&file://<path>?key=<path>&<path>]&<path>]",
+    ],
+    [
+      "inner child fragment",
+      "file://h?x=[https://o.test/t&/Users/o/one&file:///Users/a/two&[https://i.test/t&/Users/i/one&file:///Users/b/two#key=/public&\\Users\\i\\three]&\\Users\\o\\after]",
+      "file://h?x=[https://o.test/t&<path>&file://<path>&[https://i.test/t&<path>&file://<path>#key=<path>&<path>]&<path>]",
+    ],
+    [
+      "three returned-parent depths",
+      "file://h?x=[https://a.test/t&file:///Users/a/one&[https://b.test/t&file:///Users/b/two&[https://c.test/t&file:///Users/c/three&\\Users\\c\\tail]&\\Users\\b\\tail]&\\Users\\a\\tail]",
+      "file://h?x=[https://a.test/t&file://<path>&[https://b.test/t&file://<path>&[https://c.test/t&file://<path>&<path>]&<path>]&<path>]",
+    ],
+    [
+      "unclosed outer wrapper",
+      "file://h?x=[https://o.test/t&file:///Users/a/two&[https://i.test/t&file:///Users/b/two&\\Users\\i\\three]&\\Users\\o\\after",
+      "file://h?x=[https://o.test/t&file://<path>&[https://i.test/t&file://<path>&<path>]&<path>",
+    ],
+  ] as const)("retains nested-file returned parents for %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("preserves deferred direct-relative successor over-redaction", () => {
+    const input =
+      "file://h?x=[https://o.test/t&/Users/o/one&file:///Users/a/two&relative/path]";
+    const expected =
+      "file://h?x=[https://o.test/t&<path>&file://<path>&relative<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "pathless query",
+      "file://h?x=[https://e.test/t&/Users/o/one&file:///Users/a/one?key=/public&later/Users/tail/secret]",
+      "file://h?x=[https://e.test/t&<path>&file://<path>?key=<path>&later<path>]",
+    ],
+    [
+      "hosted fragment",
+      "file://h?x=[https://e.test/t&/Users/o/one&file://host/Users/a/one#key=/public&later/Users/tail/secret]",
+      "file://h?x=[https://e.test/t&<path>&file://host<path>#key=<path>&later<path>]",
+    ],
+    [
+      "unclosed query wrapper",
+      "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&later/Users/tail/secret",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later<path>",
+    ],
+  ] as const)("returns from nested-file %s for private word-bearing roots", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("Users/tail/secret");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("returns from nested-file child queries at two retained depths", () => {
+    const input =
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&[file:///Users/b/two#key=/public&later/Users/b/secret]&later/Users/outer/secret]";
+    const expected =
+      "file://h?x=[file://<path>?key=<path>&later<path>&[file://<path>#key=<path>&later<path>]&later<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("returns from repeated nested-file query children at one depth", () => {
+    const input =
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&file://host/Users/b/two#key=/public&later/Users/b/secret]";
+    const expected =
+      "file://h?x=[file://<path>?key=<path>&later<path>&file://host<path>#key=<path>&later<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "query",
+      "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&relative/path]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative/path]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative<path>]",
+    ],
+    [
+      "fragment",
+      "file://h?x=[https://e.test/t&file:///Users/a/one#key=/public&docs/readme/more]",
+      "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs/readme/more]",
+      "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs<path>]",
+    ],
+    [
+      "incomplete Users root",
+      "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&later/Users]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later/Users]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later<path>]",
+    ],
+  ] as const)("preserves deferred Bug #1336 %s pass sequence", (_name, input, firstExpected, stableExpected) => {
+    const first = sanitizeError(input);
+    const second = sanitizeError(first);
+
+    expect(first).toBe(firstExpected);
+    expect(second).toBe(stableExpected);
+    expect(sanitizeError(second)).toBe(second);
+  });
+
+  it.each([
+    [
+      "matching close",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/tail/secret]&later/Users/outside",
+      "file://h?x=[file://<path>?key=<path>&later<path>]&later/Users/outside",
+    ],
+    [
+      "whitespace reset",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/tail/secret later/Users/outside]",
+      "file://h?x=[file://<path>?key=<path>&later<path> later/Users/outside]",
+    ],
+  ] as const)("expires nested-file query return at %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("returns from a later public child to a retained exact-file parent", () => {
+    const input =
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/SECRET_A&https://public.test/x&later/Users/final/SECRET_FINAL]";
+    const expected =
+      "file://h?x=[file://<path>?key=<path>&later<path>&https://public.test/x&later<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET_A");
+    expect(first).not.toContain("SECRET_FINAL");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "hosted fragment and named public child",
+      "file://h?x=[file://host/Users/a/one#key=/public&later/Users/a/secret&https://p.test/x?key=/public&next=/also&later/Users/final/secret]",
+      "file://h?x=[file://host<path>#key=<path>&later<path>&https://p.test/x?key=/public&next=/also&later<path>]",
+    ],
+    [
+      "IPv6 child and mixed-case backslash root",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&https://[::1]/p&later/uSeRs\\final\\secret]",
+      "file://h?x=[file://<path>?key=<path>&later<path>&https://[::1]/p&later<path>]",
+    ],
+    [
+      "unclosed wrapper",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&https://p.test/x&later/Users/final/secret",
+      "file://h?x=[file://<path>?key=<path>&later<path>&https://p.test/x&later<path>",
+    ],
+    [
+      "alternating public children",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&https://p.test/one&later/Users/b/secret&ftp://p.test/two&later/Users/c/secret]",
+      "file://h?x=[file://<path>?key=<path>&later<path>&https://p.test/one&later<path>&ftp://p.test/two&later<path>]",
+    ],
+  ] as const)("retains returned parent across %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(first).not.toContain("/uSeRs");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("retains public-child return at two nested parent depths", () => {
+    const input =
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&[file:///Users/b/two#key=/public&later/Users/b/secret&https://inner.test/x&later/Users/inner/secret]&https://outer.test/x&later/Users/outer/secret]";
+    const expected =
+      "file://h?x=[file://<path>?key=<path>&later<path>&[file://<path>#key=<path>&later<path>&https://inner.test/x&later<path>]&https://outer.test/x&later<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "matching close",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&https://p.test/x]&later/Users/outside",
+      "file://h?x=[file://<path>?key=<path>&later<path>&https://p.test/x]&later/Users/outside",
+    ],
+    [
+      "whitespace reset",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/a/secret&https://p.test/x later/Users/outside]",
+      "file://h?x=[file://<path>?key=<path>&later<path>&https://p.test/x later/Users/outside]",
+    ],
+  ] as const)("expires retained public-child parent at %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts a named Windows root after a later public child", () => {
+    const input =
+      "file://h?x=[https://z.test/t&file:///Users/CHILD/path&https://a.test/t&name=\\Users\\SECRET\\path]";
+    const expected =
+      "file://h?x=[https://z.test/t&file://<path>&https://a.test/t&name=<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "query relative parameter",
+      "'file://h'['/private']?a/Users/alice&https://cdn.test/logo?a=1&relative/path",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&relative/path",
+    ],
+    [
+      "fragment relative parameter",
+      "'file://h'['/private']?a/Users/alice&https://cdn.test/logo#x=1&docs/readme/more",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo#x=1&docs/readme/more",
+    ],
+    [
+      "named slash parameter",
+      "'file://h'['/private']?a/Users/alice&https://cdn.test/logo?a=1&next=/public/path",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&next=/public/path",
+    ],
+  ] as const)("keeps quoted public URL internal %s intact", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("preserves the pre-query broad word-bearing private return", () => {
+    const input =
+      "'file://h'['/private']?a/Users/PARENT&https://cdn.test/logo&relative/path";
+    const expected =
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo&relative<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "bare private return",
+      "'file://h'['/private']?a/Users/alice&https://cdn.test/logo&/Users/bob",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo&<path>",
+    ],
+    [
+      "word-bearing private return",
+      "'file://h'['/private']?a/Users/alice&https://cdn.test/logo&c/Users/bob",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo&c<path>",
+    ],
+    [
+      "later independent public URL",
+      "'file://h'['/private']?a/Users/alice&https://cdn.test/logo&/Users/bob&https://p.test/x",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo&<path>&https://p.test/x",
+    ],
+  ] as const)("preserves quoted public child %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "named Windows root",
+      "'file://h'['/private']?a/Users/PARENT&https://cdn.test/logo?a=1&name=\\Users\\SECRET\\path&https://later.test/x&c/Users/LATER/path",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&name=<path>&https://later.test/x&c<path>",
+    ],
+    [
+      "named drive",
+      "'file://h'['/private']?a/Users/PARENT&https://cdn.test/logo?a=1&drive=C:\\Users\\SECRET\\path&https://later.test/x&c/Users/LATER/path",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&drive=<path>&https://later.test/x&c<path>",
+    ],
+    [
+      "named UNC",
+      "'file://h'['/private']?a/Users/PARENT&https://cdn.test/logo?a=1&unc=\\\\server\\share\\SECRET&https://later.test/x&c/Users/LATER/path",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&unc=<path>&https://later.test/x&c<path>",
+    ],
+  ] as const)("restores quoted parent after public-child %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
+    expect(first).not.toContain("LATER");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "'file://h'['/private']?a/Users/PARENT&https://cdn.test/logo?a=1&c/Public/path",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&c/Public/path",
+    ],
+    [
+      "'file://h'['/private']?a/Users/PARENT&https://cdn.test/logo?a=1&c/Users",
+      "'file://h'['<path>']?a<path>&https://cdn.test/logo?a=1&c/Users",
+    ],
+  ] as const)("keeps quoted public-child non-private word value intact: %s", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts repeated pipe Windows paths inside one wrapper", () => {
+    const input =
+      "file://h?x=[https://e.test/t|\\Users\\alice\\one.db|\\Users\\bob\\secret.db]";
+    const expected = "file://h?x=[https://e.test/t|<path>|<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("bob");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    ["public", "file://h?x=[https://e.test/t]", "file://h?x=[https://e.test/t]"],
+    [
+      "named",
+      "file://h?x=[https://e.test/t?key=/public&next=/also]",
+      "file://h?x=[https://e.test/t?key=/public&next=/also]",
+    ],
+    ["relative", "file://h?x=[https://e.test/t|relative/path]", "file://h?x=[https://e.test/t|relative/path]"],
+    [
+      "IPv6",
+      "file://h?x=[https://[::1]/p|\\Users\\first.db|\\Users\\second.db",
+      "file://h?x=[https://[::1]/p|<path>|\\Users\\second.db",
+    ],
+    [
+      "deferred Bug #1332",
+      "file://h?x=[value|later=\\Users\\bob\\secret.db]",
+      "file://h?x=[value|later=<path>]",
+    ],
+  ] as const)("preserves post-review 5 %s control", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts repeated nested-public ampersand paths in the same wrapper", () => {
+    const input = "file://h?x=[https://e.test/t&/Users/a/one.db&/Users/b/two.db]";
+    const expected = "file://h?x=[https://e.test/t&<path>&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/Users");
+    expect(first).not.toContain("one.db");
+    expect(first).not.toContain("two.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts nested-public ampersand Windows-root paths", () => {
+    const input = "file://h?x=[https://example.test/t&\\Users\\alice\\secret.db]";
+    const expected = "file://h?x=[https://example.test/t&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts nested-public ampersand POSIX paths beginning with a Unicode symbol", () => {
+    const input = "file://h?x=[https://example.test/t&/📁/secret.db]";
+    const expected = "file://h?x=[https://example.test/t&<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("📁");
+    expect(first).not.toContain("secret.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts bare ampersand paths after public URLs in quoted file queries", () => {
+    const input = "'file://h'['/private']?a/Users/alice&https://e.test/x&/Users/bob/two.db";
+    const expected = "'file://h'['<path>']?a<path>&https://e.test/x&<path>";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("/private");
+    expect(first).not.toContain("alice");
+    expect(first).not.toContain("bob");
+    expect(first).not.toContain("two.db");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+
+  it.each([
+    [
+      "pipe-then-ampersand returned owner",
+      "file://h?x=[https://e.test/t|/Users/a/one&\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t|<path>&<path>]",
+    ],
+    [
+      "ampersand-then-pipe nested file child",
+      "file://h?x=[https://e.test/t&file://host?key=/public|\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t&file://host?key=<path>|<path>]",
+    ],
+    [
+      "pipe-then-pipe nested file child",
+      "file://h?x=[https://e.test/t|file://host?key=/public|\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t|file://host?key=<path>|<path>]",
+    ],
+    [
+      "ampersand-relative-then-pipe nested file child",
+      "file://h?x=[https://e.test/t&file://host?key=/public&more|\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t&file://host?key=<path>&more|<path>]",
+    ],
+  ] as const)("redacts a single-backslash Windows root after %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "POSIX successor",
+      "file://h?x=[https://e.test/t&file://host?key=/public|/Users/SECRET/x]",
+      "file://h?x=[https://e.test/t&file://host?key=<path>|<path>]",
+    ],
+    [
+      "UNC successor",
+      "file://h?x=[https://e.test/t&file://host?key=/public|\\\\srv\\share\\s]",
+      "file://h?x=[https://e.test/t&file://host?key=<path>|<path>]",
+    ],
+    [
+      "drive successor",
+      "file://h?x=[https://e.test/t&file://host?key=/public|C:\\Users\\SECRET]",
+      "file://h?x=[https://e.test/t&file://host?key=<path>|<path>]",
+    ],
+  ] as const)("keeps already-recognized %s forms redacted after a pipe handoff", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
+    expect(first).not.toContain("srv");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("keeps a single-pipe direct handoff control stable", () => {
+    const input = "file://h?x=[https://e.test/t|\\Users\\SECRET\\x]";
+    const expected = "file://h?x=[https://e.test/t|<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("preserves deferred Bug #1332 contextual over-redaction after the pipe-handoff fix", () => {
+    const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
+    const expected = "file://h?x=[value|later=<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("preserves deferred Bug #1336 root anchor after the pipe-handoff fix", () => {
+    const input =
+      "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&relative/path]";
+    const expected =
+      "file://h?x=[https://e.test/t&<path>&file://<path>&relative<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "ampersand delimiter",
+      "file://h?x=[https://e.test/t&file://host?key=/public&later/Users/secret]",
+      "file://h?x=[https://e.test/t&file://host?key=<path>&later/Users/secret]",
+    ],
+    [
+      "pipe delimiter",
+      "file://h?x=[https://e.test/t&file://host?key=/public|later/Users/secret]",
+      "file://h?x=[https://e.test/t&file://host?key=<path>|later/Users/secret]",
+    ],
+    [
+      "pipe scheme then ampersand tail",
+      "file://h?x=[https://e.test/t|file://host?key=/public&later/Users/secret]",
+      "file://h?x=[https://e.test/t|file://host?key=<path>&later/Users/secret]",
+    ],
+    [
+      "pipe scheme then pipe tail",
+      "file://h?x=[https://e.test/t|file://host?key=/public|later/Users/secret]",
+      "file://h?x=[https://e.test/t|file://host?key=<path>|later/Users/secret]",
+    ],
+  ] as const)(
+    "keeps the relative tail unchanged after a query-only nested file child return via %s",
+    (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(first).toContain("later/Users/secret");
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    },
+  );
+
+  it("keeps independent query-only nested-file restart depths isolated", () => {
+    const input =
+      "file://h?x=[file://a?k=/pub&later1/Users/one&[file://b?k=/pub|\\Users\\S2]&later2/Users/two]";
+    const expected =
+      "file://h?x=[file://a?k=<path>&later1/Users/one&[file://b?k=<path>|<path>]&later2/Users/two]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).toContain("later1/Users/one");
+    expect(first).toContain("later2/Users/two");
+    expect(first).not.toContain("S2");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("clears the query-only nested-file pipe/ampersand handoff at whitespace", () => {
+    const input =
+      "file://h?x=[https://e.test/t&file://host?key=/public whitespace|\\Users\\SECRET\\x]";
+    const expected =
+      "file://h?x=[https://e.test/t&file://host?key=<path> whitespace|\\Users\\SECRET\\x]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "ampersand nested child",
+      "file://h?x=[[https://e.test/t&file://host?key=/public]\\Users\\SECRET\\x]",
+      "file://h?x=[[https://e.test/t&file://host?key=<path>]\\Users\\SECRET\\x]",
+    ],
+    [
+      "pipe nested child",
+      "file://h?x=[[https://e.test/t|file://host?key=/public]\\Users\\SECRET\\x]",
+      "file://h?x=[[https://e.test/t|file://host?key=<path>]\\Users\\SECRET\\x]",
+    ],
+  ] as const)("keeps the query-only nested-file handoff scoped inside its own bracket for %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
   it("bounds URL authority classification work by input length", () => {

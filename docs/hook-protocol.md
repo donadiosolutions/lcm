@@ -32,6 +32,12 @@ pending. That metadata is frozen atomically when the first delivery claim
 begins, so a later local correlation pass cannot change an envelope that may
 already exist in PostgreSQL.
 
+Promotion that already holds consumer publication admission forwards the same
+live token through predecessor correlation. An error-to-fix pair can therefore
+persist its predecessor and complete local acknowledgement on its first pass
+without contending with its own admission. A held maintenance journal still
+blocks correlation updates.
+
 The sequence allocator is a separate local SQLite file,
 `~/.lcm/events/.machine-sequence.sqlite`. Reservation and checkpoint update are
 one transaction. A crash between reservation and sidecar insertion can leave a
@@ -183,6 +189,18 @@ Invoked on each user prompt. lcm searches memory for relevant hints and injects 
 | `hook_event_name` | string | `"UserPromptSubmit"` |
 
 **Response:** Exit code `0`. Hints are injected via stdout when relevant matches are found.
+
+Before persisting extracted passive events, the hook checks whether the mapped
+local project storage is the exact authenticated retired-identity fence
+described in [Project identity](project-identity.md#retired-local-identities).
+For that one condition it intentionally skips the prompt's passive events,
+writes one fixed bounded terminal diagnostic directing the user to
+`lcm project renew-retired-identity`, and continues prompt search. It does not
+append a generic `ENOTDIR` row to the sidecar or `~/.lcm/logs/events.log`, does
+not open the normal hook-error circuit, and never renews identity implicitly.
+If stderr is unavailable, the diagnostic is best effort and hook exit remains
+successful. Malformed or uncertain fence topology keeps the ordinary strict
+error path.
 
 ## PostToolUse Hook
 
@@ -397,6 +415,7 @@ LCM revalidates the snapshot before storing messages and preserves exact source
 and message link checks. If a fully read and validated source changes during ingestion, LCM
 makes one fresh attempt only when the original byte prefix remains identical;
 appended bytes are allowed. Shrink or rewrite of that prefix fails the request.
+
 Mutation before the first complete validated snapshot is available also fails
 without an internal retry. A failure closing the source or quarantine after an
 otherwise retryable source change also fails the request without retrying; the
@@ -415,6 +434,13 @@ A source that disappears after path validation, or fails snapshot validation,
 fails closed. Validation now precedes parsed-message persistence for native paths,
 so an invalid source cannot first commit its parsed projection. Existing explicit
 `messages` requests retain their input behavior.
+
+At parse time, independent of the snapshot retry policy above, LCM ignores null,
+primitive, array, and unsupported record siblings in Claude message content
+arrays, at the top level and at every existing nested `tool_result` level. Valid
+text siblings remain in their original order and are joined with newlines, so a
+malformed sibling no longer discards the valid text around it. A message with no
+retained text is still omitted.
 
 Intentional request cancellation returns HTTP 499 with
 `{"status":"cancelled","error":"ingest cancelled"}` when the connection is still

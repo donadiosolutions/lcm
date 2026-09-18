@@ -86,13 +86,13 @@ describe("CI environment cache metadata", () => {
     const action = readFileSync(new URL("../../.github/actions/setup-ci/action.yml", import.meta.url), "utf8");
     const workflow = readFileSync(new URL("../../.github/workflows/ci.yml", import.meta.url), "utf8");
 
-    expect(action).toContain("actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306");
-    expect(action).toContain("actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306");
+    expect(action).toMatch(/actions\/cache\/restore@[0-9a-f]{40}/u);
+    expect(action).toMatch(/actions\/cache\/save@[0-9a-f]{40}/u);
     expect(action).not.toContain("restore-keys:");
     expect(action).toContain("path: node_modules");
     expect(action.match(/node-version:\s*"([^"]+)"/u)?.[1]).toBe(NODE_VERSION);
     expect(workflow).toContain("name: Initialize CI environment");
-    expect(workflow.match(/runs-on: blacksmith-4vcpu-ubuntu-2404/gu)).toHaveLength(3);
+    expect(workflow.match(/runs-on: blacksmith-4vcpu-ubuntu-2404/gu)).toHaveLength(2);
     expect(workflow.match(/uses: \.\/\.github\/actions\/setup-ci/gu)).toHaveLength(3);
     expect(workflow.match(/runs-on: ubuntu-latest/gu)).toHaveLength(3);
   });

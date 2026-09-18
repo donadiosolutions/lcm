@@ -1,7 +1,16 @@
 import { chmodSync, mkdirSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { dirname, join } from "node:path";
 import { inject } from "vitest";
 import { RUNTIME_HOME_ROOT_CONTEXT } from "./runtime-home-global.js";
+import {
+  installTestRuntimeHomedir,
+  type RuntimeHomeOsModule,
+} from "./runtime-home-authority.js";
+
+const require = createRequire(import.meta.url);
+const osModule = require("node:os") as RuntimeHomeOsModule;
+installTestRuntimeHomedir(osModule, syncBuiltinESMExports);
 
 const stateKey = Symbol.for("lcm.vitest.runtimeHome");
 

@@ -1,26 +1,34 @@
 import { AsyncResource } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, fsyncSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BackendPublicationCoordinator,
+  BackendPublicationAppendBarrierTimeoutError,
+  BackendPublicationRetainedAppendAdmissionStoppedError,
   BackendPublicationJournalError,
   assertBackendPublicationConsumerAccess,
   assertBackendPublicationConfigReadAccess,
   backendPublicationDirectory,
+  backendPublicationHistoryDirectory,
   backendPublicationJournalPath,
   backendPublicationCanonicalSha256,
   backendPublicationMaterialWitness,
   captureBackendPublicationFileWitness,
   readBackendPublicationJournal,
+  readBackendMaintenanceJournal,
   withBackendPublicationConfigLock,
   withBackendPublicationConsumerLock,
+  withBackendPublicationConsumerLockAsync,
   withBackendPublicationAppendBarrier,
   withBackendPublicationAppendBarrierAsync,
+  withBackendPublicationRetainedAppendAdmissionAsync,
   type BackendPublicationDriver,
+  type BackendPublicationJournal,
+  type BackendMaintenanceJournal,
   type BackendPublicationFenceRecord,
   type BackendPublicationRecoveryFile,
   type BackendPublicationRecoveryMaterial,
@@ -28,6 +36,7 @@ import {
 } from "../src/storage/backend-publication.js";
 import { PrivateMutationLockContentionError, PrivateMutationPermitRevokedError } from "../src/private-mutation-lock.js";
 import { withRevocablePrivateMutationPermit } from "../src/private-mutation-lock.js";
+import { PrivateDirectoryTopologyError } from "../src/security-files.js";
 import {
   assertHomeLockTopology,
   closeHomeLockTopology,
@@ -166,6 +175,161 @@ type PublicationDirectoryGeneration = {
   closed: number;
   fstatPhases: string[];
 };
+
+type ArchiveDirectoryDescriptor = {
+  path: string;
+  fd: number;
+  dev: string;
+  ino: string;
+  closed: number;
+};
+
+type ArchiveDirectoryEvent = Readonly<{
+  operation: "assert" | "fsync" | "close";
+  path: string;
+  fd: number;
+  dev: string;
+  ino: string;
+}>;
+
+function archiveDirectoryIdentity(stat: unknown): Readonly<{ dev: string; ino: string }> {
+  const identity = stat as Readonly<{ dev: number | bigint; ino: number | bigint }>;
+  return { dev: String(identity.dev), ino: String(identity.ino) };
+}
+
+function assertExactArchiveDirectoryEvents(
+  actual: readonly ArchiveDirectoryEvent[],
+  expected: readonly ArchiveDirectoryEvent[],
+): void {
+  expect(actual).toEqual(expected);
+}
+
+function expectedArchiveDirectoryEvent(
+  operation: ArchiveDirectoryEvent["operation"],
+  descriptor: ArchiveDirectoryDescriptor,
+): ArchiveDirectoryEvent {
+  return {
+    operation,
+    path: descriptor.path,
+    fd: descriptor.fd,
+    dev: descriptor.dev,
+    ino: descriptor.ino,
+  };
+}
+
+async function withTrackedArchiveDirectoryDescriptors<T>(
+  home: string,
+  callback: (tracking: Readonly<{
+    records: ArchiveDirectoryDescriptor[];
+    events: ArchiveDirectoryEvent[];
+    beginSyncOrder: () => void;
+    completeSyncOrder: () => void;
+    admitted: () => Readonly<{
+      history: ArchiveDirectoryDescriptor;
+      outer: ArchiveDirectoryDescriptor;
+    }>;
+    failNextSync: (path: string, error: Error) => void;
+  }>) => Promise<T>,
+): Promise<T> {
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+  const originalClose = nodeFs.closeSync as (fd: number) => void;
+  const originalFstat = nodeFs.fstatSync as (...args: unknown[]) => unknown;
+  const originalFsync = nodeFs.fsyncSync as (fd: number) => void;
+  const publication = backendPublicationDirectory(home);
+  const history = backendPublicationHistoryDirectory(home);
+  const trackedPaths = new Set([publication, history]);
+  const records: ArchiveDirectoryDescriptor[] = [];
+  const events: ArchiveDirectoryEvent[] = [];
+  const syncFailures = new Map<string, Error>();
+  let recordSyncOrder = false;
+  let admittedHistory: ArchiveDirectoryDescriptor | undefined;
+  let admittedOuter: ArchiveDirectoryDescriptor | undefined;
+  const activeRecord = (fd: number): ArchiveDirectoryDescriptor | undefined => (
+    [...records].reverse().find((record) => record.fd === fd && record.closed === 0)
+  );
+  const eventFor = (
+    operation: ArchiveDirectoryEvent["operation"],
+    record: ArchiveDirectoryDescriptor,
+    stat: unknown,
+  ): ArchiveDirectoryEvent => ({
+    operation,
+    path: record.path,
+    fd: record.fd,
+    ...archiveDirectoryIdentity(stat),
+  });
+
+  return withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+    const fd = originalOpen(path, ...args);
+    if (trackedPaths.has(path)) {
+      records.push({
+        path,
+        fd,
+        ...archiveDirectoryIdentity(originalFstat(fd, { bigint: true })),
+        closed: 0,
+      });
+    }
+    return fd;
+  }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+    const record = activeRecord(fd);
+    const closeStat = recordSyncOrder && record !== undefined
+      ? originalFstat(fd, { bigint: true })
+      : undefined;
+    originalClose(fd);
+    if (record !== undefined) record.closed += 1;
+    if (record !== undefined && closeStat !== undefined) {
+      events.push(eventFor("close", record, closeStat));
+    }
+  }) as never, async () => withPatchedFsAsync("fstatSync", ((fd: number, ...args: unknown[]) => {
+    const observed = originalFstat(fd, ...args);
+    if (recordSyncOrder) {
+      const record = activeRecord(fd);
+      if (record !== undefined) events.push(eventFor("assert", record, observed));
+    }
+    return observed;
+  }) as never, async () => withPatchedFsAsync("fsyncSync", ((fd: number) => {
+    const record = activeRecord(fd);
+    if (recordSyncOrder && record !== undefined) {
+      events.push(eventFor("fsync", record, originalFstat(fd, { bigint: true })));
+    }
+    if (record !== undefined) {
+      const failure = syncFailures.get(record.path);
+      if (failure !== undefined) {
+        syncFailures.delete(record.path);
+        throw failure;
+      }
+    }
+    originalFsync(fd);
+  }) as never, async () => callback({
+    records,
+    events,
+    beginSyncOrder: () => {
+      admittedHistory = [...records].reverse().find(
+        (record) => record.path === history && record.closed === 0,
+      );
+      admittedOuter = [...records].reverse().find(
+        (record) => record.path === publication && record.closed === 0,
+      );
+      if (admittedHistory === undefined || admittedOuter === undefined) {
+        throw new Error("archive directory descriptors were not admitted before sync");
+      }
+      recordSyncOrder = true;
+    },
+    completeSyncOrder: () => {
+      if (!recordSyncOrder || admittedHistory === undefined || admittedHistory.closed !== 1) {
+        throw new Error("archive directory operation completed before retained history cleanup");
+      }
+      recordSyncOrder = false;
+    },
+    admitted: () => {
+      if (admittedHistory === undefined || admittedOuter === undefined) {
+        throw new Error("archive directory descriptor admission was not recorded");
+      }
+      return { history: admittedHistory, outer: admittedOuter };
+    },
+    failNextSync: (path, error) => { syncFailures.set(path, error); },
+  })))));
+}
 
 async function withTrackedPublicationDirectoryGenerations<T>(
   directories: readonly string[],
@@ -332,6 +496,225 @@ function inputFor(materialInput: BackendPublicationRecoveryMaterial) {
     projects: projectInput(),
     now: new Date("2026-08-06T12:00:00.000Z"),
   };
+}
+
+async function createMaintenanceState(
+  home: string,
+  driver: BackendPublicationDriver,
+  phase: "maintenance-entering" | "maintenance-held" | "selection-prepared" | "selection-completed" | "maintenance-aborted",
+  targetBackend: "sqlite" | "postgresql" = "postgresql",
+): Promise<BackendMaintenanceJournal> {
+  const active = coordinator(home, driver);
+  const held = await active.enterMaintenance({
+    publicationId: "maintenance-publication",
+    generationId: "maintenance-generation",
+    sourceSelectionSha256: "a".repeat(64),
+    queueEvidenceSha256: "b".repeat(64),
+    roster: [{
+      machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
+      queueCutoff: null,
+      evidenceSha256: "a".repeat(64),
+    }],
+  });
+  if (phase === "maintenance-held") return held;
+  if (phase === "maintenance-entering") {
+    rewriteJournal(home, (journal) => ({ ...journal, phase }));
+    return readBackendMaintenanceJournal(home)!;
+  }
+  if (phase === "maintenance-aborted") {
+    return active.abortMaintenance({
+      expectedChecksumSha256: held.checksumSha256,
+      sourceSelectionSha256: held.sourceSelectionSha256,
+      abortEvidenceSha256: "c".repeat(64),
+    });
+  }
+  const prepared = await active.prepareMaintenanceSelection({
+    expectedChecksumSha256: held.checksumSha256,
+    generationId: held.generationId,
+    targetBackend,
+    terminalEvidenceSha256: "c".repeat(64),
+  });
+  if (phase === "selection-prepared") return prepared;
+  return active.completeMaintenanceSelection({
+    expectedChecksumSha256: prepared.checksumSha256,
+    generationId: prepared.generationId,
+    terminalEvidenceSha256: prepared.terminalEvidenceSha256!,
+  });
+}
+
+function maintenanceArchivePath(home: string, journal: BackendMaintenanceJournal): string {
+  return join(
+    backendPublicationHistoryDirectory(home),
+    `${journal.publicationId}.${journal.checksumSha256}.json`,
+  );
+}
+
+type TerminalArchiveFixture = Readonly<{
+  bytes: Buffer;
+  journal: BackendPublicationJournal | BackendMaintenanceJournal;
+  version: 2 | 3;
+}>;
+
+async function terminalArchiveFixture(
+  home: string,
+  version: 2 | 3,
+): Promise<TerminalArchiveFixture> {
+  const input = material();
+  const fake = makeDriver(input);
+  let journal: BackendPublicationJournal | BackendMaintenanceJournal;
+  if (version === 2) {
+    await coordinator(home, fake.driver).prepare(inputFor(input));
+    journal = await coordinator(home, fake.driver).resume();
+  } else {
+    journal = await createMaintenanceState(home, fake.driver, "selection-completed");
+  }
+  return {
+    bytes: readFileSync(backendPublicationJournalPath(home)),
+    journal,
+    version,
+  };
+}
+
+function validJournalBytes(
+  bytes: Buffer,
+  mutate: (journal: Record<string, unknown>) => Record<string, unknown>,
+): Buffer {
+  const current = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+  const next = mutate(current);
+  const { checksumSha256: _checksum, ...payload } = next;
+  return Buffer.from(`${JSON.stringify({
+    ...payload,
+    checksumSha256: backendPublicationCanonicalSha256(payload),
+  })}\n`);
+}
+
+function countingDriver(input: BackendPublicationRecoveryMaterial): Readonly<{
+  calls: string[];
+  driver: BackendPublicationDriver;
+}> {
+  const base = makeDriver(input).driver;
+  const calls: string[] = [];
+  return {
+    calls,
+    driver: {
+      async observeLocalState(context) {
+        calls.push("observe-local-state");
+        return base.observeLocalState(context);
+      },
+      async publishProjectMap(context) {
+        calls.push("publish-project-map");
+        return base.publishProjectMap(context);
+      },
+      async publishConfig(context) {
+        calls.push("publish-config");
+        return base.publishConfig(context);
+      },
+      async restoreConfig(context) {
+        calls.push("restore-config");
+        return base.restoreConfig(context);
+      },
+      async restoreProjectMap(context) {
+        calls.push("restore-project-map");
+        return base.restoreProjectMap(context);
+      },
+    },
+  };
+}
+
+type ArchiveRereadOperation = "prepare" | "enter-maintenance";
+
+type ArchiveRereadReplacement =
+  | "malformed-json"
+  | "null"
+  | "array"
+  | "scalar"
+  | "unsupported-version"
+  | "unknown-field"
+  | "malformed-checksum"
+  | "payload-checksum-mismatch"
+  | "cross-version"
+  | "same-version-change";
+
+const ARCHIVE_REREAD_REFUSALS = [
+  { name: "malformed JSON after v2", version: 2, replacement: "malformed-json", reason: "malformed-journal", message: "backend publication journal is not valid JSON" },
+  { name: "malformed JSON after v3", version: 3, replacement: "malformed-json", reason: "malformed-journal", message: "backend publication journal is not valid JSON" },
+  { name: "null JSON", version: 2, replacement: "null", reason: "malformed-journal", message: "backend publication journal is not an object" },
+  { name: "array JSON", version: 3, replacement: "array", reason: "malformed-journal", message: "backend publication journal is not an object" },
+  { name: "scalar JSON", version: 2, replacement: "scalar", reason: "malformed-journal", message: "backend publication journal is not an object" },
+  { name: "unsupported v2-shaped version", version: 2, replacement: "unsupported-version", reason: "malformed-journal", message: "backend publication journal fields are malformed" },
+  { name: "unsupported v3-shaped version", version: 3, replacement: "unsupported-version", reason: "malformed-journal", message: "backend publication journal has unknown fields" },
+  { name: "unknown v2 field", version: 2, replacement: "unknown-field", reason: "malformed-journal", message: "backend publication journal has unknown fields" },
+  { name: "unknown v3 field", version: 3, replacement: "unknown-field", reason: "malformed-journal", message: "backend maintenance journal has unknown fields" },
+  { name: "malformed v2 checksum", version: 2, replacement: "malformed-checksum", reason: "malformed-journal", message: "backend publication journal checksum is malformed" },
+  { name: "malformed v3 checksum", version: 3, replacement: "malformed-checksum", reason: "checksum-mismatch", message: "backend maintenance journal checksum does not match" },
+  { name: "v2 payload checksum mismatch", version: 2, replacement: "payload-checksum-mismatch", reason: "checksum-mismatch", message: "backend publication journal checksum does not match" },
+  { name: "v3 payload checksum mismatch", version: 3, replacement: "payload-checksum-mismatch", reason: "checksum-mismatch", message: "backend maintenance journal checksum does not match" },
+  { name: "v2-to-v3 substitution", version: 2, replacement: "cross-version", reason: "unexpected-state", message: "backend publication journal changed before archive" },
+  { name: "v3-to-v2 substitution", version: 3, replacement: "cross-version", reason: "unexpected-state", message: "backend publication journal changed before archive" },
+  { name: "valid changed v2 checksum", version: 2, replacement: "same-version-change", reason: "unexpected-state", message: "backend publication journal changed before archive" },
+  { name: "valid changed v3 checksum", version: 3, replacement: "same-version-change", reason: "unexpected-state", message: "backend publication journal changed before archive" },
+] as const satisfies readonly Readonly<{
+  name: string;
+  version: 2 | 3;
+  replacement: ArchiveRereadReplacement;
+  reason: BackendPublicationJournalError["reason"];
+  message: string;
+}>[];
+
+async function runArchiveRereadOperation(
+  operation: ArchiveRereadOperation,
+  home: string,
+  driver: BackendPublicationDriver,
+  observer: (event: string, path: string) => void,
+): Promise<BackendPublicationJournal | BackendMaintenanceJournal> {
+  const active = coordinator(home, driver, observer);
+  if (operation === "prepare") {
+    return active.prepare({
+      ...inputFor(material()),
+      publicationId: "archive-reread-next",
+    });
+  }
+  return active.enterMaintenance({
+    publicationId: "archive-reread-maintenance",
+    generationId: "archive-reread-generation",
+    sourceSelectionSha256: "d".repeat(64),
+    queueEvidenceSha256: "e".repeat(64),
+    roster: [{
+      machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
+      queueCutoff: null,
+      evidenceSha256: "f".repeat(64),
+    }],
+  });
+}
+
+async function replacementArchiveBytes(
+  fixture: TerminalArchiveFixture,
+  replacement: ArchiveRereadReplacement,
+): Promise<Buffer> {
+  if (replacement === "malformed-json") return Buffer.from(`{"version":${fixture.version}`);
+  if (replacement === "null") return Buffer.from("null\n");
+  if (replacement === "array") return Buffer.from("[]\n");
+  if (replacement === "scalar") return Buffer.from('"terminal"\n');
+  if (replacement === "cross-version") {
+    const otherHome = makeHome();
+    return (await terminalArchiveFixture(otherHome, fixture.version === 2 ? 3 : 2)).bytes;
+  }
+  if (replacement === "unsupported-version") {
+    return validJournalBytes(fixture.bytes, (journal) => ({ ...journal, version: 99 }));
+  }
+  if (replacement === "unknown-field") {
+    return validJournalBytes(fixture.bytes, (journal) => ({ ...journal, unexpected: true }));
+  }
+  if (replacement === "same-version-change") {
+    return validJournalBytes(fixture.bytes, (journal) => ({
+      ...journal,
+      updatedAt: "2026-09-16T12:00:00.000Z",
+    }));
+  }
+  const journal = JSON.parse(fixture.bytes.toString("utf8")) as Record<string, unknown>;
+  if (replacement === "malformed-checksum") journal.checksumSha256 = "not-a-checksum";
+  else journal.updatedAt = "2026-09-16T12:00:00.000Z";
+  return Buffer.from(`${JSON.stringify(journal)}\n`);
 }
 
 function fenceRecord(overrides: Partial<BackendPublicationFenceRecord> = {}): BackendPublicationFenceRecord {
@@ -1347,6 +1730,328 @@ describe("BackendPublicationCoordinator", () => {
     expect(fake.getState()).toEqual(targetState(input));
     expect(await coordinator(home, fake.driver).recoverPending()).toEqual(completed);
   });
+
+  it.each([
+    { phase: "maintenance-aborted", targetBackend: "postgresql" },
+    { phase: "selection-completed", targetBackend: "sqlite" },
+    { phase: "selection-completed", targetBackend: "postgresql" },
+  ] as const)(
+    "archives terminal v3 $phase for $targetBackend before ordinary prepare",
+    async ({ phase, targetBackend }) => {
+      const home = makeHome();
+      const input = material();
+      const fake = makeDriver(input);
+      const terminal = await createMaintenanceState(home, fake.driver, phase, targetBackend);
+      const terminalBytes = readFileSync(backendPublicationJournalPath(home));
+
+      const prepared = await coordinator(home, fake.driver).prepare({
+        ...inputFor(input),
+        publicationId: "ordinary-after-maintenance",
+      });
+
+      expect(prepared).toMatchObject({
+        version: 2,
+        phase: "prepared",
+        publicationId: "ordinary-after-maintenance",
+      });
+      expect(readFileSync(maintenanceArchivePath(home, terminal))).toEqual(terminalBytes);
+      expect(readBackendMaintenanceJournal(home)).toBeNull();
+      expect(readBackendPublicationJournal(home)).toEqual(prepared);
+    },
+  );
+
+  it.each([
+    { boundary: "observation", phase: "maintenance-aborted" },
+    { boundary: "observation", phase: "selection-completed" },
+    { boundary: "replacement", phase: "maintenance-aborted" },
+    { boundary: "replacement", phase: "selection-completed" },
+  ] as const)(
+    "replays terminal v3 $phase after $boundary failure",
+    async ({ boundary, phase }) => {
+      const home = makeHome();
+      const input = material();
+      const first = makeDriver(input);
+      const terminal = await createMaintenanceState(home, first.driver, phase);
+      const terminalBytes = readFileSync(backendPublicationJournalPath(home));
+      const archivePath = maintenanceArchivePath(home, terminal);
+      const nextInput = { ...inputFor(input), publicationId: "ordinary-after-failure" };
+      const failing = makeDriver(input);
+      if (boundary === "observation") {
+        failing.driver.observeLocalState = vi.fn(async () => {
+          throw new Error("crash:observe-terminal-v3");
+        });
+      }
+      const observer = (event: string): void => {
+        if (boundary === "replacement" && event === "before-journal-write") {
+          throw new Error("crash:replace-terminal-v3");
+        }
+      };
+
+      await expect(coordinator(home, failing.driver, observer).prepare(nextInput))
+        .rejects.toThrow(boundary === "observation"
+          ? "crash:observe-terminal-v3"
+          : "crash:replace-terminal-v3");
+      expect(readFileSync(backendPublicationJournalPath(home))).toEqual(terminalBytes);
+      expect(readFileSync(archivePath)).toEqual(terminalBytes);
+      expect(readBackendMaintenanceJournal(home)).toEqual(terminal);
+
+      const retry = makeDriver(input);
+      await expect(coordinator(home, retry.driver).prepare(nextInput)).resolves.toMatchObject({
+        version: 2,
+        phase: "prepared",
+        publicationId: "ordinary-after-failure",
+      });
+      expect(readFileSync(archivePath)).toEqual(terminalBytes);
+    },
+  );
+
+  it.each([
+    "maintenance-entering",
+    "maintenance-held",
+    "selection-prepared",
+  ] as const)("refuses active terminal-v3 predecessor phase %s before effects", async (phase) => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const active = await createMaintenanceState(home, fake.driver, phase);
+    const journalBytes = readFileSync(backendPublicationJournalPath(home));
+
+    await expect(coordinator(home, fake.driver).prepare({
+      ...inputFor(input),
+      publicationId: "ordinary-refused",
+    })).rejects.toMatchObject({ reason: "unresolved-publication" });
+
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(journalBytes);
+    expect(readBackendMaintenanceJournal(home)).toEqual(active);
+    expect(existsSync(backendPublicationHistoryDirectory(home))).toBe(false);
+    expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { kind: "malformed", reason: "malformed-journal" },
+    { kind: "checksum", reason: "checksum-mismatch" },
+  ] as const)("refuses $kind terminal-v3 data before ordinary publication effects", async ({ kind, reason }) => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    await createMaintenanceState(home, fake.driver, "maintenance-aborted");
+    const path = backendPublicationJournalPath(home);
+    if (kind === "malformed") {
+      rewriteJournal(home, (journal) => ({ ...journal, unexpected: true }));
+    } else {
+      const journal = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      writeFileSync(path, `${JSON.stringify({ ...journal, checksumSha256: "0".repeat(64) })}\n`, {
+        mode: 0o600,
+      });
+    }
+    const bytes = readFileSync(path);
+
+    await expect(coordinator(home, fake.driver).prepare({
+      ...inputFor(input),
+      publicationId: "ordinary-refused",
+    })).rejects.toMatchObject({ reason });
+    expect(readFileSync(path)).toEqual(bytes);
+    expect(existsSync(backendPublicationHistoryDirectory(home))).toBe(false);
+    expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+  });
+
+  it("returns a structured error for malformed terminal-v3 archive rereads", async () => {
+    const home = makeHome();
+    await terminalArchiveFixture(home, 3);
+    const journalPath = backendPublicationJournalPath(home);
+    const malformed = Buffer.from('{"version":3');
+    const replacementPath = join(home, "malformed-terminal-v3.json");
+    writeFileSync(replacementPath, malformed, { mode: 0o600 });
+    const attempt = countingDriver(material());
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    let journalReads = 0;
+    let thrown: unknown;
+
+    await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      if (path === journalPath && ++journalReads === 2) renameSync(replacementPath, journalPath);
+      return originalOpen(path, ...args);
+    }) as never, async () => {
+      try {
+        await coordinator(home, attempt.driver).prepare({
+          ...inputFor(material()),
+          publicationId: "archive-reread-next",
+        });
+      } catch (error) {
+        thrown = error;
+      }
+    });
+
+    expect(journalReads).toBe(2);
+    expect(thrown).toBeInstanceOf(BackendPublicationJournalError);
+    expect(thrown).toMatchObject({
+      name: "BackendPublicationJournalError",
+      reason: "malformed-journal",
+      message: "backend publication journal is not valid JSON",
+    });
+    expect(readFileSync(journalPath)).toEqual(malformed);
+    expect(existsSync(backendPublicationHistoryDirectory(home))).toBe(false);
+    expect(existsSync(join(backendPublicationDirectory(home), "archive-reread-next.material"))).toBe(false);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it.each(([
+    "prepare",
+    "enter-maintenance",
+  ] as const).flatMap((operation) => ARCHIVE_REREAD_REFUSALS.map((testCase) => ({
+    ...testCase,
+    operation,
+  }))))(
+    "$operation refuses $name before archive or successor effects",
+    async ({ operation, version, replacement, reason, message }) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, version);
+      const journalPath = backendPublicationJournalPath(home);
+      const replacementBytes = await replacementArchiveBytes(fixture, replacement);
+      const directory = backendPublicationDirectory(home);
+      const entriesBefore = readdirSync(directory).sort();
+      const attempt = countingDriver(material());
+      let injections = 0;
+      let thrown: unknown;
+
+      try {
+        await runArchiveRereadOperation(operation, home, attempt.driver, (event, path) => {
+          if (event !== "before-terminal-journal-archive-read") return;
+          injections += 1;
+          expect(path).toBe(journalPath);
+          writeFileSync(path, replacementBytes, { mode: 0o600 });
+        });
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(injections).toBe(1);
+      expect(thrown).toBeInstanceOf(BackendPublicationJournalError);
+      expect(thrown).toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason,
+        message,
+      });
+      expect(readFileSync(journalPath)).toEqual(replacementBytes);
+      expect(readdirSync(directory).sort()).toEqual(entriesBefore);
+      expect(existsSync(backendPublicationHistoryDirectory(home))).toBe(false);
+      expect(existsSync(join(directory, "archive-reread-next.material"))).toBe(false);
+      expect(attempt.calls).toEqual([]);
+    },
+  );
+
+  it.each(([
+    "prepare",
+    "enter-maintenance",
+  ] as const).flatMap((operation) => ([2, 3] as const).map((version) => ({ operation, version }))))(
+    "$operation archives an exact terminal-v$version reread",
+    async ({ operation, version }) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, version);
+      const journalPath = backendPublicationJournalPath(home);
+      const attempt = countingDriver(material());
+      let injections = 0;
+
+      const result = await runArchiveRereadOperation(operation, home, attempt.driver, (event, path) => {
+        if (event !== "before-terminal-journal-archive-read") return;
+        injections += 1;
+        expect(path).toBe(journalPath);
+        writeFileSync(path, fixture.bytes, { mode: 0o600 });
+      });
+
+      expect(injections).toBe(1);
+      expect(result).toMatchObject(operation === "prepare"
+        ? { version: 2, phase: "prepared", publicationId: "archive-reread-next" }
+        : { version: 3, phase: "maintenance-held", publicationId: "archive-reread-maintenance" });
+      const archivePath = join(
+        backendPublicationHistoryDirectory(home),
+        `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+      );
+      expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+      expect(attempt.calls).toEqual(operation === "prepare" ? ["observe-local-state"] : []);
+    },
+  );
+
+  it.each(["resume", "abort", "recover", "recover-abort"] as const)(
+    "keeps %s on the version-two-only recovery path",
+    async (operation) => {
+      const home = makeHome();
+      const input = material();
+      const fake = makeDriver(input);
+      const terminal = await createMaintenanceState(home, fake.driver, "selection-completed");
+      const active = coordinator(home, fake.driver);
+      const attempt = operation === "resume"
+        ? active.resume()
+        : operation === "abort"
+          ? active.abort()
+          : operation === "recover-abort"
+            ? active.recoverPending({ disposition: "abort" })
+            : active.recoverPending();
+
+      await expect(attempt).rejects.toMatchObject({ reason: "unresolved-publication" });
+      expect(readBackendMaintenanceJournal(home)).toEqual(terminal);
+      expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["missing", "changed", "active", "version-two"] as const)(
+    "refuses terminal-v3 %s drift at the initial preparing replacement checkpoint",
+    async (kind) => {
+      const home = makeHome();
+      const input = material();
+      const fake = makeDriver(input);
+      const terminal = await createMaintenanceState(home, fake.driver, "selection-completed");
+      const terminalBytes = readFileSync(backendPublicationJournalPath(home));
+      const archivePath = maintenanceArchivePath(home, terminal);
+      let versionTwoBytes: Buffer | undefined;
+      if (kind === "version-two") {
+        const otherHome = makeHome();
+        const otherDriver = makeDriver(input);
+        await coordinator(otherHome, otherDriver.driver).prepare(inputFor(input));
+        await coordinator(otherHome, otherDriver.driver).resume();
+        versionTwoBytes = readFileSync(backendPublicationJournalPath(otherHome));
+      }
+      let injected = false;
+      const active = coordinator(home, fake.driver, (event) => {
+        if (injected || event !== "before-journal-read") return;
+        injected = true;
+        if (kind === "missing") rmSync(backendPublicationJournalPath(home));
+        else if (kind === "version-two") {
+          writeFileSync(backendPublicationJournalPath(home), versionTwoBytes!, { mode: 0o600 });
+        } else if (kind === "active") {
+          rewriteJournal(home, (journal) => ({ ...journal, phase: "selection-prepared" }));
+        } else {
+          rewriteJournal(home, (journal) => ({
+            ...journal,
+            updatedAt: "2026-09-14T23:59:59.000Z",
+          }));
+        }
+      });
+
+      await expect(active.prepare({
+        ...inputFor(input),
+        publicationId: "ordinary-drifted",
+      })).rejects.toMatchObject({ reason: "unexpected-state" });
+      expect(injected).toBe(true);
+      expect(readFileSync(archivePath)).toEqual(terminalBytes);
+      expect(fake.driver.observeLocalState).toHaveBeenCalledOnce();
+      if (kind === "missing") {
+        expect(readBackendPublicationJournal(home)).toBeNull();
+        expect(existsSync(backendPublicationJournalPath(home))).toBe(false);
+      } else if (kind === "version-two") {
+        expect(readBackendPublicationJournal(home)).toMatchObject({
+          version: 2,
+          phase: "completed",
+        });
+        expect(readBackendMaintenanceJournal(home)).toBeNull();
+      } else {
+        expect(() => readBackendPublicationJournal(home)).toThrow("migration maintenance");
+        expect(readBackendMaintenanceJournal(home)?.phase).toBe(
+          kind === "active" ? "selection-prepared" : "selection-completed",
+        );
+      }
+    },
+  );
 
   it("archives terminal journal evidence before starting the next publication", async () => {
     const home = makeHome();
@@ -2617,7 +3322,11 @@ describe("BackendPublicationCoordinator", () => {
       await expect(coordinator(historyHome, makeDriver(historyInput).driver).prepare({
         ...inputFor(historyInput),
         publicationId: "publication-2",
-      })).rejects.toThrow("history mkdir denied");
+      })).rejects.toMatchObject({
+        reason: "unsafe-storage",
+        message: "backend publication history directory cannot be created",
+        cause: historyFailure,
+      });
     } finally {
       nodeFs.mkdirSync = originalMkdir;
       syncBuiltinESMExports();
@@ -3262,6 +3971,978 @@ describe("BackendPublicationCoordinator", () => {
     expect(statSync(victim).mode & 0o777).toBe(0o755);
   });
 
+  it("refuses a rebound history directory after descriptor admission", async () => {
+    const home = makeHome();
+    const input = material();
+    const first = makeDriver(input);
+    await coordinator(home, first.driver).prepare(inputFor(input));
+    const completed = await coordinator(home, first.driver).resume();
+    const terminalBytes = readFileSync(backendPublicationJournalPath(home));
+    const history = backendPublicationHistoryDirectory(home);
+    const originalHistory = `${history}.retained`;
+    mkdirSync(history, { mode: 0o700 });
+    const archiveName = `${completed.publicationId}.${completed.checksumSha256}.json`;
+    const next = countingDriver(input);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalStat = nodeFs.statSync as (...args: unknown[]) => unknown;
+    let injected = false;
+
+    await expect(withPatchedFsAsync("statSync", ((path: string, ...args: unknown[]) => {
+      const observed = originalStat(path, ...args);
+      if (!injected && path === history) {
+        injected = true;
+        renameSync(history, originalHistory);
+        mkdirSync(history, { mode: 0o700 });
+      }
+      return observed;
+    }) as never, async () => coordinator(home, next.driver).prepare({
+      ...inputFor(input),
+      publicationId: "publication-2",
+    }))).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+    expect(injected).toBe(true);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(terminalBytes);
+    expect(existsSync(join(history, archiveName))).toBe(false);
+    expect(existsSync(join(originalHistory, archiveName))).toBe(false);
+    expect(next.calls).toEqual([]);
+    expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
+  });
+
+  it("rejects a same-UID history directory substituted immediately after creation", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    const attempt = countingDriver(material());
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalLstat = nodeFs.lstatSync as (...args: unknown[]) => unknown;
+    let injected = false;
+
+    // "history" is absent, so the coordinator takes the mkdirSync-then-open
+    // creation branch. There is no public seam between mkdirSync returning
+    // and the following openPrivateDirectory call, so this test injects the
+    // closest reachable equivalent: a same-UID, same-mode real-directory
+    // substitution observed at the very first lstat the new post-open entry
+    // binding performs, which is the earliest point after open where a
+    // substitution can possibly be detected.
+    await expect(withPatchedFsAsync("lstatSync", ((path: string, ...args: unknown[]) => {
+      if (!injected && path === history) {
+        injected = true;
+        rmSync(history, { recursive: true });
+        mkdirSync(history, { mode: 0o700 });
+      }
+      return originalLstat(path, ...args);
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    }))).rejects.toMatchObject({
+      reason: "unsafe-storage",
+      // Pins the post-create binding specifically. Without it the substitution
+      // is only caught later, by the archive write's own parent-entry check,
+      // under a different message.
+      message: "created backend publication history directory is unsafe",
+    });
+
+    expect(injected).toBe(true);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(existsSync(join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    ))).toBe(false);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("rejects a history directory turned into a self-resolving symlink mid-archive", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const elsewhere = `${history}.elsewhere`;
+    const attempt = countingDriver(material());
+    let injected = false;
+
+    // Renaming the retained directory to a new name and replacing "history"
+    // with a symlink back to it leaves the retained descriptor's dev/ino
+    // reachable again through realpath resolution, so the realpathSync-based
+    // comparison in assertPrivateDirectory accepts it: that comparison only
+    // checks resolved identity, not entry type. Before this change the
+    // substitution was still refused, but later and by a different guard --
+    // the retained-parent entry check inside the archive write. The added
+    // assertPrivateDirectoryEntry lstat's the exact "history" component
+    // without following symlinks and rejects it here instead, which is what
+    // the asserted message pins.
+    await expect(coordinator(home, attempt.driver, (event) => {
+      if (!injected && event === "before-terminal-journal-archive-publication") {
+        injected = true;
+        renameSync(history, elsewhere);
+        symlinkSync(elsewhere, history, "dir");
+      }
+    }).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })).rejects.toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication history directory changed during terminal journal archive",
+    });
+
+    expect(injected).toBe(true);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(readdirSync(elsewhere)).toEqual([]);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("archives across a create-then-reuse history sequence on the ordinary happy path", async () => {
+    const home = makeHome();
+    const gen1 = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+
+    const gen2Driver = makeDriver(material());
+    await coordinator(home, gen2Driver.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    });
+    const gen2 = await coordinator(home, gen2Driver.driver).resume();
+
+    const gen3Driver = makeDriver(material());
+    const prepared3 = await coordinator(home, gen3Driver.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-3",
+    });
+
+    expect(prepared3).toMatchObject({ publicationId: "publication-3", phase: "prepared" });
+    expect(statSync(history).mode & 0o777).toBe(0o700);
+    expect(existsSync(join(
+      history,
+      `${gen1.journal.publicationId}.${gen1.journal.checksumSha256}.json`,
+    ))).toBe(true);
+    expect(existsSync(join(
+      history,
+      `${gen2.publicationId}.${gen2.checksumSha256}.json`,
+    ))).toBe(true);
+  });
+
+  it.each([2, 3] as const)(
+    "retains one history descriptor and syncs the v%s archive in fd order",
+    async (version) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, version);
+      const attempt = countingDriver(material());
+      const observed = await withTrackedArchiveDirectoryDescriptors(home, async (tracking) => {
+        const prepared = await coordinator(home, attempt.driver, (event) => {
+          if (event === "before-terminal-journal-history-sync") tracking.beginSyncOrder();
+          if (event === "after-terminal-journal-history-operation") tracking.completeSyncOrder();
+        }).prepare({
+          ...inputFor(material()),
+          publicationId: "publication-2",
+        });
+        const admitted = tracking.admitted();
+        return {
+          prepared,
+          admitted,
+          events: tracking.events,
+          records: tracking.records,
+        };
+      });
+      const history = backendPublicationHistoryDirectory(home);
+      const archivePath = join(
+        history,
+        `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+      );
+      const historyRecords = observed.records.filter((record) => record.path === history);
+
+      expect(observed.prepared).toMatchObject({ publicationId: "publication-2", phase: "prepared" });
+      expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+      expect(statSync(history).mode & 0o777).toBe(0o700);
+      expect(statSync(archivePath).mode & 0o777).toBe(0o600);
+      expect(attempt.calls).toEqual(["observe-local-state"]);
+      expect(historyRecords).toHaveLength(1);
+      expect(historyRecords[0]?.closed).toBe(1);
+      const expectedEvents = [
+        expectedArchiveDirectoryEvent("assert", observed.admitted.history),
+        expectedArchiveDirectoryEvent("assert", observed.admitted.history),
+        expectedArchiveDirectoryEvent("fsync", observed.admitted.history),
+        expectedArchiveDirectoryEvent("assert", observed.admitted.history),
+        expectedArchiveDirectoryEvent("assert", observed.admitted.history),
+        expectedArchiveDirectoryEvent("assert", observed.admitted.outer),
+        expectedArchiveDirectoryEvent("fsync", observed.admitted.outer),
+        expectedArchiveDirectoryEvent("assert", observed.admitted.outer),
+        expectedArchiveDirectoryEvent("close", observed.admitted.history),
+      ];
+      assertExactArchiveDirectoryEvents(observed.events, expectedEvents);
+    },
+  );
+
+  it("captures and rejects a real post-close retained-outer fsync", async () => {
+    const home = makeHome();
+    await terminalArchiveFixture(home, 2);
+    const attempt = countingDriver(material());
+    let injected = false;
+    const observed = await withTrackedArchiveDirectoryDescriptors(home, async (tracking) => {
+      const prepared = await coordinator(home, attempt.driver, (event) => {
+        if (event === "before-terminal-journal-history-sync") tracking.beginSyncOrder();
+        if (event === "after-terminal-journal-history-operation") {
+          fsyncSync(tracking.admitted().outer.fd);
+          injected = true;
+          tracking.completeSyncOrder();
+        }
+      }).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      });
+      return {
+        prepared,
+        admitted: tracking.admitted(),
+        events: tracking.events,
+        records: tracking.records,
+      };
+    });
+    const expectedEvents = [
+      expectedArchiveDirectoryEvent("assert", observed.admitted.history),
+      expectedArchiveDirectoryEvent("assert", observed.admitted.history),
+      expectedArchiveDirectoryEvent("fsync", observed.admitted.history),
+      expectedArchiveDirectoryEvent("assert", observed.admitted.history),
+      expectedArchiveDirectoryEvent("assert", observed.admitted.history),
+      expectedArchiveDirectoryEvent("assert", observed.admitted.outer),
+      expectedArchiveDirectoryEvent("fsync", observed.admitted.outer),
+      expectedArchiveDirectoryEvent("assert", observed.admitted.outer),
+      expectedArchiveDirectoryEvent("close", observed.admitted.history),
+    ];
+
+    expect(injected).toBe(true);
+    expect(observed.prepared).toMatchObject({ phase: "prepared" });
+    assertExactArchiveDirectoryEvents(observed.events, [
+      ...expectedEvents,
+      expectedArchiveDirectoryEvent("fsync", observed.admitted.outer),
+    ]);
+    expect(() => assertExactArchiveDirectoryEvents(observed.events, expectedEvents)).toThrow();
+    expect(observed.records.filter(
+      (record) => record.path === backendPublicationHistoryDirectory(home),
+    )[0]?.closed).toBe(1);
+  });
+
+  it("treats post-open ENOENT as unsafe instead of recreating history", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const historyIdentity = statSync(history);
+    const attempt = countingDriver(material());
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalStat = nodeFs.statSync as (...args: unknown[]) => unknown;
+    let injected = false;
+
+    await expect(withPatchedFsAsync("statSync", ((path: string, ...args: unknown[]) => {
+      if (!injected && path === history) {
+        injected = true;
+        throw Object.assign(new Error("history vanished after open"), { code: "ENOENT" });
+      }
+      return originalStat(path, ...args);
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    }))).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+    expect(injected).toBe(true);
+    expect(statSync(history).dev).toBe(historyIdentity.dev);
+    expect(statSync(history).ino).toBe(historyIdentity.ino);
+    expect(existsSync(join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    ))).toBe(false);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("refuses a history create race without adopting the entrant", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    const attempt = countingDriver(material());
+    let injected = false;
+
+    await expect(coordinator(home, attempt.driver, (event) => {
+      if (!injected && event === "before-terminal-journal-history-create") {
+        injected = true;
+        mkdirSync(history, { mode: 0o700 });
+      }
+    }).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+    expect(injected).toBe(true);
+    expect(statSync(history).mode & 0o777).toBe(0o700);
+    expect(existsSync(join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    ))).toBe(false);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it.each(["file", "symlink", "non-private-directory"] as const)(
+    "refuses an unsafe existing history %s without repairing it",
+    async (kind) => {
+      const home = makeHome();
+      await terminalArchiveFixture(home, 2);
+      const history = backendPublicationHistoryDirectory(home);
+      if (kind === "file") writeFileSync(history, "unsafe", { mode: 0o600 });
+      if (kind === "non-private-directory") mkdirSync(history, { mode: 0o755 });
+      if (kind === "symlink") {
+        const victim = join(home, "history-victim");
+        mkdirSync(victim, { mode: 0o700 });
+        symlinkSync(victim, history, "dir");
+      }
+      const attempt = countingDriver(material());
+
+      await expect(coordinator(home, attempt.driver).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      })).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+      expect(existsSync(history)).toBe(true);
+      if (kind === "file") expect(readFileSync(history, "utf8")).toBe("unsafe");
+      if (kind === "non-private-directory") expect(statSync(history).mode & 0o777).toBe(0o755);
+      expect(attempt.calls).toEqual([]);
+    },
+  );
+
+  it("refuses outer publication-directory drift during history admission", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const attempt = countingDriver(material());
+    let originalDirectory: string | undefined;
+
+    await expect(coordinator(home, attempt.driver, (event) => {
+      if (originalDirectory === undefined && event === "before-terminal-journal-history-open") {
+        originalDirectory = rebindPublicationDirectoryWithEvidence(home).originalDirectory;
+      }
+    }).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+    expect(originalDirectory).toBeDefined();
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(existsSync(join(originalDirectory!, "history"))).toBe(false);
+    expect(existsSync(backendPublicationHistoryDirectory(home))).toBe(false);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it.each(["publication", "replay", "sync"] as const)(
+    "refuses history replacement before archive %s",
+    async (stage) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, 2);
+      const history = backendPublicationHistoryDirectory(home);
+      const archiveName = `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`;
+      if (stage === "publication") mkdirSync(history, { mode: 0o700 });
+      if (stage === "replay") {
+        const setup = countingDriver(material());
+        await expect(coordinator(home, setup.driver, (event) => {
+          if (event === "before-journal-write") throw new Error("stop after archive publication");
+        }).prepare({
+          ...inputFor(material()),
+          publicationId: "publication-2",
+        })).rejects.toThrow("stop after archive publication");
+        expect(readFileSync(join(history, archiveName))).toEqual(fixture.bytes);
+      }
+      const originalHistory = `${history}.${stage}-retained`;
+      const attempt = countingDriver(material());
+      const boundary = stage === "publication"
+        ? "before-terminal-journal-archive-publication"
+        : stage === "replay"
+          ? "before-terminal-journal-archive-replay"
+          : "before-terminal-journal-history-sync";
+      let injected = false;
+
+      await expect(coordinator(home, attempt.driver, (event) => {
+        if (!injected && event === boundary) {
+          injected = true;
+          renameSync(history, originalHistory);
+          mkdirSync(history, { mode: 0o700 });
+        }
+      }).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      })).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+      expect(injected).toBe(true);
+      expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+      expect(existsSync(join(history, archiveName))).toBe(false);
+      expect(existsSync(join(originalHistory, archiveName))).toBe(stage === "publication" ? false : true);
+      expect(attempt.calls).toEqual([]);
+      expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
+    },
+  );
+
+  it.each(["different-bytes", "wrong-mode", "multiple-links", "oversize"] as const)(
+    "refuses archive replay with %s",
+    async (kind) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, 2);
+      const history = backendPublicationHistoryDirectory(home);
+      mkdirSync(history, { mode: 0o700 });
+      const archivePath = join(
+        history,
+        `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+      );
+      const content = kind === "different-bytes"
+        ? Buffer.from("different archive bytes\n")
+        : kind === "oversize"
+          ? Buffer.alloc((1024 * 1024) + 1, "x")
+          : fixture.bytes;
+      writeFileSync(archivePath, content, { mode: 0o600 });
+      if (kind === "wrong-mode") chmodSync(archivePath, 0o640);
+      if (kind === "multiple-links") linkSync(archivePath, join(history, "archive-alias"));
+      const attempt = countingDriver(material());
+
+      await expect(coordinator(home, attempt.driver).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      })).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+      expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+      expect(attempt.calls).toEqual([]);
+      expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
+    },
+  );
+
+  it.each([2, 3] as const)(
+    "replays an exact v%s archive through one retained history descriptor",
+    async (version) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, version);
+      const initial = countingDriver(material());
+      await expect(coordinator(home, initial.driver, (event) => {
+        if (event === "before-journal-write") throw new Error("stop after exact archive");
+      }).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      })).rejects.toThrow("stop after exact archive");
+      const history = backendPublicationHistoryDirectory(home);
+      const archivePath = join(
+        history,
+        `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+      );
+      const retry = countingDriver(material());
+      const observed = await withTrackedArchiveDirectoryDescriptors(home, async (tracking) => {
+        const prepared = await coordinator(home, retry.driver).prepare({
+          ...inputFor(material()),
+          publicationId: "publication-2",
+        });
+        return { prepared, records: tracking.records };
+      });
+      const historyRecords = observed.records.filter((record) => record.path === history);
+
+      expect(observed.prepared).toMatchObject({ phase: "prepared" });
+      expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+      expect(historyRecords).toHaveLength(1);
+      expect(historyRecords[0]?.closed).toBe(1);
+      expect(retry.calls).toEqual(["observe-local-state"]);
+    },
+  );
+
+  it("refuses an exact replay reported from a different parent identity", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    writeFileSync(archivePath, fixture.bytes, { mode: 0o600 });
+    const attempt = countingDriver(material());
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalStat = nodeFs.statSync as (...args: unknown[]) => unknown;
+    let archiveFd: number | undefined;
+
+    await expect(withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === archivePath) archiveFd = fd;
+      return fd;
+    }) as never, async () => withPatchedFsAsync("statSync", ((path: string, ...args: unknown[]) => {
+      const observed = originalStat(path, ...args) as Record<PropertyKey, unknown>;
+      if (archiveFd === undefined || path !== history || !((args[0] as { bigint?: boolean } | undefined)?.bigint)) {
+        return observed;
+      }
+      return new Proxy(observed, {
+        get(target, property, receiver) {
+          if (property === "dev") return BigInt(Reflect.get(target, property, receiver) as bigint) + 1n;
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })))).rejects.toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication archive replay does not match the retained history directory",
+    });
+
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("refuses archive replay whose descriptor owner is not trusted", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    writeFileSync(archivePath, fixture.bytes, { mode: 0o600 });
+    const attempt = countingDriver(material());
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalFstat = nodeFs.fstatSync as (...args: unknown[]) => unknown;
+    let archiveFd: number | undefined;
+
+    await expect(withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === archivePath) archiveFd = fd;
+      return fd;
+    }) as never, async () => withPatchedFsAsync("fstatSync", ((fd: number, ...args: unknown[]) => {
+      const observed = originalFstat(fd, ...args) as Record<PropertyKey, unknown>;
+      if (fd !== archiveFd) return observed;
+      return new Proxy(observed, {
+        get(target, property, receiver) {
+          if (property === "uid") return Number(Reflect.get(target, property, receiver)) + 1;
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })))).rejects.toMatchObject({ reason: "unsafe-storage" });
+
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it.each(["history", "outer"] as const)(
+    "preserves an exact archive for retry when %s fsync fails",
+    async (target) => {
+      const home = makeHome();
+      const fixture = await terminalArchiveFixture(home, 2);
+      const history = backendPublicationHistoryDirectory(home);
+      const archivePath = join(
+        history,
+        `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+      );
+      const attempt = countingDriver(material());
+      const failure = new Error(`${target} fsync failed`);
+      let records: ArchiveDirectoryDescriptor[] = [];
+
+      await expect(withTrackedArchiveDirectoryDescriptors(home, async (tracking) => {
+        records = tracking.records;
+        tracking.failNextSync(
+          target === "history" ? history : backendPublicationDirectory(home),
+          failure,
+        );
+        return coordinator(home, attempt.driver).prepare({
+          ...inputFor(material()),
+          publicationId: "publication-2",
+        });
+      })).rejects.toBe(failure);
+
+      expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+      expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+      expect(readdirSync(history)).toEqual([archivePath.split("/").at(-1)]);
+      expect(records.filter((record) => record.path === history)).toHaveLength(1);
+      expect(records.find((record) => record.path === history)?.closed).toBe(1);
+      expect(attempt.calls).toEqual([]);
+      expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
+
+      const retry = countingDriver(material());
+      await expect(coordinator(home, retry.driver).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      })).resolves.toMatchObject({ phase: "prepared" });
+      expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+      expect(retry.calls).toEqual(["observe-local-state"]);
+    },
+  );
+
+  it("fails on history cleanup alone, closes once, and replays the complete archive", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    const attempt = countingDriver(material());
+    const cleanupFailure = new Error("history close failed");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalClose = nodeFs.closeSync as (fd: number) => void;
+    let historyFd: number | undefined;
+    let historyCloseCalls = 0;
+
+    await expect(withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === history) historyFd = fd;
+      return fd;
+    }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+      originalClose(fd);
+      if (fd === historyFd) {
+        historyCloseCalls += 1;
+        throw cleanupFailure;
+      }
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })))).rejects.toBe(cleanupFailure);
+
+    expect(historyCloseCalls).toBe(1);
+    expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+    await expect(coordinator(home, countingDriver(material()).driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })).resolves.toMatchObject({ phase: "prepared" });
+  });
+
+  it("preserves a structured primary archive refusal when history cleanup also fails", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const retainedHistory = `${history}.primary-retained`;
+    const attempt = countingDriver(material());
+    const cleanupFailure = new Error("history close failed after refusal");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalClose = nodeFs.closeSync as (fd: number) => void;
+    let historyFd: number | undefined;
+    let historyCloseCalls = 0;
+    let caught: unknown;
+
+    try {
+      await withPatchedFsAsync("openSync", ((path: string, ...args: unknown[]) => {
+        const fd = originalOpen(path, ...args);
+        if (path === history) historyFd = fd;
+        return fd;
+      }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+        originalClose(fd);
+        if (fd === historyFd) {
+          historyCloseCalls += 1;
+          throw cleanupFailure;
+        }
+      }) as never, async () => coordinator(home, attempt.driver, (event) => {
+        if (event === "before-terminal-journal-archive-publication") {
+          renameSync(history, retainedHistory);
+          mkdirSync(history, { mode: 0o700 });
+        }
+      }).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      })));
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(BackendPublicationJournalError);
+    expect(caught).toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication history directory changed during terminal journal archive",
+      cause: expect.any(AggregateError),
+    });
+    const aggregate = (caught as BackendPublicationJournalError).cause as AggregateError;
+    expect(aggregate.errors).toHaveLength(2);
+    expect(aggregate.errors[0]).toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication history directory changed during terminal journal archive",
+    });
+    expect(aggregate.errors[1]).toBe(cleanupFailure);
+    expect(historyCloseCalls).toBe(1);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  /**
+   * Report a drifted gid for one retained directory descriptor, leaving every
+   * other field untouched. A live descriptor's dev and ino cannot change, and
+   * its uid and mode are already refused inside assertPrivateDirectory, so a
+   * gid change is the one way the retained witness and the descriptor's
+   * current identity observably diverge.
+   *
+   * The drift follows the most recent open of trackedPath, which is the
+   * descriptor the archive retains at the point each test arms it. A future
+   * reopen after the arming event would drift the wrong descriptor, and the
+   * guard would then see no drift and the test would fail loudly rather than
+   * pass for the wrong reason.
+   */
+  async function withRetainedDirectoryGidDrift<T>(
+    trackedPath: string,
+    drifting: () => boolean,
+    callback: () => Promise<T>,
+  ): Promise<T> {
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalFstat = nodeFs.fstatSync as (...args: unknown[]) => unknown;
+    let trackedFd: number | undefined;
+
+    return withPatchedFsAsync("openSync", ((path: unknown, ...args: unknown[]) => {
+      const fd = originalOpen(path, ...args);
+      if (path === trackedPath) trackedFd = fd;
+      return fd;
+    }) as never, async () => withPatchedFsAsync("fstatSync", ((fd: number, ...args: unknown[]) => {
+      const stat = originalFstat(fd, ...args) as { gid: unknown };
+      if (fd !== trackedFd || !drifting() || typeof stat.gid !== "bigint") return stat;
+      return Object.create(stat as object, {
+        gid: { value: stat.gid + 1n, enumerable: true },
+      }) as unknown;
+    }) as never, callback));
+  }
+
+  it("refuses a retained publication directory whose gid drifted mid-archive", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const directory = backendPublicationDirectory(home);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    const attempt = countingDriver(material());
+    let drifting = false;
+
+    await expect(withRetainedDirectoryGidDrift(
+      directory,
+      () => drifting,
+      async () => coordinator(home, attempt.driver, (event) => {
+        if (event === "before-terminal-journal-history-open") drifting = true;
+      }).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      }),
+    )).rejects.toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication directory changed during terminal journal archive",
+      cause: expect.objectContaining({ message: "private directory identity changed" }),
+    });
+
+    expect(drifting).toBe(true);
+    expect(existsSync(archivePath)).toBe(false);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("refuses a retained history directory whose gid drifted mid-archive", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    const attempt = countingDriver(material());
+    let drifting = false;
+
+    await expect(withRetainedDirectoryGidDrift(
+      history,
+      () => drifting,
+      async () => coordinator(home, attempt.driver, (event) => {
+        if (event === "before-terminal-journal-archive-publication") drifting = true;
+      }).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      }),
+    )).rejects.toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication history directory changed during terminal journal archive",
+      cause: expect.objectContaining({ message: "private directory identity changed" }),
+    });
+
+    expect(drifting).toBe(true);
+    expect(existsSync(archivePath)).toBe(false);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("aggregates an unstructured archive failure with a history close failure", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    mkdirSync(history, { mode: 0o700 });
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    const attempt = countingDriver(material());
+    const syncFailure = new Error("history fsync failed");
+    const cleanupFailure = new Error("history close failed after fsync");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpen = nodeFs.openSync as (...args: unknown[]) => number;
+    const originalFsync = nodeFs.fsyncSync as (fd: number) => void;
+    const originalClose = nodeFs.closeSync as (fd: number) => void;
+    let historyFd: number | undefined;
+    let historyCloseCalls = 0;
+    let caught: unknown;
+
+    try {
+      await withPatchedFsAsync("openSync", ((path: unknown, ...args: unknown[]) => {
+        const fd = originalOpen(path, ...args);
+        if (path === history) historyFd = fd;
+        return fd;
+      }) as never, async () => withPatchedFsAsync("fsyncSync", ((fd: number) => {
+        if (fd === historyFd) throw syncFailure;
+        originalFsync(fd);
+      }) as never, async () => withPatchedFsAsync("closeSync", ((fd: number) => {
+        originalClose(fd);
+        if (fd === historyFd) {
+          historyCloseCalls += 1;
+          throw cleanupFailure;
+        }
+      }) as never, async () => coordinator(home, attempt.driver).prepare({
+        ...inputFor(material()),
+        publicationId: "publication-2",
+      }))));
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect(caught).not.toBeInstanceOf(BackendPublicationJournalError);
+    expect((caught as AggregateError).message).toBe(
+      "backend publication archive operation and history cleanup failed",
+    );
+    expect((caught as AggregateError).errors).toHaveLength(2);
+    expect((caught as AggregateError).errors[0]).toBe(syncFailure);
+    expect((caught as AggregateError).errors[1]).toBe(cleanupFailure);
+    expect((caught as AggregateError).cause).toBe(syncFailure);
+    expect(historyCloseCalls).toBe(1);
+    expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("refuses a created history directory widened before it is opened", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    const attempt = countingDriver(material());
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalMkdir = nodeFs.mkdirSync as (...args: unknown[]) => unknown;
+    let widened = false;
+
+    // mkdir(2) returns no descriptor, so the archive has to open the
+    // directory it just created as a separate step. This drives the exact
+    // window that gap leaves open: another actor with write access to the
+    // parent widens the new directory before the open lands. The open must
+    // refuse the widened directory instead of retaining a descriptor to it,
+    // and must leave the directory exactly as it found it.
+    await expect(withPatchedFsAsync("mkdirSync", ((path: unknown, ...args: unknown[]) => {
+      const created = originalMkdir(path, ...args);
+      if (path === history) {
+        widened = true;
+        chmodSync(history, 0o755);
+      }
+      return created;
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    }))).rejects.toMatchObject({
+      reason: "unsafe-storage",
+      message: "created backend publication history directory is unsafe",
+    });
+
+    expect(widened).toBe(true);
+    expect(statSync(history).mode & 0o777).toBe(0o755);
+    expect(readdirSync(history)).toEqual([]);
+    expect(existsSync(archivePath)).toBe(false);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+  });
+
+  it("cleans its known unpublished archive temp after exclusive link failure", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    const archivePath = join(
+      history,
+      `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`,
+    );
+    const attempt = countingDriver(material());
+    const linkFailure = new Error("archive link failed before publication");
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalLink = nodeFs.linkSync as (...args: unknown[]) => void;
+
+    await expect(withPatchedFsAsync("linkSync", ((source: string, destination: string, ...args: unknown[]) => {
+      if (destination === archivePath) throw linkFailure;
+      return originalLink(source, destination, ...args);
+    }) as never, async () => coordinator(home, attempt.driver).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    }))).rejects.toBe(linkFailure);
+
+    expect(readdirSync(history)).toEqual([]);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(attempt.calls).toEqual([]);
+    expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
+  });
+
+  it("refuses archive replay when collision temp cleanup is incomplete", async () => {
+    const home = makeHome();
+    const fixture = await terminalArchiveFixture(home, 2);
+    const history = backendPublicationHistoryDirectory(home);
+    const archiveName = `${fixture.journal.publicationId}.${fixture.journal.checksumSha256}.json`;
+    const archivePath = join(history, archiveName);
+    const setup = countingDriver(material());
+    await expect(coordinator(home, setup.driver, (event) => {
+      if (event === "before-journal-write") throw new Error("stop after archive publication");
+    }).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    })).rejects.toThrow("stop after archive publication");
+    expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+
+    const cleanupFailure = Object.assign(new Error("archive temp cleanup denied"), { code: "EACCES" });
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalRemove = nodeFs.rmSync as (...args: unknown[]) => void;
+    const attempt = countingDriver(material());
+    const events: string[] = [];
+    let cleanupAttempts = 0;
+    await expect(withPatchedFsAsync("rmSync", ((path: string, ...args: unknown[]) => {
+      if (path.startsWith(join(history, `.${archiveName}.`)) && path.endsWith(".tmp")) {
+        cleanupAttempts += 1;
+        throw cleanupFailure;
+      }
+      return originalRemove(path, ...args);
+    }) as never, async () => coordinator(home, attempt.driver, (event) => {
+      events.push(event);
+    }).prepare({
+      ...inputFor(material()),
+      publicationId: "publication-2",
+    }))).rejects.toMatchObject({
+      reason: "unsafe-storage",
+      message: "backend publication archive publication topology is unsafe",
+      cause: expect.any(PrivateDirectoryTopologyError),
+    });
+
+    expect(cleanupAttempts).toBe(1);
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(fixture.bytes);
+    expect(readFileSync(archivePath)).toEqual(fixture.bytes);
+    expect(readdirSync(history).filter(name => name.startsWith(`.${archiveName}.`))).toHaveLength(1);
+    expect(events).not.toContain("before-terminal-journal-archive-replay");
+    expect(events).not.toContain("after-terminal-journal-archive-publication");
+    expect(events).not.toContain("before-terminal-journal-history-sync");
+    expect(attempt.calls).toEqual([]);
+    expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
+  });
+
   it("covers archive replay with missing uid evidence and rejects an unsafe archive path", async () => {
     const home = makeHome();
     const input = material();
@@ -3302,7 +4983,7 @@ describe("BackendPublicationCoordinator", () => {
     await expect(coordinator(unsafeHome, makeDriver(unsafeInput).driver).prepare({
       ...inputFor(unsafeInput),
       publicationId: "publication-2",
-    })).rejects.toThrow("regular file");
+    })).rejects.toMatchObject({ reason: "unsafe-storage" });
   });
 
   it("requires exact identities for persisted state and does not match unresolved targets", async () => {
@@ -4101,12 +5782,529 @@ describe("revocable mutation permits", () => {
       .resolves.toBe("next");
   });
 
+  it("retains tail, consumer, and private-lock order without follower overtake", async () => {
+    const home = makeHome();
+    const order: string[] = [];
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      order.push("owner");
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const retained = withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      async token => {
+        order.push("retained");
+        expect(withBackendPublicationConsumerLock(
+          home,
+          nested => nested,
+          { lockToken: token },
+        )).toBe(token);
+      },
+      undefined,
+      {
+        contentionWaitMs: 5_000,
+        externalLockAttempts: 1,
+        _appendLockObserver: event => {
+          if (event === "before-main-lock-publish") order.push("retained-lock");
+        },
+      },
+    );
+    const follower = withBackendPublicationAppendBarrierAsync(home, async () => {
+      order.push("follower");
+    });
+    await Promise.resolve();
+    expect(order).toEqual(["owner"]);
+    releaseOwner();
+    await Promise.all([owner, retained, follower]);
+    expect(order).toEqual(["owner", "retained-lock", "retained", "follower"]);
+  });
+
+  it("grants retained append authority only to the exact explicit token", async () => {
+    const home = makeHome();
+    await withBackendPublicationRetainedAppendAdmissionAsync(home, async token => {
+      expect(withBackendPublicationConsumerLock(
+        home,
+        nested => nested,
+        { lockToken: token },
+      )).toBe(token);
+      await expect(withBackendPublicationAppendBarrierAsync(
+        home,
+        nested => nested,
+        token,
+      )).resolves.toBe(token);
+      await expect(withBackendPublicationAppendBarrierAsync(
+        home,
+        async () => undefined,
+        undefined,
+        { contentionWaitMs: 0 },
+      )).rejects.toBeInstanceOf(BackendPublicationAppendBarrierTimeoutError);
+    }, undefined, { contentionWaitMs: 5_000, externalLockAttempts: 1 });
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => "released"))
+      .resolves.toBe("released");
+  });
+
+  it("suppresses active-token ambience and restores the outer append context", async () => {
+    const home = makeHome();
+    await withBackendPublicationAppendBarrierAsync(home, async token => {
+      await withBackendPublicationRetainedAppendAdmissionAsync(
+        home,
+        async retainedToken => {
+          expect(retainedToken).toBe(token);
+          await expect(withBackendPublicationAppendBarrierAsync(
+            home,
+            async () => undefined,
+            undefined,
+            { contentionWaitMs: 0 },
+          )).rejects.toBeInstanceOf(BackendPublicationAppendBarrierTimeoutError);
+          await expect(withBackendPublicationAppendBarrierAsync(
+            home,
+            nested => nested,
+            retainedToken,
+          )).resolves.toBe(token);
+        },
+        token,
+        { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+      );
+      await expect(withBackendPublicationAppendBarrierAsync(home, nested => nested))
+        .resolves.toBe(token);
+    });
+  });
+
+  it("preserves borrowed consumer authority across every pre-effect outcome", async () => {
+    const home = makeHome();
+    await withBackendPublicationConsumerLockAsync(home, async token => {
+      const assertBorrowed = (): void => {
+        expect(withBackendPublicationConsumerLock(
+          home,
+          nested => nested,
+          { lockToken: token },
+        )).toBe(token);
+      };
+      await withBackendPublicationRetainedAppendAdmissionAsync(
+        home,
+        async nested => { expect(nested).toBe(token); },
+        token,
+        { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+      );
+      assertBorrowed();
+
+      const callbackFailure = new Error("retained callback failed");
+      await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+        home,
+        async () => { throw callbackFailure; },
+        token,
+        { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+      )).rejects.toBe(callbackFailure);
+      assertBorrowed();
+
+      const controller = new AbortController();
+      controller.abort();
+      await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+        home,
+        async () => { throw new Error("pre-aborted callback ran"); },
+        token,
+        { contentionWaitMs: 5_000, signal: controller.signal, externalLockAttempts: 1 },
+      )).rejects.toMatchObject({ reason: "aborted" });
+      assertBorrowed();
+
+      await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+        home,
+        async () => { throw new Error("deadline callback ran"); },
+        token,
+        { contentionWaitMs: 0, externalLockAttempts: 1 },
+      )).rejects.toMatchObject({ reason: "deadline" });
+      assertBorrowed();
+
+      await expect(withBackendPublicationAppendBarrierAsync(
+        home,
+        async () => undefined,
+        undefined,
+        { contentionWaitMs: 0 },
+      )).rejects.toBeInstanceOf(BackendPublicationAppendBarrierTimeoutError);
+      assertBorrowed();
+    });
+  });
+
+  it("keeps borrowed tokens live after active-token callback failure", async () => {
+    const home = makeHome();
+    const callbackFailure = new Error("nested retained failure");
+    await withBackendPublicationAppendBarrierAsync(home, async token => {
+      await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+        home,
+        async () => { throw callbackFailure; },
+        token,
+        { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+      )).rejects.toBe(callbackFailure);
+      await expect(withBackendPublicationAppendBarrierAsync(home, nested => nested))
+        .resolves.toBe(token);
+    });
+  });
+
+  it("rejects revoked and wrong-home retained tokens", async () => {
+    const home = makeHome();
+    const other = makeHome();
+    let revoked!: object;
+    await withBackendPublicationConsumerLockAsync(home, async token => {
+      revoked = token;
+      await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+        other,
+        async () => undefined,
+        token,
+        { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+      )).rejects.toMatchObject({ reason: "permit-mismatch" });
+    });
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      async () => undefined,
+      revoked,
+      { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+    )).rejects.toMatchObject({ reason: "permit-mismatch" });
+  });
+
+  it("aborts predecessor waiting, removes wait resources, and preserves queue order", async () => {
+    vi.useFakeTimers();
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const controller = new AbortController();
+    const add = vi.spyOn(controller.signal, "addEventListener");
+    const remove = vi.spyOn(controller.signal, "removeEventListener");
+    const effect = vi.fn();
+    const retained = withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      effect,
+      undefined,
+      { contentionWaitMs: 5_000, signal: controller.signal, externalLockAttempts: 1 },
+    );
+    await Promise.resolve();
+    expect(vi.getTimerCount()).toBe(1);
+    controller.abort();
+    await expect(retained).rejects.toMatchObject({ reason: "aborted" });
+    expect(effect).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(add).toHaveBeenCalledOnce();
+    expect(remove).toHaveBeenCalledOnce();
+
+    let followerEntered = false;
+    const follower = withBackendPublicationAppendBarrierAsync(home, async () => {
+      followerEntered = true;
+    });
+    await Promise.resolve();
+    expect(followerEntered).toBe(false);
+    releaseOwner();
+    await Promise.all([owner, follower]);
+    expect(followerEntered).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it("cleans the predecessor timer and listener when the predecessor wins", async () => {
+    vi.useFakeTimers();
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const controller = new AbortController();
+    const remove = vi.spyOn(controller.signal, "removeEventListener");
+    const retained = withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      async () => "admitted",
+      undefined,
+      { contentionWaitMs: 5_000, signal: controller.signal, externalLockAttempts: 1 },
+    );
+    await Promise.resolve();
+    expect(vi.getTimerCount()).toBe(1);
+    releaseOwner();
+    await owner;
+    await expect(retained).resolves.toBe("admitted");
+    expect(vi.getTimerCount()).toBe(0);
+    expect(remove).toHaveBeenCalledOnce();
+    vi.useRealTimers();
+  });
+
+  it("refuses exact-deadline predecessor settlement without late effects", async () => {
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    let now = 0;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const effect = vi.fn();
+    const retained = withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      effect,
+      undefined,
+      {
+        contentionWaitMs: 10,
+        externalLockAttempts: 1,
+        _now: () => now,
+        _wait: async () => {
+          now = 10;
+          releaseOwner();
+          await owner;
+        },
+      },
+    );
+    await expect(retained).rejects.toMatchObject({ reason: "deadline" });
+    expect(effect).not.toHaveBeenCalled();
+    await owner;
+  });
+
+  it("stops retained admission cancelled after its activity assertion", async () => {
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const controller = new AbortController();
+    const add = vi.spyOn(controller.signal, "addEventListener");
+    const effect = vi.fn();
+    let nowCalls = 0;
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      effect,
+      undefined,
+      {
+        contentionWaitMs: 5_000,
+        externalLockAttempts: 1,
+        signal: controller.signal,
+        _now: () => {
+          nowCalls += 1;
+          if (nowCalls === 2) controller.abort();
+          return 0;
+        },
+      },
+    )).rejects.toMatchObject({ reason: "aborted" });
+    expect(effect).not.toHaveBeenCalled();
+    expect(add).not.toHaveBeenCalled();
+    releaseOwner();
+    await owner;
+  });
+
+  it("stops retained admission whose deadline expires before waiting", async () => {
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const effect = vi.fn();
+    const waits = vi.fn(async () => undefined);
+    let nowCalls = 0;
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      effect,
+      undefined,
+      {
+        contentionWaitMs: 10,
+        externalLockAttempts: 1,
+        _now: () => {
+          nowCalls += 1;
+          return nowCalls >= 3 ? 10 : 0;
+        },
+        _wait: waits,
+      },
+    )).rejects.toMatchObject({ reason: "deadline" });
+    expect(effect).not.toHaveBeenCalled();
+    expect(waits).not.toHaveBeenCalled();
+    releaseOwner();
+    await owner;
+  });
+
+  it("stops retained admission aborted while registering its listener", async () => {
+    const home = makeHome();
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+    const controller = new AbortController();
+    const add = vi.spyOn(controller.signal, "addEventListener");
+    const remove = vi.spyOn(controller.signal, "removeEventListener");
+    const effect = vi.fn();
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      effect,
+      undefined,
+      {
+        contentionWaitMs: 5_000,
+        externalLockAttempts: 1,
+        signal: controller.signal,
+        _now: () => 0,
+        _wait: async () => { controller.abort(); },
+      },
+    )).rejects.toMatchObject({ reason: "aborted" });
+    expect(effect).not.toHaveBeenCalled();
+    expect(add).toHaveBeenCalledOnce();
+    expect(remove).toHaveBeenCalledOnce();
+    releaseOwner();
+    await owner;
+  });
+
+  it("attempts unrelated external contention once and preserves callback failures", async () => {
+    const home = makeHome();
+    const contention = new PrivateMutationLockContentionError("external append owner");
+    let attempts = 0;
+    const effect = vi.fn();
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      effect,
+      undefined,
+      {
+        contentionWaitMs: 5_000,
+        externalLockAttempts: 1,
+        _appendLockObserver: event => {
+          if (event === "before-main-lock-publish") {
+            attempts += 1;
+            throw contention;
+          }
+        },
+      },
+    )).rejects.toBe(contention);
+    expect(attempts).toBe(1);
+    expect(effect).not.toHaveBeenCalled();
+
+    let now = 0;
+    const callbackFailure = new PrivateMutationLockContentionError("callback failure");
+    let effects = 0;
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      async () => {
+        effects += 1;
+        now = 10;
+        throw callbackFailure;
+      },
+      undefined,
+      { contentionWaitMs: 10, externalLockAttempts: 1, _now: () => now },
+    )).rejects.toBe(callbackFailure);
+    expect(effects).toBe(1);
+  });
+
+  it("cleans owned authority after callback and private-lock cleanup failures", async () => {
+    const home = makeHome();
+    const callbackFailure = new Error("callback failed");
+    let callbackEffects = 0;
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      async () => {
+        callbackEffects += 1;
+        throw callbackFailure;
+      },
+      undefined,
+      { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+    )).rejects.toBe(callbackFailure);
+    expect(callbackEffects).toBe(1);
+
+    const cleanupFailure = new Error("retained append cleanup failed");
+    let cleanupEffects = 0;
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      async () => { cleanupEffects += 1; },
+      undefined,
+      {
+        contentionWaitMs: 5_000,
+        externalLockAttempts: 1,
+        _appendLockObserver: event => {
+          if (event === "before-main-lock-release-read") throw cleanupFailure;
+        },
+      },
+    )).rejects.toBe(cleanupFailure);
+    expect(cleanupEffects).toBe(1);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => "next"))
+      .resolves.toBe("next");
+  });
+
+  it("validates the retained helper's one-shot acquisition contract", async () => {
+    const effect = vi.fn();
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      makeHome(),
+      effect,
+      undefined,
+      { externalLockAttempts: 2 as 1 },
+    )).rejects.toThrow("requires one external lock attempt");
+    expect(effect).not.toHaveBeenCalled();
+    expect(new BackendPublicationRetainedAppendAdmissionStoppedError("aborted"))
+      .toMatchObject({ name: "BackendPublicationRetainedAppendAdmissionStoppedError" });
+  });
+
   it("reuses exact-home append authority in the synchronous wrappers", () => {
     const home = makeHome();
     withBackendPublicationAppendBarrier(home, token => {
       expect(withBackendPublicationAppendBarrier(home, nested => nested)).toBe(token);
       expect(withBackendPublicationConsumerLock(home, nested => nested)).toBe(token);
     });
+  });
+
+  it("waits for an unbounded retained predecessor until it settles", async () => {
+    const home = makeHome();
+    const order: string[] = [];
+    let releaseOwner!: () => void;
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>(resolve => { ownerEntered = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      order.push("owner");
+      ownerEntered();
+      await new Promise<void>(resolve => { releaseOwner = resolve; });
+    });
+    await entered;
+
+    let retainedSettled = false;
+    const retained = withBackendPublicationRetainedAppendAdmissionAsync(home, () => {
+      order.push("retained");
+    }).then(() => { retainedSettled = true; });
+    for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+
+    expect(retainedSettled).toBe(false);
+    expect(order).toEqual(["owner"]);
+
+    releaseOwner();
+    await Promise.all([owner, retained]);
+    expect(order).toEqual(["owner", "retained"]);
+  });
+
+  it("keeps consumer gating while maintenance holds publication", async () => {
+    const home = makeHome();
+    await createMaintenanceState(home, makeDriver(material()).driver, "maintenance-held");
+    const retained = vi.fn();
+
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(
+      home,
+      retained,
+      undefined,
+      { contentionWaitMs: 5_000, externalLockAttempts: 1 },
+    )).rejects.toMatchObject({ reason: "unresolved-publication" });
+    expect(retained).not.toHaveBeenCalled();
+
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => "appended"))
+      .resolves.toBe("appended");
   });
 });
 

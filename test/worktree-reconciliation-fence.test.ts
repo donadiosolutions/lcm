@@ -1,16 +1,28 @@
 import {
+  chmodSync,
+  chownSync,
+  closeSync,
   type Dirent,
+  fstatSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   opendirSync,
+  renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  assertProjectStorageIdentityActive,
+  isAuthenticatedRetiredProjectIdentityFence,
+  RETIRED_PROJECT_IDENTITY_DIAGNOSTIC,
+  RetiredProjectIdentityError,
   isWorktreeReconciliationFence,
   serializeWorktreeReconciliationFence,
 } from "../src/worktree-reconciliation-fence.js";
@@ -50,6 +62,125 @@ describe("worktree reconciliation fences", () => {
     expect(isWorktreeReconciliationFence(path, hash, "project")).toBe(false);
     rmSync(path);
     expect(isWorktreeReconciliationFence(path, hash, "project")).toBe(false);
+  });
+
+  it("classifies only an authenticated exact retired project fence", () => {
+    const path = join(root, hash);
+    const content = serializeWorktreeReconciliationFence(hash, "project");
+    writeFileSync(path, content, { mode: 0o600 });
+    chmodSync(path, 0o600);
+
+    expect(isAuthenticatedRetiredProjectIdentityFence(path, hash)).toBe(true);
+    expect(() => assertProjectStorageIdentityActive(path, hash)).toThrowError(
+      expect.objectContaining({
+        name: "RetiredProjectIdentityError",
+        message: RETIRED_PROJECT_IDENTITY_DIAGNOSTIC,
+      }),
+    );
+    expect(RETIRED_PROJECT_IDENTITY_DIAGNOSTIC).toBe(
+      "LCM found a retired local project identity. Run `lcm project renew-retired-identity` from this project, then retry. Do not remove the reconciliation fence.",
+    );
+    expect(RETIRED_PROJECT_IDENTITY_DIAGNOSTIC.length).toBeLessThanOrEqual(240);
+    expect(new RetiredProjectIdentityError()).toBeInstanceOf(Error);
+
+    writeFileSync(path, `${JSON.stringify({ version: 1, hash: "b".repeat(64), kind: "project" })}\n`);
+    expect(isAuthenticatedRetiredProjectIdentityFence(path, hash)).toBe(false);
+    writeFileSync(path, `${JSON.stringify({ version: 1, hash, kind: "events" })}\n`);
+    expect(isAuthenticatedRetiredProjectIdentityFence(path, hash)).toBe(false);
+    writeFileSync(path, "{");
+    expect(isAuthenticatedRetiredProjectIdentityFence(path, hash)).toBe(false);
+
+    writeFileSync(path, content);
+    chmodSync(path, 0o640);
+    expect(isAuthenticatedRetiredProjectIdentityFence(path, hash)).toBe(false);
+    chmodSync(path, 0o600);
+
+    const alias = join(root, "hard-link");
+    linkSync(path, alias);
+    expect(isAuthenticatedRetiredProjectIdentityFence(path, hash)).toBe(false);
+    rmSync(alias);
+
+    if (typeof process.getuid === "function" && process.getuid() === 0) {
+      chownSync(path, 1, 1);
+      expect(isAuthenticatedRetiredProjectIdentityFence(path, hash)).toBe(false);
+      chownSync(path, 0, 0);
+    }
+
+    rmSync(path);
+    mkdirSync(path);
+    expect(isAuthenticatedRetiredProjectIdentityFence(path, hash)).toBe(false);
+    rmSync(path, { recursive: true });
+    symlinkSync(join(root, "missing"), path);
+    expect(isAuthenticatedRetiredProjectIdentityFence(path, hash)).toBe(false);
+    rmSync(path);
+    expect(isAuthenticatedRetiredProjectIdentityFence(path, hash)).toBe(false);
+  });
+
+  it("rejects leaf, content, and retained-parent races", () => {
+    const path = join(root, hash);
+    const content = serializeWorktreeReconciliationFence(hash, "project");
+    const replacement = join(root, "replacement");
+    writeFileSync(path, content, { mode: 0o600 });
+    writeFileSync(replacement, content, { mode: 0o600 });
+
+    expect(isAuthenticatedRetiredProjectIdentityFence(path, hash, {
+      _afterStatForTesting: () => {
+        rmSync(path);
+        renameSync(replacement, path);
+      },
+    })).toBe(false);
+
+    writeFileSync(replacement, content, { mode: 0o600 });
+    expect(isAuthenticatedRetiredProjectIdentityFence(path, hash, {
+      _beforeReadForTesting: () => writeFileSync(path, `${content}changed`),
+    })).toBe(false);
+
+    writeFileSync(path, content, { mode: 0o600 });
+    const oldRoot = `${root}-old`;
+    expect(isAuthenticatedRetiredProjectIdentityFence(path, hash, {
+      _beforePostStatForTesting: () => {
+        renameSync(root, oldRoot);
+        mkdirSync(root, { mode: 0o700 });
+      },
+    })).toBe(false);
+    rmSync(root, { recursive: true });
+    renameSync(oldRoot, root);
+  });
+
+  it("refuses classification when the retained parent cannot be released", () => {
+    const path = join(root, hash);
+    writeFileSync(path, serializeWorktreeReconciliationFence(hash, "project"), { mode: 0o600 });
+    chmodSync(path, 0o600);
+    expect(isAuthenticatedRetiredProjectIdentityFence(path, hash)).toBe(true);
+
+    const parent = statSync(root);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalCloseSync = nodeFs.closeSync as typeof closeSync;
+    const originalFstatSync = nodeFs.fstatSync as typeof fstatSync;
+    let retainedParentCloses = 0;
+    nodeFs.closeSync = ((fd: number) => {
+      let retainedParent: boolean;
+      try {
+        const observed = originalFstatSync(fd);
+        retainedParent = observed.dev === parent.dev && observed.ino === parent.ino;
+      } catch {
+        retainedParent = false;
+      }
+      originalCloseSync(fd);
+      if (!retainedParent) return;
+      retainedParentCloses += 1;
+      throw Object.assign(new Error("simulated retained parent release failure"), { code: "EIO" });
+    }) as typeof closeSync;
+    syncBuiltinESMExports();
+    try {
+      // An unreleasable retained parent leaves the directory evidence
+      // unproven, so the byte-exact fence must still not be classified.
+      expect(isAuthenticatedRetiredProjectIdentityFence(path, hash)).toBe(false);
+    } finally {
+      nodeFs.closeSync = originalCloseSync;
+      syncBuiltinESMExports();
+    }
+    expect(retainedParentCloses).toBeGreaterThanOrEqual(1);
   });
 
   it("requires an exact private event-fence directory shape and marker", () => {

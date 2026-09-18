@@ -133,7 +133,7 @@ describe("PostgreSQL memory repositories", () => {
         return result([{ content: "durable" }]);
       }
       if (config.text.includes("SELECT memory.memory_id")) {
-        return result([memoryRow]);
+        return config.values?.includes("missing") ? result([]) : result([memoryRow]);
       }
       return result([]);
     });
@@ -169,6 +169,12 @@ describe("PostgreSQL memory repositories", () => {
       id: importedMemoryId,
     });
     await expect(repository.getById("missing")).resolves.toBeNull();
+    await expect(repository.findExactContent("durable", "source-a")).resolves.toMatchObject({
+      id: memoryId,
+      content: "durable",
+      projectId: "source-a",
+    });
+    await expect(repository.findExactContent("missing")).resolves.toBeNull();
     await expect(repository.getAll({
       sourceProjectId: "source-a",
       since: "2026-01-01T00:00:00.000Z",
@@ -226,6 +232,46 @@ describe("PostgreSQL memory repositories", () => {
     expect(tagInsert?.text).toContain("WITH ORDINALITY");
     expect(calls.find((config) => config.text.includes("getAll")))
       .toBeUndefined();
+  });
+
+  it("uses the indexed digest candidate and raw equality residual for exact-content lookup", async () => {
+    const db = executor((config) => (
+      config.values?.includes("missing") ? result([]) : result([memoryRow])
+    ));
+    const repository = new PostgreSqlPromotedMemoryRepository(db, projectId);
+
+    await repository.findExactContent("durable", "source-a");
+
+    expect(db.query.mock.calls).toHaveLength(1);
+    const [config] = db.query.mock.calls[0]!;
+    expect(config.text).toContain("WHERE memory.project_id = $1");
+    expect(config.text).toContain("AND memory.archived_at IS NULL");
+    expect(config.text).toContain(
+      "AND memory.content_sha256 OPERATOR(pg_catalog.=)",
+    );
+    expect(config.text).toContain("public.digest($2, 'sha256')");
+    expect(config.text).not.toContain("public.digest($2::");
+    expect(config.text).toContain(
+      "AND memory.content OPERATOR(pg_catalog.=) $2::pg_catalog.text",
+    );
+    expect(config.text).toContain(
+      "AND ($3::pg_catalog.text IS NULL",
+    );
+    expect(config.text).toContain(
+      "OR memory.source_project_id OPERATOR(pg_catalog.=) $3",
+    );
+    expect(config.text).toContain(
+      "ORDER BY memory.created_at DESC, memory.memory_id DESC",
+    );
+    expect(config.text).toContain("LIMIT 1");
+    expect(config.values).toEqual([projectId, "durable", "source-a"]);
+
+    await repository.findExactContent("missing");
+    expect(db.query.mock.calls[1]?.[0]?.values).toEqual([
+      projectId,
+      "missing",
+      null,
+    ]);
   });
 
   it("implements recall aggregation, redaction counters, and exact purge counts", async () => {

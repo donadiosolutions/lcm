@@ -24,13 +24,17 @@ import {
 } from "./fixtures/runtime.js";
 
 describe("foundation leaf-module boundaries", (): void => {
-  it("parses nested transcript blocks and ignores every non-message shape", (): void => {
+  it("preserves supported transcript parsing boundaries", (): void => {
     const directory = createTemporaryDirectory("lcm-transcript-");
     const path = join(directory, "session.jsonl");
     writeFileSync(path, [
       "not json",
       JSON.stringify({ message: { role: "tool", content: "ignored role" } }),
       JSON.stringify({ message: { role: "assistant", content: [{ type: "image", text: "ignored" }] } }),
+      JSON.stringify({ message: { role: "assistant", content: [{ type: "text", text: 42 }] } }),
+      JSON.stringify({ message: { role: "user", content: "direct" } }),
+      JSON.stringify({ message: { role: "assistant", content: "assistant" } }),
+      JSON.stringify({ message: { role: "system", content: "system" } }),
       JSON.stringify({ message: { role: "user", content: [
         { type: "text", text: "question" },
         { type: "tool_result", content: [{ type: "text", text: "answer" }] },
@@ -40,10 +44,78 @@ describe("foundation leaf-module boundaries", (): void => {
     ].join("\n"));
 
     expect(parseTranscript(path)).toEqual([
+      { role: "user", content: "direct", tokenCount: 2 },
+      { role: "assistant", content: "assistant", tokenCount: 3 },
+      { role: "system", content: "system", tokenCount: 2 },
       { role: "user", content: "question\nanswer", tokenCount: 4 },
     ]);
     expect(parseTranscript(join(directory, "missing.jsonl"))).toEqual([]);
     expect(estimateTokens("")).toBe(1);
+  });
+
+  it("retains text around malformed top-level Claude blocks", (): void => {
+    const directory = createTemporaryDirectory("lcm-transcript-top-level-");
+    const path = join(directory, "session.jsonl");
+    writeFileSync(path, `${JSON.stringify({
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "before" },
+          null,
+          7,
+          false,
+          "ignored",
+          [{ type: "text", text: "array text" }],
+          { unexpected: "record" },
+          { type: "text", text: "after" },
+        ],
+      },
+    })}\n`);
+
+    expect(parseTranscript(path)).toEqual([
+      { role: "user", content: "before\nafter", tokenCount: 3 },
+    ]);
+  });
+
+  it("retains text through nested tool results with malformed blocks", (): void => {
+    const directory = createTemporaryDirectory("lcm-transcript-recursive-");
+    const path = join(directory, "session.jsonl");
+    writeFileSync(path, `${JSON.stringify({
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "outer before" },
+          {
+            type: "tool_result",
+            content: [
+              { type: "text", text: "inner before" },
+              null,
+              1,
+              true,
+              "ignored",
+              [{ type: "text", text: "array text" }],
+              { unexpected: "record" },
+              {
+                type: "tool_result",
+                content: [
+                  { type: "text", text: "deep before" },
+                  null,
+                  { type: "text", text: "deep after" },
+                ],
+              },
+              { type: "text", text: "inner after" },
+            ],
+          },
+          { type: "text", text: "outer after" },
+        ],
+      },
+    })}\n`);
+
+    expect(parseTranscript(path)).toEqual([{
+      role: "assistant",
+      content: "outer before\ninner before\ndeep before\ndeep after\ninner after\nouter after",
+      tokenCount: 18,
+    }]);
   });
 
   it("covers URL key, protocol-relative, punctuation, and invalid URL boundaries", (): void => {

@@ -222,6 +222,35 @@ contains a known truncated legacy value, repair the canonical target with the
 offline procedure above. This refusal
 behavior is implemented by [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
 
+### Unsupported legacy conversation message bytes
+
+Legacy `messages.content` values must be well-formed UTF-8 SQLite `TEXT` without
+an embedded NUL character (`U+0000`). The Node SQLite binding can replace
+malformed bytes or expose only the prefix before a NUL, so worktree
+reconciliation refuses the source before its fence commits and refuses the
+canonical target inside its transaction. The fixed error is `stored message
+content is unsupported`; it contains no message bytes, session identifiers,
+paths, or database IDs. A source refusal preserves the original bytes for
+offline inspection and repair. A target refusal rolls back its transaction
+before message rows are copied, completion markers are written, or FTS is
+rebuilt; the source fence may already be committed.
+
+Stop writers, keep the database and its WAL/SHM sidecars together, and make a
+verified backup before repair. Inspect affected rows offline with
+`typeof(content)`, `hex(content)`, and `instr(content, char(0))`, then correct
+the intended scalar value and rerun reconciliation. Do not use the promoted
+memory script above for `messages`; it is an inline, promoted-only diagnostic
+and repair procedure, not a shipped general-purpose migration. Empty text,
+valid multi-byte Unicode, a genuine replacement character (`U+FFFD`, encoded as
+UTF-8 `EF BF BD`), and literal JSON-escaped `\\u0000` text remain supported.
+Malformed UTF-8, an actual NUL byte, and non-`TEXT` storage are refused. If a
+source completion marker already exists, reconciliation preserves the existing
+replay boundary and archives the source without auditing its message bytes. If
+that marker disappears during the target transaction, LCM revalidates the
+source bytes and refuses unsupported content before copying it. After an
+offline in-place repair, rerun reconciliation to continue from its durable
+fence and marker state.
+
 No data is sent to any Long Context Manager (LCM) server. There is no telemetry.
 An explicitly configured PostgreSQL backend is a user-operated remote-primary
 store; daemon project writes and reads use it only after the publication and
@@ -328,7 +357,24 @@ load and pass both effective custom-pattern arrays: global
 implicitly; missing or non-array values fail before source or repository
 access, while an explicit empty array means that scope has no configured custom
 rules. LCM applies those arrays plus the bundled rules recursively to every
-string key and value. Invalid UTF-8, malformed or scalar JSON, records
+string key and value. For a supported top-level Claude or Codex message, it
+then extracts text from that already-sanitized tree with the same block joining
+and trimming rules as the transcript parser and scrubs the joined text again.
+When this second pass finds a cross-block match, LCM stores the complete joined
+sanitized text in the first contributing text field and empties the remaining
+contributing fields. Array length, block types, nested Claude tool-result
+objects, unknown blocks, and recursively scrubbed metadata remain in place.
+No original plaintext is consulted during this correction.
+
+The corrected text must still match the parsed message exactly before the
+native record can be linked. Overlap between field and joined matches,
+spanning anchors or Codex trimming, and patterns that match into or out of an
+inserted `[REDACTED]` marker can produce different conservative redaction.
+LCM fails that exact linkage before storing the default-backfill batch; it does
+not restore a field-redacted fragment to make the texts agree. A joined result
+that changes again when scrubbed is quarantined as `residual-secret`.
+
+Invalid UTF-8, malformed or scalar JSON, records
 oversized in raw JSONL bytes or after scrubbing in canonical UTF-8, U+0000,
 invalid custom patterns, redacted-key collisions, residual matches, and JSON
 nested beyond the exported depth limit of 100 are rejected locally. Either
@@ -344,6 +390,13 @@ Valid safe integers, fractions whose canonical decimal spelling round-trips
 unchanged through JavaScript number formatting, surrogate pairs, and literal
 Unicode remain supported. No source payload or parser excerpt is written to
 quarantine.
+
+The joined-message scrub pipeline is versioned as `native-json-scrub/v2`.
+Upgrading from v1 causes a forward-only rescan from byte zero. Unchanged rows
+deduplicate by their stable ingest key; a corrected default-path row is one
+that did not commit under v1. LCM does not delete or rewrite older transcript
+history or claim that all older rows were cross-block safe. A rescan also
+repeats the existing local quarantine append for records that still fail.
 Pattern-based filtering still has residual risk: an organization-specific
 secret that matches no active rule can remain in the sanitized record. Test
 project patterns against representative canaries before backfill and protect
@@ -495,7 +548,15 @@ The `Security` section of the doctor output shows:
   pass. For example, `'file://host'['/private']?next/Users/SECRET` becomes
   `'file://host'['<path>']?next<path>`. The handoff remains within that exact
   file URL context; whitespace and URL-ending punctuation reset it, and a
-  recognized `scheme://` token is not consumed as the local path.
+  recognized `scheme://` token is not consumed as the local path. Private
+  slash paths in later ampersand-separated parameters remain covered by the
+  same handoff. When an ampersand is immediately followed by an ordinary
+  public `scheme://` URL, the quoted-query handoff expires before that URL, so
+  its scheme, authority, and path remain byte-identical. A later
+  ampersand-separated word-bearing private path resumes the surrounding quoted
+  file query's handoff. Named public URL parameters such as `&next=/public`
+  remain part of that public URL. A nested exact `file://` literal still starts
+  its own bounded file-path classification.
   Classification state from an earlier quoted file URL does not carry into a
   later unquoted file URL's query tail. A public URL glued directly after the
   closing quote or bracket without whitespace may be conservatively redacted:
@@ -510,7 +571,10 @@ The `Security` section of the doctor output shows:
   following prose or URLs are classified normally. Double quotes in non-file
   URLs or structured text and ordinary quoted local paths retain their existing
   boundaries. Ordinary HTTP and HTTPS URLs retain their authorities, slashes,
-  and paths. In an unquoted exact
+  and paths. A pipe, comma, or semicolon after a closed quoted file-path wrapper
+  also expires its quoted-path provenance before a following ordinary public
+  URL, including a bracketed IPv6 URL with a port, path, query, or fragment.
+  In an unquoted exact
   `file://` URL with no path, a `?` or `#` outside still-open brackets ends the
   file URL authority classification. Following text is classified from fresh
   state: a nested non-file URL remains intact, while standalone POSIX, Windows,
@@ -520,12 +584,19 @@ The `Security` section of the doctor output shows:
   this restarted tail are tracked independently. A slash inside a still-open
   bracket is conservatively treated as a path marker even when it follows a
   word character, and a matched closing bracket keeps the context active so a
-  later backslash-based path is also redacted. Within that already-admitted
-  forced scan, an internal backslash followed by exactly one path-word code
-  point, a colon, and `/` or `\` keeps a drive-shaped continuation in the same
-  redacted span. Path-word characters include Unicode letters, numbers, and
-  marks plus `_.-@+~%$*`; this contextual rule does not make numeric,
-  non-ASCII, or punctuation labels standalone drive-path starts. Once the
+  later backslash-based path is also redacted. The same bounded nested-bracket
+  slash rule applies in a query or fragment after an outer file path has
+  already been admitted. It includes a slash after an inner closing bracket
+  and absorbs a scheme-shaped component there, while independently admitted
+  public URLs outside that confidential span remain unchanged. Within an
+  already-admitted forced or file-URL scan, an internal backslash followed by
+  zero or one path-word code point, a colon, and `/` or `\` keeps a
+  drive-shaped continuation in the same redacted span. Path-word characters
+  include Unicode letters, numbers, and marks plus `_.-@+~%$*`; this
+  contextual rule does not make numeric, non-ASCII, or punctuation labels
+  standalone drive-path starts. Longer labels, punctuation labels, and drive
+  forms without a slash or backslash after the colon stay outside this narrow
+  continuation grammar. Once the
   brackets are balanced, ordinary word-adjacent slash text remains unchanged.
   Whitespace, quoted-path, nested-URL, and delimiter termination remain
   unchanged. An unmatched closing bracket, a freshly recognized URL, or other
@@ -534,14 +605,63 @@ The `Security` section of the doctor output shows:
   Windows backslash path is also redacted when a bracketed file URL query or
   fragment hands off to it immediately after URL-ending punctuation or a
   bracketed nested non-file URL. A nested IPv6 URL keeps the enclosing bracket
-  context through a path, port, or query after its IP-literal closing bracket.
-  A balanced outer bracket may have only spaces or tabs before the backslash.
-  This handoff is consumed once. Prose, newlines, carriage returns, and other
-  whitespace end it; ordinary text and non-file URLs do not make a single
-  backslash a global path start.
-  When an unquoted local-path span starts with
-  `/scheme://`, its URL-shaped portion, including scheme and port colons, is
-  replaced by one `<path>` marker on the first pass. The span ends at whitespace
+  context through a path, port, query, or fragment after its IP-literal closing
+  bracket. A balanced outer bracket may have only spaces or tabs before the
+  backslash. This handoff is consumed once. Prose, newlines, carriage returns,
+  and other whitespace end it; ordinary text and non-file URLs do not make a
+  single backslash a global path start. Within a bracketed pathless file query,
+  a nested public URL keeps its ordinary path and slash-bearing named query
+  values. An ampersand or pipe immediately followed by a supported POSIX or
+  Windows root returns to the enclosing private-path grammar. That owner remains
+  active through repeated immediate paths in the same wrapper, including a
+  POSIX component beginning with a Unicode symbol. An ampersand absolute-path
+  handoff also ends the nested URL substate, so later private values in the same
+  wrapper use the enclosing owner, including after another explicit public URL.
+  Pipe absolute-path handoffs are retained independently at each originating
+  wrapper depth, so closing an inner wrapper consumes only its own one-use tail
+  while outer handoffs remain pending. Repeated handoffs at the same depth stay
+  bounded by that depth, and resets clear all pending depths. Quoted-file query
+  ownership remains independent from a nested public-URL child, allowing every
+  immediate bare path and later word-bearing private parameter to redact on the
+  same pass. A nested exact file URL retains its own path/query classification
+  while bound to the observable enclosing owner; after the child span ends, a
+  depth-keyed returned-parent set classifies every later same-wrapper bare or
+  word-bearing private value. Closing an inner wrapper removes only that depth,
+  preserving still-open outer owners until their matching close or a hard
+  reset. Within a child query or fragment, an ampersand word-bearing `Users`
+  root returns to the retained parent and redacts on the same pass. The same
+  narrow handoff remains available after an intervening public URL child while
+  that wrapper depth is retained, including a named root-relative Windows
+  value. Quoted public URLs keep ordinary relative and named slash-bearing
+  parameters inside their own query or fragment. A bare absolute path, complete
+  word-bearing `Users` root, or named Windows/drive/UNC value returns to the
+  quoted-file parent and restores that parent for later children. This does not
+  trust marker text, classify ordinary relative values as private on the
+  returned-parent transition, or make backslashes global. The direct-relative
+  nested-file query/fragment family remains deferred: its first pass preserves
+  the relative bytes and its next stable pass conservatively redacts them.
+  An unquoted exact file wrapper immediately followed by an ampersand-separated
+  public URL is recognized from that observable syntax on every pass. The
+  doubled-bracket pathless policy retains the observable scheme, authority, and
+  path of a slash-prefixed nested public URL when it has a query or fragment.
+  Later passes therefore derive ownership of named slash-bearing values from the
+  retained URL syntax. A literal `<path>` followed directly by `?` or `#` carries
+  no provenance; slash-bearing values in that ambiguous form are conservatively
+  redacted. The observable outer brackets of a pathless file query or fragment
+  remain the owner across arbitrary literal text, so a query or fragment value
+  beginning with a root-relative Windows backslash is also redacted while that
+  wrapper remains open. This does not make a single backslash a path start in
+  ordinary prose or non-file URLs. Separately quoted wrappers retain their
+  conservative unspaced-URL behavior. These boundaries make the first sanitized
+  result stable without treating an arbitrary `<path>` marker as trusted context.
+  When an unquoted local-path span contains a scheme-shaped `scheme://`
+  component, the bounded span-local scheme colon and the component that follows
+  it are replaced within the same `<path>` marker on the first pass. This also
+  applies when the component follows earlier POSIX segments or separator runs,
+  or when its scheme text is glued to an earlier path-word run. It does not
+  treat an arbitrary colon as a path continuation, cross a recognized nested
+  exact `file://` boundary, or change a separate ordinary public URL. The span
+  ends at whitespace
   or the first unbalanced `)` or `]`, `#`, `&`, `=`, `|`, `,`, `;`, `!`, `?`,
   `}`, apostrophe, double quote, `<`, or `>`. The marker therefore stops before
   a suffix such as `?a=b`. This includes slash-prefixed URLs inside or after

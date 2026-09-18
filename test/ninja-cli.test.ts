@@ -132,7 +132,7 @@ describe("renderFrame — TTY non-verbose mode", () => {
 
     expect(output).toContain("2/2");
     expect(output).toContain("[██████████████████████] 100%");
-    expect(output).toContain("4 failed");
+    expect(output).toContain("failure total 4");
   });
 
   it("shows phase bar when phases are provided", () => {

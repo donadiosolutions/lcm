@@ -38,6 +38,8 @@ import {
   hashProjectPath,
   listProjectMapEntries,
   projectMapPath,
+  renewRetiredProjectIdentity,
+  retiredProjectIdentitySuccessor,
   setRemoteProjectBinding,
 } from "../src/project-map.js";
 import {
@@ -46,12 +48,14 @@ import {
   listWorktreeReconciliationJournals,
   reconcileWorktrees,
 } from "../src/worktree-reconciliation.js";
-import { projectDbPath, projectIdentity } from "../src/daemon/project.js";
+import { projectDbPath, projectIdentity, projectPaths } from "../src/daemon/project.js";
+import { withCliProjectStorage } from "../src/cli-storage.js";
 import { recoverMachineIdentity } from "../src/machine-identity.js";
 import type { ResolvedStorageConfig } from "../src/daemon/config.js";
 import { EventsDb } from "../src/hooks/events-db.js";
 import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
 import * as securityFiles from "../src/security-files.js";
+import { serializeWorktreeReconciliationFence } from "../src/worktree-reconciliation-fence.js";
 
 const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
   backend: "postgresql",
@@ -64,6 +68,7 @@ const POSTGRESQL_STORAGE: ResolvedStorageConfig = {
     statementTimeoutMs: 60_000,
   },
 };
+const SQLITE_STORAGE: ResolvedStorageConfig = { backend: "sqlite" };
 
 const MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const CACHE_RECONCILIATION_TIMEOUT_MS = 10_000;
@@ -78,6 +83,87 @@ const FULL_SUITE_PROCESS_TEST_TIMEOUT_MS = 15_000;
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const MAX_PROJECT_METADATA_BYTES = 1024 * 1024;
+const MESSAGE_CONTENT_FIRST_ROW_QUERY = [
+  "SELECT message_id, typeof(content) AS content_type,",
+  "CAST(content AS BLOB) AS content_bytes",
+  "FROM messages ORDER BY message_id LIMIT 1",
+].join(" ");
+const MESSAGE_CONTENT_KEYSET_QUERY = [
+  "SELECT message_id, typeof(content) AS content_type,",
+  "CAST(content AS BLOB) AS content_bytes",
+  "FROM messages WHERE message_id > ? ORDER BY message_id LIMIT 1",
+].join(" ");
+
+type MessageProjectionObservation = {
+  kind: "first" | "keyset";
+  scan: number;
+  setReadBigInts: boolean[];
+  getArguments: SQLInputValue[][];
+  iterate: undefined;
+};
+
+function normalizedSql(sql: string): string {
+  return sql.replace(/\s+/gu, " ").trim();
+}
+
+function observeMessageProjectionStatements(options: {
+  readonly fail?: (
+    operation: "prepare" | "setReadBigInts" | "get",
+    observation: MessageProjectionObservation,
+  ) => unknown;
+} = {}): {
+  observations: MessageProjectionObservation[];
+  restore: () => void;
+} {
+  const originalPrepare = DatabaseSync.prototype.prepare;
+  const observations: MessageProjectionObservation[] = [];
+  let scan = -1;
+  const prepareSpy = vi.spyOn(
+    DatabaseSync.prototype,
+    "prepare",
+  ).mockImplementation(function (this: DatabaseSync, sql: string) {
+    const normalized = normalizedSql(sql);
+    const kind = normalized === MESSAGE_CONTENT_FIRST_ROW_QUERY
+      ? "first"
+      : normalized === MESSAGE_CONTENT_KEYSET_QUERY
+        ? "keyset"
+        : undefined;
+    if (kind === undefined) return originalPrepare.call(this, sql);
+    if (kind === "first") scan += 1;
+    const observation: MessageProjectionObservation = {
+      kind,
+      scan,
+      setReadBigInts: [],
+      getArguments: [],
+      iterate: undefined,
+    };
+    observations.push(observation);
+    const prepareFailure = options.fail?.("prepare", observation);
+    if (prepareFailure !== undefined) throw prepareFailure;
+    const statement = originalPrepare.call(this, sql);
+    return {
+      setReadBigInts(enabled: boolean) {
+        observation.setReadBigInts.push(enabled);
+        const failure = options.fail?.("setReadBigInts", observation);
+        if (failure !== undefined) throw failure;
+        statement.setReadBigInts(enabled);
+      },
+      get(...args: SQLInputValue[]) {
+        observation.getArguments.push(args);
+        const failure = options.fail?.("get", observation);
+        if (failure !== undefined) throw failure;
+        return statement.get(...args);
+      },
+      iterate: undefined,
+    } as unknown as typeof statement;
+  });
+  return {
+    observations,
+    restore() {
+      prepareSpy.mockRestore();
+    },
+  };
+}
 
 // Current-main readers intentionally reject ambient umask modes. Keep every
 // ordinary fixture private; a test that exercises an unsafe mode must apply
@@ -120,11 +206,15 @@ function withReportedForeignFileOwner<T>(
     const observed = originalFstat(fd, options as never);
     if (
       !active()
-      || observed.dev !== expected.dev
-      || observed.ino !== expected.ino
+      || Number(observed.dev) !== expected.dev
+      || Number(observed.ino) !== expected.ino
     ) return observed;
     const foreign = Object.create(observed) as typeof observed;
-    Object.defineProperty(foreign, "uid", { value: expected.uid + 1 });
+    Object.defineProperty(foreign, "uid", {
+      value: typeof observed.uid === "bigint"
+        ? BigInt(expected.uid + 1)
+        : expected.uid + 1,
+    });
     return foreign;
   }) as typeof fstatSync, callback);
 }
@@ -319,9 +409,53 @@ async function importReconciliationWithDirectoryFaults(
   };
 }
 
+async function importReconciliationWithJournalParentFault(
+  mismatchReads: readonly number[],
+): Promise<{
+  module: typeof import("../src/worktree-reconciliation.js");
+  readCount: () => number;
+}> {
+  let reads = 0;
+  vi.resetModules();
+  vi.doMock("../src/security-files.js", async () => {
+    const actual = await vi.importActual<typeof import("../src/security-files.js")>(
+      "../src/security-files.js",
+    );
+    return {
+      ...actual,
+      readBoundedRegularFileWithStat: ((
+        ...args: Parameters<typeof actual.readBoundedRegularFileWithStat>
+      ) => {
+        const observed = actual.readBoundedRegularFileWithStat(...args);
+        reads += 1;
+        if (!mismatchReads.includes(reads)) return observed;
+        return {
+          content: observed.content,
+          mtimeMs: observed.mtimeMs,
+          dev: observed.dev,
+          ino: observed.ino,
+          mode: observed.mode,
+          uid: observed.uid,
+          gid: observed.gid,
+          nlink: observed.nlink,
+          parentDev: observed.parentDev,
+          parentIno: (BigInt(observed.parentIno) + 1n).toString(10),
+          exactDev: observed.exactDev,
+          exactIno: observed.exactIno,
+        };
+      }) as typeof actual.readBoundedRegularFileWithStat,
+    };
+  });
+  return {
+    module: await import("../src/worktree-reconciliation.js"),
+    readCount: () => reads,
+  };
+}
+
 function resetReconciliationModuleMocks(): void {
   vi.doUnmock("node:fs");
   vi.doUnmock("node:sqlite");
+  vi.doUnmock("../src/security-files.js");
   vi.resetModules();
 }
 
@@ -1628,6 +1762,571 @@ describe("worktree reconciliation", () => {
     ).get()).toBeUndefined();
     preserved.close();
     expect(existsSync(fixture.sourcePath)).toBe(true);
+  });
+
+  it("refuses a source message TEXT value containing an embedded NUL before fencing", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "message-nul-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "message-nul-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec(
+      "UPDATE messages SET content = CAST(X'410042' AS TEXT)",
+    );
+    source.close();
+
+    const targetBefore = readFileSync(fixture.targetPath);
+    const mapBefore = readFileSync(projectMapPath());
+    let caught: unknown;
+    try {
+      reconcileWorktrees(fixture.main);
+    } catch (error) {
+      caught = error;
+    }
+    expect(String(caught)).toBe("Error: stored message content is unsupported");
+    expect(String(caught)).not.toContain(fixture.sourcePath);
+    expect(String(caught)).not.toContain("message-nul-source");
+    expect(readFileSync(fixture.targetPath)).toEqual(targetBefore);
+    expect(readFileSync(projectMapPath())).toEqual(mapBefore);
+    const preserved = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(preserved.prepare("SELECT typeof(content) AS type, hex(content) AS content FROM messages").get())
+      .toEqual({ type: "text", content: "410042" });
+    expect(preserved.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toBeUndefined();
+    preserved.close();
+  });
+
+  it("#1316 refuses malformed source message bytes before fencing and retries after repair", () => {
+    const fixture = makeProjectReconciliation(home);
+    const sessionId = "message-malformed-source";
+    makeDatabase(fixture.targetPath, "message-malformed-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, sessionId, "temporary", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec("UPDATE messages SET content = CAST(X'80' AS TEXT)");
+    source.close();
+
+    const targetBefore = readFileSync(fixture.targetPath);
+    const mapBefore = readFileSync(projectMapPath());
+    let caught: unknown;
+    try {
+      reconcileWorktrees(fixture.main);
+    } catch (error) {
+      caught = error;
+    }
+
+    const refusal = "Error: stored message content is unsupported";
+    expect(String(caught)).toBe(refusal);
+    for (const privateValue of [
+      fixture.sourcePath,
+      sessionId,
+      fixture.sourceHash,
+      fixture.targetHash,
+      "X'80'",
+      "80",
+    ]) {
+      expect(String(caught)).not.toContain(privateValue);
+    }
+    expect(readFileSync(fixture.targetPath)).toEqual(targetBefore);
+    expect(readFileSync(projectMapPath())).toEqual(mapBefore);
+    const preserved = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(preserved.prepare(
+      "SELECT typeof(content) AS type, hex(content) AS content FROM messages",
+    ).get()).toEqual({ type: "text", content: "80" });
+    expect(preserved.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toBeUndefined();
+    preserved.close();
+    const blocked = listWorktreeReconciliationJournals()[0]!;
+    expect(blocked).toMatchObject({
+      phase: "blocked",
+      targetHash: fixture.targetHash,
+      sourceHashes: [fixture.sourceHash],
+      pendingSourceHashes: [fixture.sourceHash],
+      backupPaths: [],
+      reason: refusal,
+    });
+    expect(blocked.reason).not.toContain(sessionId);
+
+    const repaired = new DatabaseSync(fixture.sourcePath);
+    repaired.prepare("UPDATE messages SET content = ?").run("repaired source");
+    repaired.close();
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const target = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(target.prepare(
+      `SELECT hex(m.content) AS content
+       FROM messages m JOIN conversations c ON c.conversation_id = m.conversation_id
+       WHERE c.session_id = ?`,
+    ).get(sessionId)).toEqual({ content: "726570616972656420736F75726365" });
+    target.close();
+  });
+
+  it.each([true, false])(
+    "#1316 refuses malformed target bytes transactionally and retries (FTS %s)",
+    (fts5Available) => {
+      const fixture = makeProjectReconciliation(home);
+      const sourceSessionId = `message-malformed-target-source-${String(fts5Available)}`;
+      makeDatabase(fixture.targetPath, "message-malformed-target", "target", fixture.targetHash);
+      makeDatabase(fixture.sourcePath, sourceSessionId, "source", fixture.sourceHash);
+      const target = new DatabaseSync(fixture.targetPath);
+      target.exec(`
+        UPDATE messages SET content = CAST(X'80' AS TEXT);
+        CREATE TABLE worktree_reconciliation_sources (
+          source_hash TEXT PRIMARY KEY,
+          merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO worktree_reconciliation_sources(source_hash) VALUES('existing-source');
+        DELETE FROM messages_fts;
+        INSERT INTO messages_fts(rowid, content) VALUES(424242, 'fts sentinel');
+      `);
+      const targetMessageBefore = target.prepare(
+        "SELECT typeof(content) AS type, hex(content) AS content FROM messages",
+      ).get();
+      const targetFtsBefore = target.prepare(
+        "SELECT rowid, content FROM messages_fts ORDER BY rowid",
+      ).all();
+      const targetMarkersBefore = target.prepare(
+        "SELECT source_hash FROM worktree_reconciliation_sources ORDER BY source_hash",
+      ).all();
+      target.close();
+
+      expect(() => reconcileWorktrees(fixture.main, { _fts5Available: fts5Available }))
+        .toThrow("stored message content is unsupported");
+
+      const blockedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+      expect(blockedTarget.prepare(
+        "SELECT typeof(content) AS type, hex(content) AS content FROM messages",
+      ).get()).toEqual(targetMessageBefore);
+      expect(blockedTarget.prepare(
+        "SELECT rowid, content FROM messages_fts ORDER BY rowid",
+      ).all()).toEqual(targetFtsBefore);
+      expect(blockedTarget.prepare(
+        "SELECT source_hash FROM worktree_reconciliation_sources ORDER BY source_hash",
+      ).all()).toEqual(targetMarkersBefore);
+      expect(blockedTarget.prepare(
+        "SELECT 1 FROM conversations WHERE session_id = ?",
+      ).get(sourceSessionId)).toBeUndefined();
+      blockedTarget.close();
+      const fencedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+      expect(fencedSource.prepare(
+        "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+      ).get()).toMatchObject({ name: "worktree_reconciliation_fence" });
+      fencedSource.close();
+      expect(listWorktreeReconciliationJournals()).toMatchObject([{
+        phase: "blocked",
+        reason: "Error: stored message content is unsupported",
+      }]);
+
+      const repairedTarget = new DatabaseSync(fixture.targetPath);
+      repairedTarget.prepare("UPDATE messages SET content = ?").run("repaired target");
+      repairedTarget.close();
+      expect(reconcileWorktrees(fixture.main, { _fts5Available: fts5Available }))
+        .toMatchObject({ status: "completed" });
+      const mergedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+      expect(mergedTarget.prepare(
+        `SELECT hex(m.content) AS content
+         FROM messages m JOIN conversations c ON c.conversation_id = m.conversation_id
+         WHERE c.session_id = ?`,
+      ).get(sourceSessionId)).toEqual({ content: "736F75726365" });
+      mergedTarget.close();
+    },
+  );
+
+  it("#1316 distinguishes real U+FFFD from a malformed-byte collision", () => {
+    const fixture = makeProjectReconciliation(home);
+    const sessionId = "message-replacement-collision";
+    makeDatabase(fixture.targetPath, sessionId, "\uFFFD", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, sessionId, "\uFFFD", fixture.sourceHash);
+    const target = new DatabaseSync(fixture.targetPath);
+    target.exec("UPDATE messages SET content = CAST(X'80' AS TEXT)");
+    target.close();
+
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "stored message content is unsupported",
+    );
+    const preservedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(preservedTarget.prepare(
+      "SELECT typeof(content) AS type, hex(content) AS content FROM messages",
+    ).get()).toEqual({ type: "text", content: "80" });
+    expect(preservedTarget.prepare(
+      "SELECT COUNT(*) AS count FROM worktree_reconciliation_sources WHERE source_hash = ?",
+    ).get(fixture.sourceHash)).toEqual({ count: 0 });
+    preservedTarget.close();
+    const fencedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(fencedSource.prepare(
+      "SELECT typeof(content) AS type, hex(content) AS content FROM messages",
+    ).get()).toEqual({ type: "text", content: "EFBFBD" });
+    expect(fencedSource.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toMatchObject({ name: "worktree_reconciliation_fence" });
+    fencedSource.close();
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      reason: "Error: stored message content is unsupported",
+    }]);
+  });
+
+  it.each([
+    { label: "leading NUL", hex: "006D657373616765" },
+    { label: "interior NUL", hex: "6D65737300616765" },
+    { label: "trailing NUL", hex: "6D65737361676500" },
+    { label: "non-TEXT BLOB", hex: "6D657373616765", blob: true },
+  ])("refuses source message $label content and retries after in-place repair", ({ hex, blob }) => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "message-unsupported-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "message-unsupported-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    const contentExpression = blob ? `X'${hex}'` : `CAST(X'${hex}' AS TEXT)`;
+    source.exec(`UPDATE messages SET content = ${contentExpression}`);
+    source.close();
+
+    const targetBefore = readFileSync(fixture.targetPath);
+    const mapBefore = readFileSync(projectMapPath());
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "stored message content is unsupported",
+    );
+    expect(readFileSync(fixture.targetPath)).toEqual(targetBefore);
+    expect(readFileSync(projectMapPath())).toEqual(mapBefore);
+    const blockedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(blockedSource.prepare(
+      "SELECT typeof(content) AS type, hex(content) AS content FROM messages",
+    ).get()).toEqual({ type: blob ? "blob" : "text", content: hex });
+    expect(blockedSource.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toBeUndefined();
+    blockedSource.close();
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      reason: "Error: stored message content is unsupported",
+    }]);
+
+    const repairedSource = new DatabaseSync(fixture.sourcePath);
+    repairedSource.prepare("UPDATE messages SET content = ?").run("repaired source");
+    repairedSource.close();
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    const mergedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(mergedTarget.prepare(
+      `SELECT hex(m.content) AS content
+       FROM messages m JOIN conversations c ON c.conversation_id = m.conversation_id
+       WHERE c.session_id = 'message-unsupported-source'`,
+    ).get()).toEqual({ content: "726570616972656420736F75726365" });
+    mergedTarget.close();
+  });
+
+  it.each([true, false])(
+    "refuses unsupported target message content before collision comparison (FTS %s)",
+    (fts5Available) => {
+      const fixture = makeProjectReconciliation(home);
+      makeDatabase(fixture.targetPath, "message-collision", "source", fixture.targetHash);
+      makeDatabase(fixture.sourcePath, "message-collision", "source", fixture.sourceHash);
+      const target = new DatabaseSync(fixture.targetPath);
+      target.exec("UPDATE messages SET content = CAST(X'736F7572636500737566666978' AS TEXT)");
+      target.close();
+
+      const targetBefore = new DatabaseSync(fixture.targetPath, { readOnly: true });
+      const targetMessageBefore = targetBefore.prepare(
+        "SELECT typeof(content) AS type, hex(content) AS content FROM messages",
+      ).get();
+      targetBefore.close();
+      let caught: unknown;
+      try {
+        reconcileWorktrees(fixture.main, { _fts5Available: fts5Available });
+      } catch (error) {
+        caught = error;
+      }
+      expect(String(caught)).toBe("Error: stored message content is unsupported");
+      expect(String(caught)).not.toContain(fixture.targetPath);
+      expect(String(caught)).not.toContain("message-collision");
+      const blockedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+      expect(blockedTarget.prepare(
+        "SELECT typeof(content) AS type, hex(content) AS content FROM messages",
+      ).get()).toEqual(targetMessageBefore);
+      expect(blockedTarget.prepare(
+        "SELECT COUNT(*) AS count FROM worktree_reconciliation_sources",
+      ).get()).toEqual({ count: 0 });
+      blockedTarget.close();
+      const fencedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+      expect(fencedSource.prepare(
+        "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+      ).get()).toMatchObject({ name: "worktree_reconciliation_fence" });
+      fencedSource.close();
+      expect(listWorktreeReconciliationJournals()).toMatchObject([{
+        phase: "blocked",
+        reason: "Error: stored message content is unsupported",
+      }]);
+
+      const repairedTarget = new DatabaseSync(fixture.targetPath);
+      repairedTarget.prepare("UPDATE messages SET content = ?").run("source");
+      repairedTarget.close();
+      expect(reconcileWorktrees(fixture.main, { _fts5Available: fts5Available }))
+        .toMatchObject({ status: "completed" });
+    },
+  );
+
+  it.each([
+    { fts5Available: true, content: "" },
+    { fts5Available: true, content: "こんにちは世界" },
+    { fts5Available: true, content: "\uFFFD" },
+    { fts5Available: true, content: "literal \\u0000" },
+    { fts5Available: false, content: "" },
+    { fts5Available: false, content: "こんにちは世界" },
+    { fts5Available: false, content: "\uFFFD" },
+    { fts5Available: false, content: "literal \\u0000" },
+  ])(
+    "reconciles valid message content byte-exactly (FTS $fts5Available, $content)",
+    ({ fts5Available, content }) => {
+      const fixture = makeProjectReconciliation(home);
+      const sessionId = "message-valid-source";
+      makeDatabase(fixture.targetPath, "message-valid-target", "target", fixture.targetHash);
+      makeDatabase(fixture.sourcePath, sessionId, "source", fixture.sourceHash);
+      const source = new DatabaseSync(fixture.sourcePath);
+      source.prepare("UPDATE messages SET content = ?").run(content);
+      const expected = source.prepare("SELECT hex(content) AS content FROM messages").get();
+      source.close();
+
+      expect(reconcileWorktrees(fixture.main, { _fts5Available: fts5Available }))
+        .toMatchObject({ status: "completed" });
+      const target = new DatabaseSync(fixture.targetPath, { readOnly: true });
+      expect(target.prepare(
+        `SELECT hex(m.content) AS content
+         FROM messages m JOIN conversations c ON c.conversation_id = m.conversation_id
+         WHERE c.session_id = ?`,
+      ).get(sessionId)).toEqual(expected);
+      target.close();
+    },
+  );
+
+  it("#1316 uses the Node 22.12 statement surface for byte admission", () => {
+    const fixture = makeProjectReconciliation(home);
+    const sessionId = "message-node-22-12-surface";
+    makeDatabase(fixture.targetPath, "message-node-22-12-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, sessionId, "temporary", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec("UPDATE messages SET content = CAST(X'80' AS TEXT)");
+    source.close();
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    const observer = observeMessageProjectionStatements();
+    try {
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "stored message content is unsupported",
+      );
+      const preserved = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+      expect(preserved.prepare(
+        "SELECT typeof(content) AS type, hex(content) AS content FROM messages",
+      ).get()).toEqual({ type: "text", content: "80" });
+      expect(preserved.prepare(
+        "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+      ).get()).toBeUndefined();
+      preserved.close();
+      expect(listWorktreeReconciliationJournals()).toMatchObject([{
+        phase: "blocked",
+        reason: "Error: stored message content is unsupported",
+      }]);
+
+      const repaired = new DatabaseSync(fixture.sourcePath);
+      repaired.prepare("UPDATE messages SET content = ?").run("\uFFFD");
+      repaired.close();
+      expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+    } finally {
+      observer.restore();
+    }
+
+    expect(DatabaseSync.prototype.prepare).toBe(originalPrepare);
+    expect(observer.observations.length).toBeGreaterThanOrEqual(6);
+    for (const observation of observer.observations) {
+      expect(observation.iterate).toBeUndefined();
+      expect(observation.setReadBigInts).toEqual([true]);
+    }
+    expect(observer.observations.some(({ kind }) => kind === "first")).toBe(true);
+    expect(observer.observations.some(({ kind }) => kind === "keyset")).toBe(true);
+    const target = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(target.prepare(
+      `SELECT hex(m.content) AS content
+       FROM messages m JOIN conversations c ON c.conversation_id = m.conversation_id
+       WHERE c.session_id = ?`,
+    ).get(sessionId)).toEqual({ content: "EFBFBD" });
+    target.close();
+  });
+
+  it("#1316 preserves adjacent high message IDs in the keyset cursor", () => {
+    const fixture = makeProjectReconciliation(home);
+    const sessionId = "message-high-id-source";
+    makeDatabase(fixture.targetPath, "message-high-id-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, sessionId, "ordinary", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec(`
+      INSERT INTO messages(
+        message_id, conversation_id, seq, role, content, token_count, created_at
+      )
+      SELECT 9007199254740992, conversation_id, 2, 'user', 'high valid', 2, '2026-01-02'
+      FROM conversations WHERE session_id = '${sessionId}';
+      INSERT INTO messages(
+        message_id, conversation_id, seq, role, content, token_count, created_at
+      )
+      SELECT 9007199254740993, conversation_id, 3, 'user', CAST(X'80' AS TEXT), 2,
+             '2026-01-03'
+      FROM conversations WHERE session_id = '${sessionId}';
+    `);
+    source.close();
+    const targetBefore = readFileSync(fixture.targetPath);
+    const mapBefore = readFileSync(projectMapPath());
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    const observer = observeMessageProjectionStatements();
+    try {
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "stored message content is unsupported",
+      );
+    } finally {
+      observer.restore();
+    }
+
+    expect(DatabaseSync.prototype.prepare).toBe(originalPrepare);
+    expect(observer.observations).toHaveLength(2);
+    for (const observation of observer.observations) {
+      expect(observation.setReadBigInts).toEqual([true]);
+    }
+    const keyset = observer.observations.find(({ kind }) => kind === "keyset")!;
+    expect(keyset.getArguments).toContainEqual([9007199254740992n]);
+    expect(readFileSync(fixture.targetPath)).toEqual(targetBefore);
+    expect(readFileSync(projectMapPath())).toEqual(mapBefore);
+    const preserved = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    const highRows = preserved.prepare(
+      `SELECT message_id, typeof(content) AS type, hex(content) AS content
+       FROM messages WHERE message_id >= 9007199254740992 ORDER BY message_id`,
+    );
+    highRows.setReadBigInts(true);
+    expect(highRows.all()).toEqual([
+      { message_id: 9007199254740992n, type: "text", content: "686967682076616C6964" },
+      { message_id: 9007199254740993n, type: "text", content: "80" },
+    ]);
+    expect(preserved.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toBeUndefined();
+    preserved.close();
+  });
+
+  it.each([
+    { label: "prepare", operation: "prepare" as const },
+    { label: "setReadBigInts", operation: "setReadBigInts" as const },
+    { label: "first get", operation: "get" as const },
+  ])("#1316 preserves a $label operational error", ({ operation }) => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "message-operation-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "message-operation-source", "source", fixture.sourceHash);
+    const target = new DatabaseSync(fixture.targetPath);
+    target.exec(`
+      CREATE TABLE worktree_reconciliation_sources (
+        source_hash TEXT PRIMARY KEY,
+        merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO worktree_reconciliation_sources(source_hash) VALUES('existing-source');
+    `);
+    const targetMarkersBefore = target.prepare(
+      "SELECT source_hash FROM worktree_reconciliation_sources ORDER BY source_hash",
+    ).all();
+    target.close();
+
+    const sentinel = new Error(`injected ${operation} failure`);
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    const observer = observeMessageProjectionStatements({
+      fail(observedOperation, observation) {
+        if (
+          observedOperation === operation
+          && observation.scan === 1
+          && observation.kind === "first"
+        ) return sentinel;
+        return undefined;
+      },
+    });
+    let caught: unknown;
+    try {
+      reconcileWorktrees(fixture.main);
+    } catch (error) {
+      caught = error;
+    } finally {
+      observer.restore();
+    }
+
+    expect(DatabaseSync.prototype.prepare).toBe(originalPrepare);
+    expect(caught).toBe(sentinel);
+    expect(String(caught)).not.toBe("Error: stored message content is unsupported");
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      reason: `Error: injected ${operation} failure`,
+    }]);
+    const fencedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(fencedSource.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toMatchObject({ name: "worktree_reconciliation_fence" });
+    fencedSource.close();
+    const preservedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(preservedTarget.prepare(
+      "SELECT source_hash FROM worktree_reconciliation_sources ORDER BY source_hash",
+    ).all()).toEqual(targetMarkersBefore);
+    expect(preservedTarget.prepare(
+      "SELECT 1 FROM conversations WHERE session_id = 'message-operation-source'",
+    ).get()).toBeUndefined();
+    preservedTarget.close();
+  });
+
+  it("#1316 preserves a second keyset get operational error", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "message-get-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "message-get-source", "source", fixture.sourceHash);
+    const target = new DatabaseSync(fixture.targetPath);
+    target.exec(`
+      CREATE TABLE worktree_reconciliation_sources (
+        source_hash TEXT PRIMARY KEY,
+        merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO worktree_reconciliation_sources(source_hash) VALUES('existing-source');
+    `);
+    const targetMarkersBefore = target.prepare(
+      "SELECT source_hash FROM worktree_reconciliation_sources ORDER BY source_hash",
+    ).all();
+    target.close();
+
+    const sentinel = new Error("injected second keyset get failure");
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    const observer = observeMessageProjectionStatements({
+      fail(operation, observation) {
+        if (
+          operation === "get"
+          && observation.scan === 1
+          && observation.kind === "keyset"
+          && observation.getArguments.length === 1
+        ) return sentinel;
+        return undefined;
+      },
+    });
+    let caught: unknown;
+    try {
+      reconcileWorktrees(fixture.main);
+    } catch (error) {
+      caught = error;
+    } finally {
+      observer.restore();
+    }
+
+    expect(DatabaseSync.prototype.prepare).toBe(originalPrepare);
+    expect(caught).toBe(sentinel);
+    expect(String(caught)).not.toBe("Error: stored message content is unsupported");
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      reason: "Error: injected second keyset get failure",
+    }]);
+    const fencedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(fencedSource.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toMatchObject({ name: "worktree_reconciliation_fence" });
+    fencedSource.close();
+    const preservedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(preservedTarget.prepare(
+      "SELECT source_hash FROM worktree_reconciliation_sources ORDER BY source_hash",
+    ).all()).toEqual(targetMarkersBefore);
+    expect(preservedTarget.prepare(
+      "SELECT 1 FROM conversations WHERE session_id = 'message-get-source'",
+    ).get()).toBeUndefined();
+    preservedTarget.close();
   });
 
   it.each([
@@ -4445,6 +5144,260 @@ describe("worktree reconciliation", () => {
     target.close();
   });
 
+  it("keeps a renewed retired identity as the configured reconciliation target across fresh caches", async () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const oldId = hashProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [oldId]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    const projects = join(home, ".lcm", "projects");
+    makePrivateFixtureDirectory(projects, { recursive: true });
+    const oldFence = join(projects, oldId);
+    const fenceBytes = serializeWorktreeReconciliationFence(oldId, "project");
+    writePrivateFixtureFile(oldFence, fenceBytes);
+    clearProjectMapCache();
+
+    expect(renewRetiredProjectIdentity(main)).toEqual({
+      oldId,
+      newId,
+      canonical,
+      changed: true,
+    });
+    clearProjectMapCache();
+    clearGitProjectAnchorCache();
+    clearWorktreeReconciliationCache();
+
+    expect(projectIdentity(linked, SQLITE_STORAGE)).toMatchObject({
+      id: newId,
+      localProjectId: newId,
+      canonical,
+    });
+    expect(projectPaths(linked)).toMatchObject({ id: newId, canonical });
+    const first = await withCliProjectStorage(linked, { create: true }, async ({ project, storage }) => {
+      await storage.conversations.getOrCreateConversation("renewed-session");
+      return project;
+    });
+    expect(first).toMatchObject({ id: newId, canonical });
+    expect(listProjectMapEntries()).toEqual({
+      [newId]: expect.objectContaining({ canonical }),
+    });
+    expect(readFileSync(oldFence, "utf8")).toBe(fenceBytes);
+    expect(lstatSync(oldFence).isFile()).toBe(true);
+    expect(existsSync(join(oldFence, "db.sqlite"))).toBe(false);
+    expect(existsSync(join(projects, oldId, "meta.json"))).toBe(false);
+
+    clearProjectMapCache();
+    clearGitProjectAnchorCache();
+    clearWorktreeReconciliationCache();
+    expect(await withCliProjectStorage(linked, { create: false }, async ({ project, storage }) => ({
+      project,
+      sessions: (await storage.conversations.listConversations()).map(row => row.sessionId),
+    }))).toEqual({
+      project: expect.objectContaining({ id: newId, canonical }),
+      sessions: ["renewed-session"],
+    });
+    expect(listProjectMapEntries()).toEqual({
+      [newId]: expect.objectContaining({ canonical }),
+    });
+    expect(readFileSync(oldFence, "utf8")).toBe(fenceBytes);
+    expect(lstatSync(oldFence).isFile()).toBe(true);
+  });
+
+  it("still reconciles an ordinary non-renewed Git project by its plain path hash", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+
+    expect(projectIdentity(linked, SQLITE_STORAGE)).toMatchObject({
+      id: targetHash,
+      localProjectId: targetHash,
+      canonical,
+    });
+    expect(projectPaths(linked)).toMatchObject({ id: targetHash, canonical });
+    expect(listProjectMapEntries()).toEqual({
+      [targetHash]: expect.objectContaining({ canonical }),
+    });
+  });
+
+  it("rejects a reconciliation target identity that does not match the discovered project directory", () => {
+    const { main } = makeRepository(home);
+    const foreignCanonical = join(home, "not-this-repository");
+    makePrivateFixtureDirectory(foreignCanonical);
+
+    expect(() => reconcileWorktrees(main, {
+      _targetIdentity: { id: hashProjectPath(foreignCanonical), canonical: foreignCanonical },
+    })).toThrow("mapped project identity does not match the current project directory");
+  });
+
+  it("fails closed when a successor-shaped identity's retired fence is absent", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const oldId = hashProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    // The project map already points at the successor id, exactly like a
+    // completed renewal, but no retired fence was ever installed at oldId
+    // (for example: the map file was hand-edited, or renewal partially
+    // failed before the fence-authentication invariant was established).
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [newId]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    const successorDb = join(home, ".lcm", "projects", newId, "db.sqlite");
+    makeDatabase(successorDb, "renewed-session", "renewed content", newId);
+    clearProjectMapCache();
+
+    const mapBefore = readFileSync(projectMapPath(), "utf8");
+    const dbBefore = readFileSync(successorDb);
+    // The persisted id is reachable only through renewal, so this shape is
+    // proof the project was already renewed. Without a fence to reverify
+    // that renewal, ordinary reconciliation would target the plain path
+    // hash, recreate the retired directory, and fold the successor's live
+    // database backwards into it as a legacy source. Fail closed instead of
+    // silently undoing the renewal.
+    expect(() => ensureWorktreeProjectReconciled(linked)).toThrow(
+      "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile",
+    );
+    // Nothing was mutated: no retired directory was recreated, the map
+    // still points only at the successor id, and its database is untouched.
+    expect(existsSync(join(home, ".lcm", "projects", oldId))).toBe(false);
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(mapBefore);
+    expect(readFileSync(successorDb)).toEqual(dbBefore);
+    expect(listProjectMapEntries()).toEqual({
+      [newId]: expect.objectContaining({ canonical }),
+    });
+  });
+
+  it("does not accept a successor-shaped identity as renewed when its retired fence content is not authenticated", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const oldId = hashProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [newId]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    const projects = join(home, ".lcm", "projects");
+    makePrivateFixtureDirectory(projects, { recursive: true });
+    // A byte-mismatched fence (wrong embedded hash) at the retired path must
+    // never be treated as an authenticated renewal fence.
+    writePrivateFixtureFile(
+      join(projects, oldId),
+      serializeWorktreeReconciliationFence(newId, "project"),
+    );
+    clearProjectMapCache();
+
+    expect(() => ensureWorktreeProjectReconciled(linked)).toThrow(
+      "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile",
+    );
+  });
+
+  // `lcm project reconcile-worktrees`, `createProject`, and
+  // `showReconciledLocalProject` call `reconcileWorktrees` directly and never
+  // supply an authenticated target identity, so the fail-closed rule has to
+  // live in `reconcileWorktrees` itself rather than only in
+  // `ensureWorktreeProjectReconciled`.
+  it("refuses a direct reconciliation of an unauthenticated successor without folding it", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const oldId = hashProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [newId]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    const successorDb = join(home, ".lcm", "projects", newId, "db.sqlite");
+    const successorEvents = join(home, ".lcm", "events", `${newId}.db`);
+    makeDatabase(successorDb, "renewed-session", "renewed content", newId);
+    makeEvents(successorEvents, "renewed-session");
+    clearProjectMapCache();
+    const mapBefore = readFileSync(projectMapPath(), "utf8");
+    const dbBefore = readFileSync(successorDb);
+    const eventsBefore = readFileSync(successorEvents);
+
+    expect(() => reconcileWorktrees(linked)).toThrow(
+      "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile",
+    );
+
+    expect(readFileSync(projectMapPath(), "utf8")).toBe(mapBefore);
+    expect(readFileSync(successorDb)).toEqual(dbBefore);
+    expect(readFileSync(successorEvents)).toEqual(eventsBefore);
+    expect(existsSync(join(home, ".lcm", "projects", oldId))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "events", `${oldId}.db`))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
+    expect(listProjectMapEntries()).toEqual({
+      [newId]: { canonical, aliases: [] },
+    });
+  });
+
+  it("reports the fence refusal, not a filesystem error, for a tampered retired fence", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const oldId = hashProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [newId]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    const projects = join(home, ".lcm", "projects");
+    makePrivateFixtureDirectory(projects, { recursive: true });
+    const tamperedBytes = serializeWorktreeReconciliationFence(newId, "project");
+    writePrivateFixtureFile(join(projects, oldId), tamperedBytes);
+    clearProjectMapCache();
+
+    // The retired path holds a regular file, so folding backwards onto it
+    // would fail with a bare ENOTDIR while creating the retired project
+    // directory. Authenticating before discovery replaces that with the
+    // actionable fence diagnostic.
+    let refusal: unknown;
+    try {
+      reconcileWorktrees(linked);
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toBe(
+      "renewed project identity is missing its predecessor reconciliation fence; refusing to reconcile",
+    );
+    expect((refusal as NodeJS.ErrnoException).code).toBeUndefined();
+    expect(readFileSync(join(projects, oldId), "utf8")).toBe(tamperedBytes);
+    expect(lstatSync(join(projects, oldId)).isFile()).toBe(true);
+  });
+
+  it("targets the authenticated successor when a renewed project is reconciled directly", () => {
+    const { main, linked } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const oldId = hashProjectPath(canonical);
+    const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+    writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
+      [oldId]: { canonical, aliases: [] },
+    }, null, 2)}\n`);
+    const projects = join(home, ".lcm", "projects");
+    makePrivateFixtureDirectory(projects, { recursive: true });
+    const fenceBytes = serializeWorktreeReconciliationFence(oldId, "project");
+    writePrivateFixtureFile(join(projects, oldId), fenceBytes);
+    clearProjectMapCache();
+    expect(renewRetiredProjectIdentity(main)).toEqual({
+      oldId,
+      newId,
+      canonical,
+      changed: true,
+    });
+    clearProjectMapCache();
+    clearGitProjectAnchorCache();
+    clearWorktreeReconciliationCache();
+
+    const result = reconcileWorktrees(linked);
+
+    expect(result.targetHash).toBe(newId);
+    expect(result.canonical).toBe(canonical);
+    expect(result.sourceHashes).toEqual([]);
+    expect(result.status).toBe("not-needed");
+    expect(listProjectMapEntries()).toEqual({
+      [newId]: { canonical, aliases: [] },
+    });
+    expect(readFileSync(join(projects, oldId), "utf8")).toBe(fenceBytes);
+    expect(lstatSync(join(projects, oldId)).isFile()).toBe(true);
+  });
+
   it("rejects conflicting legacy bindings before PostgreSQL admission mutates project state", () => {
     const { main, linked } = makeRepository(home);
     const secondLinked = join(home, "linked-two");
@@ -6541,6 +7494,388 @@ describe("worktree reconciliation", () => {
       "{}",
     );
     expect(() => listWorktreeReconciliationJournals()).toThrow("journal is malformed");
+  });
+
+  it.each([
+    {
+      label: "dangling symlink",
+      arrange: (root: string) => symlinkSync(`${root}.missing`, root),
+    },
+    {
+      label: "external-directory symlink",
+      arrange: (root: string) => {
+        const external = `${root}.external`;
+        makePrivateFixtureDirectory(external);
+        const targetHash = "a".repeat(64);
+        writePrivateFixtureFile(
+          join(external, `${targetHash}.json`),
+          reconciliationJournalBytes(targetHash, "/external", { phase: "completed" }),
+        );
+        symlinkSync(external, root);
+      },
+    },
+    {
+      label: "regular file",
+      arrange: (root: string) => writePrivateFixtureFile(root, "root evidence\n"),
+    },
+  ])("journal root admission refuses a $label without changing it", ({ arrange }) => {
+    const root = join(home, ".lcm", "reconciliations");
+    arrange(root);
+    const before = lstatSync(root);
+    const external = `${root}.external`;
+    const externalJournal = join(external, `${"a".repeat(64)}.json`);
+    const externalBytes = existsSync(externalJournal)
+      ? readFileSync(externalJournal, "utf8")
+      : undefined;
+
+    expect(() => listWorktreeReconciliationJournals())
+      .toThrow("reconciliation journal directory is not a private directory");
+
+    const after = lstatSync(root);
+    expect(after.dev).toBe(before.dev);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mode).toBe(before.mode);
+    if (externalBytes !== undefined) {
+      expect(readFileSync(externalJournal, "utf8")).toBe(externalBytes);
+    }
+  });
+
+  it("journal root admission propagates non-ENOENT lstat failures", () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    const journalPath = join(root, `${targetHash}.json`);
+    const bytes = reconciliationJournalBytes(targetHash, "/project", {
+      phase: "completed",
+    });
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, bytes);
+    const rootBefore = lstatSync(root);
+    const journalBefore = lstatSync(journalPath);
+    const failure = Object.assign(new Error("injected journal root lstat failure"), {
+      code: "EACCES",
+    });
+    const originalLstat = lstatSync;
+
+    expect(() => withPatchedFs("lstatSync", ((
+      path: Parameters<typeof lstatSync>[0],
+      options?: Parameters<typeof lstatSync>[1],
+    ) => {
+      if (String(path) === root) throw failure;
+      return originalLstat(path, options as never);
+    }) as typeof lstatSync, () => listWorktreeReconciliationJournals())).toThrow(failure);
+
+    const rootAfter = lstatSync(root);
+    const journalAfter = lstatSync(journalPath);
+    expect(rootAfter.dev).toBe(rootBefore.dev);
+    expect(rootAfter.ino).toBe(rootBefore.ino);
+    expect(rootAfter.mode).toBe(rootBefore.mode);
+    expect(journalAfter.dev).toBe(journalBefore.dev);
+    expect(journalAfter.ino).toBe(journalBefore.ino);
+    expect(journalAfter.mode).toBe(journalBefore.mode);
+    expect(readFileSync(journalPath, "utf8")).toBe(bytes);
+    expect(readdirSync(root)).toEqual([`${targetHash}.json`]);
+  });
+
+  it("journal root admission authenticates the root mode before listing", () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    const journalPath = join(root, `${targetHash}.json`);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(
+      journalPath,
+      reconciliationJournalBytes(targetHash, "/project", { phase: "completed" }),
+    );
+    fsChmodSync(root, 0o755);
+    const before = statSync(journalPath);
+    const bytes = readFileSync(journalPath, "utf8");
+
+    expect(() => listWorktreeReconciliationJournals())
+      .toThrow("private directory mode is not trusted");
+
+    expect(statSync(journalPath).ino).toBe(before.ino);
+    expect(readFileSync(journalPath, "utf8")).toBe(bytes);
+    expect(statSync(root).mode & 0o777).toBe(0o755);
+  });
+
+  it("journal root admission authenticates the root owner before listing", () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    const journalPath = join(root, `${targetHash}.json`);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(
+      journalPath,
+      reconciliationJournalBytes(targetHash, "/project", { phase: "completed" }),
+    );
+    const bytes = readFileSync(journalPath, "utf8");
+
+    expect(() => withReportedForeignFileOwner(
+      root,
+      () => listWorktreeReconciliationJournals(),
+    )).toThrow("private directory owner is not trusted");
+
+    expect(readFileSync(journalPath, "utf8")).toBe(bytes);
+  });
+
+  it("journal root admission refuses disappearance after positive lstat", async () => {
+    const root = join(home, ".lcm", "reconciliations");
+    makePrivateFixtureDirectory(root);
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      let removed = false;
+      return {
+        ...actual,
+        lstatSync: ((path: Parameters<typeof actual.lstatSync>[0], options?: unknown) => {
+          const stat = actual.lstatSync(path, options as never);
+          if (!removed && String(path) === root) {
+            removed = true;
+            actual.rmSync(root, { recursive: true });
+          }
+          return stat;
+        }) as typeof actual.lstatSync,
+      };
+    });
+    try {
+      const isolated = await import("../src/worktree-reconciliation.js");
+      expect(() => isolated.listWorktreeReconciliationJournals()).toThrow(/ENOENT/u);
+      expect(existsSync(root)).toBe(false);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal root admission fails closed when the root changes after enumeration", async () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const displaced = `${root}.displaced`;
+    const targetHash = "a".repeat(64);
+    const journalPath = join(root, `${targetHash}.json`);
+    const bytes = reconciliationJournalBytes(targetHash, "/project", { phase: "completed" });
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, bytes);
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      let replaced = false;
+      return {
+        ...actual,
+        readdirSync: ((directory: Parameters<typeof actual.readdirSync>[0], options?: unknown) => {
+          const entries = actual.readdirSync(directory, options as never);
+          if (!replaced && String(directory) === root) {
+            replaced = true;
+            actual.renameSync(root, displaced);
+            actual.mkdirSync(root, { mode: PRIVATE_DIRECTORY_MODE });
+          }
+          return entries;
+        }) as typeof actual.readdirSync,
+      };
+    });
+    try {
+      const isolated = await import("../src/worktree-reconciliation.js");
+      expect(() => isolated.listWorktreeReconciliationJournals())
+        .toThrow("private directory topology is not trusted");
+      expect(readdirSync(root)).toEqual([]);
+      expect(readFileSync(join(displaced, `${targetHash}.json`), "utf8")).toBe(bytes);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal root admission reports a close-only failure after a valid listing", async () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(
+      join(root, `${targetHash}.json`),
+      reconciliationJournalBytes(targetHash, "/project", { phase: "completed" }),
+    );
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir: join(home, "unused-target"),
+      journalDir: root,
+      failJournalClose: true,
+    });
+    try {
+      expect(() => isolated.module.listWorktreeReconciliationJournals())
+        .toThrow("reconciliation journal listing directory cleanup failed");
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal root admission preserves a read failure when close also fails", async () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(join(root, `${targetHash}.json`), "{");
+    const isolated = await importReconciliationWithDirectoryFaults({
+      targetDir: join(home, "unused-target"),
+      journalDir: root,
+      failJournalClose: true,
+    });
+    try {
+      let caught: unknown;
+      try {
+        isolated.module.listWorktreeReconciliationJournals();
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(AggregateError);
+      expect((caught as AggregateError).cause).toBeInstanceOf(SyntaxError);
+      expect((caught as AggregateError).errors[0]).toBeInstanceOf(SyntaxError);
+      expect(String((caught as AggregateError).errors[1]))
+        .toContain("injected reconciliation journal directory close failure");
+      expect(isolated.remainingDescriptorPaths()).toEqual([]);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal root admission passes its retained parent to each journal read", async () => {
+    const root = join(home, ".lcm", "reconciliations");
+    const targetHash = "a".repeat(64);
+    const journalPath = join(root, `${targetHash}.json`);
+    const bytes = reconciliationJournalBytes(targetHash, "/project", { phase: "completed" });
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, bytes);
+    const isolated = await importReconciliationWithJournalParentFault([1]);
+    const parseSpy = vi.spyOn(JSON, "parse");
+    try {
+      let caught: unknown;
+      try {
+        isolated.module.listWorktreeReconciliationJournals();
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+      });
+      expect((caught as Error).cause).toBeInstanceOf(Error);
+      expect(String((caught as Error).cause))
+        .toContain("authenticated journal reader observed a different parent inode");
+      expect(isolated.readCount()).toBe(1);
+      expect(parseSpy.mock.calls.some(([content]) => content === bytes)).toBe(false);
+      expect(readFileSync(journalPath, "utf8")).toBe(bytes);
+    } finally {
+      parseSpy.mockRestore();
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it.each([
+    { checkpoint: "locked initial read", mismatchRead: 2 },
+    { checkpoint: "prewrite", mismatchRead: 3 },
+    { checkpoint: "beforeReplace", mismatchRead: 4 },
+  ])("journal parent witness refuses a mismatch at $checkpoint", async ({ mismatchRead }) => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const root = join(home, ".lcm", "reconciliations");
+    const journalPath = join(root, `${targetHash}.json`);
+    const bytes = reconciliationJournalBytes(targetHash, canonical);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, bytes);
+    const isolated = await importReconciliationWithJournalParentFault([mismatchRead]);
+    try {
+      let caught: unknown;
+      try {
+        isolated.module.reconcileWorktrees(main, { homeDir: home });
+      } catch (error) {
+        caught = error;
+      }
+      expect(String(caught)).toContain(
+        "worktree reconciliation journal parent changed during admission",
+      );
+      expect(isolated.readCount()).toBe(mismatchRead);
+      expect(readFileSync(journalPath, "utf8")).toBe(bytes);
+      expect(readdirSync(root).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
+      expect(existsSync(projectMapPath(home))).toBe(false);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal parent witness refuses mismatched post-publication readback", async () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const root = join(home, ".lcm", "reconciliations");
+    const journalPath = join(root, `${targetHash}.json`);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, reconciliationJournalBytes(targetHash, canonical));
+    const isolated = await importReconciliationWithJournalParentFault([5]);
+    try {
+      expect(() => isolated.module.reconcileWorktrees(main, { homeDir: home }))
+        .toThrow("worktree reconciliation journal parent changed during admission");
+      expect(isolated.readCount()).toBe(5);
+      expect(JSON.parse(readFileSync(journalPath, "utf8"))).toMatchObject({
+        targetHash,
+        phase: "completed",
+      });
+      expect(readdirSync(root).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
+      expect(existsSync(projectMapPath(home))).toBe(false);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal parent witness refuses mismatch during outer blocked recovery", async () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const root = join(home, ".lcm", "reconciliations");
+    const journalPath = join(root, `${targetHash}.json`);
+    const bytes = reconciliationJournalBytes(targetHash, canonical);
+    const primary = new Error("injected failure before outer blocked recovery");
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, bytes);
+    const isolated = await importReconciliationWithJournalParentFault([3]);
+    try {
+      let caught: unknown;
+      try {
+        isolated.module.reconcileWorktrees(main, {
+          homeDir: home,
+          _observer: (event) => {
+            if (event === "after-journal-admission") throw primary;
+          },
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(AggregateError);
+      expect((caught as AggregateError).cause).toBe(primary);
+      expect((caught as AggregateError).errors[0]).toBe(primary);
+      expect(String((caught as AggregateError).errors[1]))
+        .toContain("worktree reconciliation journal parent changed during admission");
+      expect(isolated.readCount()).toBe(3);
+      expect(readFileSync(journalPath, "utf8")).toBe(bytes);
+      expect(readdirSync(root).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
+      expect(existsSync(projectMapPath(home))).toBe(false);
+    } finally {
+      resetReconciliationModuleMocks();
+    }
+  });
+
+  it("journal parent witness accepts an equal observed parent", async () => {
+    const { main } = makeRepository(home);
+    const canonical = resolveGitProjectAnchor(main)!.canonical;
+    const targetHash = hashProjectPath(canonical);
+    const root = join(home, ".lcm", "reconciliations");
+    const journalPath = join(root, `${targetHash}.json`);
+    makePrivateFixtureDirectory(root);
+    writePrivateFixtureFile(journalPath, reconciliationJournalBytes(targetHash, canonical));
+    const isolated = await importReconciliationWithJournalParentFault([]);
+    try {
+      expect(isolated.module.reconcileWorktrees(main, { homeDir: home }).status)
+        .toBe("not-needed");
+      expect(isolated.readCount()).toBe(5);
+      expect(JSON.parse(readFileSync(journalPath, "utf8"))).toMatchObject({
+        targetHash,
+        phase: "completed",
+      });
+    } finally {
+      resetReconciliationModuleMocks();
+    }
   });
 
   it.each([
@@ -9537,6 +10872,40 @@ describe("worktree reconciliation", () => {
     evidence.close();
   }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
 
+  it("re-fences unsupported source message content after a completed target merge", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "message-marker-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "message-marker-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec("UPDATE messages SET content = CAST(X'736F7572636500737566666978' AS TEXT)");
+    source.close();
+    const target = new DatabaseSync(fixture.targetPath);
+    target.exec(`
+      CREATE TABLE worktree_reconciliation_sources (
+        source_hash TEXT PRIMARY KEY,
+        merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    target.prepare(
+      "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
+    ).run(fixture.sourceHash);
+    target.close();
+    makeEvents(join(home, ".lcm", "events", `${fixture.targetHash}.db`), "message-marker-target");
+    makeEvents(join(home, ".lcm", "events", `${fixture.sourceHash}.db`), "message-marker-source");
+    const result = reconcileWorktrees(fixture.main);
+    expect(result.status).toBe("completed");
+    const merged = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(merged.prepare(
+      "SELECT hex(content) AS content FROM messages WHERE message_id = 1",
+    ).get()).toEqual({ content: "746172676574" });
+    merged.close();
+    const backup = result.backupPaths.find((path) => path.includes("oldprojects"))!;
+    const evidence = new DatabaseSync(join(backup, "db.sqlite"), { readOnly: true });
+    expect(evidence.prepare("SELECT hex(content) AS content FROM messages").get())
+      .toEqual({ content: "736F7572636500737566666978" });
+    evidence.close();
+  }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
+
   it("refuses unsupported source content if its completed marker disappears", () => {
     const fixture = makeProjectReconciliation(home);
     makeDatabase(fixture.targetPath, "marker-race-target", "target", fixture.targetHash);
@@ -9600,6 +10969,63 @@ describe("worktree reconciliation", () => {
     ).get()).toMatchObject({ name: "worktree_reconciliation_fence" });
     preservedSource.close();
 
+    expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
+  }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
+
+  it("refuses unsupported source message content if its completed marker disappears", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "message-marker-race-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "message-marker-race-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec("UPDATE messages SET content = CAST(X'736F7572636500737566666978' AS TEXT)");
+    source.close();
+    const target = new DatabaseSync(fixture.targetPath);
+    target.exec(`
+      CREATE TABLE worktree_reconciliation_sources (
+        source_hash TEXT PRIMARY KEY,
+        merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    target.prepare(
+      "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
+    ).run(fixture.sourceHash);
+    target.close();
+    const instrumentation = instrumentTargetReconciliationCommit(
+      () => undefined,
+      {
+        onBegin: (openedTarget) => {
+          openedTarget.prepare(
+            "DELETE FROM worktree_reconciliation_sources WHERE source_hash = ?",
+          ).run(fixture.sourceHash);
+        },
+      },
+    );
+    try {
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "stored message content is unsupported",
+      );
+    } finally {
+      instrumentation.restore();
+    }
+    const preservedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(preservedTarget.prepare(
+      "SELECT COUNT(*) AS count FROM worktree_reconciliation_sources WHERE source_hash = ?",
+    ).get(fixture.sourceHash)).toEqual({ count: 1 });
+    expect(preservedTarget.prepare(
+      "SELECT hex(content) AS content FROM messages WHERE message_id = 1",
+    ).get()).toEqual({ content: "746172676574" });
+    preservedTarget.close();
+    const preservedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(preservedSource.prepare("SELECT hex(content) AS content FROM messages").get())
+      .toEqual({ content: "736F7572636500737566666978" });
+    expect(preservedSource.prepare(
+      "SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'",
+    ).get()).toMatchObject({ name: "worktree_reconciliation_fence" });
+    preservedSource.close();
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{
+      phase: "blocked",
+      reason: "Error: stored message content is unsupported",
+    }]);
     expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
   }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
 

@@ -46,7 +46,12 @@ import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE }
 import { MachineIdentityFileError } from "../src/machine-identity.js";
 import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 import { PrivateMutationLockContentionError } from "../src/private-mutation-lock.js";
-import { BackendPublicationJournalError } from "../src/storage/backend-publication.js";
+import {
+  assertBackendPublicationConfigReadAccess,
+  backendPublicationHomeForConfigPath,
+  BackendPublicationJournalError,
+  withBackendPublicationReadRoot,
+} from "../src/storage/backend-publication.js";
 import { BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC } from "../src/hooks/publication-fence.js";
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
 import { isDaemonTransportFailure } from "../src/daemon/http-url.js";
@@ -1029,6 +1034,14 @@ export type RootBootstrapRetrySeams = {
   readonly migrate: () => unknown;
   readonly sleep: (delayMs: number) => Promise<void>;
   readonly attempt?: (attempt: number) => void;
+  /** @internal Deterministic restart config observation seam. */
+  readonly _readDaemonConfigSnapshot?: typeof readDaemonConfigSnapshot;
+  /** @internal Deterministic restart config publication-admission seam. */
+  readonly _assertBackendPublicationConfigReadAccess?: typeof assertBackendPublicationConfigReadAccess;
+  /** @internal Deterministic restart publication-root seam. */
+  readonly _withBackendPublicationReadRoot?: typeof withBackendPublicationReadRoot;
+  /** @internal Deterministic config interleaving seam. */
+  readonly _betweenDaemonRestartSnapshotsForTesting?: () => void;
 };
 
 const DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS: Omit<RootBootstrapRetrySeams, "migrate"> = {
@@ -1215,6 +1228,7 @@ function isNestedUnderRoot(actionCommand: Command, parentName: string, actionNam
 }
 
 function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
+  if (isNestedUnderRoot(actionCommand, "daemon", "restart")) return false;
   const action = actionCommand.name();
   const topLevel = actionCommand.parent?.name() === "lcm";
   if (topLevel && (
@@ -1230,6 +1244,117 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   if ((action === "list" || action === "doctor") && actionCommand.parent?.name() === "connectors") return false;
   if (topLevel && ["daemon", "config", "machine", "project", "postgres", "events", "connectors"].includes(action)) return false;
   return true;
+}
+
+type DaemonRestartConfigObservation = Readonly<{
+  config: DaemonConfig;
+  validate: () => void;
+}>;
+
+function daemonRestartPublicationHome(configFile: string, pidFile: string): string {
+  const homeDir = backendPublicationHomeForConfigPath(configFile);
+  if (
+    homeDir === undefined
+    || resolve(pidFile) !== resolve(join(homeDir, ".lcm", "daemon.pid"))
+  ) {
+    throw new BackendPublicationJournalError(
+      "unexpected-state",
+      "daemon restart paths do not share one canonical publication home",
+    );
+  }
+  return homeDir;
+}
+
+function observeDaemonRestartConfig(
+  configFile: string,
+  pidFile: string,
+  seams: RootBootstrapRetrySeams | undefined,
+): DaemonRestartConfigObservation {
+  const homeDir = daemonRestartPublicationHome(configFile, pidFile);
+  const readSnapshot = seams?._readDaemonConfigSnapshot ?? readDaemonConfigSnapshot;
+  const assertReadAccess = seams?._assertBackendPublicationConfigReadAccess
+    ?? assertBackendPublicationConfigReadAccess;
+  const withReadRoot = seams?._withBackendPublicationReadRoot
+    ?? withBackendPublicationReadRoot;
+
+  const readStable = (): Readonly<{
+    config: DaemonConfig;
+    witness: ReturnType<typeof readDaemonConfigSnapshot>["witness"];
+    journalChecksumSha256: string | null;
+  }> => withReadRoot(homeDir, (assertReadRoot) => {
+    const readOne = (): ReturnType<typeof readDaemonConfigSnapshot> => {
+      assertReadRoot();
+      const snapshot = readSnapshot(configFile);
+      assertReadRoot();
+      if (snapshot.witness.presence === "absent") {
+        throw new BackendPublicationJournalError(
+          "unexpected-state",
+          "daemon restart recovery requires an existing configuration",
+        );
+      }
+      return snapshot;
+    };
+    const admit = (
+      snapshot: ReturnType<typeof readDaemonConfigSnapshot>,
+    ): Readonly<{ journalChecksumSha256: string | null }> => {
+      assertReadRoot();
+      const admission = assertReadAccess(
+        configFile,
+        snapshot.config.storage.backend,
+        snapshot.witness,
+      );
+      assertReadRoot();
+      return admission;
+    };
+    const first = readOne();
+    const firstAdmission = admit(first);
+    assertReadRoot();
+    seams?._betweenDaemonRestartSnapshotsForTesting?.();
+    assertReadRoot();
+    const second = readOne();
+    const secondAdmission = admit(second);
+    if (
+      !daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
+      || first.config.storage.backend !== second.config.storage.backend
+      || first.config.daemon.port !== second.config.daemon.port
+      || firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256
+    ) {
+      throw new BackendPublicationJournalError(
+        "unexpected-state",
+        "daemon restart configuration changed during lock-free publication admission",
+      );
+    }
+    return {
+      config: second.config,
+      witness: second.witness,
+      journalChecksumSha256: secondAdmission.journalChecksumSha256,
+    };
+  });
+
+  const accepted = readStable();
+  return {
+    config: accepted.config,
+    validate: () => {
+      if (daemonRestartPublicationHome(configFile, pidFile) !== homeDir) {
+        throw new BackendPublicationJournalError(
+          "unexpected-state",
+          "daemon restart publication home changed before managed restart",
+        );
+      }
+      const current = readStable();
+      if (
+        !daemonConfigSnapshotWitnessEqual(accepted.witness, current.witness)
+        || accepted.config.storage.backend !== current.config.storage.backend
+        || accepted.config.daemon.port !== current.config.daemon.port
+        || accepted.journalChecksumSha256 !== current.journalChecksumSha256
+      ) {
+        throw new BackendPublicationJournalError(
+          "unexpected-state",
+          "daemon restart publication evidence changed before managed restart",
+        );
+      }
+    },
+  };
 }
 
 function shouldUsePublicationConvergence(actionCommand: Command): boolean {
@@ -1533,7 +1658,7 @@ export function registerProjectCommand(
       const { printHelp } = await import("../src/cli-help.js");
       printHelp("project"); exit(0);
     }
-    console.error("Usage: lcm project <create|link|unlink|list|show|reconcile-worktrees> [options]");
+    console.error("Usage: lcm project <create|link|unlink|list|show|reconcile-worktrees|renew-retired-identity> [options]");
     exit(1);
   });
 
@@ -1567,6 +1692,39 @@ export function registerProjectCommand(
           console.log(`  backup: ${sanitizeTerminalText(backup)}`);
         }
         if (result.reason) console.log(`  reason: ${sanitizeTerminalText(result.reason)}`);
+      } catch (err) {
+        projectError(err, opts);
+      }
+    });
+
+  projectCmd
+    .command("renew-retired-identity [path]")
+    .description("Renew one exact retired local project identity without removing its fence")
+    .option("--json", "Output structured JSON")
+    .helpOption(false)
+    .option("-h, --help", "Show help")
+    .action(async (path: string | undefined, opts: ProjectOptions) => {
+      if (projectHelpRequested(opts)) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("project"); exit(0);
+      }
+      try {
+        const { renewRetiredProjectIdentity } = await import("../src/project-map.js");
+        const result = renewRetiredProjectIdentity(path ?? process.cwd());
+        if (opts.json) {
+          printJson({
+            oldId: result.oldId,
+            newId: result.newId,
+            changed: result.changed,
+          });
+          return;
+        }
+        console.log(result.changed
+          ? "Renewed retired local project identity."
+          : "Retired local project identity was already renewed.");
+        console.log(`  old: ${result.oldId}`);
+        console.log(`  new: ${result.newId}`);
+        console.log("  Retry the original command; the reconciliation fence was preserved.");
       } catch (err) {
         projectError(err, opts);
       }
@@ -2297,21 +2455,60 @@ export async function runCli(
       if (opts.help) await withCustomHelp(daemonCmd, "daemon");
       const { loadDaemonConfig } = await import("../src/daemon/config.js");
       const { restartDaemon } = await import("../src/daemon/lifecycle.js");
-      const config = loadDaemonConfig(defaultConfigPath());
+      const configFile = defaultConfigPath();
+      const pidFile = daemonPidPath();
+      let config: DaemonConfig;
+      let observed: DaemonRestartConfigObservation | undefined;
+      try {
+        await migrateLegacyHomeWithRetry({
+          migrate,
+          sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
+          attempt: preflightSeams?.attempt,
+        });
+        config = loadDaemonConfig(configFile);
+      } catch (error) {
+        if (!(error instanceof PrivateMutationLockContentionError)) {
+          console.error(`  ${knownCliErrorDiagnostic(error) ?? daemonUnavailableMessage(undefined, "ambiguous")}`);
+          exit(1);
+        }
+        try {
+          observed = observeDaemonRestartConfig(configFile, pidFile, preflightSeams);
+          config = observed.config;
+        } catch (observationError) {
+          console.error(`  ${knownCliErrorDiagnostic(observationError) ?? daemonUnavailableMessage(undefined, "ambiguous")}`);
+          exit(1);
+        }
+      }
       const port = config.daemon?.port ?? 3737;
+      const validateRecoveryObservation = (): void => {
+        const current = observed
+          ?? observeDaemonRestartConfig(configFile, pidFile, preflightSeams);
+        if (
+          current.config.daemon.port !== port
+          || current.config.storage.backend !== config.storage.backend
+        ) {
+          throw new BackendPublicationJournalError(
+            "unexpected-state",
+            "daemon restart recovery configuration does not match the requested replacement",
+          );
+        }
+        current.validate();
+      };
       let result: Awaited<ReturnType<typeof restartDaemon>>;
       try {
         result = await restartDaemon({
           port,
-          pidFilePath: daemonPidPath(),
+          pidFilePath: pidFile,
           spawnTimeoutMs: 10000,
           expectedVersion: typeof pkg.version === "string" ? pkg.version : undefined,
           expectedStorageBackend: config.storage.backend,
           enforceUserManagerParent: true,
-          validateBeforeRestart: () => { loadDaemonConfig(defaultConfigPath()); },
+          validateBeforeRestart: observed?.validate
+            ?? (() => { loadDaemonConfig(configFile); }),
+          _validateBeforeManagedRestart: validateRecoveryObservation,
         });
-      } catch {
-        console.error(`  ${daemonUnavailableMessage(undefined, "ambiguous")}`);
+      } catch (error) {
+        console.error(`  ${knownCliErrorDiagnostic(error) ?? daemonUnavailableMessage(undefined, "ambiguous")}`);
         exit(1);
       }
       if (!result.connected) {
@@ -2468,6 +2665,23 @@ export async function runCli(
                 expectedStorageBackend: compactStorageBackend,
                 expectedRuntimeDigest: compactRuntimeDigest,
                 enforceUserManagerParent: true,
+                _validateBeforeManagedRestart: () => {
+                  const current = observeDaemonRestartConfig(
+                    defaultConfigPath(),
+                    compactPidFilePath!,
+                    preflightSeams,
+                  );
+                  if (
+                    current.config.daemon.port !== compactPort
+                    || current.config.storage.backend !== compactStorageBackend
+                  ) {
+                    throw new BackendPublicationJournalError(
+                      "unexpected-state",
+                      "compact drain recovery configuration changed before managed restart",
+                    );
+                  }
+                  current.validate();
+                },
                 _abortSignal: signal,
               });
             },
@@ -2639,8 +2853,8 @@ export async function runCli(
             },
             onProgress: (patch: Partial<ProgressState>): void => {
               Object.assign(compactState, patch);
-              if (patch.lastResult) compactRenderer.sessionDone();
             },
+            onEvent: event => compactRenderer.handleEvent(event),
           });
 
           compactState.phases[0].status = "done";
@@ -2652,7 +2866,6 @@ export async function runCli(
             for (const promoteCwd of compactedProjects) {
               if (signalHandlers.draining) break;
               compactState.currentProject = sanitizeTerminalText(promoteCwd);
-              if (!isTTY || verbose) console.error(`  promoting: ${sanitizeTerminalText(promoteCwd)}...`);
               try {
                 const promotionBody = {
                   cwd: promoteCwd,
@@ -2690,14 +2903,12 @@ export async function runCli(
               } catch (error) {
                 promotionFailures++;
                 const message = error instanceof Error ? error.message : "request failed";
-                compactState.phaseErrors.push({
+                compactRenderer.handleEvent({
+                  type: "phase-failure",
                   phase: "Promote",
-                  target: sanitizeTerminalText(promoteCwd),
-                  message: sanitizeTerminalText(message),
+                  project: promoteCwd,
+                  message,
                 });
-                console.error(
-                  `  promotion failed for ${sanitizeTerminalText(promoteCwd)}: ${sanitizeTerminalText(message)}`,
-                );
               }
             }
             compactState.currentProject = undefined;
@@ -2753,7 +2964,8 @@ export async function runCli(
             }
           }
         }
-        if (isTTY) compactRenderer.printSummary();
+        compactRenderer.stop();
+        compactRenderer.printSummary();
         if (totalPromoted > 0) {
           console.log(`  → ${totalPromoted} insight${totalPromoted !== 1 ? "s" : ""} promoted`);
         }

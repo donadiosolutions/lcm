@@ -3,6 +3,8 @@ import { join, resolve } from "node:path";
 import { localProjectIdentity } from "../daemon/project.js";
 import {
   hashProjectPath,
+  isAuthenticatedRetiredProjectIdentitySuccessor,
+  isRetiredProjectIdentitySuccessor,
   normalizeProjectIdentityPath,
   normalizeProjectPath,
   resolveExistingProjectIdentity,
@@ -39,6 +41,21 @@ type ExistingEventsDbPathOptions = Readonly<{
 
 function effectiveUid(): number | undefined {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
+
+/**
+ * Authenticate an identity-evidence id against its own canonical path. A
+ * plain path-hash id always matches, exactly as before. A renewed successor
+ * id (see `retiredProjectIdentitySuccessor`) is authenticated only when the
+ * retained predecessor fence for that same retirement is genuinely present,
+ * mirroring the identical `isAuthenticatedRetiredProjectIdentityFence` proof
+ * that `parseLocalProjectMapCompatibility` already requires before it will
+ * ever hand a hook that successor id. Any other id is rejected.
+ */
+function isAuthenticatedIdentityEvidenceId(canonical: string, id: string): boolean {
+  const plainId = hashProjectPath(canonical);
+  if (id === plainId) return true;
+  return isAuthenticatedRetiredProjectIdentitySuccessor(id, plainId, canonical);
 }
 
 function identityEvidencePath(normalizedCwd: string): string {
@@ -98,7 +115,7 @@ function existingSidecarFromIdentityEvidence(
       || resolve(record.canonical) !== record.canonical
       || typeof record.id !== "string"
       || !PROJECT_ID_PATTERN.test(record.id)
-      || hashProjectPath(record.canonical) !== record.id
+      || !isAuthenticatedIdentityEvidenceId(record.canonical, record.id)
     ) {
       return undefined;
     }
@@ -152,7 +169,19 @@ export function existingEventsDbPath(
     try {
       assertPrivateDirectory(handle, directory, witness);
       if (identity) {
-        result = join(directory, `${identity.id}.db`);
+        const retiredId = hashProjectPath(identity.canonical);
+        const successorUnauthenticated = isRetiredProjectIdentitySuccessor(
+          identity.id,
+          retiredId,
+          identity.canonical,
+        ) && !isAuthenticatedRetiredProjectIdentitySuccessor(
+          identity.id,
+          retiredId,
+          identity.canonical,
+        );
+        result = successorUnauthenticated
+          ? undefined
+          : join(directory, `${identity.id}.db`);
       } else {
         const evidenced = existingSidecarFromIdentityEvidence(cwd, expectedUid);
         if (evidenced) {

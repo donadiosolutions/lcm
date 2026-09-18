@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Command } from "commander";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 const state = vi.hoisted(() => ({
   exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
@@ -86,6 +87,7 @@ const state = vi.hoisted(() => ({
   batchPatch: { lastResult: { ok: true } } as Record<string, unknown>,
   batchTransportFailure: undefined as unknown,
   batchSignal: undefined as "SIGINT" | "SIGTERM" | undefined,
+  batchEvent: undefined as unknown,
   providerWitnessReads: [] as Array<{ available: boolean; providers: unknown[] } | Error>,
   providerWitnessReconciles: [] as Array<{ available: boolean; providers: unknown[] } | Error>,
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
@@ -93,7 +95,7 @@ const state = vi.hoisted(() => ({
   cliProjects: [] as Array<{ id: string; canonical: string; aliases: string[] }>,
   listCliProjects: vi.fn(async () => state.cliProjects),
   importPatch: { lastResult: { ok: true } } as Record<string, unknown>,
-  renderer: { start: vi.fn(), stop: vi.fn(), sessionDone: vi.fn(), printSummary: vi.fn() },
+  renderer: { start: vi.fn(), stop: vi.fn(), sessionDone: vi.fn(), handleEvent: vi.fn(), printSummary: vi.fn() },
   rendererOptions: undefined as unknown,
   progressState: undefined as undefined | Record<string, unknown>,
   writeFile: vi.fn(), unlink: vi.fn(), mkdir: vi.fn(),
@@ -260,9 +262,10 @@ vi.mock("../../src/config-manager.js", () => ({
   readConnectorTransport: vi.fn(() => state.storedCodexTransport),
   readConnectorTransportSnapshot: vi.fn(() => state.storedCodexTransport),
 }));
-vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void; onTransportFailure?: (error: unknown) => void }): Promise<typeof state.batchResult> => {
+vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (opts: { onProgress?: (patch: unknown) => void; onTransportFailure?: (error: unknown) => void; onEvent?: (event: unknown) => void }): Promise<typeof state.batchResult> => {
   state.batchOptions = opts;
   opts.onProgress?.(state.batchPatch);
+  if (state.batchEvent !== undefined) opts.onEvent?.(state.batchEvent);
   if (state.batchSignal !== undefined) process.emit(state.batchSignal);
   if (state.batchTransportFailure !== undefined) opts.onTransportFailure?.(state.batchTransportFailure);
   if (state.batchGate !== undefined) await state.batchGate;
@@ -279,7 +282,8 @@ vi.mock("../../src/cli/progress-state.js", () => ({ makeProgressState: vi.fn((va
 vi.mock("../../src/cli/pipeline-runner.js", () => ({ NinjaRenderer: class {
   constructor(options: unknown) { state.rendererOptions = options; }
   start = state.renderer.start; stop = state.renderer.stop;
-  sessionDone = state.renderer.sessionDone; printSummary = state.renderer.printSummary;
+  sessionDone = state.renderer.sessionDone; handleEvent = state.renderer.handleEvent;
+  printSummary = state.renderer.printSummary;
 } }));
 vi.mock("../../src/hooks/dispatch.js", () => ({ dispatchHook: state.dispatchHook }));
 vi.mock("../../src/connectors/registry.js", () => ({
@@ -358,8 +362,11 @@ async function captureRunCliActions(): Promise<Map<string, ActionHandler>> {
   return captured;
 }
 
-async function invoke(args: string[]): Promise<Error | undefined> {
-  try { await runCli(["node", "lcm", ...args]); return undefined; }
+async function invoke(
+  args: string[],
+  seams?: NonNullable<Parameters<typeof runCli>[1]>,
+): Promise<Error | undefined> {
+  try { await runCli(["node", "lcm", ...args], seams); return undefined; }
   catch (error) { return error instanceof Error ? error : new Error(String(error)); }
 }
 
@@ -387,6 +394,7 @@ beforeEach(() => {
   state.batchPatch = { lastResult: { ok: true } };
   state.batchTransportFailure = undefined;
   state.batchSignal = undefined;
+  state.batchEvent = undefined;
   state.providerWitnessReads = [];
   state.providerWitnessReconciles = [];
   state.importPatch = { lastResult: { ok: true } };
@@ -459,6 +467,7 @@ describe("runCli identity boundaries", () => {
     await expect(projectActions.get("project")!({})).rejects.toThrow("exit:1");
     await expect(projectActions.get("list")!({ help: true })).rejects.toThrow("exit:0");
     await expect(projectActions.get("reconcile-worktrees")!(undefined, { help: true })).rejects.toThrow("exit:0");
+    await expect(projectActions.get("renew-retired-identity")!(undefined, { help: true })).rejects.toThrow("exit:0");
     await expect(projectActions.get("show")!(undefined, { help: true })).rejects.toThrow("exit:0");
     await expect(projectActions.get("link")!(undefined, undefined, { help: true })).rejects.toThrow("exit:0");
     await expect(projectActions.get("unlink")!(undefined, { help: true })).rejects.toThrow("exit:0");
@@ -516,6 +525,43 @@ describe("runCli identity boundaries", () => {
     expect(await invoke(["project", "unlink", "--json"])).toBeUndefined();
     expect(await invoke(["project", "create", "/canonical", "--name", "Remote"])).toBeUndefined();
     expect(await invoke(["project", "create", "--json"])).toBeUndefined();
+  });
+
+  it("renders retired project identity renewal in text and JSON", async () => {
+    const projectMap = await import("../../src/project-map.js");
+    const renew = vi.spyOn(projectMap, "renewRetiredProjectIdentity").mockReturnValue({
+      oldId: "a".repeat(64),
+      newId: "b".repeat(64),
+      canonical: "/canonical",
+      changed: true,
+    });
+    const log = vi.spyOn(console, "log");
+    const write = vi.spyOn(process.stdout, "write");
+
+    expect(await invoke(["project", "renew-retired-identity", "/canonical"])).toBeUndefined();
+    expect(renew).toHaveBeenCalledWith("/canonical");
+    expect(log).toHaveBeenCalledWith("Renewed retired local project identity.");
+    expect(log).toHaveBeenCalledWith(`  old: ${"a".repeat(64)}`);
+    expect(log).toHaveBeenCalledWith(`  new: ${"b".repeat(64)}`);
+    expect(log).toHaveBeenCalledWith("  Retry the original command; the reconciliation fence was preserved.");
+
+    log.mockClear();
+    expect(await invoke(["project", "renew-retired-identity", "--json"])).toBeUndefined();
+    expect(write.mock.calls.map(([value]) => String(value)).join(""))
+      .toContain(`\"newId\": \"${"b".repeat(64)}\"`);
+
+    log.mockClear();
+    renew.mockReturnValueOnce({
+      oldId: "a".repeat(64),
+      newId: "b".repeat(64),
+      canonical: "/canonical",
+      changed: false,
+    });
+    expect(await invoke(["project", "renew-retired-identity", "/canonical"])).toBeUndefined();
+    expect(log).toHaveBeenCalledWith("Retired local project identity was already renewed.");
+
+    renew.mockImplementationOnce(() => { throw new Error("renewal failed"); });
+    expect((await invoke(["project", "renew-retired-identity", "/canonical"]))?.message).toBe("exit:1");
   });
 
   it("sanitizes persisted remote project text only for human output", async () => {
@@ -817,6 +863,12 @@ describe("runCli lifecycle and connector boundaries", () => {
 
     state.ensureDaemon.mockResolvedValueOnce({ connected: false, spawned: false, restartedForParent: false, pid: undefined });
     expect((await invoke(["compact", "--no-promote"]))?.message).toBe("exit:1");
+  });
+
+  it("forwards synchronous compact discovery and session events to the ninja renderer", async () => {
+    state.batchEvent = { type: "discovery-start", total: 3 };
+    await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+    expect(state.renderer.handleEvent).toHaveBeenCalledWith({ type: "discovery-start", total: 3 });
   });
 
   it("settles compact pre-registration and health drains without dispatching work", async () => {
@@ -1229,9 +1281,13 @@ describe("runCli scanning and portable knowledge boundaries", () => {
     expect(state.post).toHaveBeenCalledWith("/promote", { cwd: "/good", dry_run: false });
     expect(process.exitCode).toBe(1);
     expect(state.progressState?.errors).toEqual([]);
-    expect(state.progressState?.phaseErrors).toEqual([
-      { phase: "Promote", target: "/good", message: "best effort" },
-    ]);
+    expect(state.progressState?.phaseErrors).toEqual([]);
+    expect(state.renderer.handleEvent).toHaveBeenCalledWith({
+      type: "phase-failure",
+      phase: "Promote",
+      project: "/good",
+      message: "best effort",
+    });
   });
 
   it("registers one invocation and reuses it for automatic promotion", async () => {
@@ -1569,6 +1625,122 @@ describe("runCli scanning and portable knowledge boundaries", () => {
       vi.useRealTimers();
     }
   });
+
+  it.each([
+    ["matching config", undefined, undefined, undefined],
+    ["port drift", 4_444, undefined, undefined],
+    ["backend drift", undefined, "postgresql" as const, undefined],
+    ["observation failure", undefined, undefined, new Error("snapshot unavailable")],
+  ] as const)(
+    "validates compact-drain recovery at CLI dispatch for %s",
+    async (_name, observedPort, observedBackend, observationFailure) => {
+      vi.useFakeTimers();
+      const priorPaths = {
+        home: state.runtimeHome,
+        pid: state.runtimePidPath,
+        token: state.runtimeTokenPath,
+      };
+      state.runtimeHome = "/lcm";
+      state.runtimePidPath = "/lcm/.lcm/daemon.pid";
+      state.runtimeTokenPath = "/lcm/.lcm/daemon.token";
+      const config = {
+        daemon: { port: observedPort ?? 3_737 },
+        storage: { backend: observedBackend ?? "sqlite" },
+        llm: {
+          provider: "openai", apiMode: "responses", requestTimeoutMs: 1_000,
+          retry: { maxAttempts: 2, initialDelayMs: 1, maxDelayMs: 2, multiplier: 2 },
+        },
+        compaction: { autoCompactMinTokens: 1 },
+      };
+      const witness = {
+        presence: "present" as const,
+        rawSha256: "a".repeat(64),
+        byteLength: 100,
+        dev: "1",
+        ino: "2",
+        mtimeMs: 3,
+      };
+      let validationError: unknown;
+      const readSnapshot = vi.fn(() => {
+        if (observationFailure !== undefined) throw observationFailure;
+        return { config, witness } as never;
+      });
+      try {
+        state.health.mockReset();
+        state.cancelInvocation.mockReset();
+        state.health
+          .mockResolvedValueOnce({
+            status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+            daemonInstanceId: "11111111-1111-4111-8111-111111111111",
+            pid: 9,
+          })
+          .mockResolvedValueOnce(null)
+          .mockResolvedValueOnce({
+            status: "healthy", version: "1.4.2", storageBackend: "sqlite",
+            daemonInstanceId: "33333333-3333-4333-8333-333333333333",
+            runtimeDigest: "runtime",
+          });
+        state.restartDaemon.mockImplementationOnce(async (restartOptions: {
+          _validateBeforeManagedRestart?: () => void | Promise<void>;
+        }) => {
+          try {
+            await restartOptions._validateBeforeManagedRestart?.();
+          } catch (error) {
+            validationError = error;
+            throw error;
+          }
+          return { connected: true, restarted: true, stoppedPid: 9, pid: 10 };
+        });
+        state.cancelInvocation
+          .mockImplementationOnce(async (target: unknown) => ({
+            ...target as object,
+            state: "cancelling",
+            activeCount: 1,
+            workCount: 1,
+            commitCount: 0,
+            leaseExpiresAt: null,
+          }))
+          .mockImplementationOnce(async (target: unknown) => ({
+            ...target as object,
+            state: "cancelled",
+            activeCount: 0,
+            workCount: 0,
+            commitCount: 0,
+            leaseExpiresAt: null,
+          }));
+        state.batchSignal = "SIGINT";
+        const pending = invoke(["compact", "--no-promote"], {
+          migrate: vi.fn(),
+          sleep: async () => undefined,
+          _readDaemonConfigSnapshot: readSnapshot,
+          _assertBackendPublicationConfigReadAccess: () => ({ journalChecksumSha256: null }),
+          _withBackendPublicationReadRoot: (_homeDir, callback) => callback(() => undefined),
+        });
+        await vi.waitFor(() => expect(state.cancelInvocation).toHaveBeenCalledOnce());
+        await vi.advanceTimersByTimeAsync(1_000);
+        await expect(pending).resolves.toBeUndefined();
+
+        expect(state.restartDaemon).toHaveBeenCalledOnce();
+        if (observationFailure !== undefined) {
+          expect(validationError).toBe(observationFailure);
+          expect(readSnapshot).toHaveBeenCalledOnce();
+        } else if (observedPort !== undefined || observedBackend !== undefined) {
+          expect(validationError).toBeInstanceOf(BackendPublicationJournalError);
+          expect((validationError as Error).message)
+            .toBe("compact drain recovery configuration changed before managed restart");
+          expect(readSnapshot).toHaveBeenCalledTimes(2);
+        } else {
+          expect(validationError).toBeUndefined();
+          expect(readSnapshot).toHaveBeenCalledTimes(4);
+        }
+      } finally {
+        state.runtimeHome = priorPaths.home;
+        state.runtimePidPath = priorPaths.pid;
+        state.runtimeTokenPath = priorPaths.token;
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("covers TTY all-provider import directory filtering", async () => {
     Object.defineProperty(process.stderr, "isTTY", { configurable: true, value: true });

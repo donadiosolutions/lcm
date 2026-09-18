@@ -1077,6 +1077,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
         "inspectRuntimeRolePolicy",
         "runtimeReadinessExtensions",
         "runtimeReadinessExtensions:probePgStatStatements",
+        "runtimeReadinessContentCollation",
         "inspectRequiredExtensionFunctions",
       ]);
     },
@@ -1237,6 +1238,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       "inspectRuntimeRolePolicy",
       "runtimeReadinessExtensions",
       "runtimeReadinessExtensions:probePgStatStatements",
+      "runtimeReadinessContentCollation",
       "inspectRequiredExtensionFunctions",
       "inspectRequiredExtensionOperator",
     ]);
@@ -1295,6 +1297,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       "inspectRuntimeRolePolicy",
       "runtimeReadinessExtensions",
       "runtimeReadinessExtensions:probePgStatStatements",
+      "runtimeReadinessContentCollation",
       "inspectRequiredExtensionFunctions",
       "inspectRequiredExtensionOperator",
       "inspectRequiredGinTrgmOperatorClass",
@@ -1554,11 +1557,12 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
 
     const failure = await expectReadinessFailure(fake, "extension-preflight");
     expect(failure.operation).toBe("inspectRequiredGinTrgmSupportFunctions");
-    expect(fake.queries.map(({ options }) => options.operation).slice(0, 10)).toEqual([
+    expect(fake.queries.map(({ options }) => options.operation).slice(0, 11)).toEqual([
       "inspectServerReadiness",
       "inspectRuntimeRolePolicy",
       "runtimeReadinessExtensions",
       "runtimeReadinessExtensions:probePgStatStatements",
+      "runtimeReadinessContentCollation",
       "inspectRequiredExtensionFunctions",
       "inspectRequiredExtensionOperator",
       "inspectRequiredGinTrgmOperatorClass",
@@ -1566,6 +1570,46 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       "inspectRequiredGinTrgmIndirectOperators",
       "inspectRequiredGinTrgmSupportFunctions",
     ]);
+  });
+
+  it("rejects readiness when promoted_memories.content has a nondeterministic collation", async () => {
+    const fake = readyExecutor({
+      operationOverrides: {
+        runtimeReadinessContentCollation: [{
+          collation_name: "public.some_named_collation",
+          collation_is_deterministic: false,
+        }],
+      },
+    });
+    const failure = await expectReadinessFailure(fake, "content-collation-preflight");
+    expect(failure.operation).toBe("runtimeReadinessContentCollation");
+    // Same position rationale as the migration-time preflight: this
+    // runs immediately after required-extension readiness succeeds,
+    // and stops there rather than reaching the deeper trusted-function
+    // or search-configuration checks that follow it.
+    expect(fake.queries.map(({ options }) => options.operation)).toEqual([
+      "inspectServerReadiness",
+      "inspectRuntimeRolePolicy",
+      "runtimeReadinessExtensions",
+      "runtimeReadinessExtensions:probePgStatStatements",
+      "runtimeReadinessContentCollation",
+    ]);
+  });
+
+  it("does not run the content-collation check before required extensions are ready", async () => {
+    const fake = readyExecutor({
+      operationOverrides: {
+        "runtimeReadinessExtensions": mutateFirstField("installed_version", "2.0"),
+      },
+    });
+    await expectReadinessFailure(fake, "extension-preflight");
+    // A broken required extension must block before the
+    // managed-table-specific content-collation check ever runs: it is
+    // an environment-wide precondition, and pgcrypto backs the
+    // digest() the collation check protects.
+    expect(fake.queries.map(({ options }) => options.operation)).not.toContain(
+      "runtimeReadinessContentCollation",
+    );
   });
 
   it("propagates the caller signal to every readiness query", async () => {
@@ -1735,6 +1779,17 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
         },
       }),
       "extension-preflight",
+    );
+    await expectReadinessFailure(
+      readyExecutor({
+        operationOverrides: {
+          runtimeReadinessContentCollation: [{
+            collation_name: "public.some_named_collation",
+            collation_is_deterministic: false,
+          }],
+        },
+      }),
+      "content-collation-preflight",
     );
     await expectReadinessFailure(
       readyExecutor({

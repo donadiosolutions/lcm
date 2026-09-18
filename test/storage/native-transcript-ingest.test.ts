@@ -17,6 +17,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { parseCodexTranscriptText } from "../../src/codex-transcript.js";
+import { parseTranscriptText } from "../../src/transcript.js";
+import { ScrubEngine } from "../../src/scrub.js";
 import type {
   JsonObject,
   JsonValue,
@@ -50,6 +53,7 @@ import {
   readNativeTranscriptJsonl,
   runNativeTranscriptBackfill as runNativeTranscriptBackfillCore,
   NATIVE_TRANSCRIPT_MAX_LINK_SOURCE_ORDINAL,
+  NATIVE_TRANSCRIPT_SCRUB_PIPELINE_VERSION,
   SUPPORTED_NATIVE_TRANSCRIPT_FORMATS,
   type NativeTranscriptBackfillResult,
   type NativeTranscriptByteSource,
@@ -299,6 +303,17 @@ describe("native transcript scrub and JSONL reader", () => {
       },
     ]);
     expect(CODEX_NATIVE_TRANSCRIPT_FORMAT.clientName).toBe("codex");
+    expect(NATIVE_TRANSCRIPT_SCRUB_PIPELINE_VERSION).toBe(
+      "native-json-scrub/v2",
+    );
+    expect(DEFAULT_SCRUBBER_VERSION).toMatch(
+      /^native-json-scrub\/v2:[0-9a-f]{64}$/u,
+    );
+    expect(createNativeTranscriptScrubber({
+      globalPatterns: [],
+      projectPatterns: [],
+      pipelineVersion: "custom/v9",
+    }).scrubberVersion).toMatch(/^custom\/v9:[0-9a-f]{64}$/u);
   });
 
   it("scrubs nested keys and values and canonicalizes object keys", () => {
@@ -323,6 +338,300 @@ describe("native transcript scrub and JSONL reader", () => {
     );
     expect(canonicalNativeTranscriptJson(null)).toBe("null");
     expect(canonicalNativeTranscriptJson("x")).toBe('"x"');
+  });
+
+  it("scrubs Claude patterns that span text blocks", () => {
+    const payload = {
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "alpha" },
+          { type: "text", text: "beta" },
+        ],
+      },
+    };
+    const patterns = ["alpha\\s+beta"];
+    const parsed = parseTranscriptText(`${JSON.stringify(payload)}\n`);
+    const expected = new ScrubEngine(patterns, []).scrub(
+      parsed[0]!.content,
+    );
+
+    const scrubbed = createNativeTranscriptScrubber({
+      globalPatterns: patterns,
+      projectPatterns: [],
+    }).scrubJson(payload);
+    const mapped = createNativeTranscriptMessageMapper().map(
+      CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      scrubbed,
+      0,
+    );
+
+    expect(expected).toBe("[REDACTED]");
+    expect(mapped[0]?.content).toBe(expected);
+    expect(scrubbed).toEqual({
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "[REDACTED]" },
+          { type: "text", text: "" },
+        ],
+      },
+    });
+  });
+
+  it("coalesces sanitized Claude text without mutating the input", () => {
+    const payload = {
+      message: {
+        role: "assistant",
+        content: [
+          { type: "tool_result", content: "" },
+          { type: "tool_result", content: {} },
+          null,
+          {
+            type: "tool_result",
+            content: "alpha",
+            metadata: "private-note",
+          },
+          { type: "text", text: "" },
+          { type: "unknown", text: "private-note" },
+          { type: "text", text: "beta" },
+          { type: "text", text: "gamma" },
+        ],
+      },
+    };
+    const original = structuredClone(payload);
+    const scrubber = createNativeTranscriptScrubber({
+      globalPatterns: [],
+      projectPatterns: ["alpha\\s+beta", "private-note"],
+    });
+
+    const scrubbed = scrubber.scrubJson(payload);
+
+    expect(payload).toEqual(original);
+    expect(scrubbed).toEqual({
+      message: {
+        role: "assistant",
+        content: [
+          { type: "tool_result", content: "" },
+          { type: "tool_result", content: {} },
+          null,
+          {
+            type: "tool_result",
+            content: "[REDACTED]\ngamma",
+            metadata: "[REDACTED]",
+          },
+          { type: "text", text: "" },
+          { type: "unknown", text: "[REDACTED]" },
+          { type: "text", text: "" },
+          { type: "text", text: "" },
+        ],
+      },
+    });
+    expect(scrubber.scrubJson(scrubbed)).toEqual(scrubbed);
+  });
+
+  it("uses Codex join and trim semantics for every text block form", () => {
+    const arrayPayload = {
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "input_text", text: "   " },
+          { type: "output_text", text: "alpha" },
+          { type: "text", text: "beta" },
+          { type: "ignored", text: "alpha beta" },
+        ],
+      },
+    };
+    const patterns = ["alpha\\s+beta"];
+    const parsed = parseCodexTranscriptText(
+      `${JSON.stringify(arrayPayload)}\n`,
+    );
+    const expected = new ScrubEngine(patterns, []).scrub(
+      parsed[0]!.content,
+    );
+    const scrubbedArray = createNativeTranscriptScrubber({
+      globalPatterns: patterns,
+      projectPatterns: [],
+    }).scrubJson(arrayPayload);
+    expect(createNativeTranscriptMessageMapper().map(
+      CODEX_NATIVE_TRANSCRIPT_FORMAT,
+      scrubbedArray,
+      0,
+    )[0]?.content).toBe(expected);
+    expect(scrubbedArray).toEqual({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "input_text", text: "[REDACTED]" },
+          { type: "output_text", text: "" },
+          { type: "text", text: "" },
+          { type: "ignored", text: "[REDACTED]" },
+        ],
+      },
+    });
+
+    const stringPayload = {
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: "  secret  ",
+      },
+    };
+    expect(createNativeTranscriptScrubber({
+      globalPatterns: ["^  secret  $"],
+      projectPatterns: [],
+    }).scrubJson(stringPayload)).toEqual({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: "[REDACTED]",
+      },
+    });
+    expect(createNativeTranscriptScrubber({
+      globalPatterns: ["^secret$(?=\\s*$)"],
+      projectPatterns: [],
+    }).scrubJson(stringPayload)).toEqual({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: "[REDACTED]",
+      },
+    });
+  });
+
+  it("normalizes only exclusive supported root message shapes", () => {
+    const scrubber = createNativeTranscriptScrubber({
+      globalPatterns: ["alpha\\s+beta", "private-note"],
+      projectPatterns: [],
+    });
+    const developer = {
+      message: {
+        role: "developer",
+        content: [
+          { type: "text", text: "alpha" },
+          { type: "text", text: "beta" },
+        ],
+      },
+      metadata: "private-note",
+    };
+    const ambiguous = {
+      ...developer,
+      message: { ...developer.message, role: "user" },
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "output_text", text: "alpha" },
+          { type: "output_text", text: "beta" },
+        ],
+      },
+    };
+    const nested = { wrapper: {
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "alpha" },
+          { type: "text", text: "beta" },
+        ],
+      },
+    } };
+    const array = [developer];
+
+    expect(scrubber.scrubJson(developer)).toEqual({
+      ...developer,
+      metadata: "[REDACTED]",
+    });
+    expect(scrubber.scrubJson(ambiguous)).toEqual({
+      ...ambiguous,
+      metadata: "[REDACTED]",
+    });
+    expect(scrubber.scrubJson(nested)).toEqual(nested);
+    expect(scrubber.scrubJson(array)).toEqual([
+      { ...developer, metadata: "[REDACTED]" },
+    ]);
+  });
+
+  it("preserves stronger field redaction when joined output diverges", () => {
+    const payload = {
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "aaa bbb" },
+          { type: "text", text: "ccc" },
+        ],
+      },
+    };
+    const scrubbed = createNativeTranscriptScrubber({
+      globalPatterns: ["^aaa bbb$", "aaa b"],
+      projectPatterns: [],
+    }).scrubJson(payload);
+    expect(scrubbed).toEqual({
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "[REDACTED]" },
+          { type: "text", text: "ccc" },
+        ],
+      },
+    });
+    expect(JSON.stringify(scrubbed)).not.toContain("bb");
+  });
+
+  it("preserves benign layout and bounds corrected canonical bytes", async () => {
+    const benign = {
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "safe" },
+          { type: "unknown", text: "metadata" },
+        ],
+      },
+    };
+    const inertScrubber = createNativeTranscriptScrubber({
+      globalPatterns: ["alpha\\s+beta"],
+      projectPatterns: [],
+    });
+    const unchanged = inertScrubber.scrubJson(benign);
+    expect(unchanged).toEqual(benign);
+    expect(unchanged).not.toBe(benign);
+
+    const expanding = {
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "a" },
+          { type: "text", text: "b" },
+        ],
+      },
+    };
+    const raw = JSON.stringify(expanding);
+    const corrected = createNativeTranscriptScrubber({
+      globalPatterns: ["a\\s+b"],
+      projectPatterns: [],
+    }).scrubJson(expanding);
+    expect(Buffer.byteLength(canonicalNativeTranscriptJson(corrected)))
+      .toBeGreaterThan(Buffer.byteLength(raw));
+    const outcomes = await collect(byteChunks(`${raw}\n`), {
+      maxRecordBytes: Buffer.byteLength(raw),
+      scrubber: createNativeTranscriptScrubber({
+        globalPatterns: ["a\\s+b"],
+        projectPatterns: [],
+      }),
+    });
+    expect(outcomes).toEqual([
+      expect.objectContaining({
+        kind: "quarantine",
+        reason: "record-too-large",
+      }),
+    ]);
   });
 
   it("rejects invalid scrubber configuration before use", () => {
@@ -2344,6 +2653,340 @@ describe("native transcript backfill coordinator", () => {
     expect(byteSource.openSnapshot).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["global", ["ordinary", "alpha\\s+beta", "gamma\\s+delta"], []],
+    ["project", [], ["ordinary", "alpha\\s+beta", "gamma\\s+delta"]],
+  ] as const)(
+    "links %s patterns after parser-equivalent block joining",
+    async (_scope, globalPatterns, projectPatterns) => {
+      const payload = {
+        message: {
+          role: "user",
+          content: [
+            { type: "text", text: "ordinary" },
+            { type: "text", text: "alpha" },
+            { type: "text", text: "beta" },
+            { type: "text", text: "gamma" },
+            { type: "text", text: "delta" },
+          ],
+        },
+      };
+      const content = `${JSON.stringify(payload)}\n`;
+      const parsed = parseTranscriptText(content);
+      const expected = new ScrubEngine(
+        [...globalPatterns],
+        [...projectPatterns],
+      ).scrub(parsed[0]!.content);
+      expect(expected).toBe(
+        "[REDACTED]\n[REDACTED]\n[REDACTED]",
+      );
+      const messageResolver = createExactNativeTranscriptMessageResolver({
+        getNativeTranscriptMessageSnapshot: vi.fn(async () => [{
+          messageId: 9,
+          conversationId: 7,
+          messageSequence: 0,
+          role: "user",
+          content: expected,
+        }]),
+      });
+      const repo = repository();
+
+      await expect(runNativeTranscriptBackfill({
+        repository: repo,
+        quarantine: {
+          clientName: "claude-code",
+          quarantine: vi.fn(),
+          get: vi.fn(),
+          list: vi.fn(),
+          close: vi.fn(),
+        },
+        source: source(content),
+        machineId: "machine",
+        format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+        nativeSessionId: "session-1",
+        sourceLocator: "sessions/session.jsonl",
+        globalPatterns,
+        projectPatterns,
+        messageResolver,
+      })).resolves.toMatchObject({ importedCount: 1 });
+      expect(repo.batches[0]?.records[0]).toMatchObject({
+        nativePayload: {
+          message: {
+            role: "user",
+            content: [
+              { type: "text", text: expected },
+              { type: "text", text: "" },
+              { type: "text", text: "" },
+              { type: "text", text: "" },
+              { type: "text", text: "" },
+            ],
+          },
+        },
+        messageLinks: [{
+          conversationId: 7,
+          messageId: 9,
+          sourceOrdinal: 0,
+        }],
+      });
+    },
+  );
+
+  it("links Codex blocks to the real parser-scrubbed message", async () => {
+    const payload = {
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "input_text", text: " alpha" },
+          { type: "output_text", text: "beta" },
+          { type: "text", text: "gamma " },
+        ],
+      },
+    };
+    const content = `${JSON.stringify(payload)}\n`;
+    const patterns = ["alpha\\s+beta"];
+    const parsed = parseCodexTranscriptText(content);
+    const expected = new ScrubEngine(patterns, []).scrub(
+      parsed[0]!.content,
+    );
+    expect(expected).toBe("[REDACTED]\ngamma");
+    const repo = repository();
+
+    await expect(runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "codex",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: source(content),
+      machineId: "machine",
+      format: CODEX_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      globalPatterns: patterns,
+      messageResolver: createExactNativeTranscriptMessageResolver({
+        getNativeTranscriptMessageSnapshot: vi.fn(async () => [{
+          messageId: 9,
+          conversationId: 7,
+          messageSequence: 0,
+          role: "assistant",
+          content: expected,
+        }]),
+      }),
+    })).resolves.toMatchObject({ importedCount: 1 });
+    expect(repo.batches[0]?.records[0]).toMatchObject({
+      nativePayload: {
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [
+            { type: "input_text", text: expected },
+            { type: "output_text", text: "" },
+            { type: "text", text: "" },
+          ],
+        },
+      },
+      messageLinks: [{
+        conversationId: 7,
+        messageId: 9,
+        sourceOrdinal: 0,
+      }],
+    });
+  });
+
+  it("fails exact linkage without restoring overlapping field secrets", async () => {
+    const payload = {
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "aaa bbb" },
+          { type: "text", text: "ccc" },
+        ],
+      },
+    };
+    const content = `${JSON.stringify(payload)}\n`;
+    const patterns = ["^aaa bbb$", "aaa b"];
+    const parsed = parseTranscriptText(content);
+    const parserContent = new ScrubEngine(patterns, []).scrub(
+      parsed[0]!.content,
+    );
+    expect(parserContent).toBe("[REDACTED]bb\nccc");
+    const messageResolver = createExactNativeTranscriptMessageResolver({
+      getNativeTranscriptMessageSnapshot: vi.fn(async () => [{
+        messageId: 9,
+        conversationId: 7,
+        messageSequence: 0,
+        role: "user",
+        content: parserContent,
+      }]),
+    });
+    const repo = repository();
+
+    await expect(runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: source(content),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      globalPatterns: patterns,
+      messageResolver,
+    })).rejects.toBeInstanceOf(NativeTranscriptLinkError);
+    expect(repo.ingestBatch).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when composition matches a redaction marker", async () => {
+    const payload = {
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "xsecret" },
+          { type: "text", text: "tail" },
+        ],
+      },
+    };
+    const content = `${JSON.stringify(payload)}\n`;
+    const patterns = ["secret", "REDACTED.\\s*tail"];
+    const parsed = parseTranscriptText(content);
+    const parserContent = new ScrubEngine(patterns, []).scrub(
+      parsed[0]!.content,
+    );
+    expect(parserContent).toBe("x[REDACTED]\ntail");
+    const scrubbed = createNativeTranscriptScrubber({
+      globalPatterns: patterns,
+      projectPatterns: [],
+    }).scrubJson(payload);
+    expect(createNativeTranscriptMessageMapper().map(
+      CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      scrubbed,
+      0,
+    )[0]?.content).toBe("x[[REDACTED]");
+    expect(JSON.stringify(scrubbed)).not.toContain("secret");
+    expect(JSON.stringify(scrubbed)).not.toContain("tail");
+
+    const repo = repository();
+    await expect(runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: source(content),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      globalPatterns: patterns,
+      messageResolver: createExactNativeTranscriptMessageResolver({
+        getNativeTranscriptMessageSnapshot: vi.fn(async () => [{
+          messageId: 9,
+          conversationId: 7,
+          messageSequence: 0,
+          role: "user",
+          content: parserContent,
+        }]),
+      }),
+    })).rejects.toBeInstanceOf(NativeTranscriptLinkError);
+    expect(repo.ingestBatch).not.toHaveBeenCalled();
+  });
+
+  it("quarantines non-idempotent marker-adjacent composition", async () => {
+    const content = JSON.stringify({
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "xsecret" },
+          { type: "text", text: "tail" },
+        ],
+      },
+    });
+    const outcomes = await collect(byteChunks(`${content}\n`), {
+      scrubber: createNativeTranscriptScrubber({
+        globalPatterns: [
+          "secret",
+          "REDACTED.\\s*tail",
+          "\\[\\[REDACTED\\]",
+        ],
+        projectPatterns: [],
+      }),
+    });
+
+    expect(outcomes).toEqual([
+      expect.objectContaining({
+        kind: "quarantine",
+        sourceOrdinal: 0,
+        reason: "residual-secret",
+        contentSha256: digest(content),
+      }),
+    ]);
+  });
+
+  it("links native Claude text when the real parser ignores a null block", async () => {
+    const content = `${JSON.stringify({
+      message: {
+        role: "user",
+        content: [null, { type: "text", text: "safe" }],
+      },
+    })}\n`;
+    const parsed = parseTranscriptText(content);
+    expect(parsed).toEqual([{
+      role: "user",
+      content: "safe",
+      tokenCount: 1,
+    }]);
+    const repo = repository();
+    const messageResolver = createExactNativeTranscriptMessageResolver({
+      getNativeTranscriptMessageSnapshot: vi.fn(async () => parsed.map(
+        (message, messageSequence) => ({
+          messageId: 9,
+          conversationId: 7,
+          messageSequence,
+          role: message.role as "user" | "assistant" | "system",
+          content: message.content,
+        }),
+      )),
+    });
+
+    await expect(runNativeTranscriptBackfill({
+      repository: repo,
+      quarantine: {
+        clientName: "claude-code",
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: source(content),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      messageResolver,
+    })).resolves.toMatchObject({ importedCount: 1 });
+    expect(repo.batches).toHaveLength(1);
+    expect(repo.batches[0]?.records).toHaveLength(1);
+    expect(repo.batches[0]?.records[0]?.messageLinks).toEqual([{
+      conversationId: 7,
+      messageId: 9,
+      sourceOrdinal: 0,
+    }]);
+  });
+
   it("quarantines expanded records before mapping and persists the next record", async () => {
     const unsafe = '{"v":"z z z z z z z z z z"}';
     const safe = '{"message":{"role":"user","content":"safe"}}';
@@ -3532,6 +4175,155 @@ describe("native transcript backfill coordinator", () => {
       messageResolver: { resolveExact: vi.fn(async () => null) },
     })).resolves.toMatchObject({ rescanned: true });
     expect(wrongTypeRepo.batches[0]?.records).toHaveLength(2);
+  });
+
+  it("dedupes a committed v1 prefix before inserting its v2 suffix", async () => {
+    type StoredRecord = NativeTranscriptBatchInput["records"][number];
+    const stored = new Map<string, StoredRecord>();
+    const batches: NativeTranscriptBatchInput[] = [];
+    let current: NativeTranscriptCheckpointRecord | null = null;
+    const replayRepository: NativeTranscriptRepository = {
+      getCheckpoint: vi.fn(async () => current),
+      ingestBatch: vi.fn(async (input) => {
+        expect(input.expectedCheckpoint).toBe(current);
+        batches.push(input);
+        let importedCount = 0;
+        let skippedCount = 0;
+        for (const record of input.records) {
+          const existing = stored.get(record.ingestKey);
+          if (existing) {
+            expect(canonicalNativeTranscriptJson(existing.nativePayload))
+              .toBe(canonicalNativeTranscriptJson(record.nativePayload));
+            expect(existing.messageLinks).toEqual(record.messageLinks);
+            skippedCount += 1;
+          } else {
+            stored.set(record.ingestKey, structuredClone(record));
+            importedCount += 1;
+          }
+        }
+        current = {
+          projectId: "project",
+          machineId: input.machineId,
+          clientName: input.clientName,
+          sourceLocator: input.sourceLocator,
+          lastSourceOrdinal: input.checkpoint.lastSourceOrdinal,
+          importedCount: (current?.importedCount ?? 0) + importedCount,
+          skippedCount: (current?.skippedCount ?? 0) + skippedCount,
+          quarantinedCount:
+            (current?.quarantinedCount ?? 0) + input.quarantinedCount,
+          checkpoint: input.checkpoint.checkpoint,
+          updatedAt: new Date("2026-07-25T12:00:00.000Z"),
+        };
+        return {
+          importedCount,
+          skippedCount,
+          quarantinedCount: input.quarantinedCount,
+          checkpoint: current,
+        };
+      }),
+      getById: vi.fn(async () => null),
+      listByNativeSession: vi.fn(async () => []),
+      listBySource: vi.fn(async () => []),
+      listByMessage: vi.fn(async () => []),
+    };
+    const firstLine = JSON.stringify({
+      message: { role: "user", content: "prefix" },
+    });
+    const correctedLine = JSON.stringify({
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "alpha" },
+          { type: "text", text: "beta" },
+        ],
+      },
+    });
+    const content = `${firstLine}\n${correctedLine}\n`;
+    const patterns = ["alpha\\s+beta"];
+    const engine = new ScrubEngine(patterns, []);
+    const parsed = parseTranscriptText(content).map((message) => ({
+      ...message,
+      content: engine.scrub(message.content),
+    }));
+    expect(parsed[1]?.content).toBe("[REDACTED]");
+    expect(createNativeTranscriptMessageMapper().map(
+      CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      JSON.parse(correctedLine) as JsonObject,
+      1,
+    )[0]?.content).toBe("alpha\nbeta");
+    const resolver = () => createExactNativeTranscriptMessageResolver({
+      getNativeTranscriptMessageSnapshot: vi.fn(async () =>
+        parsed.map((message, messageSequence) => ({
+          messageId: messageSequence + 10,
+          conversationId: 7,
+          messageSequence,
+          role: message.role as "user" | "assistant" | "system",
+          content: message.content,
+        }))),
+    });
+    const common = {
+      repository: replayRepository,
+      quarantine: {
+        clientName: "claude-code" as const,
+        quarantine: vi.fn(),
+        get: vi.fn(),
+        list: vi.fn(),
+        close: vi.fn(),
+      },
+      source: source(content),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      globalPatterns: patterns,
+    };
+
+    await expect(runNativeTranscriptBackfill({
+      ...common,
+      pipelineVersion: "native-json-scrub/v1",
+      batchSize: 1,
+      messageMapper: {
+        map: (_format, _payload, sourceOrdinal) => [{
+          role: sourceOrdinal === 0 ? "user" : "assistant",
+          content: sourceOrdinal === 0 ? "prefix" : "alpha\nbeta",
+          sourceOrdinal,
+        }],
+      },
+      messageResolver: resolver(),
+    })).rejects.toBeInstanceOf(NativeTranscriptLinkError);
+    expect(stored.size).toBe(1);
+    expect(batches).toHaveLength(1);
+    expect(current?.checkpoint.scrubberVersion).toMatch(
+      /^native-json-scrub\/v1:/u,
+    );
+
+    await expect(runNativeTranscriptBackfill({
+      ...common,
+      batchSize: 2,
+      messageResolver: resolver(),
+    })).resolves.toEqual({
+      importedCount: 1,
+      skippedCount: 1,
+      quarantinedCount: 0,
+      resumedFromByteOffset: 0,
+      rescanned: true,
+    });
+    expect(batches).toHaveLength(2);
+    expect(batches[1]?.records.map((record) => record.sourceOrdinal))
+      .toEqual([0, 1]);
+    expect(batches[1]?.records[1]?.nativePayload).toEqual({
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "[REDACTED]" },
+          { type: "text", text: "" },
+        ],
+      },
+    });
+    expect(stored.size).toBe(2);
+    expect(current?.checkpoint.scrubberVersion).toMatch(
+      /^native-json-scrub\/v2:/u,
+    );
   });
 
   it("replays prefix messages through the mapper without resolving or rewriting them", async () => {
