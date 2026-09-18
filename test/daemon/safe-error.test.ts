@@ -4577,6 +4577,26 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
   });
 
+  it.each([
+    [
+      "bracketed public URL after an outward handoff",
+      "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host?key=/Users/SECOND/secret]",
+      "file://h?x=[file://host?key=<path>]<path>[https://host?key=/Users/SECOND/secret]",
+    ],
+    [
+      "bracketed public URL with no query",
+      "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host/p]",
+      "file://h?x=[file://host?key=<path>]<path>[https://host/p]",
+    ],
+  ] as const)("converges on the first pass after an outward handoff: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("FIRST");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("replaces SQLite constraint details with generic message", () => {
     const result = sanitizeError("SQLITE_CONSTRAINT: UNIQUE constraint failed: messages.conversation_id");
     expect(result).not.toContain("messages.conversation_id");

@@ -1124,6 +1124,17 @@ function scanAbsolutePath(
       continue;
     }
     if (char === "[" && sawPathCharacter) {
+      // A bracketed non-file URL is its own span. Absorbing it here consumed
+      // the URL and left its query unclassified until a second pass, which
+      // broke one-pass convergence after the outward handoff. A bracketed
+      // file URL is still absorbed as glue, which existing controls pin.
+      if (
+        quote === undefined &&
+        startsUrlSchemeLiteral(chars, index + 1) &&
+        !isFileUrlLiteral(chars, index + 1)
+      ) {
+        break;
+      }
       brackets += 1;
       sawNonSeparator = true;
       index += 1;
