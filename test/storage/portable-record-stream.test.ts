@@ -1911,7 +1911,7 @@ describe("portable record stream public seam", () => {
       predecessor: records.messages[0],
       records: [records.messages[0]],
       complete: false,
-    }, { priorCheckpoint: first.checkpoint })), "order-regression");
+    }, { priorCheckpoint: first.checkpoint })), "duplicate-identity");
     expectCode(() => createPortableBatch(createBatchInput(manifest, "project", {
       predecessor: null,
       records: [records.project[0]],

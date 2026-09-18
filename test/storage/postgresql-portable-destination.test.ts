@@ -11,9 +11,10 @@ import { PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_LIMITS, createPortableRecord, cr
 import { createGeneration, createFixtureSource, postgresGeneration, MACHINE_A_UUID, SHARED_PROJECT_UUID } from '../fixtures/portable-records.js';
 
 const boundaries = vi.hoisted(() => ({
-  client: vi.fn(), config: vi.fn(), schema: vi.fn(), witness: vi.fn(),
+  runtime: vi.fn(), client: vi.fn(), config: vi.fn(), schema: vi.fn(), witness: vi.fn(),
   headers: vi.fn(), row: vi.fn(), insert: vi.fn(), capability: vi.fn(), source: vi.fn(),
 }));
+vi.mock('../../src/storage/postgresql/runtime.js', () => ({ PostgreSqlRuntime: class { constructor() { return boundaries.runtime(); } } }));
 vi.mock('pg', () => ({ Client: class { constructor() { return boundaries.client(); } } }));
 vi.mock('../../src/storage/postgresql/client-config.js', () => ({ buildPostgreSqlClientConfig: boundaries.config }));
 vi.mock('../../src/storage/postgresql/runtime-readiness.js', () => ({ verifyPostgreSqlTransferSchema: boundaries.schema }));
@@ -780,4 +781,121 @@ describe('source-machine evidence integrity', () => {
     const { writer, stream } = await admitted(); const saved = db.snapshot(); db.sourceMachineRows = [undefined] as never;
     await expect(writer.applyBatch(await batch(stream))).rejects.toMatchObject({ code: 'destination-conflict' }); expect(db.snapshot()).toEqual(saved);
   });
+});
+
+it('admits and proves receipts entirely through the supplied transaction', async () => {
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const writer = await open(); const stream = await source(); const manifest = stream.describe();
+  const token = await writer.preflight(manifest, stream);
+  const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+  await db.query({ text: 'BEGIN' });
+  await api.admitPortableDestinationInTransaction(executor, writer, manifest, token);
+  expect(db.run?.manifest_sha256).toBe(manifest.manifestSha256);
+  await db.query({ text: 'ROLLBACK' });
+  expectNoRun();
+  await db.query({ text: 'BEGIN' });
+  await api.admitPortableDestinationInTransaction(executor, writer, manifest, token);
+  await db.query({ text: 'COMMIT' });
+  await db.query({ text: 'BEGIN' });
+  expect(await api.readPortableRunInTransaction(executor, writer, manifest, token)).toMatchObject({ state: 'active' });
+  const next = await batch(stream);
+  expect(await api.readPortableBatchReceiptInTransaction(executor, writer, next)).toBeNull();
+  await applyPortableBatchInTransaction(executor, writer, next);
+  expect(await api.readPortableBatchReceiptInTransaction(executor, writer, next)).toMatchObject({ checkpoint: next.checkpoint });
+  await db.query({ text: 'ROLLBACK' });
+  expect(db.receipts).toEqual([]);
+});
+
+it('separates actual verification from fenced completion and refuses a changed terminal prefix', async () => {
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const {writer, stream, manifest} = await admitted();
+  await transferAll(writer, stream);
+  const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+  expect(db.run?.state).toBe('active');
+  const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+  await db.query({text:'BEGIN'});
+  const last = db.receipts.at(-1)!;
+  const saved = last.checkpoint_bytes;
+  last.checkpoint_bytes = new Uint8Array();
+  await expect(api.completePortableDestinationInTransaction(executor,writer,verified)).rejects.toThrow();
+  last.checkpoint_bytes = saved;
+  await api.completePortableDestinationInTransaction(executor,writer,verified);
+  expect(db.run?.state).toBe('completed');
+  expect(await api.readPortableCompletedRunInTransaction(executor,writer,verified)).toBe(true);
+  last.checkpoint_bytes = new Uint8Array();
+  await expect(api.readPortableCompletedRunInTransaction(executor,writer,verified)).rejects.toThrow();
+  last.checkpoint_bytes = saved;
+  await db.query({text:'ROLLBACK'});
+  expect(db.run?.state).toBe('active');
+});
+
+it('probes a target without holding the transfer session lock before opening a writer', async () => {
+  boundaries.runtime.mockReturnValue({ query: db.query.bind(db), transaction: async (fn: (executor: unknown)=>unknown) => fn({query: db.query.bind(db)}), close: async()=>undefined });
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const probe = await api.probePostgreSqlPortableDestination(input);
+  expect(probe).toMatchObject({ destinationWitnessSha256: 'f'.repeat(64), nonIdentityDomainsEmpty: true, existingRun: null });
+  expect(db.queryLog.some(sql=>sql.includes('pg_try_advisory_lock'))).toBe(false);
+  await open();
+});
+
+it.each(['inactive','witness','isolation','readonly','missing-isolation'] as const)('refuses %s on admission through the caller executor',async fault=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const writer=await open(),stream=await source(),manifest=stream.describe();const token=await writer.preflight(manifest,stream);
+ if(fault==='witness')boundaries.witness.mockResolvedValue('0'.repeat(64));
+ if(fault==='isolation')db.isolation=[{isolation:'serializable',readonly:'off'}];
+ if(fault==='readonly')db.isolation=[{isolation:'read committed',readonly:'on'}];
+ if(fault==='missing-isolation')db.isolation=[];
+ await expect(api.admitPortableDestinationInTransaction({transactionScope:fault==='inactive'?undefined:'active',query:db.query.bind(db) as never},writer,manifest,token)).rejects.toMatchObject({code:'destination-conflict'});expectNoRun();
+});
+it('requires admitted manifest and exact durable run before receipt proof',async()=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const writer=await open(),stream=await source(),manifest=stream.describe();const token=await writer.preflight(manifest,stream);
+ const executor={transactionScope:'active' as const,query:db.query.bind(db) as never};const next=await batch(stream);
+ expect(await api.readPortableRunInTransaction(executor,writer,manifest,token)).toBeNull();
+ await expect(api.readPortableBatchReceiptInTransaction(executor,writer,next)).rejects.toMatchObject({code:'destination-conflict'});
+ await api.admitPortableDestinationInTransaction(executor,writer,manifest,token);
+ const saved=structuredClone(db.run!);
+ for(const changes of [{manifest_sha256:'0'.repeat(64)},{state:'invalid'}]){
+  Object.assign(db.run!,saved,changes);await expect(api.readPortableRunInTransaction(executor,writer,manifest,token)).rejects.toMatchObject({code:'destination-conflict'});
+ }
+ Object.assign(db.run!,saved);await api.readPortableRunInTransaction(executor,writer,manifest,token);
+ db.run=undefined;await expect(api.readPortableBatchReceiptInTransaction(executor,writer,next)).rejects.toMatchObject({code:'destination-conflict'});
+ db.run={...saved,manifest_sha256:'0'.repeat(64)};await expect(api.readPortableBatchReceiptInTransaction(executor,writer,next)).rejects.toMatchObject({code:'destination-conflict'});
+});
+it('binds completion proofs to the writer, matching run and exact terminal prefix',async()=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const {writer,stream,manifest}=await admitted();await transferAll(writer,stream);
+ const proof=await api.verifyPortableDestinationComplete(writer,manifest);const executor={transactionScope:'active' as const,query:db.query.bind(db) as never};
+ await expect(api.completePortableDestinationInTransaction(executor,writer,{...proof})).rejects.toMatchObject({code:'verification-failed'});
+ const saved=structuredClone(db.run!);db.run=undefined;
+ await expect(api.completePortableDestinationInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'destination-conflict'});
+ db.run={...saved,manifest_sha256:'0'.repeat(64)};await expect(api.completePortableDestinationInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'destination-conflict'});
+ db.run={...saved,state:'invalid'};await expect(api.readPortableCompletedRunInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'destination-conflict'});
+ db.run=saved;expect(await api.readPortableCompletedRunInTransaction(executor,writer,proof)).toBe(false);
+ db.receipts.pop();await expect(api.completePortableDestinationInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'verification-failed'});
+});
+it.each(['missing','tls','version','encoding','close','primary-close'] as const)('fails a read-only target probe safely on %s',async fault=>{
+ boundaries.runtime.mockReturnValue({query:db.query.bind(db),transaction:async(fn:(executor:unknown)=>unknown)=>fn({query:db.query.bind(db)}),close:async()=>{if(fault.includes('close'))throw new Error('private close');}});
+ if(fault==='missing')db.safety=[];
+ if(fault==='tls')db.safety[0]!.tls=false;
+ if(fault==='version')db.safety[0]!.version=170000;
+ if(fault==='encoding')db.safety[0]!.encoding='LATIN1';
+ if(fault==='primary-close')boundaries.schema.mockRejectedValue(new PortableTransferError('source-failed'));
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ await expect(api.probePostgreSqlPortableDestination(input)).rejects.toMatchObject({code:fault==='close'?'close-failed':fault==='primary-close'?'source-failed':'destination-conflict'});
+});
+it.each(['active','completed','run-id','generation','manifest','project','state'] as const)('classifies a populated target with %s run evidence',async fault=>{
+ const {writer,stream}=await admitted();await writer.applyBatch(await batch(stream));
+ // A nonidentity payload makes the bounded probe classify the target as populated.
+ db.records.set('messages',generation.records.get('messages')!);
+ if(fault==='completed')db.run!.state='completed';
+ if(fault==='run-id')db.run!.run_id='invalid!';
+ if(fault==='generation')db.run!.target_generation='invalid!';
+ if(fault==='manifest')db.run!.manifest_sha256='invalid';
+ if(fault==='project')db.run!.project_sha256='0'.repeat(64);
+ if(fault==='state')db.run!.state='invalid';
+ boundaries.runtime.mockReturnValue({query:db.query.bind(db),transaction:async(fn:(executor:unknown)=>unknown)=>fn({query:db.query.bind(db)}),close:async()=>{}});
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ if(fault==='active'||fault==='completed')expect(await api.probePostgreSqlPortableDestination(input)).toMatchObject({nonIdentityDomainsEmpty:false,existingRun:{state:fault}});
+ else await expect(api.probePostgreSqlPortableDestination(input)).rejects.toMatchObject({code:'destination-conflict'});
 });
