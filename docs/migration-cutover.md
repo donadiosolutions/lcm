@@ -589,9 +589,9 @@ whether that class ran this pass; its `activationEligible` field is
 therefore be clean -- zero recorded mismatches -- and still not be
 activation-eligible, because a class that never ran produces no mismatches
 for the same reason an unplugged smoke detector never sounds. This driver
-does not yet implement the `relation` and `ledger` reconciliation
-classes, so `activationEligible` is currently `false` for every report it
-can produce; that is deliberate, not a bug to route around, and it is
+does not yet implement the `ledger` reconciliation class, so
+`activationEligible` is currently `false` for every report it can
+produce; that is deliberate, not a bug to route around, and it is
 recorded in the report rather than hidden. Any mismatch in any class,
 including a `sample`-class mismatch from the public-listing probe, refuses
 eligibility outright -- a sample mismatch that were merely recorded without
@@ -706,4 +706,5 @@ not a second measurement -- rather than an unexamined guess; the same
 approach (measure, then apply a stated margin, then let the arithmetic be
 checked) is what an operator should repeat against their own data before
 relying on any specific `leaseTtlMs` value.
+
 
