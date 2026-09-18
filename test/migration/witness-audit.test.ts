@@ -4,9 +4,11 @@ import { migrationWitnessSha256 } from "../../src/migration/activation-witness.j
 import {
   MIGRATION_MISMATCH_CLASSES,
   createMigrationVerificationReportBody,
+  MigrationVerificationReportError,
   type CreateMigrationVerificationReportBodyInput,
   type MigrationVerificationReportBody,
 } from "../../src/migration/verification-report.js";
+import { DRIVER_IMPLEMENTED_MISMATCH_CLASSES } from "../../src/migration/verify-generation.js";
 import {
   MIGRATION_WITNESS_AUDIT,
   MIGRATION_WITNESS_AUDIT_EXCLUDED_BODY_FIELDS,
@@ -124,5 +126,41 @@ describe("machine-checked witness audit", () => {
       .filter((field) => !MIGRATION_WITNESS_AUDIT_EXCLUDED_BODY_FIELDS.has(field))
       .filter((field) => !auditedFields.has(field));
     expect(uncovered).toEqual(["sourceWitness"]);
+  });
+});
+
+describe("reconciliation-class coverage, tied to the same audit inventory", () => {
+  it("has an audit entry mapped to every mismatch class the driver claims as ran, and no other", () => {
+    // Ties the witness audit to verify-generation.ts's own classification
+    // so the two frozen mechanisms cannot silently drift apart: every
+    // class the driver marks ran:true must be traceable to a real,
+    // live-compared witness here, and this inventory must claim no more
+    // than the driver actually implements.
+    const classesNamedByLiveEntries = new Set(
+      MIGRATION_WITNESS_AUDIT.flatMap((entry) => entry.mismatchClasses ?? []),
+    );
+    expect(classesNamedByLiveEntries).toEqual(new Set(DRIVER_IMPLEMENTED_MISMATCH_CLASSES));
+  });
+  it("fails that cross-check when a live-compared witness's mismatchClasses is dropped (red-first demonstration)", () => {
+    const withoutSequenceMapping: readonly MigrationWitnessAuditEntry[] = MIGRATION_WITNESS_AUDIT.map((entry) => (
+      entry.id === "sequence-self-consistency" ? { ...entry, mismatchClasses: [] } : entry
+    ));
+    const classesNamedByLiveEntries = new Set(withoutSequenceMapping.flatMap((entry) => entry.mismatchClasses ?? []));
+    expect(classesNamedByLiveEntries).not.toEqual(new Set(DRIVER_IMPLEMENTED_MISMATCH_CLASSES));
+    expect(classesNamedByLiveEntries.has("sequence")).toBe(false);
+  });
+  it("rejects a report body whose classCoverage vector omits a reconciliation class entirely", () => {
+    // The direct analogue of the witness-completeness check above, for
+    // MIGRATION_MISMATCH_CLASSES rather than report-body fields: a
+    // coverage vector missing one class must never construct a report.
+    const incompleteCoverage = MIGRATION_MISMATCH_CLASSES
+      .filter((mismatchClass) => mismatchClass !== "ledger")
+      .map((mismatchClass) => ({ class: mismatchClass, ran: true }));
+    expect(() => createMigrationVerificationReportBody({
+      ...fixtureBodyInput(), classCoverage: incompleteCoverage,
+    })).toThrow(MigrationVerificationReportError);
+  });
+  it("passes once every reconciliation class has a coverage-vector entry (green after the red case above)", () => {
+    expect(() => realBody()).not.toThrow();
   });
 });

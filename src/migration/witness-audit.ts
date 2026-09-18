@@ -1,4 +1,4 @@
-import type { MigrationVerificationReportBody } from "./verification-report.js";
+import type { MigrationMismatchClass, MigrationVerificationReportBody } from "./verification-report.js";
 
 /**
  * The synthesis-round rule (V5/V6): a witness recorded without a
@@ -41,6 +41,15 @@ export type MigrationWitnessAuditEntry = Readonly<{
   comparison: MigrationWitnessComparisonKind;
   /** What happens on a difference; for the three non-live kinds, states why there is deliberately no live comparison. */
   onDifference: string;
+  /**
+   * The closed mismatch classes this witness's live comparison can
+   * produce, when comparison is "compared-live". Ties this inventory to
+   * the driver's classCoverage vector (verify-generation.ts's
+   * DRIVER_IMPLEMENTED_MISMATCH_CLASSES) so the two frozen mechanisms
+   * cannot silently drift apart: every class the driver claims ran must
+   * be traceable to a real, live-compared witness here, and vice versa.
+   */
+  mismatchClasses?: readonly MigrationMismatchClass[];
 }>;
 
 /**
@@ -65,18 +74,21 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     description: "The destination's re-derived sealed five-field identity witness.",
     comparison: "compared-live",
     onDifference: "refuses destination-drift when it disagrees with expectedDestinationIdentitySha256",
+    mismatchClasses: ["identity"],
   },
   {
     id: "destination-system-identifier", bodyField: "destinationIdentity",
     description: "pg_control_system()'s system_identifier, recorded as a sibling of the sealed witness.",
     comparison: "compared-live",
     onDifference: "refuses destination-drift when it disagrees with expectedSystemIdentifier",
+    mismatchClasses: ["identity"],
   },
   {
     id: "destination-schema-migrations", bodyField: "destinationSchemaWitness",
     description: "The destination's applied migrations chain digest.",
     comparison: "compared-live",
     onDifference: "refuses destination-drift when it disagrees with destinationMigrationsSha256",
+    mismatchClasses: ["schema"],
   },
   {
     id: "destination-schema-search-configuration", bodyField: "destinationSchemaWitness",
@@ -101,6 +113,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     description: "Per-domain destination recordCount and prefixSha256, read inside the fenced window.",
     comparison: "compared-live",
     onDifference: "records a count-class or digest-class mismatch per domain against the source checkpoint",
+    mismatchClasses: ["count", "digest"],
   },
   {
     id: "canonical-delta", bodyField: "canonicalDelta",
@@ -113,12 +126,14 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     description: "Each identity sequence's last_value/is_called against the maximum copied identity in its domain, read fresh inside the window every pass; no witness value persists in the body, only the outcome.",
     comparison: "compared-live",
     onDifference: "records a sequence-class mismatch per domain",
+    mismatchClasses: ["sequence"],
   },
   {
     id: "public-listing-probe", bodyField: "publicProbeSha256",
     description: "The destination's ordered-listing repository read, compared against the source's own canonical createdAt ordering captured during step 1.",
     comparison: "compared-live",
     onDifference: "records a sample-class mismatch on the public-listing pseudo-domain",
+    mismatchClasses: ["sample"],
   },
   {
     id: "project-map-witness", bodyField: "projectMapWitnessSha256",

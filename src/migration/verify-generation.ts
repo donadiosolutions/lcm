@@ -52,7 +52,7 @@ import { MigrationVerificationReportStore } from "./verification-store.js";
  * required class is unimplemented, by construction -- that is deliberate,
  * not an oversight to fix later in this same item.
  */
-const DRIVER_IMPLEMENTED_MISMATCH_CLASSES: ReadonlySet<MigrationMismatchClass> = new Set([
+export const DRIVER_IMPLEMENTED_MISMATCH_CLASSES: ReadonlySet<MigrationMismatchClass> = new Set([
   "count", "digest", "identity", "sequence", "schema", "sample",
 ]);
 
@@ -187,6 +187,9 @@ function truncateToMillisecondIso(value: string): string {
   return value.slice(0, 23) + "Z";
 }
 
+/** One source "conversations" record's public-listing-relevant projection, in canonical order. */
+export type MigrationPublicListingSourceEntry = Readonly<{ createdAt: string; identitySha256: string }>;
+
 /**
  * The step 5 ordered-listing probe now runs through the real repository
  * (PostgreSqlConversationRepository.listConversations, the exact production
@@ -198,24 +201,42 @@ function truncateToMillisecondIso(value: string): string {
  * evidence worth persisting). Full parity with every public repository
  * read remains out of scope for this pass (see the module-level scope
  * note); this establishes the pattern for the one probe plan-v4 names.
+ *
+ * Per witness-schema-FROZEN-v3.3.md section 6.1, a sample mismatch's
+ * identitySha256 is pinned to exactly the sampled record's portable
+ * identity digest plus its canonical ordinal -- never a hash of two
+ * aggregate probe digests, differing values, a diff shape, a rank, or a
+ * query string. The "sampled record" is the source's own record at the
+ * first position the two orders diverge, which is the earliest point a
+ * reader can name a single concrete record responsible for the mismatch.
  */
 async function runOrderedListingProbe(
-  executor: PostgreSqlRuntime, projectId: string, expectedOrder: readonly string[], signal?: AbortSignal,
+  executor: PostgreSqlRuntime, projectId: string,
+  expectedOrder: readonly MigrationPublicListingSourceEntry[], signal?: AbortSignal,
 ): Promise<{ mismatch: MigrationVerificationMismatch | null; publicListingSha256: string }> {
   const repository = new PostgreSqlConversationRepository(executor, projectId);
   const rows = await repository.listConversations();
   const actualOrder = rows.map((row) => truncateToMillisecondIso(row.createdAt.toISOString()));
   const publicListingSha256 = sha256Hex(portableCanonicalJson(["lcm-migration-verification-public-listing-v1", actualOrder]));
-  const expectedSha256 = sha256Hex(portableCanonicalJson(["lcm-migration-verification-public-listing-v1", expectedOrder]));
+  const expectedCreatedAt = expectedOrder.map((entry) => entry.createdAt);
+  const expectedSha256 = sha256Hex(portableCanonicalJson(["lcm-migration-verification-public-listing-v1", expectedCreatedAt]));
   if (expectedSha256 === publicListingSha256) return { mismatch: null, publicListingSha256 };
+  // The first position where the two orders diverge, clamped so a length
+  // difference still names a real source record rather than indexing
+  // past the end of whichever side ran out first.
+  let ordinal = 0;
+  while (
+    ordinal < expectedCreatedAt.length && ordinal < actualOrder.length
+    && expectedCreatedAt[ordinal] === actualOrder[ordinal]
+  ) ordinal += 1;
+  const sampledRecord = expectedOrder[Math.min(ordinal, expectedOrder.length - 1)]!;
   return {
     publicListingSha256,
     mismatch: {
       domain: "public-listing", class: "sample",
-      // A constant-shaped marker binding the two probe digests, never the
-      // underlying rows: both operands are already hashes, so this cannot
-      // leak the raw timestamps or any other compared value.
-      identitySha256: migrationWitnessSha256(["public-listing-probe-divergence-v1", expectedSha256, publicListingSha256]),
+      // Schema v3.3 section 6.1: the sampled record's portable identity
+      // digest plus its canonical ordinal, and nothing else.
+      identitySha256: migrationWitnessSha256(["sample", sampledRecord.identitySha256, ordinal]),
     },
   };
 }
@@ -417,13 +438,15 @@ export async function assertPermanentReadOnlyGuard(
 export interface StreamedSourceCheckpoints {
   readonly checkpoints: ReadonlyMap<PortableDomain, PortableCheckpoint>;
   /**
-   * Millisecond-truncated createdAt values for every source "conversations"
-   * record, sorted ascending by (createdAt, identitySha256). This is the
-   * step 5 ordered-listing probe's comparison target, captured during this
-   * same forward pass rather than a second read of an already-exhausted
-   * stream.
+   * Every source "conversations" record's createdAt (millisecond-
+   * truncated) and portable identitySha256, sorted ascending by
+   * (createdAt, identitySha256). This is the step 5 ordered-listing
+   * probe's comparison target, captured during this same forward pass
+   * rather than a second read of an already-exhausted stream; the
+   * identitySha256 is what lets a sample mismatch name a real sampled
+   * record per schema v3.3 section 6.1, rather than only an aggregate.
    */
-  readonly conversationsPublicOrder: readonly string[];
+  readonly conversationsPublicOrder: readonly MigrationPublicListingSourceEntry[];
 }
 
 export async function streamSourceCheckpoints(
@@ -454,7 +477,7 @@ export async function streamSourceCheckpoints(
   });
   return {
     checkpoints,
-    conversationsPublicOrder: conversationEntries.map((entry) => entry.createdAt),
+    conversationsPublicOrder: conversationEntries,
   };
 }
 

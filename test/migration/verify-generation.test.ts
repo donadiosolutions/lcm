@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { migrationWitnessSha256 } from "../../src/migration/activation-witness.js";
 import * as coordination from "../../src/storage/postgresql/coordination.js";
 import * as searchConfiguration from "../../src/storage/postgresql/search-configuration.js";
 import * as migrations from "../../src/storage/postgresql/migrations.js";
@@ -282,7 +283,7 @@ describe("sortMismatches", () => {
     // assertion proves the sort ran rather than merely preserved input order.
     const stream = fakeStream({}, [high, low]);
     const { conversationsPublicOrder } = await streamSourceCheckpoints(stream as never);
-    expect(conversationsPublicOrder).toEqual([
+    expect(conversationsPublicOrder.map((entry) => entry.createdAt)).toEqual([
       "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z",
     ]);
   });
@@ -295,7 +296,7 @@ describe("sortMismatches", () => {
     // an already-ascending array, exercising the createdAt "<" branch too.
     const stream = fakeStream({}, [third, second, first]);
     const { conversationsPublicOrder } = await streamSourceCheckpoints(stream as never);
-    expect(conversationsPublicOrder).toEqual([
+    expect(conversationsPublicOrder.map((entry) => entry.createdAt)).toEqual([
       "2026-01-01T00:00:00.000Z", "2026-01-02T00:00:00.000Z", "2026-01-03T00:00:00.000Z",
     ]);
   });
@@ -311,7 +312,7 @@ describe("sortMismatches", () => {
     // higher identity first, exercising the ">" branch instead of "<".
     const stream = fakeStream({}, [low, high]);
     const { conversationsPublicOrder } = await streamSourceCheckpoints(stream as never);
-    expect(conversationsPublicOrder).toEqual([
+    expect(conversationsPublicOrder.map((entry) => entry.createdAt)).toEqual([
       "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z",
     ]);
   });
@@ -326,7 +327,7 @@ describe("sortMismatches", () => {
     });
     const stream = fakeStream({}, [duplicate(), duplicate()]);
     const { conversationsPublicOrder } = await streamSourceCheckpoints(stream as never);
-    expect(conversationsPublicOrder).toEqual([
+    expect(conversationsPublicOrder.map((entry) => entry.createdAt)).toEqual([
       "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z",
     ]);
   });
@@ -796,8 +797,17 @@ describe("verifyMigrationGeneration: public listing probe", () => {
       dependenciesFor(copySource, runtime),
     );
     expect(result.outcome).toBe("mismatches");
+    // Schema v3.3 section 6.1: pinned to exactly the sampled record's
+    // portable identity digest plus its canonical ordinal. The first
+    // divergence is at ordinal 1 (the destination's "second" row is
+    // missing), so the sampled record is the source's "second" entry --
+    // never a hash of the two aggregate probe digests.
+    const secondRecordIdentitySha256 = fakeHash("identity-second");
     expect(result.report.mismatches).toEqual([
-      { domain: "public-listing", class: "sample", identitySha256: expect.any(String) },
+      {
+        domain: "public-listing", class: "sample",
+        identitySha256: migrationWitnessSha256(["sample", secondRecordIdentitySha256, 1]),
+      },
     ]);
   }, 15000);
 });
