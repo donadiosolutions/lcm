@@ -151,10 +151,14 @@ Renewal successors are decided only by their predecessor fence. A renewed
 project writes its own `projects/<successor>/meta.json` the first time storage
 opens it, and that metadata does not substitute for a missing fence.
 
-Enumeration follows the same rules, so an inventory never advertises a project
-that storage will refuse. `lcm compact --all`, `lcm import --all`, and SQLite
-compaction preview skip an identity they cannot authenticate and continue with
-the rest. `lcm project list` is a diagnostic surface, so it lists such an entry
+Surfaces that resolve a project through the map follow the same rules, so
+they do not act on an identity storage will refuse. Reads that never resolve an identity are
+unaffected, such as stats aggregates and doctor's read-only
+secret-detection lookup, which uses the map key as a lookup key without
+admitting it as a storage identity. `lcm compact --all` and SQLite compaction preview skip an identity they cannot
+authenticate and continue with the rest. `lcm import --all` skips it when
+enumerating projects, and fails loudly on a per-session attribution that
+reaches one. `lcm project list` is a diagnostic surface, so it lists such an entry
 and marks it rather than hiding it, because an operator who cannot see a broken
 entry cannot repair it:
 

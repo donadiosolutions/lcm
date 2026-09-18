@@ -14,8 +14,10 @@ Renewal successors are decided by their predecessor fence alone, so the
 metadata a renewed project writes when storage first opens it cannot stand in
 for a fence that has been lost.
 
-Enumeration follows the same rules. `lcm compact --all`, `lcm import --all`,
-and SQLite compaction preview skip an identity they cannot authenticate and
-continue with the remaining projects. `lcm project list` marks such an entry
-as unauthenticated rather than hiding it, so it stays visible for repair.
+Surfaces that act on a project follow the same rules. `lcm compact --all` and
+SQLite compaction preview skip an identity they cannot authenticate and
+continue with the remaining projects, and adding an alias to one is refused
+before the map is written. `lcm project list` and `lcm project show` mark
+such an entry as unauthenticated rather than hiding it, so it stays visible
+for repair.
 

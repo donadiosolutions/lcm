@@ -1074,6 +1074,35 @@ describe("identity service", () => {
     expect(listed.remote).toEqual([expect.objectContaining({ projectId: PROJECT_A })]);
   });
 
+  it("marks a shown project whose map key no local evidence authenticates", async () => {
+    const path = makeProject("show-unauthenticated");
+    resolveProjectIdentity(path);
+    writeFileSync(
+      projectMapModule.projectMapPath(),
+      JSON.stringify({ ["e".repeat(64)]: { canonical: path, aliases: [] } }),
+      { mode: 0o600 },
+    );
+    projectMapModule.clearProjectMapCache();
+
+    expect(await showProject(SQLITE_CONFIG, path, deps)).toEqual({
+      hash: "e".repeat(64),
+      entry: { canonical: path, aliases: [] },
+      unauthenticated: true,
+    });
+  });
+
+  it("leaves a shown project its canonical path hash authenticates unmarked", () => {
+    // Without this, marking every entry would still satisfy the marked case
+    // and the coverage gate, because execution is not assertion.
+    const path = makeProject("show-authenticated");
+    const identity = resolveProjectIdentity(path);
+
+    return expect(showProject(SQLITE_CONFIG, path, deps)).resolves.toEqual({
+      hash: identity.id,
+      entry: { canonical: path, aliases: [] },
+    });
+  });
+
   it("marks a local project whose map key no local evidence authenticates", async () => {
     // lcm project list is a diagnostic surface: an entry storage refuses is
     // marked rather than hidden, so an operator can see what to repair.

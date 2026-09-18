@@ -1794,6 +1794,9 @@ export function registerProjectCommand(
           return;
         }
         console.log(shown.hash);
+        if (shown.unauthenticated) {
+          console.log("  unauthenticated: storage will refuse this identity");
+        }
         console.log(`  canonical: ${sanitizeTerminalText(shown.entry.canonical)}`);
         if (shown.entry.remoteProjectId) {
           console.log(`  PostgreSQL project: ${shown.entry.remoteProjectId}`);

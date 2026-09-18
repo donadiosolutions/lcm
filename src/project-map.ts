@@ -2035,6 +2035,12 @@ export function addProjectAlias(alias: string, opts: {
     const target = resolveCliTarget(opts, publicationLockToken);
     assertExpectedProjectMapEntry(target.hash, target.entry, opts.expectedEntry);
     const canonical = resolve(target.entry.canonical);
+    // Refuse before any mutation. Resolution refuses an unauthenticated
+    // key when the alias is read back, so checking only there would leave
+    // a failed link having already published one more claimed path.
+    if (!isAuthenticatedProjectIdentity(target.hash, canonical)) {
+      throw new UnauthenticatedProjectIdentityError(target.hash, canonical);
+    }
     if (normalizedAlias === canonical) {
       throw new Error(`alias matches canonical path for ${target.hash}: ${normalizedAlias}`);
     }

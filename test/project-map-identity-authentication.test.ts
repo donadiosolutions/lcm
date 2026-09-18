@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   UnauthenticatedProjectIdentityError,
+  addProjectAlias,
   isAuthenticatedProjectIdentity,
   clearProjectMapCache,
   hashProjectPath,
@@ -203,6 +204,30 @@ describe("project-map identity authentication", () => {
         .rejects.toThrow(MISSING_PREDECESSOR_FENCE_REFUSAL);
     });
   });
+
+    it("refuses to add an alias under an unauthenticated key without mutating the map", () => {
+      // The gate must fire before publication. Refusing only when the alias is
+      // read back would leave a failed link having already published one more
+      // claimed path. Reported by exact-SHA review of the previous candidate.
+      const canonical = makeProject("alias-unauthenticated");
+      const aliasPath = makeProject("alias-unauthenticated-target");
+      const arbitrary = "e".repeat(64);
+      writeMap({ [arbitrary]: { canonical, aliases: [] } });
+      const before = readFileSync(projectMapPath(), "utf8");
+
+      expect(() => addProjectAlias(aliasPath, { hash: arbitrary }))
+        .toThrow(UnauthenticatedProjectIdentityError);
+      expect(readFileSync(projectMapPath(), "utf8")).toBe(before);
+    });
+
+    it("adds an alias under a key the canonical path hash authenticates", () => {
+      const canonical = makeProject("alias-authenticated");
+      const aliasPath = makeProject("alias-authenticated-target");
+      const id = hashProjectPath(canonical);
+      writeMap({ [id]: { canonical, aliases: [] } });
+
+      expect(addProjectAlias(aliasPath, { hash: id }).entry.aliases).toEqual([aliasPath]);
+    });
 
   describe("#1357 enumeration and preview", () => {
     it("omits a successor whose predecessor fence is missing from project enumeration", async () => {

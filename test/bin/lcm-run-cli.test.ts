@@ -754,6 +754,25 @@ describe("runCli registration and help dispatch", () => {
     }
   });
 
+  it("marks a shown project that storage will refuse", async () => {
+    state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+    state.showProject.mockResolvedValue({
+      hash: "f".repeat(64),
+      entry: { canonical: "/work/project", aliases: [] },
+      unauthenticated: true,
+      remote: null,
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await invoke(["project", "show"]);
+
+    expect(log.mock.calls.map(([line]) => line)).toEqual([
+      "f".repeat(64),
+      "  unauthenticated: storage will refuse this identity",
+      "  canonical: /work/project",
+    ]);
+  });
+
   it("marks a listed project that storage will refuse", async () => {
     state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
     state.listProjects.mockResolvedValue({

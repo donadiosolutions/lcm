@@ -660,11 +660,17 @@ export async function showProject(
   readonly hash: string;
   readonly entry: ProjectMapEntry;
   readonly transient?: boolean;
+  readonly unauthenticated?: true;
   readonly remote?: RemoteProject;
 }> {
   const deps = dependencies(dependencyOverrides);
   assertIdentityPublication(config, deps);
-  const shown = showProjectMapEntry(target);
+  const found = showProjectMapEntry(target);
+  // Mark for the same reason listProjects does: this is a diagnostic surface,
+  // and an operator who cannot see a refused identity cannot repair it.
+  const shown = isAuthenticatedProjectIdentity(found.hash, resolve(found.entry.canonical), deps.homeDir)
+    ? found
+    : { ...found, unauthenticated: true as const };
   if (config.backend === "sqlite" || !shown.entry.remoteProjectId) return shown;
   const remote = await withSession(
     config,
