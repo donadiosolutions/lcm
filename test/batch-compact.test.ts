@@ -15,6 +15,7 @@ import {
   type CompactProgressEvent,
 } from "../src/batch-compact.js";
 import * as cliStorage from "../src/cli-storage.js";
+import { NATIVE_SOURCE_LOCATOR_BATCH_SIZE } from "../src/storage/contracts.js";
 import * as daemonConfig from "../src/daemon/config.js";
 import * as publicationModule from "../src/storage/backend-publication.js";
 import * as factoryModule from "../src/storage/factory.js";
@@ -1413,6 +1414,201 @@ describe("batch compaction discovery", () => {
     expect(await findUncompacted(100, false, cwd)).toEqual([
       expect.objectContaining({ sessionId: "session-1", sourceLocator: "sessions/native-source.jsonl" }),
     ]);
+  });
+
+  function seedNativeTranscript(
+    db: DatabaseSync,
+    projectId: string,
+    sessionId: string,
+    sourceLocator: string,
+    ingestKey: string,
+  ): void {
+    const payload = JSON.stringify({ message: "scrubbed", key: ingestKey });
+    db.prepare("INSERT INTO runtime_native_transcripts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      "transcript-" + ingestKey,
+      projectId,
+      "local",
+      "codex",
+      "jsonl",
+      "1",
+      sessionId,
+      sourceLocator,
+      1,
+      "2026-09-16 00:00:00",
+      "2026-09-16 00:00:01",
+      "1",
+      createHash("sha256").update(payload).digest("hex"),
+      (ingestKey + "-").padEnd(64, "0"),
+      payload,
+    );
+  }
+
+  function seedDiscoveryFixture(
+    dbPath: string,
+    projectId: string,
+    conversationIds: readonly number[],
+    transcripts: (sessionId: string) => readonly { locator: string; key: string }[],
+  ): void {
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec("PRAGMA journal_mode = WAL");
+      db.exec("PRAGMA foreign_keys = ON");
+      runLcmMigrations(db);
+      for (const id of conversationIds) {
+        const sessionId = "session-" + id;
+        db.prepare("INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)").run(id, sessionId);
+        insertMessages(db, id);
+        for (const transcript of transcripts(sessionId)) {
+          seedNativeTranscript(db, projectId, sessionId, transcript.locator, transcript.key);
+        }
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  /** Observe the native-transcript seams discovery actually uses. */
+  function withNativeTranscriptSpy<T>(
+    run: () => Promise<T>,
+  ): Promise<{ value: T; locatorCalls: string[][]; perSessionCalls: string[] }> {
+    const locatorCalls: string[][] = [];
+    const perSessionCalls: string[] = [];
+    const realWithCliProjectStorage = cliStorage.withCliProjectStorage;
+    vi.spyOn(cliStorage, "withCliProjectStorage").mockImplementation((targetCwd, options, callback) =>
+      realWithCliProjectStorage(targetCwd, options, context => {
+        const native = context.storage.nativeTranscripts;
+        if (native === undefined) return callback(context);
+        const repository = new Proxy(native.repository, {
+          get(target, property, receiver) {
+            if (property === "listUnambiguousSourceLocators") {
+              return async (input: { nativeSessionIds: readonly string[] }) => {
+                locatorCalls.push([...input.nativeSessionIds]);
+                return target.listUnambiguousSourceLocators(input);
+              };
+            }
+            if (property === "listByNativeSession") {
+              return async (input: { nativeSessionId: string }) => {
+                perSessionCalls.push(input.nativeSessionId);
+                return target.listByNativeSession(input);
+              };
+            }
+            return Reflect.get(target, property, receiver) as unknown;
+          },
+        });
+        return callback({
+          ...context,
+          storage: { ...context.storage, nativeTranscripts: { ...native, repository } },
+        });
+      }));
+    return run().then(value => ({ value, locatorCalls, perSessionCalls }));
+  }
+
+  it("resolves source locators with project-scoped lookups independent of conversation count", async () => {
+    const small = makeDir("compact-locator-batch-small");
+    const large = makeDir("compact-locator-batch-large");
+    const smallIds = [1, 2, 3];
+    const largeIds = Array.from({ length: 12 }, (_value, index) => index + 1);
+    for (const [cwd, ids] of [[small, smallIds], [large, largeIds]] as const) {
+      ensureProjectDir(cwd);
+      seedDiscoveryFixture(projectPaths(cwd).dbPath, projectPaths(cwd).id, ids, sessionId => [
+        { locator: "sessions/" + sessionId + ".jsonl", key: "ik-" + sessionId },
+      ]);
+    }
+
+    const smallRun = await withNativeTranscriptSpy(() => findUncompacted(100, false, small));
+    vi.restoreAllMocks();
+    const largeRun = await withNativeTranscriptSpy(() => findUncompacted(100, false, large));
+
+    expect(smallRun.value).toHaveLength(smallIds.length);
+    expect(largeRun.value).toHaveLength(largeIds.length);
+    // The lookup count tracks the project, not the conversation count: four
+    // times as many eligible conversations still resolve in the same number
+    // of statements, and the per-conversation seam is never used.
+    expect(largeRun.locatorCalls).toHaveLength(smallRun.locatorCalls.length);
+    expect(smallRun.locatorCalls).toHaveLength(1);
+    expect(smallRun.perSessionCalls).toEqual([]);
+    expect(largeRun.perSessionCalls).toEqual([]);
+    expect(smallRun.locatorCalls[0]).toEqual(smallIds.map(id => "session-" + id));
+    expect(largeRun.locatorCalls[0]).toEqual(largeIds.map(id => "session-" + id));
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  it("bounds each source-locator statement for a project larger than one batch", async () => {
+    const cwd = makeDir("compact-locator-batch-chunked");
+    const ids = Array.from({ length: NATIVE_SOURCE_LOCATOR_BATCH_SIZE + 3 }, (_value, index) => index + 1);
+    ensureProjectDir(cwd);
+    seedDiscoveryFixture(projectPaths(cwd).dbPath, projectPaths(cwd).id, ids, sessionId => [
+      { locator: "sessions/" + sessionId + ".jsonl", key: "ik-" + sessionId },
+    ]);
+
+    const run = await withNativeTranscriptSpy(() => findUncompacted(100, false, cwd));
+
+    expect(run.value).toHaveLength(ids.length);
+    expect(run.perSessionCalls).toEqual([]);
+    expect(run.locatorCalls).toHaveLength(1);
+    expect(run.locatorCalls[0]).toHaveLength(ids.length);
+    for (const candidate of run.value) {
+      expect(candidate.sourceLocator).toBe("sessions/" + candidate.sessionId + ".jsonl");
+    }
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  it("matches per-conversation source-locator resolution for present, ambiguous, and absent sources", async () => {
+    const cwd = makeDir("compact-locator-equivalence");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedDiscoveryFixture(paths.dbPath, paths.id, [1, 2, 3], sessionId => {
+      if (sessionId === "session-1") return [{ locator: "sessions/one.jsonl", key: "ik-one" }];
+      if (sessionId === "session-2") {
+        return [
+          { locator: "sessions/two-a.jsonl", key: "ik-two-a" },
+          { locator: "sessions/two-b.jsonl", key: "ik-two-b" },
+        ];
+      }
+      return [];
+    });
+
+    /** The pre-batching algorithm, recomputed directly against the fixture. */
+    const legacy = (sessionId: string): string | undefined => {
+      const db = new DatabaseSync(paths.dbPath);
+      try {
+        const rows = db.prepare(
+          "SELECT source_locator FROM runtime_native_transcripts WHERE project_id = ? AND native_session_id = ? ORDER BY observed_at",
+        ).all(paths.id, sessionId) as Array<{ source_locator: string }>;
+        const locators = [...new Set(rows.map(row => row.source_locator))];
+        return locators.length === 1 ? locators[0] : undefined;
+      } finally {
+        db.close();
+      }
+    };
+
+    for (const replay of [false, true]) {
+      const discovered = await findUncompacted(100, replay, cwd);
+      const expected = discovered.map(candidate => {
+        const locator = legacy(candidate.sessionId);
+        const { sourceLocator: _ignored, ...rest } = candidate;
+        return locator === undefined ? rest : { ...rest, sourceLocator: locator };
+      });
+      expect(discovered).toEqual(expected);
+      expect(discovered.map(candidate => candidate.sourceLocator)).toEqual([
+        "sessions/one.jsonl",
+        undefined,
+        undefined,
+      ]);
+    }
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  it("omits the source locator during direct discovery when the batched lookup fails", async () => {
+    const cwd = makeDir("compact-locator-batch-failure");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const db = new DatabaseSync(paths.dbPath);
+    db.exec("DROP TABLE runtime_native_transcripts");
+    db.close();
+
+    const [candidate] = await findUncompacted(100, false, cwd);
+
+    expect(candidate).toMatchObject({ sessionId: "session-1", messages: 9, tokens: 250 });
+    expect(candidate).not.toHaveProperty("sourceLocator");
   });
 
   it("omits the source locator during preview discovery when the transcript query fails", async () => {
