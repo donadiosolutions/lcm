@@ -87,7 +87,10 @@ it("measures the full live in-window read against a realistic destination and re
       values: [seeded.expectedIdentity.id, BULK_CONVERSATION_COUNT, BULK_MESSAGES_PER_CONVERSATION],
     }, { domain: "factory", operation: "seedCensusCostBulkFixture" });
     const bulkSeedMs = performance.now() - bulkStart;
-    await grantPortablePostgreSql(db);
+    // {transfer: true}: the ledger phase needs lcm.transfer_runs/
+    // transfer_batches/transfer_identities privileges, which the default
+    // grant profile omits.
+    await grantPortablePostgreSql(db, { transfer: true });
 
     const runtime = new PostgreSqlRuntime(settings(db.runtimeUrl));
     const scratchParent = mkdtempSync(join(tmpdir(), "lcm-pg-census-cost-"));

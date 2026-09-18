@@ -8,6 +8,7 @@ import { assertHarnessReady, settings, withPostgreSqlTestDatabase } from "./harn
 import { grantPortablePostgreSql, seedPortablePostgreSql } from "./portable-fixture.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import { probePostgreSqlPortableDestination } from "../../src/storage/postgresql/portable-destination.js";
+import { PORTABLE_RECORD_DOMAIN_ORDER } from "../../src/storage/portable-record.js";
 import {
   assertPermanentReadOnlyGuard,
   readFencedDestinationCensus,
@@ -301,7 +302,10 @@ it("maps exactly the identity-sequence-backed columns pg_catalog reports under s
 it("relation and ledger read real SQL against a sound fixture and produce no mismatches", async () => {
   await withPostgreSqlTestDatabase("migration-verification-relation-ledger", async (db) => {
     const seeded = await seedPortablePostgreSql(db.migrator);
-    await grantPortablePostgreSql(db);
+    // {transfer: true}: the ledger read needs lcm.transfer_runs/
+    // transfer_batches/transfer_identities privileges, which the default
+    // grant profile omits.
+    await grantPortablePostgreSql(db, { transfer: true });
     const runtime = new PostgreSqlRuntime(settings(db.runtimeUrl));
     const scratchParent = mkdtempSync(join(tmpdir(), "lcm-pg-relation-ledger-"));
     try {
