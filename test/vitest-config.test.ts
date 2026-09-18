@@ -579,10 +579,12 @@ describe("Vitest artifact-root configuration", () => {
     expect(parallelProject?.test?.exclude).toContain("test/storage/portable-record.test.ts");
     expect(parallelProject?.test?.exclude).toContain("test/storage/portable-record-stream.test.ts");
     expect(parallelProject?.test?.exclude).toContain("test/storage/sqlite-portable-source.test.ts");
+    expect(parallelProject?.test?.exclude).toContain("test/storage/sqlite-portable-destination.test.ts");
     expect(portableBoundaryProject?.test?.include).toEqual([
       "test/storage/portable-record.test.ts",
       "test/storage/portable-record-stream.test.ts",
       "test/storage/sqlite-portable-source.test.ts",
+      "test/storage/sqlite-portable-destination.test.ts",
     ]);
     expect(portableBoundaryProject?.test?.exclude).toEqual(["node_modules/**", ".claude/**"]);
     expect(portableBoundaryProject?.test?.fileParallelism).toBe(false);

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   PORTABLE_LIMITS,
   PORTABLE_RECORD_DOMAIN_ORDER,
+  PORTABLE_RECORD_SCHEMA_DESCRIPTOR,
   PortableStreamError,
   canonicalJson,
   comparePortableOrder,
@@ -1489,4 +1490,129 @@ describe("malformed and resumable failures are sanitized and never advance a che
     expect(resumed.complete).toBe(true);
     await stream.close();
   });
+});
+
+
+// #623 W6 follow-up (round 2, S-2/S-3): createPortableBatch's builder guard
+// and duplicate-identity seeding both rely on a cross-file invariant --
+// equal order implies equal identity for every domain -- that was
+// previously protected only by a prose comment. Lock it structurally
+// against the schema descriptor so a future domain that breaks it fails
+// this test at authoring time instead of silently reopening the bug class
+// #623 fixed for passive-events, project-aliases, summary-message-links
+// and summary-parent-links.
+function unwrapTaggedScalar(value: unknown): unknown {
+  return value && typeof value === "object" && "$integer" in (value as object)
+    ? (value as { $integer: string }).$integer
+    : value;
+}
+
+describe("identity/order schema-lock", () => {
+  function schemaEntry(domain: PortableDomain) {
+    return PORTABLE_RECORD_SCHEMA_DESCRIPTOR.domainsByOrder[domain];
+  }
+
+  const KNOWN_ORDER_SUPERSET_DOMAINS: readonly PortableDomain[] = [
+    "passive-events",
+    "project-aliases",
+    "summary-message-links",
+    "summary-parent-links",
+  ];
+  const KNOWN_HASH_DERIVED_DOMAINS: readonly PortableDomain[] = [
+    "conversations",
+    "messages",
+    "message-parts",
+    "context-items",
+  ];
+
+  it("keeps identityOrderPrefix an exact prefix of order for every domain", () => {
+    for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
+      const entry = schemaEntry(domain);
+      expect(entry.order.slice(0, entry.identityOrderPrefix.length)).toEqual(entry.identityOrderPrefix);
+    }
+  });
+
+  it("has exactly the four known domains whose order carries a field outside identity", () => {
+    const supersetDomains = PORTABLE_RECORD_DOMAIN_ORDER.filter(domain => {
+      const entry = schemaEntry(domain);
+      return entry.order.length > entry.identityOrderPrefix.length;
+    });
+    expect(new Set(supersetDomains)).toEqual(new Set(KNOWN_ORDER_SUPERSET_DOMAINS));
+  });
+
+  // "project" is the only domain whose value is a nested object
+  // ({ identity: { scope, projectId } }), so its schema-declared logicalKey
+  // names fields as "identity.scope"/"identity.projectId" while its
+  // identityOrderPrefix/order name the same flattened scalars "scope"/
+  // "projectId" directly; buildRecordShape confirms both use the exact same
+  // key array at runtime. Strip that one nested-path prefix before comparing
+  // so the naming convention does not masquerade as a semantic divergence.
+  function stripIdentityPrefix(fieldNames: readonly string[]): readonly string[] {
+    return fieldNames.map(name => (name.startsWith("identity.") ? name.slice("identity.".length) : name));
+  }
+
+  it("has exactly the four known hash-derived domains among the rest", () => {
+    const equalLengthDomains = PORTABLE_RECORD_DOMAIN_ORDER.filter(domain => {
+      const entry = schemaEntry(domain);
+      return entry.order.length === entry.identityOrderPrefix.length;
+    });
+    const hashDerivedDomains = equalLengthDomains.filter(domain => {
+      const entry = schemaEntry(domain);
+      return canonicalJson(stripIdentityPrefix(entry.logicalKey)) !== canonicalJson(entry.identityOrderPrefix);
+    });
+    expect(new Set(hashDerivedDomains)).toEqual(new Set(KNOWN_HASH_DERIVED_DOMAINS));
+    // Every remaining equal-length domain must use identityOrderPrefix as its
+    // logicalKey verbatim (order equals logicalKey literally): the only other
+    // way an equal-length domain could keep the invariant is the hash-derived
+    // path above, so anything not in that frozen list must be this case.
+    for (const domain of equalLengthDomains) {
+      if (KNOWN_HASH_DERIVED_DOMAINS.includes(domain)) continue;
+      const entry = schemaEntry(domain);
+      expect(stripIdentityPrefix(entry.logicalKey)).toEqual(entry.identityOrderPrefix);
+    }
+  });
+
+  const HASH_ENFORCEMENT_CASES: ReadonlyArray<{
+    readonly domain: PortableDomain;
+    readonly buildContext: (order: readonly unknown[]) => unknown;
+    readonly corrupt: (raw: Record<string, unknown>) => Record<string, unknown>;
+  }> = [
+    {
+      domain: "conversations",
+      buildContext: () => ({ projectIdentity: LOCAL_PROJECT_IDENTITY }),
+      corrupt: raw => ({ ...raw, conversationFingerprint: "f".repeat(64) }),
+    },
+    {
+      domain: "messages",
+      buildContext: order => ({ conversationOrder: order.slice(0, 6).map(unwrapTaggedScalar) }),
+      corrupt: raw => ({ ...raw, conversationIdentitySha256: "f".repeat(64) }),
+    },
+    {
+      domain: "message-parts",
+      buildContext: order => ({ messageOrder: order.slice(0, 7).map(unwrapTaggedScalar) }),
+      corrupt: raw => ({ ...raw, messageIdentitySha256: "f".repeat(64) }),
+    },
+    {
+      domain: "context-items",
+      buildContext: order => ({ conversationOrder: order.slice(0, 6).map(unwrapTaggedScalar) }),
+      corrupt: raw => ({ ...raw, conversationIdentitySha256: "f".repeat(64) }),
+    },
+  ];
+
+  it.each(HASH_ENFORCEMENT_CASES)(
+    "enforces $domain's identity-from-order check",
+    ({ domain, buildContext, corrupt }) => {
+      const generation = createGeneration(sqliteUnboundGeneration());
+      const record = recordsOf(generation.records, domain)[0]!;
+      const rawValue = Object.fromEntries(
+        Object.entries(record.value as Record<string, unknown>).map(
+          ([key, value]) => [key, unwrapTaggedScalar(value)],
+        ),
+      );
+      const context = buildContext(record.order);
+      expect(() => createPortableRecord({
+        domain, ordinal: record.ordinal, value: corrupt(rawValue), context,
+      } as never)).toThrow();
+    },
+  );
 });

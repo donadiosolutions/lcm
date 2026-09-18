@@ -359,7 +359,18 @@ describe("SQLite canonical destination", () => {
       expect(db.prepare("SELECT tags FROM promoted WHERE id='memory-alpha-1'").get()).toEqual({ tags: '["storage","protocol","storage"]' });
       expect(db.prepare("SELECT count(*) AS n FROM portable_archive_native_transcripts").get()!.n).toBeGreaterThan(0);
     });
-  });
+    // maxRecords: 1 deliberately drives 57 single-record batches, crossing a
+    // mid-domain batch boundary in the 20 of 22 domains that hold more than
+    // one record. Each batch commits on its own, and measured fsync latency
+    // is about 42.6 ms per commit, so that transfer alone is roughly 2.4 s of
+    // the case against 11 ms for the same records under one transaction.
+    // Steady-state cost is 2.1-3.3 s depending on host load, which leaves too
+    // little headroom under the inherited 5000 ms default: it fired at 1.5x
+    // the worst observed run, which is host noise rather than regression.
+    // This deadline is sized to the measured work rather than relaxed to hide
+    // it. It still fails a hang or a regression of about 4.5x the worst
+    // observed run, and about 7x a low-load run (#1210).
+  }, 15_000);
 
   it.each(["project", "manifest", "run"])("revokes target authority on durable identity drift: %s", async kind => {
     const f = await fixture(); const writer = await destination(f); const manifest = await admit(f, writer);
