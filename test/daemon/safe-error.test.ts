@@ -3355,11 +3355,71 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("preserves deferred direct-relative successor over-redaction", () => {
+  it("preserves a direct-relative successor after a nested file child (Bug #1336)", () => {
     const input =
       "file://h?x=[https://o.test/t&/Users/o/one&file:///Users/a/two&relative/path]";
     const expected =
-      "file://h?x=[https://o.test/t&<path>&file://<path>&relative<path>]";
+      "file://h?x=[https://o.test/t&<path>&file://<path>&relative/path]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).toContain("relative/path");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "direct relative",
+      "file://h?x=[https://e.test/t&file:///Users/b/two&relative/path]",
+      "file://h?x=[https://e.test/t&file://<path>&relative/path]",
+    ],
+    [
+      "pipe direct relative",
+      "file://h?x=[https://e.test/t&file:///Users/b/two|relative/path]",
+      "file://h?x=[https://e.test/t&file://<path>|relative/path]",
+    ],
+    [
+      "named public successor",
+      "file://h?x=[https://e.test/t&file:///Users/b/two&https://p.test/x]",
+      "file://h?x=[https://e.test/t&file://<path>&https://p.test/x]",
+    ],
+    [
+      "word-bearing private root",
+      "file://h?x=[https://e.test/t&file:///Users/b/two&word/Users/secret.db]",
+      "file://h?x=[https://e.test/t&file://<path>&word<path>]",
+    ],
+    [
+      "POSIX root",
+      "file://h?x=[https://e.test/t&file:///Users/b/two&/Users/abs/x]",
+      "file://h?x=[https://e.test/t&file://<path>&<path>]",
+    ],
+    [
+      "Windows root",
+      "file://h?x=[https://e.test/t&file:///Users/b/two&\\Users\\win\\x]",
+      "file://h?x=[https://e.test/t&file://<path>&<path>]",
+    ],
+    [
+      "UNC root",
+      "file://h?x=[https://e.test/t&file:///Users/b/two&\\\\server\\share\\x]",
+      "file://h?x=[https://e.test/t&file://<path>&<path>]",
+    ],
+    [
+      "drive root",
+      "file://h?x=[https://e.test/t&file:///Users/b/two&C:\\Users\\d\\x]",
+      "file://h?x=[https://e.test/t&file://<path>&<path>]",
+    ],
+    [
+      "word-bearing private parameter",
+      "file://h?x=[https://e.test/t&file:///Users/b/two&name=\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t&file://<path>&name=<path>]",
+    ],
+    [
+      "matching close then hard reset",
+      "file://h?x=[https://e.test/t&file:///Users/b/two&relative/path]&later/Users/tail",
+      "file://h?x=[https://e.test/t&file://<path>&relative/path]&later/Users/tail",
+    ],
+  ] as const)("bounds Bug #1336 child-return ownership: %s", (_name, input, expected) => {
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -3423,21 +3483,21 @@ describe("sanitizeError", () => {
       "query",
       "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&relative/path]",
       "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative/path]",
-      "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative<path>]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative/path]",
     ],
     [
       "fragment",
       "file://h?x=[https://e.test/t&file:///Users/a/one#key=/public&docs/readme/more]",
       "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs/readme/more]",
-      "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs<path>]",
+      "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs/readme/more]",
     ],
     [
       "incomplete Users root",
       "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&later/Users]",
       "file://h?x=[https://e.test/t&file://<path>?key=<path>&later/Users]",
-      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later<path>]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later/Users]",
     ],
-  ] as const)("preserves deferred Bug #1336 %s pass sequence", (_name, input, firstExpected, stableExpected) => {
+  ] as const)("converges Bug #1336 %s on the first pass", (_name, input, firstExpected, stableExpected) => {
     const first = sanitizeError(input);
     const second = sanitizeError(first);
 
@@ -3825,11 +3885,11 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("preserves deferred Bug #1336 root anchor after the pipe-handoff fix", () => {
+  it("keeps the Bug #1336 root anchor after the pipe-handoff fix", () => {
     const input =
       "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&relative/path]";
     const expected =
-      "file://h?x=[https://e.test/t&<path>&file://<path>&relative<path>]";
+      "file://h?x=[https://e.test/t&<path>&file://<path>&relative/path]";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);

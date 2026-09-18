@@ -405,12 +405,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (chars[index + 1] === "/" || chars[index + 1] === "\\") {
         forcedPath[index + 1] = 1;
       } else if (
-        !restartedNestedFileUrlParentOwnerBracketDepths.has(pathlessFileQueryOwnerBracketDepth) &&
-        startsWordBearingSlashPath(chars, index + 1)
+        !restartedNestedFileUrlParentOwnerBracketDepths.has(pathlessFileQueryOwnerBracketDepth)
       ) {
-        let pathStart = index + 1;
-        while (isPathWord(chars[pathStart])) pathStart += 1;
-        forcedPath[pathStart] = 1;
+        // Returning from a nested file child does not make every relative
+        // value private. Only an established private root re-enters the
+        // enclosing file-query grammar here.
+        const privateRootStart = wordBearingPrivateRootPathStart(chars, index + 1);
+        if (privateRootStart >= 0) forcedPath[privateRootStart] = 1;
       }
     }
     if (restartedPathlessFile && char === "[") {
