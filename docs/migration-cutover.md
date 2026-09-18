@@ -579,10 +579,26 @@ schema and project-map witnesses in play, plus the sealed queue-classification
 witness; changing any of those mints a different report identity rather than
 silently reusing an unrelated one.
 
-A **clean** report -- one with no recorded mismatches -- is the only report
-that ever begins a `verify-generation` effect. A report **with** mismatches is
-still persisted in full as operator evidence, but no effect is begun for it,
-and it does not become activation-eligible. Recovering from a report with
+Publication requires two things together, not a clean report alone: every
+reconciliation class must have actually run, and no class may have produced a
+mismatch. The persisted report carries both facts directly, so this is
+provable from the artifact itself rather than assumed by a reader. Its
+`classCoverage` field records, for every defined reconciliation class,
+whether that class ran this pass; its `activationEligible` field is
+`true` only when every class ran **and** the report is clean. A report can
+therefore be clean -- zero recorded mismatches -- and still not be
+activation-eligible, because a class that never ran produces no mismatches
+for the same reason an unplugged smoke detector never sounds. This driver
+does not yet implement the `relation` and `ledger` reconciliation
+classes, so `activationEligible` is currently `false` for every report it
+can produce; that is deliberate, not a bug to route around, and it is
+recorded in the report rather than hidden. Any mismatch in any class,
+including a `sample`-class mismatch from the public-listing probe, refuses
+eligibility outright -- a sample mismatch that were merely recorded without
+refusing would be exactly as decorative as a witness nobody compares.
+
+A report **with** mismatches is still persisted in full as operator
+evidence, but no effect is begun for it. Recovering from a report with
 mismatches means explicit `abort` followed by a new generation, the same
 pattern used throughout this journal for a phase that cannot be resumed in
 place: verification does not retry itself, patch the destination, or narrow
@@ -656,3 +672,38 @@ evidence at all. The **exact** total for each (domain, class) pair is always
 recorded separately from the retained entries and is never itself truncated;
 an operator reading a report with a truncated class sees both the 100 (or
 fewer) example entries and the true total.
+
+### Verification cost scales with the rows in scope
+
+The census -- the fenced read of every row in every portable domain, used
+to build the per-domain record count and content digest the report compares
+against the source -- does not have a fixed cost. Its dominant cost is one
+round trip per record: the destination's canonicalisation path reads and
+re-hashes each row individually rather than in batches, so census wall time
+is roughly linear in the number of rows in scope, not a flat per-domain
+overhead. Measured against a live PostgreSQL 18 instance with roughly 9,300
+rows across the copied domains (dominated by conversations, messages and
+message-parts), the census alone took about 78.5 seconds -- effectively
+100% of measured verification wall time, since the read-only guard, the
+sequence self-consistency check and the public-listing probe are each under
+20 milliseconds by comparison. That works out to roughly 8 milliseconds per
+record; a project with substantially more rows in scope should expect
+verification time to extrapolate from that figure roughly linearly, not to
+stay flat.
+
+This matters because the census, the sequence check and the read-only guard
+all run inside one fenced window held by a single verification lease, and
+the lease has a caller-supplied `leaseTtlMs`. Verification does not renew a
+lease that is about to expire mid-window; if the window does not finish
+inside the lease term, verification fails rather than extending it, exactly
+like the rest of this journal's refuse-and-restart pattern rather than a
+retry loop. An operator sizing `leaseTtlMs` for a large project should
+measure census cost against a realistic copy of that project's own row
+counts before a cutover, not discover the lease was too short during one.
+As a starting point rather than a promise, this repository's own measured
+figure above scaled to a stated safety margin over the measured total --
+not a second measurement -- rather than an unexamined guess; the same
+approach (measure, then apply a stated margin, then let the arithmetic be
+checked) is what an operator should repeat against their own data before
+relying on any specific `leaseTtlMs` value.
+

@@ -7,13 +7,25 @@ reversible SQLite-to-PostgreSQL cutover. A copied generation is now
 independently re-verified against the immutable source snapshot and the live
 destination inside a single fenced read-only window, producing a durable,
 content-addressed report before any activation step may consider the
-generation activation-eligible.
+generation.
 
-A clean report is the only report that ever begins a verify-generation
-effect; a report with mismatches is persisted in full as operator evidence,
-but requires explicit abort and a new generation rather than an in-place
-retry. Reconciliation now includes a sequence self-consistency bound (an
-identity sequence's last_value must be at or above the maximum identity
-value present in its copied domain), and the step-5 public-read probe runs
-through the real PostgreSQL repository path and is compared against the
-source's own canonical ordering rather than being recorded and discarded.
+Publication requires both a clean report (no recorded mismatches, including
+the public-probe sample class) and full reconciliation class coverage; the
+persisted report records both as `classCoverage` and `activationEligible`
+fields, so eligibility is provable from the artifact rather than assumed. A
+report with mismatches is still persisted in full as operator evidence, but
+requires explicit abort and a new generation rather than an in-place retry.
+Reconciliation now includes a sequence self-consistency bound (an identity
+sequence's on-disk state must not allow the next allocation to collide with
+a copied row, distinguishing a privilege gap from a genuinely never-called
+sequence rather than collapsing both into the same refusal), and the
+step-5 public-read probe runs through the real PostgreSQL repository path
+and is compared against the source's own canonical ordering rather than
+being recorded and discarded.
+
+Verification cost scales with the row count in scope: the census reads and
+re-hashes each row individually, so its wall time is roughly linear in row
+count rather than a flat per-domain cost, and the census, sequence check and
+read-only guard all run inside one fenced window bounded by a single
+verification lease that is never renewed mid-window. See
+`docs/migration-cutover.md` for the measured figure and sizing guidance.
