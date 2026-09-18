@@ -3,6 +3,7 @@ import {
   closeSync,
   existsSync,
   mkdtempSync,
+  mkdirSync,
   openSync,
   readdirSync,
   renameSync,
@@ -250,7 +251,9 @@ describe("existing-only opened-inode authentication", () => {
     const fixture = createSubstitutionFixture();
     const journalPath = `${fixture.dbPath}-journal`;
     tempDescriptors.push(openSync(fixture.dbPath, "r+"));
-    fsState.beforeLeafResolve = fixture.swap;
+    // Staged after the leaf is retained so the parking action runs after the
+    // constructor, which is the shape this pins.
+    sqliteState.beforeOpen = fixture.swap;
     sqliteState.afterOpen = () => {
       renameSync(fixture.dbPath, journalPath);
       renameSync(fixture.stashPath, fixture.dbPath);
@@ -266,7 +269,7 @@ describe("existing-only opened-inode authentication", () => {
   it("refuses a substitution laundered by reopening the database in the window", () => {
     const fixture = createSubstitutionFixture();
     tempDescriptors.push(openSync(fixture.dbPath, "r+"));
-    fsState.beforeLeafResolve = fixture.swap;
+    sqliteState.beforeOpen = fixture.swap;
     sqliteState.afterOpen = () => {
       fixture.restore();
       tempDescriptors.push(openSync(fixture.dbPath, "r+"));
@@ -285,7 +288,7 @@ describe("existing-only opened-inode authentication", () => {
     const padPath = join(dirname(fixture.dbPath), "pad.bin");
     writeFileSync(padPath, "pad");
     const padFd = openSync(padPath, "r+");
-    fsState.beforeLeafResolve = () => {
+    sqliteState.beforeOpen = () => {
       closeSync(padFd);
       fixture.swap();
     };
@@ -302,7 +305,7 @@ describe("existing-only opened-inode authentication", () => {
     const fixture = createSubstitutionFixture();
     tempDescriptors.push(openSync(fixture.dbPath, "r+"));
     const substituteFd = openSync(fixture.substitutePath, "r+");
-    fsState.beforeLeafResolve = () => {
+    sqliteState.beforeOpen = () => {
       closeSync(substituteFd);
       fixture.swap();
     };
@@ -319,7 +322,7 @@ describe("existing-only opened-inode authentication", () => {
     const fixture = createSubstitutionFixture("DELETE");
     chmodSync(fixture.dbPath, 0o644);
     chmodSync(fixture.substitutePath, 0o644);
-    fsState.beforeLeafResolve = fixture.swap;
+    sqliteState.beforeOpen = fixture.swap;
     sqliteState.afterOpen = fixture.restore;
 
     expect(() => getExistingLcmConnection(fixture.dbPath)).toThrow(BINDING_ERROR);
@@ -422,8 +425,9 @@ describe("opened-inode substitution inside the retained window", () => {
     expect(() => getExistingLcmConnection(fixture.dbPath))
       .toThrow("injected retained leaf close failure");
 
-    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(true);
-    closeLcmConnection(fixture.dbPath);
+    // The caller never receives the handle, so nothing may stay pooled for a
+    // later caller to reuse with a reference no one can balance.
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
   });
 
   it("keeps the substitution refusal when the retained leaf also fails to close", () => {
@@ -544,3 +548,38 @@ describe("create-capable leaf admission exhaustion", () => {
   });
 });
 
+describe("opened-inode substitution through the parent directory", () => {
+  it("refuses a parent directory replaced and restored while SQLite opens", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-opened-inode-parent-"));
+    tempDirs.push(root);
+    const parentPath = join(root, "project");
+    const substituteParentPath = join(root, "substitute");
+    const stashParentPath = join(root, "stash");
+    mkdirSync(parentPath, { mode: 0o700 });
+    mkdirSync(substituteParentPath, { mode: 0o700 });
+    const dbPath = join(parentPath, "db.sqlite");
+    createMarkedDatabase(dbPath, "authentic");
+    createMarkedDatabase(join(substituteParentPath, "db.sqlite"), "substitute");
+    for (const directory of [parentPath, substituteParentPath]) {
+      for (const leaf of readdirSync(directory)) {
+        if (leaf.endsWith("-wal") || leaf.endsWith("-shm")) unlinkSync(join(directory, leaf));
+      }
+    }
+    fsState.targetPath = dbPath;
+    sqliteState.beforeOpen = () => {
+      renameSync(parentPath, stashParentPath);
+      renameSync(substituteParentPath, parentPath);
+    };
+    sqliteState.afterOpen = () => {
+      renameSync(parentPath, substituteParentPath);
+      renameSync(stashParentPath, parentPath);
+    };
+
+    expect(() => getExistingLcmConnection(dbPath)).toThrow(BINDING_ERROR);
+
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    sqliteState.beforeOpen = undefined;
+    sqliteState.afterOpen = undefined;
+    expectMarker(dbPath, "authentic");
+  });
+});

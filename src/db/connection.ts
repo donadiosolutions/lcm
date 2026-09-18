@@ -480,7 +480,13 @@ function openLcmConnection(
       try {
         closeSync(retainedLeaf.fd);
       } catch (closeError) {
-        if (primaryError === undefined) throw closeError;
+        if (primaryError === undefined) {
+          // The open already pooled this handle, and the caller will never
+          // receive it, so evict and close it rather than leaking a reference
+          // that no later caller can balance.
+          if (db !== undefined) invalidateLcmConnection(dbPath, db);
+          throw closeError;
+        }
       }
     }
     if (!parentClosed) {
