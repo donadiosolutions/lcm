@@ -1792,6 +1792,16 @@ This evidence is ordinary filesystem metadata rather than a Linux-specific
 interface, so it applies on every supported platform. Its limit is timestamp
 resolution: a filesystem that records change times coarsely could in principle
 admit a substitution whose renames both land within a single tick.
+On a platform whose change timestamp records creation rather than metadata
+change, the database file's own evidence adds little and the directory's
+evidence carries the check.
+
+The evidence binds the database file itself. A write-ahead log, shared-memory
+file, or rollback journal that is already in place before LCM authenticates the
+database is honored by SQLite as that database's content, and both observations
+still match across the open. The database directory is private to its owner, so
+placing one requires the owner's own privileges, but the guarantee here is about
+which file the handle opened rather than about sidecar provenance.
 
 Because the evidence is metadata on the database and its directory, an open can
 also be refused when something else changes them while SQLite is opening. A
@@ -1800,7 +1810,8 @@ and a writer that creates the write-ahead log, or anything else that adds or
 removes an entry in the database directory, changes the directory's. Running
 the daemon and a CLI command against one project at the same moment can
 therefore produce this refusal on a healthy database. It is fail-closed and
-retrying the open resolves it.
+retrying the open once that activity settles resolves it; LCM does not retry on
+its own, and an open repeated during sustained contention can refuse again.
 
 When two processes create a project database at once, the one that loses the
 exclusive create authenticates and adopts the database the winner created,
