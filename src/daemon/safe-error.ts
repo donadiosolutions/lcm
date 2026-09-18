@@ -368,7 +368,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       activeNestedFileUrlParentOwnerBracketDepth > 0 &&
       exactFileScheme &&
       foundFilePath &&
-      char === "&"
+      // Returning to the enclosing owner is a property of the delimiter's
+      // sibling role, not of the ampersand character, so a pipe returns too.
+      (char === "&" || char === "|")
     ) {
       const wordBearingPrivatePathStart = queryOrFragment
         ? wordBearingPrivateRootPathStart(chars, index + 1)

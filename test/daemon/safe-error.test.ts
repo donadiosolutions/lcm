@@ -4198,6 +4198,53 @@ describe("sanitizeError", () => {
     expect(whitespaceChecks).toBeLessThanOrEqual(Array.from(input).length);
   });
 
+  it.each([
+    [
+      "pipe returns on the first pass",
+      "file://h?x=[file:///Users/CHILD/x|later/Users/alice/secret.db]",
+      "file://h?x=[file://<path>|later<path>]",
+    ],
+    [
+      "ampersand parity control",
+      "file://h?x=[file:///Users/CHILD/x&later/Users/alice/secret.db]",
+      "file://h?x=[file://<path>&later<path>]",
+    ],
+    [
+      "POSIX successor",
+      "file://h?x=[file:///Users/CHILD/x|/Users/a/one]",
+      "file://h?x=[file://<path>|<path>]",
+    ],
+    [
+      "Windows root successor",
+      "file://h?x=[file:///Users/CHILD/x|\\Users\\a\\one]",
+      "file://h?x=[file://<path>|<path>]",
+    ],
+    [
+      "drive root successor",
+      "file://h?x=[file:///Users/CHILD/x|C:\\Users\\a\\one]",
+      "file://h?x=[file://<path>|<path>]",
+    ],
+  ] as const)("returns from an active nested file child on a pipe (Bug #1349): %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("alice");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "file://h?x=[https://e.test/t&file://host?key=/public|later/Users/secret]",
+    "file://h?x=[file:///Users/CHILD/x|relative/path]",
+    "file://h?x=[file:///Users/CHILD/x&relative/path]",
+  ] as const)("keeps Bug #1349 non-private successors intact on every pass: %s", (input) => {
+    const first = sanitizeError(input);
+
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+    expect(first).toContain(input.includes("relative") ? "relative/path" : "later/Users/secret");
+  });
+
   it("replaces SQLite constraint details with generic message", () => {
     const result = sanitizeError("SQLITE_CONSTRAINT: UNIQUE constraint failed: messages.conversation_id");
     expect(result).not.toContain("messages.conversation_id");
