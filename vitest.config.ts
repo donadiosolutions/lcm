@@ -6,10 +6,17 @@ import { defineConfig, type UserConfig } from "vitest/config";
 const sqliteRouteTests = ["test/daemon/routes/**/*.test.ts"];
 const worktreeReconciliationTests = ["test/worktree-reconciliation.test.ts"];
 const serialSqliteTests = [...sqliteRouteTests, ...worktreeReconciliationTests];
+// Portable boundary files whose real limits and deadlines are distorted by
+// contention. The first two allocate 128 MiB and 144 MiB in-memory fixtures;
+// the two sqlite-portable files additionally build migrated databases and
+// stream whole-file digests, so they are fsync-heavy. The destination
+// round-trip was omitted here originally and timed out under the default
+// parallel pool at its 5000 ms default deadline (#1210).
 const portableBoundaryTests = [
   "test/storage/portable-record.test.ts",
   "test/storage/portable-record-stream.test.ts",
   "test/storage/sqlite-portable-source.test.ts",
+  "test/storage/sqlite-portable-destination.test.ts",
 ];
 const packageConfigTests = ["test/package-config.test.ts"];
 const e2eTests = ["test/e2e/**/*.test.ts"];
