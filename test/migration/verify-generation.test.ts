@@ -408,6 +408,20 @@ describe("verifyMigrationGeneration", () => {
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-clean" }), dependencies);
     expect(result.outcome).toBe("clean");
     expect(result.report.mismatches).toEqual([]);
+    // V2's replacement for census-alone gating: relation/FK closure and
+    // ledger reconciliation are not implemented anywhere in this driver,
+    // so even a fully clean report must never claim activation eligibility.
+    expect(result.report.activationEligible).toBe(false);
+    expect(result.report.body.classCoverage).toEqual([
+      { class: "count", ran: true },
+      { class: "digest", ran: true },
+      { class: "identity", ran: true },
+      { class: "relation", ran: false },
+      { class: "sequence", ran: true },
+      { class: "schema", ran: true },
+      { class: "ledger", ran: false },
+      { class: "sample", ran: true },
+    ]);
     expect(runtime.close).toHaveBeenCalledTimes(1);
     expect(copySource.stream.close).toHaveBeenCalledTimes(1);
   }, 15000);

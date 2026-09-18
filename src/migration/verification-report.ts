@@ -118,6 +118,37 @@ const MISMATCH_CLASS_ORDINAL = new Map<MigrationMismatchClass, number>(
 /** Frozen per-class bound on the number of retained mismatch entries; exact totals are retained separately. */
 export const MIGRATION_MISMATCH_CLASS_TRUNCATION_LIMIT = 100;
 
+// --- Class-coverage vector ---------------------------------------------------
+
+/**
+ * V2's repair for census-alone gating: an empty mismatch list can look
+ * clean when a required class simply never ran (foreign keys, DAG,
+ * samples, ledger), which produces no mismatches precisely because the
+ * check did not execute. This vector makes coverage provable from the
+ * artifact itself -- one entry per closed mismatch class, in
+ * MIGRATION_MISMATCH_CLASSES order, each stating whether that class ran
+ * this pass -- rather than assumed from an absence of recorded mismatches.
+ */
+export type MigrationClassCoverageEntry = Readonly<{
+  class: MigrationMismatchClass;
+  ran: boolean;
+}>;
+export type MigrationClassCoverageVector = readonly MigrationClassCoverageEntry[];
+
+function parseMigrationClassCoverageVector(value: unknown): MigrationClassCoverageVector {
+  if (!Array.isArray(value) || value.length !== MIGRATION_MISMATCH_CLASSES.length) {
+    reportError("invalid-input", "class coverage vector must have exactly one entry per mismatch class");
+  }
+  const entries = value.map((entry, index) => {
+    const record = assertExactObject(entry, ["class", "ran"], "class coverage entry");
+    if (record.class !== MIGRATION_MISMATCH_CLASSES[index] || typeof record.ran !== "boolean") {
+      reportError("invalid-input", "class coverage vector is not in the frozen class order");
+    }
+    return { class: record.class as MigrationMismatchClass, ran: record.ran };
+  });
+  return deepFreeze(entries);
+}
+
 /**
  * Frozen ordering marker for the step 5 public probes: they always run
  * before the step 6 census window opens, and only ever describe an
@@ -348,6 +379,7 @@ export type MigrationVerificationReportBody = Readonly<{
   queueClassificationWitness: MigrationQueueClassificationWitness;
   censusVector: MigrationCensusVector;
   canonicalDelta: MigrationCanonicalDelta;
+  classCoverage: MigrationClassCoverageVector;
   /**
    * Binds the step 5 public-read probe outcome into the identity so it can
    * never again be recorded and discarded. The driver derives this from
@@ -373,6 +405,7 @@ export type CreateMigrationVerificationReportBodyInput = Readonly<{
   queueClassificationWitness: MigrationQueueClassificationWitness;
   censusVector: MigrationCensusVector;
   canonicalDelta: MigrationCanonicalDelta;
+  classCoverage: MigrationClassCoverageVector;
   publicProbeSha256: string;
   sampleParameters: MigrationVerificationSampleParameters;
   mismatches: readonly MigrationVerificationMismatch[];
@@ -411,6 +444,7 @@ export function createMigrationVerificationReportBody(
   const queueClassificationWitness = parseMigrationQueueClassificationWitness(input.queueClassificationWitness);
   const censusVector = parseMigrationCensusVector(input.censusVector);
   const canonicalDelta = parseMigrationCanonicalDelta(input.canonicalDelta);
+  const classCoverage = parseMigrationClassCoverageVector(input.classCoverage);
   const sampleParameters = parseMigrationVerificationSampleParameters(input.sampleParameters);
   if (!Array.isArray(input.mismatches) || !Array.isArray(input.mismatchTotals)) {
     reportError("invalid-input", "verification report mismatch evidence is invalid");
@@ -422,6 +456,13 @@ export function createMigrationVerificationReportBody(
     RECONCILIATION_DOMAIN_ORDINAL.get(total.domain)!, MISMATCH_CLASS_ORDINAL.get(total.class)!, "",
   ], "verification report mismatch totals");
   assertMismatchesConsistentWithTotals(mismatches, mismatchTotals);
+  // A class marked as not-run cannot have produced mismatch evidence: that
+  // combination is self-contradictory (evidence from a check that did not
+  // execute), never a real report state.
+  const ranClasses = new Set(classCoverage.filter((entry) => entry.ran).map((entry) => entry.class));
+  if (mismatchTotals.some((total) => !ranClasses.has(total.class))) {
+    reportError("invalid-input", "a mismatch total names a class the coverage vector marks as not run");
+  }
   return deepFreeze({
     version: 1,
     generationId: input.generationId,
@@ -436,6 +477,7 @@ export function createMigrationVerificationReportBody(
     queueClassificationWitness,
     censusVector,
     canonicalDelta,
+    classCoverage,
     publicProbeSha256: input.publicProbeSha256,
     reconciliationOutcomeDigestSha256: migrationReconciliationOutcomeDigest(mismatches, mismatchTotals),
     sampleParameters,
@@ -452,6 +494,15 @@ export type MigrationVerificationReport = Readonly<{
   mismatchTotals: readonly MigrationVerificationMismatchTotal[];
   /** Recomputed, never carried: true iff mismatchTotals is empty. */
   clean: boolean;
+  /**
+   * Recomputed, never carried: true iff clean AND every entry in the
+   * body's classCoverage vector ran. A report can be clean while some
+   * required class never executed (relation/ledger are not yet
+   * implemented anywhere in this driver); such a report is deliberately
+   * ineligible for activation until that coverage gap is closed, per
+   * plan-v4's replacement for census-alone gating.
+   */
+  activationEligible: boolean;
   reportSha256: string;
 }>;
 
@@ -465,8 +516,11 @@ function reportPayloadSha256(
   mismatches: readonly MigrationVerificationMismatch[],
   mismatchTotals: readonly MigrationVerificationMismatchTotal[],
   clean: boolean,
+  activationEligible: boolean,
 ): string {
-  return migrationWitnessSha256(["lcm-migration-verification-report-v1", body, mismatches, mismatchTotals, clean]);
+  return migrationWitnessSha256([
+    "lcm-migration-verification-report-v1", body, mismatches, mismatchTotals, clean, activationEligible,
+  ]);
 }
 
 export function createMigrationVerificationReport(
@@ -477,7 +531,8 @@ export function createMigrationVerificationReport(
   const mismatches = input.mismatches.map(parseMismatch);
   const mismatchTotals = input.mismatchTotals.map(parseMismatchTotal);
   const clean = mismatchTotals.length === 0;
-  const reportSha256 = reportPayloadSha256(body, mismatches, mismatchTotals, clean);
+  const activationEligible = clean && body.classCoverage.every((entry) => entry.ran);
+  const reportSha256 = reportPayloadSha256(body, mismatches, mismatchTotals, clean, activationEligible);
   return deepFreeze({
     version: 1,
     reportId: `verify-generation-${reportSha256}`,
@@ -485,6 +540,7 @@ export function createMigrationVerificationReport(
     mismatches,
     mismatchTotals,
     clean,
+    activationEligible,
     reportSha256,
   });
 }
@@ -492,7 +548,7 @@ export function createMigrationVerificationReport(
 export function parseMigrationVerificationReport(value: unknown): MigrationVerificationReport {
   const record = assertExactObject(
     value,
-    ["body", "clean", "mismatchTotals", "mismatches", "reportId", "reportSha256", "version"],
+    ["activationEligible", "body", "clean", "mismatchTotals", "mismatches", "reportId", "reportSha256", "version"],
     "verification report",
   );
   if (
@@ -500,6 +556,7 @@ export function parseMigrationVerificationReport(value: unknown): MigrationVerif
     || !isIdentifier(record.reportId)
     || !isHash(record.reportSha256)
     || typeof record.clean !== "boolean"
+    || typeof record.activationEligible !== "boolean"
   ) {
     reportError("invalid-input", "verification report is invalid");
   }
@@ -517,6 +574,7 @@ export function parseMigrationVerificationReport(value: unknown): MigrationVerif
     queueClassificationWitness: (record.body as RecordValue).queueClassificationWitness as MigrationQueueClassificationWitness,
     censusVector: (record.body as RecordValue).censusVector as MigrationCensusVector,
     canonicalDelta: (record.body as RecordValue).canonicalDelta as MigrationCanonicalDelta,
+    classCoverage: (record.body as RecordValue).classCoverage as MigrationClassCoverageVector,
     publicProbeSha256: (record.body as RecordValue).publicProbeSha256 as string,
     sampleParameters: (record.body as RecordValue).sampleParameters as MigrationVerificationSampleParameters,
     mismatches: Array.isArray(record.mismatches) ? record.mismatches : [],
@@ -529,7 +587,11 @@ export function parseMigrationVerificationReport(value: unknown): MigrationVerif
   const mismatchTotals = record.mismatchTotals.map(parseMismatchTotal);
   const clean = mismatchTotals.length === 0;
   if (clean !== record.clean) reportError("unexpected-state", "verification report clean flag does not match its mismatch totals");
-  const reportSha256 = reportPayloadSha256(body, mismatches, mismatchTotals, clean);
+  const activationEligible = clean && body.classCoverage.every((entry) => entry.ran);
+  if (activationEligible !== record.activationEligible) {
+    reportError("unexpected-state", "verification report activationEligible flag does not match its class coverage");
+  }
+  const reportSha256 = reportPayloadSha256(body, mismatches, mismatchTotals, clean, activationEligible);
   if (reportSha256 !== record.reportSha256) reportError("unexpected-state", "verification report checksum does not match its content");
   if (record.reportId !== `verify-generation-${reportSha256}`) {
     reportError("unexpected-state", "verification report id does not match its content");
@@ -541,6 +603,7 @@ export function parseMigrationVerificationReport(value: unknown): MigrationVerif
     mismatches,
     mismatchTotals,
     clean,
+    activationEligible,
     reportSha256,
   });
 }

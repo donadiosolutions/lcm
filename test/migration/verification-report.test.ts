@@ -85,6 +85,7 @@ function baseInput(overrides: Partial<CreateMigrationVerificationReportInput> = 
       version: 1,
       domains: domainVector((domain, index) => ({ domain, recordCount: index, terminalIdentitySha256: migrationWitnessSha256(["d", domain]) })),
     },
+    classCoverage: MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: true })),
     publicProbeSha256: migrationWitnessSha256(["public-probe"]),
     sampleParameters: sampleParameters(),
     mismatches: [],
@@ -375,5 +376,53 @@ describe("createMigrationVerificationReport / parseMigrationVerificationReport",
   it("rejects a report id that does not match its content", () => {
     const report = createMigrationVerificationReport(baseInput());
     expectReportError(() => parseMigrationVerificationReport({ ...report, reportId: `verify-generation-${HASH_A}` }), "unexpected-state");
+  });
+  it("computes activationEligible as false when clean but a required class did not run", () => {
+    const notFullyCovered = createMigrationVerificationReport(baseInput({
+      classCoverage: MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: mismatchClass !== "ledger" })),
+    }));
+    expect(notFullyCovered.clean).toBe(true);
+    expect(notFullyCovered.activationEligible).toBe(false);
+    expect(parseMigrationVerificationReport(notFullyCovered)).toEqual(notFullyCovered);
+  });
+  it("computes activationEligible as false when every class ran but the report is dirty", () => {
+    const dirtyButCovered = createMigrationVerificationReport(baseInput({
+      mismatches: [{ domain: "messages", class: "count", identitySha256: HASH_A }],
+      mismatchTotals: [{ domain: "messages", class: "count", count: 1 }],
+    }));
+    expect(dirtyButCovered.activationEligible).toBe(false);
+  });
+  it("rejects a tampered activationEligible flag on parse", () => {
+    const report = createMigrationVerificationReport(baseInput());
+    expectReportError(() => parseMigrationVerificationReport({ ...report, activationEligible: false }), "unexpected-state");
+  });
+  it("rejects a non-boolean activationEligible on parse", () => {
+    const report = createMigrationVerificationReport(baseInput());
+    expectReportError(() => parseMigrationVerificationReport({ ...report, activationEligible: "yes" }), "invalid-input");
+  });
+});
+
+describe("class coverage vector", () => {
+  it("rejects a coverage vector with the wrong number of entries", () => {
+    expectReportError(() => createMigrationVerificationReport(baseInput({
+      classCoverage: MIGRATION_MISMATCH_CLASSES.slice(0, 3).map((mismatchClass) => ({ class: mismatchClass, ran: true })),
+    })), "invalid-input");
+  });
+  it("rejects a coverage vector out of the frozen class order", () => {
+    const shuffled = [...MIGRATION_MISMATCH_CLASSES].reverse().map((mismatchClass) => ({ class: mismatchClass, ran: true }));
+    expectReportError(() => createMigrationVerificationReport(baseInput({ classCoverage: shuffled })), "invalid-input");
+  });
+  it("rejects a coverage entry with a non-boolean ran field", () => {
+    const invalid = MIGRATION_MISMATCH_CLASSES.map((mismatchClass, index) => ({
+      class: mismatchClass, ran: index === 0 ? ("yes" as unknown as boolean) : true,
+    }));
+    expectReportError(() => createMigrationVerificationReport(baseInput({ classCoverage: invalid })), "invalid-input");
+  });
+  it("rejects a mismatch total naming a class the coverage vector marks as not run", () => {
+    expectReportError(() => createMigrationVerificationReport(baseInput({
+      classCoverage: MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: mismatchClass !== "count" })),
+      mismatches: [{ domain: "messages", class: "count", identitySha256: HASH_A }],
+      mismatchTotals: [{ domain: "messages", class: "count", count: 1 }],
+    })), "invalid-input");
   });
 });

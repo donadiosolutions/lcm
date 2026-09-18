@@ -31,12 +31,36 @@ import {
 } from "./activation-witness.js";
 import {
   createMigrationVerificationReport,
+  MIGRATION_MISMATCH_CLASSES,
   MIGRATION_MISMATCH_CLASS_TRUNCATION_LIMIT, MIGRATION_PUBLIC_PROBE_ORDERING_SHA256,
+  type MigrationClassCoverageVector,
   type CreateMigrationVerificationReportInput, type MigrationMismatchClass, type MigrationQueueClassificationWitness,
   type MigrationReconciliationDomain, type MigrationSourceWitnessDigests, type MigrationVerificationMismatch,
   type MigrationVerificationMismatchTotal, type MigrationVerificationReport, type MigrationVerificationSampleParameters,
 } from "./verification-report.js";
 import { MigrationVerificationReportStore } from "./verification-store.js";
+
+/**
+ * V2's replacement for census-alone gating: classes this driver actually
+ * checks this pass (either as a recordable mismatch, or as a hard refuse
+ * that must have already passed by the time a report is built at all --
+ * schema's migrations-chain check and destination-identity's sealed-
+ * witness check are both the latter shape) are marked ran; classes with
+ * no implementation anywhere in this driver (relation/FK closure, ledger,
+ * a distinct record-level identity class) are marked not-run. A report
+ * built from this vector can never claim activation eligibility while a
+ * required class is unimplemented, by construction -- that is deliberate,
+ * not an oversight to fix later in this same item.
+ */
+const DRIVER_IMPLEMENTED_MISMATCH_CLASSES: ReadonlySet<MigrationMismatchClass> = new Set([
+  "count", "digest", "identity", "sequence", "schema", "sample",
+]);
+
+function buildClassCoverageVector(): MigrationClassCoverageVector {
+  return MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({
+    class: mismatchClass, ran: DRIVER_IMPLEMENTED_MISMATCH_CLASSES.has(mismatchClass),
+  }));
+}
 
 /**
  * The #624 verification driver: plan-v4.md section 2's frozen ordering.
@@ -688,7 +712,8 @@ export async function verifyMigrationGeneration(
         manifestRevision: input.manifestRevision, manifestChecksumSha256: input.manifestChecksumSha256,
         sourceWitness, destinationIdentity, destinationSchemaWitness,
         projectMapWitnessSha256: input.projectMapWitnessSha256, queueClassificationWitness: input.queueClassificationWitness,
-        censusVector, canonicalDelta, publicProbeSha256, sampleParameters: input.sampleParameters,
+        censusVector, canonicalDelta, classCoverage: buildClassCoverageVector(),
+        publicProbeSha256, sampleParameters: input.sampleParameters,
         mismatches, mismatchTotals,
       };
       const report = createMigrationVerificationReport(reportInput);

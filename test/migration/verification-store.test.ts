@@ -6,6 +6,7 @@ import { PORTABLE_RECORD_DOMAIN_ORDER, type PortableDomain } from "../../src/sto
 import { migrationWitnessSha256 } from "../../src/migration/activation-witness.js";
 import {
   createMigrationVerificationReport,
+  MIGRATION_MISMATCH_CLASSES,
   MigrationVerificationReportError,
   type CreateMigrationVerificationReportInput,
 } from "../../src/migration/verification-report.js";
@@ -52,6 +53,7 @@ function baseInput(overrides: Partial<CreateMigrationVerificationReportInput> = 
       version: 1,
       domains: domainVector((domain, index) => ({ domain, recordCount: index, terminalIdentitySha256: migrationWitnessSha256(["d", domain]) })),
     },
+    classCoverage: MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: true })),
     sampleParameters: { version: 1, strideOrdinal: 97, sampleCount: 32, seedBasisSha256: HASH_D },
     publicProbeSha256: migrationWitnessSha256(["public-probe"]),
     mismatches: [],
