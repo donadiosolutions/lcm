@@ -3876,6 +3876,60 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it.each([
+    [
+      "drive root arms the wrapper tail",
+      "file://h?x=[https://e.test/t|C:\\Users\\alice\\one.db]\\Users\\bob\\secret.db",
+      "file://h?x=[https://e.test/t|<path>]<path>",
+    ],
+    [
+      "drive root arms a repeated in-wrapper handoff",
+      "file://h?x=[https://e.test/t|C:\\Users\\alice\\one.db&\\Users\\bob\\x]",
+      "file://h?x=[https://e.test/t|<path>&<path>]",
+    ],
+    [
+      "backslash root control",
+      "file://h?x=[https://e.test/t|\\Users\\alice\\one.db]\\Users\\bob\\secret.db",
+      "file://h?x=[https://e.test/t|<path>]<path>",
+    ],
+    [
+      "slash root control",
+      "file://h?x=[https://e.test/t|/Users/alice/one.db]/Users/bob/secret.db",
+      "file://h?x=[https://e.test/t|<path>]<path>",
+    ],
+    [
+      "ampersand drive root control",
+      "file://h?x=[https://e.test/t&C:\\Users\\alice\\one.db]\\Users\\bob\\secret.db",
+      "file://h?x=[https://e.test/t&<path>]<path>",
+    ],
+  ] as const)("arms the nested-public handoff on a drive root (Bug #1348): %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("bob");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "file://h?x=[https://e.test/t|relative/path]\\Users\\bob\\secret.db",
+    "file://h?x=[https://e.test/t|C:relative]\\Users\\bob\\secret.db",
+  ] as const)("does not arm the Bug #1348 handoff without a path root: %s", (input) => {
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps a single-pipe direct handoff control stable", () => {
+    const input = "file://h?x=[https://e.test/t|\\Users\\SECRET\\x]";
+    const expected = "file://h?x=[https://e.test/t|<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("keeps the Bug #1332 delimiter boundary after the pipe-handoff fix", () => {
     const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
     const first = sanitizeError(input);
