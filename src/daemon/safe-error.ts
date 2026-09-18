@@ -129,7 +129,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let nestedPublicUrlBracketDepth = 0;
   let pathlessFileQueryBracketDepth = 0;
   let pathlessNestedPublicUrlActive = false;
-  let pathlessNestedPublicUrlHasBracket = false;
   let slashPrefixedNestedPublicSchemeStart = -1;
   let quotedQueryPublicUrl = false;
   let quotedQueryPublicUrlOwnQueryOrFragment = false;
@@ -162,7 +161,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       nestedPublicUrlBracketDepth = 0;
       pathlessFileQueryBracketDepth = 0;
       pathlessNestedPublicUrlActive = false;
-      pathlessNestedPublicUrlHasBracket = false;
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
       quotedQueryPublicUrlOwnQueryOrFragment = false;
@@ -424,7 +422,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       continue;
     }
     if (separator >= 0 && char === "[") {
-      if (pathlessNestedPublicUrlActive) pathlessNestedPublicUrlHasBracket = true;
       brackets += 1;
       continue;
     }
@@ -508,7 +505,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       nestedPublicUrlBracketDepth = 0;
       pathlessFileQueryBracketDepth = 0;
       pathlessNestedPublicUrlActive = false;
-      pathlessNestedPublicUrlHasBracket = false;
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
       quotedQueryPublicUrlOwnQueryOrFragment = false;
@@ -528,7 +524,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (
       pathlessFileQueryBracketDepth > 0 &&
       (((char === "&" || char === "|") &&
-        (chars[index + 1] === "/" || chars[index + 1] === "\\")) ||
+        (chars[index + 1] === "/" ||
+          chars[index + 1] === "\\" ||
+          // A drive-letter root is a path root just like / and \\, so it must
+          // arm the wrapper handoff rather than fall through to the URL-end
+          // reset. Without this the inner path still redacts through the
+          // private-root rules while the wrapper tail silently leaks.
+          isWindowsDrivePathStart(chars, index + 1))) ||
         retainedParentPrivatePathStart >= 0 ||
         retainedParentNamedWindowsPathStart >= 0)
     ) {
@@ -553,12 +555,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         nestedPublicUrlBracketDepth = 0;
       } else {
         pipePathHandoffWrapperDepths.add(pathlessFileQueryOwnerBracketDepth);
-        if (!pathlessNestedPublicUrlHasBracket) {
-          repeatedPipeHandoffWrapperDepths.add(pathlessFileQueryOwnerBracketDepth);
-        }
+        // A bracketed nested public URL, such as an IPv6 authority or a
+        // bracketed path segment, does not change who owns the successors of
+        // this handoff. Suppressing repeated ownership here left later rooted
+        // Windows successors visible on every pass.
+        repeatedPipeHandoffWrapperDepths.add(pathlessFileQueryOwnerBracketDepth);
       }
       pathlessNestedPublicUrlActive = false;
-      pathlessNestedPublicUrlHasBracket = false;
     }
     if (pathlessFileQueryBracketDepth > 0 && char === "[") {
       pathlessFileQueryBracketDepth += 1;
@@ -746,7 +749,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       filePathBracketDepth = 0;
       pathlessFileQueryBracketDepth = nestedPublicBracketDepth;
       pathlessNestedPublicUrlActive = nestedPublicBracketDepth > 0;
-      pathlessNestedPublicUrlHasBracket = false;
       continue;
     }
     if (schemeLength === 0) {
