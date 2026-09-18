@@ -506,6 +506,17 @@ run, immutable batch receipt, and checkpoint. Unavailable or conflicting proof
 cannot advance progress. Cancellation likewise leaves recoverable evidence;
 retry the same generation after resolving the reported condition.
 
+An ordinary destination-probe failure -- connection refusal, TLS negotiation,
+or schema mismatch -- is collapsed into an evidence-free `MigrationCopyError`
+with a fixed message and no attached cause, reason code, or payload. Only
+`PostgreSqlCommitOutcomeUnknownError` (an uncertain commit) is rethrown
+unsanitized so its own authoritative-readback recovery path can run. "Retry
+the same generation after resolving the reported condition" therefore means
+resolving the condition through the caller's own outer logging or destination
+diagnostics, not through any detail carried on `MigrationCopyError` itself;
+the error intentionally carries none, to avoid leaking destination-connection
+detail into the migration journal or its callers.
+
 `copied` means all 22 domains have terminal checkpoints and the destination's
 actual canonical content was compared before durable transfer completion.
 It does not mean the separate migration verification or activation steps have
@@ -526,3 +537,33 @@ Its UTF-8 encoding must reproduce those canonical bytes exactly. It is not a
 parsed checkpoint object or an additional hash. This encoding clarification
 makes the byte witness representable by the canonical JSON hash function,
 which intentionally refuses typed arrays.
+
+### Copy cost and the publication fence
+
+Every checkpoint publish re-proves source authority under the held
+publication token before the local journal advances: the copy worker
+re-authenticates the source path, re-reads the maintenance journal, and fully
+re-inspects and re-hashes the authenticated snapshot artifact, then repeats
+the authenticate and journal read once more to close the window opened by
+that awaited re-inspection. This is deliberate fencing behavior, not an
+optimization gap left to be tidied up later: it is what lets a checkpoint
+publish trust that the source has not changed since it was captured, and
+removing any part of it would reopen a real window for the artifact to be
+tampered with or replaced between the check and the publish.
+
+Because of this, copy cost scales with the number of checkpoint publishes
+times the authenticated artifact's size, not with domain count alone: a
+22-domain copy with `maxRecords: 1` measured 46 of these full re-proofs in a
+single run, and they alone accounted for roughly 59% of that run's own wall
+time. That figure is a floor, not a ceiling. It came from a minimal
+`maxRecords: 1` fixture; the re-hash term grows with the artifact's actual
+byte size while the rest of the copy loop does not, so a realistically sized
+source database will spend a larger share of its copy time here, not a
+smaller one.
+
+Whether that re-proof can be made cheaper without weakening the fence -- for
+example an incremental or generation-scoped witness that still leaves the
+held publication token, authority bytes, maintenance journal bytes and phase,
+and snapshot bytes all provably unchanged -- is an open question tracked in
+[issue #1369](https://github.com/donadiosolutions/lcm/issues/1369). It is not
+part of this API's current contract.
