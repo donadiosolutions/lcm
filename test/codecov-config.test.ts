@@ -771,6 +771,8 @@ describe("Codecov configuration", () => {
       ["src/storage/local-hook-outbox-schema.ts", "unit-local-event-storage"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
       ["src/migration/maintenance.ts", "unit-migration-cutover"],
+      // #1321 drops the Node 22 transaction-probe fallback from the receipts
+      // module; its cutover receipt logic keeps this owner.
       ["src/migration/receipts.ts", "unit-migration-cutover"],
       ["src/migration/queue-evidence.ts", "unit-migration-cutover"],
       ["src/migration/sqlite-snapshot.ts", "unit-migration-cutover"],
