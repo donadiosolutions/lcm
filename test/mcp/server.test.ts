@@ -89,6 +89,13 @@ describe("MCP tool definitions", () => {
     expect(tool!.description).toContain("episodic");
   });
 
+  it("lcm_expand description claims child summaries rather than raw source content", () => {
+    const tool = getMcpToolDefinitions().find((t: any) => t.name === "lcm_expand");
+    expect(tool!.description).toContain("child summaries");
+    expect(tool!.description).toContain("does not return raw source messages");
+    expect(tool!.description).not.toContain("full source content");
+  });
+
   it("advertises canonical search and grep contracts with defaults", () => {
     const search = getMcpToolDefinitions().find((t: any) => t.name === "lcm_search") as any;
     const grep = getMcpToolDefinitions().find((t: any) => t.name === "lcm_grep") as any;

@@ -252,7 +252,7 @@ flowchart LR
 |---|---|
 | `lcm_search` | Hybrid search across episodic and promoted memory (`layers` defaults to both) |
 | `lcm_grep` | Regex or full-text search across raw messages and summaries (`mode` defaults to `full_text`; `scope` defaults to `both`) |
-| `lcm_expand` | Decompress a summary node into its source content by traversing the DAG |
+| `lcm_expand` | Traverse a summary node's DAG links and return its child summaries as short snippets |
 | `lcm_describe` | Inspect metadata and lineage of a memory node (depth, token count, parent/child links) |
 | `lcm_store` | Persist durable memory manually with optional tags |
 | `lcm_stats` | Show token savings, compression ratios, and usage statistics |
@@ -287,7 +287,7 @@ lcm search "query"        # search episodic and promoted memory
 lcm grep "pattern"        # search messages and summaries
 lcm grep "config\\.threshold" --mode regex # regex search
 lcm describe <nodeId>      # inspect metadata for a memory node
-lcm expand <nodeId>        # expand a summary node into source detail
+lcm expand <nodeId>        # list a summary node's child summaries
 lcm store "content"       # persist a durable memory entry
 lcm stats                  # memory and compression overview
 lcm stats -v               # per-conversation breakdown
@@ -394,7 +394,7 @@ All environment variables are optional. The default summarizer mode is `auto`.
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Maximum source tokens per leaf compaction pass |
 | `LCM_LEAF_TARGET_TOKENS` | `1200` | Target size for leaf summaries |
 | `LCM_CONDENSED_TARGET_TOKENS` | `2000` | Target size for condensed summaries |
-| `LCM_MAX_EXPAND_TOKENS` | `4000` | Token cap for DAG expansion via `lcm_expand` |
+| `LCM_MAX_EXPAND_TOKENS` | `4000` | Default expansion token cap for the unregistered `buildExpansionToolDefinition` helper; the shipped `lcm_expand` tool does not apply it |
 | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File size (tokens) above which content is extracted to disk |
 | `LCM_AUTOCOMPACT_DISABLED` | `false` | Set to `true` to disable automatic compaction after each turn |
 | `LCM_ENABLED` | `true` | Set to `false` to disable LCM while keeping its native integration installed |

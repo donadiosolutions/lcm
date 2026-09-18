@@ -225,7 +225,7 @@ const expectedComponents = [
   },
   {
     component_id: "unit-migration-cutover",
-    name: "Unit - Migration and Cutover",
+    name: "Unit - Migration Capture, Copy and Cutover",
     // #622 keeps immutable capture, preparation, and receipt evidence here.
     // #1231 orders receipt epoch durability before machine identity visibility.
     // #622 seals private artifact modes before the final file sync.
@@ -592,7 +592,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(240);
+    expect(productionFiles).toHaveLength(243);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -622,10 +622,10 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(240);
+    expect(ownershipCounts.size).toBe(243);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1338/#1353 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -676,6 +676,9 @@ describe("Codecov configuration", () => {
       ["src/runtime-root.ts", "unit-configuration-security"],
       ["src/security-files.ts", "unit-configuration-security"],
       ["src/sensitive.ts", "unit-configuration-security"],
+      // #1335 supplementary-plane CJK column widths are a material change to
+      // terminal bounding that retains this owner, as in #1195 and #1203.
+      ["src/terminal-sanitize.ts", "unit-configuration-security"],
       // #1049 keeps project metadata owner and single-link admission here.
       ["src/project-map.ts", "unit-project-worktrees"],
       // #889 keeps private import metadata publication in this owner.
@@ -731,8 +734,25 @@ describe("Codecov configuration", () => {
       ["src/promotion/dedup.ts", "unit-promotion"],
       // #1106/#618 keep discovery-related files in their established owners.
       ["src/daemon/server.ts", "unit-daemon-core"],
+      // #1343 and #1348 widen nested-public handoff ownership in the error
+      // sanitizer. This is a material change that retains its existing owner,
+      // as in #1195 and #1203.
+      ["src/daemon/safe-error.ts", "unit-daemon-core"],
       ["src/import.ts", "unit-transcripts-import"],
+      // #1338 replaces compact discovery's per-conversation native-transcript
+      // query with a batched project-level lookup and adds the contract member
+      // both backends implement. The change is confined to existing files, so
+      // every touched file keeps its established owner and the component
+      // topology is unchanged; these pins record that decision.
       ["src/batch-compact.ts", "unit-compaction-summarization"],
+      // #1353 qualifies every equality comparison in the PostgreSQL memory
+      // repositories against pg_catalog so a hostile search_path cannot
+      // resolve a different operator. The change is confined to that existing
+      // file and adds no component, so it keeps its established owner; this
+      // pin records that decision for a materially changed file.
+      ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
+      ["src/storage/sqlite/native-transcript-repository.ts", "unit-local-persistence"],
+      ["src/storage/postgresql/native-transcript-repository.ts", "integration-postgresql-transcripts"],
       ["src/daemon/version.ts", "unit-daemon-core"],
       // #885 keeps the shared missing-Codex diagnostic and its resolver
       // identity handling within the existing LLM component. #934 keeps

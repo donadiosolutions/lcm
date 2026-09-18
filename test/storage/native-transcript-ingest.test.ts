@@ -4006,6 +4006,7 @@ describe("native transcript backfill coordinator", () => {
       ingestBatch,
       getById: vi.fn(async () => null),
       listByNativeSession: vi.fn(async () => []),
+      listUnambiguousSourceLocators: vi.fn(async () => new Map<string, string>()),
       listBySource: vi.fn(async () => []),
       listByMessage: vi.fn(async () => []),
     };
@@ -4223,6 +4224,7 @@ describe("native transcript backfill coordinator", () => {
       }),
       getById: vi.fn(async () => null),
       listByNativeSession: vi.fn(async () => []),
+      listUnambiguousSourceLocators: vi.fn(async () => new Map<string, string>()),
       listBySource: vi.fn(async () => []),
       listByMessage: vi.fn(async () => []),
     };

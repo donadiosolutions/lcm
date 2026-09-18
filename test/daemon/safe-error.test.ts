@@ -621,14 +621,59 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(expected);
   });
 
-  it("expires an IPv6 bracket handoff after its generated marker", () => {
+  it("repeats an IPv6 bracket handoff for every rooted successor", () => {
     const input = "file://h?x=[https://[::1]/p|\\Users\\first.db|\\Users\\second.db";
-    const expected = "file://h?x=[https://[::1]/p|<path>|\\Users\\second.db";
+    const expected = "file://h?x=[https://[::1]/p|<path>|<path>";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
+    expect(first).not.toContain("second.db");
     expect(sanitizeError(first)).toBe(expected);
     expect(sanitizeError(sanitizeError(first))).toBe(expected);
+  });
+
+  it.each([
+    [
+      "IPv6 authority",
+      "file://h?x=[https://[::1]/t|/Users/a/one&\\Users\\SECRET\\x]",
+      "file://h?x=[https://[::1]/t|<path>&<path>]",
+    ],
+    [
+      "bracketed path segment",
+      "file://h?x=[https://e.test/t[/seg]|/Users/a/one&\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t[/seg]|<path>&<path>]",
+    ],
+    [
+      "repeated pipe after a bracketed segment",
+      "file://h?x=[https://e.test/t[/seg]|\\Users\\S1|\\Users\\S2]",
+      "file://h?x=[https://e.test/t[/seg]|<path>|<path>]",
+    ],
+    [
+      "unbracketed parity control",
+      "file://h?x=[https://e.test/t|\\Users\\alice\\one.db|\\Users\\bob\\secret.db]",
+      "file://h?x=[https://e.test/t|<path>|<path>]",
+    ],
+    [
+      "ampersand successor control",
+      "file://h?x=[https://[::1]/t&\\Users\\SECRET\\x]",
+      "file://h?x=[https://[::1]/t&<path>]",
+    ],
+  ] as const)("keeps handoff ownership across a bracketed nested public URL (Bug #1343): %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "file://h?x=[https://[::1]prose]\\Users\\fictional.db",
+    "file://h?x=[https://[::1]/t|relative/path&\\Users\\SECRET\\x]",
+  ] as const)("does not arm the Bug #1343 handoff without a path root: %s", (input) => {
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
   });
 
   it.each([
@@ -3635,7 +3680,7 @@ describe("sanitizeError", () => {
     [
       "IPv6",
       "file://h?x=[https://[::1]/p|\\Users\\first.db|\\Users\\second.db",
-      "file://h?x=[https://[::1]/p|<path>|\\Users\\second.db",
+      "file://h?x=[https://[::1]/p|<path>|<path>",
     ],
     [
       "deferred Bug #1332",
@@ -3921,6 +3966,97 @@ describe("sanitizeError", () => {
     expect(result.match(/file:\/\//gu)).toHaveLength(tokens.length);
     expect(result.match(/<path>/gu)).toHaveLength(tokens.length);
     expect(whitespaceChecks).toBeLessThanOrEqual(Array.from(input).length);
+  });
+
+  it.each([
+    [
+      "drive root arms the wrapper tail",
+      "file://h?x=[https://e.test/t|C:\\Users\\alice\\one.db]\\Users\\bob\\secret.db",
+      "file://h?x=[https://e.test/t|<path>]<path>",
+    ],
+    [
+      "drive root arms a repeated in-wrapper handoff",
+      "file://h?x=[https://e.test/t|C:\\Users\\alice\\one.db&\\Users\\bob\\x]",
+      "file://h?x=[https://e.test/t|<path>&<path>]",
+    ],
+    [
+      "backslash root control",
+      "file://h?x=[https://e.test/t|\\Users\\alice\\one.db]\\Users\\bob\\secret.db",
+      "file://h?x=[https://e.test/t|<path>]<path>",
+    ],
+    [
+      "slash root control",
+      "file://h?x=[https://e.test/t|/Users/alice/one.db]/Users/bob/secret.db",
+      "file://h?x=[https://e.test/t|<path>]<path>",
+    ],
+    [
+      "ampersand drive root control",
+      "file://h?x=[https://e.test/t&C:\\Users\\alice\\one.db]\\Users\\bob\\secret.db",
+      "file://h?x=[https://e.test/t&<path>]<path>",
+    ],
+  ] as const)("arms the nested-public handoff on a drive root (Bug #1348): %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("bob");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "file://h?x=[https://e.test/t|relative/path]\\Users\\bob\\secret.db",
+    "file://h?x=[https://e.test/t|C:relative]\\Users\\bob\\secret.db",
+  ] as const)("does not arm the Bug #1348 handoff without a path root: %s", (input) => {
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  // Bug #1345 asked whether "," and ";" should join "&" and "|" as sibling
+  // handoff delimiters. They should not: both are already URL-end delimiters
+  // throughout this grammar and are listed in FILE_URL_AUTHORITY_DELIMITERS,
+  // so promoting them would change the meaning of every wrapper that uses
+  // them as ordinary separators. The boundary is pinned here so the decision
+  // is deliberate rather than incidental. Note the residual surface is narrow:
+  // only the single-leading-backslash Windows form survives these delimiters,
+  // because POSIX and drive roots still redact through the private-root rules.
+  it.each([
+    [
+      "comma does not hand off",
+      "file://h?x=[https://e.test/t|/Users/a/one,\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t|<path>,\\Users\\SECRET\\x]",
+    ],
+    [
+      "semicolon does not hand off",
+      "file://h?x=[https://e.test/t|/Users/a/one;\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t|<path>;\\Users\\SECRET\\x]",
+    ],
+    [
+      "ampersand does hand off",
+      "file://h?x=[https://e.test/t|/Users/a/one&\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t|<path>&<path>]",
+    ],
+    [
+      "pipe does hand off",
+      "file://h?x=[https://e.test/t|/Users/a/one|\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t|<path>|<path>]",
+    ],
+    [
+      "comma still redacts a POSIX root",
+      "file://h?x=[https://e.test/t|/Users/a/one,/Users/b/two]",
+      "file://h?x=[https://e.test/t|<path>,<path>]",
+    ],
+    [
+      "semicolon still redacts a drive root",
+      "file://h?x=[https://e.test/t|/Users/a/one;C:\\Users\\b\\two]",
+      "file://h?x=[https://e.test/t|<path>;<path>]",
+    ],
+  ] as const)("pins the Bug #1345 sibling delimiter boundary: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
   it("replaces SQLite constraint details with generic message", () => {

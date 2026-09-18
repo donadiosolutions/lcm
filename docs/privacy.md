@@ -222,6 +222,27 @@ contains a known truncated legacy value, repair the canonical target with the
 offline procedure above. This refusal
 behavior is implemented by [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
 
+That marker recheck has a rare third outcome. LCM commits the source write
+fence before the target transaction begins, so when the marker is present at
+the initial read-only check but durably absent inside the target transaction,
+the normalized source recheck refuses while the source is already retired.
+Nothing is copied and nothing is truncated: the canonical target keeps its
+existing rows and the source keeps its original bytes. The retired source now
+carries write-fence triggers on its ordinary tables, so the in-place
+`UPDATE promoted` repair described above aborts with
+`LCM source retired by worktree reconciliation`, and a later run refuses again
+at the source guard because the marker is still missing.
+
+There is no supported in-place repair for this state. Do not drop the fence
+triggers or the `worktree_reconciliation_fence` table and do not edit the
+target's `worktree_reconciliation_sources` marker by hand: those are what keep
+a retired source from being written and from being merged twice. Stop the
+writers, leave the source database, the canonical target, and the
+reconciliation journal exactly as they are, keep a backup, and report the state
+at [the issue tracker](https://github.com/donadiosolutions/lcm/issues) so that
+recovery is designed against the retirement and admission boundary instead of
+being improvised on a live database.
+
 ### Unsupported legacy conversation message bytes
 
 Legacy `messages.content` values must be well-formed UTF-8 SQLite `TEXT` without
@@ -702,6 +723,9 @@ The `Security` section of the doctor output shows:
 - Hook errors are attached to a project sidecar only when the reported working directory is an existing directory. Invalid paths are recorded in the bounded fallback log without creating project metadata.
 - Stats, status, pool diagnostics, and doctor use an allowlisted backend snapshot. They omit recalled-text previews (`topRecalled`), memory and transcript payloads, raw errors, SQL values, URLs, role names, CA paths, and arbitrary local paths. Verbose diagnostics retain the same boundary. Only observed numeric aggregates, safe identifiers, classified states, and fixed guidance are exposed. SQLite content is not modified; necessary WAL/SHM read coordination may occur. See [observational diagnostics](cli.md#observational-diagnostics).
 - Sidecar scans return a single aggregate truncation record when their time or database limit is reached, so diagnostic responses remain bounded even if the events directory contains many files.
+- A rooted path following a nested public URL inside a bracketed `file://` query wrapper is redacted in more shapes. This now includes URLs carrying brackets, such as an IPv6 authority or a bracketed path segment, and a Windows drive root such as `C:\` as the value that arms the handoff. Repeated separators inside one wrapper each redact their successor rather than only the first. Values that are not path roots, such as a bare relative value, still do not arm it.
+- Comma and semicolon are not sibling handoff separators in that wrapper, so a single-leading-backslash Windows value after them stays visible. POSIX paths and Windows drive roots after a comma or semicolon still become `<path>`.
+- Bounded terminal fields count supplementary-plane CJK ideographs as two columns rather than one, across `U+20000`-`U+2FFFD` and `U+30000`-`U+3FFFD`. Code points outside those two ranges, including `U+2FFFE` and `U+3FFFE`, remain one column. Live-frame and append-only output containing these characters keeps the column budget it promises instead of overrunning it by one column per character.
 
 ## Summary
 
