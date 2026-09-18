@@ -1639,8 +1639,10 @@ describe("batch compaction discovery", () => {
       }
     };
 
-    for (const replay of [false, true]) {
-      const discovered = await findUncompacted(100, replay, cwd);
+    // The flag selects the preview (read-only) path versus direct discovery,
+    // which is the dry-run source invariance this issue asks for.
+    for (const readOnly of [false, true]) {
+      const discovered = await findUncompacted(100, readOnly, cwd);
       const expected = discovered.map(candidate => {
         const locator = legacy(candidate.sessionId);
         const { sourceLocator: _ignored, ...rest } = candidate;
@@ -1669,6 +1671,80 @@ describe("batch compaction discovery", () => {
     expect(candidate).toMatchObject({ sessionId: "session-1", messages: 9, tokens: 250 });
     expect(candidate).not.toHaveProperty("sourceLocator");
   });
+
+  it("omits a corrupted non-text source locator instead of rendering it", async () => {
+    const cwd = makeDir("compact-locator-blob");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const db = new DatabaseSync(paths.dbPath);
+    const payload = JSON.stringify({ message: "scrubbed" });
+    // The runtime table is not STRICT, so a corrupted row can hold a blob in a
+    // TEXT column. No production writer creates one; raw SQL reproduces it.
+    db.prepare("INSERT INTO runtime_native_transcripts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      "blob-locator-transcript", paths.id, "local", "codex", "jsonl", "1", "session-1",
+      new Uint8Array([0xff, 0xfe, 0x00, 0x41]), 1,
+      "2026-09-16 00:00:00", "2026-09-16 00:00:01", "1",
+      createHash("sha256").update(payload).digest("hex"), "blob".padEnd(64, "0"), payload,
+    );
+    expect((db.prepare(
+      "SELECT typeof(source_locator) AS storedType FROM runtime_native_transcripts",
+    ).get() as { storedType: string }).storedType).toBe("blob");
+    db.close();
+
+    // Both the preview path and the direct path omit the malformed locator,
+    // and the renderer receives an identity it can print.
+    for (const readOnly of [true, false]) {
+      const [candidate] = await findUncompacted(100, readOnly, cwd);
+      expect(candidate).toMatchObject({ sessionId: "session-1" });
+      expect(candidate).not.toHaveProperty("sourceLocator");
+
+      const writes: string[] = [];
+      const renderer = new NinjaRenderer({
+        state: makeProgressState({ total: 1 }),
+        output: { columns: 80, write: (chunk: string) => { writes.push(chunk); return true; } } as never,
+        renderOpts: { isTTY: false, width: 80, color: false, verbose: false },
+        handleSignals: false,
+      });
+      renderer.start();
+      renderer.handleEvent({
+        type: "session-start",
+        identity: {
+          project: candidate!.cwd,
+          sessionId: candidate!.sessionId,
+          conversationId: candidate!.conversationId,
+        },
+        messages: 1,
+        tokens: 1,
+        startedAt: 0,
+      });
+      renderer.stop();
+      expect(writes.join("")).toContain("processing");
+    }
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  it("never returns a corrupted non-text session id from preview discovery", async () => {
+    const cwd = makeDir("compact-session-blob");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedConversation(paths.dbPath);
+    const db = new DatabaseSync(paths.dbPath);
+    const payload = JSON.stringify({ message: "scrubbed" });
+    db.prepare("INSERT INTO runtime_native_transcripts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      "blob-session-transcript", paths.id, "local", "codex", "jsonl", "1",
+      new Uint8Array([0x73, 0x65, 0x73, 0x73]), "sessions/blob-session.jsonl", 1,
+      "2026-09-16 00:00:00", "2026-09-16 00:00:01", "1",
+      createHash("sha256").update(payload).digest("hex"), "blobsess".padEnd(64, "0"), payload,
+    );
+    db.close();
+
+    // SQLite never compares a blob equal to text, so the grouped lookup cannot
+    // return this row at all. That is why the session id needs no type guard
+    // while the locator does.
+    const [candidate] = await findUncompacted(100, true, cwd);
+    expect(candidate).toMatchObject({ sessionId: "session-1" });
+    expect(candidate).not.toHaveProperty("sourceLocator");
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
 
   it("omits the source locator during preview discovery when the transcript query fails", async () => {
     const cwd = makeDir("compact-native-source-locator-query-failure");

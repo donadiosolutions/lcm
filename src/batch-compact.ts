@@ -335,9 +335,9 @@ async function discoverySourceLocators(
       for (const [sessionId, locator] of await resolve(chunk)) locators.set(sessionId, locator);
     } catch {
       // One unreadable session must not hide provenance for every other
-      // session, so a failed batch degrades to per-session resolution. That
-      // costs at most one bounded statement per session in the failed batch,
-      // and only on the error path.
+      // session, so a failed batch degrades to per-session resolution. A
+      // failed batch therefore costs its own statement plus one bounded
+      // statement per session in that batch, and only on the error path.
       for (const sessionId of chunk) {
         try {
           for (const [id, locator] of await resolve([sessionId])) locators.set(id, locator);
@@ -391,15 +391,21 @@ async function discoverSqlitePreview(
                  FROM runtime_native_transcripts
                 WHERE project_id = ? AND native_session_id IN (${chunk.map(() => "?").join(",")})
                 GROUP BY native_session_id`,
-            // Both grouped columns are NOT NULL TEXT and every group has at
-            // least one row, so MIN never yields null for a returned session.
             ).all(identity.id, ...chunk) as Array<{
               native_session_id: string;
-              source_locator: string;
+              source_locator: unknown;
               locator_count: number;
             }>;
             for (const row of rows) {
               if (row.locator_count !== 1) continue;
+              // The runtime table is not STRICT, so a corrupted row can hold a
+              // non-text locator that no production writer creates. Rendering
+              // one throws, so omit it exactly as the direct path does, where
+              // repository validation rejects the same value. native_session_id
+              // needs no such guard: the row matched an equality bind against a
+              // text session id, and SQLite never compares a blob equal to
+              // text, so a returned row's session id is always text.
+              if (typeof row.source_locator !== "string") continue;
               locators.set(row.native_session_id, row.source_locator);
             }
           }
