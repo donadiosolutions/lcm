@@ -166,7 +166,7 @@ it('publishes all exact checkpoints and proves copied reruns', async () => {
 });
 
 it.each([
-    'before-source', 'after-source', 'before-batch',
+    'before-source', 'after-source', 'before-batch', 'before-begin',
     'after-begin', 'after-batch-readback', 'before-checkpoint',
     'after-checkpoint', 'before-completion', 'after-completion-readback',
 ] as const)('recovers interruption at %s', async boundary => {
