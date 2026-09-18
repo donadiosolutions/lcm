@@ -83,6 +83,7 @@ component_management:
         - "^src/sensitive\\.ts$"
         - "^src/shell-quote\\.ts$"
         # #1283 keeps sanitize-then-bound terminal fields in this owner.
+        # #1335 keeps supplementary-plane CJK column widths in this owner.
         - "^src/terminal-sanitize\\.ts$"
         - "^src/types\\.ts$"
         - "^src/url-display\\.ts$"
@@ -147,6 +148,8 @@ component_management:
         # #1317 stable unquoted-wrapper public URLs, #1141 single-slash file
         # tails, and #1156 forced drive-after-content continuations remain
         # daemon-core-owned.
+        # #1343 bracketed nested public URL handoffs and #1348 drive-root
+        # handoff arming also remain daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -288,7 +291,7 @@ component_management:
         - "^src/storage/portable-index\\.ts$"
         - "^src/storage/postgresql/project-storage\\.ts$"
     - component_id: "unit-migration-cutover"
-      name: "Unit - Migration and Cutover"
+      name: "Unit - Migration Capture, Copy and Cutover"
       paths:
         # #681 leaves protocol-specific manifest replacement in this component.
         # #622 keeps immutable SQLite capture, maintenance preparation, and

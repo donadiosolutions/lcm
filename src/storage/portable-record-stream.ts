@@ -714,8 +714,13 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
   let callerLimitOrdinal: number | undefined;
   let prefix = prior?.prefixSha256 ?? initialDomainPrefix(manifest.schemaSha256, request.domain);
   let previous = predecessor;
-  let previousIsPredecessor = predecessor !== null;
-  const identities = new Set<string>();
+  // Seeded with the predecessor's identity so a successor that duplicates it is
+  // refused here, matching the official scanner's independent identity check
+  // (scanSourcePage) instead of relying solely on order-regression, which does
+  // not fire when a domain's order carries a field outside its logical key
+  // (for example passive-events' machineSequence) and a successor advances
+  // that field while repeating the predecessor's identity.
+  const identities = new Set<string>(predecessor === null ? [] : [predecessor.identitySha256]);
   for (let index = 0; index < records.length; index += 1) {
     const rawRecord = records[index] as PortableRecord;
     validateDependencyContract(rawRecord, request.domain);
@@ -733,7 +738,22 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
     identities.add(candidate.record.identitySha256);
     if (previous !== null) {
       const comparison = comparePortableOrder(previous.order, candidate.record.order);
-      if (comparison > 0 || (comparison === 0 && previousIsPredecessor)) {
+      // Refuse any non-advancing order, matching the scanner
+      // (scanSourcePage's own comparePortableOrder(...) >= 0 check). A tie
+      // is additionally refused earlier as a duplicate identity: equal
+      // order implies equal identity for every current domain (order
+      // equals logicalKey literally for most domains; for the four where
+      // logicalKey is a field subset of order -- passive-events,
+      // project-aliases, summary-message-links, summary-parent-links --
+      // equal order trivially gives equal logicalKey; for the hash-derived
+      // domains, portable-record.ts enforces the tie itself via each
+      // domain's identity-from-order check, which rejects a stored
+      // identity hash that disagrees with the order that determines it).
+      // That earlier refusal makes this >= 0 arm unreachable on today's
+      // schema; it is kept as fail-closed insurance for a future domain
+      // whose logicalKey is not determined by order (see the schema-lock
+      // test in test/storage/portable-record-parity.test.ts).
+      if (comparison >= 0) {
         fail("order-regression", { domain: request.domain, ordinal: candidate.record.ordinal });
       }
     }
@@ -753,7 +773,6 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
       }
     }
     previous = candidate.record;
-    previousIsPredecessor = false;
     normalized.push(candidate.record);
   }
   for (let index = 0; index < normalized.length; index += 1) {
