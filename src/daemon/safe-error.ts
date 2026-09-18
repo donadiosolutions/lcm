@@ -211,6 +211,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         if (chars[index + 1] === "/" || chars[index + 1] === "\\") {
           forcedPath[index + 1] = 1;
         }
+      } else if (
+        closedChildGroupRootedOwnerDepths.delete(closingPathlessFileQueryOwnerDepth)
+      ) {
+        // Rooted ownership handed outward by an inner group keeps moving
+        // outward through each further close, so an extra bracket level
+        // between the child and its successor does not drop it.
+        closedChildGroupRootedOwnerDepths.add(closingPathlessFileQueryOwnerDepth - 1);
+        if (chars[index + 1] === "/" || chars[index + 1] === "\\") {
+          forcedPath[index + 1] = 1;
+        }
       }
       restartedNestedFileUrlParentOwnerBracketDepths.delete(closingPathlessFileQueryOwnerDepth);
       if (closingPathlessFileQueryOwnerDepth === activeNestedFileUrlParentOwnerBracketDepth) {
@@ -603,24 +613,40 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryTail = false;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
-      // A URL-ending delimiter ends this bracket group's observable file-query
-      // ownership, but the group's own bracket depth must survive so its
-      // closing bracket still restores the enclosing owner. Angle brackets are
-      // excluded: they carry generated and literal markers inside a value
-      // rather than ending one.
-      if (
-        pathlessFileQueryOwnerBracketDepth > 0 &&
-        char !== "<" &&
-        char !== ">"
-      ) {
-        suspendedPathlessFileQueryOwnerDepths.add(pathlessFileQueryOwnerBracketDepth);
-      }
       nestedPublicUrlBracketDepth = 0;
       pathlessFileQueryBracketDepth = 0;
       pathlessNestedPublicUrlActive = false;
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
       quotedQueryPublicUrlOwnQueryOrFragment = false;
+    }
+    // A sibling-separating delimiter ends this bracket group's observable
+    // file-query ownership, while the group's own bracket depth keeps counting
+    // so its closing bracket still restores the enclosing owner. This is
+    // deliberately independent of restartedPathlessFile: a generated <path>
+    // marker earlier in the value ends the restarted scanner, and the Bug
+    // #1332 boundary must still hold for a delimiter after it.
+    //
+    // Excluded: the closing bracket, which is structure rather than a sibling
+    // separator; angle brackets and quotes, which wrap a value rather than
+    // separating one; the file-authority delimiters "," and ";", per Bug
+    // #1345; and any wrapper whose nested file URL already established
+    // observable ownership, where a delimiter separates parameters instead.
+    if (
+      pathlessFileQueryOwnerBracketDepth > 0 &&
+      URL_END_DELIMITERS.has(char) &&
+      !FILE_URL_AUTHORITY_DELIMITERS.has(char) &&
+      char !== "]" &&
+      char !== "<" &&
+      char !== ">" &&
+      quoteCode(char) === 0 &&
+      // A nested public URL span inside this wrapper is observable ownership
+      // too, so a delimiter after it separates parameters rather than ending
+      // the query.
+      pathlessFileQueryBracketDepth === 0 &&
+      !nestedFileUrlParentOwnerBracketDepths.has(pathlessFileQueryOwnerBracketDepth)
+    ) {
+      suspendedPathlessFileQueryOwnerDepths.add(pathlessFileQueryOwnerBracketDepth);
     }
     // Conservatively keep supported punctuation and embedded double quotes in
     // an exact file URL authority until the first path separator. A matching
@@ -682,9 +708,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
       nestedPublicUrlBracketDepth = 0;
+      // The closing quote always ends the nested public URL itself. Only the
+      // enclosing file-query span survives, so that a following delimiter
+      // still has an owner to hand off to.
+      pathlessNestedPublicUrlActive = false;
       if (!closesQuotedNestedPublicUrl) {
         pathlessFileQueryBracketDepth = 0;
-        pathlessNestedPublicUrlActive = false;
       }
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;

@@ -3037,12 +3037,12 @@ describe("sanitizeError", () => {
       "file://h?x=[later=<path>]",
     ],
     [
-      "comma is not a URL-ending delimiter here",
+      "comma is a file-authority delimiter, so it never suspends",
       "file://h?x=[value,later=\\Users\\bob\\secret.db]",
       "file://h?x=[value,later=<path>]",
     ],
     [
-      "semicolon is not a URL-ending delimiter here",
+      "semicolon is a file-authority delimiter, so it never suspends",
       "file://h?x=[value;later=\\Users\\bob\\secret.db]",
       "file://h?x=[value;later=<path>]",
     ],
@@ -3980,16 +3980,6 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
   });
 
-  it("keeps a single-pipe direct handoff control stable", () => {
-    const input = "file://h?x=[https://e.test/t|\\Users\\SECRET\\x]";
-    const expected = "file://h?x=[https://e.test/t|<path>]";
-    const first = sanitizeError(input);
-
-    expect(first).toBe(expected);
-    expect(sanitizeError(first)).toBe(first);
-    expect(sanitizeError(sanitizeError(first))).toBe(first);
-  });
-
   it.each([
     [
       "drive root arms the wrapper tail",
@@ -4032,16 +4022,6 @@ describe("sanitizeError", () => {
     expect(sanitizeError(input)).toBe(input);
     expect(sanitizeError(sanitizeError(input))).toBe(input);
     expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
-  });
-
-  it("keeps a single-pipe direct handoff control stable", () => {
-    const input = "file://h?x=[https://e.test/t|\\Users\\SECRET\\x]";
-    const expected = "file://h?x=[https://e.test/t|<path>]";
-    const first = sanitizeError(input);
-
-    expect(first).toBe(expected);
-    expect(sanitizeError(first)).toBe(first);
-    expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
   it("keeps the Bug #1332 delimiter boundary after the pipe-handoff fix", () => {
@@ -4391,6 +4371,118 @@ describe("sanitizeError", () => {
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  // Regression coverage for REVIEWER_A finding F1 on candidate c68095d3. The
+  // #1332 suspension must not fire on a quote, which opens or closes a wrapped
+  // value rather than separating one, and must not fire at all once a nested
+  // file URL has established observable ownership for the wrapper.
+  it.each([
+    [
+      "bare named value after a quoted public URL",
+      "file://h?x=['https://e.test/t'name=\\Users\\SECRET\\x",
+      "file://h?x=['https://e.test/t'name=<path>",
+    ],
+    [
+      "pipe then named value after a quoted public URL",
+      "file://h?x=['https://e.test/t'|name=\\Users\\SECRET\\x",
+      "file://h?x=['https://e.test/t'|name=<path>",
+    ],
+    [
+      "ampersand then named value after a quoted public URL",
+      "file://h?x=['https://e.test/t'&name=\\Users\\SECRET\\x",
+      "file://h?x=['https://e.test/t'&name=<path>",
+    ],
+    [
+      "double-quoted public URL",
+      "file://h?x=[\"https://e.test/t\"name=\\Users\\SECRET\\x",
+      "file://h?x=[\"https://e.test/t\"name=<path>",
+    ],
+    [
+      "quoted IPv6 authority",
+      "file://h?x=['https://[::1]/t'name=\\Users\\SECRET\\x",
+      "file://h?x=['https://[::1]/t'name=<path>",
+    ],
+    [
+      "pipe then named value after a nested file child",
+      "file://h?x=[file://host?key=/public|name=\\Users\\SECRET\\x]",
+      "file://h?x=[file://host?key=<path>|name=<path>]",
+    ],
+    [
+      "ampersand parity after a nested file child",
+      "file://h?x=[file://host?key=/public&name=\\Users\\SECRET\\x]",
+      "file://h?x=[file://host?key=<path>&name=<path>]",
+    ],
+    [
+      "unclosed wrapper after a nested file child",
+      "file://h?x=[file://host?key=/public|name=\\Users\\SECRET\\x",
+      "file://h?x=[file://host?key=<path>|name=<path>",
+    ],
+  ] as const)("keeps named Windows ownership across quotes and nested children: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("suspends only the named-value rule inside a delimited wrapper", () => {
+    // The file-tail backslash mechanism still redacts the first rooted value
+    // while the named-value rule stays suspended for the second. Pinned so a
+    // later narrowing or widening pass does not trip over the asymmetry.
+    const input = "file://h?x=[value|\\Users\\S1\\x&name=\\Users\\S2\\y]";
+    const expected = "file://h?x=[value|<path>&name=\\Users\\S2\\y]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  // Regression coverage for REVIEWER_B findings on candidate c68095d3.
+  it.each([
+    [
+      "angle-closed value still ends ownership at the next delimiter",
+      "file://h?x=[value>|later=\\Users\\bob\\secret.db]",
+      "file://h?x=[value>|later=\\Users\\bob\\secret.db]",
+    ],
+    [
+      "a generated marker fed back does not defeat the boundary",
+      "file://h?x=[value<path>|later=\\Users\\bob\\secret.db]",
+      "file://h?x=[value<path>|later=\\Users\\bob\\secret.db]",
+    ],
+  ] as const)("keeps the Bug #1332 boundary across angle brackets: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "delimiter successor after two closes",
+      "file://h?x=[[[https://e.test/t|file://host?key=/public]]|\\Users\\SECRET\\x]",
+      "file://h?x=[[[https://e.test/t|file://host?key=<path>]]|<path>]",
+    ],
+    [
+      "bare successor after two closes",
+      "file://h?x=[[https://e.test/t|file://host?key=/public]]\\Users\\SECRET\\x",
+      "file://h?x=[[https://e.test/t|file://host?key=<path>]]<path>",
+    ],
+    [
+      "shallower sibling still redacts",
+      "file://h?x=[[[https://e.test/t|file://host?key=/public]|\\Users\\SECRET\\x]]",
+      "file://h?x=[[[https://e.test/t|file://host?key=<path>]|<path>]]",
+    ],
+  ] as const)("carries rooted ownership through repeated closes (Bug #1346): %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
     expect(sanitizeError(first)).toBe(first);
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
