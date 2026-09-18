@@ -832,7 +832,7 @@ implements PromotedMemoryRepository {
                          memory.project_id
                        AND stored.memory_id OPERATOR(pg_catalog.=)
                          memory.memory_id
-                       AND stored.tag = requested.tag
+                       AND stored.tag OPERATOR(pg_catalog.=) requested.tag
                    )
                  )
                ORDER BY memory.created_at, memory.memory_id`,
@@ -1042,7 +1042,7 @@ implements PromotedMemoryRepository {
                      AND candidate.memory_id OPERATOR(pg_catalog.=)
                        signal.memory_id
                      AND pg_catalog.substr(candidate.tag, 1, 10)
-                       = 'memory_id:'
+                       OPERATOR(pg_catalog.=) 'memory_id:'
                    ORDER BY candidate.ordinal
                    LIMIT 1
                  ) AS reference ON TRUE
@@ -1056,7 +1056,7 @@ implements PromotedMemoryRepository {
                          signal.project_id
                        AND marker.memory_id OPERATOR(pg_catalog.=)
                          signal.memory_id
-                       AND marker.tag = 'signal:memory_used'
+                       AND marker.tag OPERATOR(pg_catalog.=) 'signal:memory_used'
                      )
                  GROUP BY pg_catalog.substr(reference.tag, 11)
                ),
@@ -1100,10 +1100,10 @@ implements PromotedMemoryRepository {
                FROM candidates AS memory
                WHERE (
                  memory.surfacing_count >= $4
-                 AND memory.usage_count = 0
+                 AND memory.usage_count OPERATOR(pg_catalog.=) 0
                ) OR (
-                 memory.surfacing_count = 0
-                 AND memory.usage_count = 0
+                 memory.surfacing_count OPERATOR(pg_catalog.=) 0
+                 AND memory.usage_count OPERATOR(pg_catalog.=) 0
                )
                ORDER BY memory.created_at, memory.memory_id`,
         values: [
@@ -1291,7 +1291,7 @@ export class PostgreSqlRecallRepository implements RecallRepository {
                      AND candidate.memory_id OPERATOR(pg_catalog.=)
                        signal.memory_id
                      AND pg_catalog.substr(candidate.tag, 1, 10)
-                       = 'memory_id:'
+                       OPERATOR(pg_catalog.=) 'memory_id:'
                    ORDER BY candidate.ordinal
                    LIMIT 1
                  ) AS reference ON TRUE
@@ -1308,7 +1308,7 @@ export class PostgreSqlRecallRepository implements RecallRepository {
                          signal.project_id
                        AND marker.memory_id OPERATOR(pg_catalog.=)
                          signal.memory_id
-                       AND marker.tag = 'signal:memory_used'
+                       AND marker.tag OPERATOR(pg_catalog.=) 'signal:memory_used'
                      )
                  GROUP BY pg_catalog.substr(reference.tag, 11)
                )
@@ -1385,7 +1385,7 @@ export class PostgreSqlRecallRepository implements RecallRepository {
                      AND candidate.memory_id OPERATOR(pg_catalog.=)
                        signal.memory_id
                      AND pg_catalog.substr(candidate.tag, 1, 10)
-                       = 'memory_id:'
+                       OPERATOR(pg_catalog.=) 'memory_id:'
                    ORDER BY candidate.ordinal
                    LIMIT 1
                  ) AS reference ON TRUE
@@ -1399,7 +1399,7 @@ export class PostgreSqlRecallRepository implements RecallRepository {
                          signal.project_id
                        AND marker.memory_id OPERATOR(pg_catalog.=)
                          signal.memory_id
-                       AND marker.tag = 'signal:memory_used'
+                       AND marker.tag OPERATOR(pg_catalog.=) 'signal:memory_used'
                      )
                  GROUP BY pg_catalog.substr(reference.tag, 11)
                ),
@@ -1663,19 +1663,23 @@ implements RedactionAdminRepository {
     const result = await executor.query<RedactionCountsRow>({
       text: `SELECT
                COALESCE(
-                 pg_catalog.sum(count) FILTER (WHERE category = 'gitleaks'),
+                 pg_catalog.sum(count) FILTER (WHERE category OPERATOR(pg_catalog.=)
+                          'gitleaks'),
                  0
                ) AS gitleaks,
                COALESCE(
-                 pg_catalog.sum(count) FILTER (WHERE category = 'built_in'),
+                 pg_catalog.sum(count) FILTER (WHERE category OPERATOR(pg_catalog.=)
+                          'built_in'),
                  0
                ) AS built_in,
                COALESCE(
-                 pg_catalog.sum(count) FILTER (WHERE category = 'global'),
+                 pg_catalog.sum(count) FILTER (WHERE category OPERATOR(pg_catalog.=)
+                          'global'),
                  0
                ) AS global,
                COALESCE(
-                 pg_catalog.sum(count) FILTER (WHERE category = 'project'),
+                 pg_catalog.sum(count) FILTER (WHERE category OPERATOR(pg_catalog.=)
+                          'project'),
                  0
                ) AS project
              FROM lcm.redaction_counters

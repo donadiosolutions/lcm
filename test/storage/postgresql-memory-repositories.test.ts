@@ -1031,24 +1031,34 @@ describe("PostgreSQL memory repositories", () => {
     });
   });
 
-  it("qualifies every identity predicate and bind type against pg_catalog", async () => {
-    const identityColumns = [
-      "project_id",
-      "memory_id",
-      "source_project_id",
-      "session_id",
-      "session_id_sha256",
-      "ingest_key",
-      "machine_id",
-      "scope_hash",
-      "client_name",
-      "worktree_path",
-      "cwd_path",
-    ];
-    const unqualifiedIdentityEquality = new RegExp(
-      "\\b(?:" + identityColumns.join("|") + ")\\b"
-        + "(?:::pg_catalog\\.[a-z0-9_]+)?\\s*=(?!=)",
-    );
+  it("qualifies every equality and bind type against pg_catalog", async () => {
+    /**
+     * Report every bare "=" a statement still resolves through search_path.
+     *
+     * This deliberately has no column allowlist and no operand order. An
+     * allowlist only catches the columns someone thought of, and anchoring
+     * the left operand misses a reversed predicate such as
+     * "$1::pg_catalog.uuid = memory.project_id"; either gap would pass while
+     * the statement still resolved its operator through an attacker
+     * controlled schema. Every remaining "=" in generated SQL is therefore a
+     * failure, except an UPDATE ... SET assignment, where "=" is assignment
+     * syntax rather than an operator application and cannot be qualified.
+     */
+    const bareEqualities = (statement: string): string[] => {
+      const scrubbed = statement.replaceAll("OPERATOR(pg_catalog.=)", " ");
+      const rows = scrubbed.split("\n");
+      const findings: string[] = [];
+      for (const [index, line] of rows.entries()) {
+        if (!/(?<![<>!=])=(?!=)/u.test(line)) continue;
+        const preceding = rows.slice(0, index + 1);
+        const setIndex = preceding.findLastIndex((entry) => /\bSET\b/u.test(entry));
+        const clauseIndex = preceding.findLastIndex((entry) =>
+          /\b(?:WHERE|FROM|RETURNING|VALUES)\b/u.test(entry));
+        if (setIndex !== -1 && setIndex > clauseIndex) continue;
+        findings.push(line.trim());
+      }
+      return findings;
+    };
     const db = executor((config) => {
       if (config.text.includes("INSERT INTO lcm.promoted_memories")) {
         return result([{ memory_id: memoryId }]);
@@ -1163,8 +1173,7 @@ describe("PostgreSQL memory repositories", () => {
     const statements = db.query.mock.calls
       .map(([config]) => (config as QueryConfig<unknown[]>).text);
     expect(statements.length).toBeGreaterThan(20);
-    expect(statements.filter((statement) =>
-      unqualifiedIdentityEquality.test(statement))).toEqual([]);
+    expect(statements.flatMap(bareEqualities)).toEqual([]);
 
     const flat = (statement: string): string =>
       statement.replace(/\s+/g, " ").trim();
@@ -1201,7 +1210,7 @@ describe("PostgreSQL memory repositories", () => {
     expect(all).toContain(
       "WHERE stored.project_id OPERATOR(pg_catalog.=) memory.project_id"
         + " AND stored.memory_id OPERATOR(pg_catalog.=) memory.memory_id"
-        + " AND stored.tag = requested.tag",
+        + " AND stored.tag OPERATOR(pg_catalog.=) requested.tag",
     );
     expect(find("SELECT content")).toContain(
       "WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid"
