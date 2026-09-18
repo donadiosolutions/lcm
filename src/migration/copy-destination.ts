@@ -43,22 +43,56 @@ export function migrationCopyLimits(input: MigrationCopyLimitsInput) {
     return result;
 }
 
-/** A budget belongs to the logical operation, including authoritative readbacks. */
+/**
+ * The attempt budget bounds retryable mutation failures. A mutation that
+ * commits, or whose commit outcome becomes ambiguous, always earns at
+ * least one authoritative readback attempt: readback retries are bounded
+ * by the same attempt count, but that readback budget runs independently
+ * of however much of the mutation budget was already spent proving the
+ * mutation could commit at all. This keeps a committed mutation from ever
+ * going unproven, so a valid `maximumTransactionAttempts: 1` configuration
+ * can still make forward progress on a mutation that commits on its only
+ * attempt, while readback failures remain retried within a finite budget
+ * rather than looping without bound.
+ */
 export async function settleMigrationCopyOperation<T>(input: {
     maximumTransactionAttempts: number;
     mutate: () => Promise<void>;
     readback: () => Promise<T | null>;
     reconnect: () => Promise<void>;
 }): Promise<T> {
-    let proofRequired = false;
     let primary: unknown;
     for (let attempt = 0; attempt < input.maximumTransactionAttempts; attempt++) {
-        if (proofRequired) {
+        let proofRequired = false;
+        try {
+            await input.mutate();
+            proofRequired = true;
+        }
+        catch (error) {
+            primary = error;
+            if (error instanceof PostgreSqlCommitOutcomeUnknownError) {
+                proofRequired = true;
+                try {
+                    await input.reconnect();
+                }
+                catch {
+                    throw primary;
+                }
+            }
+            else {
+                const retryableSqlState = error instanceof PostgreSqlStorageOperationError
+                    && ['40001', '40P01'].includes(error.sqlState ?? '');
+                if (!retryableSqlState) throw error;
+                continue;
+            }
+        }
+        for (let readbackAttempt = 0; readbackAttempt < input.maximumTransactionAttempts; readbackAttempt++) {
             try {
                 const proof = await input.readback();
                 if (proof !== null)
                     return proof;
                 proofRequired = false;
+                break;
             }
             catch (error) {
                 primary ??= error;
@@ -70,29 +104,11 @@ export async function settleMigrationCopyOperation<T>(input: {
                 }
             }
         }
-        else {
-            try {
-                await input.mutate();
-                proofRequired = true;
-            }
-            catch (error) {
-                primary = error;
-                if (error instanceof PostgreSqlCommitOutcomeUnknownError) {
-                    proofRequired = true;
-                    try {
-                        await input.reconnect();
-                    }
-                    catch {
-                        throw primary;
-                    }
-                }
-                else {
-                    const retryableSqlState = error instanceof PostgreSqlStorageOperationError
-                        && ['40001', '40P01'].includes(error.sqlState ?? '');
-                    if (!retryableSqlState) throw error;
-                }
-            }
-        }
+        // The readback loop above only exhausts here (without returning or
+        // clearing proofRequired) when every attempt threw, and every throw
+        // sets primary first, so primary is always defined at this point.
+        if (proofRequired)
+            throw primary;
     }
     throw primary ?? new Error('migration copy requires authoritative readback');
 }

@@ -114,7 +114,18 @@ it('retains uncertainty when serialized absence consumes the remaining budget',a
  const {PostgreSqlCommitOutcomeUnknownError}=await import('../../src/storage/postgresql/errors.js');
  const original=new PostgreSqlCommitOutcomeUnknownError({domain:'factory',operation:'test'});
  await expect(settleMigrationCopyOperation({maximumTransactionAttempts:2,mutate:async()=>{throw original;},readback:async()=>null,reconnect:async()=>{}})).rejects.toBe(original);
- await expect(settleMigrationCopyOperation({maximumTransactionAttempts:1,mutate:async()=>{},readback:async()=>true,reconnect:async()=>{}})).rejects.toThrow('authoritative');
+});
+it('proves a committed mutation even when the whole budget is spent on one attempt',async()=>{
+ const {settleMigrationCopyOperation}=await import('../../src/migration/copy-destination.js');
+ let writes=0,reads=0;
+ expect(await settleMigrationCopyOperation({maximumTransactionAttempts:1,mutate:async()=>{writes++;},readback:async()=>{reads++;return 'exact';},reconnect:async()=>{}})).toBe('exact');
+ expect({writes,reads}).toEqual({writes:1,reads:1});
+});
+it('bounds readback retries instead of looping when proof never arrives',async()=>{
+ const {settleMigrationCopyOperation}=await import('../../src/migration/copy-destination.js');
+ let writes=0,reads=0,reconnections=0;
+ await expect(settleMigrationCopyOperation({maximumTransactionAttempts:3,mutate:async()=>{writes++;},readback:async()=>{reads++;throw new Error('unavailable');},reconnect:async()=>{reconnections++;}})).rejects.toThrow('unavailable');
+ expect({writes,reads,reconnections}).toEqual({writes:1,reads:3,reconnections:3});
 });
 it('reacquires an expired own lease before retrying work',async()=>{
  const target=await destination();await target.admit(false);state.owned=false;
