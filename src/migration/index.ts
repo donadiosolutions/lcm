@@ -33,3 +33,5 @@ export type {
 
 export { inspectAuthenticatedSqliteMigrationSnapshot } from "./queue-evidence.js";
 export type { AuthenticatedSqliteMigrationSnapshot, MigrationReceiptReference } from "./queue-evidence.js";
+export { runSqliteMigrationCopy, inspectSqliteMigrationCopy, MigrationCopyError } from './batch-copy.js';
+export type { SqliteMigrationCopyInput, MigrationCopyBoundary, MigrationCopyTestingDependencies } from './batch-copy.js';
