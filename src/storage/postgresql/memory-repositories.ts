@@ -1318,8 +1318,12 @@ export class PostgreSqlRecallRepository implements RecallRepository {
                         AS surfacing_count,
                       surfaced.last_surfaced_at
                FROM requested
-               LEFT JOIN surfaced USING (memory_id)
-               LEFT JOIN used USING (memory_id)`,
+               LEFT JOIN surfaced
+                 ON surfaced.memory_id OPERATOR(pg_catalog.=)
+                   requested.memory_id
+               LEFT JOIN used
+                 ON used.memory_id OPERATOR(pg_catalog.=)
+                   requested.memory_id`,
         values: [this.access.projectId, jsonArray(normalizedIds)],
       }, this.access.context(operation));
       for (const row of result.rows) {

@@ -1046,15 +1046,19 @@ describe("PostgreSQL memory repositories", () => {
      */
     const bareEqualities = (statement: string): string[] => {
       const scrubbed = statement.replaceAll("OPERATOR(pg_catalog.=)", " ");
-      const rows = scrubbed.split("\n");
       const findings: string[] = [];
-      for (const [index, line] of rows.entries()) {
-        if (!/(?<![<>!=])=(?!=)/u.test(line)) continue;
-        const preceding = rows.slice(0, index + 1);
-        const setIndex = preceding.findLastIndex((entry) => /\bSET\b/u.test(entry));
-        const clauseIndex = preceding.findLastIndex((entry) =>
-          /\b(?:WHERE|FROM|RETURNING|VALUES)\b/u.test(entry));
-        if (setIndex !== -1 && setIndex > clauseIndex) continue;
+      let assigning = false;
+      for (const line of scrubbed.split("\n")) {
+        if (/\bSET\b/u.test(line)) assigning = true;
+        else if (/\b(?:WHERE|FROM|RETURNING|VALUES)\b/u.test(line)) assigning = false;
+        // Exempt the assignment token itself, never the rest of the line and
+        // never a whole region. "SET column =" and its continued "column ="
+        // cannot take an operator, but a second "=" on the same line is an
+        // operator inside the assigned expression and must still be qualified.
+        const remainder = assigning
+          ? line.replace(/^(\s*(?:SET\s+)?[A-Za-z_][A-Za-z0-9_]*\s*)=/u, "$1")
+          : line;
+        if (!/(?<![<>!=])=(?!=)/u.test(remainder)) continue;
         findings.push(line.trim());
       }
       return findings;

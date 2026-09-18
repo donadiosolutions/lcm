@@ -625,7 +625,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(240);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1338 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1338/#1353 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -738,6 +738,12 @@ describe("Codecov configuration", () => {
       // every touched file keeps its established owner and the component
       // topology is unchanged; these pins record that decision.
       ["src/batch-compact.ts", "unit-compaction-summarization"],
+      // #1353 qualifies every equality comparison in the PostgreSQL memory
+      // repositories against pg_catalog so a hostile search_path cannot
+      // resolve a different operator. The change is confined to that existing
+      // file and adds no component, so it keeps its established owner; this
+      // pin records that decision for a materially changed file.
+      ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/sqlite/native-transcript-repository.ts", "unit-local-persistence"],
       ["src/storage/postgresql/native-transcript-repository.ts", "integration-postgresql-transcripts"],
       ["src/daemon/version.ts", "unit-daemon-core"],
