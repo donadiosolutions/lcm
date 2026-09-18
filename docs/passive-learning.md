@@ -322,12 +322,15 @@ That orphan cleanup also enters the local append order before it takes
 publication admission. If another local append has already started, the sweep
 waits for it to finish and then scans, so a queued append completes and its
 events stay durable instead of timing out behind the sweep. A sweep whose
-caller already holds publication admission is the one exception: it enters the
-append order without waiting for a queued append, because that append cannot
-acquire publication until the caller releases it, so waiting would only burn
-the sweep deadline. Such a sweep still takes the local append lock and still
-runs the append-admission phase check, and appends that arrive after it still
-queue behind it. Be precise about what that phase check is: it is not the
+caller already holds publication admission can bypass a queued tokenless
+append, because that append cannot acquire publication until the caller
+releases it, so waiting would only burn the sweep deadline. This exception
+does not bypass another frame using the same live publication token: those
+frames remain ordered, and the later frame waits for the earlier callback to
+finish before it attempts the fail-fast local append lock. The sweep still
+takes that lock and runs the append-admission phase check. Tokenless appends
+that arrive later remain queued behind the complete append tail. Be precise
+about what that phase check is: it is not the
 consumer gate, because a live caller token short-circuits the consumer lock,
 and the phase check itself permits maintenance-held as the narrow append
 capability. The exception path therefore does not refuse on its own account.

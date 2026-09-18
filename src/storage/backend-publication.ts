@@ -405,7 +405,15 @@ const activeAppendBarrierContext = new AsyncLocalStorage<Readonly<{
   rootPath: string;
   token: BackendPublicationLockToken;
 }> | null>();
-const appendBarrierTails = new Map<string, Promise<void>>();
+type AppendBarrierTail = Readonly<{
+  /** Full FIFO tail used by entrants without publication admission. */
+  tail: Promise<void>;
+  /** Captured when this frame installs itself, before append-lock acquisition. */
+  holdsPublicationAdmission: boolean;
+  /** Latest admitted frame in this tail, excluding intervening tokenless frames. */
+  latestAdmittedFrame: Promise<void> | undefined;
+}>;
+const appendBarrierTails = new Map<string, AppendBarrierTail>();
 
 export class BackendPublicationAppendBarrierTimeoutError
   extends PrivateMutationLockContentionError {
@@ -2119,28 +2127,36 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
   const deadline = timing.now() + timing.contentionWaitMs;
   const holdsPublicationAdmission = contextualToken !== undefined
     && holdsActivePublicationLock(contextualToken, homeDir);
-  const previous = appendBarrierTails.get(key) ?? Promise.resolve();
+  const predecessor = appendBarrierTails.get(key);
+  const previous = predecessor?.tail ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve): void => { release = resolve; });
   const tail = previous.then(() => current);
-  appendBarrierTails.set(key, tail);
+  const entry: AppendBarrierTail = {
+    tail,
+    holdsPublicationAdmission,
+    latestAdmittedFrame: holdsPublicationAdmission
+      ? current
+      : predecessor?.latestAdmittedFrame,
+  };
+  appendBarrierTails.set(key, entry);
   void tail.then(() => {
-    if (appendBarrierTails.get(key) === tail) appendBarrierTails.delete(key);
+    if (appendBarrierTails.get(key) === entry) appendBarrierTails.delete(key);
   });
   try {
-    let previousSettled = false;
-    void previous.then(() => { previousSettled = true; });
+    const predecessorToWait = holdsPublicationAdmission
+      ? predecessor?.latestAdmittedFrame
+      : previous;
+    let previousSettled = predecessorToWait === undefined;
+    void predecessorToWait?.then(() => { previousSettled = true; });
     await Promise.resolve();
-    // The tail stays installed so later entrants still queue behind this
-    // frame, but a caller that already holds publication admission never
-    // waits on it: a queued tokenless predecessor cannot reach the append
-    // lock until this caller releases the publication flock it is holding.
-    // A same-token sibling predecessor can still proceed concurrently, which
-    // is why the tail is fairness only; .local-hook-append.lock below is what
-    // actually serializes the mutations.
-    if (!previousSettled && !holdsPublicationAdmission) {
+    // A live publication holder may bypass tokenless frames because they
+    // cannot acquire the publication flock it owns. The tail entry captures
+    // the latest admitted frame at installation time, so same-token siblings
+    // still wait for one another even when tokenless frames lie between them.
+    if (!previousSettled && predecessorToWait !== undefined) {
       if (!timing.bounded) {
-        await previous;
+        await predecessorToWait;
       } else {
         const remaining = deadline - timing.now();
         const queued = new PrivateMutationLockContentionError(
@@ -2148,7 +2164,7 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
         );
         const predecessor = remaining <= 0
           ? "deadline"
-          : await waitForAppendPredecessor(previous, timing, deadline);
+          : await waitForAppendPredecessor(predecessorToWait, timing, deadline);
         if (predecessor !== "settled") {
           throw new BackendPublicationAppendBarrierTimeoutError(queued);
         }
@@ -2229,25 +2245,34 @@ export async function withBackendPublicationRetainedAppendAdmissionAsync<T>(
   const holdsPublicationAdmission = lockToken !== undefined
     && holdsActivePublicationLock(lockToken, homeDir);
   const key = rootPath(homeDir);
-  const previous = appendBarrierTails.get(key) ?? Promise.resolve();
+  const predecessor = appendBarrierTails.get(key);
+  const previous = predecessor?.tail ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve): void => { release = resolve; });
   const tail = previous.then(() => current);
-  appendBarrierTails.set(key, tail);
+  const entry: AppendBarrierTail = {
+    tail,
+    holdsPublicationAdmission,
+    latestAdmittedFrame: holdsPublicationAdmission
+      ? current
+      : predecessor?.latestAdmittedFrame,
+  };
+  appendBarrierTails.set(key, entry);
   void tail.then(() => {
-    if (appendBarrierTails.get(key) === tail) appendBarrierTails.delete(key);
+    if (appendBarrierTails.get(key) === entry) appendBarrierTails.delete(key);
   });
   try {
-    let previousSettled = false;
-    void previous.then(() => { previousSettled = true; });
+    const predecessorToWait = holdsPublicationAdmission
+      ? predecessor?.latestAdmittedFrame
+      : previous;
+    let previousSettled = predecessorToWait === undefined;
+    void predecessorToWait?.then(() => { previousSettled = true; });
     await Promise.resolve();
-    // The tail stays installed so later entrants still queue behind this
-    // frame, but a caller that already holds publication admission never
-    // waits on it: a queued tokenless predecessor cannot reach the append
-    // lock until this caller releases the publication flock it is holding.
-    if (!previousSettled && !holdsPublicationAdmission) {
+    // Preserve same-token order while bypassing only tokenless frames that
+    // cannot acquire the publication flock held by this caller.
+    if (!previousSettled && predecessorToWait !== undefined) {
       const predecessor = await waitForAppendPredecessor(
-        previous,
+        predecessorToWait,
         timing,
         deadline,
         options.signal,

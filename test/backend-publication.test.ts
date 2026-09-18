@@ -6357,6 +6357,94 @@ describe("revocable mutation permits", () => {
     expect(queuedEntered).toBe(true);
   });
 
+  it("serializes concurrent same-token append barriers", async () => {
+    const home = makeHome();
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    let firstEntered!: () => void;
+    const entered = new Promise<void>(resolve => { firstEntered = resolve; });
+    await withBackendPublicationConsumerLockAsync(home, async token => {
+      let secondState: "pending" | "fulfilled" | "contention" | "rejected" = "pending";
+      const first = withBackendPublicationAppendBarrierAsync(home, async () => {
+        order.push("first");
+        firstEntered();
+        await new Promise<void>(resolve => { releaseFirst = resolve; });
+        return "first";
+      }, token);
+      const second = withBackendPublicationAppendBarrierAsync(home, () => {
+        order.push("second");
+        return "second";
+      }, token).then(value => {
+        secondState = "fulfilled";
+        return value;
+      }, (error: unknown) => {
+        secondState = error instanceof PrivateMutationLockContentionError
+          ? "contention"
+          : "rejected";
+        throw error;
+      });
+      const outcomes = Promise.allSettled([first, second]);
+      await entered;
+      for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+      try {
+        expect(secondState).toBe("pending");
+        expect(order).toEqual(["first"]);
+      } finally {
+        releaseFirst();
+      }
+      await expect(outcomes).resolves.toEqual([
+        { status: "fulfilled", value: "first" },
+        { status: "fulfilled", value: "second" },
+      ]);
+      expect(secondState).toBe("fulfilled");
+    });
+    expect(order).toEqual(["first", "second"]);
+  });
+
+  it("serializes concurrent same-token retained append admissions", async () => {
+    const home = makeHome();
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    let firstEntered!: () => void;
+    const entered = new Promise<void>(resolve => { firstEntered = resolve; });
+    await withBackendPublicationConsumerLockAsync(home, async token => {
+      let secondState: "pending" | "fulfilled" | "contention" | "rejected" = "pending";
+      const first = withBackendPublicationRetainedAppendAdmissionAsync(home, async () => {
+        order.push("first");
+        firstEntered();
+        await new Promise<void>(resolve => { releaseFirst = resolve; });
+        return "first";
+      }, token);
+      const second = withBackendPublicationRetainedAppendAdmissionAsync(home, () => {
+        order.push("second");
+        return "second";
+      }, token).then(value => {
+        secondState = "fulfilled";
+        return value;
+      }, (error: unknown) => {
+        secondState = error instanceof PrivateMutationLockContentionError
+          ? "contention"
+          : "rejected";
+        throw error;
+      });
+      const outcomes = Promise.allSettled([first, second]);
+      await entered;
+      for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+      try {
+        expect(secondState).toBe("pending");
+        expect(order).toEqual(["first"]);
+      } finally {
+        releaseFirst();
+      }
+      await expect(outcomes).resolves.toEqual([
+        { status: "fulfilled", value: "first" },
+        { status: "fulfilled", value: "second" },
+      ]);
+      expect(secondState).toBe("fulfilled");
+    });
+    expect(order).toEqual(["first", "second"]);
+  });
+
   it("keeps queuing later entrants behind an admitted token holder", async () => {
     const home = makeHome();
     const order: string[] = [];
