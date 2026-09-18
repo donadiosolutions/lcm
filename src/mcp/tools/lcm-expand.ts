@@ -1,6 +1,6 @@
 export const lcmExpandTool = {
   name: "lcm_expand",
-  description: "Decompress a summary node into its full source content by traversing the DAG. Use when a summary references something that needs more detail.",
+  description: "Traverse a summary node's DAG links and return its child summaries as short snippets. Use when a condensed summary references detail recorded in its children; this tool does not return raw source messages.",
   inputSchema: {
     type: "object" as const,
     properties: {

@@ -12,7 +12,7 @@ Use the least-expensive available context in this order:
 2. **`lcm_search`** — Broadly recall related knowledge across sessions when the injected memory is absent or insufficient.
 3. **`lcm_grep`** — Find an exact keyword, error message, or function name only when broad recall is insufficient and a precise match is needed.
 4. **`lcm_describe`** — Inspect a specific summary's metadata and lineage (cheap, no DAG traversal).
-5. **`lcm_expand`** — Decompress a summary node into its full source content when the required detail was compressed away.
+5. **`lcm_expand`** — Traverse a condensed summary's DAG links to list its child summaries as short snippets when you need to find where detail was recorded.
 
 Do not start with `lcm_grep`: use broad recall first, then narrow to an exact
 match only when necessary.
@@ -24,13 +24,9 @@ match only when necessary.
 
 ### When to expand
 
-Summaries are lossy by design. The "Expand for details about:" footer at the end of each summary lists what was dropped. Use `lcm_expand` when you need:
+Summaries are lossy by design. The "Expand for details about:" footer at the end of each summary lists what was dropped. `lcm_expand` walks the summary DAG downward: for a condensed node it returns that node's child summaries as snippets truncated to 200 characters followed by an ellipsis, together with their node IDs for further traversal. With a `depth` above 1, deeper descendants are flattened into that same child list.
 
-- Exact commands, error messages, or config values
-- File paths and specific code changes
-- Decision rationale beyond what the summary captured
-- Tool call sequences and their outputs
-- Verbatim quotes or specific data points
+Use it to find which child summary recorded the detail you need, such as exact commands, file paths, decision rationale, or tool call sequences. The shipped tool does not return raw source messages, so it narrows the search instead of reproducing the original text verbatim. Expanding a leaf summary returns no children and no messages, because a leaf is the lowest level this tool exposes.
 
 ## Tool reference
 
@@ -280,7 +276,7 @@ lcm_describe(nodeId: "sum_abc123def456")
 
 ### lcm_expand
 
-Decompress a summary node into its full source content by traversing the DAG. Use when a summary references details you need but doesn't include them verbatim.
+Traverse a summary node's DAG links and return its child summaries as short snippets. Use when a condensed summary references detail that its children recorded.
 
 **Parameters:**
 
@@ -295,10 +291,20 @@ admission. There is no upper bound beyond the positive-integer requirement.
 The direct daemon request also follows the shared JSON-object body contract
 above.
 
+The shipped MCP and CLI request passes no token cap and does not ask for raw
+source messages, so `LCM_MAX_EXPAND_TOKENS` does not apply to it and the
+response carries no message content. A child summary longer than 200 characters
+appears as its first 200 characters followed by an ellipsis, and every
+referenced node ID is listed in `citedIds` for follow-up traversal. Bound the
+cost with `depth`. The separate
+`buildExpansionToolDefinition` helper is an unregistered tool definition that
+does accept an explicit `tokenCap` and `includeMessages`; see
+[architecture.md](architecture.md) for that distinction.
+
 **Examples:**
 
 ```
-# Expand a leaf summary one level deep
+# Expand a condensed summary one level deep
 lcm_expand(nodeId: "sum_abc123")
 
 # Expand a condensed summary, traversing two levels
@@ -392,6 +398,6 @@ listing something you need, use `lcm_expand` with that summary's node ID.
 ### Performance considerations
 
 - `lcm_search`, `lcm_grep`, and `lcm_describe` are fast (direct database queries)
-- `lcm_expand` traverses the DAG and reads source messages — cost scales with depth
+- `lcm_expand` traverses the DAG and reads child summaries — cost scales with depth
 - `lcm_stats` may scan aggregate counters across projects; collection is bounded, but use it sparingly rather than in request handlers
-- Token caps (`LCM_MAX_EXPAND_TOKENS`) prevent runaway expansion
+- The shipped `lcm_expand` applies no token cap; bound expansion with `depth`
