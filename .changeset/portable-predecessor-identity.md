@@ -14,3 +14,9 @@ not catch. Batches built from any portable record source, including
 the SQLite-to-PostgreSQL migration copy path, now refuse this case
 at construction with a `duplicate-identity` error instead of
 accepting it.
+
+A successor whose order exactly ties its predecessor's (rather than
+advancing past it) now also surfaces `duplicate-identity` instead of
+`order-regression`. Both are non-retryable and belong to the same
+transfer classification, so no caller behavior changes on this exact
+tie case beyond the reported error code.

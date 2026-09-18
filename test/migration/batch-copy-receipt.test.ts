@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { expect,it } from 'vitest';
 import { createGeneration,createFixtureSource,postgresGeneration,sqliteUnboundGeneration,LOCAL_PROJECT_IDENTITY } from '../fixtures/portable-records.js';
-import { createPortableRecordStream,createPortableRecord,serializePortableCheckpoint,type PortableRecord,type PortableDomain } from '../../src/storage/portable-record-stream.js';
+import { createPortableRecordStream,createPortableRecord,serializePortableCheckpoint,comparePortableOrder,type PortableRecord,type PortableDomain } from '../../src/storage/portable-record-stream.js';
 import { migrationCopyBatchCommitSha256 } from '../../src/migration/batch-copy.js';
 
 it('binds canonical checkpoint UTF8 bytes to the fixed recipe-v1 commit digest',async()=>{
@@ -110,6 +110,10 @@ it.each(ORDER_OUTSIDE_IDENTITY_CASES)('refuses a $domain successor duplicating t
  const predecessor=records[0]!;
  const poisonedSuccessor=createPortableRecord({domain,ordinal:1,value:advance(rawValueOf(predecessor)),context} as never);
  expect(poisonedSuccessor.identitySha256).toBe(predecessor.identitySha256);
+ // The identity assertion above already pins the poison semantics; this
+ // proves the test title's other claim, that the successor's order
+ // genuinely advances rather than tying or regressing.
+ expect(comparePortableOrder(predecessor.order, poisonedSuccessor.order)).toBeLessThan(0);
 
  const poisonedSource=createFixtureSource({description:generation.description,records:generation.records,
   readOverride:input=>(input.domain===domain&&input.afterOrdinal===1&&input.includePredecessor

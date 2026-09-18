@@ -738,22 +738,22 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
     identities.add(candidate.record.identitySha256);
     if (previous !== null) {
       const comparison = comparePortableOrder(previous.order, candidate.record.order);
-      // A tie against the predecessor's order cannot reach this point: equal
-      // order implies equal identity for every domain (order equals
-      // logicalKey literally for most domains; for the four where
+      // Refuse any non-advancing order, matching the scanner
+      // (scanSourcePage's own comparePortableOrder(...) >= 0 check). A tie
+      // is additionally refused earlier as a duplicate identity: equal
+      // order implies equal identity for every current domain (order
+      // equals logicalKey literally for most domains; for the four where
       // logicalKey is a field subset of order -- passive-events,
       // project-aliases, summary-message-links, summary-parent-links --
       // equal order trivially gives equal logicalKey; for the hash-derived
-      // domains, portable-record.ts enforces the tie itself: the
-      // conversationFingerprint check at portable-record.ts:1724 and the
-      // conversationIdentityFromOrder/messageIdentityFromOrder checks in
-      // messages, message-parts and context-items each call malformed() if
-      // the stored identity hash disagrees with the order that determines
-      // it). So a successor whose order ties the predecessor's also
-      // duplicates its identitySha256, and the identities check above --
-      // seeded with the predecessor's identity -- already refuses it on
-      // this same iteration. Only a strict order regression is checked here.
-      if (comparison > 0) {
+      // domains, portable-record.ts enforces the tie itself via each
+      // domain's identity-from-order check, which rejects a stored
+      // identity hash that disagrees with the order that determines it).
+      // That earlier refusal makes this >= 0 arm unreachable on today's
+      // schema; it is kept as fail-closed insurance for a future domain
+      // whose logicalKey is not determined by order (see the schema-lock
+      // test in test/storage/portable-record-parity.test.ts).
+      if (comparison >= 0) {
         fail("order-regression", { domain: request.domain, ordinal: candidate.record.ordinal });
       }
     }
