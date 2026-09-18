@@ -1128,7 +1128,11 @@ implements
         if (Number(row.locator_count) !== 1) continue;
         locators.set(
           nonemptyString(row.native_session_id, this.projectId, operation, "native_session_id", true),
-          nonemptyString(row.source_locator, this.projectId, operation, "source_locator", true),
+          // Read validation matches transcriptFromRow: a stored locator is
+          // rejected only when it is empty, never merely because it is
+          // whitespace. Ingest admits such a locator, so rejecting it here
+          // would lose provenance the backend legally holds.
+          nonemptyString(row.source_locator, this.projectId, operation, "source_locator"),
         );
       }
     }

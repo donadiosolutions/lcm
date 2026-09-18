@@ -402,6 +402,21 @@ describe("PostgreSQL native transcript repository", () => {
     expect(db.query).not.toHaveBeenCalled();
   });
 
+  it("keeps a stored whitespace source locator that ingest admits", async () => {
+    // transcriptFromRow accepts this locator, so the batched read must not be
+    // stricter than the row read or a legally stored locator disappears.
+    const db = executor(() => result([{
+      native_session_id: "session-a",
+      source_locator: " ",
+      locator_count: "1",
+    }]));
+    const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
+
+    await expect(repository.listUnambiguousSourceLocators({
+      nativeSessionIds: ["session-a"],
+    })).resolves.toEqual(new Map([["session-a", " "]]));
+  });
+
   it("refuses malformed source-locator rows returned by the backend", async () => {
     const db = executor(() => result([{
       native_session_id: "session-a",
