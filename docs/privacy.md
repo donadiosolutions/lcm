@@ -222,6 +222,27 @@ contains a known truncated legacy value, repair the canonical target with the
 offline procedure above. This refusal
 behavior is implemented by [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
 
+That marker recheck has a rare third outcome. LCM commits the source write
+fence before the target transaction begins, so when the marker is present at
+the initial read-only check but durably absent inside the target transaction,
+the normalized source recheck refuses while the source is already retired.
+Nothing is copied and nothing is truncated: the canonical target keeps its
+existing rows and the source keeps its original bytes. The retired source now
+carries write-fence triggers on its ordinary tables, so the in-place
+`UPDATE promoted` repair described above aborts with
+`LCM source retired by worktree reconciliation`, and a later run refuses again
+at the source guard because the marker is still missing.
+
+There is no supported in-place repair for this state. Do not drop the fence
+triggers or the `worktree_reconciliation_fence` table and do not edit the
+target's `worktree_reconciliation_sources` marker by hand: those are what keep
+a retired source from being written and from being merged twice. Stop the
+writers, leave the source database, the canonical target, and the
+reconciliation journal exactly as they are, keep a backup, and report the state
+at [the issue tracker](https://github.com/donadiosolutions/lcm/issues) so that
+recovery is designed against the retirement and admission boundary instead of
+being improvised on a live database.
+
 ### Unsupported legacy conversation message bytes
 
 Legacy `messages.content` values must be well-formed UTF-8 SQLite `TEXT` without

@@ -72,7 +72,19 @@ idempotent ingest-key conflict handling. It intentionally exposes no payload
 update or deletion operation. Embedded backfill code receives
 `NativeTranscriptRepository` explicitly; both production project factories
 expose the repository and an exact session-message snapshot through
-`ProjectStorage.nativeTranscripts`. SQLite stores active native records in its
+`ProjectStorage.nativeTranscripts`. That interface is published from the
+`@donadiosolutions/lcm/storage/native-transcripts` entry point, so its required
+members are a compatibility surface for external implementations. It requires
+`listUnambiguousSourceLocators`, which resolves the optional source locator for
+many native sessions at once: a backend must aggregate server-side and return
+at most one entry per requested session, so both the returned row count and the
+resident memory stay bounded by the request rather than by how many transcripts
+the project has ingested. A session is omitted when it has no transcript or
+when its transcripts carry more than one distinct source locator, which keeps
+the rule that a locator is shown only for one unambiguous native source.
+Callers batch their requests, so an implementation receives a bounded session
+list rather than an entire project. This member was added in 2.0.0 and is a
+breaking change for an external implementation of the interface. SQLite stores active native records in its
 project database, separately from immutable canonical recovery archives. The
 production PostgreSQL factory, runtime, migration runner, identity repository,
 and isolated test-database lease support the
