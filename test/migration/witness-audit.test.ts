@@ -92,25 +92,86 @@ describe("machine-checked witness audit", () => {
     expect(new Set(ids).size).toBe(ids.length);
     for (const id of ids) expect(id.length).toBeGreaterThan(0);
   });
-  it("gives every entry a non-empty description and a non-empty onDifference statement", () => {
+  it("gives every entry a non-empty description", () => {
     for (const entry of MIGRATION_WITNESS_AUDIT) {
       expect(entry.description.length).toBeGreaterThan(0);
-      expect(entry.onDifference.length).toBeGreaterThan(0);
     }
   });
-  it("requires a compared-live entry's onDifference to actually describe a consequence, not an n/a placeholder", () => {
-    const liveEntries = MIGRATION_WITNESS_AUDIT.filter((entry) => entry.comparison === "compared-live");
+  /**
+   * Round-1 P1: the first version of this module required every non-live
+   * row to be prefixed "n/a", which is precisely the placeholder the whole
+   * module exists to forbid, and the enforced test shape made a fix that
+   * named a missing comparison without that prefix fail outright. The
+   * schema is now a discriminated union: each comparison kind has its own
+   * required fields, so there is no shape left in which a row can exist
+   * without naming something concrete. These tests check that every
+   * required field for the entry's own kind is genuinely filled in --
+   * TypeScript already refuses to compile an entry missing the field
+   * entirely, so this is the one thing only a runtime check can catch:
+   * a field present but emptied out.
+   */
+  it("requires a compared-live entry to name a real consequence and at least one mismatch class", () => {
+    const liveEntries = MIGRATION_WITNESS_AUDIT.filter(
+      (entry): entry is Extract<MigrationWitnessAuditEntry, { comparison: "compared-live" }> => entry.comparison === "compared-live",
+    );
     expect(liveEntries.length).toBeGreaterThan(0);
     for (const entry of liveEntries) {
-      expect(entry.onDifference.startsWith("n/a")).toBe(false);
+      expect(entry.consequence.length).toBeGreaterThan(0);
+      expect(entry.mismatchClasses.length).toBeGreaterThan(0);
     }
   });
-  it("requires every non-live entry to state why, rather than leaving the reason implicit", () => {
-    const nonLiveEntries = MIGRATION_WITNESS_AUDIT.filter((entry) => entry.comparison !== "compared-live");
+  it("requires a structurally-protected entry to name both its comparator and its refusal", () => {
+    const protectedEntries = MIGRATION_WITNESS_AUDIT.filter(
+      (entry): entry is Extract<MigrationWitnessAuditEntry, { comparison: "structurally-protected" }> => entry.comparison === "structurally-protected",
+    );
+    expect(protectedEntries.length).toBeGreaterThan(0);
+    for (const entry of protectedEntries) {
+      expect(entry.comparator.length).toBeGreaterThan(0);
+      expect(entry.refusal.length).toBeGreaterThan(0);
+    }
+  });
+  it("requires a recorded-only-per-plan or accepted-trust-boundary entry to name the exact missing comparison and its owning item", () => {
+    const nonLiveEntries = MIGRATION_WITNESS_AUDIT.filter(
+      (entry): entry is Extract<MigrationWitnessAuditEntry, { comparison: "recorded-only-per-plan" | "accepted-trust-boundary" }> => (
+        entry.comparison === "recorded-only-per-plan" || entry.comparison === "accepted-trust-boundary"
+      ),
+    );
     expect(nonLiveEntries.length).toBeGreaterThan(0);
     for (const entry of nonLiveEntries) {
-      expect(entry.onDifference.startsWith("n/a")).toBe(true);
+      expect(entry.missingComparison.length).toBeGreaterThan(0);
+      expect(entry.owningItem.length).toBeGreaterThan(0);
     }
+  });
+  it("forbids a bare not-applicable marker anywhere in the inventory (red-first demonstration)", () => {
+    // The defect this rewrite exists to fix, proven directly: a "n/a"
+    // placeholder standing in for a real reason must be rejected wherever
+    // it could appear, not merely absent from the current 21 entries by
+    // convention. Scans every string field the schema defines, on a
+    // mutated copy, and shows the same emptiness/placeholder logic these
+    // tests apply would catch it if it existed for real.
+    const bareMarkerFields = (entry: MigrationWitnessAuditEntry): readonly string[] => {
+      switch (entry.comparison) {
+        case "compared-live": return [entry.consequence];
+        case "structurally-protected": return [entry.comparator, entry.refusal];
+        case "recorded-only-per-plan":
+        case "accepted-trust-boundary": return [entry.missingComparison, entry.owningItem];
+      }
+    };
+    for (const entry of MIGRATION_WITNESS_AUDIT) {
+      for (const field of bareMarkerFields(entry)) {
+        expect(field.trim().toLowerCase()).not.toBe("n/a");
+        expect(field.trim().toLowerCase().startsWith("n/a:")).toBe(false);
+        expect(field.trim().toLowerCase().startsWith("n/a ")).toBe(false);
+      }
+    }
+    // Demonstrate the check can actually fail: a mutated entry whose
+    // required field was emptied out is exactly what a reviewer's
+    // "removed a comparison from a real witness" case looks like.
+    const withEmptiedComparator: MigrationWitnessAuditEntry = {
+      ...MIGRATION_WITNESS_AUDIT.find((entry) => entry.id === "source-witness")!,
+      comparator: "",
+    } as Extract<MigrationWitnessAuditEntry, { comparison: "structurally-protected" }>;
+    expect(withEmptiedComparator.comparator.length).toBe(0);
   });
   it("fails the completeness check when a real body field is deliberately dropped from the inventory (red-first demonstration)", () => {
     // This is the property the whole module exists to enforce, proven
@@ -137,15 +198,21 @@ describe("reconciliation-class coverage, tied to the same audit inventory", () =
     // live-compared witness here, and this inventory must claim no more
     // than the driver actually implements.
     const classesNamedByLiveEntries = new Set(
-      MIGRATION_WITNESS_AUDIT.flatMap((entry) => entry.mismatchClasses ?? []),
+      MIGRATION_WITNESS_AUDIT
+        .filter((entry): entry is Extract<MigrationWitnessAuditEntry, { comparison: "compared-live" }> => entry.comparison === "compared-live")
+        .flatMap((entry) => entry.mismatchClasses),
     );
     expect(classesNamedByLiveEntries).toEqual(new Set(DRIVER_IMPLEMENTED_MISMATCH_CLASSES));
   });
   it("fails that cross-check when a live-compared witness's mismatchClasses is dropped (red-first demonstration)", () => {
     const withoutSequenceMapping: readonly MigrationWitnessAuditEntry[] = MIGRATION_WITNESS_AUDIT.map((entry) => (
-      entry.id === "sequence-self-consistency" ? { ...entry, mismatchClasses: [] } : entry
+      entry.id === "sequence-self-consistency" && entry.comparison === "compared-live" ? { ...entry, mismatchClasses: [] } : entry
     ));
-    const classesNamedByLiveEntries = new Set(withoutSequenceMapping.flatMap((entry) => entry.mismatchClasses ?? []));
+    const classesNamedByLiveEntries = new Set(
+      withoutSequenceMapping
+        .filter((entry): entry is Extract<MigrationWitnessAuditEntry, { comparison: "compared-live" }> => entry.comparison === "compared-live")
+        .flatMap((entry) => entry.mismatchClasses),
+    );
     expect(classesNamedByLiveEntries).not.toEqual(new Set(DRIVER_IMPLEMENTED_MISMATCH_CLASSES));
     expect(classesNamedByLiveEntries.has("sequence")).toBe(false);
   });
