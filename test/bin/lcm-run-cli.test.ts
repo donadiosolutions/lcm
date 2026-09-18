@@ -754,6 +754,29 @@ describe("runCli registration and help dispatch", () => {
     }
   });
 
+  it("marks a listed project that storage will refuse", async () => {
+    state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+    state.listProjects.mockResolvedValue({
+      local: [{
+        hash: "f".repeat(64),
+        canonical: "/work/project",
+        aliases: ["/work/alias"],
+        unauthenticated: true,
+      }],
+      remote: null,
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await invoke(["project", "list"]);
+
+    expect(log.mock.calls.map(([line]) => line)).toEqual([
+      "f".repeat(64),
+      "  unauthenticated: storage will refuse this identity",
+      "  canonical: /work/project",
+      "  alias: /work/alias",
+    ]);
+  });
+
   it("retries project list and show preparation while preserving one result", async () => {
     state.createInstallerPublicationConvergence.mockImplementation(async () => makeTestConvergence());
     state.listProjects.mockImplementationOnce(() => { throw new PrivateMutationLockContentionError("busy"); })

@@ -1421,6 +1421,97 @@ function existingProjectHasStoredData(hash: string): boolean {
     || existsSync(join(lcmHomeDir(), "events", `${hash}.db`));
 }
 
+/** Reject a map key that no local evidence binds to its canonical path. */
+export class UnauthenticatedProjectIdentityError extends Error {
+  constructor(readonly id: string, readonly canonical: string) {
+    super(`project map identity is not authenticated for its canonical path: ${canonical} (${id})`);
+    this.name = "UnauthenticatedProjectIdentityError";
+  }
+}
+
+/**
+ * Decide whether one map key may act as the storage identity for its path.
+ *
+ * Three grounds admit a key, and their order matters. The canonical path hash
+ * is the derivation every other code path reproduces. A renewal successor is
+ * decided solely by its retained predecessor fence: once a key has the
+ * successor shape, no other evidence may stand in for that fence, because a
+ * renewed project writes its own project metadata the first time it is opened
+ * and that metadata would otherwise re-admit a successor whose fence was lost.
+ * Only a key that is neither falls through to its project metadata.
+ *
+ * The metadata ground is compatibility, not a defence. A hash minted before
+ * the current path normalization does not equal hashProjectPath(canonical),
+ * and populateFromExistingProjectMetadata legitimately backfills the map from
+ * such a directory, so refusing it would reject identities this repository
+ * supports. It is not an independent trust anchor: anyone who can write
+ * map.json can usually also write projects/<id>/meta.json. What it removes is
+ * the case with no corroboration anywhere on disk, where the CLI adopted a key
+ * the hook side would never derive.
+ */
+export function isAuthenticatedProjectIdentity(
+  id: string,
+  canonical: string,
+  homeDir?: string,
+): boolean {
+  const retiredId = hashProjectPath(canonical);
+  if (id === retiredId) return true;
+  if (isRetiredProjectIdentitySuccessor(id, retiredId, canonical)) {
+    return isAuthenticatedRetiredProjectIdentitySuccessor(id, retiredId, canonical, homeDir);
+  }
+  return projectMetadataBindsCanonical(id, canonical, homeDir);
+}
+
+/**
+ * Recognize a legacy identity corroborated by its own project metadata.
+ *
+ * The stored cwd must normalize to the same canonical path the entry claims,
+ * read through the same bounded, single-link, owner-checked reader the map
+ * backfill uses, so an unreadable or mismatched metadata file corroborates
+ * nothing. This is same-UID corroboration rather than an independent trust
+ * anchor; see isAuthenticatedProjectIdentity for what it does and does not
+ * establish.
+ */
+function projectMetadataBindsCanonical(
+  id: string,
+  canonical: string,
+  homeDir?: string,
+): boolean {
+  const dir = join(projectsDir(homeDir), id);
+  const metaPath = join(dir, "meta.json");
+  if (!existsSync(metaPath)) return false;
+  try {
+    const meta = JSON.parse(readBoundedRegularFile(metaPath, {
+      allowedRoot: dir,
+      maxBytes: 1024 * 1024,
+      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      requireSingleLink: true,
+    })) as { cwd?: unknown };
+    return typeof meta.cwd === "string"
+      && meta.cwd.length > 0
+      && normalizeProjectPath(meta.cwd) === canonical;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Refuse a map key no derivation can produce, before it becomes an identity.
+ *
+ * A successor-shaped key deliberately passes here even when its predecessor
+ * fence is missing or tampered: admission and reconciliation already refuse it
+ * with the specific renewal diagnostic, and pre-empting them with a generic
+ * message would lose that guidance. Enumeration uses the authenticated
+ * predicate instead, so no surface presents a successor it cannot open.
+ */
+function assertDerivableProjectIdentity(id: string, canonical: string): void {
+  const pathHash = hashProjectPath(canonical);
+  if (id === pathHash) return;
+  if (isRetiredProjectIdentitySuccessor(id, pathHash, canonical)) return;
+  if (projectMetadataBindsCanonical(id, canonical)) return;
+  throw new UnauthenticatedProjectIdentityError(id, canonical);
+}
+
 function identityForMatches(
   map: ProjectMap,
   cwd: string,
@@ -1432,9 +1523,11 @@ function identityForMatches(
   }
   if (matches.size === 0) return null;
   const id = [...matches][0];
+  const canonical = resolve(map[id].canonical);
+  assertDerivableProjectIdentity(id, canonical);
   return {
     id,
-    canonical: resolve(map[id].canonical),
+    canonical,
     ...(map[id].remoteProjectId ? { remoteProjectId: map[id].remoteProjectId } : {}),
   };
 }

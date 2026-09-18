@@ -1074,6 +1074,28 @@ describe("identity service", () => {
     expect(listed.remote).toEqual([expect.objectContaining({ projectId: PROJECT_A })]);
   });
 
+  it("marks a local project whose map key no local evidence authenticates", async () => {
+    // lcm project list is a diagnostic surface: an entry storage refuses is
+    // marked rather than hidden, so an operator can see what to repair.
+    const path = makeProject("list-unauthenticated");
+    resolveProjectIdentity(path);
+    writeFileSync(
+      projectMapModule.projectMapPath(),
+      JSON.stringify({ ["f".repeat(64)]: { canonical: path, aliases: [] } }),
+      { mode: 0o600 },
+    );
+    projectMapModule.clearProjectMapCache();
+
+    expect(await listProjects(SQLITE_CONFIG, deps)).toEqual({
+      local: [{
+        hash: "f".repeat(64),
+        canonical: path,
+        aliases: [],
+        unauthenticated: true,
+      }],
+    });
+  });
+
   it("refuses local project reads before publication admission", async () => {
     const listMap = vi.spyOn(projectMapModule, "listProjectMapEntries");
     const showMap = vi.spyOn(projectMapModule, "showProjectMapEntry");
