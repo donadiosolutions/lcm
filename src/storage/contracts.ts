@@ -230,6 +230,15 @@ export interface NativeTranscriptMessageSnapshotRepository {
   ): Promise<readonly NativeTranscriptSessionMessageRecord[]>;
 }
 
+/**
+ * Maximum native sessions resolved per source-locator statement.
+ *
+ * Discovery batches its lookups so one statement stays bounded in both
+ * placeholders and returned rows regardless of how many conversations a
+ * project holds.
+ */
+export const NATIVE_SOURCE_LOCATOR_BATCH_SIZE = 100;
+
 export interface NativeTranscriptRepository {
   ingestBatch(
     input: NativeTranscriptBatchInput,
@@ -238,6 +247,18 @@ export interface NativeTranscriptRepository {
   listByNativeSession(input: {
     readonly nativeSessionId: string;
   }): Promise<NativeTranscriptRecord[]>;
+  /**
+   * Resolve one unambiguous source locator per requested native session.
+   *
+   * Backends must aggregate server-side and return at most one entry per
+   * requested session, so both the row count and the resident memory stay
+   * bounded by the request instead of by the project's transcript history.
+   * A session is omitted when it has no transcript or when its transcripts
+   * carry more than one distinct source locator.
+   */
+  listUnambiguousSourceLocators(input: {
+    readonly nativeSessionIds: readonly string[];
+  }): Promise<ReadonlyMap<string, string>>;
   listBySource(input: NativeTranscriptCheckpointKey): Promise<NativeTranscriptRecord[]>;
   listByMessage(input: {
     readonly conversationId: number;

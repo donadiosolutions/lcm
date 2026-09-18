@@ -17,7 +17,7 @@ const mocks = vi.hoisted(() => ({
   migrate: vi.fn(),
   validate: vi.fn((cwd: string) => cwd),
   describe: vi.fn(async () => ({ id: "node" })),
-  expand: vi.fn(async () => ({ expanded: ["node"] })),
+  expand: vi.fn(async (_request: unknown) => ({ expanded: ["node"] })),
   grep: vi.fn(async () => ({ messages: [], summaries: [], matches: [] })),
   poolStats: vi.fn(() => ({ totalConnections: 0 })),
   stats: vi.fn(() => ({ projects: 0 })),
@@ -240,6 +240,13 @@ describe("persistence read route boundaries", () => {
       expanded: null,
       error: "expand failed for https://outer.test/x?next=file://host.invalid<path>",
     });
+  });
+
+  it("requests expansion without a token cap or raw source messages", async () => {
+    mocks.expand.mockClear();
+    await invoke(createExpandHandler(config), { nodeId: "n", cwd: "/ok" });
+    expect(mocks.expand).toHaveBeenCalledTimes(1);
+    expect(mocks.expand.mock.calls[0][0]).toEqual({ summaryIds: ["n"], maxDepth: 1 });
   });
 
   it("preserves adjacent nested file URL schemes in describe wire errors", async () => {

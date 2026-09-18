@@ -85,6 +85,67 @@ describe("NinjaRenderer session-terminal output contract", () => {
     }
   });
 
+  it.each([
+    ["native TTY screen state", { isTTY: true, verbose: false }],
+    ["verbose TTY", { isTTY: true, verbose: true }],
+    ["non-TTY", { isTTY: false, verbose: false }],
+  ] as const)(
+    "keeps every later item line independent of the historical failure total in %s",
+    (_mode, renderMode) => {
+      const state = makeProgressState({ total: 5 });
+      const renderer = new NinjaRenderer({
+        state,
+        renderOpts: opts(renderMode),
+        output: fakeOutput(),
+      });
+      renderer.start();
+
+      // A discovery failure, which is the invocation-wide history the later
+      // item lines must not repeat.
+      renderer.handleEvent({
+        type: "phase-failure",
+        phase: "Compact",
+        project: "/broken",
+        message: "daemon unavailable",
+      });
+      writes.length = 0;
+
+      const outcomes: readonly CompactItemOutcome[] = ["done", "unchanged", "skipped", "dry-run"];
+      let conversationId = 1;
+      for (const outcome of outcomes) {
+        const identity = { project: "/project", sessionId: "session-" + outcome, conversationId };
+        renderer.handleEvent({ type: "session-start", identity, messages: 3, tokens: 30, startedAt: NOW.getTime() });
+        renderer.handleEvent({
+          type: "session-terminal",
+          identity,
+          outcome,
+          messages: 3,
+          tokensBefore: 30,
+          elapsed: 1,
+        });
+        conversationId += 1;
+      }
+      renderer.stop();
+
+      // Normalize the screen control sequences a live TTY frame interleaves
+      // with its append-only lines, then read the lines an operator sees.
+      const plain = writes.join("").replace(/\u001b\[[0-9;]*[A-Za-z]/gu, "");
+      const itemLines = plain
+        .split(/[\r\n]/u)
+        .filter(line => outcomes.some(outcome => line.trim().startsWith(outcome)));
+
+      expect(itemLines).toEqual([
+        "  done /project · session-done · conversation 1",
+        "  unchanged /project · session-unchanged · conversation 2",
+        "  skipped /project · session-skipped · conversation 3",
+        "  dry-run /project · session-dry-run · conversation 4",
+      ]);
+      // The cumulative total stays in its own field rather than on item lines.
+      expect(state.phaseErrors).toHaveLength(1);
+      expect(renderFrame(state, opts({ isTTY: true }), 0)).toContain("failure total 1");
+    },
+  );
+
   it("keeps the cumulative failure total in the failure event, the live header, and the final summary", () => {
     const state = makeProgressState({ total: 2 });
     const renderer = new NinjaRenderer({ state, renderOpts: opts(), output: fakeOutput() });
