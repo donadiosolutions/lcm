@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrationWitnessSha256 } from "../../src/migration/activation-witness.js";
 import * as coordination from "../../src/storage/postgresql/coordination.js";
 import * as searchConfiguration from "../../src/storage/postgresql/search-configuration.js";
@@ -13,6 +13,10 @@ import * as runtimeReadiness from "../../src/storage/postgresql/runtime-readines
 import { PORTABLE_RECORD_DOMAIN_ORDER, canonicalJson, type PortableDomain } from "../../src/storage/portable-record.js";
 import type { PortableCheckpoint } from "../../src/storage/portable-record-stream.js";
 import type { StorageIdentityContext } from "../../src/storage/contracts.js";
+import {
+  beginMigrationEffect, completeMigrationEffect, createMigrationManifest,
+  type MigrationCheckpoint, type MigrationManifest,
+} from "../../src/migration/protocol.js";
 import {
   MigrationVerificationDriverError,
   assertPermanentReadOnlyGuard,
@@ -57,6 +61,88 @@ function defaultLedgerCheckpoint(domain: PortableDomain): {
     sourceCheckpointSha256: fakeHash("ledger-checkpoint-" + domain), destinationCommitSha256: fakeHash("ledger-commit-" + domain),
   };
 }
+
+const MANIFEST_FIXTURE_GENERATION_ID = "generation-1";
+const MANIFEST_FIXTURE_AT = "2026-01-01T00:00:00.000Z";
+const MANIFEST_FIXTURE_SOURCE_WITNESS = {
+  version: 1 as const, backend: "sqlite" as const, identitySha256: HASH_A,
+  schemaSha256: HASH_A, contentSha256: HASH_A, capturedAt: MANIFEST_FIXTURE_AT,
+};
+const MANIFEST_FIXTURE_DESTINATION_WITNESS = { ...MANIFEST_FIXTURE_SOURCE_WITNESS, backend: "postgresql" as const };
+
+/**
+ * A manifest at phase "copied" with the given checkpoints, built by
+ * driving the real protocol.ts state machine (beginMigrationEffect /
+ * completeMigrationEffect / createMigrationManifest) rather than a
+ * hand-rolled object shape. Steps 9-11 in verify-generation.ts call the
+ * same real functions against whatever MigrationManifestStore.read()
+ * returns, so a fixture that skipped this machinery would let a shape bug
+ * pass silently instead of failing parseMigrationManifest's validation
+ * the way a real store-backed manifest would.
+ */
+function buildCopiedManifestFixture(checkpoints: readonly MigrationCheckpoint[]): MigrationManifest {
+  let manifest = createMigrationManifest({
+    generationId: MANIFEST_FIXTURE_GENERATION_ID, source: MANIFEST_FIXTURE_SOURCE_WITNESS,
+    destination: MANIFEST_FIXTURE_DESTINATION_WITNESS, parentGenerationId: null,
+    preservedSourceGenerationId: MANIFEST_FIXTURE_GENERATION_ID, createdAt: MANIFEST_FIXTURE_AT,
+  });
+  manifest = beginMigrationEffect(manifest, {
+    kind: "verify-dry-run", effectId: "fixture-dryrun", inputSha256: HASH_A, startedAt: MANIFEST_FIXTURE_AT,
+  });
+  manifest = completeMigrationEffect(manifest, {
+    effectId: "fixture-dryrun", completedAt: MANIFEST_FIXTURE_AT,
+    report: { kind: "dry-run", reportId: "fixture-dryrun-report", reportSha256: HASH_A, createdAt: MANIFEST_FIXTURE_AT },
+  });
+  for (const [index, checkpoint] of checkpoints.entries()) {
+    const effectId = `fixture-batch-${index}`;
+    manifest = beginMigrationEffect(manifest, {
+      kind: "copy-batch", effectId, inputSha256: HASH_A, startedAt: MANIFEST_FIXTURE_AT,
+    });
+    manifest = completeMigrationEffect(manifest, { effectId, completedAt: MANIFEST_FIXTURE_AT, checkpoint });
+  }
+  manifest = beginMigrationEffect(manifest, {
+    kind: "complete-copy", effectId: "fixture-complete-copy", inputSha256: HASH_A, startedAt: MANIFEST_FIXTURE_AT,
+  });
+  manifest = completeMigrationEffect(manifest, { effectId: "fixture-complete-copy", completedAt: MANIFEST_FIXTURE_AT });
+  return manifest;
+}
+
+const DEFAULT_MANIFEST_CHECKPOINTS = PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain));
+
+/**
+ * Replaces MigrationManifestStore with an in-memory fake backed by a
+ * mutable manifest advanced through the real state machine above. read()
+ * and update() behave like the real store's checksum-based compare-and-
+ * swap: an update() against a stale checksum throws, exactly like
+ * MigrationManifestStore.update() does. Returns an accessor so a test can
+ * inspect the manifest's final phase/pendingEffect/activationEligible.
+ */
+function fakeManifestStore(checkpoints: readonly MigrationCheckpoint[] = DEFAULT_MANIFEST_CHECKPOINTS): { current: MigrationManifest } {
+  let current = buildCopiedManifestFixture(checkpoints);
+  vi.spyOn(manifestStoreModule, "MigrationManifestStore").mockImplementation(function () {
+    return {
+      read: vi.fn(() => current),
+      update: vi.fn((_generationId: string, expectedChecksumSha256: string, reduce: (manifest: MigrationManifest) => MigrationManifest) => {
+        if (current.checksumSha256 !== expectedChecksumSha256) {
+          throw new Error("migration manifest update is stale");
+        }
+        current = reduce(current);
+        return current;
+      }),
+    } as never;
+  });
+  return {
+    get current() { return current; },
+    set current(value: MigrationManifest) { current = value; },
+  };
+}
+
+/** Every test in this file reaches verifyMigrationGeneration's resume
+ * check before anything else, so every test needs a working manifest
+ * mock even if it never calls stubDestinationPrimitives() itself. A test
+ * that wants specific checkpoints or a specific pending-effect state
+ * calls fakeManifestStore() again to override this default. */
+beforeEach(() => { fakeManifestStore(); });
 const projectId = "01990000-0000-7000-8000-000000000001";
 const machineId = "01990000-0000-7000-8000-000000000002";
 const timestamp = "2026-09-06T12:34:56.123456Z";
@@ -255,9 +341,7 @@ function stubDestinationPrimitives(options: {
   } as never);
   const manifestCheckpoints = options.manifestCheckpoints
     ?? PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain));
-  vi.spyOn(manifestStoreModule, "MigrationManifestStore").mockImplementation(function () { return ({
-    read: vi.fn(() => ({ checkpoints: manifestCheckpoints })),
-  } as never); });
+  const manifest = fakeManifestStore(manifestCheckpoints);
   const defaultReadDomainPage = () => ({ predecessor: null, records: [], complete: true });
   vi.spyOn(portableSource, "createPostgreSqlPortableSource").mockResolvedValue({
     close: vi.fn(async () => { /* fake */ }),
@@ -268,6 +352,7 @@ function stubDestinationPrimitives(options: {
     terminalIdentitySha256: PORTABLE_RECORD_DOMAIN_ORDER.indexOf(domain) === 0 ? null : HASH_A,
   });
   vi.spyOn(portableSource, "readPostgreSqlPortableSourceDomainCensus").mockImplementation(((_source: unknown, domain: PortableDomain) => (options.domainCensus ?? defaultCensus)(domain)) as never);
+  return manifest;
 }
 
 function dependenciesFor(copySource: ReturnType<typeof fakeCopySource>, runtime: ReturnType<typeof fakeRuntime>, extra: Partial<VerifyMigrationGenerationDependencies> = {}): VerifyMigrationGenerationDependencies {
@@ -823,9 +908,7 @@ describe("verifyMigrationGeneration", () => {
     vi.spyOn(portableDestination, "probePostgreSqlPortableDestination").mockResolvedValue({
       destinationWitnessSha256: HASH_A, identityFingerprintSha256: HASH_A, nonIdentityDomainsEmpty: true, existingRun: null,
     } as never);
-    vi.spyOn(manifestStoreModule, "MigrationManifestStore").mockImplementation(function () { return ({
-      read: vi.fn(() => ({ checkpoints: PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain)) })),
-    } as never); });
+    fakeManifestStore();
     const copySource = fakeCopySource();
     const runtime = fakeRuntime();
     const dependencies = dependenciesFor(copySource, runtime);
@@ -953,6 +1036,119 @@ describe("verifyMigrationGeneration", () => {
         poolMax: 1, connectionTimeoutMs: 200, idleTimeoutMs: 200, statementTimeoutMs: 200,
       },
     }))).rejects.toThrow();
+  }, 15000);
+
+  it("steps 10-11: begins and completes the manifest effect for a genuinely eligible report", async () => {
+    const manifest = stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts });
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-begin-complete" }), dependencies);
+    expect(result.outcome).toBe("clean");
+    expect(result.report.activationEligible).toBe(true);
+    // The manifest actually advanced through the real protocol state
+    // machine: phase "copied" -> "verified", the pending effect closed,
+    // and the verification report reference appended -- not merely a
+    // driver-local flag.
+    expect(manifest.current.phase).toBe("verified");
+    expect(manifest.current.activationEligible).toBe(true);
+    expect(manifest.current.pendingEffect).toBe(null);
+    // The fixture manifest already carries one "dry-run" report from
+    // buildCopiedManifestFixture's own setup; this asserts the new
+    // verification report reference was appended alongside it, not that
+    // it replaced it.
+    expect(manifest.current.reports).toHaveLength(2);
+    expect(manifest.current.reports).toContainEqual(
+      { kind: "verification", reportId: result.report.reportId, reportSha256: result.report.reportSha256, createdAt: expect.any(String) },
+    );
+  }, 15000);
+
+  it("does not begin an effect for an ineligible report: persisted evidence only, no pending effect", async () => {
+    // The "operator evidence" path: a badly diverged destination still
+    // gets a persisted report, but plan-v4's steps 10-11 never run for
+    // it, so the manifest is untouched and a resumed call cannot wedge
+    // on an effect that was never begun.
+    const manifest = stubDestinationPrimitives({
+      domainCensus: (domain) => ({ domain, recordCount: 99, prefixSha256: fakeHash(`wrong-${domain}`), terminalIdentitySha256: HASH_A }),
+    });
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => [domain, 1])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts });
+    const runtime = fakeRuntime({ session: fakeSession({ ledgerIdentityTotal: 99 * PORTABLE_RECORD_DOMAIN_ORDER.length }) });
+    const dependencies = dependenciesFor(copySource, runtime);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-ineligible-no-begin" }), dependencies);
+    expect(result.outcome).toBe("mismatches");
+    expect(result.report.activationEligible).toBe(false);
+    expect(manifest.current.phase).toBe("copied");
+    expect(manifest.current.pendingEffect).toBe(null);
+    // Only the fixture's own pre-existing dry-run report: no verification
+    // report reference was ever appended for this ineligible attempt.
+    expect(manifest.current.reports).toHaveLength(1);
+    expect(manifest.current.reports.every((report) => report.kind !== "verification")).toBe(true);
+  }, 15000);
+
+  it("a pending verify-generation effect resumes by completing the persisted report, without ever reopening the source -- proving both no recomputation and no wedge under destination drift", async () => {
+    const homeDir = "/tmp/lcm-verify-resume-no-recompute";
+    const manifest = stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const firstResult = await verifyMigrationGeneration(
+      baseInput({ homeDir }), dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime()),
+    );
+    expect(firstResult.outcome).toBe("clean");
+    expect(manifest.current.phase).toBe("verified");
+
+    // Simulate a crash that landed exactly between begin and complete: a
+    // fresh manifest, still at "copied", with the same effect begun but
+    // never completed. This attempt's own evidence -- the persisted
+    // report bytes -- is already on disk from the run above, under the
+    // same reportSha256, since persist always precedes begin.
+    const resumeManifestStore = fakeManifestStore();
+    resumeManifestStore.current = beginMigrationEffect(resumeManifestStore.current, {
+      kind: "verify-generation", effectId: firstResult.effectId, inputSha256: firstResult.inputSha256,
+      startedAt: MANIFEST_FIXTURE_AT,
+    });
+    // Also simulate the destination having drifted since begin: if the
+    // resumed attempt recomputed the census at all, this would produce a
+    // different, non-eligible report. The openSource spy below proves it
+    // is never even called, so the drift below is never actually read --
+    // that is the point.
+    const driftedCensus = (domain: PortableDomain) => ({
+      domain, recordCount: 999, prefixSha256: fakeHash(`drifted-${domain}`), terminalIdentitySha256: HASH_A,
+    });
+    vi.spyOn(portableSource, "readPostgreSqlPortableSourceDomainCensus").mockImplementation(((_source: unknown, domain: PortableDomain) => driftedCensus(domain)) as never);
+    const openSourceSpy = vi.fn(async () => { throw new Error("resume must not reopen the source"); });
+    const createRuntimeSpy = vi.fn(() => { throw new Error("resume must not open a fresh runtime"); });
+    const resumedResult = await verifyMigrationGeneration(baseInput({ homeDir }), {
+      openSource: openSourceSpy as never, createRuntime: createRuntimeSpy as never,
+      verifyTransferSchema: vi.fn(async () => { throw new Error("resume must not re-verify the transfer schema"); }) as never,
+    });
+    expect(openSourceSpy).not.toHaveBeenCalled();
+    expect(createRuntimeSpy).not.toHaveBeenCalled();
+    expect(resumedResult.report).toEqual(firstResult.report);
+    expect(resumedResult.effectId).toBe(firstResult.effectId);
+    expect(resumedResult.inputSha256).toBe(firstResult.inputSha256);
+    // Terminal state reached despite the drift: no wedge.
+    expect(resumeManifestStore.current.phase).toBe("verified");
+    expect(resumeManifestStore.current.pendingEffect).toBe(null);
+  }, 15000);
+
+  it("refuses when a different effect is already pending for the generation, rather than silently adopting it", async () => {
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const manifest = stubDestinationPrimitives();
+    // "abort" is the only other effect legal from phase "copied" besides
+    // "verify-generation" -- begin it without completing, simulating a
+    // concurrent operator-initiated abort racing this verification pass.
+    // This attempt's own report computation still runs to completion
+    // (the destination fixture is sound), but begin() must see the
+    // mismatched pending effect and refuse rather than adopt it.
+    manifest.current = beginMigrationEffect(manifest.current, {
+      kind: "abort", effectId: "concurrent-abort", inputSha256: HASH_A, startedAt: MANIFEST_FIXTURE_AT,
+    });
+    const copySource = fakeCopySource({ recordCounts });
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    await expect(verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-conflicting-pending-effect" }), dependencies))
+      .rejects.toMatchObject({ reason: "report-identity-conflict" });
   }, 15000);
 });
 

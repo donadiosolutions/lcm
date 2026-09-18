@@ -23,7 +23,7 @@ import type {
 import { aggregateContentSha256 } from "../storage/portable-record-stream.js";
 import { openMigrationCopySource, type MigrationCopySourceInput } from "./copy-source.js";
 import { MigrationManifestStore } from "./manifest-store.js";
-import type { MigrationCheckpoint } from "./protocol.js";
+import { beginMigrationEffect, completeMigrationEffect, type MigrationCheckpoint } from "./protocol.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import {
   migrationWitnessSha256,
@@ -69,15 +69,18 @@ function buildClassCoverageVector(): MigrationClassCoverageVector {
  * The #624 verification driver: plan-v4.md section 2's frozen ordering.
  *
  * Scope note, stated plainly rather than left implicit: this pass reconciles
- * counts, the census, the canonical delta, and the destination schema
- * witness (migrations/search-configuration/collation/sequence-state)
- * end-to-end against a live PostgreSQL destination. It records but does not
- * yet independently reconcile foreign-key closure, summary-parent-links
- * acyclicity, native-transcript-message-links and project-aliases set
- * equality, ordinal contiguity/seq monotonicity, or the ledger; the "public
- * reads" step runs a representative ordered-listing probe rather than every
- * repository read path. These are flagged to the owner as a stated scope
- * reduction for this pass, not silently assumed complete.
+ * counts, the census, the canonical delta, the destination schema witness
+ * (migrations/search-configuration/collation/sequence-state), destination
+ * identity, foreign-key edge-set equality plus a dangling-reference guard
+ * (the `relation` class), and the transfer ledger's run/batch/identity
+ * state (the `ledger` class) end-to-end against a live PostgreSQL
+ * destination. It does not yet independently reconcile summary-parent-links
+ * acyclicity or ordinal contiguity/seq monotonicity as their own checks
+ * (edge-set equality catches a wrong parent, but not a structurally cyclic
+ * or gapped chain of otherwise-correct edges); the "public reads" step runs
+ * a representative ordered-listing probe rather than every repository read
+ * path. These are flagged to the owner as a stated scope reduction for this
+ * pass, not silently assumed complete.
  */
 
 export type MigrationVerificationDriverReason =
@@ -905,12 +908,12 @@ export interface VerifyMigrationGenerationResult {
   /**
    * Pinned per plan-v4 step 10 (previously left asserted rather than
    * named): deterministic functions of the persisted report identity,
-   * never a live observation. This driver does not itself call
-   * beginMigrationEffect/completeMigrationEffect (that manifest-effect
-   * wiring is a separate, not-yet-built caller), but pinning the formula
-   * here means that caller has no choice to make, and two independent
-   * drivers over an identical persisted report mint the same effectId --
-   * the property the concurrent-begin adoption rule needs.
+   * never a live observation. This driver calls
+   * beginMigrationEffect/completeMigrationEffect itself (steps 10-11)
+   * once the persisted report is activationEligible, and pinning the
+   * formula means two independent drivers over an identical persisted
+   * report mint the same effectId -- the property the idempotent-begin
+   * adoption rule below needs.
    */
   readonly effectId: string;
   readonly inputSha256: string;
@@ -926,11 +929,48 @@ export function migrationVerificationEffectId(reportSha256: string): string {
  * internally: a connection loss or any other failure propagates to the
  * caller, and restarting means calling this function again from scratch.
  * Nothing is persisted until the fully-formed report is ready to write.
+ *
+ * Steps 9-11 (persist, begin, complete) run in that fixed order: nothing
+ * is begun until it is durably persisted, and begin always precedes
+ * complete, so a resumed attempt can tell exactly how far a prior attempt
+ * got from the manifest and the report store alone. If a verify-generation
+ * effect is already pending when this function starts, that can only be
+ * because an earlier attempt already persisted and began it -- the report
+ * is already frozen, content-addressed evidence -- so this attempt reads
+ * that report back and completes with it directly, without repeating any
+ * of the expensive destination work below. This is what makes a crash
+ * between begin and complete resumable without recomputation, and what
+ * makes destination drift after begin harmless: this path never reopens
+ * the destination at all.
  */
 export async function verifyMigrationGeneration(
   input: VerifyMigrationGenerationInput,
   dependencies: VerifyMigrationGenerationDependencies = defaultDependencies,
 ): Promise<VerifyMigrationGenerationResult> {
+  const manifestStore = new MigrationManifestStore({ homeDir: input.homeDir });
+  const reportStore = new MigrationVerificationReportStore({ homeDir: input.homeDir });
+  const resumeManifest = manifestStore.read(input.generationId);
+  if (resumeManifest.pendingEffect !== null && resumeManifest.pendingEffect.kind === "verify-generation") {
+    const pending = resumeManifest.pendingEffect;
+    const persistedReport = reportStore.read(input.generationId, pending.inputSha256);
+    const completedAt = new Date().toISOString();
+    manifestStore.update(input.generationId, resumeManifest.checksumSha256, (current) => completeMigrationEffect(current, {
+      effectId: pending.effectId, completedAt, activationEligible: true,
+      report: {
+        kind: "verification", reportId: persistedReport.reportId,
+        reportSha256: persistedReport.reportSha256, createdAt: completedAt,
+      },
+    }));
+    return {
+      // The resume path is only reachable for an effect this driver's own
+      // begin() previously started, which only ever happens for a report
+      // that was already eligible (clean and fully covered): "mismatches"
+      // is not a reachable outcome for a resumed completion, and writing
+      // a ternary here would be an untested, unreachable branch.
+      report: persistedReport, outcome: "clean",
+      effectId: pending.effectId, inputSha256: pending.inputSha256,
+    };
+  }
   const copySource = await dependencies.openSource({
     generationId: input.generationId, homeDir: input.homeDir, expectedIdentity: input.expectedIdentity,
     scratchParent: input.scratchParent, signal: input.signal,
@@ -1059,11 +1099,50 @@ export async function verifyMigrationGeneration(
       const report = createMigrationVerificationReport(reportInput);
       const store = new MigrationVerificationReportStore({ homeDir: input.homeDir });
       const persisted = store.persist(input.generationId, report);
-      return {
+      const result: VerifyMigrationGenerationResult = {
         report: persisted.report, outcome: persisted.report.clean ? "clean" : "mismatches",
         effectId: migrationVerificationEffectId(persisted.report.reportSha256),
         inputSha256: persisted.report.reportSha256,
       };
+      // Steps 10-11: begin and complete the manifest effect, but only for
+      // a genuinely eligible report. An ineligible report -- clean but
+      // missing coverage, or carrying a mismatch -- stops here: it is
+      // persisted in full as operator evidence, but no effect is ever
+      // begun for it, so it can never wedge activation on a bad reading.
+      if (persisted.report.activationEligible) {
+        let effectManifest = manifestStore.read(input.generationId);
+        if (effectManifest.pendingEffect === null) {
+          effectManifest = manifestStore.update(input.generationId, effectManifest.checksumSha256, (current) => beginMigrationEffect(current, {
+            kind: "verify-generation", effectId: result.effectId, inputSha256: result.inputSha256,
+            startedAt: new Date().toISOString(),
+          }));
+        } else {
+          // Any pending effect reached here cannot be kind
+          // "verify-generation": the resume shortcut at the top of this
+          // function already intercepts that case unconditionally, before
+          // any of the expensive work above ever runs. So a pending
+          // effect surviving to here is necessarily a different, genuinely
+          // conflicting effect (for example a concurrent abort) -- refuse
+          // rather than silently reusing or overwriting it.
+          driverError("report-identity-conflict", "a different migration effect is already pending for this generation");
+        }
+        // The idempotent-adoption case -- another attempt already began
+        // this exact effect -- never reaches here: it is intercepted by
+        // the resume shortcut at the top of this function instead, before
+        // any of this attempt's own (redundant) recomputation above ever
+        // ran. So by the time control reaches this point, either this
+        // attempt itself just began the effect above, or the `else`
+        // branch already refused.
+        const completedAt = new Date().toISOString();
+        manifestStore.update(input.generationId, effectManifest.checksumSha256, (current) => completeMigrationEffect(current, {
+          effectId: result.effectId, completedAt, activationEligible: true,
+          report: {
+            kind: "verification", reportId: persisted.report.reportId,
+            reportSha256: persisted.report.reportSha256, createdAt: completedAt,
+          },
+        }));
+      }
+      return result;
     } finally {
       await coordinator.releaseLease({ ...resource, fencingToken: lease.fencingToken }).catch(() => undefined);
     }
