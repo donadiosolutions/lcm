@@ -267,6 +267,53 @@ export function authenticatedDescriptorEntries(
   }
 }
 
+/** Identity, target, and kind of one retained descriptor in the namespace. */
+export type RetainedDescriptorIdentity = Readonly<{
+  fd: number;
+  link: string;
+  dev: bigint;
+  ino: bigint;
+  isFile: boolean;
+}>;
+
+function isClosedDescriptorError(error: unknown): boolean {
+  return ["ENOENT", "EBADF"].includes(errorCode(error) ?? "");
+}
+
+/**
+ * Enumerate every retained descriptor with its namespace link target, identity,
+ * and kind. Descriptors closed during enumeration are skipped: a descriptor
+ * that no longer exists cannot be one a caller authenticates.
+ */
+export function retainedDescriptorIdentities(
+  operations: Partial<DescriptorCapabilityOperations> = {},
+): readonly RetainedDescriptorIdentity[] {
+  const ops = { ...DEFAULT_DESCRIPTOR_CAPABILITY_OPERATIONS, ...operations };
+  const identities: RetainedDescriptorIdentity[] = [];
+  for (const entry of authenticatedDescriptorEntries(ops)) {
+    const fd = Number(entry);
+    if (!Number.isSafeInteger(fd) || fd < 0) continue;
+    const descriptorPath = `${DESCRIPTOR_NAMESPACE}/${entry}`;
+    let link: string;
+    let stat: BigIntDirectoryStat;
+    try {
+      link = ops.readlink(descriptorPath);
+      stat = ops.stat(descriptorPath);
+    } catch (error) {
+      if (isClosedDescriptorError(error)) continue;
+      throw error;
+    }
+    identities.push({
+      fd,
+      link,
+      dev: stat.dev,
+      ino: stat.ino,
+      isFile: (stat.mode & 0o170000n) === 0o100000n,
+    });
+  }
+  return identities;
+}
+
 /**
  * Prove that the descriptor namespace resolves a retained directory descriptor.
  * The literal descendant `/.` is required to prove directory traversal support.

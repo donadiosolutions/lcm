@@ -26,7 +26,11 @@ import {
   PRIVATE_FILE_MODE,
   requireSupportedProcessUid,
   retainedDirectoryDescriptorPath,
+  retainedDescriptorIdentities,
+  UnsupportedPlatformCapabilityError,
+  type DescriptorCapabilityOperations,
   type PrivateDirectoryHandle,
+  type RetainedDescriptorIdentity,
 } from "../security-files.js";
 import {
   admitDatabaseParent,
@@ -183,6 +187,8 @@ export function inspectExistingLcmDatabasePath(dbPath: string): DatabaseFileIden
 export type LcmConnectionOptions = Readonly<{
   /** @internal Deterministic database-parent admission seams for tests. */
   _databaseParentForTesting?: DatabaseParentTestingOptions;
+  /** @internal Deterministic descriptor-capability seams for tests. */
+  _descriptorsForTesting?: Partial<DescriptorCapabilityOperations>;
 }>;
 
 export type ExistingLcmConnectionOptions = LcmConnectionOptions & Readonly<{
@@ -191,6 +197,85 @@ export type ExistingLcmConnectionOptions = LcmConnectionOptions & Readonly<{
   /** Safely repair the authenticated existing parent to mode 0700. */
   tightenDatabaseParent?: boolean;
 }>;
+
+/** Stable diagnostic for a handle that is not provably the authenticated file. */
+const DATABASE_HANDLE_BINDING_ERROR =
+  "database handle is not bound to the authenticated database file";
+
+type RetainedDescriptorSnapshot = ReadonlyMap<number, RetainedDescriptorIdentity>;
+
+/** Every retained descriptor with its target and identity, or null off Linux. */
+function retainedDescriptorSnapshot(
+  operations: Partial<DescriptorCapabilityOperations> | undefined,
+): RetainedDescriptorSnapshot | null {
+  try {
+    return new Map(retainedDescriptorIdentities(operations ?? {})
+      .map(descriptor => [descriptor.fd, descriptor]));
+  } catch (error) {
+    if (error instanceof UnsupportedPlatformCapabilityError) return null;
+    throw error;
+  }
+}
+
+/**
+ * Prove the opened handle retained the authenticated inode. Substituting the
+ * leaf for the constructor call and restoring it before the post-open check
+ * leaves both pathname observations intact, so the descriptor the open actually
+ * retained is the only admissible evidence. Platforms without an authenticated
+ * descriptor namespace cannot offer this guarantee and keep pathname evidence.
+ *
+ * SQLite can satisfy an open from a descriptor it already retains for the same
+ * inode, so demanding a newly added descriptor would refuse ordinary opens.
+ * Admission therefore requires every descriptor naming the database to hold the
+ * authenticated identity, at least one such descriptor to exist, and the open to
+ * have left the process holding no regular file that is neither the database nor
+ * its authenticated inode. A restored substitution always leaves exactly that
+ * descriptor behind, wherever the substituted file is parked.
+ *
+ * A descriptor number alone proves nothing about provenance: a number that was
+ * live before the open can be closed and reused by it. A descriptor therefore
+ * counts as retained by this open whenever its number is new or its target or
+ * identity differs from what that number held before.
+ *
+ * The evidence deliberately says nothing about which descriptor SQLite itself
+ * holds, because nothing observable does. A descriptor naming the database can
+ * be opened by unrelated work in the same process, so treating one as proof
+ * would let a concurrent reopen bless a handle bound elsewhere. The cost is a
+ * fail-closed refusal when unrelated work opens another regular file or
+ * recycles a descriptor while the constructor runs; that refusal is intended,
+ * and a caller may retry the open once that work finishes.
+ */
+function assertOpenedDatabaseIdentity(
+  path: string,
+  openedIdentity: DatabaseFileIdentity,
+  beforeOpen: RetainedDescriptorSnapshot | null,
+  operations: Partial<DescriptorCapabilityOperations> | undefined,
+): void {
+  if (beforeOpen === null) return;
+  const afterOpen = retainedDescriptorSnapshot(operations);
+  if (afterOpen === null) throw new Error(DATABASE_HANDLE_BINDING_ERROR);
+  const expectedDevice = BigInt(openedIdentity.device);
+  const expectedInode = BigInt(openedIdentity.inode);
+  let boundToDatabase = false;
+  let retainedForeignFile = false;
+  for (const descriptor of afterOpen.values()) {
+    const authentic = descriptor.dev === expectedDevice && descriptor.ino === expectedInode;
+    const previous = beforeOpen.get(descriptor.fd);
+    const recycled = previous !== undefined
+      && (previous.link !== descriptor.link
+        || previous.dev !== descriptor.dev
+        || previous.ino !== descriptor.ino);
+    if (descriptor.link === path) {
+      if (!authentic) throw new Error(DATABASE_HANDLE_BINDING_ERROR);
+      boundToDatabase = true;
+      continue;
+    }
+    if ((previous === undefined || recycled) && descriptor.isFile && !authentic) {
+      retainedForeignFile = true;
+    }
+  }
+  if (!boundToDatabase || retainedForeignFile) throw new Error(DATABASE_HANDLE_BINDING_ERROR);
+}
 
 function openLcmConnection(
   dbPath: string,
@@ -281,6 +366,10 @@ function openLcmConnection(
 
     // SQLite's URI mode=rw opens an existing database read/write but atomically
     // refuses to create it if another process removes it after the lstat above.
+    // The authenticated leaf never resolves through a leaf symlink, so the
+    // admitted parent's resolved path names the same file the open will use.
+    const resolvedPath = join(realpathSync.native(dirname(dbPath)), basename(dbPath));
+    const descriptorsBeforeOpen = retainedDescriptorSnapshot(options._descriptorsForTesting);
     const location = createIfMissing
       ? dbPath
       : (() => {
@@ -301,6 +390,12 @@ function openLcmConnection(
     if (expectedIdentity && !sameDatabaseFileIdentity(expectedIdentity, openedIdentity)) {
       throw new Error("database path changed while opening");
     }
+    assertOpenedDatabaseIdentity(
+      resolvedPath,
+      openedIdentity,
+      descriptorsBeforeOpen,
+      options._descriptorsForTesting,
+    );
     chmodSync(dbPath, PRIVATE_FILE_MODE);
     // Enable WAL mode for better concurrent read performance
     parent.assertCurrent();

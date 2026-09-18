@@ -1774,6 +1774,30 @@ open, permission, initialization, and pooling boundaries; these checks are not
 a kernel-atomic guarantee against another process substituting a path through
 a writable ancestor between system calls.
 
+On Linux, LCM additionally checks which inode the handle actually retained,
+using the `/proc/self/fd` descriptor namespace. Every descriptor that names the
+database must hold the authenticated identity, at least one such descriptor must
+exist, and the open must not have left the process holding any other regular
+file that is neither the database nor its authenticated inode. Replacing the
+database leaf for the constructor call and restoring it before the post-open
+path check always leaves such a descriptor behind, wherever the substituted file
+is parked, including under a name such as the rollback journal, so it is refused
+before LCM changes permissions, initializes pragmas, or pools the handle.
+SQLite can satisfy an open from a descriptor it already holds for the same
+inode, so LCM does not require the open to add one. A descriptor counts as
+retained by the open when its number is new or when a number the process
+already held now refers to a different target or inode, so reusing a freed
+descriptor number does not hide a substituted file.
+
+These rules describe what the process holds rather than which descriptor SQLite
+uses, because nothing observable identifies that descriptor. An uncached open
+can therefore be refused when unrelated work in the same process opens another
+regular file or recycles a descriptor while SQLite is opening the database.
+That refusal is deliberate, and retrying the open once that work finishes
+resolves it; LCM does not retry on its own. Platforms without the descriptor
+namespace keep the pathname evidence described above and do not gain this
+guarantee.
+
 Database paths retain normal filesystem semantics when an ancestor alias is
 followed by `..`: LCM authenticates and opens the directory reached by the
 kernel. Existing-only SQLite URI opens first resolve the admitted database leaf
