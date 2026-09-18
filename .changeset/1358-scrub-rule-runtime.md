@@ -3,8 +3,7 @@
 ---
 
 Stop bundled Gitleaks detectors from monopolizing the daemon during native
-transcript backfill. Five imported rules carried a redundant nested lazy prefix
-over the same character class, costing about 25x more per rule than the
-equivalent single prefix and together 70% of the whole scan, and every
-secret-free string was scrubbed a second time to verify no residual secret
-remained.
+transcript backfill. Imported patterns collapse redundant nested lazy prefixes,
+and structurally verified required keywords now skip rules that cannot match the
+current text. Rules without a mechanical proof continue scanning in full.
+Secret-free strings also avoid a redundant residual scrub pass.

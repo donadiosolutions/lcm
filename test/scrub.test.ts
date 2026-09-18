@@ -5,6 +5,7 @@ import {
   ScrubEngine,
 } from "../src/scrub.js";
 import { GITLEAKS_PATTERNS } from "../src/generated-patterns.js";
+import { analyzeRequiredKeywords, createRegexWitness } from "../scripts/update-gitleaks-patterns.js";
 
 function compiledGitleaksRule(id: string): RegExp {
   const pattern = GITLEAKS_PATTERNS.find((candidate) => candidate.id === id);
@@ -667,6 +668,111 @@ describe("Gitleaks generated pattern runtime bounds", () => {
     expect(offenders).toEqual([]);
   });
 
+  it("emits only structurally verified prefilters with pinned coverage", () => {
+    const prefiltered = GITLEAKS_PATTERNS.filter((pattern) => pattern.prefilter);
+    const failClosed = GITLEAKS_PATTERNS
+      .filter((pattern) => !pattern.prefilter)
+      .map((pattern) => pattern.id)
+      .sort();
+
+    expect(prefiltered).toHaveLength(216);
+    expect(
+      GITLEAKS_PATTERNS
+        .filter((pattern) => pattern.keywords.length === 0)
+        .map((pattern) => pattern.id),
+    ).toEqual([]);
+    expect(failClosed).toEqual([
+      "airtable-personnal-access-token",
+      "facebook-access-token",
+      "slack-config-access-token",
+      "sourcegraph-access-token",
+    ]);
+    expect(
+      prefiltered
+        .filter((pattern) =>
+          !analyzeRequiredKeywords(
+            pattern.regex,
+            pattern.keywords,
+            pattern.flags,
+          ).verified
+        )
+        .map((pattern) => pattern.id),
+    ).toEqual([]);
+  });
+
+  it("keeps unverified rules unconditional on keyword-absent positives", () => {
+    const samples = new Map<string, string>([
+      [
+        "airtable-personnal-access-token",
+        "pat" + "a".repeat(14) + "." + "a".repeat(64),
+      ],
+      [
+        "facebook-access-token",
+        "0".repeat(15) + "|" + "a".repeat(27) + " ",
+      ],
+      [
+        "slack-config-access-token",
+        "XOXEaXOXB-0-" + "a".repeat(163),
+      ],
+      ["sourcegraph-access-token", "a".repeat(40)],
+    ]);
+    const engine = new ScrubEngine([], []);
+
+    for (const pattern of GITLEAKS_PATTERNS.filter(({ prefilter }) => !prefilter)) {
+      const sample = samples.get(pattern.id);
+      expect(sample, pattern.id).toBeDefined();
+      expect(
+        pattern.keywords.some((keyword) => sample!.toLowerCase().includes(keyword)),
+        pattern.id,
+      ).toBe(false);
+      expect(new RegExp(pattern.regex, pattern.flags).test(sample!), pattern.id)
+        .toBe(true);
+      expect(engine.scrub(sample!), pattern.id).not.toBe(sample);
+    }
+  });
+
+  it("redacts a generated positive for every prefiltered rule", () => {
+    const engine = new ScrubEngine([], []);
+    const failures: string[] = [];
+
+    for (const pattern of GITLEAKS_PATTERNS.filter(({ prefilter }) => prefilter)) {
+      const sample = createRegexWitness(pattern.regex, pattern.flags);
+      const scrubbed = sample === null ? null : engine.scrubWithCounts(sample);
+      if (
+        sample === null
+        || !new RegExp(pattern.regex, pattern.flags).test(sample)
+        || !pattern.keywords.some((keyword) => sample.toLowerCase().includes(keyword))
+        || scrubbed?.text === sample
+        || scrubbed?.gitleaks === 0
+      ) {
+        failures.push(pattern.id);
+      }
+    }
+
+    expect(failures).toEqual([]);
+  });
+
+  it("keeps prefiltered and unconditional engine output byte-identical", () => {
+    const samples = GITLEAKS_PATTERNS.map((pattern) =>
+      createRegexWitness(pattern.regex, pattern.flags)
+    );
+    expect(samples.filter((sample) => sample === null)).toEqual([]);
+
+    const cases = [
+      ...(samples as string[]),
+      "opaque-" + "qz_019".repeat(256),
+      "context contains meraki but no matching secret",
+    ];
+    const prefiltered = new ScrubEngine([], []);
+    const unconditional = new ScrubEngine([], [], {
+      useGitleaksPrefilter: false,
+    });
+
+    for (const [index, sample] of cases.entries()) {
+      expect(prefiltered.scrubWithCounts(sample), "case " + index)
+        .toEqual(unconditional.scrubWithCounts(sample));
+    }
+  });
   it("keeps the previously nested rules detecting their secrets", () => {
     expect("meraki_api_key = 0123456789abcdef0123456789abcdef01234567 ")
       .toMatch(compiledGitleaksRule("cisco-meraki-api-key"));
