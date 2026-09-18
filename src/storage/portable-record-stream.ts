@@ -714,8 +714,13 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
   let callerLimitOrdinal: number | undefined;
   let prefix = prior?.prefixSha256 ?? initialDomainPrefix(manifest.schemaSha256, request.domain);
   let previous = predecessor;
-  let previousIsPredecessor = predecessor !== null;
-  const identities = new Set<string>();
+  // Seeded with the predecessor's identity so a successor that duplicates it is
+  // refused here, matching the official scanner's independent identity check
+  // (scanSourcePage) instead of relying solely on order-regression, which does
+  // not fire when a domain's order carries a field outside its logical key
+  // (for example passive-events' machineSequence) and a successor advances
+  // that field while repeating the predecessor's identity.
+  const identities = new Set<string>(predecessor === null ? [] : [predecessor.identitySha256]);
   for (let index = 0; index < records.length; index += 1) {
     const rawRecord = records[index] as PortableRecord;
     validateDependencyContract(rawRecord, request.domain);
@@ -733,7 +738,22 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
     identities.add(candidate.record.identitySha256);
     if (previous !== null) {
       const comparison = comparePortableOrder(previous.order, candidate.record.order);
-      if (comparison > 0 || (comparison === 0 && previousIsPredecessor)) {
+      // A tie against the predecessor's order cannot reach this point: equal
+      // order implies equal identity for every domain (order equals
+      // logicalKey literally for most domains; for the four where
+      // logicalKey is a field subset of order -- passive-events,
+      // project-aliases, summary-message-links, summary-parent-links --
+      // equal order trivially gives equal logicalKey; for the hash-derived
+      // domains, portable-record.ts enforces the tie itself: the
+      // conversationFingerprint check at portable-record.ts:1724 and the
+      // conversationIdentityFromOrder/messageIdentityFromOrder checks in
+      // messages, message-parts and context-items each call malformed() if
+      // the stored identity hash disagrees with the order that determines
+      // it). So a successor whose order ties the predecessor's also
+      // duplicates its identitySha256, and the identities check above --
+      // seeded with the predecessor's identity -- already refuses it on
+      // this same iteration. Only a strict order regression is checked here.
+      if (comparison > 0) {
         fail("order-regression", { domain: request.domain, ordinal: candidate.record.ordinal });
       }
     }
@@ -753,7 +773,6 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
       }
     }
     previous = candidate.record;
-    previousIsPredecessor = false;
     normalized.push(candidate.record);
   }
   for (let index = 0; index < normalized.length; index += 1) {

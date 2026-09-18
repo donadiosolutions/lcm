@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { expect,it } from 'vitest';
 import { createGeneration,createFixtureSource,postgresGeneration,sqliteUnboundGeneration,LOCAL_PROJECT_IDENTITY } from '../fixtures/portable-records.js';
-import { createPortableRecordStream,createPortableRecord,serializePortableCheckpoint } from '../../src/storage/portable-record-stream.js';
+import { createPortableRecordStream,createPortableRecord,serializePortableCheckpoint,type PortableRecord,type PortableDomain } from '../../src/storage/portable-record-stream.js';
 import { migrationCopyBatchCommitSha256 } from '../../src/migration/batch-copy.js';
 
 it('binds canonical checkpoint UTF8 bytes to the fixed recipe-v1 commit digest',async()=>{
@@ -54,13 +54,78 @@ it('refuses a successor whose identity matches the predecessor, and accepts a le
   const first=await poisonedStream.readBatch({domain:'conversations',maxRecords:1,maxBytes:150994944});
   expect(first.records).toEqual([predecessor]);
   await expect(poisonedStream.readBatch({domain:'conversations',after:first.checkpoint,maxRecords:1,maxBytes:150994944}))
-   .rejects.toMatchObject({code:'order-regression'});
+   .rejects.toMatchObject({code:'duplicate-identity'});
  }finally{await poisonedStream.close();}
 
  const legalStream=await createPortableRecordStream(generation.source);
  try{
   const first=await legalStream.readBatch({domain:'conversations',maxRecords:1,maxBytes:150994944});
   const second=await legalStream.readBatch({domain:'conversations',after:first.checkpoint,maxRecords:1,maxBytes:150994944});
+  expect(second.records).toHaveLength(1);
+  expect(second.records[0]!.identitySha256).not.toBe(first.records[0]!.identitySha256);
+ }finally{await legalStream.close();}
+});
+
+// #623 W6 correction: the conversations test above proves the contract holds
+// for a domain where order-regression happens to catch every identity
+// collision too (its identity is a hash of exactly the fields order does not
+// otherwise cover). It does not generalize. Four domains carry an order field
+// that is genuinely independent of their logicalKey -- passive-events
+// (machineSequence), project-aliases (path), summary-message-links and
+// summary-parent-links (ordinal) -- so a successor can duplicate a
+// predecessor's identity while its order still strictly advances, which
+// used to slip past both the order-regression guard (order did not regress)
+// and the identities Set (empty per batch, never seeded from the
+// predecessor). createPortableBatch now seeds that Set with the
+// predecessor's identity, so every one of these is refused as
+// duplicate-identity, matching the official scanner (scanSourcePage) instead
+// of emitting a stream it rejects. Every other domain was checked against
+// buildRecordShape (src/storage/portable-record.ts) and its order is either
+// identical to its logicalKey or, like conversations, fully determined by
+// the same fields; native-transcript-checkpoints in particular uses the same
+// tuple for both and is not included here because it cannot exhibit this.
+function unwrapTaggedInteger(value: unknown): unknown {
+ return value && typeof value === 'object' && '$integer' in (value as object) ? (value as {$integer:string}).$integer : value;
+}
+function rawValueOf(record: PortableRecord): Record<string, unknown> {
+ return Object.fromEntries(Object.entries(record.value as Record<string, unknown>).map(([key,value])=>[key,unwrapTaggedInteger(value)]));
+}
+const ORDER_OUTSIDE_IDENTITY_CASES: ReadonlyArray<{
+ readonly domain: PortableDomain;
+ readonly context: { readonly projectIdentity: typeof LOCAL_PROJECT_IDENTITY } | null;
+ readonly advance: (raw: Record<string,unknown>) => Record<string,unknown>;
+}> = [
+ { domain:'passive-events', context:{projectIdentity:LOCAL_PROJECT_IDENTITY},
+   advance: raw => ({...raw, machineSequence: String(BigInt(raw.machineSequence as string) + 1000n)}) },
+ { domain:'project-aliases', context:{projectIdentity:LOCAL_PROJECT_IDENTITY},
+   advance: raw => ({...raw, path: `${raw.path as string}/zzz-poisoned`}) },
+ { domain:'summary-message-links', context:null,
+   advance: raw => ({...raw, ordinal: String(BigInt(raw.ordinal as string) + 1000n)}) },
+ { domain:'summary-parent-links', context:null,
+   advance: raw => ({...raw, ordinal: String(BigInt(raw.ordinal as string) + 1000n)}) },
+];
+it.each(ORDER_OUTSIDE_IDENTITY_CASES)('refuses a $domain successor duplicating the predecessor identity while its order advances, and accepts a legal one',async({domain,context,advance})=>{
+ const generation=createGeneration(sqliteUnboundGeneration());
+ const records=generation.records.get(domain)!;
+ const predecessor=records[0]!;
+ const poisonedSuccessor=createPortableRecord({domain,ordinal:1,value:advance(rawValueOf(predecessor)),context} as never);
+ expect(poisonedSuccessor.identitySha256).toBe(predecessor.identitySha256);
+
+ const poisonedSource=createFixtureSource({description:generation.description,records:generation.records,
+  readOverride:input=>(input.domain===domain&&input.afterOrdinal===1&&input.includePredecessor
+   ?{predecessor,records:[poisonedSuccessor],complete:false}:undefined)});
+ const poisonedStream=await createPortableRecordStream(poisonedSource);
+ try{
+  const first=await poisonedStream.readBatch({domain,maxRecords:1,maxBytes:150994944});
+  expect(first.records).toEqual([predecessor]);
+  await expect(poisonedStream.readBatch({domain,after:first.checkpoint,maxRecords:1,maxBytes:150994944}))
+   .rejects.toMatchObject({code:'duplicate-identity'});
+ }finally{await poisonedStream.close();}
+
+ const legalStream=await createPortableRecordStream(generation.source);
+ try{
+  const first=await legalStream.readBatch({domain,maxRecords:1,maxBytes:150994944});
+  const second=await legalStream.readBatch({domain,after:first.checkpoint,maxRecords:1,maxBytes:150994944});
   expect(second.records).toHaveLength(1);
   expect(second.records[0]!.identitySha256).not.toBe(first.records[0]!.identitySha256);
  }finally{await legalStream.close();}
