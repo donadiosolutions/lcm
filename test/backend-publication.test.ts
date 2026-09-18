@@ -26,6 +26,7 @@ import {
   withBackendPublicationAppendBarrier,
   withBackendPublicationAppendBarrierAsync,
   withBackendPublicationRetainedAppendAdmissionAsync,
+  type BackendPublicationLockToken,
   type BackendPublicationDriver,
   type BackendPublicationJournal,
   type BackendMaintenanceJournal,
@@ -5283,6 +5284,190 @@ describe("BackendPublicationCoordinator", () => {
     )).not.toThrow();
   });
 
+});
+
+describe("BackendPublicationCoordinator lockToken seam", () => {
+  // Each pair below proves two independently breakable facts about one call
+  // site this seam edited: (1) a valid retained-barrier token lets the call
+  // skip re-acquiring the publication lock, so it does not self-deadlock
+  // under a held barrier; (2) omitting the token still takes that same lock
+  // exactly as before the amendment, so it contends with its own barrier and
+  // fails with PrivateMutationLockContentionError. If either branch were
+  // wired wrong -- token ignored, or untokened path silently skipping the
+  // lock -- the corresponding assertion goes red on its own.
+
+  it("prepareMaintenanceSelection: accepts a retained barrier token", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const held = await createMaintenanceState(home, fake.driver, "maintenance-held");
+    const active = coordinator(home, fake.driver);
+    const prepared = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.prepareMaintenanceSelection({
+      expectedChecksumSha256: held.checksumSha256,
+      generationId: held.generationId,
+      targetBackend: "postgresql",
+      terminalEvidenceSha256: "c".repeat(64),
+    }, token));
+    expect(prepared.phase).toBe("selection-prepared");
+  });
+
+  it("prepareMaintenanceSelection: still acquires the lock when no token is supplied", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const held = await createMaintenanceState(home, fake.driver, "maintenance-held");
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.prepareMaintenanceSelection({
+      expectedChecksumSha256: held.checksumSha256,
+      generationId: held.generationId,
+      targetBackend: "postgresql",
+      terminalEvidenceSha256: "c".repeat(64),
+    }))).rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("completeMaintenanceSelection: accepts a retained barrier token", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const prepared = await createMaintenanceState(home, fake.driver, "selection-prepared");
+    const active = coordinator(home, fake.driver);
+    const completed = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.completeMaintenanceSelection({
+      expectedChecksumSha256: prepared.checksumSha256,
+      generationId: prepared.generationId,
+      terminalEvidenceSha256: prepared.terminalEvidenceSha256!,
+    }, token));
+    expect(completed.phase).toBe("selection-completed");
+  });
+
+  it("completeMaintenanceSelection: still acquires the lock when no token is supplied", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const prepared = await createMaintenanceState(home, fake.driver, "selection-prepared");
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.completeMaintenanceSelection({
+      expectedChecksumSha256: prepared.checksumSha256,
+      generationId: prepared.generationId,
+      terminalEvidenceSha256: prepared.terminalEvidenceSha256!,
+    }))).rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("abortMaintenance: accepts a retained barrier token", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const held = await createMaintenanceState(home, fake.driver, "maintenance-held");
+    const active = coordinator(home, fake.driver);
+    const aborted = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.abortMaintenance({
+      expectedChecksumSha256: held.checksumSha256,
+      sourceSelectionSha256: held.sourceSelectionSha256,
+      abortEvidenceSha256: "c".repeat(64),
+    }, token));
+    expect(aborted.phase).toBe("maintenance-aborted");
+  });
+
+  it("abortMaintenance: still acquires the lock when no token is supplied", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const held = await createMaintenanceState(home, fake.driver, "maintenance-held");
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.abortMaintenance({
+      expectedChecksumSha256: held.checksumSha256,
+      sourceSelectionSha256: held.sourceSelectionSha256,
+      abortEvidenceSha256: "c".repeat(64),
+    }))).rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("prepare: accepts a retained barrier token", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const active = coordinator(home, fake.driver);
+    const prepared = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.prepare(inputFor(input), token));
+    expect(prepared.phase).toBe("prepared");
+  });
+
+  it("prepare: still acquires the lock when no token is supplied", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.prepare(inputFor(input))))
+      .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("resume: accepts a retained barrier token", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    const resumed = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.resume(token));
+    expect(resumed.phase).not.toBe("preparing");
+  });
+
+  it("resume: still acquires the lock when no token is supplied", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.resume()))
+      .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("abort: accepts a retained barrier token", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    const aborted = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.abort(token));
+    expect(aborted.phase).toBe("aborted");
+  });
+
+  it("abort: still acquires the lock when no token is supplied", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.abort()))
+      .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("recoverPending: accepts a retained barrier token", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    const recovered = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.recoverPending({}, token));
+    expect(recovered).not.toBeNull();
+  });
+
+  it("recoverPending: still acquires the lock when no token is supplied", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.recoverPending({})))
+      .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("refuses a lock token whose home differs from the coordinator's home", async () => {
+    const { home, fake } = await preparedFixture();
+    const otherHome = makeHome();
+    const active = coordinator(home, fake.driver);
+    await withBackendPublicationAppendBarrierAsync(otherHome, async (foreignToken) => {
+      await expect(active.resume(foreignToken)).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "permit-mismatch",
+      });
+    });
+  });
+
+  it("refuses a lock token that was already revoked when its barrier released", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    let capturedToken: BackendPublicationLockToken | undefined;
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      capturedToken = token;
+    });
+    await expect(active.resume(capturedToken)).rejects.toMatchObject({
+      name: "BackendPublicationJournalError",
+      reason: "permit-mismatch",
+    });
+  });
+
+  it("accepts a plain consumer-lock token, proving append-barrier membership is not required", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    const resumed = await withBackendPublicationConsumerLockAsync(
+      home,
+      async (token) => active.resume(token),
+      { allowUnresolved: true },
+    );
+    expect(resumed.phase).not.toBe("preparing");
+  });
 });
 
 describe("revocable mutation permits", () => {

@@ -3640,6 +3640,7 @@ export class BackendPublicationCoordinator {
 
   async prepareMaintenanceSelection(
     input: PrepareBackendMaintenanceSelectionInput,
+    lockToken?: BackendPublicationLockToken,
   ): Promise<BackendMaintenanceJournal> {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
@@ -3669,11 +3670,12 @@ export class BackendPublicationCoordinator {
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, prepared, journal.checksumSha256);
       return prepared;
-    });
+    }, lockToken);
   }
 
   async completeMaintenanceSelection(
     input: CompleteBackendMaintenanceSelectionInput,
+    lockToken?: BackendPublicationLockToken,
   ): Promise<BackendMaintenanceJournal> {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
@@ -3701,10 +3703,13 @@ export class BackendPublicationCoordinator {
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, completed, journal.checksumSha256);
       return completed;
-    });
+    }, lockToken);
   }
 
-  async abortMaintenance(input: AbortBackendMaintenanceInput): Promise<BackendMaintenanceJournal> {
+  async abortMaintenance(
+    input: AbortBackendMaintenanceInput,
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<BackendMaintenanceJournal> {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
       if (journal === null) return fail("publication-evidence-missing", "backend maintenance journal is missing");
@@ -3730,10 +3735,13 @@ export class BackendPublicationCoordinator {
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, aborted, journal.checksumSha256);
       return aborted;
-    });
+    }, lockToken);
   }
 
-  async prepare(input: PrepareBackendPublicationInput): Promise<BackendPublicationJournal> {
+  async prepare(
+    input: PrepareBackendPublicationInput,
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<BackendPublicationJournal> {
     return this.#locked(async (directoryHandle) => {
       const validated = validateInput(input);
       const existing = readParsedJournalFromDirectory(
@@ -3790,24 +3798,27 @@ export class BackendPublicationCoordinator {
       );
       this.#observer("after-prepared", backendPublicationJournalPath(this.#homeDir));
       return prepared;
-    });
+    }, lockToken);
   }
 
-  async resume(): Promise<BackendPublicationJournal> {
-    return this.#locked(async (directoryHandle) => this.#resumeUnlocked(directoryHandle));
+  async resume(lockToken?: BackendPublicationLockToken): Promise<BackendPublicationJournal> {
+    return this.#locked(async (directoryHandle) => this.#resumeUnlocked(directoryHandle), lockToken);
   }
 
-  async abort(): Promise<BackendPublicationJournal> {
-    return this.#locked(async (directoryHandle) => this.#abortUnlocked(directoryHandle));
+  async abort(lockToken?: BackendPublicationLockToken): Promise<BackendPublicationJournal> {
+    return this.#locked(async (directoryHandle) => this.#abortUnlocked(directoryHandle), lockToken);
   }
 
-  async recoverPending(options: RecoverPendingOptions = {}): Promise<BackendPublicationJournal | null> {
+  async recoverPending(
+    options: RecoverPendingOptions = {},
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<BackendPublicationJournal | null> {
     return this.#locked(async (directoryHandle) => {
       const journal = readJournalFromDirectory(this.#homeDir, directoryHandle);
       if (journal === null) return null;
       if (options.disposition === "abort") return this.#abortUnlocked(directoryHandle);
       return this.#resumeUnlocked(directoryHandle);
-    });
+    }, lockToken);
   }
 
   async #locked<T>(
