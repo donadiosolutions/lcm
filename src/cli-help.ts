@@ -194,7 +194,7 @@ const HELP: Record<string, CommandHelp> = {
   },
 
   expand: {
-    summary: "Expand a summary node back into lower-level source detail.",
+    summary: "Traverse a summary node's DAG links and list its child summaries.",
     usage: "lcm expand <nodeId> [--depth N]",
     options: [
       ["--depth N", "Traversal depth (default: 1)"],
@@ -512,7 +512,7 @@ const GROUPS = [
       { name: "search <query> [--limit N]", summary: "Search episodic and promoted memory" },
       { name: "grep <query> [--mode ...]", summary: "Search raw messages and summaries" },
       { name: "describe <nodeId>", summary: "Inspect metadata for a memory node" },
-      { name: "expand <nodeId> [--depth N]", summary: "Expand a summary node into source detail" },
+      { name: "expand <nodeId> [--depth N]", summary: "List a summary node's child summaries" },
       { name: "store <text> [--tag ...]", summary: "Store a durable memory entry" },
       { name: "compact [--all] [--dry-run] [--replay] [--no-promote] [LLM overrides]", summary: "Compact conversations into DAG summaries (auto-promotes after)" },
       { name: "import [--provider ...] [--all] [--verbose] [--dry-run] [--replay]", summary: "Import Claude Code and Codex session transcripts" },

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
+  NATIVE_SOURCE_LOCATOR_BATCH_SIZE,
   NATIVE_TRANSCRIPT_MAX_JSON_DEPTH,
   type CreateNativeTranscriptInput,
   type CreateNativeTranscriptMessageLinkInput,
@@ -97,6 +98,12 @@ const scopedExecutorStates = new WeakMap<
   PostgreSqlNativeTranscriptScopedExecutor,
   ScopedExecutorState
 >();
+
+type SourceLocatorRow = QueryResultRow & {
+  native_session_id: unknown;
+  source_locator: unknown;
+  locator_count: unknown;
+};
 
 type TranscriptRow = QueryResultRow & {
   transcript_id: unknown;
@@ -1072,6 +1079,64 @@ implements
              ORDER BY transcript.observed_at, transcript.transcript_id`,
       values: [this.projectId, nativeSessionId],
     });
+  }
+
+  async listUnambiguousSourceLocators(input: {
+    readonly nativeSessionIds: readonly string[];
+  }): Promise<ReadonlyMap<string, string>> {
+    const operation = "listUnambiguousSourceLocators";
+    const requested = input.nativeSessionIds;
+    if (!Array.isArray(requested)) {
+      throw new TypeError("invalid native transcript data");
+    }
+    const sessionIds = [...new Set(requested.map(value => nonemptyString(
+      value,
+      this.projectId,
+      operation,
+      "native_session_id",
+      true,
+    )))];
+    const locators = new Map<string, string>();
+    for (
+      let offset = 0;
+      offset < sessionIds.length;
+      offset += NATIVE_SOURCE_LOCATOR_BATCH_SIZE
+    ) {
+      const chunk = sessionIds.slice(
+        offset,
+        offset + NATIVE_SOURCE_LOCATOR_BATCH_SIZE,
+      );
+      const rows = await this.read(operation, async (executor) => {
+        const result = await executor.query<SourceLocatorRow>({
+          text: `SELECT transcript.native_session_id,
+                        MIN(transcript.source_locator) AS source_locator,
+                        COUNT(DISTINCT transcript.source_locator)
+                          AS locator_count
+                   FROM unnest($2::text[]) AS requested(native_session_id)
+                   JOIN lcm.native_transcripts AS transcript
+                     ON transcript.project_id = $1
+                    AND transcript.native_session_id_sha256 =
+                        public.digest(requested.native_session_id, 'sha256')
+                    AND transcript.native_session_id =
+                        requested.native_session_id
+                  GROUP BY transcript.native_session_id`,
+          values: [this.projectId, chunk],
+        }, this.context(operation));
+        return result.rows;
+      });
+      for (const row of rows) {
+        if (Number(row.locator_count) !== 1) continue;
+        locators.set(
+          nonemptyString(row.native_session_id, this.projectId, operation, "native_session_id", true),
+          // Read validation matches transcriptFromRow: a stored locator is
+          // rejected only when it is empty, never merely because it is
+          // whitespace. Ingest admits such a locator, so rejecting it here
+          // would lose provenance the backend legally holds.
+          nonemptyString(row.source_locator, this.projectId, operation, "source_locator"),
+        );
+      }
+    }
+    return locators;
   }
 
   async listBySource(
