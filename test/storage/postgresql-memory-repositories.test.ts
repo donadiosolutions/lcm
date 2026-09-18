@@ -1053,8 +1053,16 @@ describe("PostgreSQL memory repositories", () => {
         else if (/\b(?:WHERE|FROM|RETURNING|VALUES)\b/u.test(line)) assigning = false;
         // Exempt the assignment token itself, never the rest of the line and
         // never a whole region. "SET column =" and its continued "column ="
-        // cannot take an operator, but a second "=" on the same line is an
-        // operator inside the assigned expression and must still be qualified.
+        // cannot take an operator, so the leading assignment is stripped and
+        // whatever remains on the line is still checked.
+        //
+        // Only the first assignment per line is stripped. This file writes one
+        // assignment per line, so a comma-separated "SET a = 1, b = 2" would
+        // be reported even though its second "=" is another assignment rather
+        // than an operator. That is a false positive, which fails in the safe
+        // direction: it stops the build until a human looks, and can never
+        // admit an unqualified operator. Teaching the parser about
+        // comma-separated assignments would add a way to miss one.
         const remainder = assigning
           ? line.replace(/^(\s*(?:SET\s+)?[A-Za-z_][A-Za-z0-9_]*\s*)=/u, "$1")
           : line;
