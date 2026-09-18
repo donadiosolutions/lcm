@@ -130,18 +130,12 @@ function fakeSession(overrides: {
         const domain = Object.entries(SEQUENCE_BACKED_TABLES).find(([, value]) => value === table)?.[0];
         return { rows: [{ seq_name: domain ? seqNameFor(domain) : null }] };
       }
-      if (config.text.includes("FROM lcm.fake_")) {
-        const domain = Object.keys(SEQUENCE_BACKED_TABLES).find((candidate) => config.text.includes(seqNameFor(candidate)));
-        const state = domain ? sequenceState[domain] : undefined;
-        if (state === undefined || state.lastValue === null) return { rows: [] };
-        return { rows: [{ last_value: state.lastValue, is_called: state.isCalled ?? true }] };
-      }
-      if (config.text.includes("pg_catalog.pg_sequence")) {
+      if (config.text.includes("pg_catalog.pg_sequences")) {
         const seqName = config.values?.[0] as string | undefined;
         const domain = Object.keys(SEQUENCE_BACKED_TABLES).find((candidate) => seqNameFor(candidate) === seqName);
         const state = domain ? sequenceState[domain] : undefined;
-        if (state === undefined) return { rows: [] };
-        return { rows: [{ increment_by: state.incrementBy ?? "1" }] };
+        if (state === undefined || state.lastValue === null) return { rows: [] };
+        return { rows: [{ last_value: state.lastValue, is_called: state.isCalled ?? true, increment_by: state.incrementBy ?? "1" }] };
       }
       return { rows: [{ admitted: true }] };
     }),

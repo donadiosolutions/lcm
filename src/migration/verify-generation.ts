@@ -338,25 +338,30 @@ async function readSequenceStoredState(
   }, { domain: "factory", operation: "verifyGenerationSequenceName", signal });
   const seqName = nameResult.rows[0]?.seq_name ?? null;
   if (seqName === null) return null;
-  const [stateResult, incrementResult] = await Promise.all([
-    session.query<{ last_value: string; is_called: boolean }>({
-      // seqName came back from pg_get_serial_sequence above, never from
-      // caller input, so splicing it here is not an injection surface;
-      // PostgreSQL forbids parameterising a FROM-clause relation name.
-      text: "SELECT last_value::text AS last_value, is_called FROM " + seqName,
-    }, { domain: "factory", operation: "verifyGenerationSequenceLastValue", signal }),
-    session.query<{ increment_by: string }>({
-      // Joined by oid via ::regclass, never by name-string concatenation,
-      // so quoting-sensitive identifiers cannot desync the two reads.
-      text: "SELECT increment_by::text AS increment_by FROM pg_catalog.pg_sequence "
-        + "WHERE seqrelid OPERATOR(pg_catalog.=) $1::regclass",
-      values: [seqName],
-    }, { domain: "factory", operation: "verifyGenerationSequenceIncrement", signal }),
-  ]);
-  const stateRow = stateResult.rows[0];
-  const incrementRow = incrementResult.rows[0];
-  if (stateRow === undefined || incrementRow === undefined) return null;
-  return { lastValue: BigInt(stateRow.last_value), isCalled: stateRow.is_called, incrementBy: BigInt(incrementRow.increment_by) };
+  // pg_catalog.pg_sequences (the view, not pg_sequence the catalog table)
+  // is deliberately used for last_value/is_called: its definition gates
+  // last_value on has_sequence_privilege(oid, 'SELECT') OR (..., 'USAGE'),
+  // so the least-privilege runtime role -- granted USAGE on every
+  // identity sequence but never SELECT -- still reads a real value here,
+  // unlike a direct "SELECT last_value FROM <sequence>", which requires
+  // SELECT specifically and would silently reintroduce the same fail-
+  // closed defect this replaces. increment_by is ordinary catalog
+  // metadata (pg_sequence), publicly readable regardless of sequence-
+  // level ACLs, joined by oid via ::regclass rather than by name-string
+  // matching so a quoting-sensitive identifier cannot desync the join.
+  const result = await session.query<{ last_value: string | null; is_called: boolean | null; increment_by: string }>({
+    text: "SELECT ps.last_value::text AS last_value, ps.is_called, pc.increment_by::text AS increment_by "
+      + "FROM pg_catalog.pg_sequences ps "
+      + "JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) ps.schemaname "
+      + "JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) n.oid "
+      + "AND c.relname OPERATOR(pg_catalog.=) ps.sequencename "
+      + "JOIN pg_catalog.pg_sequence pc ON pc.seqrelid OPERATOR(pg_catalog.=) c.oid "
+      + "WHERE c.oid OPERATOR(pg_catalog.=) $1::regclass",
+    values: [seqName],
+  }, { domain: "factory", operation: "verifyGenerationSequenceLastValue", signal });
+  const row = result.rows[0];
+  if (row === undefined || row.last_value === null || row.is_called === null) return null;
+  return { lastValue: BigInt(row.last_value), isCalled: row.is_called, incrementBy: BigInt(row.increment_by) };
 }
 export async function readSequenceSelfConsistencyMismatches(
   session: PostgreSqlSnapshotSession, projectId: string, signal?: AbortSignal,
