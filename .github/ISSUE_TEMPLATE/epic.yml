@@ -1,0 +1,28 @@
+name: Epic
+description: A large outcome that must be divided into independently deliverable child issues
+type: Epic
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: The single outcome this epic delivers, and why it is worth doing
+    validations:
+      required: true
+  - type: textarea
+    id: children
+    attributes:
+      label: Planned child issues
+      description: The independently deliverable pieces, one per line
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Definition of done
+      description: How to tell the outcome has been delivered
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Constraints, dependencies, or prior work
