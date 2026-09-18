@@ -36,6 +36,7 @@ import {
   createMigrationVerificationReport,
   MIGRATION_MISMATCH_CLASSES,
   MIGRATION_MISMATCH_CLASS_TRUNCATION_LIMIT, MIGRATION_PUBLIC_PROBE_ORDERING_SHA256,
+  migrationMismatchClassOrdinal,
   type MigrationClassCoverageVector,
   type CreateMigrationVerificationReportInput, type MigrationMismatchClass, type MigrationQueueClassificationWitness,
   type MigrationReconciliationDomain, type MigrationSourceWitnessDigests, type MigrationVerificationMismatch,
@@ -799,8 +800,17 @@ export function reconcileCounts(
   return mismatches;
 }
 
-export function mismatchOrdinal(value: MigrationVerificationMismatch, order: readonly MigrationReconciliationDomain[]): readonly [number, string, string] {
-  return [order.indexOf(value.domain), value.class, value.identitySha256];
+/**
+ * Domain position comes from the caller-supplied order (this driver's
+ * own construction order, or a test's narrower one); class position
+ * comes from verification-report.ts's migrationMismatchClassOrdinal --
+ * the same frozen ordinal the report body's own validator enforces at
+ * construction, never a second, separately-maintained comparison. See
+ * migrationMismatchClassOrdinal's docstring for the round-1 defect this
+ * sharing exists to close.
+ */
+export function mismatchOrdinal(value: MigrationVerificationMismatch, order: readonly MigrationReconciliationDomain[]): readonly [number, number, string] {
+  return [order.indexOf(value.domain), migrationMismatchClassOrdinal(value.class), value.identitySha256];
 }
 
 export function sortMismatches(
@@ -810,7 +820,7 @@ export function sortMismatches(
     const [leftDomain, leftClass, leftIdentity] = mismatchOrdinal(left, order);
     const [rightDomain, rightClass, rightIdentity] = mismatchOrdinal(right, order);
     if (leftDomain !== rightDomain) return leftDomain - rightDomain;
-    if (leftClass !== rightClass) return leftClass < rightClass ? -1 : 1;
+    if (leftClass !== rightClass) return leftClass - rightClass;
     return leftIdentity < rightIdentity ? -1 : leftIdentity > rightIdentity ? 1 : 0;
   });
 }

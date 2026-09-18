@@ -37,6 +37,7 @@ import {
   type VerifyMigrationGenerationInput,
 } from "../../src/migration/verify-generation.js";
 import { MigrationVerificationReportStore } from "../../src/migration/verification-store.js";
+import { createMigrationVerificationReportBody, MIGRATION_MISMATCH_CLASSES } from "../../src/migration/verification-report.js";
 
 const HASH_A = "a".repeat(64);
 const FAKE_MIGRATIONS = [{ id: "0001", filename: "0001.sql", sql: "", sha256: HASH_A }];
@@ -827,6 +828,67 @@ describe("sortMismatches", () => {
       { domain: "messages" as const, class: "count" as const, identitySha256: same },
     ], order);
     expect(equal.map((m) => m.identitySha256)).toEqual([same, same]);
+  });
+  it("round-1 P1 red case: orders relation before ledger within one domain, per the frozen class ordinal, not lexicographically", () => {
+    // "ledger" < "relation" lexicographically, but the frozen
+    // MIGRATION_MISMATCH_CLASSES ordinal places relation (index 3) before
+    // ledger (index 6). Every existing sort test before this one mixed
+    // only class pairs whose two orderings happen to agree; this pairing
+    // is the one that actually breaks under a lexicographic comparison.
+    const order = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger"] as const;
+    const sorted = sortMismatches([
+      { domain: "messages" as const, class: "ledger" as const, identitySha256: fakeHash("ledger-mismatch") },
+      { domain: "messages" as const, class: "relation" as const, identitySha256: fakeHash("relation-mismatch") },
+    ], order);
+    expect(sorted.map((m) => m.class)).toEqual(["relation", "ledger"]);
+  });
+  it("round-1 P1 red case: a same-domain relation-plus-ledger mismatch pair, sorted by this driver, constructs a report body without throwing", () => {
+    // The defect this closes: the driver's own sortMismatches output was
+    // fed straight into createMigrationVerificationReport as "already
+    // sorted", but its lexicographic class order disagreed with the
+    // report body's own construction-time validator, which enforces the
+    // frozen ordinal via assertSortedUnique. A domain carrying both
+    // classes therefore threw invalid-input at construction and no
+    // report was ever persisted for exactly the badly diverged
+    // destination the operator-evidence path exists to serve. This test
+    // goes through the real report-body constructor, not just the sort
+    // function in isolation.
+    const order = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger", "public-listing", "public-search"] as const;
+    const mismatches = sortMismatches([
+      { domain: "messages" as const, class: "ledger" as const, identitySha256: fakeHash("ledger-mismatch") },
+      { domain: "messages" as const, class: "relation" as const, identitySha256: fakeHash("relation-mismatch") },
+    ], order);
+    const mismatchTotals = sortMismatches(
+      totalsFor(mismatches) as unknown as typeof mismatches, order,
+    ).map((total) => ({ domain: total.domain, class: total.class, count: 1 }));
+    const domainVector = <T>(build: (domain: PortableDomain, index: number) => T): T[] => PORTABLE_RECORD_DOMAIN_ORDER.map(build);
+    expect(() => createMigrationVerificationReportBody({
+      generationId: "generation-1", targetGenerationId: "generation-1-postgresql",
+      bindingSha256: HASH_A, manifestRevision: 1, manifestChecksumSha256: HASH_A,
+      sourceWitness: { version: 1, identitySha256: HASH_A, schemaSha256: HASH_A, contentSha256: HASH_A },
+      destinationIdentity: { version: 1, sealedWitnessSha256: HASH_A, systemIdentifier: "712345" },
+      destinationSchemaWitness: {
+        version: 1, migrationsSha256: HASH_A, searchConfigurationSha256: HASH_A,
+        collationSha256: HASH_A, sequenceStateSha256: HASH_A,
+      },
+      projectMapWitnessSha256: HASH_A,
+      queueClassificationWitness: {
+        version: 1, queueCutoff: null, queueSetSha256: HASH_A, receiptSetSha256: HASH_A, epochChecksumSha256: HASH_A,
+      },
+      censusVector: {
+        version: 1,
+        domains: domainVector((domain, index) => ({ domain, recordCount: index, prefixSha256: fakeHash("c" + domain) })),
+        contentSha256: HASH_A,
+      },
+      canonicalDelta: {
+        version: 1,
+        domains: domainVector((domain, index) => ({ domain, recordCount: index, terminalIdentitySha256: fakeHash("d" + domain) })),
+      },
+      classCoverage: MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: true })),
+      publicProbeSha256: HASH_A,
+      sampleParameters: { version: 1, strideOrdinal: 97, sampleCount: 32, seedBasisSha256: HASH_A },
+      mismatches, mismatchTotals,
+    })).not.toThrow();
   });
 });
 

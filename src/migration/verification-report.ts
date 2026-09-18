@@ -115,6 +115,21 @@ const MISMATCH_CLASS_ORDINAL = new Map<MigrationMismatchClass, number>(
   MIGRATION_MISMATCH_CLASSES.map((klass, index) => [klass, index]),
 );
 
+/**
+ * The one place a mismatch class's frozen sort position is computed.
+ * verify-generation.ts's sortMismatches uses this directly rather than
+ * a second, separately-maintained comparator (round-1 P1): a driver-side
+ * lexicographic class comparison sorted "ledger" before "relation" while
+ * this module's own construction-time validator enforces the reverse
+ * (relation=3, ledger=6), so a domain carrying both mismatch classes
+ * threw invalid-input at createMigrationVerificationReportBody and no
+ * report was ever persisted for exactly the badly diverged destination
+ * the operator-evidence path exists for.
+ */
+export function migrationMismatchClassOrdinal(value: MigrationMismatchClass): number {
+  return MISMATCH_CLASS_ORDINAL.get(value)!;
+}
+
 /** Frozen per-class bound on the number of retained mismatch entries; exact totals are retained separately. */
 export const MIGRATION_MISMATCH_CLASS_TRUNCATION_LIMIT = 100;
 
