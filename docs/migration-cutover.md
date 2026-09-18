@@ -688,13 +688,13 @@ collect dependency edges, so wall time is roughly linear in the number of
 rows in scope, not a flat per-domain overhead. Measured against a live
 PostgreSQL 18 instance with 9,345 rows across the copied domains
 (dominated by conversations, messages and message-parts), the
-census-plus-relation phase took about 95.8 seconds and the ledger phase
-took about 84 milliseconds; together with the read-only guard and the
-sequence check, the whole in-window read took about 95.9 seconds, and the
+census-plus-relation phase took about 95.9 seconds and the ledger phase
+took about 86 milliseconds; together with the read-only guard and the
+sequence check, the whole in-window read took about 96.0 seconds, and the
 two pre-window probes (the public-listing repository read and the
-destination probe) added a further 214 milliseconds outside the lease
-window, for a measured total of about 96.1 seconds. Census-plus-relation
-alone is 99.7% of that total; the ledger, sequence-check and read-only
+destination probe) added a further 251 milliseconds outside the lease
+window, for a measured total of about 96.3 seconds. Census-plus-relation
+alone is 99.6% of that total; the ledger, sequence-check and read-only
 guard phases are each under 100 milliseconds and do not materially move
 the figure. This section's name is historical -- the number below covers
 the whole in-window read, not the census alone -- because once `relation`
@@ -729,13 +729,15 @@ sizing `leaseTtlMs` for a large project should measure the whole in-window
 read against a realistic copy of that project's own row counts before a
 cutover, not discover the lease was too short during one. As a starting
 point rather than a promise, this repository's own measured total above
-(about 96.1 seconds) scaled by a stated 3x safety margin -- not a second
-measurement -- yields `leaseTtlMs = 288,313`; the same approach (measure,
+(about 96.3 seconds) scaled by a stated 3x safety margin -- not a second
+measurement -- yields `leaseTtlMs = 288,787`; the same approach (measure,
 then apply a stated margin, then let the arithmetic be checked) is what an
 operator should repeat against their own data before relying on any
 specific `leaseTtlMs` value. This figure was regenerated against the
-freeze commit's own code (steps 9-11 do not touch the read window, and
-the ~50ms difference from an earlier measurement in this same file's
-history is ordinary environmental noise, not a behavioural change).
+freeze commit's own code (steps 9-11 and the read-only inspect entry
+point do not touch the read window, and the small, sub-second
+differences across successive measurements in this file's own history
+are ordinary environmental noise on a live PostgreSQL instance, not a
+behavioural change).
 
 
