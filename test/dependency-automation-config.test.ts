@@ -120,10 +120,26 @@ function regexPatterns(value: unknown): RegExp[] {
   });
 }
 
+// Renovate merges a manager's configured `managerFilePatterns` into that
+// manager's built-in defaults: configured patterns are additive and cannot
+// replace the defaults. Modelling only the configured patterns therefore
+// understates which files hosted Renovate can claim. These are the
+// `github-actions` built-ins read from
+// dist/modules/manager/github-actions/index.js, verified byte-identical in the
+// installed 44.35.3 bundle and the published 44.97.4 bundle on 2026-09-17, so
+// this expectation is stable across that version gap.
+const GITHUB_ACTIONS_BUILT_IN_PATTERNS = [
+  "/(^|/)(workflow-templates|\\.(?:github|gitea|forgejo)/(?:workflows|actions))/.+\\.ya?ml$/",
+  "/(^|/)action\\.ya?ml$/",
+];
+
+/** Managers whose merged built-in and configured patterns match `fileName`. */
 function matchingManagers(fileName: string): string[] {
-  const githubActionsPatterns = regexPatterns(
-    renovate["github-actions"]?.managerFilePatterns,
-  );
+  const configured = renovate["github-actions"]?.managerFilePatterns;
+  const githubActionsPatterns = regexPatterns([
+    ...GITHUB_ACTIONS_BUILT_IN_PATTERNS,
+    ...(Array.isArray(configured) ? configured : []),
+  ]);
   const githubActionsMatches = githubActionsPatterns.some((pattern) => pattern.test(fileName));
   const customRegexMatches = (renovate.customManagers ?? []).some((manager) =>
     regexPatterns(manager.managerFilePatterns).some((pattern) => pattern.test(fileName)),
@@ -133,6 +149,21 @@ function matchingManagers(fileName: string): string[] {
     ...(githubActionsMatches ? ["github-actions"] : []),
     ...(customRegexMatches ? ["custom.regex"] : []),
   ];
+}
+
+/** Whether `includePaths` admits `fileName` before any manager can claim it. */
+function includedByPaths(fileName: string): boolean {
+  const paths = renovate.includePaths;
+  if (!Array.isArray(paths)) return false;
+  return paths.some((pattern) =>
+    typeof pattern === "string"
+      && (pattern.endsWith("/**") ? fileName.startsWith(pattern.slice(0, -2)) : fileName === pattern),
+  );
+}
+
+/** Managers hosted Renovate effectively assigns, after `includePaths` filtering. */
+function effectiveOwners(fileName: string): string[] {
+  return includedByPaths(fileName) ? matchingManagers(fileName) : [];
 }
 
 function postgresqlImageMatches(source: string): Array<Record<string, string | undefined>> {
@@ -217,16 +248,26 @@ describe("dependency automation configuration", () => {
   it.each([".github/actions/action.yml", ".github/actions/action.yaml"])(
     "assigns the root composite action %s only to the GitHub Actions manager",
     (fileName) => {
-      expect(matchingManagers(fileName)).toEqual(["github-actions"]);
+      expect(effectiveOwners(fileName)).toEqual(["github-actions"]);
     },
   );
 
   it.each([
     ".github/actions/action.YAML",
     ".github/actions/action.yaml.bak",
-    ".github/actions/my-action.yaml",
   ])("does not assign the root lookalike %s to a Renovate manager", (fileName) => {
-    expect(matchingManagers(fileName)).toEqual([]);
+    expect(effectiveOwners(fileName)).toEqual([]);
+  });
+
+  it("assigns nested lookalike YAML through Renovate's built-in patterns", () => {
+    // The configured pattern does not match these names, but the built-in
+    // `.github/actions` default does and `includePaths` admits them, so hosted
+    // Renovate owns them as github-actions. Asserting no owner here would
+    // describe a repository-only pattern set that Renovate never applies.
+    expect(effectiveOwners(".github/actions/my-action.yaml")).toEqual(["github-actions"]);
+    expect(effectiveOwners(".github/actions/example/my-action.yaml")).toEqual([
+      "github-actions",
+    ]);
   });
 
   it("gives hosted Renovate exactly one owner for each approved file family", () => {
@@ -235,19 +276,26 @@ describe("dependency automation configuration", () => {
       ".github/actions/**",
       "scripts/postgresql-images.mjs",
     ]);
-    expect(matchingManagers(".github/actions/setup-ci/action.yml")).toEqual([
+    expect(effectiveOwners(".github/actions/setup-ci/action.yml")).toEqual([
       "github-actions",
     ]);
-    expect(matchingManagers(".github/actions/nested/setup/action.yaml")).toEqual([
+    expect(effectiveOwners(".github/actions/nested/setup/action.yaml")).toEqual([
       "github-actions",
     ]);
-    expect(matchingManagers(".github/actions/example/action.YAML")).toEqual([]);
-    expect(matchingManagers(".github/actions/example/action.yaml.bak")).toEqual([]);
-    expect(matchingManagers(".github/actions/example/my-action.yaml")).toEqual([]);
-    expect(matchingManagers("scripts/postgresql-images.mjs")).toEqual(["custom.regex"]);
-    expect(matchingManagers("package.json")).toEqual([]);
-    expect(matchingManagers("pnpm-lock.yaml")).toEqual([]);
-    expect(matchingManagers(".github/workflows/ci.yml")).toEqual([]);
+    expect(effectiveOwners(".github/actions/example/action.YAML")).toEqual([]);
+    expect(effectiveOwners(".github/actions/example/action.yaml.bak")).toEqual([]);
+    expect(effectiveOwners("scripts/postgresql-images.mjs")).toEqual(["custom.regex"]);
+    expect(effectiveOwners("package.json")).toEqual([]);
+    expect(effectiveOwners("pnpm-lock.yaml")).toEqual([]);
+  });
+
+  it("keeps workflow files out of scope through includePaths, not manager patterns", () => {
+    // The built-in github-actions pattern does match workflow YAML, so only
+    // `includePaths` keeps these files out of scope. Asserting this through the
+    // manager patterns alone would pass for the wrong reason.
+    expect(matchingManagers(".github/workflows/ci.yml")).toEqual(["github-actions"]);
+    expect(includedByPaths(".github/workflows/ci.yml")).toBe(false);
+    expect(effectiveOwners(".github/workflows/ci.yml")).toEqual([]);
   });
 
   it("recognizes both fully pinned PostgreSQL harness images and rejects partial tuples", () => {
