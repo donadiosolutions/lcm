@@ -161,7 +161,15 @@ export class MigrationVerificationReportStore {
       maxBytes: MAX_REPORT_BYTES,
       expectedUid: this.#expectedUid,
       allowedModes: [PRIVATE_FILE_MODE],
-      requireSingleLink: true,
+      // Not requireSingleLink: the winner's best-effort temp-file cleanup
+      // (atomicWritePrivateFileExclusive) can fail after the durable link
+      // already succeeded, in which case published is still true but the
+      // final name keeps nlink=2 forever -- no later caller ever retries
+      // that specific temp file's removal. Content addressing is the real
+      // safety property here (this read-back already requires byte
+      // identity against the caller's own bytes); an extra hard link to
+      // the same immutable content is harmless, so requiring exactly one
+      // link would durably wedge every reuse of that report identity.
     });
     if (existing.content !== content) {
       storeError(
@@ -185,7 +193,8 @@ export class MigrationVerificationReportStore {
         maxBytes: MAX_REPORT_BYTES,
         expectedUid: this.#expectedUid,
         allowedModes: [PRIVATE_FILE_MODE],
-        requireSingleLink: true,
+        // See persist()'s EEXIST read-back: not requireSingleLink, for the
+        // same durable-wedge reason.
       });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -212,7 +221,8 @@ export class MigrationVerificationReportStore {
         maxBytes: MAX_REPORT_BYTES,
         expectedUid: this.#expectedUid,
         allowedModes: [PRIVATE_FILE_MODE],
-        requireSingleLink: true,
+        // See persist()'s EEXIST read-back: not requireSingleLink, for the
+        // same durable-wedge reason.
       });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;

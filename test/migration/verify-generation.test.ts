@@ -109,9 +109,12 @@ const SEQUENCE_BACKED_TABLES: Record<string, string> = {
 
 function fakeSession(overrides: {
   xid?: string | null;
-  sequenceState?: Partial<Record<string, { maxValue: string | null; lastValue: string | null }>>;
+  sequenceState?: Partial<Record<string, {
+    maxValue: string | null; lastValue: string | null; isCalled?: boolean; incrementBy?: string;
+  }>>;
 } = {}) {
   const sequenceState = overrides.sequenceState ?? {};
+  const seqNameFor = (domain: string) => `lcm.fake_${domain}_seq`;
   return {
     identity: { sessionId: "window-session", backendPid: 999, projectId },
     query: vi.fn(async (config: { text: string; values?: readonly unknown[] }) => {
@@ -121,11 +124,23 @@ function fakeSession(overrides: {
         const state = domain ? sequenceState[domain] : undefined;
         return { rows: [{ max_value: state?.maxValue ?? null }] };
       }
-      if (config.text.includes("pg_sequence_last_value")) {
+      if (config.text.includes("pg_get_serial_sequence")) {
         const table = config.values?.[0];
         const domain = Object.entries(SEQUENCE_BACKED_TABLES).find(([, value]) => value === table)?.[0];
+        return { rows: [{ seq_name: domain ? seqNameFor(domain) : null }] };
+      }
+      if (config.text.includes("FROM lcm.fake_")) {
+        const domain = Object.keys(SEQUENCE_BACKED_TABLES).find((candidate) => config.text.includes(seqNameFor(candidate)));
         const state = domain ? sequenceState[domain] : undefined;
-        return { rows: [{ last_value: state?.lastValue ?? null }] };
+        if (state === undefined || state.lastValue === null) return { rows: [] };
+        return { rows: [{ last_value: state.lastValue, is_called: state.isCalled ?? true }] };
+      }
+      if (config.text.includes("pg_catalog.pg_sequence")) {
+        const seqName = config.values?.[0] as string | undefined;
+        const domain = Object.keys(SEQUENCE_BACKED_TABLES).find((candidate) => seqNameFor(candidate) === seqName);
+        const state = domain ? sequenceState[domain] : undefined;
+        if (state === undefined) return { rows: [] };
+        return { rows: [{ increment_by: state.incrementBy ?? "1" }] };
       }
       return { rows: [{ admitted: true }] };
     }),
@@ -159,6 +174,7 @@ function baseInput(overrides: Partial<VerifyMigrationGenerationInput> = {}): Ver
     expectedOwner: "lcm_test_migrator", ownerProcessId: "worker-1", scratchParent: "/scratch", leaseTtlMs: 60000,
     manifestRevision: 3, manifestChecksumSha256: HASH_A, destinationMigrationsSha256: EXPECTED_MIGRATIONS_SHA256,
     expectedDestinationIdentitySha256: HASH_A,
+    expectedSystemIdentifier: "7123456789",
     projectMapWitnessSha256: HASH_A,
     queueClassificationWitness: { version: 1, queueCutoff: null, queueSetSha256: HASH_A, receiptSetSha256: HASH_A, epochChecksumSha256: HASH_A },
     sampleParameters: { version: 1, strideOrdinal: 97, sampleCount: 32, seedBasisSha256: HASH_A },
@@ -582,21 +598,55 @@ describe("readSequenceSelfConsistencyMismatches", () => {
   });
   it("flags a domain whose sequence last_value is null even though rows exist (never called despite copied data)", async () => {
     const session = fakeSession({ sequenceState: { conversations: { maxValue: "500", lastValue: null } } });
+    // sequenceState omits the sequence entirely (no seq_name resolvable),
+    // so readSequenceStoredState returns null: a sequence that cannot be
+    // read at all must fail closed, exactly like one that is genuinely
+    // never-called with a colliding start value.
+    const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
+    expect(mismatches).toEqual([{ domain: "conversations", class: "sequence", identitySha256: expect.any(String) }]);
+  });
+  it("flags a never-called sequence (is_called=false) whose start value collides with the copied maximum", async () => {
+    const session = fakeSession({ sequenceState: {
+      conversations: { maxValue: "1", lastValue: "1", isCalled: false, incrementBy: "1" },
+    } });
     const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
     expect(mismatches).toEqual([{ domain: "conversations", class: "sequence", identitySha256: expect.any(String) }]);
   });
   it("flags a domain whose sequence last_value is strictly below the copied maximum identity", async () => {
-    const session = fakeSession({ sequenceState: { messages: { maxValue: "1000", lastValue: "999" } } });
+    const session = fakeSession({ sequenceState: { messages: { maxValue: "1000", lastValue: "999", isCalled: true, incrementBy: "1" } } });
     const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
     expect(mismatches).toEqual([{ domain: "messages", class: "sequence", identitySha256: expect.any(String) }]);
   });
-  it("passes when the sequence last_value is at or above the copied maximum identity", async () => {
+  it("passes a never-called sequence whose start value is strictly ahead of the copied maximum", async () => {
     const session = fakeSession({ sequenceState: {
-      conversations: { maxValue: "500", lastValue: "500" },
-      "recall-surfacings": { maxValue: "10", lastValue: "11" },
+      conversations: { maxValue: "1", lastValue: "2", isCalled: false, incrementBy: "1" },
     } });
     const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
     expect(mismatches).toEqual([]);
+  });
+  it("passes when the sequence last_value is at or above the copied maximum identity", async () => {
+    const session = fakeSession({ sequenceState: {
+      conversations: { maxValue: "500", lastValue: "500", isCalled: true, incrementBy: "1" },
+      "recall-surfacings": { maxValue: "10", lastValue: "11", isCalled: true, incrementBy: "1" },
+    } });
+    const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
+    expect(mismatches).toEqual([]);
+  });
+  it("fails closed when the sequence backing an identity column cannot be resolved at all", async () => {
+    // pg_get_serial_sequence returning NULL for a table/column this map
+    // claims is identity-backed would mean the map itself has drifted from
+    // the schema; that must fail closed rather than silently pass.
+    const session = {
+      query: vi.fn(async (config: { text: string }) => {
+        if (config.text.includes("MAX(")) return { rows: [{ max_value: "500" }] };
+        if (config.text.includes("pg_get_serial_sequence")) return { rows: [{ seq_name: null }] };
+        return { rows: [{ admitted: true }] };
+      }),
+      close: vi.fn(async () => { /* fake */ }),
+    };
+    const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
+    expect(mismatches.length).toBeGreaterThan(0);
+    expect(mismatches.every((mismatch) => mismatch.class === "sequence")).toBe(true);
   });
 });
 
@@ -633,6 +683,19 @@ describe("verifyMigrationGeneration: destination identity comparison", () => {
       dependencies,
     )).rejects.toMatchObject({ reason: "destination-drift" });
     expect(runtime.close).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("verifyMigrationGeneration: system-identifier comparison", () => {
+  it("refuses a destination whose live pg_control_system() system identifier does not match the expected value", async () => {
+    stubDestinationPrimitives();
+    const copySource = fakeCopySource();
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    await expect(verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-system-identifier-drift", expectedSystemIdentifier: "9999999999" }),
+      dependencies,
+    )).rejects.toMatchObject({ reason: "destination-drift" });
   });
 });
 

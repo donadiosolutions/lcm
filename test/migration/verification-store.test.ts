@@ -200,12 +200,13 @@ describe("MigrationVerificationReportStore", () => {
   it("propagates an unexpected filesystem error from read() unwrapped", () => {
     const report = createMigrationVerificationReport(baseInput());
     const path = reportPath("generation-1", report.reportSha256);
-    const otherPath = reportPath("generation-1", HASH_B);
     mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
     writeFileSync(path, "content\n", { mode: 0o600 });
-    // A second hard link trips requireSingleLink, a real error distinct from ENOENT.
-    linkSync(path, otherPath);
-    chmodSync(path, 0o600);
+    // requireSingleLink is deliberately not used by this store (see the
+    // durable-wedge test below), so an untrusted mode is the vehicle here
+    // for a real, non-ENOENT filesystem error distinct from malformed
+    // JSON or a content/filename mismatch.
+    chmodSync(path, 0o644);
     expect(() => store.read("generation-1", report.reportSha256)).toThrow();
     expect(() => store.read("generation-1", report.reportSha256)).not.toThrow(MigrationVerificationStoreError);
   });
@@ -213,13 +214,32 @@ describe("MigrationVerificationReportStore", () => {
   it("propagates an unexpected filesystem error from has() as malformed-record", () => {
     const report = createMigrationVerificationReport(baseInput());
     const path = reportPath("generation-1", report.reportSha256);
-    const otherPath = reportPath("generation-1", HASH_B);
     mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
     writeFileSync(path, "content\n", { mode: 0o600 });
-    // A second hard link trips requireSingleLink, a real error distinct from ENOENT.
-    linkSync(path, otherPath);
-    chmodSync(path, 0o600);
+    // See the read() test above: an untrusted mode is the vehicle for a
+    // real, non-ENOENT filesystem error.
+    chmodSync(path, 0o644);
     expectStoreError(() => store.has("generation-1", report.reportSha256), "malformed-record");
+  });
+
+  it("tolerates a durable extra hard link left by a winner's failed temp-file cleanup (does not wedge reuse or read)", () => {
+    // Models the exact synthesis-round durable wedge: the winner's publish
+    // already succeeded (published=true), but atomicWritePrivateFileExclusive's
+    // best-effort temp-file removal failed afterwards, leaving nlink=2 on
+    // the final name forever -- no later caller ever retries that specific
+    // removal. Content addressing, not link count, is this store's real
+    // safety property, so this must not throw.
+    const report = createMigrationVerificationReport(baseInput());
+    const persisted = store.persist("generation-1", report);
+    expect(persisted.outcome).toBe("published");
+    const path = reportPath("generation-1", report.reportSha256);
+    const strayTempPath = join(path, "..", ".stray-temp-link.tmp");
+    linkSync(path, strayTempPath);
+    expect(() => store.read("generation-1", report.reportSha256)).not.toThrow();
+    expect(store.has("generation-1", report.reportSha256)).toBe(true);
+    const reused = store.persist("generation-1", report);
+    expect(reused.outcome).toBe("reused");
+    expect(reused.report.reportSha256).toBe(report.reportSha256);
   });
 });
 

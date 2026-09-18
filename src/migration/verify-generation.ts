@@ -13,11 +13,13 @@ import type { PostgreSqlSnapshotSession } from "../storage/postgresql/snapshot-s
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor } from "../storage/postgresql/contracts.js";
 import {
   PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_LIMITS, canonicalJson as portableCanonicalJson,
+  PORTABLE_RECORD_SCHEMA_SHA256,
   type PortableDomain,
 } from "../storage/portable-record.js";
 import type {
   PortableCheckpoint, PortableRecordStream, PortableRecordValueByDomain,
 } from "../storage/portable-record-stream.js";
+import { aggregateContentSha256 } from "../storage/portable-record-stream.js";
 import { openMigrationCopySource, type MigrationCopySourceInput } from "./copy-source.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import {
@@ -241,7 +243,13 @@ export async function readFencedDestinationCensus(
  * non-sequence primary key (UUID or a composite key) and has no sequence
  * to bound.
  */
-const SEQUENCE_BACKED_IDENTITY_COLUMN: Readonly<Partial<Record<PortableDomain, Readonly<{ table: string; column: string }>>>> = Object.freeze({
+/**
+ * Exported so the live completeness guard (S2: a future migration adding
+ * an identity column must not silently fall outside this map's scope) can
+ * assert this exact set against pg_catalog, rather than only against
+ * itself.
+ */
+export const SEQUENCE_BACKED_IDENTITY_COLUMN: Readonly<Partial<Record<PortableDomain, Readonly<{ table: string; column: string }>>>> = Object.freeze({
   conversations: { table: "lcm.conversations", column: "conversation_id" },
   messages: { table: "lcm.messages", column: "message_id" },
   "recall-surfacings": { table: "lcm.recall_surfacing", column: "surfacing_id" },
@@ -261,6 +269,50 @@ const SEQUENCE_BACKED_IDENTITY_COLUMN: Readonly<Partial<Record<PortableDomain, R
  * canonical digest is identical, which is exactly the failure this class
  * exists to catch (see witness-schema-FROZEN-v2.md's own named blind spot).
  */
+
+/**
+ * Reads the sequence's own stored, on-disk state -- never
+ * pg_sequence_last_value(), which is scoped to the calling session and
+ * reports NULL until that same session has called nextval() itself (S1: a
+ * fresh read-only snapshot session never has, so that formula always read
+ * NULL here and every non-empty sequence-backed domain would mismatch,
+ * even a perfectly healthy one). SELECT last_value, is_called directly
+ * from the sequence relation reads the persisted state regardless of what
+ * this session has done, exactly like psql's \d on a sequence. The
+ * sequence name is resolved server-side via pg_get_serial_sequence and is
+ * never caller input, so splicing it into the second query's FROM clause
+ * (PostgreSQL forbids parameterising a relation name) admits nothing an
+ * attacker controls.
+ */
+async function readSequenceStoredState(
+  session: PostgreSqlSnapshotSession, table: string, column: string, signal?: AbortSignal,
+): Promise<{ lastValue: bigint; isCalled: boolean; incrementBy: bigint } | null> {
+  const nameResult = await session.query<{ seq_name: string | null }>({
+    text: "SELECT pg_catalog.pg_get_serial_sequence($1, $2) AS seq_name",
+    values: [table, column],
+  }, { domain: "factory", operation: "verifyGenerationSequenceName", signal });
+  const seqName = nameResult.rows[0]?.seq_name ?? null;
+  if (seqName === null) return null;
+  const [stateResult, incrementResult] = await Promise.all([
+    session.query<{ last_value: string; is_called: boolean }>({
+      // seqName came back from pg_get_serial_sequence above, never from
+      // caller input, so splicing it here is not an injection surface;
+      // PostgreSQL forbids parameterising a FROM-clause relation name.
+      text: "SELECT last_value::text AS last_value, is_called FROM " + seqName,
+    }, { domain: "factory", operation: "verifyGenerationSequenceLastValue", signal }),
+    session.query<{ increment_by: string }>({
+      // Joined by oid via ::regclass, never by name-string concatenation,
+      // so quoting-sensitive identifiers cannot desync the two reads.
+      text: "SELECT increment_by::text AS increment_by FROM pg_catalog.pg_sequence "
+        + "WHERE seqrelid OPERATOR(pg_catalog.=) $1::regclass",
+      values: [seqName],
+    }, { domain: "factory", operation: "verifyGenerationSequenceIncrement", signal }),
+  ]);
+  const stateRow = stateResult.rows[0];
+  const incrementRow = incrementResult.rows[0];
+  if (stateRow === undefined || incrementRow === undefined) return null;
+  return { lastValue: BigInt(stateRow.last_value), isCalled: stateRow.is_called, incrementBy: BigInt(incrementRow.increment_by) };
+}
 export async function readSequenceSelfConsistencyMismatches(
   session: PostgreSqlSnapshotSession, projectId: string, signal?: AbortSignal,
 ): Promise<MigrationVerificationMismatch[]> {
@@ -272,12 +324,15 @@ export async function readSequenceSelfConsistencyMismatches(
     }, { domain: "factory", operation: "verifyGenerationSequenceSelfConsistencyMax", projectId, signal });
     const maxValue = maxResult.rows[0]?.max_value ?? null;
     if (maxValue === null) continue; // domain is empty for this project: nothing to bound.
-    const sequenceResult = await session.query<{ last_value: string | null }>({
-      text: "SELECT pg_catalog.pg_sequence_last_value(pg_catalog.pg_get_serial_sequence($1, $2)::regclass)::text AS last_value",
-      values: [target.table, target.column],
-    }, { domain: "factory", operation: "verifyGenerationSequenceSelfConsistencyLastValue", signal });
-    const lastValue = sequenceResult.rows[0]?.last_value ?? null;
-    if (lastValue === null || BigInt(lastValue) < BigInt(maxValue)) {
+    const state = await readSequenceStoredState(session, target.table, target.column, signal);
+    // is_called=false means nextval() has never run: the *next* call
+    // returns last_value itself (the start value), not last_value plus
+    // the increment. Getting this boundary backwards is exactly the S1
+    // defect this replaces: a never-called sequence whose start value
+    // collides with an already-copied row must still be caught.
+    const nextAllocatedValue = state === null ? null
+      : state.isCalled ? state.lastValue + state.incrementBy : state.lastValue;
+    if (nextAllocatedValue === null || nextAllocatedValue <= BigInt(maxValue)) {
       mismatches.push({
         domain: domain as PortableDomain, class: "sequence",
         // A constant marker, never the compared values: the sequence bound
@@ -294,9 +349,13 @@ function buildCensusVector(domains: readonly MigrationVerificationDomainCensus[]
   return parseMigrationCensusVector({
     version: 1,
     domains: domains.map((entry) => ({ domain: entry.domain, recordCount: entry.recordCount, prefixSha256: entry.prefixSha256 })),
-    contentSha256: migrationWitnessSha256([
-      "lcm-migration-verification-content-v1", domains.map((entry) => [entry.domain, entry.prefixSha256]),
-    ]),
+    // Pinned to the portable manifest's own aggregate family (per freeze-
+    // integrity repair 3): the same aggregateContentSha256(schema, prefixes)
+    // formula the source's PortableManifest.contentSha256 uses, never a
+    // second verification-only digest family for the same concept.
+    contentSha256: aggregateContentSha256(
+      PORTABLE_RECORD_SCHEMA_SHA256, domains.map((entry) => entry.prefixSha256),
+    ),
   });
 }
 
@@ -473,6 +532,15 @@ export interface VerifyMigrationGenerationInput {
    * report bound to the wrong destination.
    */
   readonly expectedDestinationIdentitySha256: string;
+  /**
+   * pg_control_system()'s system_identifier, recorded as a sibling of the
+   * sealed five-field identity witness (per plan-v4 section 4) rather than
+   * inside it. Comparing it live-to-live is what catches a destination
+   * whose underlying physical cluster changed -- a failover to a standby
+   * with a different system_identifier -- while the application-level
+   * five-field witness happened to stay identical.
+   */
+  readonly expectedSystemIdentifier: string;
   readonly projectMapWitnessSha256: string;
   readonly queueClassificationWitness: MigrationQueueClassificationWitness;
   readonly sampleParameters: MigrationVerificationSampleParameters;
@@ -501,6 +569,23 @@ const defaultDependencies: VerifyMigrationGenerationDependencies = {
 export interface VerifyMigrationGenerationResult {
   readonly report: MigrationVerificationReport;
   readonly outcome: "clean" | "mismatches";
+  /**
+   * Pinned per plan-v4 step 10 (previously left asserted rather than
+   * named): deterministic functions of the persisted report identity,
+   * never a live observation. This driver does not itself call
+   * beginMigrationEffect/completeMigrationEffect (that manifest-effect
+   * wiring is a separate, not-yet-built caller), but pinning the formula
+   * here means that caller has no choice to make, and two independent
+   * drivers over an identical persisted report mint the same effectId --
+   * the property the concurrent-begin adoption rule needs.
+   */
+  readonly effectId: string;
+  readonly inputSha256: string;
+}
+
+/** effectId = `verify-generation-${reportSha256}`, inputSha256 = reportSha256. Pinned, not asserted. */
+export function migrationVerificationEffectId(reportSha256: string): string {
+  return `verify-generation-${reportSha256}`;
 }
 
 /**
@@ -536,6 +621,9 @@ export async function verifyMigrationGeneration(
     // must refuse, not publish a clean report bound to the wrong target.
     if (destinationIdentity.sealedWitnessSha256 !== input.expectedDestinationIdentitySha256) {
       driverError("destination-drift", "destination identity does not match the expected witness");
+    }
+    if (destinationIdentity.systemIdentifier !== input.expectedSystemIdentifier) {
+      driverError("destination-drift", "destination system identifier does not match the expected value");
     }
 
     const coordinator = new PostgreSqlWorkCoordinator(runtime, input.expectedIdentity.id, input.expectedIdentity.machineId!);
@@ -606,7 +694,11 @@ export async function verifyMigrationGeneration(
       const report = createMigrationVerificationReport(reportInput);
       const store = new MigrationVerificationReportStore({ homeDir: input.homeDir });
       const persisted = store.persist(input.generationId, report);
-      return { report: persisted.report, outcome: persisted.report.clean ? "clean" : "mismatches" };
+      return {
+        report: persisted.report, outcome: persisted.report.clean ? "clean" : "mismatches",
+        effectId: migrationVerificationEffectId(persisted.report.reportSha256),
+        inputSha256: persisted.report.reportSha256,
+      };
     } finally {
       await coordinator.releaseLease({ ...resource, fencingToken: lease.fencingToken }).catch(() => undefined);
     }
