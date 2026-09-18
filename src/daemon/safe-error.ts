@@ -528,7 +528,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (
       pathlessFileQueryBracketDepth > 0 &&
       (((char === "&" || char === "|") &&
-        (chars[index + 1] === "/" || chars[index + 1] === "\\")) ||
+        (chars[index + 1] === "/" ||
+          chars[index + 1] === "\\" ||
+          // A drive-letter root is a path root just like / and \\, so it must
+          // arm the wrapper handoff rather than fall through to the URL-end
+          // reset. Without this the inner path still redacts through the
+          // private-root rules while the wrapper tail silently leaks.
+          isWindowsDrivePathStart(chars, index + 1))) ||
         retainedParentPrivatePathStart >= 0 ||
         retainedParentNamedWindowsPathStart >= 0)
     ) {

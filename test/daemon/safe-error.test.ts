@@ -3923,6 +3923,50 @@ describe("sanitizeError", () => {
     expect(whitespaceChecks).toBeLessThanOrEqual(Array.from(input).length);
   });
 
+  it.each([
+    [
+      "drive root arms the wrapper tail",
+      "file://h?x=[https://e.test/t|C:\\Users\\alice\\one.db]\\Users\\bob\\secret.db",
+      "file://h?x=[https://e.test/t|<path>]<path>",
+    ],
+    [
+      "drive root arms a repeated in-wrapper handoff",
+      "file://h?x=[https://e.test/t|C:\\Users\\alice\\one.db&\\Users\\bob\\x]",
+      "file://h?x=[https://e.test/t|<path>&<path>]",
+    ],
+    [
+      "backslash root control",
+      "file://h?x=[https://e.test/t|\\Users\\alice\\one.db]\\Users\\bob\\secret.db",
+      "file://h?x=[https://e.test/t|<path>]<path>",
+    ],
+    [
+      "slash root control",
+      "file://h?x=[https://e.test/t|/Users/alice/one.db]/Users/bob/secret.db",
+      "file://h?x=[https://e.test/t|<path>]<path>",
+    ],
+    [
+      "ampersand drive root control",
+      "file://h?x=[https://e.test/t&C:\\Users\\alice\\one.db]\\Users\\bob\\secret.db",
+      "file://h?x=[https://e.test/t&<path>]<path>",
+    ],
+  ] as const)("arms the nested-public handoff on a drive root (Bug #1348): %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("bob");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "file://h?x=[https://e.test/t|relative/path]\\Users\\bob\\secret.db",
+    "file://h?x=[https://e.test/t|C:relative]\\Users\\bob\\secret.db",
+  ] as const)("does not arm the Bug #1348 handoff without a path root: %s", (input) => {
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
   it("replaces SQLite constraint details with generic message", () => {
     const result = sanitizeError("SQLITE_CONSTRAINT: UNIQUE constraint failed: messages.conversation_id");
     expect(result).not.toContain("messages.conversation_id");
