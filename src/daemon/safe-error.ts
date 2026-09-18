@@ -639,6 +639,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       // A closed quoted file path can hand off a root-relative Windows tail,
       // even when the preceding path contains only root separators.
       if (closesQuotedFilePath && chars[index + 1] === "\\") file[index + 1] = 1;
+      // A quote that closes a nested public URL ends that URL, not the
+      // enclosing pathless file query that owns it. Dropping the enclosing
+      // span here left a following delimiter with no owner, so a rooted
+      // successor stayed visible for quoted nested public URLs only.
+      const closesQuotedNestedPublicUrl =
+        pathlessFileQueryBracketDepth > 0 &&
+        !exactFileScheme &&
+        schemeQuote !== 0 &&
+        quoteCode(char) === schemeQuote;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;
@@ -653,8 +662,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
       nestedPublicUrlBracketDepth = 0;
-      pathlessFileQueryBracketDepth = 0;
-      pathlessNestedPublicUrlActive = false;
+      if (!closesQuotedNestedPublicUrl) {
+        pathlessFileQueryBracketDepth = 0;
+        pathlessNestedPublicUrlActive = false;
+      }
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
       quotedQueryPublicUrlOwnQueryOrFragment = false;

@@ -3923,6 +3923,75 @@ describe("sanitizeError", () => {
 
   it.each([
     [
+      "apostrophe and pipe",
+      "file://h?x=['https://e.test/t'|\\Users\\SECRET\\x]",
+      "file://h?x=['https://e.test/t'|<path>]",
+    ],
+    [
+      "apostrophe and ampersand",
+      "file://h?x=['https://e.test/t'&\\Users\\SECRET\\x]",
+      "file://h?x=['https://e.test/t'&<path>]",
+    ],
+    [
+      "double quote and pipe",
+      "file://h?x=[\"https://e.test/t\"|\\Users\\SECRET\\x]",
+      "file://h?x=[\"https://e.test/t\"|<path>]",
+    ],
+    [
+      "POSIX successor",
+      "file://h?x=['https://e.test/t'|/Users/a/one]",
+      "file://h?x=['https://e.test/t'|<path>]",
+    ],
+    [
+      "drive root successor",
+      "file://h?x=['https://e.test/t'|C:\\Users\\a\\one]",
+      "file://h?x=['https://e.test/t'|<path>]",
+    ],
+    [
+      "IPv6 authority",
+      "file://h?x=['https://[::1]/t'|\\Users\\SECRET\\x]",
+      "file://h?x=['https://[::1]/t'|<path>]",
+    ],
+    [
+      "wrapper tail after the handoff",
+      "file://h?x=['https://e.test/t'|/Users/a/one]\\Users\\bob\\x",
+      "file://h?x=['https://e.test/t'|<path>]<path>",
+    ],
+    [
+      "quoted nested file child parity",
+      "file://h?x=[\"file://host?key=/public\"|\\Users\\SECRET\\x]",
+      "file://h?x=[\"file://host?key=<path>\"|<path>]",
+    ],
+  ] as const)("hands off after a quoted nested public URL (Bug #1344): %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).not.toContain("SECRET");
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "file://h?x=['https://e.test/t'|relative/path]",
+    "see 'https://e.test/t'|\\Users\\SECRET\\x",
+  ] as const)("keeps the Bug #1344 handoff scoped to a rooted successor inside a wrapper: %s", (input) => {
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
+  it("keeps a single-pipe direct handoff control stable", () => {
+    const input = "file://h?x=[https://e.test/t|\\Users\\SECRET\\x]";
+    const expected = "file://h?x=[https://e.test/t|<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
       "drive root arms the wrapper tail",
       "file://h?x=[https://e.test/t|C:\\Users\\alice\\one.db]\\Users\\bob\\secret.db",
       "file://h?x=[https://e.test/t|<path>]<path>",
