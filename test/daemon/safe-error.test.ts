@@ -4245,6 +4245,53 @@ describe("sanitizeError", () => {
     expect(first).toContain(input.includes("relative") ? "relative/path" : "later/Users/secret");
   });
 
+  // Bug #1345 asked whether "," and ";" should join "&" and "|" as sibling
+  // handoff delimiters. They should not: both are already URL-end delimiters
+  // throughout this grammar and are listed in FILE_URL_AUTHORITY_DELIMITERS,
+  // so promoting them would change the meaning of every wrapper that uses
+  // them as ordinary separators. The boundary is pinned here so the decision
+  // is deliberate rather than incidental. Note the residual surface is narrow:
+  // only the single-leading-backslash Windows form survives these delimiters,
+  // because POSIX and drive roots still redact through the private-root rules.
+  it.each([
+    [
+      "comma does not hand off",
+      "file://h?x=[https://e.test/t|/Users/a/one,\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t|<path>,\\Users\\SECRET\\x]",
+    ],
+    [
+      "semicolon does not hand off",
+      "file://h?x=[https://e.test/t|/Users/a/one;\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t|<path>;\\Users\\SECRET\\x]",
+    ],
+    [
+      "ampersand does hand off",
+      "file://h?x=[https://e.test/t|/Users/a/one&\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t|<path>&<path>]",
+    ],
+    [
+      "pipe does hand off",
+      "file://h?x=[https://e.test/t|/Users/a/one|\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t|<path>|<path>]",
+    ],
+    [
+      "comma still redacts a POSIX root",
+      "file://h?x=[https://e.test/t|/Users/a/one,/Users/b/two]",
+      "file://h?x=[https://e.test/t|<path>,<path>]",
+    ],
+    [
+      "semicolon still redacts a drive root",
+      "file://h?x=[https://e.test/t|/Users/a/one;C:\\Users\\b\\two]",
+      "file://h?x=[https://e.test/t|<path>;<path>]",
+    ],
+  ] as const)("pins the Bug #1345 sibling delimiter boundary: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("replaces SQLite constraint details with generic message", () => {
     const result = sanitizeError("SQLITE_CONSTRAINT: UNIQUE constraint failed: messages.conversation_id");
     expect(result).not.toContain("messages.conversation_id");
