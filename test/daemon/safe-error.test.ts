@@ -2966,9 +2966,57 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
   });
 
-  it("preserves deferred Bug #1332 contextual over-redaction", () => {
+  it("stops pathless query ownership at a URL-ending delimiter (Bug #1332)", () => {
     const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
-    const expected = "file://h?x=[value|later=<path>]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(input);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "query delimiter keeps ownership",
+      "file://h?x=[value?later=\\Users\\bob\\secret.db]",
+      "file://h?x=[value?later=<path>]",
+    ],
+    [
+      "fragment delimiter keeps ownership",
+      "file://h?x=[value#later=\\Users\\bob\\secret.db]",
+      "file://h?x=[value#later=<path>]",
+    ],
+    [
+      "no delimiter keeps ownership",
+      "file://h?x=[later=\\Users\\bob\\secret.db]",
+      "file://h?x=[later=<path>]",
+    ],
+    [
+      "comma is not a URL-ending delimiter here",
+      "file://h?x=[value,later=\\Users\\bob\\secret.db]",
+      "file://h?x=[value,later=<path>]",
+    ],
+    [
+      "semicolon is not a URL-ending delimiter here",
+      "file://h?x=[value;later=\\Users\\bob\\secret.db]",
+      "file://h?x=[value;later=<path>]",
+    ],
+    [
+      "POSIX root still redacts after the delimiter",
+      "file://h?x=[value|later=/Users/bob/secret.db]",
+      "file://h?x=[value|later=<path>]",
+    ],
+    [
+      "Windows drive root still redacts after the delimiter",
+      "file://h?x=[value|later=C:\\Users\\bob\\secret.db]",
+      "file://h?x=[value|later=<path>]",
+    ],
+    [
+      "UNC root still redacts after the delimiter",
+      "file://h?x=[value|later=\\\\server\\share\\secret.db]",
+      "file://h?x=[value|later=<path>]",
+    ],
+  ] as const)("bounds Bug #1332 ownership precisely: %s", (_name, input, expected) => {
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -3638,9 +3686,9 @@ describe("sanitizeError", () => {
       "file://h?x=[https://[::1]/p|<path>|\\Users\\second.db",
     ],
     [
-      "deferred Bug #1332",
+      "Bug #1332 delimiter boundary",
       "file://h?x=[value|later=\\Users\\bob\\secret.db]",
-      "file://h?x=[value|later=<path>]",
+      "file://h?x=[value|later=\\Users\\bob\\secret.db]",
     ],
   ] as const)("preserves post-review 5 %s control", (_name, input, expected) => {
     const first = sanitizeError(input);
@@ -3768,12 +3816,11 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("preserves deferred Bug #1332 contextual over-redaction after the pipe-handoff fix", () => {
+  it("keeps the Bug #1332 delimiter boundary after the pipe-handoff fix", () => {
     const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
-    const expected = "file://h?x=[value|later=<path>]";
     const first = sanitizeError(input);
 
-    expect(first).toBe(expected);
+    expect(first).toBe(input);
     expect(sanitizeError(first)).toBe(first);
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });

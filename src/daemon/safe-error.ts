@@ -106,6 +106,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const repeatedPipeHandoffWrapperDepths = new Set<number>();
   const nestedFileUrlParentOwnerBracketDepths = new Set<number>();
   const restartedNestedFileUrlParentOwnerBracketDepths = new Set<number>();
+  const suspendedPathlessFileQueryOwnerDepths = new Set<number>();
   let schemeLength = 0;
   let fileSchemeLength = 0;
   let schemeQuote = 0;
@@ -157,6 +158,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       repeatedPipeHandoffWrapperDepths.clear();
       nestedFileUrlParentOwnerBracketDepths.clear();
       restartedNestedFileUrlParentOwnerBracketDepths.clear();
+      suspendedPathlessFileQueryOwnerDepths.clear();
       activeNestedFileUrlParentOwnerBracketDepth = 0;
       queryOrFragment = false;
       nestedPublicUrlBracketDepth = 0;
@@ -180,6 +182,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (pathlessFileQueryOwnerBracketDepth > 0 && char === "[") {
       pathlessFileQueryOwnerBracketDepth += 1;
     } else if (pathlessFileQueryOwnerBracketDepth > 0 && char === "]") {
+      suspendedPathlessFileQueryOwnerDepths.delete(pathlessFileQueryOwnerBracketDepth);
       pathlessFileQueryOwnerBracketDepth -= 1;
     } else if (restartedPathlessFile && char === "[") {
       pathlessFileQueryOwnerBracketDepth = 1;
@@ -226,6 +229,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     if (
       pathlessFileQueryOwnerBracketDepth > 0 &&
+      !suspendedPathlessFileQueryOwnerDepths.has(pathlessFileQueryOwnerBracketDepth) &&
       separator < 0 &&
       !pathlessNestedPublicUrlActive &&
       char === "\\" &&
@@ -575,6 +579,18 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryTail = false;
       restartedPathlessBrackets = 0;
       queryOrFragment = false;
+      // A URL-ending delimiter ends this bracket group's observable file-query
+      // ownership, but the group's own bracket depth must survive so its
+      // closing bracket still restores the enclosing owner. Angle brackets are
+      // excluded: they carry generated and literal markers inside a value
+      // rather than ending one.
+      if (
+        pathlessFileQueryOwnerBracketDepth > 0 &&
+        char !== "<" &&
+        char !== ">"
+      ) {
+        suspendedPathlessFileQueryOwnerDepths.add(pathlessFileQueryOwnerBracketDepth);
+      }
       nestedPublicUrlBracketDepth = 0;
       pathlessFileQueryBracketDepth = 0;
       pathlessNestedPublicUrlActive = false;
