@@ -1805,9 +1805,11 @@ which file the handle opened rather than about sidecar provenance.
 
 Because the evidence is metadata on the database and its directory, an open can
 also be refused when something else changes them while SQLite is opening. A
-concurrent writer to the same database updates the database file's timestamps,
-and a writer that creates the write-ahead log, or anything else that adds or
-removes an entry in the database directory, changes the directory's. Running
+concurrent writer may update the database file's timestamps, though a
+steady-state writer in WAL mode often touches only the write-ahead log and
+leaves the database file alone. A writer that creates or checkpoints that log,
+or anything else that adds or removes an entry in the database directory,
+changes the directory's timestamps instead. Running
 the daemon and a CLI command against one project at the same moment can
 therefore produce this refusal on a healthy database. It is fail-closed and
 retrying the open once that activity settles resolves it; LCM does not retry on
